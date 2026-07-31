@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import logging
 import time
 from dataclasses import dataclass, replace
@@ -8,10 +9,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
-from .fleet_paths import fleet_dir
+from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
+from . import layout
 from .github import GitHub, GitHubError
 from .global_config import describe_config_file, load_layered_config
+from .instrumentation import log_event
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
 from .supervise import (
@@ -35,7 +38,7 @@ from .runners import (
     scale_down_idle_runners,
     ScaleAction,
 )
-from .state import utc_now
+from .state import state_lock, utc_now
 from .workflow import CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -165,7 +168,7 @@ def compute_api_worker_fleet_report(
     from .api_budget import budget_status, ledger_path, load_ledger
     from .worker import iter_workers
 
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos = registry.get("repos", {})
     if not repos:
@@ -229,7 +232,7 @@ def compute_api_worker_fleet_report(
         state_dir_str = entry.get("state_dir")
         if not state_dir_str:
             continue
-        sessions_dir = Path(state_dir_str) / "dispatches" / "sessions"
+        sessions_dir = layout.sessions_dir_default(Path(state_dir_str))
         if not sessions_dir.is_dir():
             continue
         try:
@@ -358,7 +361,7 @@ def _run_fleet_allocation_prologue(
     # Any existing repo root works as the gh working directory: the allocation
     # pass addresses every repo by explicit owner/name slug, so the cwd's git
     # identity is irrelevant. Only auth and a valid directory are needed.
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     anchor_root: Path | None = None
     anchor_state: Path | None = None
@@ -367,7 +370,7 @@ def _run_fleet_allocation_prologue(
         if candidate.is_dir():
             anchor_root = candidate
             state_dir = entry.get("state_dir")
-            anchor_state = Path(state_dir) / "state.json" if state_dir else None
+            anchor_state = layout.state_file_path(Path(state_dir)) if state_dir else None
             break
 
     if anchor_root is None:
@@ -479,7 +482,7 @@ def _run_fleet_autoscale_prologue(
     # Pick a representative repo with runner_scaling enabled. Its runtime config
     # is used for the fleet-wide runner count (all repos share the same retry
     # knobs) and for the subsequent autoscale observation/actions.
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos_map = registry.get("repos", {})
 
@@ -885,8 +888,150 @@ def _add_launch_failures(
                 failures.append(event)
 
 
+# Event types whose AttentionEntry represents a persistent health state of an
+# issue/worker (STALLED/ERROR/REPAIRED-style). Only these are subject to
+# cross-pass transition dedup: a persistent ERROR must not re-fire with
+# ``previous_health: null`` every pass (issue #554). Occurrence-style events
+# (review_verdict_recorded, review_verdict_missed, skipped,
+# live_worker_redispatch_averted, and the operational fallback entries) are
+# one-shot confirmations whose health string is constant by construction, so
+# deduping them would collapse the recorded-verdict heartbeat and silently drop
+# repeat missed-verdict signals (PR #669 review).
+_PERSISTENT_HEALTH_EVENT_TYPES = frozenset({"stalled", "error", "health_transition"})
+
+
+def _fleet_health_state_path(fleet_dir_override: str | None) -> Path:
+    """Return the fleet-level notify health baseline sidecar path.
+
+    This sidecar persists the last-known health per (adapter_kind, issue_number)
+    so the fleet digest can emit only on real transitions instead of re-firing
+    every pass with ``previous_health: null`` (issue #554). It lives in the
+    fleet directory alongside ``fleet.json``.
+    """
+    return layout.notify_health_state_path(override=fleet_dir_override)
+
+
+def _load_fleet_health_state(path: Path) -> dict[str, str]:
+    """Load the fleet health baseline sidecar.
+
+    Returns an empty dict when the file is missing or unparseable (a corrupt
+    sidecar is non-fatal: the worst case is one extra transition emission on
+    the next pass, which is exactly the degraded mode we are fixing away from).
+    """
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, LookupError, ValueError, OSError):
+        logger.warning("Fleet health state %s unreadable; starting fresh", path)
+        return {}
+    issues = data.get("issues") if isinstance(data, dict) else None
+    if not isinstance(issues, dict):
+        return {}
+    # Coerce values to str; keys are already "adapter_kind:issue_number" strings.
+    return {str(k): str(v) for k, v in issues.items() if isinstance(v, str)}
+
+
+def _save_fleet_health_state(path: Path, issues: dict[str, str]) -> None:
+    """Atomically persist the fleet health baseline sidecar.
+
+    Temp-file + ``replace()`` per the project's atomic-write invariant. Warns
+    on fleet-dir virtualization (issue #624) but never blocks the write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    warn_fleet_dir_virtualization_on_write(path.parent, context="writing notify_health_state.json")
+    payload = {"version": 1, "generated_at": utc_now(), "issues": issues}
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp_path.replace(path)
+
+
+def _filter_fleet_health_transitions(
+    entries: list[AttentionEntry],
+    state_file: Path,
+    *,
+    persistent_mask: list[bool] | None = None,
+) -> list[AttentionEntry]:
+    """Stateful filter: keep only persistent-health entries whose health changed.
+
+    Reads the fleet health baseline sidecar (``notify_health_state.json``)
+    mapping ``"adapter_kind:issue_number"`` to the last-emitted health. For
+    each *persistent* entry, only keeps it when the health differs from the
+    persisted baseline, setting ``previous_health`` to that prior value.
+    Updates and atomically persists the new baselines.
+
+    This is the fleet-level analogue of ``workflow._build_attention_digest``'s
+    per-issue transition dedup. Without it, every fleet pass re-emits the same
+    ERROR/STALLED entries with ``previous_health: null`` (issue #554).
+
+    ``persistent_mask`` (parallel to ``entries``) marks which entries represent
+    a persistent health state subject to cross-pass dedup. Entries marked
+    ``False`` are occurrence-style events (review_verdict_recorded/missed,
+    skipped, live_worker_redispatch_averted, operational fallback) and pass
+    through unchanged every call — they never consult nor update the baseline,
+    so a constant-health confirmation keeps firing as a heartbeat (PR #669
+    review). When ``persistent_mask`` is ``None`` every entry is treated as
+    persistent (the self-deploy ERROR/REPAIRED path, which is always
+    persistent).
+
+    Entries are processed in order so a within-pass health change (e.g.
+    ERROR then OK for the same issue) emits both transitions; the persisted
+    baseline ends at the final health.
+    """
+    emitted: list[AttentionEntry] = []
+    # Ensure the parent directory exists before state_lock tries to create the
+    # sibling .lock file (advisory_file_lock touches it directly).
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    with state_lock(state_file):
+        baselines = _load_fleet_health_state(state_file)
+        for idx, entry in enumerate(entries):
+            is_persistent = persistent_mask[idx] if persistent_mask is not None else True
+            if not is_persistent:
+                # Occurrence-style event: emit every time and leave the
+                # persisted baseline untouched (it tracks persistent health
+                # only, so a one-shot confirmation must not poison it).
+                emitted.append(entry)
+                continue
+            key = f"{entry.adapter_kind}:{entry.issue_number}"
+            last = baselines.get(key)
+            if last == entry.health:
+                continue
+            emitted.append(replace(entry, previous_health=last))
+            baselines[key] = entry.health
+        _save_fleet_health_state(state_file, baselines)
+    return emitted
+
+
+def _emit_fleet_transition(
+    notify_config: Any,
+    entry: AttentionEntry,
+    fleet_dir_override: str | None,
+) -> None:
+    """Emit a single fleet attention entry as a digest, deduped across passes.
+
+    Wraps the stateful ``_filter_fleet_health_transitions`` so a persistent
+    condition (e.g. a recurring self-deploy ERROR) does not re-fire with
+    ``previous_health: null`` every supervisor pass (issue #554). Only emits
+    when the entry represents a real transition vs the persisted baseline.
+    """
+    state_file = _fleet_health_state_path(fleet_dir_override)
+    filtered = _filter_fleet_health_transitions([entry], state_file)
+    if not filtered:
+        return
+    digest = AttentionDigest(
+        generated_at=utc_now(),
+        repo="fleet",
+        transitions=tuple(filtered),
+    )
+    emit_digest(notify_config, digest)
+
+
 def _build_fleet_attention_digest(
     attention_events: list[dict[str, Any]],
+    state_file: Path | None = None,
 ) -> AttentionDigest:
     """Convert fleet-aggregated event dicts into a single AttentionDigest.
 
@@ -900,10 +1045,27 @@ def _build_fleet_attention_digest(
     ``issue_number`` is required by ``AttentionEntry``; events that carry no
     issue number (e.g. PR errors) fall back to ``-1`` as a sentinel so they
     still surface in the digest instead of being silently dropped.
+
+    When ``state_file`` is provided, the entries are filtered through
+    ``_filter_fleet_health_transitions`` so persistent-health entries
+    (``stalled``/``error``/``health_transition``) emit only on real transitions
+    vs the last-persisted baseline, while occurrence-style entries
+    (``review_verdict_recorded``/``review_verdict_missed``, ``skipped``,
+    ``live_worker_redispatch_averted``, operational fallback) pass through
+    every pass — collapsing those would defeat the recorded-verdict heartbeat
+    (PR #669 review). Without ``state_file`` every pass re-fires the same
+    entries with ``previous_health: null`` (issue #554). The returned digest
+    always carries the post-filter entries; callers that pass ``state_file``
+    should still check ``digest.transitions`` for emptiness before emitting.
     """
     entries: list[AttentionEntry] = []
+    # Parallel to ``entries``: True for persistent-health event types subject
+    # to cross-pass dedup, False for occurrence-style events that emit every
+    # pass. See ``_PERSISTENT_HEALTH_EVENT_TYPES``.
+    persistent_mask: list[bool] = []
     for event in attention_events:
         event_type = event["type"]
+        is_persistent = event_type in _PERSISTENT_HEALTH_EVENT_TYPES
         if event_type == "stalled":
             entries.append(
                 AttentionEntry(
@@ -915,6 +1077,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "error":
             entries.append(
                 AttentionEntry(
@@ -926,6 +1089,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "health_transition":
             entries.append(
                 AttentionEntry(
@@ -937,6 +1101,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "skipped":
             entries.append(
                 AttentionEntry(
@@ -948,6 +1113,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "live_worker_redispatch_averted":
             entries.append(
                 AttentionEntry(
@@ -959,6 +1125,7 @@ def _build_fleet_attention_digest(
                     pid=event.get("pid"),
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "review_verdict_recorded":
             entries.append(
                 AttentionEntry(
@@ -970,6 +1137,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "review_verdict_missed":
             entries.append(
                 AttentionEntry(
@@ -981,6 +1149,7 @@ def _build_fleet_attention_digest(
                     pid=None,
                 )
             )
+            persistent_mask.append(is_persistent)
         elif event_type == "runner_allocation":
             # Deliberately not in the digest — unlike the accidental drops the
             # fallback below exists to prevent. This is the allocator's *success*
@@ -1013,12 +1182,71 @@ def _build_fleet_attention_digest(
                     pid=event.get("pid"),
                 )
             )
+            persistent_mask.append(is_persistent)
+
+    if state_file is not None:
+        entries = _filter_fleet_health_transitions(
+            entries, state_file, persistent_mask=persistent_mask
+        )
 
     return AttentionDigest(
         generated_at=utc_now(),
         repo="fleet",
         transitions=tuple(entries),
     )
+
+
+def _lane_failure_state_path(repo_root: Path, entry: dict[str, Any]) -> Path:
+    """Resolve the per-repo ``state.json`` path for a lane that failed to start.
+
+    A lane failure (e.g. ``load_layered_config`` raising ``ConfigError``) can
+    happen before ``runtime_paths()`` is reachable, so this cannot use the
+    configured ``runtime.state_dir`` the way a healthy pass does. Instead it
+    mirrors ``_take_fleet_snapshot``'s precedent: prefer the fleet registry's
+    recorded ``state_dir`` (written by a prior successful ``touch_repo()``),
+    falling back to the conventional default for a repo that has never
+    registered successfully.
+
+    Note this can diverge from ``runtime_paths(...).state_file`` for a repo
+    whose config overrides ``runtime.state_dir`` to a non-default path *and*
+    has no registry ``state_dir`` recorded yet (e.g. its very first pass) —
+    the event would be recorded at the default location, and a doctor check
+    reading the configured path would not find it until the repo registers
+    successfully once. This is the same divergence class layout.py's
+    docstrings warn about; it is not fully closable here since the whole
+    point of this helper is to work when config load has failed.
+    """
+    state_dir_str = entry.get("state_dir")
+    state_root = Path(state_dir_str) if state_dir_str else layout.default_state_root(repo_root)
+    return layout.state_file_path(state_root)
+
+
+def _record_lane_failure_event(
+    repo_root: Path,
+    repo_key: str,
+    entry: dict[str, Any],
+    error_message: str,
+) -> None:
+    """Durably record a lane-startup failure to the repo's own events.db (#6-G).
+
+    This is best-effort and must never escape: ``log_event`` already guards
+    its own sqlite calls, but the directory-creation call it makes before
+    that guard is not caught by that guard's exception type, so this wraps
+    the whole call in its own try/except. A failure to *record* a lane
+    failure must never itself break the per-repo isolation boundary this is
+    called from (D-4) — the caller has already logged the real error via
+    ``logger.exception`` regardless of what happens here.
+    """
+    try:
+        state_path = _lane_failure_state_path(repo_root, entry)
+        log_event(
+            state_path,
+            "fleet_pass_config_error",
+            {"repo_key": repo_key, "error": error_message},
+            repo=repo_key,
+        )
+    except Exception:
+        logger.exception("Failed to record lane failure event for repo %s", repo_key)
 
 
 def fleet_loop(
@@ -1052,7 +1280,7 @@ def fleet_loop(
         A CommandResult with per-repo results and the consolidated digest.
     """
     # Load fleet registry with state_lock guard
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
 
     # Select repos in the appropriate order
@@ -1116,7 +1344,7 @@ def fleet_loop(
             # Non-blocking supervisor lock: fleet passes must be mutually exclusive
             # with a supervised bash-rats loop on the same repo to avoid double-
             # dispatching through the governor's read-then-launch window.
-            lock = try_acquire_supervisor_lock(paths.root / "supervisor.lock")
+            lock = try_acquire_supervisor_lock(layout.supervisor_lock_path(paths.root))
             if lock is None:
                 per_repo_results[repo_key] = CommandResult(
                     True,
@@ -1180,10 +1408,27 @@ def fleet_loop(
             # pass alive instead of crashing on one unclassified exception.
             # The exception type is part of the message and the full traceback
             # goes to the log — an unclassified failure must stay diagnosable.
+            error_message = f"{type(exc).__name__}: {exc}"
             per_repo_results[repo_key] = CommandResult(
-                False, f"fleet pass error: {type(exc).__name__}: {exc}", {}
+                False, f"fleet pass error: {error_message}", {}
             )
             logger.exception("Error processing repo %s", repo_key)
+            # #6-G: the two lines above are an in-process dict and a line in a
+            # dated flat-text log — neither reaches events.db, state.json, or
+            # the fleet digest, since _extract_attention_events() above only
+            # runs after a successful app.loop(). A repo whose lane fails on
+            # every pass (e.g. a config-load ConfigError, cw#... 2026-07-29)
+            # was previously invisible to everything except that log line.
+            # Reuse the existing "error" AttentionEntry branch (health=ERROR,
+            # already desktop-toast-eligible via _DESKTOP_SEVERITIES) so this
+            # works on exactly the path where app.loop() never ran, and
+            # durably record it so `charlie doctor` and
+            # query_events(level="error") can see it even after the digest's
+            # cross-pass dedup stops re-emitting the same standing failure.
+            attention_events.append(
+                {"repo_key": repo_key, "type": "error", "error": error_message}
+            )
+            _record_lane_failure_event(repo_root, repo_key, entry, error_message)
 
     # Call the notifier digest sink exactly once per fleet pass, via the real
     # #166 notify.py implementation (AttentionDigest + emit_digest).
@@ -1194,12 +1439,28 @@ def fleet_loop(
         "orphan_sweep_calls": orphan_sweep_calls,
         "emitted": False,
     }
-    if notify_config is not None and getattr(notify_config, "enabled", False) and attention_events:
-        attention_digest = _build_fleet_attention_digest(attention_events)
-        notify_result = emit_digest(notify_config, attention_digest)
-        digest["emitted"] = notify_result.ok
-        if notify_result.error:
-            digest["notify_error"] = notify_result.error
+    # Build the digest whenever notify is on, then gate the *emission* on the
+    # built digest's transitions (the inner ``if attention_digest.transitions``
+    # added by #669). The previous outer ``and attention_events`` test was
+    # redundant with that inner gate and tested a different, rawer signal — a
+    # converged pass (every event routed to an explicit ``continue``, e.g. a
+    # healthy ``runner_allocation``) has a non-empty ``attention_events`` list
+    # but an empty ``transitions`` tuple, so the two tests disagreed on whether
+    # to enter this block. #669's inner gate already prevented the
+    # ``emit_digest(transitions=())`` empty-envelope call for that case; this
+    # drop removes the contradictory outer condition rather than fixing a
+    # currently-reproducing emission (issue #610). The ``notify_config`` check
+    # stays outermost so no digest is built when notify is off.
+    if notify_config is not None and getattr(notify_config, "enabled", False):
+        health_state_file = _fleet_health_state_path(fleet_dir_override)
+        attention_digest = _build_fleet_attention_digest(
+            attention_events, state_file=health_state_file
+        )
+        if attention_digest.transitions:
+            notify_result = emit_digest(notify_config, attention_digest)
+            digest["emitted"] = notify_result.ok
+            if notify_result.error:
+                digest["notify_error"] = notify_result.error
 
     ok = all(r.ok for r in per_repo_results.values())
     message = f"fleet pass complete: {len(per_repo_results)} repo(s) processed"
@@ -1283,7 +1544,7 @@ class FleetLocalSnapshot:
 
 def _repo_state_dirs(state_dir: Path) -> tuple[Path, Path]:
     """Return the (sessions_dir, prs_dir) for a repo given its state dir."""
-    sessions_dir = state_dir / "dispatches" / "sessions"
+    sessions_dir = layout.sessions_dir_default(state_dir)
     prs_dir = state_dir / "prs"
     return sessions_dir, prs_dir
 
@@ -1293,7 +1554,7 @@ def _take_fleet_snapshot(
     fleet_dir_override: str | None = None,
 ) -> FleetLocalSnapshot:
     """Capture a cheap, network-free snapshot across all registered fleet repos."""
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos = registry.get("repos", {})
 
@@ -1348,7 +1609,10 @@ def run_fleet_supervise(
     """
     try:
         global_config = load_layered_config(
-            Path.cwd(), None, fleet_dir_override=fleet_dir_override
+            Path.cwd(),
+            None,
+            fleet_dir_override=fleet_dir_override,
+            require_global=True,
         )
     except (ConfigError, RepoNotFoundError) as exc:
         # Falling back to defaults silently is how a whole feature disappears
@@ -1356,12 +1620,24 @@ def run_fleet_supervise(
         # runner prologues) reverts to off while passes keep reporting success.
         # A typo in the global layer must be loud.
         logger.warning(
-            "Fleet supervisor could not load config; running on DEFAULTS "
-            "(notify, labels and runner prologues are all off): %s",
+            "Fleet supervisor could not load the global config layer; "
+            "continuing with per-repo config only (fleet-wide knobs fall back "
+            "to per-repo values or defaults): %s",
             exc,
         )
-        print(f"config load failed, running on defaults: {exc}", flush=True)
-        global_config = OrchestratorConfig()
+        print(f"config load failed, continuing on per-repo config: {exc}", flush=True)
+        # The global layer is required, but the per-repo config is still valid
+        # and must not be discarded with it -- discarding both regresses the
+        # #623 silent-disable failure (every per-repo knob reverting to its
+        # dataclass default while passes keep reporting success). Reload
+        # without the global requirement so per-repo settings survive; only
+        # fall back to pristine defaults if the per-repo load itself fails.
+        try:
+            global_config = load_layered_config(
+                Path.cwd(), None, fleet_dir_override=fleet_dir_override
+            )
+        except (ConfigError, RepoNotFoundError):
+            global_config = OrchestratorConfig()
 
     # Provenance of the layer every fleet-wide knob comes from, logged once per
     # supervisor start (not per pass -- this is startup, so it costs one stat).
@@ -1373,7 +1649,7 @@ def run_fleet_supervise(
     # False, and all of them take load_layered_config's silent-{} branch. A bare
     # exists=False here would reproduce the exact ambiguity this line exists to
     # remove. See describe_config_file for which errors are and are not hidden.
-    global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
+    global_config_path = layout.global_config_path(override=fleet_dir_override)
     logger.info(
         "Fleet supervisor global config: path=%s %s",
         global_config_path,
@@ -1387,7 +1663,7 @@ def run_fleet_supervise(
         overrides["max_runtime_minutes"] = max_runtime_override
     cfg = replace(global_config.supervisor, **overrides)
 
-    lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     lock = try_acquire_supervisor_lock(lock_path)
     if lock is None:
         return CommandResult(
@@ -1455,21 +1731,15 @@ def run_fleet_supervise(
                     and notify_config is not None
                     and getattr(notify_config, "enabled", False)
                 ):
-                    attention_digest = AttentionDigest(
-                        generated_at=utc_now(),
-                        repo="fleet",
-                        transitions=(
-                            AttentionEntry(
-                                issue_number=-1,
-                                adapter_kind="self-deploy",
-                                health="ERROR",
-                                previous_health=None,
-                                last_log_line=deploy.error,
-                                pid=None,
-                            ),
-                        ),
+                    entry = AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="self-deploy",
+                        health="ERROR",
+                        previous_health=None,
+                        last_log_line=deploy.error,
+                        pid=None,
                     )
-                    emit_digest(notify_config, attention_digest)
+                    _emit_fleet_transition(notify_config, entry, fleet_dir_override)
             elif deploy.previewed:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
             elif deploy.synced:
@@ -1478,21 +1748,15 @@ def run_fleet_supervise(
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
                 notify_config = getattr(global_config, "notify", None)
                 if notify_config is not None and getattr(notify_config, "enabled", False):
-                    attention_digest = AttentionDigest(
-                        generated_at=utc_now(),
-                        repo="fleet",
-                        transitions=(
-                            AttentionEntry(
-                                issue_number=-1,
-                                adapter_kind="self-deploy",
-                                health="REPAIRED",
-                                previous_health=None,
-                                last_log_line=deploy.message,
-                                pid=None,
-                            ),
-                        ),
+                    entry = AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="self-deploy",
+                        health="REPAIRED",
+                        previous_health=None,
+                        last_log_line=deploy.message,
+                        pid=None,
                     )
-                    emit_digest(notify_config, attention_digest)
+                    _emit_fleet_transition(notify_config, entry, fleet_dir_override)
 
             # A successful pull that actually moved HEAD updated the files on
             # disk, but this process already imported every charlie_work

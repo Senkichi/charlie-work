@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,16 +11,18 @@ import yaml
 
 from . import CLI_NAME
 from .config import ConfigError, find_config_path
-from .doctor import run_doctor
+from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import compute_api_worker_fleet_report, fleet_loop, run_fleet_supervise
-from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import GitHub, GitHubError
+from . import layout
 from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
-from .paths import RepoNotFoundError, find_repo_root, runtime_paths
+from .paths import RepoNotFoundError, find_repo_root, resolved_layout, runtime_paths
+from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
+from .state_migration import apply_state_dir_migration, gather_migration_inputs
 from .supervise import orchestrator_root, self_deploy
 from .runner_allocation import plan_summary
 from .runner_allocation_pass import run_allocation_pass
@@ -260,6 +263,19 @@ def build_parser() -> argparse.ArgumentParser:
     runners_sub.add_parser("status")
     ensure_started_parser = runners_sub.add_parser("ensure-started")
     _add_dry_run(ensure_started_parser)
+    ensure_started_parser.add_argument(
+        "--force",
+        action="store_true",
+        dest="force",
+        help=(
+            "Bypass the runner_allocation single-controller guard. By default "
+            "ensure-started refuses to run when runner_allocation.enabled is true, "
+            "because relaunching every not-running listener silently undoes slot "
+            "parking and burns a full demand_idle_samples hysteresis window "
+            "reconverging. Use this only for a deliberate manual recovery that "
+            "runners allocate cannot do; otherwise prefer `charlie runners allocate`."
+        ),
+    )
     scale_down_parser = runners_sub.add_parser("scale-down")
     _add_dry_run(scale_down_parser)
     autoscale_parser = runners_sub.add_parser("autoscale")
@@ -276,7 +292,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_dry_run(allocate_parser)
 
-    subparsers.add_parser("worktree-clean")
+    worktree_clean_parser = subparsers.add_parser("worktree-clean")
+    _add_dry_run(worktree_clean_parser)
+
+    migrate_parser = subparsers.add_parser(
+        "migrate-state-dir",
+        help="Plan (and optionally apply) a move of a legacy state dir to its new root",
+    )
+    # --src/--dst are optional overrides. Their defaults are derived, never a
+    # repeated literal: src is wherever this repo's config currently points
+    # runtime.state_dir at (the "legacy" location for the duration of the
+    # migration window), dst is the package-wide default state root from
+    # layout.py. Overrides exist so an operator can rehearse against a copied
+    # tree instead of the live one.
+    migrate_parser.add_argument(
+        "--src",
+        default=None,
+        help="Legacy state dir to move from (default: this repo's configured runtime.state_dir)",
+    )
+    migrate_parser.add_argument(
+        "--dst",
+        default=None,
+        help="New state dir to move into (default: the package's default state root)",
+    )
+    migrate_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually move. Without this the command only plans and prints.",
+    )
+    migrate_parser.add_argument(
+        "--quiesce-pattern",
+        action="append",
+        dest="quiesce_patterns",
+        default=None,
+        metavar="REGEX",
+        help=(
+            "Regex matched against live process command lines to prove the fleet is "
+            "stopped before --apply acts; repeatable. With --apply and no pattern given, "
+            "quiescence cannot be established and the move is refused. Without --apply, "
+            "patterns (if given) are only reported informationally."
+        ),
+    )
+    _add_dry_run(migrate_parser)
 
     return parser
 
@@ -295,7 +352,26 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
 def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config_path = find_config_path(repo_root, args.config)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    # #6-G: doctor exists to diagnose a broken repo, so it must not itself
+    # crash on the exact condition it is meant to diagnose (e.g. the
+    # unknown-config-key ConfigError that silently killed the cw fleet lane
+    # three times on 2026-07-29). Render the parse failure as a structured
+    # finding instead of letting it propagate to main()'s generic
+    # `except (ConfigError, ValueError)` handler, which prints to stderr and
+    # exits 2 with no machine-readable finding at all.
+    try:
+        config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    except ConfigError as exc:
+        check = DoctorCheck(
+            name="config file",
+            ok=False,
+            detail=f"{config_path or 'orchestrator.config.yaml'}: {exc}",
+        )
+        return CommandResult(
+            False,
+            "doctor: 1 finding(s), at least one blocking",
+            {"checks": [check.to_dict()]},
+        )
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
     touch_repo(args.fleet_dir, repo_root, paths, gh)
@@ -328,13 +404,174 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     state = load_state_locked(paths.state_file)
     result = clean_worktrees(
         repo_root,
-        paths.root / "worktrees",
+        resolved_layout(config, repo_root).worktrees,
         state,
         config,
         gh,
         dry_run=args.dry_run,
     )
     return CommandResult(result.ok, result.message, result.data)
+
+
+def _resolve_migration_root(raw: str, repo_root: Path) -> Path:
+    """Resolve a ``--src``/``--dst`` argument against *repo_root* when relative."""
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return candidate
+
+
+def _migration_path_key(path: Path) -> str:
+    """Fold case/separator so a resolved src/dst pair compares equal correctly.
+
+    Mirrors the normalization discipline ``state_migration._normalize_path_key``
+    applies for the same hazard (git-porcelain forward slashes vs. disk
+    backslashes, drive-letter case) without importing a private name across
+    that module's boundary.
+    """
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _render_migration_plan(plan) -> str:
+    """Human-readable rendering of a plan: counts, then every blocked child.
+
+    Blocked children are printed with their reasons *and* remediation, because the
+    operator's next action is always "clear the blockers, re-plan" -- a bare count
+    would send them back to the filesystem to work out why.
+    """
+    lines = [
+        f"src: {plan.src_root}",
+        f"dst: {plan.dst_root}",
+        f"children: {len(plan.children)}  movable: {len(plan.movable)}  "
+        f"blocked: {len(plan.blocked)}",
+    ]
+    for child in plan.blocked:
+        lines.append(f"  BLOCKED {child.name}")
+        for reason in child.reasons:
+            lines.append(f"      reason: {reason}")
+        for step in child.remediation:
+            lines.append(f"      remediate: {step}")
+    return "\n".join(lines)
+
+
+def run_migrate_state_dir_command(
+    args: argparse.Namespace,
+    *,
+    planner=gather_migration_inputs,
+    actuator=apply_state_dir_migration,
+    quiescence_checker=check_quiescence,
+) -> CommandResult:
+    """Plan, and with ``--apply``, actuate a legacy state-dir move.
+
+    Plan-only is the default; ``--apply`` is the explicit opt-in. A global or
+    subcommand ``--dry-run`` *overrides* ``--apply`` rather than the other way
+    round, so the two flags together can only ever be safe: the failure mode of
+    the opposite precedence is an operator who wrote ``--dry-run`` watching a
+    real migration run.
+
+    ``--src``/``--dst`` default to the repo's *currently configured*
+    ``runtime.state_dir`` and the package's default state root respectively --
+    never a literal re-spelled here -- so the common case needs no flags at
+    all. If they resolve to the same place there is nothing to migrate.
+
+    Quiescence (proof the fleet is stopped) gates ``--apply`` only. A dry run
+    must keep working against a live fleet -- that is how an operator inspects
+    a plan before committing -- so it only *reports* quiesce status. Patterns
+    are supplied by the caller via ``--quiesce-pattern`` (repeatable); there is
+    no built-in default list (CLAUDE.md rule 9: no embedded manual lists), so
+    ``--apply`` with none given is refused rather than silently skipping the
+    check.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+
+    src_root = (
+        _resolve_migration_root(args.src, repo_root)
+        if args.src is not None
+        else runtime_paths(repo_root, config.runtime.state_dir).root
+    )
+    dst_root = (
+        _resolve_migration_root(args.dst, repo_root)
+        if args.dst is not None
+        # ``.resolve()`` here (not just in ``layout.default_state_root``) matters:
+        # ``runtime_paths`` above resolves symlinks/junctions in the *whole* src
+        # path, not just ``repo_root``. Without a matching resolve on this side,
+        # a repo whose ``.var`` is itself a symlink/junction would make the two
+        # roots compare unequal even when they name the same on-disk location,
+        # producing a same-place migration plan instead of the intended
+        # already-migrated short-circuit. Safe on a not-yet-created dst: Path
+        # .resolve() does not require the path to exist.
+        else layout.default_state_root(repo_root).resolve()
+    )
+
+    if _migration_path_key(src_root) == _migration_path_key(dst_root):
+        return CommandResult(
+            True,
+            f"already migrated: src and dst both resolve to {dst_root}",
+            {
+                "src_root": str(src_root),
+                "dst_root": str(dst_root),
+                "already_migrated": True,
+                "applied": False,
+            },
+        )
+
+    patterns = tuple(args.quiesce_patterns) if args.quiesce_patterns else ()
+
+    plan = planner(repo_root=repo_root, src_root=src_root, dst_root=dst_root)
+    rendered = _render_migration_plan(plan)
+    data = {
+        "src_root": str(plan.src_root),
+        "dst_root": str(plan.dst_root),
+        "children": len(plan.children),
+        "movable": len(plan.movable),
+        "blocked": [child.name for child in plan.blocked],
+        "applied": False,
+    }
+
+    if not plan.ok:
+        return CommandResult(False, f"{rendered}\nplan failed: {plan.error}", data)
+
+    acting = args.apply and not args.dry_run
+
+    if not acting:
+        if args.apply and args.dry_run:
+            note = "(dry-run: --apply ignored, nothing moved)"
+        else:
+            note = "(plan only; pass --apply to move)"
+        if patterns:
+            report = quiescence_checker(patterns=patterns)
+            note = f"{note}\nquiesce (informational, not enforced for a dry run): {report.summary}"
+        else:
+            note = f"{note}\nquiesce: not checked (no --quiesce-pattern given)"
+        return CommandResult(True, f"{rendered}\n{note}", data)
+
+    if not patterns:
+        return CommandResult(
+            False,
+            f"{rendered}\nrefusing to apply: no --quiesce-pattern given, "
+            "quiescence cannot be established",
+            data,
+        )
+
+    report = quiescence_checker(patterns=patterns)
+    if not report.ok:
+        return CommandResult(
+            False,
+            f"{rendered}\nrefusing to apply: fleet is not quiescent\n{report.summary}",
+            data,
+        )
+
+    outcome = actuator(plan)
+    data = {**data, "applied": outcome.ok, "moved": list(outcome.moved)}
+    if not outcome.ok:
+        data = {**data, "aborted_at": outcome.aborted_at}
+        return CommandResult(
+            False,
+            f"{rendered}\nmigration failed after {len(outcome.moved)} moved: {outcome.error}",
+            data,
+        )
+    return CommandResult(True, f"{rendered}\nmoved {len(outcome.moved)} children", data)
 
 
 def run_fleet_work(args: argparse.Namespace) -> CommandResult:
@@ -352,10 +589,26 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
     try:
-        global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
+        global_config = load_layered_config(
+            Path.cwd(),
+            None,
+            fleet_dir_override=args.fleet_dir,
+            require_global=True,
+        )
     except (ConfigError, RepoNotFoundError) as exc:
         print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        global_config = None
+        # The global layer is required, but the per-repo config is still valid
+        # and must not be discarded with it -- discarding both regresses the
+        # #623 silent-disable failure (every per-repo knob reverting to its
+        # dataclass default while passes keep reporting success). Reload
+        # without the global requirement so per-repo settings survive; only
+        # fall back to None if the per-repo load itself fails.
+        try:
+            global_config = load_layered_config(
+                Path.cwd(), None, fleet_dir_override=args.fleet_dir
+            )
+        except (ConfigError, RepoNotFoundError):
+            global_config = None
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -383,10 +636,26 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
     try:
-        global_config = load_layered_config(Path.cwd(), None, fleet_dir_override=args.fleet_dir)
+        global_config = load_layered_config(
+            Path.cwd(),
+            None,
+            fleet_dir_override=args.fleet_dir,
+            require_global=True,
+        )
     except (ConfigError, RepoNotFoundError) as exc:
         print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        global_config = None
+        # The global layer is required, but the per-repo config is still valid
+        # and must not be discarded with it -- discarding both regresses the
+        # #623 silent-disable failure (every per-repo knob reverting to its
+        # dataclass default while passes keep reporting success). Reload
+        # without the global requirement so per-repo settings survive; only
+        # fall back to None if the per-repo load itself fails.
+        try:
+            global_config = load_layered_config(
+                Path.cwd(), None, fleet_dir_override=args.fleet_dir
+            )
+        except (ConfigError, RepoNotFoundError):
+            global_config = None
 
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
@@ -486,7 +755,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     Note: This command does not include per-worker health fields yet. That will be added
     in a follow-up issue (#167) once the worker health abstraction lands.
     """
-    fleet_json_path = fleet_dir() / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path()
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -531,7 +800,7 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
     - Aggregates per-repo queue entries keyed by repo_key (nameWithOwner)
     - Isolates per-repo errors (missing/broken repos) without aborting aggregation
     """
-    fleet_json_path = fleet_dir() / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path()
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -616,6 +885,16 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
     - Returns the number of runners started and status messages
 
     Returns an error if the runner_scaling feature is not enabled.
+
+    Single-controller guard: when ``runner_allocation.enabled`` is true, this
+    command refuses unless ``--force`` is passed. ``ensure_runner_running``
+    relaunches any runner where ``not is_runner_launched(...)`` -- exactly the
+    state a deliberately parked slot is in -- so running it while allocation
+    is enabled restarts every parked listener and silently undoes
+    ``runners allocate``'s parking, burning a full ``demand_idle_samples``
+    hysteresis window reconverging (CLAUDE.md: "``charlie runners allocate``
+    is the only thing allowed to decide which listeners run"). The guard
+    enforces that invariant at one boundary rather than documenting it.
     """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
@@ -625,6 +904,26 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
             ok=False,
             message="runner_scaling feature is not enabled in config",
             data={},
+        )
+
+    # Single-controller guard (issue #598): when runner_allocation is enabled,
+    # `runners allocate` owns the set of running listeners. ensure-started would
+    # relaunch every parked slot (a parked slot is exactly a configured-but-
+    # not-running listener), silently undoing allocation and burning a full
+    # demand_idle_samples hysteresis window reconverging. Refuse and point at
+    # the single controller; --force is the explicit escape hatch for a
+    # deliberate manual recovery that allocate cannot do.
+    force = getattr(args, "force", False)
+    if config.runner_allocation.enabled and not force:
+        return CommandResult(
+            ok=False,
+            message=(
+                "runner_allocation is enabled: `charlie runners allocate` owns "
+                "which listeners run. ensure-started would relaunch every parked "
+                "slot and silently undo allocation. Re-run with --force only for "
+                "a deliberate manual recovery that allocate cannot do."
+            ),
+            data={"runner_allocation_enabled": True},
         )
 
     if not config.runner_scaling.managed_root:
@@ -903,7 +1202,25 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
     Returns an error if the runner_allocation feature is not enabled.
     """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    # runner_allocation is a fleet-wide knob declared in the global fleet config
+    # layer. An unreachable global layer silently flips it to its dataclass
+    # default (enabled=False), and this command would then report "not enabled"
+    # -- the exact #623 silent-disable failure. Require the global layer and
+    # fail loudly instead, so an unready volume is distinguishable from a
+    # fleet that genuinely opted out of runner allocation.
+    try:
+        config = load_layered_config(
+            repo_root,
+            args.config,
+            fleet_dir_override=args.fleet_dir,
+            require_global=True,
+        )
+    except (ConfigError, RepoNotFoundError) as exc:
+        return CommandResult(
+            ok=False,
+            message=f"config load failed, cannot decide runner_allocation: {exc}",
+            data={},
+        )
     paths = runtime_paths(repo_root, config.runtime.state_dir)
 
     if not config.runner_allocation.enabled:
@@ -1012,7 +1329,7 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             # Single-pass mode: check the supervisor lock first to avoid double-
             # dispatching through the governor read→launch window when a supervised
             # loop is already running.
-            lock_path = app.paths.root / "supervisor.lock"
+            lock_path = layout.supervisor_lock_path(app.paths.root)
             lock = try_acquire_supervisor_lock(lock_path)
             if lock is None:
                 return CommandResult(
@@ -1096,6 +1413,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif args.command == "worktree-clean":
             result = run_worktree_clean_command(args)
+        elif args.command == "migrate-state-dir":
+            result = run_migrate_state_dir_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)

@@ -30,6 +30,7 @@ from typing import Any
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .github import (
     GitHub,
+    GitHubError,
     GraphQLBudgetError,
     _LIST_LIMIT,
     RECONCILE_ISSUE_FIELDS,
@@ -38,10 +39,11 @@ from .github import (
     linked_issue_number,
 )
 from .labels import TransitionOutcome, transition
+from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
 from .state import (
+    ORCHESTRATOR_OWNED_ISSUE_STATUSES,
     PASSIVE_OPEN_STATUS,
-    VALID_ISSUE_STATUSES,
     append_event,
     is_claim_stale,
     set_throttled_until,
@@ -89,13 +91,15 @@ class DriftItem:
 # finalized; the terminal human_needed label is intentionally preserved.
 # INVARIANT (guarded by test_fix_reconcile's coverage test): every
 # VALID_ISSUE_STATUSES member except the deliberate exclusions below must be
-# in this set. The status-normalization sweep skips anything in
-# VALID_ISSUE_STATUSES, so a valid status missing here is invisible to BOTH
-# sweeps -- a closed issue stuck in it would never be finalized (the exact
-# dead zone adding manifest_written/dispatch_failed to the valid set briefly
-# created). Deliberate exclusions: "closed" (already terminal), "approved"/
-# "blocked" (finalization of closed approved/blocked issues is owned by the
-# merged-PR finalization flow, pre-existing behavior).
+# in this set. The status-normalization sweep below skips anything in
+# ORCHESTRATOR_OWNED_ISSUE_STATUSES (VALID_ISSUE_STATUSES minus the
+# externally-derived "closed" -- issue #789), so a valid orchestrator-owned
+# status missing here is invisible to BOTH sweeps -- a closed issue stuck in
+# it would never be finalized (the exact dead zone adding
+# manifest_written/dispatch_failed to the valid set briefly created).
+# Deliberate exclusions: "closed" (already terminal), "approved"/"blocked"
+# (finalization of closed approved/blocked issues is owned by the merged-PR
+# finalization flow, pre-existing behavior).
 ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
     {
         "dispatched",
@@ -120,8 +124,46 @@ def _issue_state(issue: dict[str, Any] | None) -> str:
     return str(issue.get("state") or "OPEN").upper()
 
 
+def _fetch_snapshot(gh: GitHub, args: list[str], *, what: str) -> list[dict[str, Any]]:
+    """Run a ``gh ... list --json`` query, refusing to degrade a failed read to ``[]``.
+
+    ``GitHub.run`` does not raise on every failure mode. On the *success* path
+    -- ``returncode == 0``, ``allow_failure=False``, ``json_output=True`` -- an
+    empty stdout returns ``None`` (``github.py``'s ``if not output: return
+    None``). Coercing that ``None`` to ``[]``, as both fetchers used to, makes
+    "I could not read GitHub" indistinguishable from "GitHub has zero ``what``".
+
+    That distinction is load-bearing. ``detect_drift`` answers "GitHub has zero
+    PRs" by flagging every tracked PR ``state_pr_missing_on_github``, and the
+    fix handler drops each one out of ``state["prs"]`` -- erasing ``decision``
+    and ``reviewed_head_sha`` fleet-wide, so approved PRs read as un-approved.
+
+    It cannot be recovered downstream: ``detect_drift`` receives bit-identical
+    inputs (``prs=[]`` plus a non-empty ``state["prs"]``) from a genuinely
+    empty GitHub and from a failed fetch, which is exactly why a "suspiciously
+    empty" heuristic there is unsound in both directions. The non-list value is
+    only visible *here*, so this is the one layer that can preserve it -- after
+    which ``[]`` unambiguously means "GitHub has zero ``what``" and the
+    downstream sweep is correct by construction rather than by heuristic.
+
+    Raises ``GitHubError`` so existing caller handling applies: the periodic
+    in-loop pass records ``reconcile_pass_failed`` and leaves state untouched,
+    and the ``reconcile``/``mop-up`` CLI paths surface it through their
+    ``except GitHubError`` handlers instead of mutating state on a bad read.
+    """
+    result = gh.run(args, json_output=True)
+    if not isinstance(result, list):
+        raise GitHubError(
+            f"reconcile: `gh {args[0]} list` returned {type(result).__name__}, not a list; "
+            f"refusing to treat an unreadable {what} snapshot as an empty one "
+            "(that reading would drop every tracked item from state.json)"
+        )
+    return result
+
+
 def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
-    result = gh.run(
+    return _fetch_snapshot(
+        gh,
         [
             "pr",
             "list",
@@ -132,13 +174,13 @@ def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
             "--json",
             RECONCILE_PR_FIELDS,
         ],
-        json_output=True,
+        what="PR",
     )
-    return result if isinstance(result, list) else []
 
 
 def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
-    result = gh.run(
+    return _fetch_snapshot(
+        gh,
         [
             "issue",
             "list",
@@ -149,9 +191,8 @@ def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
             "--json",
             RECONCILE_ISSUE_FIELDS,
         ],
-        json_output=True,
+        what="issue",
     )
-    return result if isinstance(result, list) else []
 
 
 # Aviator (job-cannon/charlie-work's merge-queue bot) owns these strings; they
@@ -163,7 +204,41 @@ AVIATOR_CHECK_NAME = "aviator/checks"
 AVIATOR_BLOCKED_MESSAGE = "PR has a blocked label, remove to re-queue"
 
 
-def detect_aviator_stale_blocked(gh: GitHub, config: OrchestratorConfig) -> list[DriftItem]:
+def _pr_review_approved_at_head(
+    config: OrchestratorConfig, repo_root: Path | None, pr_number: int, head_sha: str
+) -> bool:
+    """Mirror ``OrchestratorApp._review_decision``'s approval gate.
+
+    Re-adding the Aviator ``mergequeue`` label must never be safer than the
+    normal ship_it path, which only queues a PR when its review-decision.json
+    records ``decision == "approved"`` at the PR's *current* head. Without
+    this check, ``detect_aviator_stale_blocked`` re-queued job-cannon PR
+    #1408 (issue #1404) and PR #1392 (issue #1268) for Aviator merge while
+    their recorded decisions were ``request_changes``/never-reviewed --
+    Aviator then merged both unreviewed once CI was green, since Aviator's
+    own admission check knows nothing about ``review-decision.json``.
+    Returns ``False`` (fail closed) when *repo_root* is unavailable or no
+    matching approved-at-head decision can be read.
+    """
+    if repo_root is None:
+        return False
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+    if not decision_path.exists():
+        return False
+    try:
+        with decision_path.open("r", encoding="utf-8") as handle:
+            decision = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(decision, dict) or decision.get("decision") != "approved":
+        return False
+    return decision.get("reviewed_head_sha") == head_sha
+
+
+def detect_aviator_stale_blocked(
+    gh: GitHub, config: OrchestratorConfig, *, repo_root: Path | None = None
+) -> list[DriftItem]:
     """Detect PRs stuck behind a stale Aviator ``blocked`` label.
 
     Aviator sometimes blocks a PR (setting ``blocked`` and stripping
@@ -187,6 +262,13 @@ def detect_aviator_stale_blocked(gh: GitHub, config: OrchestratorConfig) -> list
     Check Runs (only legacy Commit Statuses populate it), so
     ``GitHub.pr_checks``/``PR_CHECKS_FIELDS`` cannot see it at all; this is
     the only path that can.
+
+    The stale ``blocked`` label is always cleared once CI is confirmed green
+    (Aviator will re-evaluate honestly on its own). The ``mergequeue`` label
+    is re-added only when ``_pr_review_approved_at_head`` confirms the PR is
+    currently approved at its live head -- otherwise this function would
+    reintroduce the exact worker-self-merge-without-review gap issue #502's
+    unauthorized-merge tripwire exists to catch.
     """
     drift: list[DriftItem] = []
     for pr in _fetch_prs(gh):
@@ -238,7 +320,11 @@ def detect_aviator_stale_blocked(gh: GitHub, config: OrchestratorConfig) -> list
         )
         mergequeue_label = config.auto_merge.mergequeue_label
         add_labels: tuple[str, ...] = ()
-        if mergequeue_label and mergequeue_label not in label_names(pr):
+        if (
+            mergequeue_label
+            and mergequeue_label not in label_names(pr)
+            and _pr_review_approved_at_head(config, repo_root, pr_number, str(head_sha))
+        ):
             add_labels = (mergequeue_label,)
 
         fix_actions = [f"remove label 'blocked' from PR #{pr_number}"]
@@ -265,7 +351,12 @@ def detect_aviator_stale_blocked(gh: GitHub, config: OrchestratorConfig) -> list
 
 
 def detect_drift(
-    gh: GitHub, state: dict[str, Any], config: OrchestratorConfig, *, repo_root: Path | None = None
+    gh: GitHub,
+    state: dict[str, Any],
+    config: OrchestratorConfig,
+    *,
+    repo_root: Path | None = None,
+    skip_dead_session_sweep: bool = False,
 ) -> list[DriftItem]:
     """Read-only comparison of GitHub reality against ``state``.
 
@@ -275,6 +366,29 @@ def detect_drift(
 
     If ``repo_root`` is provided, also checks for dead sessions and classifies
     their failures to update the provider throttle state.
+
+    ``skip_dead_session_sweep`` (merge-lane-recovery §6-B): when True, the
+    confirmed-dead-session classify+reap block below is skipped entirely,
+    while live-session tracking and launch-stalled detection (both gated on
+    the same ``repo_root is not None`` check, immediately above it) still
+    run. This lane predates issue #343 and never adopted its single
+    enforcement point (``classify_worker_health`` + the
+    ``max_inconclusive_probe_deferrals`` grace cap) — it goes straight from
+    "pid not alive" to classify-and-reap on the very first sighting. That
+    was safe as long as this function was reachable only from manual
+    ``mop-up --fix``, run by an operator who has already independently
+    satisfied themselves the session is really gone. It stops being safe once
+    ``detect_drift`` runs automatically inside the main loop
+    (``_maybe_reconcile_drift``): the loop's own stall/dead lanes
+    (``_detect_and_handle_stalled_sessions`` /
+    ``_classify_dead_sessions_and_update_throttle_state``) already ran this
+    exact same pass, immediately before reconcile, and may have deliberately
+    *deferred* a not-yet-confirmed-dead session to preserve its grace budget.
+    Re-scanning the same ``sessions_dir`` a few calls later with no memory of
+    that decision reaps the sidecar out from under the grace period,
+    silently halving it every 30 minutes. The periodic in-loop caller passes
+    True for this reason; ``mop-up --fix`` (and every existing caller/test)
+    defaults to False and keeps today's full behavior.
     """
     threshold = config.runtime.graphql_rate_limit_threshold
     sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold)
@@ -291,6 +405,22 @@ def detect_drift(
     # issues that ARE in the snapshot.
     issue_snapshot_truncated = len(issues) >= _LIST_LIMIT
     state_prs: dict[str, Any] = state.get("prs", {})
+    # PR-side counterpart of issue_snapshot_truncated, guarding
+    # state_pr_missing_on_github below: truncated-from-above only.
+    # `--limit _LIST_LIMIT` returning exactly that many means real GitHub has
+    # strictly more PRs than fit in this snapshot, so the sweep can't be
+    # trusted to see every tracked PR.
+    #
+    # Deliberately NOT "prs is empty while state.json tracks PRs" -- that
+    # signal is unsatisfiable at this layer: detect_drift receives
+    # bit-identical inputs (prs=[], non-empty state_prs) from a genuinely
+    # empty GitHub snapshot (state_pr_missing_on_github must fire; see
+    # test_detect_drift_finds_state_pr_missing_on_github) and from a
+    # test-double gap that isn't a real production signal at all. Adding an
+    # "empty implies incomplete" branch here to work around the latter always
+    # breaks the former -- confirmed by running both variants. The actual
+    # fidelity gap belongs in the test double, not in production logic.
+    pr_snapshot_incomplete = len(prs) >= _LIST_LIMIT
 
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}
@@ -477,21 +607,22 @@ def detect_drift(
                 )
 
     pr_numbers_on_github = {int(pr["number"]) for pr in prs if pr.get("number") is not None}
-    for pr_number_str in state_prs:
-        try:
-            pr_number = int(pr_number_str)
-        except ValueError:
-            continue
-        if pr_number not in pr_numbers_on_github:
-            drift.append(
-                DriftItem(
-                    kind="state_pr_missing_on_github",
-                    issue_number=state_prs[pr_number_str].get("issue_number"),
-                    pr_number=pr_number,
-                    detail=f"state has prs[{pr_number}] but gh reports no such PR",
-                    fix_actions=(f"drop prs[{pr_number}] from state",),
+    if not pr_snapshot_incomplete:
+        for pr_number_str in state_prs:
+            try:
+                pr_number = int(pr_number_str)
+            except ValueError:
+                continue
+            if pr_number not in pr_numbers_on_github:
+                drift.append(
+                    DriftItem(
+                        kind="state_pr_missing_on_github",
+                        issue_number=state_prs[pr_number_str].get("issue_number"),
+                        pr_number=pr_number,
+                        detail=f"state has prs[{pr_number}] but gh reports no such PR",
+                        fix_actions=(f"drop prs[{pr_number}] from state",),
+                    )
                 )
-            )
 
     # Detect dead sessions and classify failures for provider throttle state
     # This must happen AFTER the PR loop (to populate open_prs_by_issue) but BEFORE
@@ -507,7 +638,7 @@ def detect_drift(
             update_worker_log_stat,
         )
 
-        sessions_dir = repo_root / config.devin.sessions_dir
+        sessions_dir = resolved_layout(config, repo_root).sessions_dir
         # state_dir root (sibling of state.json) for api-budget ledger settlement
         # on reap (issue #480). Resolved through runtime_paths so an absolute
         # state_dir config is honored identically to state.json itself.
@@ -607,7 +738,7 @@ def detect_drift(
                                     # Mark this issue as handled to avoid double-emission
                                     issues_handled_by_session_relabel.add(w.issue_number)
 
-                if w.error is None and not w.is_alive():
+                if not skip_dead_session_sweep and w.error is None and not w.is_alive():
                     # Update log stat fields for progress tracking (final update before classification)
                     update_worker_log_stat(sessions_dir, w)
 
@@ -1090,6 +1221,16 @@ def detect_drift(
         # actually differs from the current value, so a second pass over an
         # already-normalized record (including the "no status key" baseline)
         # is a no-op.
+        #
+        # Issue #789: "closed" is deliberately excluded from the skip-set
+        # (ORCHESTRATOR_OWNED_ISSUE_STATUSES, not the full VALID_ISSUE_STATUSES)
+        # because GitHub -- not the orchestrator -- owns that value and can
+        # invalidate it at any time via a reopen. Re-examining it costs no
+        # extra GitHub call: `issues_by_number` below is the same in-memory
+        # snapshot the rest of this function already uses, so the common
+        # both-closed case (the overwhelming majority of "closed" entries)
+        # just confirms target_status == current_status and continues without
+        # emitting drift.
         for issue_number_str, entry in state_issues.items():
             if not isinstance(entry, dict):
                 continue
@@ -1100,10 +1241,22 @@ def detect_drift(
             if issue_number in issues_status_repaired:
                 continue  # already normalized by issue_active_label_with_open_pr above
             current_status = entry.get("status")
-            if current_status in VALID_ISSUE_STATUSES:
+            if current_status in ORCHESTRATOR_OWNED_ISSUE_STATUSES:
                 continue
             issue = issues_by_number.get(issue_number)
-            if issue is not None and _issue_state(issue) == "CLOSED":
+            if issue is None:
+                # The snapshot cannot support any conclusion about an issue it
+                # doesn't contain -- absence here is an unanswered query, not
+                # evidence the issue is gone (issue #789 review). This matters
+                # once the repo passes _LIST_LIMIT: an older closed issue can
+                # fall off the `--state all` page while still being genuinely
+                # closed, and falling through to `target_status = None` would
+                # strip its "closed" status -- a mass wipe with no signal in
+                # the drift log to explain it. Skip unconditionally rather
+                # than gating on issue_snapshot_truncated: a missing issue is
+                # equally unanswerable regardless of *why* it's missing.
+                continue
+            if _issue_state(issue) == "CLOSED":
                 target_status: str | None = "closed"
             elif open_prs_by_issue.get(issue_number):
                 target_status = PASSIVE_OPEN_STATUS
@@ -1154,6 +1307,33 @@ def detect_drift(
             )
         )
 
+    # PR-side counterpart: see pr_snapshot_incomplete's definition above for
+    # the two conditions this covers (truncated-from-above, or suspiciously
+    # empty relative to what state.json tracks).
+    if pr_snapshot_incomplete:
+        logger.warning(
+            "PR snapshot is incomplete (%d returned, %d tracked in state); "
+            "skipping state_pr_missing_on_github sweep for this pass",
+            len(prs),
+            len(state_prs),
+        )
+        drift.append(
+            DriftItem(
+                kind="snapshot_truncated",
+                issue_number=None,
+                pr_number=None,
+                detail=(
+                    f"PR snapshot returned {len(prs)} PR(s) while state tracks "
+                    f"{len(state_prs)}; snapshot may be incomplete or the fetch may "
+                    "have failed"
+                ),
+                fix_actions=(
+                    "skip state_pr_missing_on_github sweep for this pass",
+                    "full pagination is tracked in issue #45",
+                ),
+            )
+        )
+
     return drift
 
 
@@ -1164,6 +1344,7 @@ def apply_fixes(
     config: OrchestratorConfig,
     *,
     repo_root: Path | None = None,
+    state_path: Path | None = None,
 ) -> dict[str, Any]:
     """Apply the structured fixes for each drift item and return a NEW state dict.
 
@@ -1175,6 +1356,12 @@ def apply_fixes(
     state so the closed lifecycle cannot be mistaken for a live claim. A PR
     whose reviewer process is still alive is deferred to a later pass (issue
     #504) so the live session is not interrupted.
+
+    ``state_path`` is threaded through to ``append_event`` so each
+    ``"reconcile"`` event is also dual-written to the unlimited ``events.db``
+    log, not just the capped 200-entry ring in ``state.json`` — without it,
+    fixes like ``merged_outside_orchestrator`` and ``aviator_stale_blocked``
+    are invisible to ``query_events``/``event_counts_by_kind`` entirely.
     """
     new_issues: dict[str, Any] = dict(state.get("issues", {}))
     new_prs: dict[str, Any] = dict(state.get("prs", {}))
@@ -1182,7 +1369,7 @@ def apply_fixes(
 
     alive_pr_numbers: set[int] = set()
     if repo_root is not None:
-        reviews_dir = repo_root / config.review_dispatch.reviews_dir
+        reviews_dir = resolved_layout(config, repo_root).reviews_dir
         from .worker import _alive_review_worker_issue_numbers
 
         alive_pr_numbers = _alive_review_worker_issue_numbers(reviews_dir)
@@ -1206,7 +1393,7 @@ def apply_fixes(
 
                 checkout_removed = False
                 if repo_root is not None:
-                    reviews_dir = repo_root / config.review_dispatch.reviews_dir
+                    reviews_dir = resolved_layout(config, repo_root).reviews_dir
                     checkout_removed = remove_review_checkout(
                         repo_root, item.pr_number, reviews_dir=reviews_dir
                     )
@@ -1264,7 +1451,7 @@ def apply_fixes(
                 if pr_key in new_prs:
                     new_prs[pr_key] = without_review_dispatch_claim(new_prs[pr_key])
                 if repo_root is not None:
-                    reviews_dir = repo_root / config.review_dispatch.reviews_dir
+                    reviews_dir = resolved_layout(config, repo_root).reviews_dir
                     checkout_removed = remove_review_checkout(
                         repo_root, item.pr_number, reviews_dir=reviews_dir
                     )
@@ -1449,11 +1636,13 @@ def apply_fixes(
                 new_issues.pop(issue_key, None)
 
         elif item.kind == "issue_status_normalized":
-            # A status outside VALID_ISSUE_STATUSES (or missing entirely) is
-            # recomputed from ground truth in detect_drift and carried here
-            # via item.new_status. None means "no status" (the baseline a
-            # never-dispatched issue naturally has) -- drop the key rather
-            # than write a synthesized placeholder string.
+            # A status outside ORCHESTRATOR_OWNED_ISSUE_STATUSES (missing
+            # entirely, never assigned by any code path, or "closed" but no
+            # longer accurate because the issue was reopened on GitHub --
+            # issue #789) is recomputed from ground truth in detect_drift and
+            # carried here via item.new_status. None means "no status" (the
+            # baseline a never-dispatched issue naturally has) -- drop the key
+            # rather than write a synthesized placeholder string.
             if item.issue_number is not None:
                 issue_key = str(item.issue_number)
                 existing_issue = new_issues.get(issue_key, {})
@@ -1647,6 +1836,7 @@ def apply_fixes(
                 "fix_actions": list(item.fix_actions),
                 "detail": item.detail,
             },
+            state_path=state_path,
         )
 
     return new_state

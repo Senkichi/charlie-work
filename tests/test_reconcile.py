@@ -14,13 +14,20 @@ from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import LabelConfig, OrchestratorConfig, PostMortemConfig
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.file_lock import try_acquire_byte_range_lock
-from charlie_work.github import GraphQLBudgetError, _LIST_LIMIT as github_list_limit
-from charlie_work.paths import runtime_paths
+from charlie_work.github import (
+    GitHubError,
+    GraphQLBudgetError,
+    _LIST_LIMIT as github_list_limit,
+)
+from charlie_work.instrumentation import read_event_log
+from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.reconcile import (
     AVIATOR_BLOCKED_MESSAGE,
     AVIATOR_CHECK_NAME,
     DriftItem,
     _LIST_LIMIT as reconcile_list_limit,
+    _fetch_issues,
+    _fetch_prs,
     apply_fixes,
     detect_aviator_stale_blocked,
     detect_drift,
@@ -2064,8 +2071,9 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
     gh = FakeGitHub(prs=[], issues=[_issue(55, [config.labels.in_progress])])
     state = empty_state()
 
-    # detect_drift looks in repo_root / config.devin.sessions_dir
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    # detect_drift resolves the sessions dir through paths.resolved_layout
+    # (config.devin.sessions_dir is a "" sentinel resolved against runtime.state_dir).
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     # Write a small log with only the shim marker — frozen well past grace period
@@ -2607,7 +2615,7 @@ def test_apply_fixes_merged_pr_reaps_review_checkout_and_clears_dispatch_state(
     repo_root, pr_number, reviews_dir = removed_calls[0]
     assert repo_root == tmp_path
     assert pr_number == 1
-    assert reviews_dir == tmp_path / config.review_dispatch.reviews_dir
+    assert reviews_dir == tmp_path / ".var" / "charlie-work" / "dispatches" / "reviews"
 
     assert new_state["prs"]["1"]["status"] == "merged"
     assert new_state["prs"]["1"]["review_dispatch_status"] is None
@@ -2642,7 +2650,7 @@ def test_apply_fixes_merged_pr_defers_reap_while_reviewer_alive(
         "reviewer_process_start_time": 1.0,
     }
 
-    reviews_dir = tmp_path / config.review_dispatch.reviews_dir
+    reviews_dir = resolved_layout(config, tmp_path).reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     sidecar = {
         "issue_number": 1,
@@ -2722,7 +2730,7 @@ def test_apply_fixes_closed_unmerged_pr_defers_reap_while_reviewer_alive(
         "reviewer_process_start_time": 1.0,
     }
 
-    reviews_dir = tmp_path / config.review_dispatch.reviews_dir
+    reviews_dir = resolved_layout(config, tmp_path).reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     sidecar = {
         "issue_number": 2,
@@ -2818,7 +2826,7 @@ def test_detect_drift_dead_api_session_settles_budget_ledger(tmp_path: Path) -> 
     )
     state = empty_state()
 
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     write_api_sidecar(sessions_dir, 42, provider="example")
     write_api_events(sessions_dir, 42)
@@ -2870,7 +2878,7 @@ def test_detect_drift_launch_stalled_api_session_settles_budget_ledger(
     )
     state = empty_state()
 
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     write_api_sidecar(sessions_dir, 55, provider="example")
     write_api_events(sessions_dir, 55)
@@ -3068,6 +3076,114 @@ def test_detect_aviator_stale_blocked_no_readd_when_mergequeue_already_present()
     assert drift[0].add_labels == ()
 
 
+def _write_review_decision(
+    tmp_path: Path, config: OrchestratorConfig, pr_number: int, decision: dict[str, Any]
+) -> None:
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    pr_dir = paths.prs / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+
+
+def _aviator_blocked_pr_and_gh(pr_number: int, head_sha: str) -> tuple[dict[str, Any], Any]:
+    pr = {**_pr(pr_number, "OPEN"), "headRefOid": head_sha, "labels": [{"name": "blocked"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+    gh.check_runs_by_sha[head_sha] = [
+        _aviator_check_run("failure", _AVIATOR_FAILURE_OUTPUT, run_id=1),
+        _passing_check_run("Tests passed", run_id=2),
+    ]
+    return pr, gh
+
+
+def test_detect_aviator_stale_blocked_does_not_readd_mergequeue_without_repo_root() -> None:
+    """Fail closed: without repo_root there is no way to check the review
+    decision, so re-queueing must not happen even though CI is green."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+
+    drift = detect_aviator_stale_blocked(gh, config)
+
+    assert len(drift) == 1
+    assert drift[0].remove_labels == ("blocked",)
+    assert drift[0].add_labels == ()
+
+
+def test_detect_aviator_stale_blocked_does_not_readd_mergequeue_when_not_approved(
+    tmp_path: Path,
+) -> None:
+    """job-cannon #1408/#1404: a PR carrying request_changes must never be
+    re-queued just because Aviator's own 'blocked' label went stale."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "request_changes", "reviewed_head_sha": "sha-1408"},
+    )
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].add_labels == ()
+
+
+def test_detect_aviator_stale_blocked_does_not_readd_mergequeue_when_approved_at_stale_head(
+    tmp_path: Path,
+) -> None:
+    """An approval recorded for an old commit must not authorize a newer,
+    unreviewed head -- mirrors the head_moved check in ship_it's can_merge."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-new")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "approved", "reviewed_head_sha": "sha-old"},
+    )
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].add_labels == ()
+
+
+def test_detect_aviator_stale_blocked_readds_mergequeue_when_approved_at_live_head(
+    tmp_path: Path,
+) -> None:
+    """Once a PR is genuinely approved at its current head, unsticking the
+    stale 'blocked' label may still re-queue it for Aviator."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "approved", "reviewed_head_sha": "sha-1408"},
+    )
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].add_labels == (mergequeue_label,)
+
+
 def test_apply_fixes_aviator_stale_blocked_removes_blocked_readds_mergequeue() -> None:
     config = OrchestratorConfig()
     mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
@@ -3094,6 +3210,37 @@ def test_apply_fixes_aviator_stale_blocked_removes_blocked_readds_mergequeue() -
     assert gh.pr_labels_added == [(1400, mergequeue_label)]
 
 
+def test_apply_fixes_dual_writes_reconcile_event_to_events_db(tmp_path: Path) -> None:
+    """``apply_fixes`` must pass ``state_path`` through to ``append_event`` --
+    without it, every reconcile fix (including aviator_stale_blocked re-queues)
+    is invisible to events.db and only survives in the capped 200-entry ring
+    in state.json (found via job-cannon audit: 39 merged_outside_orchestrator
+    fixes recorded in state.json, zero in events.db)."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="aviator_stale_blocked",
+            issue_number=None,
+            pr_number=1400,
+            detail="PR #1400 has a stale Aviator 'blocked' label",
+            fix_actions=("remove label 'blocked' from PR #1400",),
+            remove_labels=("blocked",),
+            add_labels=(),
+        )
+    ]
+    state_path = tmp_path / "state.json"
+
+    apply_fixes(gh, state, drift, config, state_path=state_path)
+
+    events = read_event_log(state_path)
+    reconcile_events = [e for e in events if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert reconcile_events[0]["payload"]["kind"] == "aviator_stale_blocked"
+    assert reconcile_events[0]["payload"]["pr_number"] == 1400
+
+
 def test_apply_fixes_aviator_stale_blocked_records_label_write_failure() -> None:
     config = OrchestratorConfig()
     gh = FakeGitHub(prs=[], issues=[])
@@ -3117,3 +3264,71 @@ def test_apply_fixes_aviator_stale_blocked_records_label_write_failure() -> None
     assert any(
         "label_write_failed: true" in e.get("payload", {}).get("fix_actions", []) for e in events
     )
+
+
+class _EmptyStdoutGitHub:
+    """``gh`` exits 0 but writes nothing to stdout.
+
+    ``GitHub.run`` turns that into ``None`` (``if not output: return None`` on
+    the success path) -- the exact value both reconcile fetchers used to
+    coerce into ``[]``.
+    """
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+    ) -> Any:
+        return None
+
+    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int]:
+        return True, 10000, 0
+
+    def invalidate_list_cache(self) -> None:
+        return None
+
+
+def test_fetch_prs_raises_rather_than_degrading_to_empty_list() -> None:
+    """A PR snapshot that could not be read must not read as "zero PRs".
+
+    The old ``return result if isinstance(result, list) else []`` made an
+    unreadable snapshot bit-identical to an empty GitHub. ``detect_drift``
+    answers "GitHub has zero PRs" by flagging every tracked PR
+    ``state_pr_missing_on_github``, whose fix handler pops it out of
+    ``state["prs"]`` -- erasing ``decision``/``reviewed_head_sha`` fleet-wide.
+    """
+    with pytest.raises(GitHubError, match="refusing to treat an unreadable"):
+        _fetch_prs(_EmptyStdoutGitHub())  # type: ignore[arg-type]
+
+
+def test_fetch_issues_raises_rather_than_degrading_to_empty_list() -> None:
+    """Symmetric with the PR fetcher -- hardening one and not the other would
+    leave the identical coercion live on the issue side."""
+    with pytest.raises(GitHubError, match="refusing to treat an unreadable"):
+        _fetch_issues(_EmptyStdoutGitHub())  # type: ignore[arg-type]
+
+
+def test_detect_drift_leaves_state_untouched_when_snapshot_unreadable() -> None:
+    """End-to-end property: a failed read aborts the pass instead of mutating.
+
+    This is what makes the downstream sweep correct *by construction* -- once
+    an unreadable snapshot can no longer arrive as ``[]``, an empty ``prs``
+    genuinely means "GitHub has zero PRs" and no "suspiciously empty"
+    heuristic is needed to second-guess it.
+    """
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["999"] = {
+        "issue_number": 5,
+        "status": "reviewing",
+        "decision": "approved",
+    }
+    before = json.dumps(state, sort_keys=True)
+
+    with pytest.raises(GitHubError):
+        detect_drift(_EmptyStdoutGitHub(), state, config)  # type: ignore[arg-type]
+
+    assert json.dumps(state, sort_keys=True) == before
+    assert state["prs"]["999"]["decision"] == "approved"

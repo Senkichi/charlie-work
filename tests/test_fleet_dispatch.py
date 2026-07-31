@@ -8,7 +8,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from charlie_work import layout
 from charlie_work.config import (
+    ConfigError,
     OrchestratorConfig,
     RunnerAllocationConfig,
     RunnerScalingConfig,
@@ -20,6 +22,7 @@ from charlie_work.fleet_dispatch import (
     _build_fleet_attention_digest,
     _extract_attention_events,
     _is_fleet_pass_active,
+    _lane_failure_state_path,
     _run_fleet_allocation_prologue,
     _select_repos,
     compute_api_worker_fleet_report,
@@ -27,6 +30,7 @@ from charlie_work.fleet_dispatch import (
     run_fleet_supervise,
 )
 from charlie_work.fleet_registry import count_fleet_runners
+from charlie_work.instrumentation import query_events
 from charlie_work.runner_allocation import (
     AllocationPlan,
     SlotAction,
@@ -689,6 +693,397 @@ def test_fleet_loop_unclassified_exception_isolated(
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_config_load_error_isolated(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """#6-G / G-AC4 (most important): a repo whose lane fails during startup —
+    i.e. inside ``load_layered_config`` itself, before ``OrchestratorApp`` is
+    ever constructed — must not prevent another repo's lane from running.
+
+    This is distinct from ``test_fleet_loop_unclassified_exception_isolated``
+    above, which raises inside ``app.loop()`` (config load succeeds for both
+    repos there). The real 2026-07-29 incident (``ConfigError: unknown
+    key(s) in config section 'cross_family': auto_verdict``) failed at
+    config-load time, before any per-repo app object existed — this test
+    pins isolation at that exact point. D-4 requires the per-repo ``except``
+    to keep catching this; this test would fail loudly (as a fleet-wide
+    exception) if a future change narrowed or removed it.
+
+    G-AC6: the injected failure happens inside ``load_layered_config``,
+    strictly before ``paths = runtime_paths(...)`` executes in the same try
+    block, so ``paths`` is genuinely unbound in repo1's except handler (not
+    merely untested) -- see the ``mock_runtime_paths.call_count`` assertion
+    below.
+    """
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    # repo1's config load raises during startup; repo2's succeeds. Only one
+    # OrchestratorApp is ever constructed (for repo2) because repo1 never
+    # reaches that line — mock_app_class.return_value (not side_effect list)
+    # pins that.
+    #
+    # Keyed by repo_root rather than a fixed-length call-order list: the
+    # fleet pass also calls load_layered_config a second time for repo1 from
+    # compute_api_worker_fleet_report (it re-loads any repo missing from
+    # preloaded_configs, which repo1 is, since its first load failed). A
+    # positional side_effect list of length 2 would exhaust after the two
+    # per-repo-loop calls and raise a spurious StopIteration on that third
+    # call. Retrying the same broken config deterministically re-raises the
+    # same ConfigError, matching real load_layered_config behavior.
+    repo1_root = tmp_path / "repo1"
+
+    def _load_layered_config_side_effect(
+        repo_root: Path, *args: Any, **kwargs: Any
+    ) -> OrchestratorConfig:
+        if Path(repo_root) == repo1_root:
+            raise ConfigError(
+                "unknown key(s) in config section 'cross_family': auto_verdict "
+                "(valid: enabled, model, command)"
+            )
+        return OrchestratorConfig()
+
+    mock_load_layered_config.side_effect = _load_layered_config_side_effect
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app2 = MagicMock()
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.return_value = mock_app2
+
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # repo1 failed at startup; repo2's lane actually ran. This is the
+    # isolation proof: only one OrchestratorApp was ever built, and its
+    # loop() was called exactly once, for the surviving repo.
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+    assert mock_app_class.call_count == 1
+    assert mock_app2.loop.call_count == 1
+
+    # G-AC6: repo1's ConfigError is raised inside load_layered_config,
+    # strictly before `paths = runtime_paths(...)` is reached in that same
+    # try block. runtime_paths is therefore called exactly once (for repo2
+    # only) -- proving `paths` is genuinely unbound in repo1's except
+    # handler, not just untested. The handler itself never references
+    # `paths` (it uses `repo_root`/`entry`, both bound before the try); if a
+    # future change added a `paths.state_file` reference there, this would
+    # raise UnboundLocalError *inside* the except block, which escapes the
+    # per-repo isolation boundary entirely (D-4) instead of being caught by
+    # it -- this assertion is what pins that it never happens.
+    assert mock_runtime_paths.call_count == 1
+
+    message = result.data["repos"]["owner/repo1"]["message"]
+    assert "fleet pass error" in message
+    assert "ConfigError" in message
+    assert "cross_family" in message
+
+    # G-AC2: the raw digest feed carries the failure even though app.loop()
+    # never ran for repo1 — _extract_attention_events() (which only runs
+    # after a successful loop()) never fires for repo1, so this event must
+    # come from the except block itself.
+    digest_events = result.data["digest"]["events"]
+    error_events = [e for e in digest_events if e.get("repo_key") == "owner/repo1"]
+    assert len(error_events) == 1
+    assert error_events[0]["type"] == "error"
+
+    # Confirm the reused "error" branch actually maps this to a real
+    # AttentionEntry (health=ERROR, already desktop-toast-eligible via
+    # _DESKTOP_SEVERITIES) rather than silently falling through.
+    attention_digest = _build_fleet_attention_digest(digest_events)
+    matching = [e for e in attention_digest.transitions if e.adapter_kind == "owner/repo1"]
+    assert len(matching) == 1
+    assert matching[0].health == "ERROR"
+    assert "cross_family" in (matching[0].last_log_line or "")
+
+    assert result.ok is False
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_lane_failure_reaches_real_emit_digest(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_emit_digest: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """#6-G / G-AC2: the lane-failure entry must reach the real ``emit_digest``
+    sink, not just the raw ``digest["events"]`` list.
+
+    ``test_fleet_loop_config_load_error_isolated`` proves the raw event dict
+    is correct and that ``_build_fleet_attention_digest`` maps it to
+    ``health=ERROR`` -- but it calls ``_build_fleet_attention_digest`` itself
+    (out of band) and passes ``global_config=None`` to ``fleet_loop``, so the
+    real ``if notify_config is not None and notify_config.enabled`` /
+    ``if attention_digest.transitions`` gates that guard the actual
+    ``emit_digest(...)`` call at the end of ``fleet_loop`` are never entered.
+    That leaves open exactly the failure mode this AC exists to close: a gate
+    keyed on something only the loop()-succeeded path populates would still
+    pass the other test while leaving the desktop/file sink silent. This test
+    turns notify on for real and asserts ``emit_digest`` fires with an ERROR
+    entry for the failed repo, driving ``fleet_loop`` itself on the exact
+    pass where ``app.loop()`` never ran for repo1 -- rather than re-deriving
+    the mapping out of band.
+    """
+    from charlie_work.config import NotifyConfig
+
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    repo1_root = tmp_path / "repo1"
+
+    def _load_layered_config_side_effect(
+        repo_root: Path, *args: Any, **kwargs: Any
+    ) -> OrchestratorConfig:
+        if Path(repo_root) == repo1_root:
+            raise ConfigError(
+                "unknown key(s) in config section 'cross_family': auto_verdict "
+                "(valid: enabled, model, command)"
+            )
+        return OrchestratorConfig()
+
+    mock_load_layered_config.side_effect = _load_layered_config_side_effect
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app2 = MagicMock()
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.return_value = mock_app2
+
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    # The real gate: notify_config comes from the *outer* global_config
+    # parameter (not from a per-repo loaded config), so this alone drives
+    # whether the digest-build-and-emit block at the end of fleet_loop runs.
+    global_config = OrchestratorConfig(
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        )
+    )
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=global_config,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+
+    # The discriminating assertion: the real sink actually fired, on the pass
+    # where repo1's app.loop() never ran (only repo2's did).
+    assert mock_emit_digest.called is True
+    emitted_digest = mock_emit_digest.call_args[0][1]
+    matching = [e for e in emitted_digest.transitions if e.adapter_kind == "owner/repo1"]
+    assert len(matching) == 1
+    assert matching[0].health == "ERROR"
+    assert "cross_family" in (matching[0].last_log_line or "")
+
+
+def test_lane_failure_state_path_prefers_registry_state_dir(tmp_path: Path) -> None:
+    """_lane_failure_state_path uses the registry's recorded state_dir when
+    present — the common case for a repo that previously registered
+    successfully and only later started failing (e.g. self-deploy version
+    skew, the actual 2026-07-29 shape)."""
+    repo_root = tmp_path / "repo"
+    recorded_state_dir = tmp_path / "custom-state"
+    entry = {"repo_root": str(repo_root), "state_dir": str(recorded_state_dir)}
+
+    result = _lane_failure_state_path(repo_root, entry)
+
+    assert result == layout.state_file_path(recorded_state_dir)
+
+
+def test_lane_failure_state_path_falls_back_to_default_without_registry_entry(
+    tmp_path: Path,
+) -> None:
+    """Without a recorded state_dir (a repo that has never registered
+    successfully), _lane_failure_state_path falls back to the conventional
+    default location so the failure is still recorded somewhere findable."""
+    repo_root = tmp_path / "repo"
+    entry: dict[str, Any] = {"repo_root": str(repo_root)}
+
+    result = _lane_failure_state_path(repo_root, entry)
+
+    assert result == layout.state_file_path(layout.default_state_root(repo_root))
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_real_unknown_config_key_reproduces_incident(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """#6-G / G-AC5: full reproduction of the 2026-07-29 incident.
+
+    An unknown key in one repo's real config file (``cross_family:
+    totally_unknown_key``, mirroring the actual ``cross_family: auto_verdict``
+    version-skew incident) drives the real, unmocked ``load_layered_config``
+    to raise ``ConfigError``. This proves: (a) an events.db row is recorded
+    for the failing repo (queryable via query_events(kind=
+    "fleet_pass_config_error")), (b) the fleet digest carries a matching
+    AttentionEntry, and (c) a second, healthy repo's lane still completes —
+    while a doctor check run against the failing repo's own state directory
+    surfaces the same event as a finding (see
+    test_check_recent_lane_failures_surfaces_past_event in test_doctor.py,
+    which covers the doctor half of this chain with the same event shape).
+
+    Only load_layered_config is left unmocked; runtime_paths/GitHub/
+    OrchestratorApp stay mocked exactly as in the other fleet_loop tests —
+    this isolates "does the real config parser really raise ConfigError for
+    an unknown key, and does fleet_loop's except really catch it" from the
+    rest of the per-repo machinery.
+    """
+    repo1 = tmp_path / "repo1"
+    repo1.mkdir()
+    (repo1 / "orchestrator.config.yaml").write_text(
+        "labels:\n"
+        "  ready: automated-ready\n"
+        "runtime:\n"
+        "  state_dir: .var/charlie-work\n"
+        "cross_family:\n"
+        "  totally_unknown_key: true\n",
+        encoding="utf-8",
+    )
+    repo1_state_dir = repo1 / ".var" / "charlie-work"
+    repo1_state_dir.mkdir(parents=True)
+
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo1),
+                "state_dir": str(repo1_state_dir),
+                # No config_path override: load_layered_config resolves the
+                # real file above via find_config_path(repo_root, None).
+            },
+            "owner/repo2": {
+                "repo_root": str(repo2),
+            },
+        }
+    }
+
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app2 = MagicMock()
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.return_value = mock_app2
+    mock_gh_class.return_value = MagicMock()
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # (c) repo2's lane proceeded despite repo1's real ConfigError.
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+    assert mock_app_class.call_count == 1
+    assert mock_app2.loop.call_count == 1
+
+    # G-AC6: same pre-`paths`-binding failure point as
+    # test_fleet_loop_config_load_error_isolated, this time via the real,
+    # unmocked load_layered_config raising the real ConfigError rather than
+    # a mock side_effect. runtime_paths is called exactly once (repo2 only).
+    assert mock_runtime_paths.call_count == 1
+
+    message = result.data["repos"]["owner/repo1"]["message"]
+    assert "ConfigError" in message
+    assert "cross_family" in message
+    assert "totally_unknown_key" in message
+
+    # (a) the failure is durably recorded to repo1's own events.db.
+    state_path = layout.state_file_path(repo1_state_dir)
+    recorded = query_events(state_path, kind="fleet_pass_config_error")
+    assert len(recorded) == 1
+    assert recorded[0]["level"] == "error"
+    assert recorded[0]["payload"]["repo_key"] == "owner/repo1"
+    assert "totally_unknown_key" in recorded[0]["payload"]["error"]
+
+    # (b) the fleet digest carries a matching entry.
+    attention_digest = _build_fleet_attention_digest(result.data["digest"]["events"])
+    matching = [e for e in attention_digest.transitions if e.adapter_kind == "owner/repo1"]
+    assert len(matching) == 1
+    assert matching[0].health == "ERROR"
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
 def test_fleet_loop_dry_run_propagates(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
@@ -1210,6 +1605,81 @@ def test_run_fleet_supervise_logs_global_config_provenance(
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_loud_on_absent_global_layer(
+    mock_lock: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An absent global layer must be loud, not silent, in the supervisor.
+
+    Before #623, ``load_layered_config`` treated an unreachable global fleet
+    config as an empty mapping with no diagnostic, so a fleet supervisor whose
+    global layer was missing silently ran on pristine dataclass defaults --
+    ``runner_allocation`` off, ``notify`` off, ``labels`` back to built-ins --
+    while passes kept reporting success. ``run_fleet_supervise`` now loads with
+    ``require_global=True``, so the absent case raises ``ConfigError`` and the
+    supervisor's existing handler catches it, warns, and prints -- the same
+    loud path a malformed config already took.
+
+    This test drives the *real* ``load_layered_config`` (not a mock) against an
+    empty fleet dir so the ``require_global=True`` wiring is actually exercised
+    end-to-end. The provenance line below the handler still fires because it
+    uses ``describe_config_file`` directly, so the operator sees both the
+    warning and the cause.
+    """
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    fc = _FakeClock(auto_advance=1.0)
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
+        result = run_fleet_supervise(
+            max_passes=1,
+            clock=fc.now,
+            sleep=fc.sleep,
+            fleet_dir_override=str(tmp_path),
+        )
+
+    # The supervisor continues (the daemon must not crash on a missing global
+    # layer) but it does so loudly: a WARNING was emitted naming the failure.
+    warning_lines = [r.getMessage() for r in caplog.records if "could not load" in r.getMessage()]
+    assert warning_lines, "an absent global layer must trigger the loud handler, not silence"
+    assert "per-repo config only" in warning_lines[0], (
+        f"the warning must name the fallback: {warning_lines[0]!r}"
+    )
+    # The ConfigError raised by require_global carries the path and the
+    # describe_config_file cause, and the handler interpolates it into the
+    # warning -- so the operator sees *why* the layer was unreadable, not just
+    # that it was.
+    assert str(tmp_path / "config.yaml") in warning_lines[0], (
+        "the expected global config path must appear in the warning"
+    )
+    assert "absent" in warning_lines[0], (
+        f"an absent layer must read as absent in the warning: {warning_lines[0]!r}"
+    )
+
+    # The handler also prints, so the failure is visible on stdout, not only in
+    # the log.
+    captured = capsys.readouterr()
+    assert "config load failed" in captured.out, (
+        "the absent-global failure must be printed, not only logged"
+    )
+
+    # The supervisor fell back to the per-repo config (NOT discarded to None or
+    # pristine defaults) and still ran the pass -- the daemon stays alive, but
+    # the operator has been told exactly why. Discarding the per-repo config
+    # with the global layer would regress the #623 silent-disable failure.
+    assert result.ok is True
+    assert mock_fleet_loop.call_count == 1
+    assert mock_fleet_loop.call_args.kwargs.get("global_config") is not None, (
+        "fleet_loop must NOT receive global_config=None when the global layer "
+        "is absent -- the per-repo config must survive the fallback, not be "
+        "discarded with the global layer (#623 silent-disable regression)"
+    )
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
 def test_run_fleet_supervise_respects_max_runtime(
@@ -1701,7 +2171,7 @@ def test_run_fleet_supervise_emits_attention_digest_on_venv_repaired(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    result = run_fleet_supervise(max_passes=1)
+    result = run_fleet_supervise(max_passes=1, fleet_dir_override=str(tmp_path / "fleet"))
 
     assert result.ok is True
     assert mock_fleet_loop.call_count == 1
@@ -1759,7 +2229,7 @@ def test_run_fleet_supervise_emits_attention_digest_on_repair_failure(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    result = run_fleet_supervise(max_passes=1)
+    result = run_fleet_supervise(max_passes=1, fleet_dir_override=str(tmp_path / "fleet"))
 
     assert result.ok is True
     assert mock_fleet_loop.call_count == 1
@@ -2670,12 +3140,12 @@ def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:
     generic fallback would render a near-identical attention entry on every pass.
 
     Precise about what this does and does not assert. It pins the *entry*: none is
-    rendered for a converged pass. It does not assert the digest sink stays untouched,
-    because the envelope is emitted every pass either way -- `fleet_loop`'s notify gate
-    tests the raw event list rather than the built digest, so `emit_digest` is called
-    with `transitions=()` on a converged pass. That gate/digest mismatch predates this
-    PR (unchanged since #591) and is tracked separately in issue #610; it is not
-    something this branch introduced or fixes.
+    rendered for a converged pass. The emission-level guarantee -- that `emit_digest`
+    is not called at all on such a pass -- is covered by
+    ``test_fleet_loop_converged_pass_does_not_emit_digest`` (issue #610), which drives
+    the full ``fleet_loop`` notify gate. This test stays at the builder level so a
+    regression in the routing (re-introducing a fallback for ``runner_allocation``)
+    is caught here even if the gate test's mocks mask it.
     """
     from charlie_work.fleet_dispatch import _build_fleet_attention_digest
 
@@ -2692,6 +3162,209 @@ def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:
     ]
     digest = _build_fleet_attention_digest(converged)
     assert digest.transitions == ()
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.run_allocation_pass")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_converged_pass_does_not_emit_digest(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_run_allocation_pass: MagicMock,
+    mock_emit_digest: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #610: a converged pass must not call emit_digest at all.
+
+    A converged allocation pass emits a ``runner_allocation`` event (the
+    prologue fires it whenever anything moved *or any note was produced*, and
+    standing advisory notes persist for as long as the condition does). That
+    event is routed to an explicit ``continue`` in
+    ``_build_fleet_attention_digest``, so ``attention_events`` is non-empty
+    while ``transitions`` is empty.
+
+    Note: #669's inner ``if attention_digest.transitions:`` gate already
+    prevents ``emit_digest`` being called with ``transitions=()`` on this
+    scenario — so this test would pass identically without this PR's outer
+    gate change. It pins the inner gate's behavior on the
+    converged-allocation-note shape. This PR's actual behavior change (the
+    outer ``and attention_events`` removal) is exercised by
+    ``test_fleet_loop_empty_events_still_builds_digest_when_notify_on``.
+
+    This drives ``fleet_loop`` unmocked (only the prologue's
+    ``run_allocation_pass`` and the per-repo ``OrchestratorApp`` are patched)
+    so the gate at the emission site is the thing under test. The per-repo
+    loop returns an empty ``CommandResult.data`` so no per-repo attention
+    events are produced -- the only event is the converged
+    ``runner_allocation``.
+    """
+    from dataclasses import replace
+
+    from charlie_work.config import NotifyConfig
+
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        }
+    }
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "ok", {})
+    mock_app_class.return_value = mock_app
+    # Converged: nothing moved, but a standing advisory note is present -- the
+    # exact shape every recorded pass on this host had (verified against
+    # events.db). The prologue emits runner_allocation because notes is non-empty.
+    mock_run_allocation_pass.return_value = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+        notes=("Senkichi/job-cannon: holding 4 surplus slot(s) - slack for 0/3 pass(es)",),
+    )
+
+    cfg = replace(
+        _allocation_config(enabled=True, managed_root="C:/actions-runners"),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+
+    fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=cfg,
+        repos=None,
+        limit=1,
+        merge=False,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # The raw event list is non-empty (runner_allocation), but every event
+    # hit an explicit continue, so transitions is empty and the inner
+    # ``if attention_digest.transitions:`` gate (#669) blocks emit_digest.
+    # This pins that inner gate on the converged-allocation-note shape; the
+    # outer-gate removal this PR makes is covered by the empty-events test.
+    mock_emit_digest.assert_not_called()
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.run_allocation_pass")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_empty_events_still_builds_digest_when_notify_on(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_run_allocation_pass: MagicMock,
+    mock_emit_digest: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #610: the genuinely new path this PR opens -- empty attention_events.
+
+    Pre-PR the outer gate was ``notify_config.enabled and attention_events``,
+    so a pass with *zero* attention events (no prologue event, no per-repo
+    events) skipped the whole digest-build block: ``_build_fleet_attention_digest``
+    never ran and the fleet health-state sidecar was never written. This PR
+    drops ``and attention_events`` so the digest is built whenever notify is on.
+
+    #669's inner ``if attention_digest.transitions:`` gate already prevents
+    ``emit_digest`` being called with ``transitions=()`` on a converged pass
+    (the non-empty-events case) -- so this PR's value is *not* fixing a
+    currently-reproducing empty-envelope emission. Its value is removing the
+    redundant, contradictory outer raw-list test. This test exercises the one
+    behavior the diff actually changes: with ``attention_events == []`` and
+    notify on, the digest-build / health-state-write path now runs (the
+    sidecar file appears on disk), ``emit_digest`` is still not called
+    (transitions empty, #669's inner guard), and ``digest["emitted"]`` stays
+    ``False``.
+
+    Drives ``fleet_loop`` with ``run_allocation_pass`` returning a fully
+    converged result with empty notes (so the prologue emits no event) and the
+    per-repo ``OrchestratorApp.loop`` returning empty data (so no per-repo
+    events). The only thing under test is the outer gate.
+    """
+    from dataclasses import replace
+
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import _fleet_health_state_path
+
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        }
+    }
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "ok", {})
+    mock_app_class.return_value = mock_app
+    # Fully converged and quiet: nothing moved, no notes -- the prologue
+    # emits no runner_allocation event (started/parked/notes all falsy), so
+    # attention_events stays empty.
+    mock_run_allocation_pass.return_value = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+        notes=(),
+    )
+
+    cfg = replace(
+        _allocation_config(enabled=True, managed_root="C:/actions-runners"),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    result = fleet_loop(
+        fleet_dir_override=str(fleet_dir),
+        global_config=cfg,
+        repos=None,
+        limit=1,
+        merge=False,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # The new path: with attention_events empty and notify on, the digest is
+    # still built -- the health-state sidecar appears on disk. Pre-PR the
+    # outer ``and attention_events`` gate skipped this block entirely, so the
+    # file would not exist. This is the discriminating assertion for the diff.
+    health_state = _fleet_health_state_path(str(fleet_dir))
+    assert health_state.exists(), "digest-build path did not run on empty events"
+
+    # Emission is still gated on the built digest's transitions (#669's
+    # inner guard), so no envelope is written and emitted stays False.
+    mock_emit_digest.assert_not_called()
+    assert result.data["digest"]["emitted"] is False
 
 
 def test_digest_still_surfaces_allocation_failures() -> None:
@@ -2717,3 +3390,253 @@ def test_digest_still_surfaces_allocation_failures() -> None:
     reasons = " ".join(str(e.last_log_line) for e in digest.transitions)
     assert "managed_root missing" in reasons
     assert "no registry anchor" in reasons
+
+
+def test_filter_fleet_health_transitions_dedups_repeated_error(tmp_path: Path) -> None:
+    """Issue #554: a persistent ERROR must not re-fire with previous_health:null every pass."""
+    from dataclasses import replace
+
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entry = AttentionEntry(
+        issue_number=42,
+        adapter_kind="owner/repo",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="failed to launch claude: OSError",
+        pid=None,
+    )
+
+    # Pass 1: null -> ERROR is a real transition; emits with previous_health=None.
+    first = _filter_fleet_health_transitions([entry], state_file)
+    assert len(first) == 1
+    assert first[0].health == "ERROR"
+    assert first[0].previous_health is None
+
+    # Pass 2: ERROR -> ERROR is not a transition; nothing emits.
+    second = _filter_fleet_health_transitions([entry], state_file)
+    assert second == []
+
+    # Pass 3: ERROR -> STALLED is a real transition; emits with previous_health=ERROR.
+    stalled = replace(entry, health="STALLED")
+    third = _filter_fleet_health_transitions([stalled], state_file)
+    assert len(third) == 1
+    assert third[0].health == "STALLED"
+    assert third[0].previous_health == "ERROR"
+
+
+def test_build_fleet_attention_digest_stateful_skips_repeats(tmp_path: Path) -> None:
+    """Issue #554: _build_fleet_attention_digest with state_file emits only on real transitions."""
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo",
+            "type": "error",
+            "issue_number": 100,
+            "error": "PR #100 review failed: timeout",
+        }
+    ]
+
+    # First pass: null -> ERROR transition emits.
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert digest1.transitions[0].health == "ERROR"
+    assert digest1.transitions[0].previous_health is None
+
+    # Second pass: same ERROR, no transition — digest is empty.
+    digest2 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert digest2.transitions == ()
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_self_deploy_error_dedups_across_passes(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_emit_digest: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #554: a persistent self-deploy ERROR emits once, not every supervisor pass."""
+    from charlie_work.config import NotifyConfig
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        ),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    mock_lock.return_value = MagicMock()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=False,
+            pulled=False,
+            changed=False,
+            synced=False,
+            error="venv pth repair failed: Access is denied",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(
+        max_passes=2,
+        clock=fc.now,
+        sleep=fc.sleep,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    # Two passes, same persistent ERROR — emit_digest fires once (first pass).
+    assert mock_emit_digest.call_count == 1
+    digest = mock_emit_digest.call_args[0][1]
+    assert len(digest.transitions) == 1
+    assert digest.transitions[0].health == "ERROR"
+    assert digest.transitions[0].previous_health is None
+
+
+def test_build_fleet_attention_digest_stateful_keeps_review_verdict_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: occurrence-style events must not be deduped by the
+    stateful filter. ``review_verdict_recorded`` carries a constant ``OK``
+    health string by construction; if the cross-pass dedup applied to it, the
+    recorded-verdict heartbeat would collapse after the first occurrence per
+    issue/repo and a silent 0%-recording-rate regression would go invisible.
+    The fleet path in production goes through ``_build_fleet_attention_digest``
+    with ``state_file`` set, so this locks in the filtered path (not just the
+    unfiltered one covered by ``test_build_fleet_attention_digest_maps_review_verdict_events``).
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_recorded",
+            "issue_number": 10,
+            "pr": 100,
+            "decision": "approved",
+        }
+    ]
+
+    # Two passes, identical recorded-verdict event — both must emit. The
+    # heartbeat stays visible; the baseline sidecar is not consulted for
+    # occurrence-style entries.
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert digest1.transitions[0].health == "OK"
+    assert digest1.transitions[0].last_log_line == "approved recorded for PR 100"
+
+    digest2 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest2.transitions) == 1
+    assert digest2.transitions[0].health == "OK"
+
+
+def test_build_fleet_attention_digest_stateful_keeps_review_verdict_missed_every_pass(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: ``review_verdict_missed`` has health ``ERROR`` (the same
+    string as a persistent worker error) but is an occurrence-style event. The
+    dedup must be scoped by entry type, not by health string, or repeat
+    missed-verdict signals would be silently dropped after the first one per
+    issue/repo. Locks in the exception for the ERROR-health occurrence case.
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo1",
+            "type": "review_verdict_missed",
+            "issue_number": 11,
+            "pr": 101,
+            "reason": "no parseable verdict",
+        }
+    ]
+
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert digest1.transitions[0].health == "ERROR"
+    assert digest1.transitions[0].last_log_line == "no parseable verdict"
+
+    # Same missed verdict next pass — still emits despite health == "ERROR",
+    # because the event type is occurrence-style and bypasses the baseline.
+    digest2 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest2.transitions) == 1
+    assert digest2.transitions[0].health == "ERROR"
+
+
+def test_build_fleet_attention_digest_stateful_mixed_persistent_and_occurrence(
+    tmp_path: Path,
+) -> None:
+    """PR #669 review: a persistent ``error`` and an occurrence
+    ``review_verdict_recorded`` for the same issue/repo share the dedup key
+    ``adapter_kind:issue_number``. The persistent entry must still be deduped
+    across passes while the occurrence entry keeps emitting, and the occurrence
+    entry must not poison the persistent baseline (so a later persistent
+    transition is not masked).
+    """
+    from charlie_work.fleet_dispatch import _build_fleet_attention_digest, _fleet_health_state_path
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    persistent_event = {
+        "repo_key": "owner/repo",
+        "type": "error",
+        "issue_number": 42,
+        "error": "launch failed: OSError",
+    }
+    occurrence_event = {
+        "repo_key": "owner/repo",
+        "type": "review_verdict_recorded",
+        "issue_number": 42,
+        "pr": 420,
+        "decision": "approved",
+    }
+
+    # Pass 1: persistent null->ERROR emits; occurrence OK emits alongside.
+    digest1 = _build_fleet_attention_digest(
+        [persistent_event, occurrence_event], state_file=state_file
+    )
+    healths = [t.health for t in digest1.transitions]
+    assert healths == ["ERROR", "OK"]
+
+    # Pass 2: persistent ERROR->ERROR is deduped away; occurrence OK still emits.
+    digest2 = _build_fleet_attention_digest(
+        [persistent_event, occurrence_event], state_file=state_file
+    )
+    assert [t.health for t in digest2.transitions] == ["OK"]
+
+    # Pass 3: persistent ERROR->STALLED is a real transition and must emit even
+    # though the occurrence event sat between them every pass — the occurrence
+    # entry never wrote the shared baseline key.
+    stalled_event = {
+        "repo_key": "owner/repo",
+        "type": "stalled",
+        "issue_number": 42,
+        "reason": "no progress for 30m",
+    }
+    digest3 = _build_fleet_attention_digest(
+        [stalled_event, occurrence_event], state_file=state_file
+    )
+    healths3 = [t.health for t in digest3.transitions]
+    assert healths3 == ["STALLED", "OK"]
+    assert digest3.transitions[0].previous_health == "ERROR"

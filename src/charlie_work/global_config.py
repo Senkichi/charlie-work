@@ -12,7 +12,7 @@ from .config import (
     find_config_path,
     load_config,
 )
-from .fleet_paths import fleet_dir
+from . import layout
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,7 @@ def load_layered_config(
     explicit: Path | None = None,
     *,
     fleet_dir_override: str | None = None,
+    require_global: bool = False,
 ) -> OrchestratorConfig:
     """Load config with a global fleet layer and per-repo override.
 
@@ -83,6 +84,18 @@ def load_layered_config(
         repo_root: The repository root path.
         explicit: Optional explicit path to the per-repo config file.
         fleet_dir_override: Optional override for the fleet directory path.
+        require_global: When True, treat an unreachable global fleet config as
+            a hard error rather than an empty mapping. A plain single-repo
+            checkout has no global layer and that absence is legitimate, so the
+            default is False; fleet entry points (``run_fleet_supervise``,
+            ``run_fleet_work``, ``run_fleet_bash_rats``) pass True because every
+            fleet-wide knob silently reverting to its dataclass default while
+            passes keep reporting success is the #590/#623 failure shape. The
+            raised ``ConfigError`` names the path and the
+            ``describe_config_file`` cause so an unready volume or an
+            unresolvable path is distinguishable from a file that was never
+            created -- ``Path.exists()`` collapses all of those into a bare
+            ``False`` and this is the one place that un-collapses them.
 
     Returns:
         The merged OrchestratorConfig.
@@ -91,8 +104,24 @@ def load_layered_config(
     repo_config_path = find_config_path(repo_root, explicit)
 
     # Load global config if present
-    global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
+    global_config_path = layout.global_config_path(override=fleet_dir_override)
     global_exists = global_config_path.exists()
+    if require_global and not global_exists:
+        # The silent-{} branch below is the whole of issue #623: every
+        # fleet-wide knob reverts to its dataclass default with no error
+        # raised anywhere, and ``exists()`` swallows ENOENT/ENOTDIR/EBADF/
+        # ELOOP plus the Windows device-not-ready / unresolvable-path
+        # winerrors into a bare False, so a genuinely absent file is
+        # indistinguishable from an unready volume. ``describe_config_file``
+        # does one ``stat()`` and keeps the cause, so the error message
+        # separates "never created" from "could not be reached" -- the two
+        # demand opposite fixes. ``EACCES`` is not in the ignored set, so a
+        # permission-denied config raises from ``exists()`` before reaching
+        # here and is therefore not a silent-default mechanism.
+        raise ConfigError(
+            "global fleet config layer is required but was not readable: "
+            f"{global_config_path} — {describe_config_file(global_config_path)}"
+        )
     global_raw = (
         yaml.safe_load(global_config_path.read_text(encoding="utf-8")) if global_exists else {}
     )
@@ -134,6 +163,21 @@ def load_layered_config(
         else {}
     )
     repo_data = repo_raw if isinstance(repo_raw, dict) else {}
+
+    # ``runner_allocation`` is host-wide only (see RunnerAllocationConfig's
+    # docstring): three repos must not hold three opinions about how many jobs
+    # one machine can run. The merge below is section-by-section with the
+    # per-repo file winning per key, so without this rejection a per-repo
+    # ``orchestrator.config.yaml`` could silently override a host-wide knob --
+    # the exact confusion that made #590 expensive to diagnose. Reject the key
+    # outright so the invalid state is unrepresentable rather than merely
+    # unused (issue #600).
+    if "runner_allocation" in repo_data:
+        raise ConfigError(
+            "config section 'runner_allocation' is host-wide only and must not "
+            f"appear in a per-repo config ({repo_config_path}); declare it in "
+            "the global fleet layer (<fleet_dir>/config.yaml) instead"
+        )
 
     # Merge: global as base, per-repo as override (section-by-section, deep)
     merged_data: dict[str, Any] = {}
