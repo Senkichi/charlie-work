@@ -2009,6 +2009,7 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
             pulled=True,
             changed=True,
             synced=True,
+            head_changed=True,
             from_sha="abc123",
             to_sha="def456",
             message="updated and synced: def456",
@@ -2067,6 +2068,65 @@ def test_run_fleet_supervise_does_not_restart_when_already_up_to_date(
 
     assert result.ok is True
     assert result.data["passes"] == 3
+    assert mock_fleet_loop.call_count == 3
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_does_not_restart_on_deferred_sync_with_unmoved_head(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Regression guard for the total-fleet-outage bug (issue root cause).
+
+    self_deploy reports a differing ``from_sha``/``to_sha`` pair even though
+    HEAD did not move on *this* attempt, because those shas are carried
+    forward from an earlier deferred-sync marker (see
+    ``test_self_deploy_loud_warning_on_repeated_deferral`` in
+    test_supervise.py for the producer side of this exact scenario). Gating
+    the restart-exit on ``from_sha != to_sha`` instead of ``head_changed``
+    made the supervisor exit and relaunch every single pass without ever
+    reaching zero live workers to complete the deferred sync -- a total
+    fleet outage. ``head_changed=False`` here must keep the loop running.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            head_changed=False,
+            from_sha="abc123",
+            to_sha="def456",
+            message="sync deferred: 2 runners active",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 3
+    assert deploy_mock.call_count == 3
+    # The pending-sync marker's from_sha != to_sha must not trigger a
+    # restart-exit when head_changed is False -- the loop must keep running
+    # so live-worker draining can eventually reach zero and complete the
+    # deferred sync.
     assert mock_fleet_loop.call_count == 3
 
 
