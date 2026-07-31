@@ -14,9 +14,11 @@ from pathlib import Path
 import pytest
 
 from charlie_work.config import RunnerAllocationConfig
+from charlie_work.instrumentation import close_db, query_events
 from charlie_work.runner_allocation import (
     AllocationPlan,
     RepoDemand,
+    RepoTarget,
     RunnerInstance,
     SlotAction,
     SlotChange,
@@ -27,6 +29,7 @@ from charlie_work.runner_allocation import (
     plan_allocation,
     plan_summary,
     repo_slug_from_github_url,
+    starved_repos,
 )
 from charlie_work.runner_allocation_pass import resolve_inputs, run_allocation_pass
 from charlie_work.runner_slots import (
@@ -1649,3 +1652,304 @@ def test_run_allocation_pass_threads_and_persists_tie_break_offset_across_passes
     t2 = {t.repo: t.target for t in r2.plan.targets}
     assert t2 == {"o/A": 1, "o/B": 0, "o/C": 1}
     assert load_tie_break_offset(fleet_dir) == 2
+
+
+# --------------------------------------------------------------------------
+# starved_repos — pure detection (issue #799)
+# --------------------------------------------------------------------------
+#
+# Fast, direct checks of the pure function against hand-built plans. These do
+# not exercise run_allocation_pass's edge-triggering — see the
+# run_allocation_pass section below for that, driven through the real entry
+# point rather than a synthesized plan.
+
+
+def test_starved_repos_detects_demand_exceeding_capacity_with_spare_budget() -> None:
+    """demand > capacity, with the host budget undersubscribed, is starvation."""
+    plan = AllocationPlan(
+        budget=4,
+        budget_reason="test",
+        targets=(RepoTarget(repo="Fake/repo-xyz", target=2, running=2, demand=9, capacity=2),),
+        changes=(),
+    )
+
+    starved = starved_repos(plan)
+
+    assert len(starved) == 1
+    signal = starved[0]
+    assert signal.repo == "Fake/repo-xyz"
+    assert signal.demand == 9
+    assert signal.capacity == 2
+    assert signal.running == 2
+    assert signal.spare_budget == 2  # budget 4 - running 2
+
+
+def test_starved_repos_silent_when_demand_within_capacity() -> None:
+    """Positive control: a healthy target set must signal nothing.
+
+    Without this, a detector that always fires (or never fires) would still
+    pass a "fires when starved" test alone.
+    """
+    plan = AllocationPlan(
+        budget=4,
+        budget_reason="test",
+        targets=(
+            RepoTarget(repo="Fake/repo-a", target=1, running=1, demand=1, capacity=2),
+            RepoTarget(repo="Fake/repo-b", target=1, running=1, demand=1, capacity=1),
+        ),
+        changes=(),
+    )
+
+    assert starved_repos(plan) == ()
+
+
+def test_starved_repos_silent_when_budget_fully_subscribed() -> None:
+    """demand > capacity alone is not enough; a saturated budget has no slack
+    a bigger registration could use, so the signal must stay silent."""
+    plan = AllocationPlan(
+        budget=2,
+        budget_reason="test",
+        targets=(RepoTarget(repo="Fake/repo-xyz", target=2, running=2, demand=9, capacity=2),),
+        changes=(),
+    )
+
+    assert starved_repos(plan) == ()
+
+
+# --------------------------------------------------------------------------
+# run_allocation_pass — runner_capacity_starved / _recovered events (#799)
+# --------------------------------------------------------------------------
+#
+# These drive the REAL run_allocation_pass entrypoint — the same function
+# both `charlie runners allocate` (cli.py's run_runners_allocate, which calls
+# run_allocation_pass with state_path=paths.state_file) and the fleet
+# prologue (fleet_dispatch.py's _run_fleet_allocation_prologue, which calls
+# it with state_path=anchor_state) invoke — rather than the private
+# _emit_capacity_events helper directly. A test that only called the helper
+# would keep passing even if it were no longer wired into the real pass.
+
+
+def _capacity_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    repo: str,
+    demand: int,
+    capacity: int,
+    budget: int,
+    state_path: Path | None,
+    dry_run: bool = False,
+):
+    """Run the real run_allocation_pass against one synthesized repo.
+
+    ``repo`` is caller-supplied and deliberately not one of this module's
+    CW/JC/PUB constants in most callers below, so a repo that only exists
+    because this test invented it still drives the signal correctly --
+    proving nothing in the detector or the pass is keyed off a known name.
+    """
+    managed_root = tmp_path / "runners"
+    managed_root.mkdir(exist_ok=True)
+    for i in range(capacity):
+        dirname = f"{repo.replace('/', '-')}-{i}"
+        if not (managed_root / dirname).exists():
+            _make_runner_dir(managed_root, dirname, f"https://github.com/{repo}", dirname)
+
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.measure_repo_demand",
+        lambda gh, r, max_runs_scanned: RepoDemand(repo=r, queued_jobs=demand),
+    )
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.fetch_busy_runner_names",
+        lambda gh, r: (set(), None),
+    )
+    # No real actuation: these runner dirs have no listener process, so
+    # starting/parking them would touch the host. The plan and the event log
+    # are what these tests inspect.
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.apply_allocation",
+        lambda plan, dry_run=False: [],
+    )
+
+    config = RunnerAllocationConfig(
+        enabled=True,
+        managed_root=str(managed_root),
+        max_running_runners=budget,
+        min_running_per_repo=0,
+        demand_idle_samples=3,
+    )
+
+    class _FakeGh:
+        """Stand-in: every gh.run call is intercepted by the monkeypatches above."""
+
+    return run_allocation_pass(
+        _FakeGh(),  # type: ignore[arg-type]
+        config,
+        fleet_dir_override=str(tmp_path / "fleet"),
+        state_path=state_path,
+        dry_run=dry_run,
+        source="prologue",
+    )
+
+
+def test_run_allocation_pass_emits_runner_capacity_starved_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A synthesized starved target set produces exactly one starved event,
+    written through the real run_allocation_pass entrypoint."""
+    state_path = tmp_path / "state.json"
+    try:
+        result = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=9,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+        )
+        assert result.ok is True
+
+        events = query_events(state_path, kind="runner_capacity_starved")
+        assert len(events) == 1
+        assert events[0]["repo"] == "Fake/repo-xyz"
+        assert events[0]["payload"]["demand"] == 9
+        assert events[0]["payload"]["capacity"] == 1
+        assert events[0]["payload"]["spare_budget"] == 4
+        assert events[0]["level"] == "warning"
+    finally:
+        close_db(state_path)
+
+
+def test_run_allocation_pass_positive_control_silence_on_healthy_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mandatory positive control: a healthy synthesized target set (demand <=
+    capacity) must write zero capacity events through the real entrypoint."""
+    state_path = tmp_path / "state.json"
+    try:
+        result = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-healthy",
+            demand=1,
+            capacity=2,
+            budget=4,
+            state_path=state_path,
+        )
+        assert result.ok is True
+
+        assert query_events(state_path, kind="runner_capacity_starved") == []
+        assert query_events(state_path, kind="runner_capacity_recovered") == []
+    finally:
+        close_db(state_path)
+
+
+def test_run_allocation_pass_dry_run_writes_no_capacity_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run previews a starved plan without writing the event -- an
+    event write is a side effect, and dry-run must have none."""
+    state_path = tmp_path / "state.json"
+    try:
+        result = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=9,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+            dry_run=True,
+        )
+        assert result.ok is True
+
+        assert query_events(state_path, kind="runner_capacity_starved") == []
+    finally:
+        close_db(state_path)
+
+
+def test_run_allocation_pass_emits_exactly_one_starved_event_across_n_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion: N consecutive passes with a persistently starved
+    repo produce exactly ONE runner_capacity_starved event, not N.
+
+    demand > capacity while the budget has slack is this host's steady state
+    for days at a time (registration only moves on a separate, much slower,
+    possibly-disabled provisioning cadence) -- a level-triggered emit would
+    write one row per repo per pass forever. This is the test that would have
+    passed under that broken design; it is the one that actually matters.
+    """
+    state_path = tmp_path / "state.json"
+    try:
+        for _ in range(4):
+            result = _capacity_pass(
+                tmp_path,
+                monkeypatch,
+                repo="Fake/repo-xyz",
+                demand=9,
+                capacity=1,
+                budget=4,
+                state_path=state_path,
+            )
+            assert result.ok is True
+
+        events = query_events(state_path, kind="runner_capacity_starved")
+        assert len(events) == 1
+    finally:
+        close_db(state_path)
+
+
+def test_run_allocation_pass_emits_recovery_event_on_transition_out_of_starvation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repo transitioning from starved to healthy fires exactly one
+    runner_capacity_recovered event -- and staying healthy afterward does not
+    re-fire it. Without this, a reader cannot tell "recovered" from "the
+    signal stopped working"."""
+    state_path = tmp_path / "state.json"
+    try:
+        r1 = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=9,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+        )
+        assert r1.ok is True
+        assert len(query_events(state_path, kind="runner_capacity_starved")) == 1
+        assert query_events(state_path, kind="runner_capacity_recovered") == []
+
+        # Demand drops to at-or-below capacity: the repo recovers.
+        r2 = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=1,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+        )
+        assert r2.ok is True
+        assert len(query_events(state_path, kind="runner_capacity_starved")) == 1
+        recovered = query_events(state_path, kind="runner_capacity_recovered")
+        assert len(recovered) == 1
+        assert recovered[0]["repo"] == "Fake/repo-xyz"
+
+        # A further healthy pass must not re-fire the recovery event.
+        r3 = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=1,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+        )
+        assert r3.ok is True
+        assert len(query_events(state_path, kind="runner_capacity_starved")) == 1
+        assert len(query_events(state_path, kind="runner_capacity_recovered")) == 1
+    finally:
+        close_db(state_path)

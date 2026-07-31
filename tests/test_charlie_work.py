@@ -61,6 +61,7 @@ from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, link
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
+    PASSIVE_OPEN_STATUS,
     append_event,
     empty_state,
     is_throttled,
@@ -82,6 +83,7 @@ from charlie_work.workflow import (
     _reap_orphaned_review_checkouts,
     _render_required_changes_section,
     _required_changes_from_checks,
+    _summary_is_vacuous,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -10650,6 +10652,57 @@ def test_is_carry_forward_eligible_false_for_whitespace_padded_placeholder() -> 
 
 
 # --------------------------------------------------------------------------
+# Issue #792: _summary_is_vacuous is the single shared discriminator between
+# "nothing to derive" (record_review's write-time marker) and "not eligible
+# for carry-forward" (_is_carry_forward_eligible's read-time check above).
+# It must classify real, specific reviewer prose as non-vacuous even when
+# that prose is terse or lacks a file/line reference -- only a blank string
+# or the one known historical placeholder is vacuous.
+# --------------------------------------------------------------------------
+
+
+def test_summary_is_vacuous_true_for_blank_string() -> None:
+    assert _summary_is_vacuous("") is True
+
+
+def test_summary_is_vacuous_true_for_whitespace_only() -> None:
+    assert _summary_is_vacuous("   \n\t  ") is True
+
+
+def test_summary_is_vacuous_true_for_legacy_placeholder() -> None:
+    assert _summary_is_vacuous(LEGACY_VACUOUS_SUMMARY) is True
+
+
+def test_summary_is_vacuous_true_for_whitespace_padded_placeholder() -> None:
+    assert _summary_is_vacuous(f"  {LEGACY_VACUOUS_SUMMARY}  ") is True
+
+
+def test_summary_is_vacuous_false_for_substantive_architectural_prose() -> None:
+    """A real, specific finding with no file/line reference (pr-774's shape)
+    must not be misclassified as vacuous just because it lacks structure."""
+    prose = (
+        "The retry wrapper swallows the underlying exception type, so a "
+        "caller cannot distinguish a transient network failure from a "
+        "permanent 4xx and will retry requests that can never succeed."
+    )
+    assert _summary_is_vacuous(prose) is False
+
+
+def test_summary_is_vacuous_false_for_terse_but_real_ci_summary() -> None:
+    """The CI-failure producer's own summary shape (pr-529/683's pattern)
+    is short but names a specific, real cause -- not content-free."""
+    assert _summary_is_vacuous("CI failed on Lint; push a fix") is False
+
+
+def test_summary_is_vacuous_false_for_prefix_or_suffix_of_placeholder() -> None:
+    """Only an exact match on the known placeholder is vacuous -- a summary
+    that merely contains it as a substring (e.g. a reviewer quoting the old
+    bug) is real, distinguishing text and must not be swept in by a loose
+    substring check."""
+    assert _summary_is_vacuous(f"{LEGACY_VACUOUS_SUMMARY} but I also checked X") is False
+
+
+# --------------------------------------------------------------------------
 # Issue #784 AC-8: review_queue() must never silently re-confirm a
 # content-free recorded verdict via the head-unchanged shortcut -- it is
 # queued as "vacuous" instead, regardless of whether the head moved.
@@ -13382,9 +13435,13 @@ def test_review_ci_failure_without_annotations_degrades_without_fabricating(
 ) -> None:
     """Issue #771: a failing required check whose run carries zero GitHub
     annotations AND no link (e.g. a process-level crash with nothing GitHub
-    can point at) must not fabricate a file/line -- required_changes stays
-    empty and the pre-existing summary-only fallback
-    (_render_required_changes_section tier 2) renders instead."""
+    can point at) must not fabricate a file/line -- no bogus per-file bullet
+    is synthesized. Issue #792: record_review now derives a single
+    required_changes entry from the non-vacuous summary text (marking
+    findings_channel="derived"), and _render_required_changes_section renders
+    that marker with the same summary-only fallback shape (tier 2) as before
+    -- the rendered prompt is unchanged even though required_changes is no
+    longer empty."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithChecksAndAnnotations(
@@ -13405,7 +13462,8 @@ def test_review_ci_failure_without_annotations_degrades_without_fabricating(
     assert result.ok is True
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
-    assert decision["required_changes"] == []
+    assert decision["required_changes"] == ["CI failed on Tests passed; push a fix"]
+    assert decision["findings_channel"] == "derived"
     assert decision["summary"] == "CI failed on Tests passed; push a fix"
 
     rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
@@ -17345,7 +17403,16 @@ def test_record_review_approved_allows_empty_summary(tmp_path: Path) -> None:
 
 
 def test_record_review_decision_payload_includes_required_changes(tmp_path: Path) -> None:
-    """Issue #11: decision payload always includes required_changes field."""
+    """Issue #11: decision payload always includes required_changes field.
+
+    Issue #792: a request_changes verdict with no required_changes no longer
+    persists an empty list when `summary` has real content -- record_review
+    now derives required_changes from summary at write time, so the
+    persisted list here is `["fix A"]`, not `[]`. See
+    test_record_review_derives_required_changes_from_summary and
+    test_record_review_persists_vacuous_marker_when_nothing_derivable for the
+    dedicated coverage of both derivation outcomes.
+    """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -17357,12 +17424,160 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "required_changes" in decision
     assert decision["required_changes"] == []
+    # approved is never subject to derivation: no marker at all (issue #792 AC-4).
+    assert "findings_channel" not in decision
 
     app.record_review(456, "request_changes", summary="fix A")
 
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "required_changes" in decision
+    assert decision["required_changes"] == ["fix A"]
+    assert decision["findings_channel"] == "derived"
+
+
+# --------------------------------------------------------------------------
+# Issue #792: required_changes has a near-0% fill rate because reviewers
+# reliably fill in `summary` and skip the structured list. record_review now
+# derives required_changes from summary at write time instead of leaving it
+# empty for a downstream renderer to paper over. These tests cover the 8
+# acceptance criteria from the issue directly against the record_review
+# entrypoint (not the decision-payload dict alone).
+# --------------------------------------------------------------------------
+
+
+def test_record_review_derives_required_changes_from_summary(tmp_path: Path) -> None:
+    """AC-1: request_changes + empty required_changes + extractable prose ->
+    persisted with required_changes populated from that prose, and
+    findings_channel marks it as derived (not an itemized reviewer list)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    prose = "The null check in parse() is missing, causing a crash on empty input."
+    result = app.record_review(456, "request_changes", summary=prose, required_changes=None)
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["required_changes"] == [prose]
+    assert decision["findings_channel"] == "derived"
+    assert decision["summary"] == prose
+
+
+def test_record_review_persists_vacuous_marker_when_nothing_derivable(
+    tmp_path: Path,
+) -> None:
+    """AC-2: request_changes + empty required_changes + a summary with no
+    extractable findings is still PERSISTED -- never rejected -- with
+    required_changes: [], findings_channel: "vacuous", and a distinct
+    required_changes_vacuous event alongside the general record_review
+    event. A blank/whitespace-only summary cannot reach this derivation at
+    all (issue #11's gate rejects it outright before any state mutation, so
+    that shape can never produce a persisted vacuous marker); the only
+    non-blank text this function is entitled to call vacuous is the one
+    known historical placeholder, so that is what exercises this path here.
+    See test_record_review_positive_control_legacy_vacuous_summary (AC-8)
+    for the same literal used to prove the discriminator fires on real
+    on-disk data, not just a fixture invented for this test.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
     assert decision["required_changes"] == []
+    assert decision["findings_channel"] == "vacuous"
+
+    state = load_state(paths.state_file)
+    kinds = [
+        event["kind"] for event in state["events"] if event["payload"].get("pr_number") == 456
+    ]
+    assert "required_changes_vacuous" in kinds
+    assert "record_review" in kinds
+
+
+def test_record_review_positive_control_legacy_vacuous_summary(tmp_path: Path) -> None:
+    """AC-8 positive control: the exact LEGACY_VACUOUS_SUMMARY literal --
+    real text that shipped on six on-disk pre-#795 cross-family verdicts --
+    fed through record_review must be classified vacuous, proving the
+    discriminator actually fires on real historical data rather than only
+    on a synthetic fixture invented for this test."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary=LEGACY_VACUOUS_SUMMARY,
+        required_changes=None,
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["findings_channel"] == "vacuous"
+    assert decision["required_changes"] == []
+
+
+def test_record_review_blocked_also_derives_required_changes(tmp_path: Path) -> None:
+    """The derivation is not request_changes-specific: `blocked` verdicts go
+    through the same rework-adjacent path (merge-conflict / janitor routes
+    can carry a `blocked` decision forward) and must not silently drop the
+    reviewer's stated reason either."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456, "blocked", summary="Security review flagged an unauthenticated endpoint."
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["findings_channel"] == "derived"
+    assert decision["required_changes"] == ["Security review flagged an unauthenticated endpoint."]
+
+
+def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
+    """AC-3 regression pin, referenced by name in record_review's derivation
+    comment. A reject-on-empty-required_changes gate here would recreate the
+    unbounded re-review loop this fix closes: a False CommandResult writes no
+    review-decision.json, the caller logs review_verdict_missed, the PR still
+    reads as pending next pass, and it gets re-dispatched to a fresh reviewer
+    forever. Assert both the vacuous case and the derivable case return
+    ok=True -- neither shape may ever produce ok=False on account of
+    required_changes."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    vacuous_result = app.record_review(
+        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+    )
+    assert vacuous_result.ok is True
+
+    fake_gh.pr_head_shas[456] = "sha-2"
+    derivable_result = app.record_review(
+        456, "request_changes", summary="Real finding here.", required_changes=None
+    )
+    assert derivable_result.ok is True
 
 
 def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> None:
@@ -21999,16 +22214,18 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
 
 
-@pytest.mark.parametrize("terminal_status", ["escalated", "blocked"])
-def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
-    tmp_path: Path, terminal_status: str
-) -> None:
-    """Issue #379 rework: a merge conflict whose linked issue is escalated/blocked
-    (human-terminal) must never be rerouted to rework_requested.
+def test_merge_ready_conflict_blocked_issue_not_rerouted(tmp_path: Path) -> None:
+    """Issue #379 rework: a merge conflict whose linked issue is blocked (a
+    human reviewer verdict, set by record_review's decision=="blocked") must
+    never be rerouted to rework_requested.
 
     transition() has no source-state validation, so rerouting would silently
-    strip the human_needed label and hand the issue back to automation behind
-    the human's back. The PR and issue must be left untouched.
+    strip that reviewer verdict and hand the issue back to automation behind
+    the human's back. The PR and issue must be left untouched. Unlike
+    "escalated" (see
+    test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework
+    below), "blocked" records no reason a re-entry mechanism could scope to,
+    so issue #776 deliberately leaves it a one-way door.
     """
     from charlie_work.config import AutoMergeConfig
 
@@ -22037,14 +22254,14 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
         },
     ]
     # Mark the linked issue as carrying the human_needed label, matching a
-    # real escalated/blocked issue, so a stripped label would be observable.
+    # real blocked issue, so a stripped label would be observable.
     fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
-        state["issues"]["123"]["status"] = terminal_status
+        state["issues"]["123"]["status"] = "blocked"
         save_state(paths.state_file, state)
 
     labels_removed_before = list(fake_gh.labels_removed)
@@ -22059,12 +22276,412 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
     assert result.data["merge_attempt_warning"] is None
 
     state = load_state(paths.state_file)
-    assert state["issues"]["123"]["status"] == terminal_status
+    assert state["issues"]["123"]["status"] == "blocked"
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
     # No label mutation must have been issued for the linked issue —
     # human_needed must stay in place.
     assert fake_gh.labels_removed == labels_removed_before
     assert fake_gh.labels_added == labels_added_before
+
+
+def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #776: an issue escalated for an UNRELATED reason (e.g. a dead
+    request-changes-fix worker exhausting the watchdog's redispatch cap --
+    the real mechanism that escalated corpus issues #592/#648/#606 via
+    _reap_restore_rework_requested) must not permanently wall off a PR that
+    separately develops a merge conflict.
+
+    This is the regression test for narrowing merge_ready()'s Guard 1
+    exclusion from ``("escalated", "blocked")`` down to ``"blocked"`` only --
+    it asserts the ROUTING CALL actually happened (a fresh dispatch, the
+    label edge, the attempts counter), not merely that the return value
+    looks different from the blocked case. It also asserts reason X's own
+    budget (``redispatch_at``, the watchdog counter that produced the
+    original escalation) survives untouched: re-entry must not reset X's
+    cap while remediating unrelated Y.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    unrelated_redispatch_at = ["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"]["123"],
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+            "redispatch_at": unrelated_redispatch_at,
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    # The routing call actually happened: a fresh dispatch, not a no-op.
+    # (merge_ready()'s top-level result.data doesn't expose the internal
+    # routed/escalated booleans -- verify via the state.json side effects
+    # the routing call actually produces instead.)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert conflict_events[0]["payload"]["issue_number"] == 123
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+    assert (123, config.labels.human_needed) in fake_gh.labels_removed
+    # Reason X's own budget must survive remediating unrelated Y: the
+    # watchdog redispatch timestamps that drove the ORIGINAL escalation are
+    # untouched, so a later re-escalation for the same reason X is not
+    # handed a falsely-fresh cap.
+    assert state["issues"]["123"]["redispatch_at"] == unrelated_redispatch_at
+
+
+def test_merge_ready_conflict_rework_dispatch_bounded_by_cap_across_repeated_evaluation(
+    tmp_path: Path,
+) -> None:
+    """Issue #777: merge_ready()'s conflict-rework trigger must never dispatch
+    more rework workers than config.review.max_conflict_rework_attempts, no
+    matter how many times merge_ready() re-evaluates the same conflicting PR
+    -- including across issue-status resets that mimic an external lane
+    (e.g. a dead-session reaper) putting the issue back into a re-dispatchable
+    state between passes.
+
+    Before this fix, merge_ready()'s dispatch trigger called
+    _request_merge_conflict_rework directly with no attempts_key bookkeeping
+    at all, so nothing bounded the number of real dispatches across such
+    cycles (real corpus: PR #679/issue #602, where the diagnostic-only
+    consecutive_failed_merge_attempts counter climbed past 11 while the
+    functional cap sat at 0 the entire time).
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig, ReviewConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    def _reset_issue_to_fresh() -> None:
+        with state_lock(paths.state_file):
+            state = load_state(paths.state_file)
+            state["issues"]["123"] = {**state["issues"]["123"], "status": "approved"}
+            save_state(paths.state_file, state)
+
+    dispatch_events_total = 0
+    escalated_seen_at: int | None = None
+    for pass_number in range(1, 5):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["merge_conflict"] is True
+        state = load_state(paths.state_file)
+        dispatch_events_total = sum(
+            1 for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+        )
+        if state["issues"]["123"]["status"] == "escalated":
+            escalated_seen_at = pass_number
+            assert (
+                state["issues"]["123"]["escalation_reason"]
+                == "conflict_rework_attempts_cap_exceeded"
+            )
+            # Once escalated for this lane's own exhausted cap, stop
+            # artificially re-arming: no real production path resets an
+            # escalated issue's status back to "approved" (only
+            # `charlie unescalate` does, and it also clears
+            # escalation_reason) -- the loop's reset is only a harness
+            # device to reach the cap boundary, not a realistic post-
+            # escalation event. Break here and verify stability below
+            # instead of feeding the wrapper a state no real caller would
+            # ever produce.
+            break
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        # Never more real dispatches than the cap, no matter how many passes.
+        assert dispatch_events_total <= config.review.max_conflict_rework_attempts
+        _reset_issue_to_fresh()
+
+    # The cap was actually reached and enforced, not merely never approached.
+    assert escalated_seen_at is not None
+    assert dispatch_events_total == config.review.max_conflict_rework_attempts
+    escalated_events_after_first = sum(
+        1 for e in state["events"] if e["kind"] == "janitor_rework_escalated"
+    )
+    assert escalated_events_after_first == 1
+
+    # Issue #776: once escalated for THIS lane's own exhausted cap, a FURTHER
+    # evaluation of the same still-conflicting PR must not dispatch yet
+    # another worker, must not burn the counter past what it already is, and
+    # must not re-fire a duplicate escalation event on every pass ("X blocks
+    # retry of X") -- it simply leaves the already-escalated pair alone.
+    for _ in range(3):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "conflict_rework_attempts_cap_exceeded"
+    expected_final_attempts = config.review.max_conflict_rework_attempts + 1
+    assert state["prs"]["456"]["conflict_rework_attempts"] == expected_final_attempts
+    final_dispatch_events = sum(
+        1 for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    )
+    assert final_dispatch_events == config.review.max_conflict_rework_attempts
+    final_escalated_events = sum(
+        1 for e in state["events"] if e["kind"] == "janitor_rework_escalated"
+    )
+    assert final_escalated_events == 1
+
+
+def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #777(d): the conflict-rework attempt must be counted (via
+    _route_janitor_gate_failure_to_rework's conflict_rework_attempts write,
+    which merge_ready's dispatch trigger now goes through) BEFORE a later,
+    deterministic worktree_unsafe failure at actual worker-launch time can
+    escalate the issue through dispatch_rework's separate failure_kind lane.
+
+    Real corpus: PR #679/issue #602, escalation_reason="worktree_unsafe".
+    dispatch_rework's deterministic-failure branch only ever writes to
+    state["issues"][...] -- it must never zero or otherwise touch the PR
+    record's conflict_rework_attempts counter.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import AutoMergeConfig, DevinConfig, WatchdogConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    dispatch_result = app.merge_ready(456, merge=False)
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree is unsafe to reuse",
+                failure_kind="worktree_unsafe",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+    # The attempt counted by the (now-unified) conflict-rework dispatch must
+    # survive this SEPARATE escalation lane untouched -- it lives on the PR
+    # record, and dispatch_rework's deterministic-failure branch only ever
+    # writes to the issue record.
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+
+def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
+    tmp_path: Path,
+) -> None:
+    """Issue #776 follow-up: the new same-reason guard in
+    _route_janitor_gate_failure_to_rework (which refuses to re-route once
+    escalation_reason == f"{attempts_key}_cap_exceeded" is already recorded)
+    must not become a NEW one-way door of its own. ``charlie unescalate`` is
+    the sanctioned re-arm: it clears ``escalation_reason`` on both the issue
+    and PR records (``_UNESCALATE_ISSUE_RESET_FIELDS`` /
+    ``_UNESCALATE_PR_RESET_FIELDS`` both list it) and zeros
+    ``conflict_rework_attempts`` on the PR record, so a PR that is STILL
+    conflicting after a human re-arms it gets a genuinely fresh attempts
+    budget rather than being silently re-refused by the guard or picking up
+    where the exhausted counter left off.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Directly construct the "this lane's own cap already exhausted,
+    # escalated" state that _route_janitor_gate_failure_to_rework's
+    # cap-exceeded branch produces (workflow.py ~11862-11878), merged over
+    # whatever record_review() already wrote -- mirrors the construction
+    # convention test_fix_unescalate.py uses rather than re-deriving the
+    # escalation via a repeated merge_ready() loop.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"]["456"],
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "conflict_rework_attempts": 3,
+        }
+        state["issues"]["123"] = {
+            **state["issues"]["123"],
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    # Sanity check: while escalated for THIS lane's own reason, the new guard
+    # refuses to re-route at all (the property test C already covers directly
+    # -- reconfirmed here as a precondition for what unescalate() is about to
+    # undo).
+    precheck = app.merge_ready(456, merge=False)
+    assert precheck.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 3
+
+    unescalate_result = app.unescalate(issue_number=123)
+    assert unescalate_result.ok is True
+    assert unescalate_result.data["changed"] is True
+
+    state = load_state(paths.state_file)
+    assert "escalation_reason" not in state["prs"]["456"]
+    assert "escalation_reason" not in state["issues"]["123"]
+    assert "conflict_rework_attempts" not in state["prs"]["456"]
+    assert state["prs"]["456"]["status"] == PASSIVE_OPEN_STATUS
+
+    # The conflict is still present (PR still CONFLICTING/DIRTY on GitHub) --
+    # a fresh merge_ready() pass must dispatch rework again with a genuinely
+    # fresh attempts counter, not pick up where the exhausted counter (3)
+    # left off and not be silently refused by the same-reason guard (which no
+    # longer matches now that escalation_reason has been cleared).
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    dispatch_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(dispatch_events) == 1
 
 
 def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
@@ -34442,6 +35059,50 @@ def test_cross_family_request_changes_verdict_persists_required_changes(
     assert decision["summary"] == "file.py:10 has a real bug that breaks X"
 
 
+def test_cross_family_legacy_path_verdict_with_empty_required_changes_gets_derived(
+    tmp_path: Path,
+) -> None:
+    """AC-6 (cross-family producer): the legacy Markdown-only parse path
+    (no JSON verdict block) never itemizes required_changes -- it only ever
+    extracts a summary -- so a request_changes verdict recorded from it
+    always arrives at record_review with required_changes=() and a real,
+    non-vacuous summary. This is the shape record_review's derivation
+    exists for. Contrast with test_handle_malformed_cross_family_verdict_*:
+    a JSON verdict block declaring request_changes with an empty
+    required_changes is diverted to MalformedCrossFamilyVerdict before ever
+    reaching record_review (issue #795) -- this test's report has no JSON
+    block at all, so that defense-in-depth layer does not apply here and
+    record_review's own derivation is what prevents the content-free
+    outcome."""
+    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
+    report_text = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    parsed = parse_cross_family_verdict(report_text)
+    assert isinstance(parsed, CrossFamilyVerdict)
+    assert parsed.decision == "request_changes"
+    assert parsed.required_changes == ()
+    assert parsed.summary and not _summary_is_vacuous(parsed.summary)
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Mirrors workflow.py's _record_cross_family_verdicts call site exactly.
+    result = app.record_review(
+        456,
+        parsed.decision,
+        summary=parsed.summary,
+        required_changes=parsed.required_changes,
+    )
+    assert result.ok is True
+
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["required_changes"] == [parsed.summary]
+    assert decision["findings_channel"] == "derived"
+
+
 def test_rework_brief_contains_required_changes_from_verdict(tmp_path: Path) -> None:
     """Issue #632 defect 1: a request_changes verdict's required_changes must
     reach the rework brief. The brief reads review-decision.json itself (single
@@ -34731,6 +35392,90 @@ def test_render_required_changes_section_blocked_both_empty_renders_escape_hatch
     section = _render_required_changes_section(decision)
 
     assert "REVIEWER FINDINGS UNAVAILABLE" in section
+
+
+# --------------------------------------------------------------------------
+# Issue #792: verdicts recorded by the current record_review carry an
+# explicit findings_channel marker ("vacuous" or "derived"). These tests
+# cover the renderer's handling of that marker directly, independent of the
+# shape-based (required_changes/summary) tiers above, which exist only to
+# infer the same distinction for pre-#792 records with no marker at all.
+# --------------------------------------------------------------------------
+
+
+def test_render_required_changes_section_vacuous_marker_renders_escape_hatch() -> None:
+    """A findings_channel="vacuous" verdict always renders tier 3, even
+    though `summary` is technically non-blank (it may carry the historical
+    placeholder) -- rendering it as real content (tier 2) would silently
+    present content-free text as the reviewer's actual findings."""
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [],
+        "findings_channel": "vacuous",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+    assert LEGACY_VACUOUS_SUMMARY not in section
+
+
+def test_render_required_changes_section_vacuous_marker_fires_for_blocked_too() -> None:
+    """The vacuous marker's escape hatch is decision-agnostic -- it fires for
+    `blocked` exactly as it does for `request_changes`, unlike the "derived"
+    marker below which is request_changes-specific."""
+    decision = {
+        "decision": "blocked",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [],
+        "findings_channel": "vacuous",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+
+
+def test_render_required_changes_section_derived_marker_renders_summary_verbatim() -> None:
+    """A findings_channel="derived" request_changes verdict renders the
+    tier-2-shaped verbatim-summary section even though required_changes is
+    now populated (record_review copied summary into it) -- it must not
+    fall into tier 1's bullet-list rendering, which would wrap an entire
+    multi-sentence summary as a single bullet."""
+    prose = "The retry wrapper swallows the exception type; callers cannot distinguish causes."
+    decision = {
+        "decision": "request_changes",
+        "summary": prose,
+        "required_changes": [prose],
+        "findings_channel": "derived",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert prose in section
+    assert f"- {prose}" not in section
+    assert "did not record a structured findings list" in section
+
+
+def test_render_required_changes_section_derived_marker_suppressed_for_blocked() -> None:
+    """Unlike "vacuous", the "derived" marker's special-cased rendering only
+    applies to request_changes (see the docstring's blocked-suppression
+    rule) -- for `blocked` it falls through to the pre-existing shape-based
+    tiers, where a populated required_changes on a blocked verdict is
+    suppressed by design (blocked's "what must change before approval"
+    framing doesn't fit blocked's routes)."""
+    prose = "Security review flagged an unauthenticated endpoint."
+    decision = {
+        "decision": "blocked",
+        "summary": prose,
+        "required_changes": [prose],
+        "findings_channel": "derived",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert section == ""
 
 
 def test_defang_closing_keywords_strips_live_keyword_but_keeps_number_legible() -> None:

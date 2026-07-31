@@ -116,7 +116,9 @@ from .state import (
     clear_quota_throttles,
     clear_reviewer_quota,
     defer_reviewer_probe_after,
+    DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     disarm_quota_probe,
+    ESCALATION_REASON_CLASS_BY_EVENT_KIND,
     escalation_reason_class,
     is_claim_stale,
     is_deescalation_due,
@@ -143,7 +145,7 @@ from .state import (
     utc_now,
     without_review_dispatch_claim,
 )
-from .instrumentation import correlation_context, log_event, record_loop_pass
+from .instrumentation import correlation_context, log_event, query_events, record_loop_pass
 from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
 from .process_utils import (
     find_worker_terminal_status,
@@ -467,6 +469,34 @@ class CarryForwardCheck:
         return self.tier is not None
 
 
+def _summary_is_vacuous(summary: str) -> bool:
+    """True when ``summary`` carries no reviewer content.
+
+    Covers a blank/whitespace-only string, and the historical
+    ``LEGACY_VACUOUS_SUMMARY`` placeholder (issue #784) that pre-#784
+    cross-family code emitted for a verdict that was, in fact, content-free.
+    This is the single definition of "there is nothing here to act on",
+    shared by two different callers at two different times:
+
+    - ``_is_carry_forward_eligible`` (read-time): should an old, already-
+      recorded verdict be reused across a content-identical head?
+    - ``record_review`` (write-time, issue #792): is there anything to
+      derive from ``summary`` into ``required_changes`` when the caller
+      didn't supply a structured list?
+
+    Deliberately does *not* do anything smarter than an equality check
+    against one known, exported constant -- a referent/keyword classifier
+    over free-form reviewer prose was evaluated and rejected (issue #792)
+    because it misclassified genuine, specific findings (e.g. architectural
+    gaps with no file/line reference, or "CI failed on Lint; push a fix")
+    as content-free. The only text this function is entitled to call
+    vacuous is text our *own* code emitted as a known placeholder, not text
+    a reviewer wrote that merely looks terse or unstructured.
+    """
+    stripped = summary.strip()
+    return not stripped or stripped == LEGACY_VACUOUS_SUMMARY
+
+
 def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
     """Reject carry-forward for a content-free cross-family verdict (issue #784, AC-8).
 
@@ -479,13 +509,12 @@ def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
 
     A verdict is ineligible only when it is unmistakably a product of the
     pre-#784 bug: ``decision == "request_changes"`` with no itemized
-    ``required_changes`` AND a summary that is either empty or exactly the
-    historical hardcoded placeholder (``LEGACY_VACUOUS_SUMMARY``). A primary
-    reviewer's ``request_changes`` verdict always has a non-empty, non-
-    placeholder summary (``record_review`` rejects an empty one outright),
-    so this predicate cannot mistake a legitimate primary-review decision --
-    one that simply chose prose over an itemized list -- for a vacuous one.
-    Everything else (``approved``, ``blocked``, populated
+    ``required_changes`` AND a vacuous summary (see ``_summary_is_vacuous``).
+    A primary reviewer's ``request_changes`` verdict always has a non-empty,
+    non-placeholder summary (``record_review`` rejects an empty one
+    outright), so this predicate cannot mistake a legitimate primary-review
+    decision -- one that simply chose prose over an itemized list -- for a
+    vacuous one. Everything else (``approved``, ``blocked``, populated
     ``required_changes``, or a real summary) is eligible, unchanged from
     before this fix.
     """
@@ -493,8 +522,7 @@ def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
         return True
     if decision.get("required_changes"):
         return True
-    summary = str(decision.get("summary") or "").strip()
-    return bool(summary) and summary != LEGACY_VACUOUS_SUMMARY
+    return not _summary_is_vacuous(str(decision.get("summary") or ""))
 
 
 # Statuses that mean an issue already has a rework routed (or an equivalent
@@ -1506,7 +1534,16 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
     - ``summary`` as a non-empty string, for EVERY decision including
       ``approved`` (issue #597), and not an unfilled ``<...>`` template
       placeholder
-    - ``required_changes`` is optional; if present it must be a list of strings
+    - ``required_changes``, if present, must be a list of strings. This
+      function does not require it to be non-empty: an empty or absent
+      ``required_changes`` on a ``request_changes``/``blocked`` verdict is
+      repaired downstream, at ``record_review`` (issue #792), which derives
+      it from ``summary`` or marks it ``findings_channel: "vacuous"`` when
+      nothing is derivable -- never by rejecting the verdict here. Rejecting
+      an empty ``required_changes`` at this layer would recreate the
+      unbounded re-review loop that gate is designed to avoid: see
+      ``record_review``'s derivation block and
+      ``test_record_review_never_rejects_for_empty_required_changes``.
 
     ``approved`` used to be exempt from the non-empty-summary rule, on the
     reasoning that ``record_review`` only rejects empty summaries where a
@@ -3932,6 +3969,24 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     could read as "there is nothing to change" when a decision actively
     requires rework.
 
+    Issue #792: ``record_review`` now derives ``required_changes`` from
+    ``summary`` itself, at write time, and records which of two outcomes
+    happened via ``decision["findings_channel"]``: ``"derived"`` (the
+    summary was used as the findings, i.e. what used to be this function's
+    own tier-2 fallback) or ``"vacuous"`` (nothing was derivable -- neither
+    an itemized list nor a usable summary -- e.g. the historical
+    cross-family placeholder, ``cross_family.LEGACY_VACUOUS_SUMMARY``, which
+    is genuinely non-blank text but carries no reviewer content). Verdicts
+    carrying either marker are handled explicitly, before the shape-based
+    tiers below: ``"vacuous"`` always renders tier 3 (a non-blank-but-
+    content-free summary is strictly worse than an empty one -- rendering
+    it as tier 2 would silently present it as real findings), and
+    ``"derived"`` always renders tier 2 verbatim rather than falling into
+    tier 1's bullet list (a single derived item wrapped as a one-item bullet
+    would otherwise dump an entire multi-paragraph summary onto one line).
+    Verdicts with no marker at all -- every record written before this
+    fix -- fall through unchanged to the original shape-based tiers.
+
     Rendered for ``request_changes`` and, defensively, ``blocked`` verdicts
     (routing to rework via the decision-agnostic janitor gates -- merge
     conflict / no-op-rework repair -- can carry forward whatever verdict was
@@ -3980,6 +4035,39 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     )
     raw_summary = decision.get("summary")
     summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
+    findings_channel = decision.get("findings_channel")
+
+    # issue #792: a verdict recorded by the current record_review carries an
+    # explicit marker for exactly this distinction -- handle it before the
+    # shape-based tiers below, which exist only to infer the same thing for
+    # verdicts recorded before this marker existed.
+    if findings_channel == "vacuous":
+        lines = [
+            "## Required changes",
+            "",
+            "**REVIEWER FINDINGS UNAVAILABLE.** No structured findings list "
+            "and no summary were recorded for this verdict. This is NOT a "
+            "signal that there is nothing to change — it means the findings "
+            "did not make it into `review-decision.json`. Inspect the PR's "
+            "review comments and review threads on GitHub directly before "
+            "doing anything else.",
+            "",
+        ]
+        return "\n".join(lines)
+
+    if verdict == "request_changes" and findings_channel == "derived":
+        lines = [
+            "## Required changes",
+            "",
+            "The reviewer did not record a structured findings list for this "
+            "verdict. This is their summary, rendered verbatim so it is not "
+            "lost — treat it as the findings to address before this PR can "
+            "be approved:",
+            "",
+            defang_closing_keywords(summary_text),
+            "",
+        ]
+        return "\n".join(lines)
 
     if verdict == "request_changes" and changes:
         lines = [
@@ -7388,6 +7476,7 @@ class OrchestratorApp:
             # re-log identical failures every pass while escalated either.
             escalated_checks = self.gh.pr_checks(pr_number)
             escalated_diff = self.gh.pr_diff(pr_number)
+            escalated_verdict = None
             with state_lock(self.paths.state_file):
                 fresh_state = load_state(self.paths.state_file)
                 existing_pr_state = fresh_state["prs"].get(str(pr_number))
@@ -7419,6 +7508,60 @@ class OrchestratorApp:
                             },
                         )
                     save_state(self.paths.state_file, fresh_state)
+
+            # Issue #776: escalation must stay terminal for the reason that
+            # caused it, but must not become a one-way door that ALSO blocks
+            # an unrelated, independently-capped remediation -- e.g. a dead
+            # request-changes-fix worker exhausting the unrelated watchdog
+            # redispatch cap used to permanently wall off a PR that
+            # separately developed a merge conflict, with no path back short
+            # of a human running `charlie unescalate` (real corpus: issues
+            # #592/#648/#606). A merge-conflict or no-op-rework janitor
+            # failure is routed through the SAME attempts_key-capped wrapper
+            # the non-escalated janitor gate below uses
+            # (_route_janitor_gate_failure_to_rework); that wrapper's own
+            # rework_pending check does not treat "escalated" as in-flight,
+            # so it re-derives its own dispatch/escalate decision from
+            # conflict_rework_attempts/no_op_rework_attempts -- a cap that is
+            # untouched by (and therefore still fresh after) an escalation
+            # from a different lane, but already exhausted -- so still
+            # correctly refused -- if THIS lane is what escalated the issue
+            # previously. This never re-litigates the original verdict or
+            # reason for escalation: only these two deterministic,
+            # zero-token checks are attempted here; packet generation and the
+            # LLM reviewer remain skipped below.
+            if issue_number is not None and escalated_verdict is not None:
+                is_merge_conflict_block = str(
+                    pr.get("mergeable") or ""
+                ).upper() == "CONFLICTING" or (
+                    str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
+                )
+                is_no_op_rework_block = (
+                    escalated_verdict.is_no_op_rework
+                    and not escalated_verdict.failed_required_checks
+                )
+                if is_merge_conflict_block or is_no_op_rework_block:
+                    if is_merge_conflict_block:
+                        routed = self._route_janitor_gate_failure_to_rework(
+                            pr,
+                            issue_number,
+                            attempts_key="conflict_rework_attempts",
+                            max_attempts=self.config.review.max_conflict_rework_attempts,
+                            reason="merge_conflict",
+                            router=self._request_merge_conflict_rework,
+                        )
+                    else:
+                        routed = self._route_janitor_gate_failure_to_rework(
+                            pr,
+                            issue_number,
+                            attempts_key="no_op_rework_attempts",
+                            max_attempts=self.config.review.max_no_op_rework_attempts,
+                            reason="no_op_rework",
+                            router=self._request_no_op_rework_repair,
+                        )
+                    if routed is not None:
+                        return routed
+
             return CommandResult(
                 True,
                 reason,
@@ -9511,6 +9654,53 @@ class OrchestratorApp:
                 f"--summary or --summary-file is required for decision '{decision}'",
                 {},
             )
+
+        # Issue #792: required_changes has a near-0% fill rate because
+        # prompts/review.md historically documented it as optional, so
+        # reviewers reliably fill in `summary` and skip the structured list.
+        # `_render_required_changes_section` used to paper over this at
+        # *render* time, falling back to `summary` when the list was empty --
+        # but that runs long after the reviewer is gone and the verdict is
+        # frozen, so a bad or missing derivation there can never be
+        # corrected. Derive here instead, at the point of record, so
+        # whatever `required_changes` lands on disk is exactly what a
+        # worker's rework brief will show.
+        #
+        # This step never *rejects* a verdict for an empty required_changes
+        # -- see test_record_review_never_rejects_for_empty_required_changes.
+        # A reject path here is the tempting wrong fix and that test is what
+        # stops a future session from "tightening" it: a False return writes
+        # no review-decision.json, the caller logs review_verdict_missed and
+        # moves on, the next pass still sees the PR as pending, and it gets
+        # re-dispatched to a fresh reviewer -- an unbounded re-review loop
+        # with no cap and no escalation. Contrast with issue #597's reject
+        # gate on a contentless *approved* verdict in
+        # `_validate_review_verdict`: that gate is safe because rejecting an
+        # approval just means "not merged yet", not an infinite loop.
+        effective_required_changes = list(required_changes) if required_changes else []
+        findings_channel: str | None = None
+        if decision in {"request_changes", "blocked"} and not effective_required_changes:
+            if _summary_is_vacuous(summary_text):
+                # Nothing derivable. Persist the empty list anyway (never
+                # reject) with an explicit marker so
+                # `_render_required_changes_section` can tell "genuinely
+                # nothing was recorded" apart from "the reviewer wrote
+                # prose instead of a list" and render its loud tier-3
+                # warning instead of silently treating this the same as a
+                # real derivation.
+                findings_channel = "vacuous"
+            else:
+                # The F1 extractor: `_render_required_changes_section`'s own
+                # tier-2 fallback, lifted here unchanged (issue #792) so the
+                # producer -- not a consumer with no way to correct a bad
+                # call -- makes this decision. `findings_channel = "derived"`
+                # tells the renderer this single item is reviewer prose, not
+                # an itemized list, so it renders as prose (tier 2) rather
+                # than a one-item bullet list built from a multi-paragraph
+                # summary.
+                effective_required_changes = [summary_text.strip()]
+                findings_channel = "derived"
+
         pr = self.gh.pr_view(pr_number)
         issue_number = (
             linked_issue_number(
@@ -9630,7 +9820,7 @@ class OrchestratorApp:
             "issue_number": issue_number,
             "decision": decision,
             "summary": summary_text,
-            "required_changes": list(required_changes) if required_changes is not None else [],
+            "required_changes": effective_required_changes,
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_head_source": reviewed_head_source,
             "reviewed_patch_id": reviewed_patch_id,
@@ -9640,6 +9830,11 @@ class OrchestratorApp:
             "carried_forward_from": [],
             "reviewed_at": utc_now(),
         }
+        # Only present when the derivation above ran (issue #792): a verdict
+        # that already carried a populated required_changes, or an
+        # `approved` verdict, passes through with no new key at all.
+        if findings_channel is not None:
+            decision_payload["findings_channel"] = findings_channel
         decision_path = pr_dir / "review-decision.json"
         # Merge-update (never in-place assignment) and persist BEFORE any GitHub
         # label mutation: a label-write failure or crash must not desync the
@@ -9800,7 +9995,24 @@ class OrchestratorApp:
             }
             if session_metrics is not None:
                 event_payload["session_metrics"] = session_metrics
+            if findings_channel is not None:
+                event_payload["findings_channel"] = findings_channel
             state = self._record_event(state, "record_review", event_payload)
+            if findings_channel == "vacuous":
+                # Distinct from the general "record_review" event (issue
+                # #792): this is the signal that a request_changes/blocked
+                # verdict arrived with nothing to act on -- neither an
+                # itemized required_changes nor derivable prose -- so it can
+                # be queried/alerted on independently of every other verdict.
+                state = self._record_event(
+                    state,
+                    "required_changes_vacuous",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "decision": decision,
+                    },
+                )
             if rescue_dispatched:
                 state = self._record_event(
                     state,
@@ -10260,6 +10472,7 @@ class OrchestratorApp:
         sync_failed = False
         merge_conflict = False
         merge_conflict_routed = False
+        merge_conflict_escalated = False
         check_failure_routed = False
         cross_pr_revert_detected = False
         cross_pr_revert_routed = False
@@ -10399,14 +10612,30 @@ class OrchestratorApp:
                             "merge_attempt_warning": None,
                         },
                     )
-                # The linked issue is in a human-terminal state (escalated to a
-                # human decision, or blocked pending one). Never reroute those
-                # to rework_requested: transition() has no source-state
-                # validation, so doing so would silently strip human_needed
-                # and hand the issue back into the automated pipeline behind
-                # the human's back. Leave the issue and PR alone; a human
-                # must move it out of this state.
-                if issue_status in ("escalated", "blocked"):
+                # "blocked" is a human reviewer verdict (record_review's
+                # decision == "blocked"), not a cap escalation: transition()
+                # has no source-state validation, so rerouting it to
+                # rework_requested would silently strip that verdict and hand
+                # the issue back into the automated pipeline behind the
+                # human's back. Leave it alone; a human must move it out.
+                #
+                # "escalated" is deliberately NOT excluded here (issue #776):
+                # it used to be, which let an escalation for ANY reason --
+                # e.g. a dead request-changes-fix worker exhausting the
+                # unrelated watchdog redispatch cap -- permanently wall off a
+                # PR that separately develops a merge conflict, with no path
+                # back short of a human running `charlie unescalate` (real
+                # corpus: issues #592/#648/#606). The unified conflict-rework
+                # dispatch below (_route_janitor_gate_failure_to_rework)
+                # re-derives its own decision from conflict_rework_attempts,
+                # a cap left untouched by an escalation from a different lane
+                # -- but already exhausted, so still correctly refused, if
+                # THIS lane is what escalated the issue previously. Falling
+                # through is safe: it is the same merge_conflict=True /
+                # sync_failed=True path already taken today by a fresh,
+                # not-yet-escalated conflict before the failed-attempt-alarm
+                # threshold below is reached.
+                if issue_status == "blocked":
                     return CommandResult(
                         True,
                         f"PR #{pr_number} merge conflict on issue #{issue_number} "
@@ -10788,8 +11017,37 @@ class OrchestratorApp:
         # human-terminal state, and the stale `existing_pr_state` snapshot can
         # diverge from the counter the final persistence block will reload
         # (e.g. a carry-forward reset in this same pass). Dispatch outside the
-        # final state-lock because _request_merge_conflict_rework acquires its
-        # own lock.
+        # final state-lock because _route_janitor_gate_failure_to_rework
+        # acquires its own lock.
+        #
+        # Issues #776/#777: this used to call _request_merge_conflict_rework
+        # directly, bypassing conflict_rework_attempts entirely -- the only
+        # gate was this threshold check, so a PR could be re-dispatched to
+        # rework on every pass forever with no cap, and consecutive_failed_
+        # merge_attempts (a diagnostic-only alarm counter, see
+        # AutoMergeConfig.failed_attempt_alarm) was the only "cap" a human
+        # could point to. It is now routed through the SAME
+        # attempts_key-capped wrapper review()'s janitor gate uses, so there
+        # is exactly one place in the codebase that increments
+        # conflict_rework_attempts and decides dispatch vs. rescue vs.
+        # escalation for this lane -- and the attempt is counted (line
+        # `attempts = ... + 1` inside that wrapper) BEFORE any subsequent
+        # worker-launch failure (e.g. a deterministic worktree_unsafe at
+        # actual dispatch time, real corpus: PR #679/issue #602) can
+        # escalate, so a launch failure no longer bypasses the cap.
+        # "manifest_written"/"blocked" remain pre-checked here because they
+        # are merge_ready()-specific concerns the shared wrapper does not
+        # know about: manifest_written means an unrelated worker is being
+        # launched for this issue right now (preempting it would race that
+        # launch), and blocked is a human reviewer verdict that must never be
+        # silently routed around. "dispatched"/"dispatch_pending"/
+        # "rework_requested" and "escalated" are deliberately NOT
+        # pre-excluded any more: the wrapper's own rework_pending check
+        # already treats the first three as in-flight (returning None, a
+        # no-op here), and its own attempts_key cap -- untouched by an
+        # escalation from an unrelated lane, already exhausted if this lane
+        # is what escalated the issue -- is what correctly decides
+        # "escalated" (issue #776's fix; real corpus: issues #592/#648/#606).
         if (
             merge_conflict
             and approved
@@ -10801,23 +11059,24 @@ class OrchestratorApp:
             issue_state = state["issues"].get(str(issue_number), {})
             issue_status = issue_state.get("status")
             existing_for_route = state["prs"].get(str(pr_number), {})
-            if issue_status not in (
-                "dispatched",
-                "dispatch_pending",
-                "manifest_written",
-                "escalated",
-                "blocked",
-                "rework_requested",
-            ):
+            if issue_status not in ("manifest_written", "blocked"):
                 new_attempts_for_route = (
                     int(existing_for_route.get("consecutive_failed_merge_attempts", 0)) + 1
                 )
                 threshold = self.config.auto_merge.failed_attempt_alarm
                 if threshold > 0 and new_attempts_for_route >= threshold:
-                    merge_conflict_routed = True
-                    rework_label_error = self._request_merge_conflict_rework(
-                        pr, issue_number, decision
+                    routed = self._route_janitor_gate_failure_to_rework(
+                        pr,
+                        issue_number,
+                        attempts_key="conflict_rework_attempts",
+                        max_attempts=self.config.review.max_conflict_rework_attempts,
+                        reason="merge_conflict",
+                        router=self._request_merge_conflict_rework,
                     )
+                    if routed is not None:
+                        merge_conflict_routed = bool(routed.data.get("routed_to_rework"))
+                        merge_conflict_escalated = bool(routed.data.get("escalated"))
+                        rework_label_error = routed.data.get("label_error")
         # Check-failure rework dispatch (issue #674): an approved PR whose
         # required checks have genuinely failed (a completed FAILURE
         # conclusion, not merely pending/missing/infra_failed/unavailable)
@@ -10875,12 +11134,32 @@ class OrchestratorApp:
             ) or mergequeue_handoff_failed:
                 new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0)) + 1
                 threshold = self.config.auto_merge.failed_attempt_alarm
+                # Issue #777(b): this counter previously had no ceiling and
+                # grew unbounded across passes (real corpus: PR #679 reached
+                # 12 and climbing) because nothing ever reset it once a
+                # rework was dispatched and pending. It is diagnostic only --
+                # the FUNCTIONAL bound on repeated conflict-rework/no-op-
+                # rework dispatch is conflict_rework_attempts/
+                # no_op_rework_attempts, enforced by
+                # _route_janitor_gate_failure_to_rework above. Clamp at
+                # threshold + 1 (not at threshold): clamping AT threshold
+                # would make `merge_attempt_alarm` below re-fire every pass
+                # once clamped, turning a one-time alarm into a cost spiral;
+                # threshold + 1 keeps the alarm's "== threshold" one-shot
+                # semantics intact while still giving every trigger sharing
+                # this counter (check-failure, cross-PR-revert, mergequeue
+                # handoff) a stable ">= threshold" debounce reading forever
+                # after the first alarm fires, instead of an ever-growing one.
+                if threshold > 0:
+                    new_attempts = min(new_attempts, threshold + 1)
                 merge_attempt_alarm = threshold > 0 and new_attempts == threshold
                 if merge_attempt_alarm:
                     if merge_conflict:
                         pass_str = "pass" if new_attempts == 1 else "passes"
                         if issue_number is None:
                             conflict_detail = "no linked issue, cannot route to rework"
+                        elif merge_conflict_escalated:
+                            conflict_detail = "conflict-rework cap exhausted; escalated to a human"
                         elif merge_conflict_routed:
                             if rework_label_error:
                                 outcome = rework_label_error.get("outcome", rework_label_error)
@@ -12085,7 +12364,41 @@ class OrchestratorApp:
         # failure direction.
         snapshot = load_state_locked(self.paths.state_file)
         existing_pr_state = snapshot.get("prs", {}).get(str(pr_number), {})
-        issue_status = snapshot.get("issues", {}).get(str(issue_number), {}).get("status")
+        issue_state = snapshot.get("issues", {}).get(str(issue_number), {})
+        issue_status = issue_state.get("status")
+        # Issue #776: this wrapper is called on every pass for as long as the
+        # underlying janitor failure persists (review()'s escalated-issue
+        # early return re-attempts it every pass; merge_ready()'s conflict
+        # trigger no longer pre-excludes "escalated" either, by design, so
+        # unrelated remediation can proceed). Once THIS lane's own cap has
+        # already escalated the pair, re-running the block below on an
+        # unchanged verdict would re-burn attempts_key past the cap, re-fire
+        # janitor_rework_escalated, and re-call transition() every single
+        # pass forever. Match on the lane-specific escalation_reason (not
+        # just issue_status == "escalated") so an escalation from a
+        # DIFFERENT lane -- a different attempts_key, or the unrelated
+        # watchdog redispatch cap -- does NOT match here and remediation of
+        # that unrelated Y still proceeds below. Checking both records
+        # covers the PR-only-escalated edge case.
+        #
+        # Both this lane's cap-exceeded escalation AND its stall escalation
+        # (_check_janitor_rework_stall, issue #765/#774) must be recognized
+        # here. Without the stall reason, an issue escalated for a stalled
+        # rework (nobody working it -- the whole point of that escalation is
+        # to get a human to look) would fall through: its status is
+        # "escalated", not "rework_requested"/"dispatched"/"dispatch_pending",
+        # so `rework_pending` below is False and the function would proceed
+        # straight to the attempts-increment/dispatch logic and silently
+        # redispatch a fresh rework attempt on the very next pass --
+        # defeating the stall escalation the moment it fires.
+        current_escalation_reasons = frozenset(
+            {f"{attempts_key}_cap_exceeded", f"{attempts_key}_stall_exceeded"}
+        )
+        if (
+            issue_state.get("escalation_reason") in current_escalation_reasons
+            or existing_pr_state.get("escalation_reason") in current_escalation_reasons
+        ):
+            return None
         rework_pending = issue_status in ("rework_requested", "dispatched", "dispatch_pending")
         counted_head = existing_pr_state.get(last_head_key)
         if rework_pending:
@@ -12231,6 +12544,15 @@ class OrchestratorApp:
             )
 
         if max_attempts > 0 and attempts > max_attempts:
+            # Issue #776: record a structured, lane-specific escalation reason
+            # (distinct from the generic "redispatch_cap_exceeded" other
+            # escalation sites use for the unrelated worker-liveness
+            # redispatch cap) so a human -- and any future reason-scoped
+            # guard -- can tell THIS lane's cap is what's exhausted, as
+            # opposed to an unrelated lane having escalated the issue. This
+            # was the one escalation call site in the codebase that recorded
+            # no reason at all.
+            escalation_reason = f"{attempts_key}_cap_exceeded"
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 state["prs"][str(pr_number)] = {
@@ -12238,12 +12560,14 @@ class OrchestratorApp:
                     "number": pr_number,
                     "issue_number": issue_number,
                     "status": "escalated",
+                    "escalation_reason": escalation_reason,
                     attempts_key: attempts,
                 }
                 state["issues"][str(issue_number)] = {
                     **state["issues"].get(str(issue_number), {}),
                     "number": issue_number,
                     "status": "escalated",
+                    "escalation_reason": escalation_reason,
                     "merge_alert": "OK",
                     # Issue #783: janitor-gate rework attempt cap is a
                     # process limit, not a judgment call -- mechanical.
@@ -12256,6 +12580,7 @@ class OrchestratorApp:
                         "pr_number": pr_number,
                         "issue_number": issue_number,
                         "reason": reason,
+                        "escalation_reason": escalation_reason,
                         "attempts": attempts,
                     },
                 )
@@ -12456,6 +12781,15 @@ class OrchestratorApp:
         if elapsed_minutes < threshold_minutes:
             return None
 
+        # Issue #776 follow-up: record a lane-scoped escalation_reason here
+        # too (parallel to the cap-exceeded branch above), not just a status
+        # flip. Without it, _route_janitor_gate_failure_to_rework's same-lane
+        # guard has nothing to match on the next pass -- the issue's status
+        # is "escalated" (so rework_pending is False, skipping straight past
+        # the not-settled branch) and the wrapper would silently redispatch a
+        # fresh rework attempt (or re-escalate) immediately, undoing the stall
+        # escalation's entire purpose the moment it fires.
+        escalation_reason = f"{attempts_key}_stall_exceeded"
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             attempts_so_far = int(state["prs"].get(str(pr_number), {}).get(attempts_key, 0))
@@ -12464,6 +12798,7 @@ class OrchestratorApp:
                 "number": pr_number,
                 "issue_number": issue_number,
                 "status": "escalated",
+                "escalation_reason": escalation_reason,
                 stall_since_key: None,
                 stall_head_key: None,
             }
@@ -12471,6 +12806,7 @@ class OrchestratorApp:
                 **state["issues"].get(str(issue_number), {}),
                 "number": issue_number,
                 "status": "escalated",
+                "escalation_reason": escalation_reason,
                 "merge_alert": "OK",
                 # Issue #783: a stalled rework worker is a process failure,
                 # not a judgment call -- mechanical.
@@ -12483,6 +12819,7 @@ class OrchestratorApp:
                     "pr_number": pr_number,
                     "issue_number": issue_number,
                     "reason": reason,
+                    "escalation_reason": escalation_reason,
                     "attempts": attempts_so_far,
                     "stalled_minutes": round(elapsed_minutes, 1),
                     "stall_since": stall_since,
@@ -13611,6 +13948,78 @@ class OrchestratorApp:
             "cleared_condition": cleared_condition,
         }
 
+    def _backfill_missing_reason_classes(self, state: dict[str, Any]) -> dict[str, Any]:
+        """One-way migration that gives legacy escalations a ``reason_class`` (issue #797).
+
+        Escalations created before the ``reason_class`` field shipped carry no
+        ``reason_class`` at all, so the de-escalation sweep cannot see them.
+        ``events.db`` retains the original escalation-transition event for most
+        of them; for each ``escalated``/``blocked`` issue that still lacks
+        ``reason_class``, this helper looks up the most recent such event and
+        derives the class from its kind.
+
+        The mapping is deliberately conservative: only kinds that unambiguously
+        indicate a process failure are mapped to ``"mechanical"``. Kinds in
+        ``DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS`` (e.g.
+        ``janitor_rework_escalated``, a deliberately-preserved forensic record)
+        are left untouched, so they stay terminal. No event, or an unknown
+        kind, also stays fail-closed.
+
+        Backfilling only writes ``reason_class``. It does not clear the
+        escalation, does not reset ``auto_deescalation_count`` or any
+        per-mechanism attempt counter, and emits exactly one
+        ``deescalation_reason_class_backfilled`` event per issue so the
+        migration is auditable. It is idempotent: once ``reason_class`` is
+        present the issue is skipped.
+        """
+        all_source_kinds: frozenset[str] = (
+            frozenset(ESCALATION_REASON_CLASS_BY_EVENT_KIND)
+            | DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS
+        )
+        for issue_key, issue in list(state.get("issues", {}).items()):
+            if not isinstance(issue, dict):
+                continue
+            if issue.get("status") not in ("escalated", "blocked"):
+                continue
+            if "reason_class" in issue:
+                continue
+            if not issue_key.isdigit():
+                continue
+            issue_number = int(issue_key)
+
+            events = query_events(
+                self.paths.state_file,
+                issue_number=issue_number,
+            )
+            escalation_events = [e for e in events if e["kind"] in all_source_kinds]
+            if not escalation_events:
+                continue
+            latest = escalation_events[-1]
+            reason_class = ESCALATION_REASON_CLASS_BY_EVENT_KIND.get(latest["kind"])
+            if reason_class is None:
+                continue
+
+            issue = {
+                **issue,
+                "number": issue_number,
+                "reason_class": reason_class,
+            }
+            state = {
+                **state,
+                "issues": {**state.get("issues", {}), issue_key: issue},
+            }
+            state = self._record_event(
+                state,
+                "deescalation_reason_class_backfilled",
+                {
+                    "issue_number": issue_number,
+                    "from_event_kind": latest["kind"],
+                    "from_event_ts": latest["ts"],
+                    "reason_class": reason_class,
+                },
+            )
+        return state
+
     def _maybe_deescalate_mechanical(self) -> None:
         """Periodic sweep that re-evaluates ``mechanical`` escalations (issue #783).
 
@@ -13626,15 +14035,16 @@ class OrchestratorApp:
         This method is the automated re-entry point for exactly that
         process-failure class. It is scoped narrowly by construction:
 
-        - Only issues whose entry carries ``reason_class == "mechanical"`` --
+        - Issues whose entry carries ``reason_class == "mechanical"`` --
           written atomically alongside every ``status -> escalated/blocked``
           transition at its call site (S1-S14 in the issue #783 implementation)
-          -- are ever considered. ``judgment`` escalations (an explicit
-          product/security decision, or a merged-PR mention needing human
-          confirmation) and any PRE-EXISTING escalation with no recorded
-          reason_class at all (every escalation before this change shipped)
-          fail closed: they are invisible to this selection query and stay
-          exactly as terminal as they were before this method existed.
+          -- are considered directly. ``judgment`` escalations stay terminal.
+          A PRE-EXISTING escalation with no recorded ``reason_class`` (every
+          escalation before issue #783 shipped) is first backfilled from its
+          most recent escalation-transition event in ``events.db`` (issue #797):
+          only kinds that unambiguously denote a process failure become
+          ``mechanical``; ambiguous or unknown kinds, and issues with no event,
+          stay fail-closed and invisible to the selection query.
         - Clearing additionally requires a live, freshly-fetched PR that is
           still OPEN, does not report ``mergeable == "CONFLICTING"`` (mirrors
           ``janitor._check_mergeable``'s own permissive definition exactly --
@@ -13673,6 +14083,8 @@ class OrchestratorApp:
             state = load_state(state_file)
             if not is_deescalation_due(state):
                 return
+            state = self._backfill_missing_reason_classes(state)
+            save_state(state_file, state)
             candidates = sorted(
                 int(num)
                 for num, entry in state.get("issues", {}).items()
