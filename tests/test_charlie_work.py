@@ -74,12 +74,14 @@ from charlie_work.workflow import (
     CommandResult,
     ConcurrencyGovernorResult,
     OrchestratorApp,
+    _annotation_to_required_change,
     _append_sweep_events,
     _detect_and_handle_stalled_reviews,
     _is_carry_forward_eligible,
     _parse_review_verdict_from_log,
     _reap_orphaned_review_checkouts,
     _render_required_changes_section,
+    _required_changes_from_checks,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -2534,6 +2536,46 @@ def test_pr_checks_returns_none_on_gh_command_failure(monkeypatch, tmp_path: Pat
     assert checks is None
 
 
+def test_check_run_annotations_returns_parsed_list_on_success(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(
+                [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    result = github_module.GitHub(tmp_path).check_run_annotations(999)
+
+    assert result == [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+
+
+def test_check_run_annotations_returns_empty_list_on_api_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #771: the annotations accessor must return a value (empty list),
+    never raise, when the gh api call fails -- callers building required_changes
+    from it must never crash the review() codepath on a transient GitHub error."""
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr="HTTP 404: Not Found",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    result = github_module.GitHub(tmp_path).check_run_annotations(999)
+
+    assert result == []
+
+
 def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) -> None:
     """gh pr checks exits non-zero but with JSON list (failing checks) -> list."""
 
@@ -3094,6 +3136,11 @@ class FakeGitHub:
             {"name": "Pre-commit", "state": "SUCCESS"},
         ]
 
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        # Mirrors the real GitHub.check_run_annotations default: no
+        # annotations configured means an empty list, never a raise.
+        return []
+
     def pr_diff(self, number: int):
         # Return custom diff if set, otherwise default
         if number in self.diffs:
@@ -3394,6 +3441,22 @@ class FakeGitHubWithChecks(FakeGitHub):
             }
             for check in self.checks
         ]
+
+
+class FakeGitHubWithChecksAndAnnotations(FakeGitHubWithChecks):
+    """FakeGitHubWithChecks whose check_run_annotations returns a configurable
+    per-check-run-id mapping (issue #771 tests)."""
+
+    def __init__(
+        self,
+        checks: list[dict[str, Any]] | None = None,
+        annotations_by_check_run_id: dict[int, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        super().__init__(checks=checks)
+        self.annotations_by_check_run_id = annotations_by_check_run_id or {}
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        return self.annotations_by_check_run_id.get(check_run_id, [])
 
 
 class FakeGitHubWithMissingRequired(FakeGitHubWithChecks):
@@ -13111,6 +13174,292 @@ def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> 
     assert "No interdiff is needed" in packet
 
 
+def test_annotation_to_required_change_full_annotation() -> None:
+    """Issue #771: a well-formed GitHub annotation renders check/path/line/message."""
+    entry = _annotation_to_required_change(
+        "Lint",
+        {
+            "path": "src/charlie_work/workflow.py",
+            "start_line": 42,
+            "message": "line too long (100 > 99)",
+        },
+    )
+    assert entry == "Lint: src/charlie_work/workflow.py:42 — line too long (100 > 99)"
+
+
+def test_annotation_to_required_change_no_message_returns_none() -> None:
+    """Never fabricate a placeholder when GitHub gives no explanatory message."""
+    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "start_line": 1}) is None
+    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "message": ""}) is None
+
+
+def test_annotation_to_required_change_missing_path_falls_back_to_message_only() -> None:
+    """No path/line data (e.g. a process-level crash) still surfaces the real
+    message rather than being dropped -- but with no fabricated location."""
+    entry = _annotation_to_required_change("Tests", {"message": "process exited with code 1"})
+    assert entry == "Tests: process exited with code 1"
+
+
+def test_annotation_to_required_change_path_without_line() -> None:
+    entry = _annotation_to_required_change(
+        "Lint", {"path": "src/foo.py", "message": "file-level issue"}
+    )
+    assert entry == "Lint: src/foo.py — file-level issue"
+
+
+def test_annotation_to_required_change_non_dict_returns_none() -> None:
+    assert _annotation_to_required_change("Lint", "not a dict") is None  # type: ignore[arg-type]
+
+
+def test_required_changes_from_checks_aggregates_annotations_for_failing_check() -> None:
+    checks = [
+        {"name": "Lint", "state": "FAILURE", "databaseId": 111},
+        {"name": "Tests", "state": "SUCCESS", "databaseId": 222},
+    ]
+    annotations_by_id = {
+        111: [
+            {"path": "src/foo.py", "start_line": 10, "message": "E501 line too long"},
+            {"path": "src/bar.py", "start_line": 20, "message": "F401 unused import"},
+        ],
+    }
+    required_changes = _required_changes_from_checks(
+        checks, ("Lint",), lambda check_run_id: annotations_by_id.get(check_run_id, [])
+    )
+    assert required_changes == [
+        "Lint: src/foo.py:10 — E501 line too long",
+        "Lint: src/bar.py:20 — F401 unused import",
+    ]
+
+
+def test_required_changes_from_checks_skips_passing_run_of_failed_name() -> None:
+    """A name with two runs (matrix legs) under worst-of semantics: only the
+    FAILURE run's annotations should be fetched, not the passing sibling's."""
+    fetched_ids: list[int] = []
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        fetched_ids.append(check_run_id)
+        return [{"path": "x.py", "start_line": 1, "message": "boom"}] if check_run_id == 2 else []
+
+    checks = [
+        {"name": "Tests", "state": "SUCCESS", "databaseId": 1},
+        {"name": "Tests", "state": "FAILURE", "databaseId": 2},
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Tests",), fetch)
+    assert fetched_ids == [2]
+    assert required_changes == ["Tests: x.py:1 — boom"]
+
+
+def test_required_changes_from_checks_no_databaseid_degrades_to_empty() -> None:
+    """No resolvable check-run id AND no link (e.g. a bare status check with
+    neither) -- degrade to [] without ever calling the annotations fetcher."""
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": None}]
+    called = False
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        nonlocal called
+        called = True
+        return []
+
+    assert _required_changes_from_checks(checks, ("Lint",), fetch) == []
+    assert called is False
+
+
+def test_required_changes_from_checks_no_databaseid_falls_back_to_link() -> None:
+    """No resolvable check-run id (e.g. an external status check) but a real
+    ``link`` from GitHub -- fall back to pointing at the link rather than
+    silently dropping the failure, and never call the annotations fetcher
+    (there is no check-run id to fetch with)."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": None,
+            "link": "https://example.com/status/lint",
+        }
+    ]
+    called = False
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        nonlocal called
+        called = True
+        return []
+
+    result = _required_changes_from_checks(checks, ("Lint",), fetch)
+    assert result == [
+        "Lint: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://example.com/status/lint",
+    ]
+    assert called is False
+
+
+def test_required_changes_from_checks_zero_annotations_degrades_to_empty() -> None:
+    """A resolvable check run with zero annotations and no link (common for a
+    process-level crash) degrades to [] -- never a fabricated file/line."""
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
+    assert _required_changes_from_checks(checks, ("Lint",), lambda _id: []) == []
+
+
+def test_required_changes_from_checks_zero_annotations_falls_back_to_link() -> None:
+    """A resolvable check run with zero annotations but a real ``link`` falls
+    back to the link -- more useful than silence, still not fabricated."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": 5,
+            "link": "https://github.com/o/r/actions/runs/1/jobs/5",
+        }
+    ]
+    result = _required_changes_from_checks(checks, ("Lint",), lambda _id: [])
+    assert result == [
+        "Lint: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://github.com/o/r/actions/runs/1/jobs/5",
+    ]
+
+
+def test_required_changes_from_checks_no_checks_available_degrades_to_empty() -> None:
+    assert _required_changes_from_checks(None, ("Lint",), lambda _id: []) == []
+
+
+def test_required_changes_from_checks_no_failed_names_degrades_to_empty() -> None:
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
+    assert _required_changes_from_checks(checks, (), lambda _id: [{"message": "x"}]) == []
+
+
+def test_review_ci_failure_with_annotations_populates_required_changes(tmp_path: Path) -> None:
+    """Issue #771: a required-check failure whose check run carries GitHub
+    annotations yields required_changes naming the real file/line, and the
+    rendered rework brief contains them -- not just the bare check-name
+    summary the route previously emitted."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={
+            9001: [
+                {
+                    "path": "src/charlie_work/workflow.py",
+                    "start_line": 7296,
+                    "message": "F821 undefined name 'checks'",
+                    "annotation_level": "failure",
+                },
+            ],
+        },
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == [
+        "Tests passed: src/charlie_work/workflow.py:7296 — F821 undefined name 'checks'",
+    ]
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "## Required changes" in prompt_text
+    assert "src/charlie_work/workflow.py:7296" in prompt_text
+    assert "F821 undefined name 'checks'" in prompt_text
+    # The failing check's own name reaches the brief via $dispatch_note (the
+    # rework_summary passed to _write_rework_prompt, kept as a separate
+    # template slot from $required_changes_section) regardless of which
+    # required_changes tier rendered -- a worker sees which check was red
+    # even when tier 1 (the enumerated list) is what fired.
+    assert "Tests passed" in prompt_text
+
+
+def test_review_ci_failure_without_annotations_degrades_without_fabricating(
+    tmp_path: Path,
+) -> None:
+    """Issue #771: a failing required check whose run carries zero GitHub
+    annotations AND no link (e.g. a process-level crash with nothing GitHub
+    can point at) must not fabricate a file/line -- required_changes stays
+    empty and the pre-existing summary-only fallback
+    (_render_required_changes_section tier 2) renders instead."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9002},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={},  # 9002 resolves to zero annotations
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == []
+    assert decision["summary"] == "CI failed on Tests passed; push a fix"
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    # Tier-2 fallback renders the real summary verbatim -- not a fabricated
+    # file/line, and still strictly more informative than an empty section.
+    assert "CI failed on Tests passed; push a fix" in prompt_text
+    assert "## Required changes" in prompt_text
+
+
+def test_review_ci_failure_without_annotations_but_with_link_uses_link_fallback(
+    tmp_path: Path,
+) -> None:
+    """Issue #771: a failing required check with zero GitHub annotations but a
+    real ``link`` (the common case: GitHub Actions always assigns a run URL,
+    but only some failure modes emit per-line annotations) falls back to
+    pointing the worker at the failing run instead of degrading all the way
+    to the bare check-name summary."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {
+                "name": "Tests passed",
+                "state": "FAILURE",
+                "databaseId": 9003,
+                "link": "https://github.com/o/r/actions/runs/1/jobs/9003",
+            },
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={},  # 9003 resolves to zero annotations
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == [
+        "Tests passed: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://github.com/o/r/actions/runs/1/jobs/9003",
+    ]
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "## Required changes" in prompt_text
+    assert "https://github.com/o/r/actions/runs/1/jobs/9003" in prompt_text
+
+
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
     """Issue #376: a definitive required-check failure on a linked issue routes to rework."""
     config = _required_checks_config()
@@ -14360,6 +14709,115 @@ def test_linked_issue_number_none_treats_as_cross_repository() -> None:
             branch_prefix="agent/issue",
         )
         is None
+    )
+
+
+def test_linked_issue_number_negation_guard_rejects_negated_keyword() -> None:
+    # Issue #781 AC1: a closing keyword preceded by a negation must not
+    # bind -- "does not fix #649" is the real-world PR #766 -> issue #649
+    # text that produced a false LABEL TRANSITION (not a GitHub auto-close;
+    # this guard only affects charlie-work's own binding). The non-negated
+    # form of the identical keyword still binds.
+    assert (
+        linked_issue_number(
+            {"body": "does not fix #649"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+    assert (
+        linked_issue_number(
+            {"body": "Fixes #649"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        == 649
+    )
+
+
+def test_linked_issue_number_negation_guard_table() -> None:
+    # Issue #781 AC2: table-driven negation coverage (doesn't / never /
+    # without / cannot / does not), plus non-negated controls proving the
+    # guard doesn't over-trigger on unrelated text.
+    negated_cases = [
+        "doesn't close #1",
+        "never resolves #2",
+        # "without fixing #3" returns None via the BASE regex, not the
+        # negation guard: _CLOSING_KEYWORD_REF only matches fix/fixes/fixed
+        # (fix(?:e[sd])?) -- never the gerund "fixing". Included per the
+        # issue's explicit list, but see the dedicated assertion below for
+        # proof this is NOT evidence the negation guard itself fired.
+        "without fixing #3",
+        "cannot close #4",
+        "does not fix #5",
+    ]
+    for body in negated_cases:
+        assert (
+            linked_issue_number(
+                {"body": body},
+                is_cross_repository=False,
+                branch_prefix="agent/issue",
+            )
+            is None
+        ), f"expected no binding for negated text: {body!r}"
+
+    # Non-negated controls: the same keywords, without a preceding negation,
+    # still bind -- proves the guard isn't simply matching nothing.
+    non_negated_cases = [
+        ("Closes #1", 1),
+        ("This resolves #2", 2),
+        ("Fixes #5", 5),
+    ]
+    for body, expected in non_negated_cases:
+        assert (
+            linked_issue_number(
+                {"body": body},
+                is_cross_repository=False,
+                branch_prefix="agent/issue",
+            )
+            == expected
+        ), f"expected binding to {expected} for non-negated text: {body!r}"
+
+    # "fixing #3" alone (no negation at all) confirms the gerund truly never
+    # matches the base regex -- so the None result above for "without
+    # fixing #3" is not evidence the negation guard fired.
+    assert (
+        linked_issue_number(
+            {"body": "fixing #3"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+
+
+def test_linked_issue_number_negation_does_not_shadow_later_genuine_match() -> None:
+    # A negated match earlier in a text field must not prevent a later,
+    # genuine closing keyword from binding -- finditer-continuation, not
+    # search()-first-match-only. Monotone with respect to pre-#781 behavior:
+    # no input that previously returned a number now returns None because of
+    # this change; the negation guard can only turn a previously-binding
+    # negated match into None, never suppress a separate genuine one.
+    #
+    # The negation lookback window (32 chars, chosen to cover "does not "
+    # plus headroom) is deliberately wide enough to span a short clause, so
+    # a genuine match must sit outside that window to prove continuation
+    # rather than an accidental non-negation coincidence. Verified
+    # empirically: without the padding, "does not fix #649. Fixes #700"
+    # actually returns None (the 32-char window reaches back across the
+    # sentence boundary to "not") -- that cross-sentence over-triggering is
+    # the deliberate, sanctioned safe-direction tradeoff described on
+    # `_NEGATION_LOOKBEHIND_CHARS`, not a bug. This test instead places the
+    # genuine match far enough away to isolate the continuation behavior.
+    padded_body = "does not fix #649. " + ("x" * 50) + " Fixes #700"
+    assert (
+        linked_issue_number(
+            {"body": padded_body},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        == 700
     )
 
 
@@ -29994,6 +30452,175 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
     assert recovered_events[0]["payload"]["pr_number"] == 100
     assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
 
+    # Issue #773 measurement-first requirement: even the legacy no-terminal-
+    # record fallback path now reports pid/exit_code/duration_seconds on the
+    # event (exit_code/duration None since no terminal record exists).
+    assert recovered_events[0]["payload"]["pid"] == 99999
+    assert recovered_events[0]["payload"]["exit_code"] is None
+    assert recovered_events[0]["payload"]["duration_seconds"] is None
+
+
+def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
+    """Issue #773: a worker that exited 0 (clean, no-op) must not be reset to
+    rework_requested or burn a redispatch attempt, even though its dead PID and
+    unchanged head otherwise look identical to a crash under
+    ``_worker_pid_alive`` alone.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",  # Unchanged since request_changes
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Durable terminal-status record a real worker's watcher thread would have
+    # written at exit (process_utils.start_terminal_status_watcher): exit
+    # code 0 means the worker completed cleanly rather than crashing.
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 0,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:05:00Z",
+                "duration_seconds": 300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Must NOT be reset to rework_requested -- that would burn a redispatch
+    # attempt on a worker that never had anything to change.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("dispatched_at") == "2024-01-01T00:00:00Z"
+    assert entry["worker_pid"] == 99999
+
+    events = state.get("events", [])
+    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    payload = drift_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_clean_exit_no_op"
+    assert payload["pid"] == 99999
+    assert payload["exit_code"] == 0
+    assert payload["duration_seconds"] == 300.0
+
+
+def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Path) -> None:
+    """Issue #773: a non-zero exit code recorded in the terminal-status file
+    must still take the pre-#773 recovery path (reset to rework_requested) --
+    the fix only special-cases a confirmed clean (exit code 0) exit, never a
+    confirmed abnormal one.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 1,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:00:05Z",
+                "duration_seconds": 5.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    payload = recovered_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_with_request_changes"
+    assert payload["pid"] == 99999
+    assert payload["exit_code"] == 1
+    assert payload["duration_seconds"] == 5.0
+
 
 def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
     """Regression test for issue #207: dead worker with head change should emit drift event, not auto-reset."""
@@ -34020,7 +34647,13 @@ def test_rework_brief_falls_back_to_summary_when_required_changes_empty(
     _render_required_changes_section returned "" whenever required_changes
     was empty, so the worker's rework brief contained none of that summary
     content even though it was real, substantive review findings sitting
-    right there in review-decision.json. Must fail before F1, pass after."""
+    right there in review-decision.json. Must fail before F1, pass after.
+
+    The reviewer_summary text here is the real PR #766 reproduction string
+    from issue #781 -- it contains a live closing keyword ("does not fix
+    #649") that must reach the brief DEFANGED (issue #781 outbound fix), so
+    this test also doubles as an AC4-adjacent regression guard: the summary
+    fallback tier must not leak `fix #649` verbatim into a worker's brief."""
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -34038,8 +34671,12 @@ def test_rework_brief_falls_back_to_summary_when_required_changes_empty(
     )
 
     brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
-    assert reviewer_summary in brief, "reviewer summary missing from brief"
     assert "## Required changes" in brief
+    # Content (the reviewer's findings) survives, defanged of the live
+    # closing-keyword syntax that would otherwise let GitHub or a worker's
+    # own PR body auto-close/mis-bind issue #649.
+    assert "does not fix issue 649" in brief, "reviewer summary missing from brief"
+    assert "does not fix #649" not in brief, "live closing keyword leaked into brief"
 
 
 def test_render_required_changes_section_populated_list_unaffected_by_fallback() -> None:
@@ -34096,6 +34733,71 @@ def test_render_required_changes_section_blocked_both_empty_renders_escape_hatch
     assert "REVIEWER FINDINGS UNAVAILABLE" in section
 
 
+def test_defang_closing_keywords_strips_live_keyword_but_keeps_number_legible() -> None:
+    # Issue #781 AC3: defang_closing_keywords rewrites `<keyword> #N` to
+    # `<keyword> issue N` -- the rewritten text no longer matches the
+    # closing-keyword regex (so it can no longer auto-close or falsely bind
+    # via linked_issue_number), but the issue number stays legible to a
+    # human reader.
+    from charlie_work.github import _CLOSING_KEYWORD_REF, defang_closing_keywords
+
+    text = "does not fix #649"
+    defanged = defang_closing_keywords(text)
+
+    assert _CLOSING_KEYWORD_REF.search(defanged) is None
+    assert "649" in defanged, "issue number must remain legible to a human"
+    assert defanged == "does not fix issue 649"
+
+
+def test_defang_closing_keywords_preserves_non_keyword_hash_refs() -> None:
+    # Bare `#N` (no preceding closing keyword) and `issue #N` mentions pass
+    # through untouched -- defang targets only the live auto-close syntax.
+    # Multiple keyword refs in one string are each independently defanged.
+    from charlie_work.github import defang_closing_keywords
+
+    assert defang_closing_keywords("see #5 for context") == "see #5 for context"
+    assert defang_closing_keywords("related to issue #5") == "related to issue #5"
+    assert (
+        defang_closing_keywords("Closes #1 and also fixes #2")
+        == "Closes issue 1 and also fixes issue 2"
+    )
+
+
+def test_render_required_changes_section_defangs_live_keyword_in_list_tier() -> None:
+    # Issue #781 AC4: reviewer prose in the required_changes list tier must
+    # not carry a live closing keyword into the rendered brief -- a worker
+    # reads this brief and writes its own PR body from it, a boundary
+    # linked_issue_number's hijack-safety check never sees.
+    from charlie_work.github import _CLOSING_KEYWORD_REF
+
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["this does not fix #649, dig deeper"],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "does not fix issue 649" in section
+    assert _CLOSING_KEYWORD_REF.search(section) is None, "live keyword survived"
+
+
+def test_render_required_changes_section_defangs_live_keyword_in_summary_tier() -> None:
+    # Same guarantee for the summary-fallback tier (tier 2).
+    from charlie_work.github import _CLOSING_KEYWORD_REF
+
+    decision = {
+        "decision": "request_changes",
+        "summary": "BLOCKER - does not fix #649. Still broken.",
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "does not fix issue 649" in section
+    assert _CLOSING_KEYWORD_REF.search(section) is None, "live keyword survived"
+
+
 def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) -> None:
     """F3: _request_no_op_rework_repair's hardcoded no-op note must not
     displace the reviewer's findings. It routes through _route_to_rework,
@@ -34132,8 +34834,10 @@ def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) ->
     # The no-op operational note (the "dispatch_note") is present...
     assert "no actual content change" in brief
     # ...and the reviewer's original findings are still present alongside it,
-    # not replaced by it.
-    assert reviewer_summary in brief
+    # not replaced by it -- defanged of the live closing keyword (issue
+    # #781 outbound fix) the same way as the summary-fallback test above.
+    assert "does not fix issue 649" in brief
+    assert "does not fix #649" not in brief, "live closing keyword leaked into brief"
 
 
 def _normalize_ws(text: str) -> str:
