@@ -20,6 +20,7 @@ from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
     WorktreeCleanResult,
+    WorktreeCleanGH,
     WorktreeInfo,
     WorktreeProbeFailedError,
     WorktreeState,
@@ -4191,8 +4192,12 @@ def _make_state(issue_number: int, pr_number: int, *, status: str = "merged") ->
     }
 
 
-class _FakeGH:
+class _FakeGH(WorktreeCleanGH):
     """Fake ``GitHub`` for ``clean_worktrees`` tests.
+
+    Implements the ``WorktreeCleanGH`` protocol (the slice of ``GitHub`` the
+    cleanup lane depends on) so it is statically assignable to
+    ``clean_worktrees(..., gh=...)`` without ``cast`` (issue #641).
 
     ``available=False`` simulates ``gh`` itself failing/being unreachable
     (``GitHubRunResult(ok=False, ...)``), distinct from ``gh`` succeeding but

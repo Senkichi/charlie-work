@@ -11,6 +11,8 @@ import yaml
 
 from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
+from . import layout
+
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
 # Root-relative path the Claude Code adapter writes to in each worktree.
@@ -270,6 +272,37 @@ class QuotaProbeConfig:
 
 
 @dataclass(frozen=True)
+class ReconcilePassConfig:
+    """Periodic in-loop reconcile: merge-lane-recovery plan §6-B.
+
+    Wires ``OrchestratorApp.reconcile(fix=True)`` -- previously reachable
+    only via the operator-invoked ``charlie mop-up --fix`` CLI command --
+    into the fleet loop on a fixed cadence, so a state/label divergence
+    (e.g. an escalation whose ``human_needed`` label write silently failed,
+    per the plan's PRIMARY defect) is repaired automatically instead of only
+    when an operator remembers to run mop-up. Repair direction is always
+    state-wins: reconcile only ever converges GitHub labels to match
+    ``state.json``; it never rewrites ``status`` (D-2), so this is safe to
+    run unattended on every repo, every cycle.
+    """
+
+    # Default True: the fleet has never run its own repair (baseline: zero
+    # reconcile events ever recorded across the whole event history), and
+    # the repair direction is provably safe (see class docstring). A knob
+    # defaulted off would leave that divergence class unrepaired until an
+    # operator remembered to flip it -- exactly the failure mode this
+    # workstream exists to close. The knob exists for rollback, not opt-in.
+    enabled: bool = True
+    # detect_drift() issues two full-repo GitHub list queries (all PRs, all
+    # issues) plus a GraphQL rate-limit check every time it runs -- heavier
+    # than quota_probe's single cheap Haiku subprocess call, so a longer flat
+    # cadence than quota_probe's 15 minutes is appropriate here. 30 minutes
+    # still comfortably beats "only ever runs when an operator remembers to
+    # run mop-up".
+    interval_minutes: int = 30
+
+
+@dataclass(frozen=True)
 class ReviewDispatchConfig:
     # Issue #370: concurrent reviewer launcher for queued PRs. This is a
     # deterministic loop stage, not a provider governor; reviewers use
@@ -277,8 +310,10 @@ class ReviewDispatchConfig:
     enabled: bool = False
     # Per-PR review sidecar + log directory. MUST be distinct from
     # devin.sessions_dir so worker concurrency accounting is not poisoned by
-    # reviewer processes.
-    reviews_dir: str = ".var/charlie-work/dispatches/reviews"
+    # reviewer processes. Empty string means "derive from runtime.state_dir"
+    # (layout.reviews_dir_default) rather than a fixed literal -- see
+    # paths.resolved_layout, the single place that resolves this sentinel.
+    reviews_dir: str = ""
     # Local-only process bound. 0 means unlimited; raise this only if local
     # CPU/disk from concurrent reviewer worktrees becomes a visible bottleneck.
     # Default is 2 so a host that enables review_dispatch without overriding
@@ -482,7 +517,7 @@ class AutoMergeConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    state_dir: str = ".var/charlie-work"
+    state_dir: str = layout.DEFAULT_STATE_DIR
     # Repo-local template dir searched before the package defaults. Relative
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None
@@ -561,12 +596,18 @@ class DevinConfig:
     # "claude-code" launches Claude Code workers in isolated git worktrees
     # (claude_code.py, configured under the claude_code section).
     adapter: str = "manual"
-    session_manifest: str = ".var/charlie-work/dispatches/session-manifest.json"
-    session_results: str = ".var/charlie-work/dispatches/session-results.json"
+    # Empty string means "derive from runtime.state_dir" (layout.py's
+    # session_manifest_default/session_results_default) rather than a fixed
+    # literal -- see paths.resolved_layout, the single place that resolves
+    # this sentinel.
+    session_manifest: str = ""
+    session_results: str = ""
     dispatch_command: str | tuple[str, ...] = ""
     command_timeout_seconds: int = 300
-    # devin-shell adapter: sidecar JSON + per-session logs live here.
-    sessions_dir: str = ".var/charlie-work/dispatches/sessions"
+    # devin-shell adapter: sidecar JSON + per-session logs live here. Empty
+    # string means "derive from runtime.state_dir" (layout.sessions_dir_default)
+    # -- see paths.resolved_layout.
+    sessions_dir: str = ""
     # devin-shell launch command; empty means devin_shell.DEFAULT_COMMAND_TEMPLATE.
     # Placeholders: {prompt_path} {issue_number} {branch} {model_args}.
     shell_command: tuple[str, ...] = ()
@@ -786,6 +827,7 @@ class CrossFamilyConfig:
         "{prompt_path}",
     )
     timeout_seconds: int = 300
+    auto_verdict: bool = False
 
 
 @dataclass(frozen=True)
@@ -961,7 +1003,10 @@ class NotifyConfig:
     sink: str = "file"  # "webhook" | "desktop" | "shell" | "file"
     webhook_url: str = ""
     shell_command: tuple[str, ...] = ()
-    file_path: str = ".var/charlie-work/notify/digest.jsonl"
+    # Empty string means "derive from runtime.state_dir"
+    # (layout.notify_digest_default) rather than a fixed literal -- see
+    # paths.resolved_layout, the single place that resolves this sentinel.
+    file_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -1180,6 +1225,7 @@ class OrchestratorConfig:
     review: ReviewConfig = field(default_factory=ReviewConfig)
     review_dispatch: ReviewDispatchConfig = field(default_factory=ReviewDispatchConfig)
     quota_probe: QuotaProbeConfig = field(default_factory=QuotaProbeConfig)
+    reconcile_pass: ReconcilePassConfig = field(default_factory=ReconcilePassConfig)
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)
@@ -1467,6 +1513,26 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if qp_prompt is not None and not qp_prompt.strip():
         raise ConfigError("config section 'quota_probe' key 'prompt' must not be empty")
     quota_probe = _build_section(QuotaProbeConfig, "quota_probe", quota_probe_data)
+    reconcile_pass_data = _section(data, "reconcile_pass")
+    rp_enabled = reconcile_pass_data.get("enabled")
+    if rp_enabled is not None and not isinstance(rp_enabled, bool):
+        raise ConfigError(
+            f"config section 'reconcile_pass' key 'enabled' must be a bool, "
+            f"got {type(rp_enabled).__name__}"
+        )
+    rp_interval = reconcile_pass_data.get("interval_minutes")
+    if rp_interval is not None and (
+        isinstance(rp_interval, bool) or not isinstance(rp_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'reconcile_pass' key 'interval_minutes' must be an int, "
+            f"got {type(rp_interval).__name__}"
+        )
+    if rp_interval is not None and rp_interval < 1:
+        raise ConfigError(
+            f"config section 'reconcile_pass' key 'interval_minutes' must be >= 1, got {rp_interval}"
+        )
+    reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -2235,6 +2301,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         review=review,
         review_dispatch=review_dispatch,
         quota_probe=quota_probe,
+        reconcile_pass=reconcile_pass,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,

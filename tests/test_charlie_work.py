@@ -49,12 +49,13 @@ from charlie_work.cross_family import (
     _CAVEAT,
     CrossFamilyResult,
     extract_report_body,
+    parse_cross_family_verdict,
     render_command,
     report_body_is_valid,
     run_cross_family_review,
 )
 from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
-from charlie_work.paths import runtime_paths
+from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
     append_event,
@@ -4528,6 +4529,90 @@ def test_dispatch_merged_pr_mention_flag_is_one_shot(tmp_path: Path) -> None:
     assert len(flagged_events_3) == 1  # still only the single pass-1 event
 
 
+def test_dispatch_merged_pr_mention_flag_skips_dedup_marker_on_partial_failure(
+    tmp_path: Path,
+) -> None:
+    """A PARTIAL_FAILURE label transition for merged_pr_mention_flagged must
+    NOT stamp merged_pr_mention_flagged_at. Before the fix, the dedup marker
+    was written unconditionally regardless of transition()'s outcome, so a
+    failed agent:human-needed label add still left the timestamp in state --
+    and the one-shot guard exercised by
+    test_dispatch_merged_pr_mention_flag_is_one_shot keys off exactly that
+    timestamp's presence, so the issue would never be retried even though
+    its label never actually changed.
+
+    Pass 2 then clears the injected failure and re-dispatches, proving the
+    withheld marker actually causes a retry -- not just that it is absent.
+    """
+    config = OrchestratorConfig()
+    human_needed = config.labels.human_needed
+
+    class LabelFailMentionGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_add = True
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            if label == human_needed and self.fail_add:
+                # Simulate a failed add (error-as-value) -> PARTIAL_FAILURE.
+                return False
+            return super().add_issue_label(number, label)
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailMentionGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Same mention-only setup as test_dispatch_merged_pr_mention_flag_is_one_shot:
+    # merged PR #456 only *mentions* issue #123 in free text -- no branch-prefix
+    # binding, no closing keyword -- so only the loose mention scan finds it.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+
+    # --- Pass 1: label add fails -> marker withheld, no event ---------------
+    result = app.dispatch(limit=1)
+    assert result.ok is True
+
+    # The add was attempted (proves the transition actually ran) but failed.
+    assert (123, human_needed) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"].get("123", {})
+    # The dedup marker must be ABSENT: a retry must occur on the next pass
+    # instead of being permanently suppressed by a marker stamped despite
+    # the label write having failed.
+    assert issue_entry.get("merged_pr_mention_flagged_at") is None
+
+    # The one-shot event is gated on the same success condition as the
+    # marker, so it must not have fired either.
+    flagged_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert flagged_events == []
+
+    # --- Pass 2: label add now succeeds -> the withheld marker must let the
+    # mention scan retry, not permanently suppress the issue. This is the
+    # behavior the marker's absence exists to enable -- proving it, not just
+    # the marker's absence, is what distinguishes "will retry" from "silently
+    # dropped."
+    fake_gh.fail_add = False
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    assert result2.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert (123, human_needed) in fake_gh.labels_added
+
+    state2 = load_state(paths.state_file)
+    assert state2["issues"]["123"].get("merged_pr_mention_flagged_at") is not None
+    flagged_events_2 = [
+        e
+        for e in state2.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert len(flagged_events_2) == 1
+    assert flagged_events_2[0]["payload"]["issue_numbers"] == [123]
+
+
 def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -> None:
     """Regression for the isCrossRepository guard (workflow.py,
     _merged_pr_referenced_issue_numbers): a merged PR whose provenance is
@@ -4828,7 +4913,7 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Create a session record for issue 123 with a live PID
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -5317,7 +5402,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Create a session record for issue 123 with a live PID
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -7650,7 +7735,7 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
     _write_review_packet(tmp_path, 100, "sha-100")
 
     # Seed a stale reviewer sidecar + state claim.
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     old_dispatched = old_started
@@ -7788,7 +7873,7 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
         save_state(app.paths.state_file, state)
 
     # Write a sidecar + log with a verdict so _reap_review_verdicts finds it.
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     log_path = reviews_dir / "issue-100-review.claude.log"
     log_path.write_text(
@@ -7870,7 +7955,7 @@ def test_dispatch_reviews_turn_limit_posts_summary_comment(monkeypatch, tmp_path
         }
         save_state(app.paths.state_file, state)
 
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
 
     # Write a log with NO verdict block (simulates turn-limit exhaustion).
@@ -7992,7 +8077,7 @@ def test_dispatch_reviews_turn_limit_summary_not_posted_twice(monkeypatch, tmp_p
         }
         save_state(app.paths.state_file, state)
 
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     log_path = reviews_dir / "issue-100-review.claude.log"
     log_path.write_text("Some analysis without a verdict.\n", encoding="utf-8")
@@ -10133,11 +10218,88 @@ def test_report_body_is_valid_rejects_blocked_output_with_bold_markers() -> None
     assert report_body_is_valid(blocked_with_bold) is False
 
 
+def test_report_body_is_valid_accepts_heading_style_markers() -> None:
+    """Cross-family models (e.g. kimi-k3) emit findings as ``### NIT —`` headings
+    and a ``## Verdict`` heading instead of ``**NIT**`` bold / ``Verdict:`` line.
+    These are real reviews and must not be falsely rejected as UNAVAILABLE.
+    """
+    heading_severity = (
+        "### NIT — worktree.py:2977 (new): dead weight\n\n"
+        "## Verdict\n\n**Approve** — claims verified."
+    )
+    assert report_body_is_valid(heading_severity) is True
+    # Heading verdict alone (no severity heading) is also valid.
+    assert report_body_is_valid("## Verdict\n\nApprove") is True
+    # Heading severity alone (no verdict heading) is also valid.
+    assert report_body_is_valid("### MAJOR — bug.py:10: off-by-one\n\nfix it") is True
+
+
 def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None:
     body = "**MAJOR**\nissue\n\nVerdict: safe"
     wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     assert extract_report_body(wrapped) == body
     assert extract_report_body(body) == body
+
+
+def test_parse_cross_family_verdict_approved_no_blockers() -> None:
+    """A report with only MINOR/NIT findings parses to approved."""
+    body = "**MINOR**\nsmall issue\n\nVerdict: No BLOCKERs or MAJORs — fix is correct"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, summary = result
+    assert decision == "approved"
+    assert "No BLOCKERs" in summary
+
+
+def test_parse_cross_family_verdict_request_changes_with_blocker() -> None:
+    """A report with a BLOCKER finding parses to request_changes."""
+    body = "**BLOCKER**\ncritical bug\n\nVerdict: BLOCKER — does not fix the issue"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, summary = result
+    assert decision == "request_changes"
+    assert "BLOCKER" in summary
+
+
+def test_parse_cross_family_verdict_request_changes_with_major() -> None:
+    """A report with a MAJOR finding parses to request_changes."""
+    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, _summary = result
+    assert decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_heading_style_major() -> None:
+    """Heading-style ``### MAJOR`` markers are detected as request_changes."""
+    body = "### MAJOR — bug.py:10: off-by-one\n\nfix it\n\n## Verdict\n\nMAJOR should be fixed"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    decision, _summary = result
+    assert decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_unavailable_returns_none() -> None:
+    """An UNAVAILABLE stub report returns None (skip, don't record a wrong verdict)."""
+    stub = "# Cross-family adversarial review — `glm-5.2` (UNAVAILABLE)\n\n> timed out\n"
+    assert parse_cross_family_verdict(stub) is None
+
+
+def test_parse_cross_family_verdict_empty_returns_none() -> None:
+    """Empty/blank report text returns None."""
+    assert parse_cross_family_verdict("") is None
+    assert parse_cross_family_verdict("   ") is None
+
+
+def test_parse_cross_family_verdict_invalid_body_returns_none() -> None:
+    """A report body that fails report_body_is_valid returns None."""
+    body = "some random text with no severity or verdict"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    assert parse_cross_family_verdict(wrapped) is None
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
@@ -10430,6 +10592,68 @@ def test_clear_reviewer_quota_drops_alerted_at() -> None:
 
     assert "alerted_at" not in cleared["reviewer_quota"]
     assert "throttled_until" not in cleared["reviewer_quota"]
+
+
+def test_defer_reviewer_probe_after_bumps_past_probe_after() -> None:
+    """A red flat probe must bump reviewer_quota.probe_after forward so
+    dispatch_reviews's probe_mode gate defers instead of independently
+    launching a real reviewer session into the same still-closed window
+    (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    # Quota exhausted, probe_after in the past (ready to probe).
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="2020-01-01T00:00:00Z",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T00:30:00Z"
+    # throttled_until is untouched.
+    assert result["reviewer_quota"]["throttled_until"] == "2099-01-01T00:00:00Z"
+
+
+def test_defer_reviewer_probe_after_noop_when_quota_not_exhausted() -> None:
+    """Must not write probe_after on a non-exhausted quota -- that would
+    leave stale state for no reason (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert "probe_after" not in result.get("reviewer_quota", {})
+
+
+def test_defer_reviewer_probe_after_never_moves_earlier() -> None:
+    """If the reviewer quota's own exponential backoff already pushed
+    probe_after further out than the flat probe's interval, the bump must
+    not shorten it -- that would make dispatch_reviews probe more often,
+    not less (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="2026-08-01T04:00:00Z",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T04:00:00Z"
+
+
+def test_defer_reviewer_probe_after_overwrites_malformed_current() -> None:
+    """A malformed current probe_after must not wedge the bump -- overwrite
+    with the well-formed new value (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="not-a-timestamp",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T00:30:00Z"
 
 
 def test_set_throttled_until_records_reason_and_adapter_kind() -> None:
@@ -14348,6 +14572,161 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
     }
 
 
+def test_merge_ready_failed_attempt_alarm_reports_merge_state_not_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #751: when every check-summary bucket is empty (all required
+    checks pass) but the PR is still unmergeable for a reason none of the
+    explicitly modelled branches (merge_conflict, cross_pr_revert_detected,
+    mergequeue_handoff_failed, summary.failed) name, the terminal ``else``
+    branch must report GitHub's own ``mergeable``/``mergeStateStatus``
+    instead of discarding it as "check summary unknown" (the real #679
+    payload: all required checks green, alarm text still uninformative).
+
+    The scenario is built by forcing a genuine merge-base staleness
+    (compare_overrides) combined with a failed ``pr_update_branch`` — this
+    sets ``sync_failed`` (and therefore ``can_merge=False``) without ever
+    setting ``merge_conflict`` (which only looks at CONFLICTING/DIRTY), so
+    the alarm chain falls through every explicit branch into the ``else``.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            # No required checks -> the check-summary buckets are vacuously
+            # empty, isolating the terminal `else` branch under test.
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+    fake_gh.prs[0]["mergeStateStatus"] = "BLOCKED"
+    # Force the merge-base freshness check to see a stale base (independent of
+    # mergeStateStatus, which the real _is_base_current path never consults),
+    # then fail the resulting update-branch attempt so sync_failed=True without
+    # ever tripping the CONFLICTING/DIRTY-only merge_conflict detector.
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "main-tip"},
+        "merge_base_commit": {"sha": "main-tip-stale"},
+    }
+    fake_gh.update_branch_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "mergeable=MERGEABLE" in warning
+    assert "mergeStateStatus=BLOCKED" in warning
+    # The negative control: without this assertion the test would also pass
+    # against the pre-fix code, which always appended the literal fallback
+    # regardless of what pr_view returned.
+    assert "check summary unknown" not in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["mergeable"] == "MERGEABLE"
+    assert alarm_events[0]["payload"]["merge_state_status"] == "BLOCKED"
+
+
+def test_merge_ready_failed_attempt_alarm_falls_back_when_merge_state_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #751: the "check summary unknown" fallback must survive for the
+    genuinely-unknown case where GitHub reports neither ``mergeable`` nor
+    ``mergeStateStatus`` as a usable signal (both ``"UNKNOWN"``), so a later
+    refactor of the merge-state bucket can't silently delete the fallback.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeable"] = "UNKNOWN"
+    fake_gh.prs[0]["mergeStateStatus"] = "UNKNOWN"
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "main-tip"},
+        "merge_base_commit": {"sha": "main-tip-stale"},
+    }
+    fake_gh.update_branch_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "check summary unknown" in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["mergeable"] == "UNKNOWN"
+    assert alarm_events[0]["payload"]["merge_state_status"] == "UNKNOWN"
+
+
+def test_merge_ready_failed_attempt_alarm_reports_unavailable_not_passed(
+    tmp_path: Path,
+) -> None:
+    """When ``gh pr checks`` itself fails, summarize_checks(None, required)
+    puts every required check into ``summary.unavailable`` — missing,
+    pending, failed, and infra_failed all stay empty. The terminal ``else``
+    branch's bucket chain checked those four buckets but never
+    ``unavailable``, so it fell through to the "every bucket empty" fallback
+    and (after the mergeable/mergeStateStatus fix above) would have claimed
+    "all required checks passed" — an actively false statement when the
+    check status could not be fetched at all. This must report the
+    unavailable checks instead of asserting they passed.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests",),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["checks_unavailable"] is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "unavailable: Tests" in warning
+    # The negative control: an unavailable check is not a passed check.
+    assert "all required checks passed" not in warning
+    assert "check summary unknown" not in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["checks_summary"]["unavailable"] == ["Tests"]
+
+
 def test_merge_ready_failed_attempt_alarm_resets_on_merge(tmp_path: Path) -> None:
     """Issue #254: a successful merge resets the failed attempt counter."""
     from charlie_work.config import AutoMergeConfig
@@ -15567,7 +15946,22 @@ def test_loop_skips_review_for_approved_unmerged_pr(tmp_path: Path) -> None:
     merge_ready."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """loop() now runs a reconcile pass (merge-lane-recovery §6-B) that
+        calls gh.run(["pr", "list", ...]) via reconcile._fetch_prs. The base
+        FakeGitHub.run() generic fallback always returns [] for that query
+        regardless of self.prs, which makes detect_drift see an empty GitHub
+        snapshot against a non-empty tracked-PR state and misreport PR 456 as
+        missing on GitHub. Reflect self.prs for real here so the reconcile
+        pass sees the same PR the rest of this fake already knows about."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     # Record an approved decision in state (as record_review would).
     state = load_state(paths.state_file)
@@ -16307,7 +16701,20 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
 ) -> None:
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """See the identical override in
+        test_loop_skips_review_for_approved_unmerged_pr: loop()'s reconcile
+        pass (merge-lane-recovery §6-B) queries gh.run(["pr", "list", ...]),
+        and the base fake's generic run() fallback returns [] regardless of
+        self.prs, which misreports PR 456 as missing on GitHub."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     state = load_state(paths.state_file)
     state["prs"]["456"] = {
@@ -22375,11 +22782,12 @@ def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypa
     }
     fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
 
-    # Mock fleet_dir to point to our test fleet dir
-    def mock_fleet_dir(override=None):
-        return fleet_dir
-
-    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", mock_fleet_dir)
+    # Redirect fleet_dir resolution to our test fleet dir via the env var
+    # fleet_paths.fleet_dir() itself supports (checked before the platform
+    # default). Patching the module-level name directly no longer works since
+    # fleet_registry composes fleet paths through layout.py, which binds its
+    # own reference to fleet_paths.fleet_dir at import time.
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
 
     # Count fleet live sessions
     live_count, skipped_repos = count_fleet_live_sessions(None)
@@ -23887,6 +24295,147 @@ def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_thro
     assert any(e["kind"] == "quota_probe_failed" for e in state["events"])
 
 
+def test_maybe_probe_quota_recovery_red_also_defers_reviewer_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A red flat probe must also bump reviewer_quota.probe_after so
+    dispatch_reviews's probe_mode gate defers instead of independently
+    launching a real reviewer session into the same still-closed window
+    (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        is_reviewer_probe_ready,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    # Reviewer quota exhausted with probe_after in the past (ready to probe).
+    state = set_reviewer_quota_exhausted(
+        state, throttled_until=future, probe_after="2020-01-01T00:00:00Z"
+    )
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    next_probe_at = state["quota_probe"]["next_probe_at"]
+    # probe_after must now be bumped to the flat probe's next attempt, so
+    # dispatch_reviews's is_reviewer_probe_ready returns False.
+    assert state["reviewer_quota"]["probe_after"] == next_probe_at
+    assert is_reviewer_probe_ready(state) is False
+    # consecutive_probe_failures is not touched by the flat probe.
+    assert state["reviewer_quota"].get("consecutive_probe_failures", 0) == 0
+
+
+def test_maybe_probe_quota_recovery_red_does_not_shorten_existing_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the reviewer quota's own exponential backoff already pushed
+    probe_after further out than the flat probe's interval, a red flat
+    probe must not shorten it (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    far_future = (
+        (datetime.now(UTC) + timedelta(hours=4))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=far_future)
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # probe_after stays at the existing (further-out) backoff target.
+    assert state["reviewer_quota"]["probe_after"] == far_future
+
+
+def test_maybe_probe_quota_recovery_red_skips_reviewer_probe_when_only_root_throttled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A red flat probe must not write reviewer_quota.probe_after when the
+    reviewer quota is not exhausted -- only the root throttle is active
+    (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
+    )
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # No reviewer_quota.probe_after written -- reviewer quota was not exhausted.
+    assert "probe_after" not in state.get("reviewer_quota", {})
+
+
 def test_maybe_probe_quota_recovery_disabled_config_never_probes(tmp_path: Path) -> None:
     from datetime import UTC, datetime
 
@@ -24002,6 +24551,305 @@ def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throt
     assert state.get("quota_probe", {}).get("next_probe_at") is None
     assert state["throttled_until"] == future
     assert state["throttle_adapter_kind"] == "devin"
+
+
+def _reconcile_pass_app(
+    tmp_path: Path,
+    *,
+    interval_minutes: int = 30,
+    enabled: bool = True,
+    gh: Any = None,
+) -> OrchestratorApp:
+    from charlie_work.config import ReconcilePassConfig
+
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=enabled, interval_minutes=interval_minutes)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())
+
+
+def test_maybe_reconcile_drift_noop_when_disabled(tmp_path: Path) -> None:
+    """B-AC1/B-AC2: reconcile_pass.enabled=False must skip reconcile entirely --
+    no call to reconcile(), no schedule armed, no summary event."""
+    app = _reconcile_pass_app(tmp_path, enabled=False)
+
+    def _fail_if_called(*, fix: bool = False) -> CommandResult:
+        raise AssertionError("reconcile() must not be called when reconcile_pass is disabled")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _fail_if_called)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("reconcile_pass", {}).get("next_reconcile_at") is None
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+
+
+def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -> None:
+    """B-AC1/B-AC2: enabled + due calls _reconcile_locked(fix=True) exactly
+    once, arms the next-due schedule ~interval_minutes out, and records a
+    single reconcile_pass_completed summary event carrying drift counts.
+
+    Patches ``_reconcile_locked``, not ``reconcile`` (merge-lane-recovery
+    D-8a): ``_maybe_reconcile_drift`` calls ``_reconcile_locked`` directly
+    because loop()'s caller already holds supervisor.lock for the whole
+    pass, and re-entering ``reconcile()`` would re-acquire that same
+    non-reentrant lock and always no-op. Patching ``reconcile`` here would
+    silently never be invoked and this test would falsely pass with 0 calls
+    recorded as a bug, not a confirmation -- see
+    test_maybe_reconcile_drift_runs_while_supervisor_lock_held for the test
+    that actually exercises that lock-contention distinction end to end."""
+    from datetime import UTC, datetime
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+    original_reconcile_locked = app._reconcile_locked
+    calls: list[tuple[bool, bool]] = []
+
+    def _counting_reconcile_locked(
+        *, fix: bool = False, skip_dead_session_sweep: bool = False
+    ) -> CommandResult:
+        calls.append((fix, skip_dead_session_sweep))
+        return original_reconcile_locked(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "_reconcile_locked", _counting_reconcile_locked)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    # merge-lane-recovery §6-B follow-up: the in-loop caller must skip
+    # reconcile's own dead-session sweep -- the loop's stall/dead lanes
+    # (_detect_and_handle_stalled_sessions /
+    # _classify_dead_sessions_and_update_throttle_state) already ran this
+    # exact pass, immediately before this call, with grace-period semantics
+    # (max_inconclusive_probe_deferrals) that reconcile.py's sweep does not
+    # implement.
+    assert calls == [(True, True)]
+
+    state = load_state(app.paths.state_file)
+    next_at = state["reconcile_pass"]["next_reconcile_at"]
+    parsed = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=30)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+    events = state.get("events", [])
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1
+    assert completed[0]["payload"]["drift_detected"] == 0
+    assert completed[0]["payload"]["drift_fixed"] == 0
+    assert completed[0]["payload"]["drift_remaining"] == 0
+
+
+def test_maybe_reconcile_drift_waits_until_due(tmp_path: Path) -> None:
+    """The periodic cadence must not re-run reconcile before the armed
+    next_reconcile_at timestamp."""
+    from datetime import UTC, datetime
+
+    from charlie_work.state import arm_reconcile_pass
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+    not_due = (
+        (datetime.now(UTC) + timedelta(minutes=25))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_reconcile_pass(load_state(app.paths.state_file), not_due)
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(*, fix: bool = False) -> CommandResult:
+        raise AssertionError("must not reconcile before the scheduled time")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _fail_if_called)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state["reconcile_pass"]["next_reconcile_at"] == not_due
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+
+
+def test_maybe_reconcile_drift_defers_on_graphql_rate_limit(tmp_path: Path) -> None:
+    """B-AC3: reconcile()'s existing GraphQL rate-limit deferral must be
+    preserved, not bypassed -- surfaced as a distinguishable
+    reconcile_pass_deferred event rather than a silent no-op."""
+
+    class LowBudgetGitHub(FakeGitHub):
+        def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
+            return (False, 50, 1234567890)
+
+    app = _reconcile_pass_app(tmp_path, gh=LowBudgetGitHub())
+
+    app._maybe_reconcile_drift()
+
+    state = load_state(app.paths.state_file)
+    assert state["reconcile_pass"]["next_reconcile_at"] is not None
+    events = state.get("events", [])
+    deferred = [e for e in events if e.get("kind") == "reconcile_pass_deferred"]
+    assert len(deferred) == 1
+    assert deferred[0]["payload"]["deferred_reason"] == "graphql_rate_limit"
+    assert deferred[0]["payload"]["graphql_remaining"] == 50
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert completed == []
+
+
+def test_loop_corrects_escalated_label_divergence_via_reconcile_pass(tmp_path: Path) -> None:
+    """B-AC5 (critical wiring test): a state/label divergence of the
+    escalated_labels_converged shape -- state says status "escalated", GitHub
+    still carries the stale needs-rework label -- must be corrected by a
+    single app.loop() pass. This proves _maybe_reconcile_drift is actually
+    wired into _loop_body's production call path, not merely present and
+    independently callable. Must FAIL if the wiring call site is removed;
+    see the removal verification recorded in the PR description."""
+    from charlie_work.config import ReconcilePassConfig
+
+    class EscalatedDivergenceGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 40,
+                    "title": "issue 40",
+                    "url": "https://example.test/issues/40",
+                    "body": "",
+                    "labels": [{"name": "agent:needs-rework"}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = []
+
+        def run(
+            self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        ) -> Any:
+            if args[:2] == ["issue", "list"]:
+                return self.issues
+            if args[:2] == ["pr", "list"]:
+                return self.prs
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+        def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]:
+            return self.issues
+
+        def pr_list(self) -> list[dict[str, Any]]:
+            return self.prs
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {
+                issue["number"]
+                for issue in self.issues
+                if issue["number"] in issue_numbers and issue.get("state") == "OPEN"
+            }
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    names = {entry.get("name") for entry in issue["labels"]}
+                    if label not in names:
+                        issue["labels"].append({"name": label})
+            return True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            super().remove_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    issue["labels"] = [
+                        entry for entry in issue["labels"] if entry.get("name") != label
+                    ]
+            return True
+
+    gh = EscalatedDivergenceGitHub()
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=True, interval_minutes=30)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    state = load_state(app.paths.state_file)
+    state = {
+        **state,
+        "issues": {**state.get("issues", {}), "40": {"number": 40, "status": "escalated"}},
+    }
+    save_state(app.paths.state_file, state)
+
+    app.loop(limit=1)
+
+    assert (40, "agent:human-needed") in gh.labels_added
+    assert (40, "agent:needs-rework") in gh.labels_removed
+
+    # B-AC7 (critical safety invariant): reconcile must never rewrite status
+    # to match labels -- only `charlie unescalate` re-enters the machine.
+    final_state = load_state(app.paths.state_file)
+    assert final_state["issues"]["40"]["status"] == "escalated"
+
+
+def test_maybe_reconcile_drift_runs_while_supervisor_lock_held(tmp_path: Path) -> None:
+    """merge-lane-recovery D-8a: every production caller of loop() -- the
+    cli.py bash-rats handler, fleet_dispatch.py, and supervise.py's
+    `while True` -- already holds supervisor.lock for the whole call, so
+    _maybe_reconcile_drift must make progress under that exact condition.
+
+    The buggy predecessor called `self.reconcile(fix=True, ...)`, which
+    re-acquires supervisor.lock as its first action. Byte-range locks taken
+    via msvcrt.locking(LK_NBLCK) are per-handle and non-reentrant even
+    within one process (file_lock.py keeps no reentrancy bookkeeping), so
+    that reacquisition always failed and reconcile silently no-opped on
+    every one of the fleet's loop passes (0 reconcile events across 9,848
+    recorded events). The fix calls `self._reconcile_locked(...)` directly,
+    bypassing the lock acquisition entirely, since the precondition (lock
+    already held by loop()'s caller) is guaranteed by this method's callers.
+
+    A test that does not hold supervisor.lock during the call cannot
+    distinguish the two implementations -- both acquire/no-op fine when
+    unlocked, which is exactly how this shipped undetected.
+    """
+    from charlie_work import layout
+    from charlie_work.file_lock import try_acquire_byte_range_lock
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+
+    supervisor_lock = try_acquire_byte_range_lock(layout.supervisor_lock_path(app.paths.root))
+    assert supervisor_lock is not None, "test setup failed to acquire the supervisor lock"
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        supervisor_lock.release()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1, (
+        "reconcile_pass_completed must be recorded even while supervisor.lock "
+        f"is held by the loop() caller; events were: {events}"
+    )
+
+    # The assertion that actually discriminates the bug: the buggy code path
+    # (self.reconcile(fix=True, ...) re-acquiring the same non-reentrant
+    # lock) always produced this event with this exact reason instead.
+    lock_held_skips = [
+        e
+        for e in events
+        if e.get("kind") == "reconcile_pass_skipped"
+        and e.get("payload", {}).get("reason") == "supervisor_lock_held"
+    ]
+    assert lock_held_skips == [], (
+        "reconcile must not report supervisor_lock_held when the lock is "
+        "already held by this same in-process loop() call -- that reason is "
+        "reserved for a genuinely concurrent mop-up --fix"
+    )
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
@@ -26742,11 +27590,11 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("charlie_work.cli.GitHub", fake_github)
 
-    # Mock fleet_dir to use tmp_path
-    def fake_fleet_dir(*, override: str | None = None) -> Path:
-        return tmp_path / "fleet"
-
-    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", fake_fleet_dir)
+    # Redirect fleet_dir resolution to tmp_path via the env var fleet_paths.fleet_dir()
+    # itself supports. Patching the module-level name directly no longer works since
+    # fleet_registry composes fleet paths through layout.py, which binds its own
+    # reference to fleet_paths.fleet_dir at import time.
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
 
     # Build args
     import argparse
@@ -27601,7 +28449,7 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Create a session record for issue 123 with a live PID and stale log
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -27680,7 +28528,7 @@ def test_loop_advances_inconclusive_probe_deferral_counter_once_per_pass(
     fake_gh.prs = []
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-343.json"
     log_file = sessions_dir / "issue-343.log"
@@ -27774,7 +28622,7 @@ def test_standalone_dispatch_and_rework_advance_inconclusive_probe_counter_once(
     fake_gh.prs = []
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-356.json"
     log_file = sessions_dir / "issue-356.log"
@@ -30080,7 +30928,7 @@ def test_detect_drift_api_dead_session_provider_auth(
     gh.prs = []
     state = empty_state()
 
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     write_api_sidecar(sessions_dir, 4805, provider="example", pid=99996)
 
@@ -31522,7 +32370,7 @@ def test_reap_review_verdicts_records_valid_verdict(monkeypatch, tmp_path: Path)
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31576,7 +32424,7 @@ def test_reap_review_verdicts_records_session_metrics(monkeypatch, tmp_path: Pat
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31649,7 +32497,7 @@ def test_reap_review_verdicts_folds_review_effort_arm_into_session_metrics(
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31710,7 +32558,7 @@ def test_reap_review_verdicts_missing_events_file_records_verdict_with_no_metric
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31830,7 +32678,7 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
@@ -32469,7 +33317,7 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(
