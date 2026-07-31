@@ -32,7 +32,7 @@ from .claude_code import (
     resolve_review_effort,
     run_quota_probe,
 )
-from .checks import CheckSummary, summarize_checks
+from .checks import CheckSummary, _is_failing_run, summarize_checks
 from .config import (
     AutoMergeConfig,
     CrossFamilyConfig,
@@ -3751,6 +3751,107 @@ def _rework_prompt_search_dirs(
     return (path,)
 
 
+def _annotation_to_required_change(check_name: str, annotation: dict[str, Any]) -> str | None:
+    """Format a single GitHub check-run annotation as a ``required_changes`` entry.
+
+    Returns ``None`` -- never a fabricated placeholder -- when the annotation
+    carries no message; a bare location with no explanation is not
+    actionable. ``path``/``start_line`` are appended when present, but their
+    absence does not sink the entry: the message alone is still real,
+    GitHub-sourced reviewer content, so it renders as ``"<check>: <message>"``
+    rather than being dropped.
+    """
+    if not isinstance(annotation, dict):
+        return None
+    message = str(annotation.get("message") or "").strip()
+    if not message:
+        return None
+    path = str(annotation.get("path") or "").strip()
+    start_line = annotation.get("start_line")
+    if path and isinstance(start_line, int):
+        location = f"{path}:{start_line}"
+    elif path:
+        location = path
+    else:
+        location = None
+    return f"{check_name}: {location} — {message}" if location else f"{check_name}: {message}"
+
+
+def _required_changes_from_checks(
+    checks: list[dict[str, Any]] | None,
+    failed_required_checks: tuple[str, ...],
+    fetch_annotations: Callable[[int], list[dict[str, Any]]],
+) -> list[str]:
+    """Build ``required_changes`` entries from the annotations on each
+    genuinely-failed required check (issue #771: the CI-failure rework route
+    previously recorded a verdict naming only the check, never the failure).
+
+    ``fetch_annotations`` is injected (rather than this function calling
+    ``GitHub`` directly) so it stays pure and unit-testable; the
+    ``OrchestratorApp`` caller passes ``self.gh.check_run_annotations``, which
+    already returns ``[]`` on any GitHub API failure -- never raises -- so
+    this function inherits that fail-safe without adding its own try/except.
+
+    Uses ``checks.py``'s own ``_is_failing_run`` classifier (the same one
+    ``summarize_checks``/``compute_check_debounce`` use to decide
+    ``CheckSummary.failed``) to pick which run(s) of a check name to fetch
+    annotations for, rather than re-deriving a second "is this failing"
+    predicate from ``state`` alone -- a name can appear in
+    ``failed_required_checks`` purely on ``bucket == "fail"`` with an empty
+    ``state`` (external status checks), which an enumerated-``state`` filter
+    would silently skip, discarding annotations for the very run that caused
+    the verdict. When a name has multiple runs (e.g. matrix legs) under
+    "worst-of" semantics, only the actually-failing run's annotations are
+    fetched -- a passing sibling run's annotations (if any) are not failure
+    findings.
+
+    Returns an empty list -- never a fabricated file/line -- only when
+    ``checks`` is unavailable or no name in ``failed_required_checks`` is
+    actually failing per ``_is_failing_run``. For each failing check that
+    resolves to a check-run id but whose annotations are empty or unusable
+    (common for a process-level crash with no per-line findings), or that
+    has no resolvable check-run id at all (e.g. a non-Actions status check),
+    this falls back to the check's own ``link`` -- real, GitHub-sourced data
+    already present on every entry in ``checks`` (``PR_CHECKS_FIELDS``
+    always requests it) -- so the rework brief still points the worker at
+    the failing run instead of only naming the check. ``record_review``'s
+    caller passes this straight through as ``required_changes``; the
+    ``_render_required_changes_section`` tier-2 "CI failed on X" summary
+    fallback only fires when this list comes back fully empty, which now
+    only happens when GitHub gave us neither annotations nor a link.
+    """
+    if not checks or not failed_required_checks:
+        return []
+    failed_names = set(failed_required_checks)
+    required_changes: list[str] = []
+    for check in checks:
+        name = str(check.get("name") or "")
+        if name not in failed_names:
+            continue
+        if not _is_failing_run(check):
+            continue
+        check_run_id = check.get("databaseId")
+        entries = (
+            [
+                entry
+                for annotation in fetch_annotations(check_run_id)
+                if (entry := _annotation_to_required_change(name, annotation)) is not None
+            ]
+            if isinstance(check_run_id, int)
+            else []
+        )
+        if entries:
+            required_changes.extend(entries)
+            continue
+        link = str(check.get("link") or "").strip()
+        if link:
+            required_changes.append(
+                f"{name}: no per-line annotations available from GitHub; "
+                f"inspect the failing run at {link}"
+            )
+    return required_changes
+
+
 def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     """Render the ``$required_changes_section`` for a rework brief.
 
@@ -7370,11 +7471,22 @@ class OrchestratorApp:
             if issue_number is not None and verdict.is_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
+                # Issue #771: name the failure, not just the check. Populated
+                # from the failing check run(s)' GitHub annotations when
+                # available, falling back to the check's own run link when
+                # there are no annotations; degrades all the way to [] only
+                # when GitHub gave us neither, in which case record_review's
+                # summary-only fallback still renders the message above via
+                # _render_required_changes_section.
+                required_changes = _required_changes_from_checks(
+                    checks, verdict.failed_required_checks, self.gh.check_run_annotations
+                )
                 return self.record_review(
                     pr_number,
                     "request_changes",
                     summary=summary,
                     reviewed_head=pr.get("headRefOid"),
+                    required_changes=required_changes,
                 )
 
             # Merge-conflict and no-op-rework janitor failures used to have no
