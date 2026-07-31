@@ -143,6 +143,15 @@ _ERROR_KINDS = frozenset(
         # reachable through query_events(level="error") without any new
         # query infrastructure.
         "fleet_pass_config_error",
+        # Issue #817 items 4-5: self_deploy failed this pass (venv repair,
+        # pull, HEAD read, diff, or uv sync), or a consecutive-failure streak
+        # just crossed the escalation threshold. Both are reachable via
+        # query_events(level="error") for the same reason as
+        # fleet_pass_config_error above -- deploy status was previously the
+        # least observable thing in the system (121 consecutive failures,
+        # zero events.db rows).
+        "self_deploy_failed",
+        "self_deploy_alarm",
     }
 )
 _WARNING_KINDS = frozenset(
@@ -165,6 +174,24 @@ _WARNING_KINDS = frozenset(
         # actionable backoff kinds above. The paired "runner_capacity_recovered"
         # event stays at the default "info" level.
         "runner_capacity_starved",
+        # Issue #818: a draft PR is a park that would otherwise be invisible
+        # without a manual `gh pr list` sweep -- warning, so both the failed
+        # un-draft attempt and a mixed draft+other-failure block are reachable
+        # via query_events(level="warning") distinct from routine
+        # janitor_gate bookkeeping (which stays "info"). The paired
+        # "draft_pr_ready_triggered" success event stays at the default
+        # "info" level, matching "flake_rerun_triggered".
+        "draft_pr_ready_failed",
+        "draft_pr_blocked",
+        # Issue #820: an operator merge-hold (or an unavailable hold check,
+        # which fails safe the same way) suppresses the #818 auto-ready
+        # actuator. Grouped as a warning alongside its two siblings above --
+        # even though the hold itself may be a deliberate operator action,
+        # not an error -- so all three "why is this draft PR not moving"
+        # signals are reachable together via query_events(level="warning")
+        # rather than the deliberate-park case being invisible next to the
+        # other two.
+        "draft_pr_ready_held",
     }
 )
 

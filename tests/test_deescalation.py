@@ -513,6 +513,81 @@ def test_backfill_reason_class_positive_control(tmp_path: Path) -> None:
     assert passes[0]["payload"]["cleared"] == []
 
 
+def test_backfill_reason_class_mechanical_shadowed_by_later_unclassified_event(
+    tmp_path: Path,
+) -> None:
+    """``_backfill_missing_reason_classes`` keys off ``escalation_events[-1]``
+    -- the most recent matching event, not merely the presence of a mapped
+    one. An issue whose history has an early ``session_failed_escalated``
+    (mechanical) followed by a later ``janitor_rework_escalated`` (a fresh
+    re-escalation after a failed rework attempt) must stay fail-closed: the
+    later event is the operative reason, and it is deliberately
+    unclassified. ``query_events`` orders by insertion id, so logging the two
+    events in this order deterministically reproduces "session_failed first,
+    janitor_rework later" without needing to fake timestamps.
+    """
+    app = _app(tmp_path)
+    _log_escalation_event(app.paths.state_file, 123, "session_failed_escalated")
+    _log_escalation_event(app.paths.state_file, 123, "janitor_rework_escalated")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "janitor_rework_escalated",
+            # Deliberately no reason_class: legacy state.
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    issue = state["issues"]["123"]
+    assert issue["status"] == "escalated"
+    assert "reason_class" not in issue
+    assert _events(state, "deescalation_reason_class_backfilled") == []
+    passes = _events(state, "deescalation_pass_completed")
+    assert len(passes) == 1
+    assert passes[0]["payload"]["candidates"] == 0
+
+
+def test_backfill_reason_class_unclassified_shadowed_by_later_mechanical_event(
+    tmp_path: Path,
+) -> None:
+    """Mirror of the case above: an early ``janitor_rework_escalated``
+    followed by a later ``session_failed_escalated`` must classify as
+    ``mechanical`` from the latest event, proving the ordering dependency
+    runs both directions rather than "any unclassified event in history
+    poisons the issue forever"."""
+    app = _app(tmp_path)
+    _log_escalation_event(app.paths.state_file, 123, "janitor_rework_escalated")
+    _log_escalation_event(app.paths.state_file, 123, "session_failed_escalated")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
+            # Deliberately no reason_class: legacy state.
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    issue = state["issues"]["123"]
+    assert issue["status"] == "escalated"
+    assert issue["reason_class"] == "mechanical"
+
+    backfilled = _events(state, "deescalation_reason_class_backfilled")
+    assert len(backfilled) == 1
+    assert backfilled[0]["payload"]["issue_number"] == 123
+    assert backfilled[0]["payload"]["from_event_kind"] == "session_failed_escalated"
+    assert backfilled[0]["payload"]["reason_class"] == "mechanical"
+
+
 # --- mapping completeness machine check ---
 
 
