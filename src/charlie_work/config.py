@@ -234,6 +234,33 @@ class ReviewConfig:
     # but never consumed by anything (pr-lifecycle.md "janitor_blocked zero
     # readers" finding).
     max_no_op_rework_attempts: int = 2
+    # Issue #765: orthogonal stall bound for _route_janitor_gate_failure_to_
+    # rework's passive wait. max_conflict_rework_attempts/max_no_op_rework_
+    # attempts only advance on a SETTLED head change (merge_conflict) or a
+    # fresh non-pending detection (no_op_rework) -- both require the issue to
+    # leave `rework_requested` at least once. A PR whose head simply stops
+    # moving while queued (nobody dispatched a worker, or the worker's rework
+    # brief was empty -- see issue #765's "relationship to the empty-findings
+    # defect") never produces that signal, so it can sit in the passive
+    # janitor_blocked wait forever: PR #696 spun 55 `rework_already_pushed`
+    # events over 24h+ with its attempt count already AT the cap and the
+    # rescue tier never even attempted, because the cap/rescue check below is
+    # only reachable via progress. This bound fires independently of attempts
+    # count: once the head has been observed unchanged for this long while
+    # the issue is `rework_requested` (queued, nobody actively working),
+    # escalate regardless of how many attempts have been burned. Only a HEAD
+    # CHANGE resets the clock -- a live `dispatched` session pushing a real
+    # commit resets it, but idle dispatched time (and a same-head status
+    # flip, e.g. reconcile's issue_active_label_with_open_pr self-heal
+    # normalizing the label away from rework_requested and back) still
+    # counts toward the bound; see the call site. 240 minutes (4h)
+    # matches WatchdogConfig.redispatch_window_minutes, this codebase's
+    # existing convention for "how long a stuck fleet item may sit before
+    # it's treated as abnormal" -- long enough to absorb normal dispatch
+    # queueing latency under fleet load, short enough to bound the failure
+    # mode to hours instead of the unbounded, indefinite spin this issue was
+    # filed over.
+    rework_stall_minutes: int = 240
 
 
 @dataclass(frozen=True)
