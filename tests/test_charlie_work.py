@@ -7323,6 +7323,118 @@ def test_merge_ready_post_update_branch_records_verified_sync_event(
     assert payload["carry_forward_tier"] == "verified-sync"
 
 
+def test_merge_ready_head_sync_verification_none_sets_sync_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A degraded post-sync ``pr.get("headRefOid")`` (resolving to ``None``)
+    must be treated as a FAILED sync verification, not silently as
+    "already up-to-date". ``_verify_synced_head`` always returns ``None``
+    when passed ``old_head_sha=None`` (its sentinel for "verification
+    failed"), but the buggy call site in ``merge_ready`` checked
+    ``new_head == live_head_sha`` before checking ``new_head is None``, so
+    ``None == None`` took the up-to-date no-op branch and ``sync_failed``
+    stayed False despite a real, unverified ``pr_update_branch`` mutation
+    having just happened on GitHub."""
+    from charlie_work.config import AutoMergeConfig
+
+    class FakeGitHubDegradedSecondFetch(FakeGitHub):
+        """Returns the real PR on the first two ``pr_view`` calls (consumed
+        by ``record_review`` and ``merge_ready``'s initial fetch), then a
+        degraded ``headRefOid: None`` on every call after that -- modeling a
+        GitHub API response missing the field on the re-fetch that follows
+        a carry-forward."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._pr_view_calls = 0
+
+        def pr_view(self, number: int):
+            self._pr_view_calls += 1
+            pr_copy = super().pr_view(number)
+            if self._pr_view_calls > 2:
+                pr_copy["headRefOid"] = None
+            return pr_copy
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_branch_strategy="broadcast",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubDegradedSecondFetch()
+    pr_number = 456
+    issue_number = 123
+    old_head = "sha-abc123"
+    new_head = "sha-v2-rebased"
+    original_diff = (
+        "diff --git a/file b/file\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    fake_gh.prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": old_head,
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "MERGEABLE",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.diffs[pr_number] = original_diff
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="lgtm")
+
+    # Simulate the branch moving (e.g. a rebase) with unchanged cumulative
+    # content, so the patch-id carry-forward tier fires naturally and the
+    # head_moved gate does not short-circuit before reaching the
+    # pr_update_branch sync path under test.
+    fake_gh.prs[0]["headRefOid"] = new_head
+
+    # The compare API reports the branch as stale, so merge_ready attempts a
+    # sync regardless of what the (degraded) post-carry-forward pr_view call
+    # reports for headRefOid -- isolating this test to the
+    # _verify_synced_head call-site bug rather than the unrelated
+    # base-freshness signal.
+    monkeypatch.setattr(app, "_is_base_current", lambda pr: False)
+
+    result = app.merge_ready(pr_number, merge=True)
+
+    assert result.ok is True
+    # All required checks are green and the verdict is approved -- the ONLY
+    # thing that can make can_merge False here is sync_failed having been
+    # set from the None-verification result. This also rules out the
+    # merge-base-freshness deferral gate as a false-positive explanation for
+    # can_merge being False: that gate returns before ever fetching real
+    # checks (an empty/synthetic "checks" summary), so seeing the real,
+    # all-passed checks proves execution reached the sync_failed-gated
+    # can_merge computation instead.
+    assert result.data["checks"]["passed"] == (
+        "Tests passed",
+        "Lint & Format",
+        "Pre-commit",
+    )
+    assert result.data["checks"]["missing"] == ()
+    assert result.data["review_decision"]["decision"] == "approved"
+    assert result.data.get("stale_base") is not True
+    assert result.data["can_merge"] is False
+    assert result.data.get("merged") is not True
+    assert fake_gh.merged == []
+
+
 def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
     tmp_path: Path,
 ) -> None:
