@@ -18,6 +18,7 @@ from charlie_work.config import (
 )
 from charlie_work.config import ApiProviderConfig, ApiWorkerConfig
 from charlie_work.doctor import _check_name_matches, run_doctor, workflow_job_names
+from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
 from charlie_work.subprocess_runner import RunResult
 
@@ -1760,3 +1761,52 @@ def test_doctor_worktrees_root_agrees_when_explicit_worktrees_dir_matches_state_
 
     by_name = {c.name: c for c in checks}
     assert by_name["worktrees root"].ok is True
+
+
+def test_check_recent_lane_failures_surfaces_past_event(tmp_path: Path) -> None:
+    """#6-G / G-AC3 + G-AC5: a past fleet_pass_config_error event recorded to
+    this repo's events.db (by fleet_dispatch._record_lane_failure_event, when
+    a lane failed to start on a prior pass) surfaces as a doctor finding.
+
+    Severity is a warning, not a hard error, per doctor.py's own convention
+    for "this recently happened, may already be fixed" reports (e.g.
+    _check_runner_allocation's staleness checks) — it must not, by itself,
+    flip run_doctor()'s overall ok to False the way a currently-broken
+    required check does.
+    """
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    log_event(
+        paths.state_file,
+        "fleet_pass_config_error",
+        {
+            "repo_key": "owner/repo",
+            "error": "ConfigError: unknown key(s) in config section 'cross_family': auto_verdict",
+        },
+        repo="owner/repo",
+    )
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {c.name: c for c in checks}
+    check = by_name["recent lane failures"]
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert "cross_family" in check.detail
+    # A warning-severity finding must not by itself block the overall result.
+    assert ok is True
+
+
+def test_check_recent_lane_failures_silent_when_no_events(tmp_path: Path) -> None:
+    """No fleet_pass_config_error events -> no "recent lane failures" finding
+    at all, so a healthy repo's doctor output stays unchanged (no new noise)."""
+    config = _config(auto_merge=AutoMergeConfig(required_checks=(), enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    _, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {c.name: c for c in checks}
+    assert "recent lane failures" not in by_name

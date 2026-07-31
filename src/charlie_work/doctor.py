@@ -21,7 +21,7 @@ from .config import ApiWorkerConfig, OrchestratorConfig
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
 from . import layout
-from .instrumentation import _db_path
+from .instrumentation import _db_path, query_events
 from .github import (
     GitHub,
     GitHubError,
@@ -812,6 +812,50 @@ def _check_worktrees_root_agreement(
     )
 
 
+_LANE_FAILURE_LOOKBACK_HOURS = 24
+
+
+def _check_recent_lane_failures(add: Any, paths: RuntimePaths) -> None:
+    """Warn when this repo's own fleet lane recently failed to start (#6-G).
+
+    A lane that fails before ``app.loop()`` runs (e.g. ``load_layered_config``
+    raising ``ConfigError`` on an unknown config key, cw 2026-07-29) is caught
+    by ``fleet_loop``'s per-repo ``except Exception`` isolation boundary and
+    durably recorded here via ``log_event(..., "fleet_pass_config_error",
+    ...)`` — see ``fleet_dispatch._record_lane_failure_event``. Without this
+    check, that record is only reachable by directly querying events.db; this
+    surfaces it in the same preflight report an operator already runs.
+
+    Severity is a warning, not a hard error: the failure already happened and
+    may since be fixed — this reports "did this recently happen", not a live
+    health gate. (Recording and reading agree only when the fleet registry's
+    ``state_dir`` for this repo matches ``paths.state_file`` — see the
+    divergence note on ``fleet_dispatch._lane_failure_state_path``.)
+    """
+    cutoff = (
+        (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(hours=_LANE_FAILURE_LOOKBACK_HOURS)
+        )
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    events = query_events(paths.state_file, kind="fleet_pass_config_error", since=cutoff, limit=5)
+    if not events:
+        return
+    latest = events[-1]
+    payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
+    add(
+        "recent lane failures",
+        False,
+        f"{len(events)} fleet-pass lane failure(s) in the last "
+        f"{_LANE_FAILURE_LOOKBACK_HOURS}h, most recent at {latest.get('ts')}: "
+        f"{payload.get('error')}",
+        severity="warning",
+    )
+
+
 def run_doctor(
     repo_root: Path,
     paths: RuntimePaths,
@@ -1033,6 +1077,12 @@ def run_doctor(
     # Read-only: compares the allocation state file's age against the pass
     # interval. Never starts, parks, or plans anything.
     _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override)
+
+    # -- recent lane-startup failures (#6-G) ---------------------------------
+    # Read-only: queries this repo's own events.db for past
+    # fleet_pass_config_error records. Never raises: query_events() itself
+    # returns [] rather than propagating on a query error.
+    _check_recent_lane_failures(add, paths)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)
