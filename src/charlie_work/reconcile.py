@@ -407,7 +407,7 @@ def _mergequeue_revocation_detail(
 
 
 def detect_mergequeue_not_approved(
-    gh: GitHub, config: OrchestratorConfig, *, repo_root: Path | None = None
+    gh: GitHubLike, config: OrchestratorConfig, *, repo_root: Path | None = None
 ) -> list[DriftItem]:
     """Revoke the Aviator ``mergequeue`` label from any open PR not approved at its head.
 
