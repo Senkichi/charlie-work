@@ -855,6 +855,13 @@ class CrossFamilyConfig:
     )
     timeout_seconds: int = 300
     auto_verdict: bool = False
+    # Issue #784: bounds the "content-free verdict -> forced regeneration ->
+    # still content-free" cycle. Counts distinct parse-failure attempts (one
+    # per genuinely new report/head, never per loop-pass re-read of a cached
+    # one) per PR. Once exceeded, the PR is released from the cross-family
+    # gate (recorded as a caveated "approved") instead of looping forever or
+    # escalating to a human — see workflow._record_cross_family_verdicts.
+    max_parse_failures: int = 2
 
 
 @dataclass(frozen=True)
