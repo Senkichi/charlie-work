@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -45,6 +46,15 @@ from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME, load_allocation
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
+
+
+def _iso(dt: datetime) -> str:
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+_supervisor_started = datetime.now(UTC).replace(microsecond=0)
+SUPERVISOR_STARTED_AT = _iso(_supervisor_started)
+SUPERVISOR_BEAT_AT = _iso(_supervisor_started + timedelta(seconds=2609))
 
 
 class _FakeClock:
@@ -1932,8 +1942,8 @@ def test_supervisor_lifecycle_detects_and_records_prior_abnormal_exit(
     mocks = _patch_self_deploy_for_fleet_tests
     mocks["detect_prior_abnormal_exit"].return_value = {
         "prior_pid": 4242,
-        "prior_started_at": "2026-07-25T17:55:22Z",
-        "prior_last_beat_at": "2026-07-25T18:38:51Z",
+        "prior_started_at": SUPERVISOR_STARTED_AT,
+        "prior_last_beat_at": SUPERVISOR_BEAT_AT,
         "prior_pass_number": 9,
         "uptime_seconds": 2609.0,
     }
@@ -2106,8 +2116,8 @@ def test_supervisor_lifecycle_prior_exit_alerts_when_notify_enabled(
     mocks = _patch_self_deploy_for_fleet_tests
     mocks["detect_prior_abnormal_exit"].return_value = {
         "prior_pid": 4242,
-        "prior_started_at": "2026-07-25T17:55:22Z",
-        "prior_last_beat_at": "2026-07-25T18:38:51Z",
+        "prior_started_at": SUPERVISOR_STARTED_AT,
+        "prior_last_beat_at": SUPERVISOR_BEAT_AT,
         "prior_pass_number": 9,
         "uptime_seconds": 2609.0,
     }

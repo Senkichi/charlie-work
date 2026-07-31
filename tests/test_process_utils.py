@@ -6,6 +6,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -245,20 +246,50 @@ def test_kill_process_tree_own_group_guard_posix() -> None:
     assert killed == []
 
 
-def test_kill_process_tree_self_pid_exempt() -> None:
-    """kill_process_tree never kills the calling process (issue #627).
+def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
+    """kill_process_tree returns empty without invoking the platform kill when the target PID is the caller.
 
     The fleet supervisor reaps stalled workers from within its own process
     image, so a ``kill_process_tree(os.getpid())`` call (e.g. from a
     recycled-PID or bogus-caller case) would terminate it silently. The
-    PID self-exemption guard returns an empty list without attempting
-    the kill, regardless of platform.
+    explicit PID self-exemption guard must win even if the process-group
+    guard would also block, because a target PID matching the supervisor is
+    unambiguous.
     """
-    own_pid = os.getpid()
+    own_pid = 424242
+    monkeypatch.setattr("os.getpid", lambda: own_pid, raising=False)
+
+    # Make the process-group guard think the target is in a different group so
+    # the only thing preventing self-termination is the explicit PID guard.
+    def fake_getpgid(pid: int) -> int:
+        return 100 if pid == own_pid else 200
+
+    # Add these on the process_utils os module even if the host os module does
+    # not provide them (e.g. Windows), because we force the POSIX branch below.
+    monkeypatch.setattr("charlie_work.process_utils.os.getpgid", fake_getpgid, raising=False)
+
+    # Avoid querying the real system for children of a non-existent PID.
+    monkeypatch.setattr("charlie_work.process_utils._enumerate_child_pids", lambda _pid: [])
+
+    kill_attempts: list[Any] = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        kill_attempts.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        kill_attempts.append((pgid, sig))
+
+    monkeypatch.setattr("charlie_work.process_utils.os.killpg", fake_killpg, raising=False)
+
+    # Force the POSIX branch so both platform kill paths are gated by the guard.
+    monkeypatch.setattr("charlie_work.process_utils.os.name", "posix")
+
     killed = kill_process_tree(own_pid)
     assert killed == []
-    # The calling process is still alive.
-    assert os.getpid() == own_pid
+    assert kill_attempts == []
 
 
 def test_kill_process_tree_enumerates_children() -> None:

@@ -668,7 +668,9 @@ def _write_heartbeat(
 ) -> None:
     payload = {
         "pid": pid,
-        "started_at": "2026-07-25T17:00:00Z",
+        # Use the beat time as the start time; check_supervisor_heartbeat only
+        # reads last_beat_at/exited_at, so this keeps the fixture date-free.
+        "started_at": last_beat_at,
         "last_beat_at": last_beat_at,
         "pass_number": 5,
         "full_pass_interval_seconds": full_pass_interval_seconds,

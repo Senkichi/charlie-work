@@ -19174,22 +19174,27 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
 
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
+    # Verify the cooldown reflects the parsed 10 minutes plus the resume margin.
+    # Capture a wall-clock bracket around the loop pass; the computed
+    # throttled_until must fall between (start + cooldown) and (end + cooldown).
+    # Using a bracket instead of a point-in-time assertion makes the test robust
+    # on slow or heavily loaded CI runners.
+    cooldown = timedelta(minutes=10, seconds=config.runtime.throttle_resume_margin_s)
+    before = datetime.now(UTC).replace(microsecond=0)
+
     # Run a loop pass with limit=0 (no actual dispatch, just the classification logic)
     # We don't assert result.ok because dispatch may fail with no issues to process
     # The key is that the classification logic runs regardless
     app.loop(limit=0)
 
+    after = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=1)
+
     # Verify throttled_until was set in state by the loop's classification pass
     state = load_state(paths.state_file)
     assert state.get("throttled_until") is not None
 
-    # Verify the cooldown reflects the parsed 10 minutes plus the resume margin
     throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(
-        minutes=10, seconds=config.runtime.throttle_resume_margin_s
-    )
-    # Allow 2 second tolerance for test execution time
-    assert abs((throttle_time - expected_time).total_seconds()) < 2
+    assert before + cooldown <= throttle_time <= after + cooldown
 
     # Verify that a subsequent dispatch() defers launches while throttled
     # Add a dispatchable issue
@@ -30950,6 +30955,11 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
         def name_with_owner(self) -> str:
             return "owner/repo"
 
+        def validate_field_lists(self) -> None:
+            # build_app is an integration test for fleet.json registration; the
+            # gh --json field-list probe needs no real GitHub CLI here.
+            pass
+
     # Monkeypatch GitHub to use our fake
     def fake_github(
         repo_root: Path, dry_run: bool = False, runtime: object | None = None
@@ -31431,6 +31441,9 @@ def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr(
         "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
     )
+    # run_fleet_status creates a real GitHub instance; the field-list probe
+    # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -31505,6 +31518,9 @@ def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
     )
+    # run_fleet_status creates a real GitHub instance; the field-list probe
+    # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -31590,6 +31606,9 @@ def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
     )
+    # run_fleet_status creates a real GitHub instance; the field-list probe
+    # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -31664,6 +31683,9 @@ def test_fleet_status_json_output_shape(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
     )
+    # run_fleet_status creates a real GitHub instance; the field-list probe
+    # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     # Capture stdout
     fake_stdout = StringIO()
@@ -31784,6 +31806,9 @@ def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monke
         ]
 
     monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    # run_fleet_review_queue creates a real GitHub instance; short-circuit the
+    # field-list probe, which would otherwise require an authenticated ``gh`` CLI.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     args = cli.build_parser().parse_args(["fleet", "review-queue"])
     result = cli.run_fleet_review_queue(args)
