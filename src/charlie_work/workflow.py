@@ -4630,7 +4630,11 @@ def _is_pending_only(summary: CheckSummary) -> bool:
 
 
 def _format_merge_attempt_alarm_message(
-    pr_number: int, attempts: int, summary: CheckSummary
+    pr_number: int,
+    attempts: int,
+    summary: CheckSummary,
+    mergeable: str | None = None,
+    merge_state_status: str | None = None,
 ) -> str:
     """Human-readable alarm message for an approved PR that cannot merge.
 
@@ -4647,8 +4651,33 @@ def _format_merge_attempt_alarm_message(
         buckets.append(f"failed: {', '.join(summary.failed)}")
     if summary.infra_failed:
         buckets.append(f"infra_failed: {', '.join(summary.infra_failed)}")
+    if summary.unavailable:
+        # gh reported no parseable check list at all (see summarize_checks'
+        # `checks is None` branch) — distinct from "all required checks
+        # passed", so it must not fall into the passed-but-unmergeable
+        # bucket below.
+        buckets.append(f"unavailable: {', '.join(summary.unavailable)}")
     if not buckets:
-        buckets.append("check summary unknown")
+        # Issue #751: every check-summary bucket above is empty, which means
+        # the checks the bot tracks are not why this PR is stuck — GitHub's
+        # own mergeability signal is (a lagging/absent CONFLICTING reading, a
+        # BLOCKED merge state, branch protection, or a merge-base freshness
+        # result that isn't one of the explicitly modelled branches above).
+        # Surface what `pr_view` already fetched instead of discarding it;
+        # only fall back to the generic "unknown" text when GitHub hasn't
+        # reported anything usable either, so that case stays distinguishable.
+        norm_mergeable = str(mergeable or "").upper()
+        norm_merge_state = str(merge_state_status or "").upper()
+        known_mergeable = bool(norm_mergeable) and norm_mergeable != "UNKNOWN"
+        known_merge_state = bool(norm_merge_state) and norm_merge_state != "UNKNOWN"
+        if known_mergeable or known_merge_state:
+            buckets.append(
+                f"mergeable={norm_mergeable or 'UNKNOWN'}, "
+                f"mergeStateStatus={norm_merge_state or 'UNKNOWN'}, "
+                "all required checks passed"
+            )
+        else:
+            buckets.append("check summary unknown")
     checks_str = "; ".join(buckets)
     pass_str = "pass" if attempts == 1 else "passes"
     return f"PR #{pr_number} approved but unmergeable for {attempts} {pass_str}: {checks_str}"
@@ -10227,7 +10256,11 @@ class OrchestratorApp:
                         )
                     else:
                         merge_attempt_warning = _format_merge_attempt_alarm_message(
-                            pr_number, new_attempts, summary
+                            pr_number,
+                            new_attempts,
+                            summary,
+                            mergeable=pr.get("mergeable"),
+                            merge_state_status=pr.get("mergeStateStatus"),
                         )
                     state = self._record_event(
                         state,
@@ -10238,6 +10271,14 @@ class OrchestratorApp:
                             "attempts": new_attempts,
                             "threshold": threshold,
                             "checks_summary": asdict(summary),
+                            # Issue #751: carry GitHub's own mergeability signal
+                            # alongside checks_summary so the event is
+                            # diagnosable without re-deriving state that has
+                            # since changed (mergeable/mergeStateStatus are
+                            # already fetched by pr_view — see field list at
+                            # _PR_SLIM_FIELDS).
+                            "mergeable": pr.get("mergeable"),
+                            "merge_state_status": pr.get("mergeStateStatus"),
                             "message": merge_attempt_warning,
                         },
                     )
