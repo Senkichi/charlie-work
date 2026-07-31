@@ -11071,7 +11071,9 @@ class OrchestratorApp:
                 if not already_in_mergequeue and self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
-                        if new_head and new_head != live_head_sha:
+                        if new_head is None:
+                            sync_failed = True
+                        elif new_head != live_head_sha:
                             self._update_approval_head(
                                 pr_number,
                                 decision,
@@ -11081,11 +11083,9 @@ class OrchestratorApp:
                             )
                             pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
-                        elif new_head == live_head_sha:
+                        else:
                             # Already up-to-date; nothing to do.
                             pass
-                        else:
-                            sync_failed = True
                     else:
                         sync_failed = True
             # merge-base freshness gate: mergeStateStatus can lag, so verify
@@ -13637,7 +13637,7 @@ class OrchestratorApp:
             )
             save_state(self.paths.state_file, state)
 
-    def _verify_synced_head(self, pr_number: int, old_head_sha: str) -> str | None:
+    def _verify_synced_head(self, pr_number: int, old_head_sha: str | None) -> str | None:
         """Verify that the new head of a PR is a valid base-sync merge commit.
 
         After ``gh pr update-branch`` advances the PR head, we must not bless the
@@ -13645,7 +13645,16 @@ class OrchestratorApp:
         whose parents include the previously approved head. This closes the
         approval-integrity TOCTOU: a racing push to the PR branch could otherwise
         be mistaken for a base update and auto-merged without review.
+
+        ``old_head_sha`` must be a real SHA the caller observed before the sync
+        attempt. A ``None``/falsy value means the caller never had a valid
+        pre-sync head to verify against, so verification cannot succeed;
+        return early rather than falling through to the parent-SHA check below,
+        where ``None not in parent_shas`` would otherwise be vacuously true for
+        any two-parent web-flow merge commit and mask this as a normal miss.
         """
+        if not old_head_sha:
+            return None
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return None
