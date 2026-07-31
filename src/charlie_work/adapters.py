@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from . import layout
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .subprocess_runner import run_captured
 
@@ -124,7 +125,12 @@ def dispatch_sessions(
 ) -> list[SessionDispatchResult]:
     adapter = settings.adapter
     write_session_manifest(manifest_path, requests, adapter=adapter)
-    sessions_dir = settings.sessions_dir or manifest_path.parent / "sessions"
+    # NOTE: constant-only substitution, not layout.sessions_dir_default(). That
+    # helper requires a genuine state_root; manifest_path.parent only equals
+    # the default dispatches dir when devin.session_manifest is at its default
+    # value -- under an operator override it can point anywhere, so composing
+    # through the helper here could change the resolved path.
+    sessions_dir = settings.sessions_dir or manifest_path.parent / layout.SESSIONS_DIRNAME
     if settings.dry_run:
         results = [_dry_run_result(request, adapter) for request in requests]
     elif adapter == "manual":

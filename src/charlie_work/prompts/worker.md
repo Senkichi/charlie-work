@@ -22,9 +22,15 @@ $issue_body
 
 $section_scope_contract
 
+$section_spec_letter
+
 $section_no_merge_contract
 
+$section_process_lifetime
+
 $section_api_shape_validation
+
+$section_caller_sweep
 
 $section_parallel_investigation
 
@@ -48,6 +54,8 @@ The following skills are available to help you complete this task:
 2. Read `CLAUDE.md`, `CONTRIBUTING.md`, the issue, and relevant code.
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change.
+
+   $section_invariant_enumeration
 5. Run the tests impacted by your change from the worktree root: the test
    file(s) you added or modified, plus `grep tests/` for every
    module/function/symbol your production diff touched and run every
@@ -68,6 +76,12 @@ The following skills are available to help you complete this task:
 10. Use `/push` to push your branch to GitHub.
 11. Use `/create-pr` to create a pull request with proper formatting.
 12. Use `/complete` to finalize the session.
+
+$section_mutation_check
+
+$section_test_hygiene
+
+$section_pr_body_honesty
 
 ## PR requirements
 

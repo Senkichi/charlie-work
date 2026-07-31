@@ -9,12 +9,14 @@ Injected sleep/clock: record sleep args; monotonically advancing fake clock.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
 from charlie_work.config import OrchestratorConfig, SupervisorConfig
+from charlie_work.paths import resolved_layout
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.supervise import (
     SelfDeployResult,
@@ -62,6 +64,16 @@ class FakeApp:
         self.paths.root.mkdir(parents=True, exist_ok=True)
         self._sessions_dir = tmp_path / "sessions"
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
+        # Public layout contract mirroring OrchestratorApp.layout. Override
+        # sessions_dir back onto the stub's own `_sessions_dir` (rather than
+        # whatever resolved_layout derives from config.devin.sessions_dir) so
+        # fixtures that write session files into that exact directory keep
+        # working -- the rest of the resolved layout is unused by
+        # run_supervised today but kept real (not stubbed) so this stays a
+        # faithful stand-in.
+        self.layout = replace(
+            resolved_layout(self.config, tmp_path), sessions_dir=self._sessions_dir
+        )
         self._results = list(results)
         self._call_count = 0
 

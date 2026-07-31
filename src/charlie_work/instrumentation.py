@@ -137,6 +137,12 @@ _ERROR_KINDS = frozenset(
         "merge_failed",
         "spec_review_failed",
         "operator_claim_failed",
+        # #6-G: a per-repo fleet-pass iteration failed before (or during)
+        # config load / app.loop() — see fleet_dispatch.py's per-repo
+        # except Exception boundary. Classified as an error so it is
+        # reachable through query_events(level="error") without any new
+        # query infrastructure.
+        "fleet_pass_config_error",
     }
 )
 _WARNING_KINDS = frozenset(
@@ -147,6 +153,18 @@ _WARNING_KINDS = frozenset(
         "dispatch_merged_pr_mention_flagged",
         "review_dispatch_lifecycle_reaped",
         "session_rate_limit_deferred",
+        # Issue #612: a quota-dead reviewer session is a handled backoff
+        # (the fleet defers and probes), not a crash — warning, like the
+        # analogous session_rate_limit_deferred. Distinct from the per-PR
+        # review_dispatch_stalled (error) that fires alongside it.
+        "review_quota_exhausted",
+        # Issue #799: demand exceeding registered capacity while the host has
+        # spare budget is actionable (provision more runners for the repo),
+        # not a crash — warning, so it is reachable via
+        # query_events(level="warning") alongside the other handled-but-
+        # actionable backoff kinds above. The paired "runner_capacity_recovered"
+        # event stays at the default "info" level.
+        "runner_capacity_starved",
     }
 )
 
