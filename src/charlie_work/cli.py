@@ -16,7 +16,7 @@ from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import compute_api_worker_fleet_report, fleet_loop, run_fleet_supervise
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
-from .github import GitHub, GitHubError, linked_issue_number
+from .github import GitHub, GitHubError, defang_closing_keywords, linked_issue_number
 from . import layout
 from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -486,7 +486,8 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
 
     if findings:
         lines = [
-            f"  issue #{finding.issue_number} via {finding.source}: {finding.matched_text!r}"
+            f"  issue #{finding.issue_number} via {finding.source}: "
+            f"{finding.matched_text!r} -> reword to {defang_closing_keywords(finding.matched_text)!r}"
             for finding in findings
         ]
         message = (
@@ -494,8 +495,8 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
             f"PR #{args.pr} (declared target: "
             f"{'#' + str(intended) if intended is not None else 'none resolved'})\n"
             + "\n".join(lines)
-            + "\nGitHub will auto-close these issues on merge unless the wording is fixed "
-            "(e.g. reword to 'addresses #N' or drop the keyword) or the reference is dropped."
+            + "\nGitHub will auto-close these issues on merge unless the wording above is "
+            "changed to the suggested rewrite (or the reference is dropped entirely)."
         )
         return CommandResult(False, message, data)
 

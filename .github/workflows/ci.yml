@@ -51,6 +51,18 @@ jobs:
     # a true wedge vs GitHub's 360-min default. Sibling: job-cannon PR #1443
     # set 10 min on its required aggregate gate (13s healthy).
     timeout-minutes: 15
+    # Explicit permissions block, required by the closing-keyword gate step
+    # below: repo default_workflow_permissions is "read", but that does not
+    # extend to the PR GraphQL query `gh pr view` issues (GitHub.pr_view in
+    # github.py) -- verified via a live failure (run 30607061237, job
+    # 91081435392): "GraphQL: Resource not accessible by integration
+    # (repository.pullRequest)". Once ANY explicit permissions: key is set,
+    # GitHub treats every unlisted scope as none for this job, so
+    # contents: read (needed by actions/checkout@v4) must be listed
+    # alongside pull-requests: read, not just the new scope alone.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
@@ -62,39 +74,24 @@ jobs:
         run: uv run ruff check --no-cache .
       - name: Ruff format
         run: uv run ruff format --check --no-cache .
-
-  ClosingKeywords:
-    name: Closing Keywords
-    runs-on: self-hosted
-    # PR-only (issue #790): scans the PR body and every commit message for a
-    # closing keyword (close(s/d)/fix(es/ed)/resolve(s/d)) bound to an issue
-    # number other than this PR's own declared target -- the surface GitHub's
-    # native auto-close-on-merge scans, which has no negation awareness at
-    # all. Not yet added to orchestrator.config.yaml auto_merge.required_checks,
-    # .aviator/config.yml, or GitHub branch-protection required_status_checks:
-    # promoting it to a hard-required gate immediately would strand every PR
-    # branch cut before this workflow file landed (their own checked-out
-    # ci.yml has no such job to ever report a status). See the PR body for
-    # the promotion follow-up.
-    if: github.event_name == 'pull_request'
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: false
-      - name: Install dependencies
-        run: uv sync --frozen --all-extras
-      - name: Scan PR body and commits for closing keywords
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: uv run charlie closing-keyword-check --pr ${{ github.event.pull_request.number }}
-      - name: Closing-keyword gate (issue #790)
+      - name: Closing-keyword gate (issue 790)
         # PR-only: push-to-main has no PR number, and GitHub's native
         # auto-close scan only ever runs against a PR's body + commits.
-        # Added as a Lint step (not a new job) so it rides the existing
-        # required "Lint" status check without a branch-protection edit --
-        # that's an admin mutation outside a worker PR's blast radius.
+        #
+        # Deliberately a step of the existing "Lint" job, not a new job:
+        # GitHub reports check-run status per JOB, not per step, so this
+        # rides the already-required "Lint" context and becomes a de facto
+        # blocking gate the moment a PR branch includes this workflow
+        # change -- no branch-protection edit, no orchestrator.config.yaml
+        # or .aviator/config.yml change, no separate promotion step at all.
+        # pull_request-triggered workflows run the version of ci.yml on the
+        # PR's own head branch, so a PR branch cut before this merges simply
+        # has no such step yet and is unaffected -- nothing is stranded.
+        #
+        # Scans the PR body and every commit message for a closing keyword
+        # (close(s/d)/fix(es/ed)/resolve(s/d)) bound to an issue number other
+        # than this PR's own declared target -- the surface GitHub's native
+        # auto-close-on-merge scans, which has no negation awareness at all.
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
