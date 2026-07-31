@@ -34,7 +34,19 @@ $required_changes_section
 - Re-run verification and update the PR body or comment with results.
 - If you disagree with a finding, explain with evidence in the PR instead of ignoring it.
 
+$section_invariant_enumeration
+
+$section_caller_sweep
+
 $section_no_merge_contract
+
+$section_process_lifetime
+
+$section_mutation_check
+
+$section_test_hygiene
+
+$section_pr_body_honesty
 
 ## Done condition
 

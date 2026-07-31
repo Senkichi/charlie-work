@@ -21,6 +21,15 @@ jobs:
   Tests:
     name: Tests
     runs-on: self-hosted
+    # 35 min: derived from 28 successful runs (2026-07-28/29). Per-job
+    # execution time (startedAt->completedAt, excluding runner-queue wait):
+    # median 11.5 min, range 3.85-23.72 min. The 23.72 max was a contended
+    # run that still passed. 35 clears it by ~48% and catches the
+    # pathological 40+ min degraded/orphaned runs observed on this shared
+    # box (job-cannon #1440: 40, 51, 86 min). Tests is a required status
+    # check, so a spurious timeout wedges merges -- 3x median headroom
+    # avoids firing on ordinary contention. Sibling: job-cannon PR #1443.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
@@ -34,6 +43,14 @@ jobs:
   Lint:
     name: Lint
     runs-on: self-hosted
+    # 15 min: derived from 28 successful runs (2026-07-28/29). Per-job
+    # execution: median 0.37 min (22s), max 0.55 min (33s) -- checkout,
+    # setup-uv, uv sync, and both ruff steps combined. Lint is a required
+    # status check and trivial work, so a very wide margin (27x median)
+    # prevents a spurious timeout from wedging merges while still catching
+    # a true wedge vs GitHub's 360-min default. Sibling: job-cannon PR #1443
+    # set 10 min on its required aggregate gate (13s healthy).
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7

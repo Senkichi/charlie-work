@@ -44,11 +44,12 @@ Repeat until the termination condition below:
    packets and pick up new dispatches next pass. One pass every few minutes is
    plenty; polling faster only burns tokens and risks the Devin rate limit.
 3. **Review every PR with a fresh packet.** For each
-   `.var/<state_dir>/prs/pr-*/review-prompt.md` (and its `cross-family-review.md`
-   if present), do a real adversarial review — inspect the linked issue, PR
-   metadata, changed files, diff, tests, and CI. **Never approve from the summary
-   alone.** Treat cross-family findings and the test-adequacy rubric as leads to
-   verify, not verdicts.
+   `<state_dir>/prs/pr-*/review-prompt.md` (where `<state_dir>` is that repo's
+   configured `runtime.state_dir`, e.g. `.var/charlie-work`) and its
+   `cross-family-review.md` if present, do a real adversarial review —
+   inspect the linked issue, PR metadata, changed files, diff, tests, and
+   CI. **Never approve from the summary alone.** Treat cross-family findings
+   and the test-adequacy rubric as leads to verify, not verdicts.
 4. **Record the verdict — the judgment only you can supply.**
    - Solves the issue at root cause, meaningful tests, green checks, invariants
      preserved → `charlie verdict --pr <N> --decision approved`, then

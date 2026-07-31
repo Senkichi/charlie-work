@@ -32,6 +32,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from . import layout
+
 # Issue #646: box-wide dispatch parallelism cap. A consuming repo's own
 # pyproject.toml commonly ships `addopts = "... -n auto --dist loadscope"`
 # (e.g. job-cannon), so a bare `pytest` invoked inside a worker claims every
@@ -40,10 +42,12 @@ from pathlib import Path
 # sessions can spawn dozens of xdist workers on an 8-core box (measured
 # incident 2026-07-26: 5 stacked local suites, ~36 xdist workers on 8 physical
 # cores, CI runtime 6.4min -> ~145min). This mirrors the manual operator
-# recipe already used by .var/devin-orchestrator/launch_devin_worker.sh line
-# 49 (comment on line 13: "3 concurrent tracks x 2 xdist workers ~= 8
+# recipe already used by job-cannon's scripts/orchestrator/launch_devin_worker.sh,
+# which exports this same variable ("3 concurrent tracks x 2 xdist workers ~= 8
 # physical cores") — this constant is that same value, applied automatically
-# instead of requiring every dispatch path to remember to set it.
+# instead of requiring every dispatch path to remember to set it. Cited by
+# path + variable name rather than line number: the previous form pointed at
+# .var/devin-orchestrator/…:49, and both the directory and the line moved.
 PYTEST_XDIST_AUTO_NUM_WORKERS_VAR = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 
@@ -107,7 +111,7 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     # worktree-local empty directory is created on demand. If an operator later
     # merges a scoped ``GH_TOKEN`` via ``worker_env``, it takes precedence over
     # any (empty) stored credential.
-    gh_config_dir = target_path / ".var" / "gh-config"
+    gh_config_dir = layout.gh_config_dir(target_path)
     gh_config_dir.mkdir(parents=True, exist_ok=True)
     env["GH_CONFIG_DIR"] = str(gh_config_dir)
 

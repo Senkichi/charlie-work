@@ -11,8 +11,10 @@ from typing import Any, Callable
 from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
+from . import layout
 from .github import GitHub, GitHubError
 from .global_config import describe_config_file, load_layered_config
+from .instrumentation import log_event
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
 from .supervise import (
@@ -166,7 +168,7 @@ def compute_api_worker_fleet_report(
     from .api_budget import budget_status, ledger_path, load_ledger
     from .worker import iter_workers
 
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos = registry.get("repos", {})
     if not repos:
@@ -230,7 +232,7 @@ def compute_api_worker_fleet_report(
         state_dir_str = entry.get("state_dir")
         if not state_dir_str:
             continue
-        sessions_dir = Path(state_dir_str) / "dispatches" / "sessions"
+        sessions_dir = layout.sessions_dir_default(Path(state_dir_str))
         if not sessions_dir.is_dir():
             continue
         try:
@@ -359,7 +361,7 @@ def _run_fleet_allocation_prologue(
     # Any existing repo root works as the gh working directory: the allocation
     # pass addresses every repo by explicit owner/name slug, so the cwd's git
     # identity is irrelevant. Only auth and a valid directory are needed.
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     anchor_root: Path | None = None
     anchor_state: Path | None = None
@@ -368,7 +370,7 @@ def _run_fleet_allocation_prologue(
         if candidate.is_dir():
             anchor_root = candidate
             state_dir = entry.get("state_dir")
-            anchor_state = Path(state_dir) / "state.json" if state_dir else None
+            anchor_state = layout.state_file_path(Path(state_dir)) if state_dir else None
             break
 
     if anchor_root is None:
@@ -480,7 +482,7 @@ def _run_fleet_autoscale_prologue(
     # Pick a representative repo with runner_scaling enabled. Its runtime config
     # is used for the fleet-wide runner count (all repos share the same retry
     # knobs) and for the subsequent autoscale observation/actions.
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos_map = registry.get("repos", {})
 
@@ -886,8 +888,6 @@ def _add_launch_failures(
                 failures.append(event)
 
 
-_FLEET_HEALTH_STATE_FILENAME = "notify_health_state.json"
-
 # Event types whose AttentionEntry represents a persistent health state of an
 # issue/worker (STALLED/ERROR/REPAIRED-style). Only these are subject to
 # cross-pass transition dedup: a persistent ERROR must not re-fire with
@@ -908,7 +908,7 @@ def _fleet_health_state_path(fleet_dir_override: str | None) -> Path:
     every pass with ``previous_health: null`` (issue #554). It lives in the
     fleet directory alongside ``fleet.json``.
     """
-    return fleet_dir(override=fleet_dir_override) / _FLEET_HEALTH_STATE_FILENAME
+    return layout.notify_health_state_path(override=fleet_dir_override)
 
 
 def _load_fleet_health_state(path: Path) -> dict[str, str]:
@@ -1196,6 +1196,59 @@ def _build_fleet_attention_digest(
     )
 
 
+def _lane_failure_state_path(repo_root: Path, entry: dict[str, Any]) -> Path:
+    """Resolve the per-repo ``state.json`` path for a lane that failed to start.
+
+    A lane failure (e.g. ``load_layered_config`` raising ``ConfigError``) can
+    happen before ``runtime_paths()`` is reachable, so this cannot use the
+    configured ``runtime.state_dir`` the way a healthy pass does. Instead it
+    mirrors ``_take_fleet_snapshot``'s precedent: prefer the fleet registry's
+    recorded ``state_dir`` (written by a prior successful ``touch_repo()``),
+    falling back to the conventional default for a repo that has never
+    registered successfully.
+
+    Note this can diverge from ``runtime_paths(...).state_file`` for a repo
+    whose config overrides ``runtime.state_dir`` to a non-default path *and*
+    has no registry ``state_dir`` recorded yet (e.g. its very first pass) —
+    the event would be recorded at the default location, and a doctor check
+    reading the configured path would not find it until the repo registers
+    successfully once. This is the same divergence class layout.py's
+    docstrings warn about; it is not fully closable here since the whole
+    point of this helper is to work when config load has failed.
+    """
+    state_dir_str = entry.get("state_dir")
+    state_root = Path(state_dir_str) if state_dir_str else layout.default_state_root(repo_root)
+    return layout.state_file_path(state_root)
+
+
+def _record_lane_failure_event(
+    repo_root: Path,
+    repo_key: str,
+    entry: dict[str, Any],
+    error_message: str,
+) -> None:
+    """Durably record a lane-startup failure to the repo's own events.db (#6-G).
+
+    This is best-effort and must never escape: ``log_event`` already guards
+    its own sqlite calls, but the directory-creation call it makes before
+    that guard is not caught by that guard's exception type, so this wraps
+    the whole call in its own try/except. A failure to *record* a lane
+    failure must never itself break the per-repo isolation boundary this is
+    called from (D-4) — the caller has already logged the real error via
+    ``logger.exception`` regardless of what happens here.
+    """
+    try:
+        state_path = _lane_failure_state_path(repo_root, entry)
+        log_event(
+            state_path,
+            "fleet_pass_config_error",
+            {"repo_key": repo_key, "error": error_message},
+            repo=repo_key,
+        )
+    except Exception:
+        logger.exception("Failed to record lane failure event for repo %s", repo_key)
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -1227,7 +1280,7 @@ def fleet_loop(
         A CommandResult with per-repo results and the consolidated digest.
     """
     # Load fleet registry with state_lock guard
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
 
     # Select repos in the appropriate order
@@ -1291,7 +1344,7 @@ def fleet_loop(
             # Non-blocking supervisor lock: fleet passes must be mutually exclusive
             # with a supervised bash-rats loop on the same repo to avoid double-
             # dispatching through the governor's read-then-launch window.
-            lock = try_acquire_supervisor_lock(paths.root / "supervisor.lock")
+            lock = try_acquire_supervisor_lock(layout.supervisor_lock_path(paths.root))
             if lock is None:
                 per_repo_results[repo_key] = CommandResult(
                     True,
@@ -1355,10 +1408,27 @@ def fleet_loop(
             # pass alive instead of crashing on one unclassified exception.
             # The exception type is part of the message and the full traceback
             # goes to the log — an unclassified failure must stay diagnosable.
+            error_message = f"{type(exc).__name__}: {exc}"
             per_repo_results[repo_key] = CommandResult(
-                False, f"fleet pass error: {type(exc).__name__}: {exc}", {}
+                False, f"fleet pass error: {error_message}", {}
             )
             logger.exception("Error processing repo %s", repo_key)
+            # #6-G: the two lines above are an in-process dict and a line in a
+            # dated flat-text log — neither reaches events.db, state.json, or
+            # the fleet digest, since _extract_attention_events() above only
+            # runs after a successful app.loop(). A repo whose lane fails on
+            # every pass (e.g. a config-load ConfigError, cw#... 2026-07-29)
+            # was previously invisible to everything except that log line.
+            # Reuse the existing "error" AttentionEntry branch (health=ERROR,
+            # already desktop-toast-eligible via _DESKTOP_SEVERITIES) so this
+            # works on exactly the path where app.loop() never ran, and
+            # durably record it so `charlie doctor` and
+            # query_events(level="error") can see it even after the digest's
+            # cross-pass dedup stops re-emitting the same standing failure.
+            attention_events.append(
+                {"repo_key": repo_key, "type": "error", "error": error_message}
+            )
+            _record_lane_failure_event(repo_root, repo_key, entry, error_message)
 
     # Call the notifier digest sink exactly once per fleet pass, via the real
     # #166 notify.py implementation (AttentionDigest + emit_digest).
@@ -1369,7 +1439,19 @@ def fleet_loop(
         "orphan_sweep_calls": orphan_sweep_calls,
         "emitted": False,
     }
-    if notify_config is not None and getattr(notify_config, "enabled", False) and attention_events:
+    # Build the digest whenever notify is on, then gate the *emission* on the
+    # built digest's transitions (the inner ``if attention_digest.transitions``
+    # added by #669). The previous outer ``and attention_events`` test was
+    # redundant with that inner gate and tested a different, rawer signal — a
+    # converged pass (every event routed to an explicit ``continue``, e.g. a
+    # healthy ``runner_allocation``) has a non-empty ``attention_events`` list
+    # but an empty ``transitions`` tuple, so the two tests disagreed on whether
+    # to enter this block. #669's inner gate already prevented the
+    # ``emit_digest(transitions=())`` empty-envelope call for that case; this
+    # drop removes the contradictory outer condition rather than fixing a
+    # currently-reproducing emission (issue #610). The ``notify_config`` check
+    # stays outermost so no digest is built when notify is off.
+    if notify_config is not None and getattr(notify_config, "enabled", False):
         health_state_file = _fleet_health_state_path(fleet_dir_override)
         attention_digest = _build_fleet_attention_digest(
             attention_events, state_file=health_state_file
@@ -1462,7 +1544,7 @@ class FleetLocalSnapshot:
 
 def _repo_state_dirs(state_dir: Path) -> tuple[Path, Path]:
     """Return the (sessions_dir, prs_dir) for a repo given its state dir."""
-    sessions_dir = state_dir / "dispatches" / "sessions"
+    sessions_dir = layout.sessions_dir_default(state_dir)
     prs_dir = state_dir / "prs"
     return sessions_dir, prs_dir
 
@@ -1472,7 +1554,7 @@ def _take_fleet_snapshot(
     fleet_dir_override: str | None = None,
 ) -> FleetLocalSnapshot:
     """Capture a cheap, network-free snapshot across all registered fleet repos."""
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     repos = registry.get("repos", {})
 
@@ -1567,7 +1649,7 @@ def run_fleet_supervise(
     # False, and all of them take load_layered_config's silent-{} branch. A bare
     # exists=False here would reproduce the exact ambiguity this line exists to
     # remove. See describe_config_file for which errors are and are not hidden.
-    global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
+    global_config_path = layout.global_config_path(override=fleet_dir_override)
     logger.info(
         "Fleet supervisor global config: path=%s %s",
         global_config_path,
@@ -1581,7 +1663,7 @@ def run_fleet_supervise(
         overrides["max_runtime_minutes"] = max_runtime_override
     cfg = replace(global_config.supervisor, **overrides)
 
-    lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     lock = try_acquire_supervisor_lock(lock_path)
     if lock is None:
         return CommandResult(

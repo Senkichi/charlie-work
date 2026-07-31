@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import string
 from pathlib import Path
 
 from charlie_work.prompt_sections import section_variables
@@ -280,8 +281,16 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
         # Verify the comparison instruction
         assert "headRefOid" in prompt
         assert "git rev-parse HEAD" in prompt
-        # CRITICAL: assert NO unresolved $ placeholders remain anywhere
-        assert "$" not in prompt, f"Unresolved placeholders found in rendered prompt:\n{prompt}"
+        # CRITICAL: assert NO unresolved $ placeholders remain anywhere. This is
+        # narrower than a bare `"$" not in prompt` check: worker_sections
+        # partials may legitimately contain a literal `$` that isn't a
+        # `string.Template` placeholder at all -- e.g. `mutation_check.md`'s
+        # shell snippet `git show $(git merge-base ...)` uses `$(` (command
+        # substitution), which `get_identifiers()` correctly ignores because it
+        # is not `$identifier`/`${identifier}` shaped.
+        assert not string.Template(prompt).get_identifiers(), (
+            f"Unresolved placeholders found in rendered prompt:\n{prompt}"
+        )
 
 
 def test_worker_prompt_includes_push_then_verify() -> None:

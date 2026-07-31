@@ -702,6 +702,54 @@ def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     quota.pop("throttled_until", None)
     quota.pop("probe_after", None)
     quota.pop("alerted_at", None)
+    # Issue #612: the parsed provider reset time is per-episode; clear it so
+    # a stale value does not linger after the quota window is proven open.
+    quota.pop("reset_at", None)
+    return {**data, "reviewer_quota": quota}
+
+
+def defer_reviewer_probe_after(data: dict[str, Any], probe_after: str) -> dict[str, Any]:
+    """Bump ``reviewer_quota.probe_after`` to at least ``probe_after``.
+
+    Called from the flat-interval quota probe's red branch so that
+    ``dispatch_reviews``'s own ``probe_mode`` gate (which reads
+    ``is_reviewer_probe_ready``) defers at least until the cheap probe's
+    next scheduled attempt, instead of independently launching a full
+    reviewer session into a window the cheap probe just confirmed is still
+    closed (issue #663). Without this, the two probing mechanisms run on
+    independent schedules and don't share failure-path state: a red flat
+    probe only re-armed ``quota_probe.next_probe_at``, leaving
+    ``reviewer_quota.probe_after`` in the past, so ``dispatch_reviews``
+    could launch a real (non-Haiku) reviewer session as its own probe of
+    the same still-closed window -- wasting a bounded (``dispatch_limit=1``)
+    but real reviewer dispatch.
+
+    Only acts when the reviewer quota is currently exhausted: writing
+    ``probe_after`` on a non-exhausted quota would leave stale state that
+    ``clear_reviewer_quota`` would later clean up, but there is no reason
+    to set it in the first place. Never moves ``probe_after`` earlier --
+    the reviewer quota's own exponential backoff may have already pushed
+    it further out than the flat probe's interval, and shortening it would
+    make ``dispatch_reviews`` probe more often, not less. Does not touch
+    ``consecutive_probe_failures``: that counter belongs to the reviewer
+    quota's own probe path, not the flat-interval probe.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    if not is_reviewer_quota_exhausted(data):
+        return data
+    quota = _reviewer_quota(data)
+    current = quota.get("probe_after")
+    if current:
+        try:
+            current_dt = datetime.fromisoformat(current.replace("Z", "+00:00"))
+            new_dt = datetime.fromisoformat(probe_after.replace("Z", "+00:00"))
+            if current_dt >= new_dt:
+                return data
+        except (ValueError, TypeError):
+            # Malformed current value: overwrite with the well-formed new one.
+            pass
+    quota["probe_after"] = probe_after
     return {**data, "reviewer_quota": quota}
 
 
@@ -771,6 +819,55 @@ def disarm_quota_probe(data: dict[str, Any]) -> dict[str, Any]:
         return data
     probe.pop("next_probe_at", None)
     return {**data, "quota_probe": probe}
+
+
+def _reconcile_pass(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the periodic in-loop reconcile scheduling sub-dict from ``data``.
+
+    Distinct from ``quota_probe``: tracks the merge-lane-recovery §6-B
+    cadence (``OrchestratorApp._maybe_reconcile_drift``), not the quota
+    probe. Ensures a mutable copy so callers can build new state without
+    mutating the original ``data``.
+    """
+    section = data.get("reconcile_pass")
+    if not isinstance(section, dict):
+        return {}
+    return dict(section)
+
+
+def is_reconcile_due(data: dict[str, Any]) -> bool:
+    """True when the periodic in-loop reconcile pass should run.
+
+    Unlike the quota probe (which only arms once a throttle indicator is
+    observed, deliberately delaying the first real probe), reconcile has no
+    "is something wrong" precondition to wait on -- it is a plain periodic
+    cadence, so an absent schedule (never run before, e.g. right after a
+    fresh deploy) is treated as due immediately rather than requiring one
+    full interval to elapse first. This matters for G1: the divergence class
+    this closes has already been sitting unrepaired indefinitely, so the
+    first pass after this lands should not wait `interval_minutes` before
+    doing anything. Malformed timestamps are treated as due, mirroring
+    ``is_quota_probe_due``, so a corrupt value cannot wedge reconcile off
+    forever.
+    """
+    next_at = _reconcile_pass(data).get("next_reconcile_at")
+    if not next_at:
+        return True
+    try:
+        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= next_time
+    except (ValueError, TypeError):
+        return True
+
+
+def arm_reconcile_pass(data: dict[str, Any], next_reconcile_at: str) -> dict[str, Any]:
+    """Schedule the next periodic in-loop reconcile attempt.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    section = _reconcile_pass(data)
+    section["next_reconcile_at"] = next_reconcile_at
+    return {**data, "reconcile_pass": section}
 
 
 def any_quota_exhausted_indicator(data: dict[str, Any]) -> bool:
