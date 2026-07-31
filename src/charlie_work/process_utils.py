@@ -360,11 +360,10 @@ def write_worker_terminal_status(
 ) -> None:
     """Atomically persist a worker process's terminal status (issue #773).
 
-    Written by ``start_terminal_status_watcher`` once the process this
-    process's exit-monitoring thread observed via ``Popen.wait()`` returns.
-    Uses the tmp-file + ``replace()`` pattern required by CLAUDE.md for every
-    JSON state write so a reader (the orphan detector's polling pass) never
-    observes a partially-written file.
+    Written by ``start_terminal_status_watcher`` once its ``Popen.poll()``
+    loop observes the process has exited. Uses the tmp-file + ``replace()``
+    pattern required by CLAUDE.md for every JSON state write so a reader (the
+    orphan detector's polling pass) never observes a partially-written file.
     """
     payload: dict[str, Any] = {
         "pid": pid,
@@ -418,6 +417,13 @@ def find_worker_terminal_status(sessions_dir: Path, issue_number: int) -> dict[s
     return None
 
 
+# Sleep interval for the terminal-status watcher's poll() loop. Workers run
+# for minutes, so this granularity costs nothing; kept as a named constant
+# (rather than an inline literal) since it's the one knob that trades
+# poll-loop wakeups against exit-timestamp precision.
+_TERMINAL_STATUS_POLL_INTERVAL_SECONDS = 2.0
+
+
 def start_terminal_status_watcher(process: subprocess.Popen[Any], path: Path) -> threading.Thread:
     """Spawn a daemon thread that records ``process``'s terminal status at exit.
 
@@ -428,12 +434,16 @@ def start_terminal_status_watcher(process: subprocess.Popen[Any], path: Path) ->
     code must be captured once, at the moment the process actually exits, and
     persisted where a later poll can find it.
 
-    Does NOT block the caller: ``Popen.wait()`` runs entirely on the spawned
-    daemon thread, so ``launch_claude_worker`` still returns immediately, per
-    CLAUDE.md's "adapters must not block on worker completion" invariant --
-    that invariant is about the launch call, not about every thread the
-    adapter may start. Never raises: a failure inside the thread (a wait()
-    error, or a write failure) is swallowed, since this is best-effort
+    Does NOT call ``Popen.wait()`` or ``Popen.communicate()`` -- on the caller
+    thread or any other. CLAUDE.md's "adapters must not block on worker
+    completion" invariant bans those two calls outright, not just a
+    caller-thread version of them (this project was previously bitten by
+    exactly this deadlock class). Instead this polls ``Popen.poll()`` in a
+    sleep loop, so the banned calls are structurally absent from every code
+    path here -- a later edit cannot reintroduce the deadlock class by moving
+    a `wait()`/`communicate()` call onto a different thread, because there is
+    no such call to move. Never raises: a failure inside the thread (a
+    poll() error, or a write failure) is swallowed, since this is best-effort
     telemetry that must not crash the orchestrator or the worker's own I/O
     threads (e.g. the tee_stream_json reader thread also draining
     ``process.stdout`` concurrently in ``claude_code.launch_claude_worker``).
@@ -444,7 +454,9 @@ def start_terminal_status_watcher(process: subprocess.Popen[Any], path: Path) ->
 
     def _watch() -> None:
         try:
-            exit_code = process.wait()
+            while process.poll() is None:
+                time.sleep(_TERMINAL_STATUS_POLL_INTERVAL_SECONDS)
+            exit_code = process.returncode
         except Exception:
             exit_code = None
         duration_seconds = time.monotonic() - started_monotonic
