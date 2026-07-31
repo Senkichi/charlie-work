@@ -14793,6 +14793,80 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
     assert result.data["remaining_drift"] == []
 
 
+def test_reconcile_removes_mergequeue_label_via_full_stack(tmp_path: Path) -> None:
+    """Wiring check for issue #819. Every other ``detect_mergequeue_not_approved``
+    test (test_reconcile.py) calls the detector directly with a config it
+    builds itself; none of them prove the detector is actually reached
+    through ``app.reconcile()``. Every reconcile test *in this file* uses
+    the default ``OrchestratorConfig()``, where ``auto_merge.mergequeue_label``
+    is ``None`` -- so the detector's very first line (``if not
+    mergequeue_label: return []``) short-circuits before doing anything,
+    and green tests here would prove nothing about wiring (the exists/
+    substantive/wired distinction). This test configures the label and
+    drives a real ``request_changes``-at-head PR through
+    ``app.reconcile(fix=True)`` end to end, asserting the label actually
+    comes off via ``GitHub.remove_pr_label`` -- the same mechanical step
+    that was missing when Aviator merged PR #695 over a standing
+    request-changes verdict."""
+    config = dataclasses.replace(
+        OrchestratorConfig(),
+        auto_merge=dataclasses.replace(
+            OrchestratorConfig().auto_merge, mergequeue_label="mergequeue"
+        ),
+    )
+    mergequeue_label = config.auto_merge.mergequeue_label
+    assert mergequeue_label is not None
+
+    class MergequeueGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self._pr = {
+                "number": 819,
+                "title": "fix",
+                "url": "u",
+                "headRefName": "agent/issue-819-x",
+                "baseRefName": "main",
+                "headRefOid": "sha-819-live",
+                "body": "",
+                "state": "OPEN",
+                "labels": [{"name": mergequeue_label}],
+                "isCrossRepository": False,
+                "headRepositoryOwner": "owner",
+                "baseRepositoryOwner": "owner",
+            }
+            self.pr_labels_removed: list[tuple[int, str]] = []
+
+        def run(self, arguments, *, json_output=False, allow_failure=False):
+            if "dependencies" in " ".join(arguments):
+                return [] if json_output else ""
+            if arguments[:2] == ["pr", "list"]:
+                return [self._pr]
+            if arguments[:2] == ["issue", "list"]:
+                return []
+            return []
+
+        def remove_pr_label(self, number: int, label: str) -> bool:
+            self.pr_labels_removed.append((number, label))
+            self._pr["labels"] = [item for item in self._pr["labels"] if item.get("name") != label]
+            return True
+
+    gh = MergequeueGitHub()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    pr_dir = paths.prs / "pr-819"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-819-live"}),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    app.reconcile(fix=True)
+
+    assert gh.pr_labels_removed == [(819, mergequeue_label)]
+    assert mergequeue_label not in [item.get("name") for item in gh._pr["labels"]]
+
+
 def test_reconcile_partial_fix_failure_reports_remaining_drift(tmp_path: Path) -> None:
     """mop-up --fix must exit non-zero when a label removal silently fails."""
     config = OrchestratorConfig()

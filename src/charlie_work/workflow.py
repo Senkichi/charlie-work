@@ -90,6 +90,7 @@ from .reconcile import (
     apply_fixes as apply_drift_fixes,
     detect_aviator_stale_blocked,
     detect_drift,
+    detect_mergequeue_not_approved,
 )
 from .worktree import (
     OPERATOR_MARKER_KIND,
@@ -11847,14 +11848,20 @@ class OrchestratorApp:
                     )
                 new_state = state
                 try:
-                    drift = detect_drift(
-                        self.gh,
-                        state,
-                        self.config,
-                        repo_root=self.repo_root,
-                        skip_dead_session_sweep=skip_dead_session_sweep,
-                    ) + detect_aviator_stale_blocked(
-                        self.gh, self.config, repo_root=self.repo_root
+                    drift = (
+                        detect_drift(
+                            self.gh,
+                            state,
+                            self.config,
+                            repo_root=self.repo_root,
+                            skip_dead_session_sweep=skip_dead_session_sweep,
+                        )
+                        + detect_aviator_stale_blocked(
+                            self.gh, self.config, repo_root=self.repo_root
+                        )
+                        + detect_mergequeue_not_approved(
+                            self.gh, self.config, repo_root=self.repo_root
+                        )
                     )
                     fixed = False
                     post_fix_drift: list[DriftItem] = []
@@ -11872,14 +11879,20 @@ class OrchestratorApp:
                         # for failed adds/removes, and apply_fixes records the outcome in the
                         # reconcile event. Re-detect against the new state to verify the repairs
                         # actually landed before reporting success.
-                        post_fix_drift = detect_drift(
-                            self.gh,
-                            new_state,
-                            self.config,
-                            repo_root=self.repo_root,
-                            skip_dead_session_sweep=skip_dead_session_sweep,
-                        ) + detect_aviator_stale_blocked(
-                            self.gh, self.config, repo_root=self.repo_root
+                        post_fix_drift = (
+                            detect_drift(
+                                self.gh,
+                                new_state,
+                                self.config,
+                                repo_root=self.repo_root,
+                                skip_dead_session_sweep=skip_dead_session_sweep,
+                            )
+                            + detect_aviator_stale_blocked(
+                                self.gh, self.config, repo_root=self.repo_root
+                            )
+                            + detect_mergequeue_not_approved(
+                                self.gh, self.config, repo_root=self.repo_root
+                            )
                         )
                         fixed = len(post_fix_drift) == 0
                 except GraphQLBudgetError as exc:
