@@ -47,6 +47,8 @@ from . import rescue as rescue_helpers
 from .subprocess_runner import no_console_window_kwargs
 from .cross_family import (
     CrossFamilyResult,
+    LEGACY_VACUOUS_SUMMARY,
+    MalformedCrossFamilyVerdict,
     extract_head_ref_oid,
     extract_report_body,
     parse_cross_family_verdict,
@@ -463,6 +465,52 @@ class CarryForwardCheck:
     @property
     def carry_forward(self) -> bool:
         return self.tier is not None
+
+
+def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
+    """Reject carry-forward for a content-free cross-family verdict (issue #784, AC-8).
+
+    ``review_queue`` reads recorded verdicts as plain dicts straight off
+    ``review-decision.json`` (never through the ``CrossFamilyVerdict``
+    constructor -- see ``_review_decision``), so this is a data-shape check,
+    not a dataclass reconstruction: it must never raise on the 8 pre-#784
+    on-disk records this predicate exists to catch, which is exactly the
+    deserialization hazard flagged during this fix's design.
+
+    A verdict is ineligible only when it is unmistakably a product of the
+    pre-#784 bug: ``decision == "request_changes"`` with no itemized
+    ``required_changes`` AND a summary that is either empty or exactly the
+    historical hardcoded placeholder (``LEGACY_VACUOUS_SUMMARY``). A primary
+    reviewer's ``request_changes`` verdict always has a non-empty, non-
+    placeholder summary (``record_review`` rejects an empty one outright),
+    so this predicate cannot mistake a legitimate primary-review decision --
+    one that simply chose prose over an itemized list -- for a vacuous one.
+    Everything else (``approved``, ``blocked``, populated
+    ``required_changes``, or a real summary) is eligible, unchanged from
+    before this fix.
+    """
+    if decision.get("decision") != "request_changes":
+        return True
+    if decision.get("required_changes"):
+        return True
+    summary = str(decision.get("summary") or "").strip()
+    return bool(summary) and summary != LEGACY_VACUOUS_SUMMARY
+
+
+# Statuses that mean an issue already has a rework routed (or an equivalent
+# gate) in flight, or is otherwise spoken for -- shared by every "should I
+# route this PR to rework_requested" check so they cannot drift apart.
+# Originally the cross-PR-revert gate in ``merge_ready`` (below); issue #784
+# AC-8 Case 2 reuses it verbatim for ``review_queue``'s stranded-verdict
+# check rather than inventing a second list.
+_REWORK_ALREADY_ROUTED_STATUSES = (
+    "escalated",
+    "blocked",
+    "dispatched",
+    "dispatch_pending",
+    "manifest_written",
+    "rework_requested",
+)
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -7994,6 +8042,22 @@ class OrchestratorApp:
         - The recorded decision is a stale ``request_changes``/``blocked``/
           ``approved`` verdict whose patch-id genuinely differs from the live
           head and the packet head is still current.
+        - The recorded decision is a content-free ``request_changes`` verdict
+          (issue #784 AC-8, ``_is_carry_forward_eligible``) and the packet
+          head is current -- queued as ``"vacuous"`` regardless of whether
+          the head moved, since carry-forward and the head-unchanged
+          shortcut must never re-confirm a verdict with nothing for a
+          rework brief to act on.
+
+        A PR is NOT queued, but has a side-effecting repair applied instead,
+        when the recorded decision is an actionable (non-content-free),
+        non-escalated ``request_changes`` verdict at the live head whose
+        linked issue status does not show it was ever routed to rework
+        (issue #784 AC-8, Case 2, ``_reroute_stranded_request_changes``) --
+        this re-applies the SAME ``rework_requested`` transition
+        ``record_review`` already decided, so it is a repair of a dropped
+        transition, not a new decision, and is a no-op once the issue is at
+        ``rework_requested`` (or otherwise already spoken for).
 
         Returns:
             CommandResult with a sorted ``queue`` list keyed by repo.
@@ -8026,7 +8090,49 @@ class OrchestratorApp:
             reviewed_head_sha = decision.get("reviewed_head_sha")
 
             if decision_value in ("approved", "request_changes", "blocked"):
+                if not _is_carry_forward_eligible(decision):
+                    # Issue #784 AC-8: a content-free request_changes verdict
+                    # must never be silently re-confirmed. This check runs
+                    # BEFORE the head-unchanged shortcut below on purpose --
+                    # that shortcut is the dominant case (a label-strip
+                    # requeue never moves the head), and the whole point of
+                    # AC-8 is that "head unchanged" must stop meaning
+                    # "verdict re-affirmed" for exactly this content-free
+                    # shape. Queue it as "vacuous" (packet permitting) so
+                    # _record_cross_family_verdicts can force a *bounded*
+                    # number of regeneration attempts
+                    # (cross_family.max_parse_failures) rather than looping
+                    # or re-confirming forever.
+                    if packet_head_sha is None or packet_head_sha != live_head_sha:
+                        continue
+                    queue.append(
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "packet_head_sha": packet_head_sha,
+                            "decision": "vacuous",
+                            "reviewed_head_sha": reviewed_head_sha,
+                        }
+                    )
+                    continue
+
                 if reviewed_head_sha == live_head_sha:
+                    # Issue #784 AC-8 (Case 2): "reviewed at live head" only
+                    # means "nothing to do" if the recorded verdict was
+                    # actually actioned. A request_changes verdict that
+                    # record_review decided is within the rework-cycle
+                    # budget (``escalated`` falsy) must have routed its
+                    # issue to rework_requested in that same call; if the
+                    # issue status doesn't show that -- e.g. issue #789's
+                    # reconcile one-way "closed" gate clobbered it -- re-
+                    # drive the same target here rather than silently
+                    # re-confirming a verdict nobody ever acted on.
+                    if (
+                        not self.dry_run
+                        and decision_value == "request_changes"
+                        and not decision.get("escalated")
+                    ):
+                        self._reroute_stranded_request_changes(pr, issue_number, decision)
                     continue
 
                 check = self._check_carry_forward(pr_number, decision)
@@ -8276,10 +8382,18 @@ class OrchestratorApp:
         When ``cross_family.auto_verdict`` is enabled and
         ``review_dispatch`` is disabled (the cross-family pass is the sole
         automated review), this scans the review queue for PRs whose
-        ``review-decision.json`` is still ``pending`` but whose
-        ``cross-family-review.md`` report is valid and non-stale. It
-        parses the report into an approved/request_changes verdict and
-        records it via ``record_review()``, unblocking the merge lane.
+        ``review-decision.json`` is still ``pending`` -- or whose recorded
+        verdict was rejected as content-free and re-queued as ``"vacuous"``
+        (issue #784 AC-8) -- but whose ``cross-family-review.md`` report is
+        valid and non-stale. It parses the report into an approved/
+        request_changes verdict and records it via ``record_review()``,
+        unblocking the merge lane.
+
+        A report that fails to parse into a real verdict
+        (``MalformedCrossFamilyVerdict``) is never recorded -- issue #784
+        AC-3: it must not increment ``request_changes_count`` or dispatch
+        rework. See ``_handle_malformed_cross_family_verdict`` for how that
+        outcome is bounded so it cannot repeat forever.
 
         Returns a list of per-PR result dicts for logging/diagnostics.
         """
@@ -8291,7 +8405,7 @@ class OrchestratorApp:
         for candidate in candidates:
             pr_number = candidate["pr"]
             decision = candidate.get("decision")
-            if decision != "pending":
+            if decision not in ("pending", "vacuous"):
                 continue
             pr_dir = self.paths.prs / f"pr-{pr_number}"
             report_path = pr_dir / "cross-family-review.md"
@@ -8310,6 +8424,13 @@ class OrchestratorApp:
             parsed = parse_cross_family_verdict(report_text)
             if parsed is None:
                 continue
+            if isinstance(parsed, MalformedCrossFamilyVerdict):
+                results.append(
+                    self._handle_malformed_cross_family_verdict(
+                        pr_number, candidate.get("issue"), packet_head, parsed
+                    )
+                )
+                continue
             verdict_decision = parsed.decision
             record_result = self.record_review(
                 pr_number,
@@ -8327,6 +8448,93 @@ class OrchestratorApp:
                 }
             )
         return results
+
+    def _handle_malformed_cross_family_verdict(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        packet_head: str | None,
+        parsed: MalformedCrossFamilyVerdict,
+    ) -> dict[str, Any]:
+        """Bound the malformed-verdict cycle for one PR (issue #784 AC-8 bound).
+
+        Never calls ``record_review`` with the malformed outcome itself
+        (AC-3: no ``request_changes_count`` increment, no rework dispatch).
+        Tracks a *separate* durable counter,
+        ``cross_family_parse_failure_count``, so the "content-free verdict
+        -> AC-8 forces regeneration -> still content-free" cycle cannot
+        repeat forever: without a bound of its own, removing the
+        request_changes-cycle counter from this path (as AC-3 requires)
+        would leave nothing capping how many times a PR re-enters this
+        branch, one ``_record_cross_family_verdicts`` invocation per loop
+        pass.
+
+        Past ``cross_family.max_parse_failures`` observations, cross-family
+        review is abandoned for this PR: recorded as a caveated, non-
+        blocking ``approved`` (never ``agent:human-needed``, and never a
+        ``request_changes`` verdict that blocks indefinitely -- both of
+        which would recreate the original bug with better provenance). This
+        is deliberately asymmetric: a reviewer this pipeline cannot parse is
+        a failure of the pipeline, not evidence against the PR, so the PR
+        does not pay for it.
+        """
+        cap = self.config.cross_family.max_parse_failures
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            failure_count = int(pr_state.get("cross_family_parse_failure_count", 0)) + 1
+            abandon = failure_count > cap
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "cross_family_parse_failure_count": failure_count,
+            }
+            state = self._record_event(
+                state,
+                "cross_family_verdict_abandoned"
+                if abandon
+                else "cross_family_verdict_unparseable",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "reason": parsed.reason,
+                    "attempt": failure_count,
+                    "max_parse_failures": cap,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        if not abandon:
+            return {
+                "pr_number": pr_number,
+                "decision": "unparseable",
+                "ok": False,
+                "message": (
+                    f"cross-family verdict unparseable ({parsed.reason}), "
+                    f"attempt {failure_count}/{cap}"
+                ),
+            }
+        record_result = self.record_review(
+            pr_number,
+            "approved",
+            summary=(
+                "Cross-family review could not produce a parseable verdict "
+                f"after {failure_count} attempts ({parsed.reason}); treated "
+                "as non-blocking per its advisory-only design (issue #784). "
+                f"A human should inspect prs/pr-{pr_number}/cross-family-review.md "
+                "directly."
+            ),
+            reviewed_head=packet_head,
+            required_changes=(),
+        )
+        return {
+            "pr_number": pr_number,
+            "decision": "approved",
+            "ok": record_result.ok,
+            "message": (
+                f"cross-family review abandoned after {failure_count} parse "
+                f"failures: {record_result.message}"
+            ),
+        }
 
     @_guard_state_lock
     def dispatch_reviews(self, limit: int | None = None) -> CommandResult:
@@ -9575,6 +9783,13 @@ class OrchestratorApp:
                 # the PR is not stuck. If the head later advances and triggers a
                 # new review cycle, the counter starts fresh.
                 "review_dispatch_attempt_count": 0,
+                # Reset the cross-family parse-failure bound (issue #784
+                # AC-8): a real verdict was just recorded -- whether a
+                # genuine parse or this method's own "abandon" call from
+                # _handle_malformed_cross_family_verdict -- so a future
+                # review cycle (new head, new content) gets a fresh budget
+                # rather than inheriting an exhausted one.
+                "cross_family_parse_failure_count": 0,
                 # Reviewer session token/cost telemetry (best-effort): merge-update
                 # so a call without metrics (e.g. a manual `charlie verdict`)
                 # never clobbers metrics recorded by an earlier automated reap.
@@ -10389,18 +10604,11 @@ class OrchestratorApp:
                         state = load_state_locked(self.paths.state_file)
                         issue_state = state["issues"].get(str(issue_number), {})
                         issue_status = issue_state.get("status")
-                        if issue_status not in (
-                            "escalated",
-                            "blocked",
-                            "dispatched",
-                            "dispatch_pending",
-                            "manifest_written",
-                        ):
-                            if issue_status != "rework_requested":
-                                cross_pr_revert_routed = True
-                                rework_label_error = self._request_cross_pr_revert_rework(
-                                    pr, issue_number, decision, cross_pr_revert_reason
-                                )
+                        if issue_status not in _REWORK_ALREADY_ROUTED_STATUSES:
+                            cross_pr_revert_routed = True
+                            rework_label_error = self._request_cross_pr_revert_rework(
+                                pr, issue_number, decision, cross_pr_revert_reason
+                            )
         checks = self.gh.pr_checks(pr_number)
         checks_unavailable = checks is None
 
@@ -12530,6 +12738,56 @@ class OrchestratorApp:
         )
         return self._route_to_rework(
             pr, issue_number, decision, summary, "cross_pr_revert_rework_requested"
+        )
+
+    def _reroute_stranded_request_changes(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Re-drive an actionable, already-recorded ``request_changes`` verdict
+        to ``rework_requested`` when the linked issue's status never reflects it.
+
+        Issue #784 AC-8 (Case 2). ``record_review`` durably decides and
+        persists the rework-vs-escalate outcome (``decision["escalated"]``,
+        computed against ``max_rework_cycles`` and persisted to
+        ``request_changes_count`` BEFORE any GitHub label mutation --
+        ``record_review`` ~9355-9396) and applies the matching issue-status
+        transition in that same call. If that label transition silently
+        failed, or the issue status was later clobbered by an independent
+        bug (e.g. issue #789's reconcile one-way "closed" gate), the issue
+        is stranded: a real, actionable verdict sits on disk with nothing
+        routing it to a rework worker (``dispatch_rework`` only ever selects
+        issues already at ``status == "rework_requested"``).
+
+        This never re-decides escalation -- the caller only invokes it when
+        ``decision.get("escalated")`` is falsy, i.e. record_review already
+        decided this verdict is within the rework-cycle budget -- it only
+        re-applies that SAME target via the SAME generic entry point
+        (``_route_to_rework``) that every other "discovered late, needs
+        rework" lane in this file uses (cross-PR-revert, merge-conflict,
+        check-failure).
+
+        Idempotent: guarded by ``_REWORK_ALREADY_ROUTED_STATUSES`` -- the
+        exact status set ``merge_ready``'s cross-PR-revert gate uses -- so a
+        second pass over unchanged state (issue already ``rework_requested``,
+        or otherwise mid-flight/escalated/blocked) is a no-op. This is also
+        why the fix lives here rather than in ``reconcile.py``: routing to
+        rework can dispatch a worker, and reconcile's repair pass must never
+        synthesize ``rework_requested`` (reconcile.py's own invariant) --
+        only a dispatch-context caller may complete this transition.
+        """
+        state = load_state_locked(self.paths.state_file)
+        issue_status = state.get("issues", {}).get(str(issue_number), {}).get("status")
+        if issue_status in _REWORK_ALREADY_ROUTED_STATUSES:
+            return None
+        return self._route_to_rework(
+            pr,
+            issue_number,
+            decision,
+            decision.get("summary") or "",
+            "stranded_request_changes_rework_requested",
         )
 
     def _merge_train_head(self, prs: list[dict[str, Any]] | None = None) -> int | None:
