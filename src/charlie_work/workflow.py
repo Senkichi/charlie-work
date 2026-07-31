@@ -60,6 +60,7 @@ from .github import (
     GitHubRunResult,
     GraphQLBudgetError,
     cancel_superseded_runs,
+    defang_closing_keywords,
     detect_prose_only_dependencies,
     get_github_issue_dependencies,
     is_infrastructure_failure,
@@ -3724,6 +3725,15 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     Returns an empty string only when there is no decision, or the decision
     is not ``request_changes``/``blocked``, or it is ``blocked`` with some
     (but not zero) findings content -- every other case renders something.
+
+    Reviewer-authored text (tiers 1-2) passes through
+    ``defang_closing_keywords`` before rendering. A worker reads this brief
+    and writes its own PR body/commit message from it -- text charlie-work
+    does not control downstream and cannot re-check with
+    ``linked_issue_number``'s hijack-safety guard. If reviewer prose contains
+    a live closing keyword (``Fixes #649``), rewriting it to ``Fixes issue
+    649`` keeps the issue number legible while removing the syntax that
+    would trigger GitHub auto-close or a false label-transition binding.
     """
     if not isinstance(decision, dict):
         return ""
@@ -3749,7 +3759,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             "PR can be approved.",
             "",
         ]
-        lines.extend(f"- {change}" for change in changes)
+        lines.extend(f"- {defang_closing_keywords(change)}" for change in changes)
         lines.append("")
         return "\n".join(lines)
 
@@ -3762,7 +3772,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             "lost — treat it as the findings to address before this PR can "
             "be approved:",
             "",
-            summary_text,
+            defang_closing_keywords(summary_text),
             "",
         ]
         return "\n".join(lines)
@@ -3843,6 +3853,16 @@ def _write_rework_prompt(
     them. The raw note is also written to a sidecar
     (``rework-dispatch-note.txt``) so a stale brief can be regenerated at
     dispatch time without losing its note.
+
+    Single point of enforcement for issue #781 (outbound defang): reviewer
+    prose reaches this brief through two independent template slots —
+    ``$required_changes_section`` (via ``_render_required_changes_section``,
+    already defanged there) and ``$dispatch_note`` (this parameter, often the
+    same reviewer summary text under a different name). Both slots land in a
+    document a worker reads and copies from when authoring its own PR body,
+    so ``dispatch_note`` is defanged here too, at render time only — the
+    sidecar on disk stays raw so a future regeneration re-defangs from the
+    same source instead of compounding a prior rewrite.
     """
     pr_number = int(pr["number"])
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
@@ -3857,16 +3877,17 @@ def _write_rework_prompt(
             "pr_title": pr.get("title", ""),
             "pr_url": pr.get("url", ""),
             "issue_number": issue_number or "UNKNOWN",
-            "dispatch_note": dispatch_note,
+            "dispatch_note": defang_closing_keywords(dispatch_note),
             "required_changes_section": required_changes_section,
             "branch_name": pr.get("headRefName", ""),
         },
         search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
     )
     prompt_path.write_text(prompt, encoding="utf-8")
-    # Sidecar: the raw dispatch note, so a dispatch-time regeneration (when
-    # review-decision.json is newer than the brief) can reproduce the note
-    # without parsing the rendered markdown.
+    # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
+    # regeneration (when review-decision.json is newer than the brief) can
+    # reproduce the note and re-defang it fresh rather than parsing already-
+    # rewritten markdown back out.
     (pr_dir / "rework-dispatch-note.txt").write_text(dispatch_note, encoding="utf-8")
     return prompt_path
 
