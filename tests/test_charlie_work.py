@@ -3042,6 +3042,13 @@ class FakeGitHub:
         self.base_head_sha = "base-sha"
         self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
         self.compare_diff_overrides: dict[tuple[str, str], str | None] = {}
+        # Per-base branch protection overrides for testing issue #812's
+        # freshness-policy derivation. Default (no override) is None, matching
+        # the real GitHub.branch_protection()'s fail-closed return on any read
+        # failure -- so every pre-existing test keeps exercising the
+        # require_current_base fallback unchanged unless it opts in.
+        self.branch_protection_overrides: dict[str, dict[str, Any] | None] = {}
+        self.branch_protection_calls: list[str] = []
         self._record_pr_heads(self.prs)
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -3413,6 +3420,10 @@ class FakeGitHub:
         if override != "_unset":
             return override
         return f"diff --git a/interdiff b/interdiff\n--- a/interdiff\n+++ b/interdiff\n@@ -1 +1 @@\n-{base}\n+{head}\n"
+
+    def branch_protection(self, base: str) -> dict[str, Any] | None:
+        self.branch_protection_calls.append(base)
+        return self.branch_protection_overrides.get(base)
 
     def label_create(self, label: str, color: str, description: str) -> None:
         self.labels_created.append((label, color, description))
@@ -9817,6 +9828,209 @@ def test_unauthorized_merge_baseline_arming_writes_nothing_in_dry_run(tmp_path: 
     )
 
 
+def _ack_unauthorized_merge(paths, pr_number: int, reason: str = "triaged") -> None:
+    """Mark a post-arming unauthorized-merge finding as acknowledged in state.json.
+
+    Mirrors ``_arm_unauthorized_merge_tripwire`` for the ack half of the
+    tripwire: tests asserting on post-arming findings use this to declare the
+    steady state where a finding has already been triaged and must no longer
+    pin ``ok=False`` (issue #673).
+    """
+    from charlie_work.state import load_state, save_state
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    state = load_state(paths.state_file)
+    acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+    if not isinstance(acks, dict):
+        acks = {}
+    acks[str(pr_number)] = {
+        "acknowledged_at": "2026-07-27T00:00:00Z",
+        "reason": reason,
+    }
+    state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
+    save_state(paths.state_file, state)
+
+
+def test_unauthorized_merge_ack_suppresses_acknowledged_finding(tmp_path: Path) -> None:
+    """An acknowledged post-arming finding must stop polluting every pass (issue #673).
+
+    The tripwire keeps its bite until a finding is explicitly acknowledged; once
+    acked it is filtered the same way the pre-arming baseline filters history, so
+    ``ok=False`` / ``errors`` go back to meaning "there is something new to look
+    at" instead of "the mechanism cannot ever clear this".
+    """
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [
+        _merged_worker_pr(1408, 1404, "sha-1408"),
+        _merged_worker_pr(1392, 1268, "sha-1392"),
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-ack: both post-arming findings are flagged.
+    detected = app._detect_unauthorized_merges(fake_gh.prs)
+    assert sorted(d["pr"] for d in detected) == [1392, 1408]
+
+    # Acknowledge both (e.g. root cause fixed in #672, confirmed benign per #634).
+    _ack_unauthorized_merge(paths, 1408, "root cause fixed in #672")
+    _ack_unauthorized_merge(paths, 1392, "root cause fixed in #672")
+
+    # Post-ack: both are suppressed — the tripwire can go quiet.
+    assert app._detect_unauthorized_merges(fake_gh.prs) == [], (
+        "an acknowledged finding must not be re-reported on every pass"
+    )
+
+    # A NEW post-arming finding is still flagged — ack only suppresses what was
+    # explicitly acked, it does not auto-acknowledge anything else.
+    new_prs = [*fake_gh.prs, _merged_worker_pr(1500, 1501, "sha-1500")]
+    detected_after = app._detect_unauthorized_merges(new_prs)
+    assert [d["pr"] for d in detected_after] == [1500]
+
+
+def test_unauthorized_merge_ack_does_not_suppress_unacked(tmp_path: Path) -> None:
+    """The ack set suppresses only the acked PR, never a sibling finding (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
+    _ack_unauthorized_merge(paths, 1408, "fixed")
+
+    fake_gh = FakeGitHub()
+    prs = [
+        _merged_worker_pr(1408, 1404, "sha-1408"),
+        _merged_worker_pr(1392, 1268, "sha-1392"),
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    detected = app._detect_unauthorized_merges(prs)
+    assert [d["pr"] for d in detected] == [1392], (
+        "acking #1408 must not also suppress the unrelated #1392 finding"
+    )
+
+
+def test_ack_unauthorized_merge_records_ack_and_event(tmp_path: Path) -> None:
+    """``ack_unauthorized_merge`` persists the ack set and an audit event (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="senki")
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+    assert isinstance(acks, dict), "ack must persist an ack set to state.json"
+    entry = acks["1408"]
+    assert entry["reason"] == "root cause fixed in #672"
+    assert entry["acknowledged_at"]
+    assert entry["by"] == "senki"
+
+    # The ack must be auditable: an event carries who/why/when.
+    acked = [e for e in state["events"] if e["kind"] == "unauthorized_merge_acknowledged"]
+    assert len(acked) == 1
+    assert acked[0]["payload"]["pr"] == 1408
+    assert acked[0]["payload"]["reason"] == "root cause fixed in #672"
+    assert acked[0]["payload"]["by"] == "senki"
+
+
+def test_ack_unauthorized_merge_requires_reason(tmp_path: Path) -> None:
+    """An ack without a reason is rejected — a tripwire that can be silenced silently is no control (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.ack_unauthorized_merge(1408, "   ")
+    assert result.ok is False
+    assert "reason" in result.message.lower()
+    assert UNAUTHORIZED_MERGE_ACK_KEY not in load_state(paths.state_file), (
+        "a rejected ack must not have written anything to state"
+    )
+
+
+def test_ack_unauthorized_merge_updates_existing_ack(tmp_path: Path) -> None:
+    """Re-acking a PR updates the record rather than refusing or duplicating (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    app.ack_unauthorized_merge(1408, "initial triage", by="alice")
+    first = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]["1408"]
+
+    app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="bob")
+    second = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]["1408"]
+
+    assert len(load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]) == 1, (
+        "re-acking must not duplicate the entry"
+    )
+    assert second["reason"] == "root cause fixed in #672"
+    assert second["by"] == "bob"
+    assert second["acknowledged_at"] >= first["acknowledged_at"]
+
+
+def test_cli_tripwire_ack_writes_state(monkeypatch, tmp_path: Path) -> None:
+    """`charlie tripwire ack <pr> --reason ...` persists the ack through the CLI (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    monkeypatch.setattr(cli, "build_app", lambda args: app)
+
+    exit_code = cli.main(
+        ["tripwire", "ack", "1408", "--reason", "root cause fixed in #672", "--by", "senki"]
+    )
+    assert exit_code == 0
+
+    acks = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]
+    assert acks["1408"]["reason"] == "root cause fixed in #672"
+    assert acks["1408"]["by"] == "senki"
+
+
+def test_cli_tripwire_ack_requires_reason(monkeypatch, capsys, tmp_path: Path) -> None:
+    """`charlie tripwire ack` without --reason exits non-zero and writes nothing (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    monkeypatch.setattr(cli, "build_app", lambda args: app)
+
+    exit_code = cli.main(["tripwire", "ack", "1408"])
+    assert exit_code == 1
+    assert UNAUTHORIZED_MERGE_ACK_KEY not in load_state(paths.state_file)
+
+
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
         return subprocess.CompletedProcess(
@@ -10528,7 +10742,7 @@ def test_run_cross_family_sanitizes_environment(
 def test_run_cross_family_sanitizes_environment_with_repo_venv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When repo has .venv, VIRTUAL_ENV must be set to that path."""
+    """When repo has a real .venv, VIRTUAL_ENV must be set and UV_PROJECT_ENVIRONMENT dropped."""
     from charlie_work.env_sanitize import sanitize_env
 
     repo_root = tmp_path / "repo"
@@ -10544,7 +10758,7 @@ def test_run_cross_family_sanitizes_environment_with_repo_venv(
 
     assert env.get("VIRTUAL_ENV") == str(repo_venv), "VIRTUAL_ENV must be set to repo .venv"
     assert "UV_PROJECT_ENVIRONMENT" not in env, (
-        "UV_PROJECT_ENVIRONMENT must be dropped when repo has .venv"
+        "UV_PROJECT_ENVIRONMENT must be dropped; uv's default is the same repo .venv (issue #649)"
     )
 
 
@@ -10857,6 +11071,66 @@ def test_parse_cross_family_verdict_legacy_blocker_with_no_summary_is_malformed(
     assert isinstance(result, MalformedCrossFamilyVerdict)
     assert result.reason == "blocker_or_major_with_no_extractable_summary"
     assert "BLOCKER" in result.raw_body
+
+
+def test_parse_cross_family_verdict_bold_inline_verdict_marker() -> None:
+    """Regression: some cross-family models (e.g. glm-5.2) emit the verdict as
+    a bold-inline ``**Verdict:**`` marker within a paragraph, rather than a
+    bare ``Verdict:`` line or a ``## Verdict`` heading. The pre-fix
+    ``_VERDICT_RE`` matched neither the bare-colon nor the heading form, so
+    every such report (PRs #680, #690, #692, #699, #700 in production, all
+    with real BLOCKER/MAJOR findings and a readable verdict) fell through to
+    the "no extractable summary" branch and was misclassified as
+    ``MalformedCrossFamilyVerdict`` despite the verdict being right there."""
+    body = (
+        "**MAJOR**\nfile.py:10 real bug\n\n"
+        "**Verdict:** Approve with a required follow-up — MAJOR 1 is a real "
+        "correctness bug that must be fixed before this claim can be trusted."
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary=(
+            "Approve with a required follow-up — MAJOR 1 is a real "
+            "correctness bug that must be fixed before this claim can be trusted."
+        ),
+        required_changes=(),
+    )
+
+
+def test_parse_cross_family_verdict_json_block_after_language_tagged_code_fences() -> None:
+    """Regression for PR #802's real failure shape: a report that cites code
+    in ```python fences before its final ```json verdict fence. The pre-fix
+    ``_VERDICT_FENCE_RE`` (``` ```(?:json)?\\s*\\n `` ``) only recognized an
+    opening fence tagged bare or ``json`` -- a ```python fence's own opening
+    backtick never matched, so ``finditer`` instead paired that block's
+    *closing* bare ``` with the *next* fence's opening as a bogus "match",
+    permanently desynchronizing every fence pair after it and hiding the
+    genuinely well-formed trailing JSON verdict entirely (confirmed
+    byte-for-byte against PR #802's on-disk report)."""
+    body = (
+        "**MAJOR**\nfile.py:10 real bug\n\n"
+        "```python\n"
+        "total_running = sum(t.running for t in plan.targets)\n"
+        "```\n\n"
+        "some prose explaining the first citation\n\n"
+        "```python\n"
+        "planned_running = sum(t.target for t in plan.targets)\n"
+        "```\n\n"
+        "some prose explaining the second citation\n\n"
+        "```json\n"
+        '{"decision": "request_changes", "summary": "real bug in the spare-budget gate", '
+        '"required_changes": ["Fix the gate to use planned running, not actual running"]}\n'
+        "```\n"
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="real bug in the spare-budget gate",
+        required_changes=("Fix the gate to use planned running, not actual running",),
+    )
 
 
 def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
@@ -14607,6 +14881,241 @@ def test_find_repo_root_explicit_raises_when_not_git_repo(tmp_path: Path) -> Non
         raise AssertionError("expected RepoNotFoundError")
 
 
+def _init_git_repo(repo_root: Path) -> None:
+    """Create a real non-bare git repo with one commit on ``main``."""
+    repo_root.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+
+
+def test_find_repo_root_resolves_shared_root_from_linked_worktree(tmp_path: Path) -> None:
+    """Issue #648: with no --repo, find_repo_root() invoked from inside a
+    linked git worktree must resolve the *shared* (main) worktree root, not
+    the worktree's own toplevel — otherwise runtime state silently targets a
+    phantom, never-populated ``.var/charlie-work/`` directory."""
+    from charlie_work.paths import find_repo_root, runtime_paths
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    # Seed a real state dir under the main root so we can distinguish it.
+    main_state_dir = repo_root / ".var" / "charlie-work"
+    main_state_dir.mkdir(parents=True)
+    (main_state_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    branch = "agent/issue-648-linked"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(tmp_path / "wt"), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        resolved = find_repo_root(tmp_path / "wt")
+        # Must resolve to the main worktree root, not the linked worktree.
+        assert resolved == repo_root.resolve()
+        paths = runtime_paths(resolved, ".var/charlie-work")
+        assert paths.state_file.exists()
+        assert paths.state_file == (repo_root / ".var" / "charlie-work" / "state.json").resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(tmp_path / "wt")],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_explicit_main_worktree_returns_main_root(tmp_path: Path) -> None:
+    """An explicit --repo pointing at the main checkout returns the main root.
+    The shared-root resolution returns None in the main worktree (where
+    --git-dir == --git-common-dir), so --show-toplevel is used and is correct."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    resolved = find_repo_root(repo_root, explicit=True)
+    assert resolved == repo_root.resolve()
+
+
+def test_find_repo_root_explicit_linked_worktree_resolves_main_root(tmp_path: Path) -> None:
+    """Issue #648 review: an explicit --repo pointing at a linked worktree must
+    also resolve to the shared main root, not the linked worktree's own
+    toplevel.  The orchestrator's state is shared — there is no per-worktree
+    state directory — so --repo <linked-worktree> would silently target a
+    phantom state dir without this."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    branch = "agent/issue-648-explicit"
+    linked_wt = tmp_path / "wt-explicit"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(linked_wt), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        resolved = find_repo_root(linked_wt, explicit=True)
+        assert resolved == repo_root.resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_from_subdirectory_of_linked_worktree(tmp_path: Path) -> None:
+    """Issue #648 review: find_repo_root from a *subdirectory* of a linked
+    worktree must still resolve to the shared main root."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    linked_wt = tmp_path / "wt-subdir"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "agent/issue-648-subdir", str(linked_wt), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subdir = linked_wt / "src" / "deep"
+    subdir.mkdir(parents=True)
+    try:
+        resolved = find_repo_root(subdir)
+        assert resolved == repo_root.resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_separate_git_dir_main_worktree(tmp_path: Path) -> None:
+    """Issue #648 review MAJOR 1: a --separate-git-dir repo's main worktree
+    must resolve to the *working tree* root (where the code lives), not the
+    external git dir's container.  The shared-root resolution detects the main
+    worktree (--git-dir == --git-common-dir) and returns None, so
+    --show-toplevel is used and returns the working tree root."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    external_git = tmp_path / "external" / ".git"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    external_git.parent.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", f"--separate-git-dir={external_git}", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+    # The external dir's parent must NOT be returned as the repo root.
+    resolved = find_repo_root(repo_root)
+    assert resolved == repo_root.resolve()
+    assert resolved != external_git.parent.resolve()
+
+
+def test_runtime_paths_warns_on_phantom_state_dir(tmp_path: Path, caplog: Any) -> None:
+    """Issue #648: a state dir that exists with sibling artifacts but no
+    state.json is a phantom signal — runtime_paths must warn (non-blocking)
+    so the operator notices instead of seeing a silent 'all clear'."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    # Mimic the stray artifacts described in the issue.
+    (state_dir / "events.db").write_bytes(b"")
+    (state_dir / "state.json.lock").write_text("", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(state_dir.resolve()) in warnings[0].message
+    assert "state.json" in warnings[0].message
+
+
+def test_runtime_paths_silent_without_sibling_artifacts(tmp_path: Path, caplog: Any) -> None:
+    """Issue #648 review MINOR: a state dir that exists but has no state.json
+    AND no sibling artifacts (events.db, state.json.lock) must NOT warn — it
+    could be a pre-existing directory used for an unrelated purpose, not a
+    phantom left by a misresolved invocation."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    # No sibling artifacts — just an empty dir.
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
+
+
+def test_runtime_paths_no_warn_for_absolute_unrelated_state_dir(
+    tmp_path: Path, caplog: Any
+) -> None:
+    """Issue #648 review MINOR: an absolute state_dir pointing at a
+    pre-existing directory without sibling artifacts must not trigger the
+    phantom warning."""
+    from charlie_work.paths import runtime_paths
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "some-file.txt").write_text("data", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, str(unrelated))
+
+    assert not caplog.records
+
+
+def test_runtime_paths_silent_when_state_dir_absent(tmp_path: Path, caplog: Any) -> None:
+    """A genuine first run has not created the state dir yet at runtime_paths
+    call time — no phantom warning must fire."""
+    from charlie_work.paths import runtime_paths
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
+
+
+def test_runtime_paths_silent_when_state_json_exists(tmp_path: Path, caplog: Any) -> None:
+    """A populated state dir is the normal steady state — no warning."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
+
+
 # --- adversarial-review fixes: regressions + coverage gaps ---------------------
 
 
@@ -17233,6 +17742,70 @@ def test_github_dry_run_allows_readonly_command(monkeypatch, tmp_path: Path) -> 
     gh.run(["issue", "list", "--label", "x"], json_output=True)
 
     assert len(calls) == 1  # read-only command still executes under dry-run
+
+
+def test_branch_protection_caches_per_pass(monkeypatch, tmp_path: Path) -> None:
+    """Issue #812: branch_protection() must cost exactly one `gh api` call per
+    base ref per orchestrator pass, not one per PR -- N callers sharing a base
+    (e.g. N open PRs against main in one merge_ready/broadcast-sweep pass) must
+    collapse to a single underlying read. The cache lives in GitHub._list_cache
+    (the same dict pr_list/issue_list already use) and is cleared only by
+    invalidate_list_cache(), which the orchestrator calls once per pass.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        payload = json.dumps({"required_status_checks": {"strict": True}})
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    # Simulate N=5 PRs against the same base within one pass: 5 calls to the
+    # method, but the underlying `gh api` subprocess must run exactly once.
+    results = [gh.branch_protection("main") for _ in range(5)]
+    assert all(r == {"required_status_checks": {"strict": True}} for r in results)
+    assert len(calls) == 1
+    # Pin the actual endpoint (and the {owner}/{repo} placeholder escaping),
+    # not just "something got cached" -- a wrong URL would still pass a
+    # call-count-only assertion.
+    assert calls[0] == ["gh", "api", "repos/{owner}/{repo}/branches/main/protection"]
+
+    # A different base ref is a distinct cache key, so it costs a fresh read.
+    gh.branch_protection("develop")
+    assert len(calls) == 2
+    gh.branch_protection("develop")
+    assert len(calls) == 2  # still cached
+
+    # invalidate_list_cache() (called once at the top of every orchestrator
+    # pass) must force a fresh read on the next call -- the cache is valid
+    # only within a single pass, never leaking across passes.
+    gh.invalidate_list_cache()
+    gh.branch_protection("main")
+    assert len(calls) == 3
+
+
+def test_branch_protection_caches_failed_read_too(monkeypatch, tmp_path: Path) -> None:
+    """A failed read (404/rate-limited) must also be cached as None for the
+    rest of the pass -- otherwise every PR sharing a broken base ref retries
+    the same doomed `gh api` call once each, turning one outage into N.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(
+            args=args, returncode=1, stdout="", stderr="HTTP 404: Not Found"
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    assert gh.branch_protection("main") is None
+    assert gh.branch_protection("main") is None
+    assert gh.branch_protection("main") is None
+    assert len(calls) == 1
 
 
 def test_is_mutating_classifies_readonly_and_mutating() -> None:
@@ -21573,6 +22146,309 @@ def test_merge_ready_require_current_base_false_allows_stale_base(tmp_path: Path
 
     state = json.loads(paths.state_file.read_text())
     assert not any(e["kind"] == "merge_deferred_stale_base" for e in state["events"])
+
+
+def _stale_base_prs() -> list[dict[str, Any]]:
+    """Two-PR fixture used by the issue #812 protection-derivation tests: PR
+    456 merges first (advancing the fake base tip), then PR 789's merge-base
+    is still the old tip, making it organically stale for the second call.
+    """
+    return [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+
+
+def test_merge_ready_protection_strict_true_defers_even_when_config_disables_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #812: base freshness is DERIVED from branch protection, not merely
+    defaulted from config. Prove the direction that matters most for adoption --
+    protection strict:true still enforces the gate even though the operator has
+    explicitly set require_current_base=False in config. If this regressed to
+    "config wins", a repo relying on protection-derived enforcement while having
+    require_current_base=False would silently stop deferring stale merges.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,  # broadcast
+            require_current_base=False,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = _stale_base_prs()
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": True}}
+
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps({"decision": "approved", "reviewed_head_sha": head_sha}, indent=2),
+            encoding="utf-8",
+        )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
+
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.data["merged"] is True
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.data["can_merge"] is False
+    assert result_789.data["merged"] is False
+    assert result_789.data.get("stale_base") is True
+    assert fake_gh.merged == [(456, "squash")]
+    assert "main" in fake_gh.branch_protection_calls
+
+    state = json.loads(paths.state_file.read_text())
+    stale_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base"]
+    assert len(stale_events) == 1
+    assert stale_events[0]["payload"]["pr_number"] == 789
+
+
+def test_merge_ready_protection_strict_false_allows_stale_base_without_update_call(
+    tmp_path: Path,
+) -> None:
+    """Issue #812: protection strict:false disables the gate even though
+    require_current_base defaults to True in config -- the config constant is
+    a fallback for unreadable protection, not the authority. Also pins that the
+    pr_update_branch write is skipped entirely (the CI-churn half of the fix),
+    not merely that the deferral gate is skipped.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,  # broadcast
+        )
+    )
+    assert config.auto_merge.require_current_base is True  # sanity: default unchanged
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = _stale_base_prs()
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": False}}
+
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps({"decision": "approved", "reviewed_head_sha": head_sha}, indent=2),
+            encoding="utf-8",
+        )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.data["merged"] is True
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.data["can_merge"] is True
+    assert result_789.data["merged"] is True
+    assert result_789.data.get("stale_base") is not True
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+    # The write half of the churn (pr_update_branch) never fires when
+    # freshness isn't required -- not just the deferral-gate read half.
+    assert fake_gh.pr_update_branch_calls == []
+
+    state = json.loads(paths.state_file.read_text())
+    assert not any(e["kind"] == "merge_deferred_stale_base" for e in state["events"])
+
+
+def test_is_base_freshness_required_fails_closed_when_protection_raises(tmp_path: Path) -> None:
+    """Fail-closed shape 1/3: the protection read raising an exception must not
+    propagate as an unhandled error, and must not be treated as "no freshness
+    required" -- it falls back to the require_current_base config value.
+    """
+
+    class ExplodingProtectionGitHub(FakeGitHub):
+        def branch_protection(self, base: str) -> dict[str, Any] | None:
+            raise RuntimeError("simulated network failure")
+
+    config = OrchestratorConfig()  # require_current_base defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ExplodingProtectionGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app._is_base_freshness_required("main") is True
+
+
+def test_is_base_freshness_required_fails_closed_when_protection_read_errors(
+    tmp_path: Path,
+) -> None:
+    """Fail-closed shape 2/3: an error-value read (404 / rate-limited / gh
+    unavailable) surfaces as branch_protection() returning None -- the fake's
+    default for a base with no configured override, mirroring the real
+    GitHub.branch_protection()'s contract. This must fall back to
+    require_current_base, not be treated as "no freshness required".
+    """
+    config = OrchestratorConfig()  # require_current_base defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # no override for "main" -> branch_protection("main") is None
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app._is_base_freshness_required("main") is True
+
+
+def test_is_base_freshness_required_fails_closed_on_malformed_protection_payload(
+    tmp_path: Path,
+) -> None:
+    """Fail-closed shape 3/3: the protection payload is readable (200 OK) but
+    `required_status_checks.strict` is absent or the wrong type -- e.g. a repo
+    with protection configured for something other than status checks, or a
+    GitHub API response shape this code doesn't anticipate. Every malformed
+    shape must fall back to require_current_base, never silently disable the
+    gate.
+    """
+    config = OrchestratorConfig()  # require_current_base defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    malformed_payloads: list[dict[str, Any]] = [
+        {},  # no required_status_checks key at all
+        {"required_status_checks": {}},  # present but no "strict" key
+        {"required_status_checks": {"strict": "yes"}},  # wrong type (str, not bool)
+        {"required_status_checks": None},  # wrong type (None, not dict)
+        {"enforce_admins": {"enabled": True}},  # unrelated protection field only
+    ]
+    for payload in malformed_payloads:
+        fake_gh = FakeGitHub()
+        fake_gh.branch_protection_overrides["main"] = payload
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+        assert app._is_base_freshness_required("main") is True, f"payload={payload!r}"
+
+
+def test_is_base_freshness_required_bidirectional_config_fallback(tmp_path: Path) -> None:
+    """The fallback target on failure is require_current_base itself (per issue
+    #812's non-goal: preserve it as the fallback), not a hardcoded True -- an
+    operator who has explicitly opted out via config keeps that behavior when
+    protection can't be read, matching pre-#812 semantics exactly.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(require_current_base=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # unreadable protection (no override -> None)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app._is_base_freshness_required("main") is False
+
+
+def test_update_open_agent_prs_broadcast_skips_when_protection_strict_false(
+    tmp_path: Path,
+) -> None:
+    """Issue #812, second half: the broadcast sweep's pr_update_branch write was
+    previously ungated by require_current_base entirely (only merge_ready's own
+    deferral gate checked it). Prove the new gate now skips the compare-API
+    read and the update-branch write together when protection says freshness
+    isn't required, recording a distinct skipped_reason for telemetry.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,  # broadcast
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": False}}
+    fake_gh.prs = [
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-new456",
+            "mergeStateStatus": "BEHIND",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        }
+    ]
+    decision_dir = paths.prs / "pr-789"
+    decision_dir.mkdir(parents=True, exist_ok=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-def456"}, indent=2),
+        encoding="utf-8",
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    results = app._update_open_agent_prs(merged_pr_number=456)
+
+    assert len(results) == 1
+    assert results[0]["pr_number"] == 789
+    assert results[0]["updated"] is False
+    assert results[0]["skipped_reason"] == "base_freshness_not_required"
+    assert fake_gh.pr_update_branch_calls == []
+
+
+def test_merge_ready_strategy_off_skips_freshness_check_despite_protection_strict_true(
+    tmp_path: Path,
+) -> None:
+    """Regression pin for a deadlock this fix could otherwise introduce:
+    update_branch_strategy="off" means there is no sync mechanism at all, so
+    requiring base currency would be an inescapable deferral loop -- the same
+    hazard AutoMergeConfig.__post_init__ already blocks for the config-only
+    case (require_current_base=True + strategy=off). Since base_freshness_required
+    can now become True purely from protection (independent of config), the
+    strategy=="off" guard in merge_ready must short-circuit it before the
+    protection read is ever consulted.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="off",
+            require_current_base=False,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = _stale_base_prs()
+    # If the "off" guard were missing, this would force freshness_required=True
+    # for both PRs and PR 789 would be deferred below.
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": True}}
+
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps({"decision": "approved", "reviewed_head_sha": head_sha}, indent=2),
+            encoding="utf-8",
+        )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result_456 = app.merge_ready(456, merge=True)
+    assert result_456.data["merged"] is True
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert result_789.data["merged"] is True
+    assert result_789.data.get("stale_base") is not True
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+    # strategy=="off" short-circuits before the protection read ever happens.
+    assert fake_gh.branch_protection_calls == []
 
 
 def test_merge_ready_next_mode_syncs_head_before_merge(tmp_path: Path) -> None:
@@ -34986,6 +35862,37 @@ def test_parse_review_verdict_from_log_extracts_last_fenced_json(tmp_path: Path)
     assert verdict["decision"] == "approved"
     assert verdict["summary"] == "lgtm"
     assert verdict["required_changes"] == []
+
+
+def test_parse_review_verdict_from_log_extracts_json_after_language_tagged_fence(
+    tmp_path: Path,
+) -> None:
+    """Regression: ``_VERDICT_FENCE_RE`` previously only recognized an opening
+    fence tagged bare or ``json`` (``` ```(?:json)?\\s*\\n `` ``), so a
+    reviewer quoting evidence in a ```python fence before its final verdict
+    fence would desync the pairing entirely -- the ```python fence's own
+    opening backtick never matched, so its *closing* bare ``` got misread as
+    a new opening and swallowed everything up to the *next* fence's opening,
+    permanently misaligning the scan. This mirrors the exact structure that
+    hid a real, well-formed verdict in a production cross-family report
+    (PR #802); the same regex is duplicated here in ``workflow.py`` (kept
+    latent so far by per-event stream-json decoding, but a real defect)."""
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        "Citing the bug:\n```python\ndef broken():\n    return None\n```\n"
+        "That's a real problem.\n\n"
+        'Final verdict:\n```json\n{\n  "decision": "request_changes",\n'
+        '  "summary": "broken() returns None instead of raising",\n'
+        '  "required_changes": ["Raise instead of returning None"]\n}\n```\n',
+        encoding="utf-8",
+    )
+
+    verdict = _parse_review_verdict_from_log(log)
+
+    assert verdict is not None
+    assert verdict["decision"] == "request_changes"
+    assert verdict["summary"] == "broken() returns None instead of raising"
+    assert verdict["required_changes"] == ["Raise instead of returning None"]
 
 
 def test_parse_review_verdict_from_log_requires_valid_decision(tmp_path: Path) -> None:

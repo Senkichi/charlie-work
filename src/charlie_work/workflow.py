@@ -84,7 +84,7 @@ from .janitor import (
 )
 from .labels import TransitionOutcome, transition
 from .paths import ResolvedLayout, RuntimePaths, resolved_layout
-from .prompts import render_prompt
+from .prompts import prompt_template_digest, render_prompt
 from .reconcile import (
     DriftItem,
     apply_fixes as apply_drift_fixes,
@@ -1514,7 +1514,18 @@ def _is_review_dispatchable(
     return True
 
 
-_VERDICT_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+# Language-tag group accepts any tag (not just ``json``), mirroring the fix in
+# ``cross_family._VERDICT_FENCE_RE``: a fence opened with an unrecognized tag
+# (e.g. ```python) previously failed to match as an opening delimiter at all,
+# causing its own closing ``` to be misread as a spurious new opening and
+# desynchronizing every fence pair after it. In practice this path is
+# protected here because each stream-json event's text is checked in
+# isolation (see ``_extract_verdict_from_stream_json``) and the reviewer's
+# final verdict fence normally lands in its own turn, separate from any
+# earlier code-citation turns -- but the defect is real and latent, so it is
+# fixed here too rather than left to fire the day a reviewer's final message
+# happens to combine both.
+_VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 
 # Absolute path ending in .md, as reviewers reference their summary files in
 # final output (e.g. "Full review written to `C:\...\review.md`"). Colons,
@@ -1893,6 +1904,16 @@ def _log_tail_throttled(log_path: Path, markers: Sequence[str]) -> bool:
 # #502 post-merge tripwire. Named here rather than inlined so the arming logic and
 # the tests that pre-arm it cannot drift apart on a string literal.
 UNAUTHORIZED_MERGE_BASELINE_KEY = "unauthorized_merge_baseline"
+
+# state.json key holding the ongoing acknowledgment set for post-arming
+# unauthorized-merge findings (issue #673). The baseline (#510) suppresses
+# *pre-arming* history once; this set suppresses *post-arming* findings that a
+# human or automated remediation has explicitly triaged, so a confirmed,
+# already-actioned finding stops pinning ok=False on every subsequent pass.
+# Like the baseline it is an explicit set of PR numbers (never a high-water
+# mark) and is only ever populated by an explicit `charlie tripwire ack` action
+# — the tripwire never auto-acknowledges, or it would defeat itself.
+UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 
 
 @dataclass(frozen=True)
@@ -7859,7 +7880,15 @@ class OrchestratorApp:
             )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
-        self._write_json(pr_dir / "pr.json", _slim_pr_json(pr))
+        # Issue #592: stamp the digest of the resolved review template +
+        # referenced section partials into pr.json so a future template edit
+        # is detectable as packet staleness alongside a head-SHA change.
+        # Without this, a static-head PR keeps being handed a packet rendered
+        # from the old template indefinitely -- the orchestrator never
+        # regenerates because headRefOid is treated as the packet's only input.
+        pr_json = _slim_pr_json(pr)
+        pr_json["prompt_template_sha"] = self._review_template_sha()
+        self._write_json(pr_dir / "pr.json", pr_json)
         self._write_json(pr_dir / "checks.json", checks)
         diff_path = pr_dir / "diff.patch"
         diff_path.write_text(diff, encoding="utf-8")
@@ -8229,6 +8258,19 @@ class OrchestratorApp:
                     # or re-confirming forever.
                     if packet_head_sha is None or packet_head_sha != live_head_sha:
                         continue
+                    # Issue #592: a template edit makes a same-head packet
+                    # stale for this path too. dispatch_reviews() does not
+                    # filter its normal (non-cross-family) dispatch by
+                    # decision value -- _is_review_dispatchable ignores the
+                    # candidate payload entirely -- so an un-gated "vacuous"
+                    # entry here could still reach a fresh reviewer as a
+                    # packet rendered from the old template: the exact
+                    # failure this issue fixed for the "stale" and
+                    # "pending"/"missing"/"invalid" branches below. loop()
+                    # regenerates the packet from the current template
+                    # first; the next pass re-queues it once fresh.
+                    if not self._packet_template_current(pr_number):
+                        continue
                     queue.append(
                         {
                             "pr": pr_number,
@@ -8287,6 +8329,11 @@ class OrchestratorApp:
                 # surface as stale when the packet head is still current.
                 if packet_head_sha is None or packet_head_sha != live_head_sha:
                     continue
+                # Issue #592: a template edit makes a same-head packet stale
+                # too. Don't queue it for dispatch -- loop() will regenerate it
+                # from the current template first, and the next pass queues it.
+                if not self._packet_template_current(pr_number):
+                    continue
 
                 queue.append(
                     {
@@ -8299,6 +8346,10 @@ class OrchestratorApp:
                 )
             elif decision_value in ("pending", "missing", "invalid"):
                 if packet_head_sha is None or packet_head_sha != live_head_sha:
+                    continue
+                # Issue #592: a template-stale packet must be regenerated by
+                # loop() before it is dispatched, not handed to a reviewer as-is.
+                if not self._packet_template_current(pr_number):
                     continue
 
                 queue.append(
@@ -10734,8 +10785,29 @@ class OrchestratorApp:
             # compare API once and use it for both the pre-merge sync decision
             # and the merge-base gate. mergeStateStatus can lag and report CLEAN
             # while the branch is actually stale, so it is no longer authoritative.
+            #
+            # Whether base freshness is required AT ALL is itself derived from
+            # GitHub branch protection (issue #812), not trusted from the
+            # `require_current_base` config constant: a repo whose protection sets
+            # `strict: false` does not require branches to be current with main, so
+            # both the pr_update_branch write below and the deferral gate are
+            # skipped entirely. See _is_base_freshness_required for the
+            # fail-closed contract on read failure. `update_branch_strategy ==
+            # "off"` additionally forces this off regardless of what protection
+            # says: with no sync mechanism at all, requiring currency would be an
+            # inescapable deadlock -- the same hazard __post_init__ already blocks
+            # for the config-only case (require_current_base=True + strategy=off).
             base_current: bool | None = None
-            if not sync_failed and update_branch_strategy in {"front_of_train", "broadcast"}:
+            base_freshness_required = False
+            if not sync_failed and update_branch_strategy != "off":
+                base_freshness_required = self._is_base_freshness_required(
+                    pr.get("baseRefName") or self.config.runners.default_branch
+                )
+            if (
+                not sync_failed
+                and base_freshness_required
+                and update_branch_strategy in {"front_of_train", "broadcast"}
+            ):
                 base_current = self._is_base_current(pr)
                 # Aviator MergeQueue handoff (task #10): once this PR has
                 # already been parked in Aviator's queue (state status
@@ -10745,9 +10817,9 @@ class OrchestratorApp:
                 # writer on the same ref — this repo's live config is
                 # broadcast, so every poll would otherwise attempt it. The
                 # base-freshness *read* above still runs (it only feeds the
-                # require_current_base gate below); only the write is
-                # skipped. See the merge-train exclusion in
-                # _merge_train_candidates for the sibling half of this fix.
+                # deferral gate below); only the write is skipped. See the
+                # merge-train exclusion in _merge_train_candidates for the
+                # sibling half of this fix.
                 already_in_mergequeue = existing_pr_state.get("status") == "mergequeue"
                 if not already_in_mergequeue and self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
@@ -10770,8 +10842,9 @@ class OrchestratorApp:
                     else:
                         sync_failed = True
             # merge-base freshness gate: mergeStateStatus can lag, so verify
-            # ancestry with the GitHub compare API before merging.
-            if not sync_failed and self.config.auto_merge.require_current_base:
+            # ancestry with the GitHub compare API before merging. Skipped
+            # entirely when base freshness is not required (issue #812).
+            if not sync_failed and base_freshness_required:
                 if base_current is None and update_branch_strategy not in {
                     "front_of_train",
                     "broadcast",
@@ -11701,39 +11774,69 @@ class OrchestratorApp:
                             "graphql_threshold": threshold,
                         },
                     )
-                drift = detect_drift(
-                    self.gh,
-                    state,
-                    self.config,
-                    repo_root=self.repo_root,
-                    skip_dead_session_sweep=skip_dead_session_sweep,
-                ) + detect_aviator_stale_blocked(self.gh, self.config, repo_root=self.repo_root)
-                fixed = False
-                post_fix_drift: list[DriftItem] = []
-                if fix and drift:
-                    new_state = apply_drift_fixes(
+                new_state = state
+                try:
+                    drift = detect_drift(
                         self.gh,
                         state,
-                        drift,
-                        self.config,
-                        repo_root=self.repo_root,
-                        state_path=self.paths.state_file,
-                    )
-                    save_state(self.paths.state_file, new_state)
-                    # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
-                    # for failed adds/removes, and apply_fixes records the outcome in the
-                    # reconcile event. Re-detect against the new state to verify the repairs
-                    # actually landed before reporting success.
-                    post_fix_drift = detect_drift(
-                        self.gh,
-                        new_state,
                         self.config,
                         repo_root=self.repo_root,
                         skip_dead_session_sweep=skip_dead_session_sweep,
                     ) + detect_aviator_stale_blocked(
                         self.gh, self.config, repo_root=self.repo_root
                     )
-                    fixed = len(post_fix_drift) == 0
+                    fixed = False
+                    post_fix_drift: list[DriftItem] = []
+                    if fix and drift:
+                        new_state = apply_drift_fixes(
+                            self.gh,
+                            state,
+                            drift,
+                            self.config,
+                            repo_root=self.repo_root,
+                            state_path=self.paths.state_file,
+                        )
+                        save_state(self.paths.state_file, new_state)
+                        # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
+                        # for failed adds/removes, and apply_fixes records the outcome in the
+                        # reconcile event. Re-detect against the new state to verify the repairs
+                        # actually landed before reporting success.
+                        post_fix_drift = detect_drift(
+                            self.gh,
+                            new_state,
+                            self.config,
+                            repo_root=self.repo_root,
+                            skip_dead_session_sweep=skip_dead_session_sweep,
+                        ) + detect_aviator_stale_blocked(
+                            self.gh, self.config, repo_root=self.repo_root
+                        )
+                        fixed = len(post_fix_drift) == 0
+                except GraphQLBudgetError as exc:
+                    # Defensive: detect_drift re-checks the budget and may raise.
+                    new_state = self._record_event(
+                        new_state,
+                        "reconcile_pass_deferred",
+                        {
+                            "remaining": exc.remaining,
+                            "reset": exc.reset_at,
+                            "threshold": exc.threshold,
+                            "fix": fix,
+                            "deferred_reason": "graphql_rate_limit",
+                        },
+                    )
+                    save_state(self.paths.state_file, new_state)
+                    return CommandResult(
+                        True,
+                        "reconcile deferred: GraphQL rate limit below threshold",
+                        {
+                            "deferred": True,
+                            "deferred_reason": "graphql_rate_limit",
+                            "graphql_remaining": exc.remaining,
+                            "graphql_reset": exc.reset_at,
+                            "graphql_threshold": exc.threshold,
+                            "reconcile_pass_event_recorded": True,
+                        },
+                    )
             message = f"found {len(drift)} drift item(s)"
             if fixed:
                 message += " — fixed"
@@ -11754,19 +11857,6 @@ class OrchestratorApp:
                     "drift_before": len(drift),
                     "drift_after": len(post_fix_drift),
                     "remaining_drift": [asdict(item) for item in post_fix_drift],
-                },
-            )
-        except GraphQLBudgetError as exc:
-            # Defensive: detect_drift re-checks the budget and may raise.
-            return CommandResult(
-                True,
-                "reconcile deferred: GraphQL rate limit below threshold",
-                {
-                    "deferred": True,
-                    "deferred_reason": "graphql_rate_limit",
-                    "graphql_remaining": exc.remaining,
-                    "graphql_reset": exc.reset_at,
-                    "graphql_threshold": exc.threshold,
                 },
             )
         except StateLockBusy:
@@ -11983,6 +12073,25 @@ class OrchestratorApp:
                         }
                     )
                     continue
+
+            # Whether base freshness is required at all is derived from GitHub
+            # branch protection, cached per orchestrator pass (issue #812) --
+            # see _is_base_freshness_required for the fail-closed contract.
+            # When not required, skip the compare-API read and the
+            # pr_update_branch write entirely: this is the update_open_prs
+            # half of the churn issue #812 eliminates (merge_ready's own sync
+            # block is the other half).
+            base_ref = pr.get("baseRefName") or self.config.runners.default_branch
+            if not self._is_base_freshness_required(base_ref):
+                results.append(
+                    {
+                        "pr_number": pr_number,
+                        "head_ref": head,
+                        "updated": False,
+                        "skipped_reason": "base_freshness_not_required",
+                    }
+                )
+                continue
 
             # Use the same compare-derived base-current signal as the front-of-train
             # path and merge_ready so broadcast mode also skips up-to-date PRs and
@@ -13323,6 +13432,53 @@ class OrchestratorApp:
             return None
         return bool(base_sha == merge_base_sha)
 
+    def _is_base_freshness_required(self, base_ref: str) -> bool:
+        """Return whether base currency is actually required for ``base_ref``.
+
+        Derives base-freshness policy from GitHub branch protection
+        (``required_status_checks.strict``) instead of trusting the
+        hardcoded ``auto_merge.require_current_base`` config constant
+        (issue #812). A repo whose protection sets ``strict: false`` does
+        not require branches to be current with their base before merging,
+        so forcing ``pr_update_branch`` on every open PR and deferring
+        merges on staleness is pure CI-capacity waste with zero
+        mergeability benefit.
+
+        The read is cached per orchestrator pass by
+        ``GitHub.branch_protection`` (cleared each pass by
+        ``_loop_body``'s ``invalidate_list_cache()`` call), so PRs sharing a
+        base ref within one pass cost exactly one API call in total.
+
+        FAILS CLOSED: this is the single most important safety property of
+        the derivation. If the protection read raises, returns an error
+        value (``None``), 404s, is rate-limited, or
+        ``required_status_checks.strict`` is absent or not a bool for any
+        reason, this falls back to ``auto_merge.require_current_base``
+        (default ``True``) rather than treating the failure as "no
+        freshness required". An API hiccup must never silently disable base
+        checking.
+        """
+        try:
+            protection = self.gh.branch_protection(base_ref)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "branch_protection(%s) raised; failing closed to "
+                "auto_merge.require_current_base=%s",
+                base_ref,
+                self.config.auto_merge.require_current_base,
+                exc_info=True,
+            )
+            return self.config.auto_merge.require_current_base
+        if isinstance(protection, dict):
+            required_status_checks = protection.get("required_status_checks")
+            if isinstance(required_status_checks, dict):
+                strict = required_status_checks.get("strict")
+                if isinstance(strict, bool):
+                    return strict
+        return self.config.auto_merge.require_current_base
+
     def _record_review_or_error(
         self,
         review_result: CommandResult,
@@ -13745,16 +13901,17 @@ class OrchestratorApp:
                     {"reason": data.get("reason")},
                 )
             elif data.get("deferred"):
-                state = self._record_event(
-                    state,
-                    "reconcile_pass_deferred",
-                    {
-                        "deferred_reason": data.get("deferred_reason"),
-                        "graphql_remaining": data.get("graphql_remaining"),
-                        "graphql_reset": data.get("graphql_reset"),
-                        "graphql_threshold": data.get("graphql_threshold"),
-                    },
-                )
+                if not data.get("reconcile_pass_event_recorded"):
+                    state = self._record_event(
+                        state,
+                        "reconcile_pass_deferred",
+                        {
+                            "deferred_reason": data.get("deferred_reason"),
+                            "graphql_remaining": data.get("graphql_remaining"),
+                            "graphql_reset": data.get("graphql_reset"),
+                            "graphql_threshold": data.get("graphql_threshold"),
+                        },
+                    )
             else:
                 drift_before = data.get("drift_before", 0)
                 drift_after = data.get("drift_after", 0)
@@ -14442,13 +14599,30 @@ class OrchestratorApp:
                     # and regenerating packets every poll cycle while the operator
                     # is still reading. The packet remains current; verdict file
                     # appearance triggers a delta → the merge lane fires normally.
+                    #
+                    # Issue #592: the prompt template is as load-bearing an
+                    # input to the packet as the head SHA. A template edit
+                    # must reach static-head PRs, otherwise reviewers keep
+                    # receiving a packet rendered from the old template and
+                    # fail identically until they escalate. Treat a digest
+                    # mismatch as staleness alongside a head mismatch. A
+                    # missing digest is a legacy packet (pre-#592); treat it
+                    # as current so the upgrade does not force a one-time
+                    # fleet-wide regeneration burst -- packets rendered after
+                    # this fix always carry the digest.
                     live_head_sha = pr.get("headRefOid")
                     packet_head_sha = self._read_packet_head_oid(pr_number)
-                    if (
+                    head_current = (
                         live_head_sha is not None
                         and packet_head_sha is not None
                         and live_head_sha == packet_head_sha
-                    ):
+                    )
+                    current_template_sha = self._review_template_sha()
+                    packet_template_sha = self._read_packet_template_sha(pr_number)
+                    template_current = packet_template_sha is None or (
+                        packet_template_sha == current_template_sha
+                    )
+                    if head_current and template_current:
                         # Packet is current — skip regenerating it. But an
                         # operator may have written review-decision.json
                         # directly without state.json reflecting it yet (the
@@ -14465,6 +14639,22 @@ class OrchestratorApp:
                             )
                             self._record_merge_or_error(merge_result, errors, merges)
                     else:
+                        # Emit a distinct event when regeneration fires
+                        # because the template changed while the head stayed
+                        # put, so a fleet-wide template edit is visible as a
+                        # burst rather than unexplained review churn.
+                        if head_current and not template_current:
+                            log_event(
+                                self.paths.state_file,
+                                "review_packet_template_stale",
+                                {
+                                    "pr_number": pr_number,
+                                    "issue_number": issue_number,
+                                    "packet_template_sha": packet_template_sha,
+                                    "current_template_sha": current_template_sha,
+                                },
+                                repo=self.repo_root.name,
+                            )
                         review = self.review(pr_number)
                         if self._record_review_or_error(review, errors, reviews):
                             continue
@@ -16078,6 +16268,21 @@ class OrchestratorApp:
         auditable, and reports nothing. Every later pass reports only merges
         absent from that baseline.
 
+        A second, ongoing dedupe layer handles *post-arming* findings (issue
+        #673). The baseline suppresses history once; it cannot suppress a
+        genuine bypass that lands after arming, and without an ack mechanism
+        such a finding is re-appended to ``errors`` on every single pass for as
+        long as it stays inside ``merged_pr_list()``'s 500-PR window — pinning
+        ``ok=False`` forever and drowning any new signal in constant noise. That
+        is the same "a control that can never go quiet is not a control" failure
+        the baseline exists to prevent, arriving from the other direction. So a
+        finding that has been explicitly acknowledged via
+        ``ack_unauthorized_merge`` (state key ``unauthorized_merge_acknowledged``,
+        a ``{pr_number: {acknowledged_at, reason, by}}`` map) is filtered out of
+        the reported candidates the same way the baseline filters pre-arming
+        history. Acknowledgment is never automatic — it requires an explicit
+        ``charlie tripwire ack`` action — or the tripwire would defeat itself.
+
         Why an explicit set of PR numbers and not a high-water PR number: a
         number watermark also exempts any PR that was already open when the
         control armed but merges afterwards. That is not hypothetical here — at
@@ -16103,10 +16308,29 @@ class OrchestratorApp:
             raw = baseline.get("pre_existing_prs") or []
             return {int(n) for n in raw if isinstance(n, int) and not isinstance(n, bool)}
 
+        def _acked(ack_map: Any) -> set[int]:
+            # The ack set is a JSON object keyed by string PR numbers (JSON keys
+            # are always strings). Parse them back to int so the membership test
+            # against the int ``c["pr"]`` candidates works.
+            if not isinstance(ack_map, dict):
+                return set()
+            out: set[int] = set()
+            for n in ack_map:
+                try:
+                    out.add(int(n))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
         state = load_state_locked(self.paths.state_file)
         if isinstance(state.get(key), dict):
             pre_existing = _suppressed(state.get(key))
-            return [c for c in candidates if c["pr"] not in pre_existing]
+            acknowledged = _acked(state.get(UNAUTHORIZED_MERGE_ACK_KEY))
+            return [
+                c
+                for c in candidates
+                if c["pr"] not in pre_existing and c["pr"] not in acknowledged
+            ]
 
         # ---- arming pass ----
         pre_existing_now = sorted({int(c["pr"]) for c in candidates})
@@ -16128,7 +16352,12 @@ class OrchestratorApp:
                 # Another pass armed between the read above and this lock. Its
                 # baseline wins, so arming is idempotent and never re-widens.
                 pre_existing = _suppressed(locked.get(key))
-                return [c for c in candidates if c["pr"] not in pre_existing]
+                acknowledged = _acked(locked.get(UNAUTHORIZED_MERGE_ACK_KEY))
+                return [
+                    c
+                    for c in candidates
+                    if c["pr"] not in pre_existing and c["pr"] not in acknowledged
+                ]
             locked[key] = {
                 "armed_at": utc_now(),
                 "pre_existing_prs": pre_existing_now,
@@ -16150,6 +16379,65 @@ class OrchestratorApp:
             ", ".join(f"#{n}" for n in pre_existing_now) or "none",
         )
         return []
+
+    def ack_unauthorized_merge(
+        self, pr_number: int, reason: str, *, by: str | None = None
+    ) -> CommandResult:
+        """Acknowledge a post-arming unauthorized-merge finding so it stops pinning ok=False.
+
+        The #502 tripwire's pre-arming baseline (``_apply_unauthorized_merge_baseline``)
+        suppresses history once. It has no equivalent for *post-arming* findings, so a
+        single confirmed, already-actioned bypass is re-detected and re-appended to
+        ``loop()``'s ``errors`` bucket on every pass for as long as the merged PR stays
+        inside ``merged_pr_list()``'s 500-PR REST window — pinning ``ok=False`` forever
+        and drowning any new signal (issue #673).
+
+        This records an explicit acknowledgment in ``state.json`` under
+        ``unauthorized_merge_acknowledged`` (a ``{pr_number: {acknowledged_at, reason,
+        by}}`` map). The tripwire filters acknowledged PRs out of its reported
+        candidates the same way it filters pre-arming history, so the finding keeps its
+        bite until acked and then goes quiet, freeing ``ok=False`` / ``errors`` to mean
+        "there is something new to look at" again.
+
+        Acknowledgment is never automatic — that would defeat the tripwire. It requires
+        this explicit action (exposed as ``charlie tripwire ack``), mirroring how
+        ``agent:human-needed`` requires explicit human action to clear. A non-empty
+        ``reason`` is mandatory: a tripwire that can be silenced silently is no control.
+        Re-acking the same PR updates the record (new reason/by/timestamp) rather than
+        duplicating or refusing, so a finding's triage state can be corrected.
+        """
+        if not reason.strip():
+            return CommandResult(
+                False,
+                "a non-empty --reason is required to acknowledge an unauthorized-merge "
+                "finding (a tripwire that can be silenced silently is no control)",
+                {"pr": pr_number},
+            )
+
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+            if not isinstance(acks, dict):
+                acks = {}
+            acks[str(pr_number)] = {
+                "acknowledged_at": utc_now(),
+                "reason": reason,
+                "by": by,
+            }
+            state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
+            state = self._record_event(
+                state,
+                "unauthorized_merge_acknowledged",
+                {"pr": pr_number, "reason": reason, "by": by},
+            )
+            save_state(self.paths.state_file, state)
+
+        return CommandResult(
+            True,
+            f"acknowledged unauthorized-merge finding for PR #{pr_number}; "
+            "it will no longer pin ok=False",
+            {"pr": pr_number, "reason": reason, "by": by},
+        )
 
     def _review_decision(self, pr_number: int) -> dict[str, Any]:
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
@@ -16183,6 +16471,58 @@ class OrchestratorApp:
             return None
         value = data.get("headRefOid")
         return str(value) if value is not None else None
+
+    def _review_template_sha(self) -> str:
+        """SHA-256 digest of the resolved review template + referenced section
+        partials.
+
+        Captures every input to ``review()``'s prompt render that lives in a
+        template file: the ``review.md`` template (package default or repo-local
+        override) and every ``worker_sections/*.md`` partial it references. A
+        change in any of those files changes this digest, so ``loop()`` can
+        treat a digest mismatch as packet staleness alongside a head-SHA
+        mismatch (issue #592).
+        """
+        return prompt_template_digest("review.md", search_dirs=self.prompt_dirs)
+
+    def _read_packet_template_sha(self, pr_number: int) -> str | None:
+        """Return the ``prompt_template_sha`` stamped in the existing review
+        packet for ``pr_number``, or ``None`` if no packet exists, it cannot
+        be read, or it predates issue #592 (when the field started being
+        stamped).
+
+        A ``None`` result is a legacy packet, not a staleness signal: callers
+        conservatively treat a missing digest as "current" so a one-time
+        fleet-wide burst of regenerations is not forced on upgrade. Packets
+        rendered after this fix always carry the digest, so every *future*
+        template change reaches static-head PRs.
+        """
+        pr_json_path = self.paths.prs / f"pr-{pr_number}" / "pr.json"
+        if not pr_json_path.exists():
+            return None
+        try:
+            with pr_json_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        value = data.get("prompt_template_sha")
+        return str(value) if value is not None else None
+
+    def _packet_template_current(self, pr_number: int) -> bool:
+        """True if the packet's stamped template digest matches the current
+        review template.
+
+        A packet that predates issue #592 (no ``prompt_template_sha`` field)
+        is treated as current so the upgrade does not force a one-time
+        fleet-wide regeneration burst; packets rendered after this fix always
+        carry the digest, so future template edits are caught.
+        """
+        packet_template_sha = self._read_packet_template_sha(pr_number)
+        if packet_template_sha is None:
+            return True
+        return packet_template_sha == self._review_template_sha()
 
     def _read_packet_diff(self, pr_number: int) -> str | None:
         """Return the diff text stored in the existing review packet for

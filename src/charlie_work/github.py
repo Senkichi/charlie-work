@@ -6,6 +6,7 @@ import random
 import re
 import subprocess
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -59,6 +60,24 @@ PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # object, and on the REST path it is already present in the payload as
 # head.sha, so adding it costs neither an extra request nor a graph walk.
 MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+# Fields needed by `charlie closing-keyword-check` (issue #790): the gate only
+# scans PR body/title text for closing keywords and resolves the PR's own
+# declared-target binding via linked_issue_number(), which reads headRefName
+# and is_cross_repository. It touches no CI/review/label state at all, so it
+# must not go through the general-purpose PR_VIEW_FIELDS -- that list's
+# `statusCheckRollup` forces gh's GraphQL query to walk the PR's check-run
+# connection, which the default Actions GITHUB_TOKEN cannot read by default.
+# This surfaced twice on the same branch, each a step deeper into the same
+# query: run 30607061237 ("repository.pullRequest" itself inaccessible,
+# fixed by granting `pull-requests: read`), then run 30609781476
+# ("...statusCheckRollup.nodes.0.commit.statusCheckRollup" inaccessible one
+# level further in, before `checks: read` had been granted at all). Rather
+# than keep granting one nested-connection scope at a time and re-running to
+# find the next one, the fix is at the query layer: the gate never needed
+# statusCheckRollup in the first place, so a narrow field list sidesteps the
+# whole class of integration-context permission gaps instead of chasing them
+# field by field.
+CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,isCrossRepository"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
@@ -661,14 +680,24 @@ class GitHub:
                 matched.append(pr)
         return _MergedPRSearchResult(matched, ok=True)
 
-    def pr_view(self, number: int) -> dict[str, Any]:
+    def pr_view(self, number: int, *, fields: str = PR_VIEW_FIELDS) -> dict[str, Any]:
+        """Fetch a PR via ``gh pr view --json <fields>``.
+
+        ``fields`` defaults to the general-purpose ``PR_VIEW_FIELDS`` (CI/review/
+        label state included). Callers that only need a narrow slice -- e.g.
+        the closing-keyword-check gate, which never touches CI status and
+        must not risk `statusCheckRollup`'s token-scope failure (see
+        `CLOSING_KEYWORD_PR_FIELDS`) -- should pass their own narrower field
+        list rather than filtering the wide result after the fact, so the gh
+        invocation itself never requests a field it doesn't need.
+        """
         result = self.run(
             [
                 "pr",
                 "view",
                 str(number),
                 "--json",
-                PR_VIEW_FIELDS,
+                fields,
             ],
             json_output=True,
         )
@@ -791,6 +820,32 @@ class GitHub:
         check_runs = value.get("check_runs")
         return check_runs if isinstance(check_runs, list) else None
 
+    def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
+        """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.
+
+        Each item's ``commit.message`` is the exact, untruncated raw commit
+        message text (subject + blank line + body), matching ``git show
+        --format=%B``. Deliberately NOT ``gh pr view --json commits``: that
+        GraphQL field set truncates ``messageHeadline`` at a fixed length
+        (~70 chars observed) and splits the remainder into ``messageBody``
+        without preserving the original text — verified on PR #788's own
+        commit, where the GraphQL fields split the subject line mid-word
+        ("defang o" / "utbound reviewer prose...") and would silently corrupt
+        the very "keyword #N" text `closing_keyword_gate` (issue #790) needs
+        to scan intact. ``per_page=100`` covers every PR this codebase
+        produces (worker branches are single- or few-commit); a PR with more
+        commits than that is outside this project's workflow. Returns
+        ``None`` on failure — errors are returned as values, never raised.
+        """
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/pulls/{number}/commits?per_page=100"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, list) else None
+        return result if isinstance(result, list) else None
+
     def compare(self, base: str, head: str) -> dict[str, Any] | None:
         """Compare two commits and return the comparison metadata.
 
@@ -807,6 +862,41 @@ class GitHub:
         if isinstance(result, GitHubRunResult):
             return result.value if result.ok and isinstance(result.value, dict) else None
         return result if isinstance(result, dict) else None
+
+    def branch_protection(self, base: str) -> dict[str, Any] | None:
+        """Return branch protection settings for ``base``, or None on failure.
+
+        Wraps ``gh api repos/{owner}/{repo}/branches/{base}/protection``.
+        Returns ``None`` on any failure -- 404 (no protection configured),
+        rate limit, transient network error, gh not installed. Errors are
+        returned as values, never raised.
+
+        Cached per orchestrator pass in ``_list_cache`` (issue #812): callers
+        use this to derive base-freshness policy (``required_status_checks.
+        strict``) instead of a hardcoded config constant, and need exactly
+        one API call per base ref per pass, not one per PR. A failed read is
+        cached as ``None`` too, so a 404/rate-limit does not turn into a
+        per-PR retry storm within the same pass.
+
+        Safety note for callers: ``None`` means "could not be read", not "no
+        freshness required". Any caller gating a safety check on this value
+        must fail closed on ``None``.
+        """
+        cache_key = ("branch_protection", base)
+        if cache_key in self._list_cache:
+            return self._list_cache[cache_key]
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/branches/{base}/protection"],
+            json_output=True,
+            allow_failure=True,
+        )
+        value: dict[str, Any] | None = None
+        if isinstance(result, GitHubRunResult):
+            value = result.value if result.ok and isinstance(result.value, dict) else None
+        elif isinstance(result, dict):
+            value = result
+        self._list_cache[cache_key] = value
+        return value
 
     def compare_diff(self, base: str, head: str) -> str | None:
         """Return the plain unified-diff text between two commits (three-dot compare).
@@ -1141,6 +1231,30 @@ def _has_preceding_negation(text: str, match_start: int) -> bool:
     return bool(_NEGATION_RE.search(text, window_start, match_start))
 
 
+def iter_unnegated_closing_keyword_matches(text: str) -> Iterator[re.Match[str]]:
+    """Yield every `_CLOSING_KEYWORD_REF` match in ``text`` not preceded by negation.
+
+    This is the shared core scanning primitive (finditer over every
+    keyword+``#N`` occurrence, filtered by the negation lookback) behind both
+    consumers that need it:
+
+    - `_first_unnegated_closing_keyword_match` (below) takes only the first —
+      `linked_issue_number`'s label-transition binding only ever needs one
+      match to bind an issue.
+    - `closing_keyword_gate.find_unexpected_closing_references` (issue #790)
+      needs *every* match across a whole PR body plus every commit message,
+      because GitHub's native auto-close-on-merge scans all of those
+      surfaces for every closing-keyword reference, not just the first.
+
+    Both consume this one generator rather than each hand-rolling their own
+    `finditer` + negation-lookback scan, so the two callers cannot drift
+    apart on what counts as a live closing reference.
+    """
+    for match in _CLOSING_KEYWORD_REF.finditer(text):
+        if not _has_preceding_negation(text, match.start()):
+            yield match
+
+
 def _first_unnegated_closing_keyword_match(text: str) -> re.Match[str] | None:
     """Return the first `_CLOSING_KEYWORD_REF` match not preceded by negation.
 
@@ -1148,10 +1262,7 @@ def _first_unnegated_closing_keyword_match(text: str) -> re.Match[str] | None:
     genuine match in the same field (e.g. "...but this PR also fixes #700") —
     scanning continues past it instead of giving up on the whole field.
     """
-    for match in _CLOSING_KEYWORD_REF.finditer(text):
-        if not _has_preceding_negation(text, match.start()):
-            return match
-    return None
+    return next(iter_unnegated_closing_keyword_matches(text), None)
 
 
 def defang_closing_keywords(text: str) -> str:
