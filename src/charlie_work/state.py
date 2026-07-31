@@ -865,6 +865,55 @@ def schedule_worktree_reclamation(data: dict[str, Any], next_run_at: str) -> dic
     return {**data, "worktree_reclamation": sched}
 
 
+def _reconcile_pass(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the periodic in-loop reconcile scheduling sub-dict from ``data``.
+
+    Distinct from ``quota_probe``: tracks the merge-lane-recovery §6-B
+    cadence (``OrchestratorApp._maybe_reconcile_drift``), not the quota
+    probe. Ensures a mutable copy so callers can build new state without
+    mutating the original ``data``.
+    """
+    section = data.get("reconcile_pass")
+    if not isinstance(section, dict):
+        return {}
+    return dict(section)
+
+
+def is_reconcile_due(data: dict[str, Any]) -> bool:
+    """True when the periodic in-loop reconcile pass should run.
+
+    Unlike the quota probe (which only arms once a throttle indicator is
+    observed, deliberately delaying the first real probe), reconcile has no
+    "is something wrong" precondition to wait on -- it is a plain periodic
+    cadence, so an absent schedule (never run before, e.g. right after a
+    fresh deploy) is treated as due immediately rather than requiring one
+    full interval to elapse first. This matters for G1: the divergence class
+    this closes has already been sitting unrepaired indefinitely, so the
+    first pass after this lands should not wait `interval_minutes` before
+    doing anything. Malformed timestamps are treated as due, mirroring
+    ``is_quota_probe_due``, so a corrupt value cannot wedge reconcile off
+    forever.
+    """
+    next_at = _reconcile_pass(data).get("next_reconcile_at")
+    if not next_at:
+        return True
+    try:
+        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= next_time
+    except (ValueError, TypeError):
+        return True
+
+
+def arm_reconcile_pass(data: dict[str, Any], next_reconcile_at: str) -> dict[str, Any]:
+    """Schedule the next periodic in-loop reconcile attempt.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    section = _reconcile_pass(data)
+    section["next_reconcile_at"] = next_reconcile_at
+    return {**data, "reconcile_pass": section}
+
+
 def any_quota_exhausted_indicator(data: dict[str, Any]) -> bool:
     """True when either throttle mechanism is currently active.
 

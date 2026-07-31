@@ -272,6 +272,37 @@ class QuotaProbeConfig:
 
 
 @dataclass(frozen=True)
+class ReconcilePassConfig:
+    """Periodic in-loop reconcile: merge-lane-recovery plan §6-B.
+
+    Wires ``OrchestratorApp.reconcile(fix=True)`` -- previously reachable
+    only via the operator-invoked ``charlie mop-up --fix`` CLI command --
+    into the fleet loop on a fixed cadence, so a state/label divergence
+    (e.g. an escalation whose ``human_needed`` label write silently failed,
+    per the plan's PRIMARY defect) is repaired automatically instead of only
+    when an operator remembers to run mop-up. Repair direction is always
+    state-wins: reconcile only ever converges GitHub labels to match
+    ``state.json``; it never rewrites ``status`` (D-2), so this is safe to
+    run unattended on every repo, every cycle.
+    """
+
+    # Default True: the fleet has never run its own repair (baseline: zero
+    # reconcile events ever recorded across the whole event history), and
+    # the repair direction is provably safe (see class docstring). A knob
+    # defaulted off would leave that divergence class unrepaired until an
+    # operator remembered to flip it -- exactly the failure mode this
+    # workstream exists to close. The knob exists for rollback, not opt-in.
+    enabled: bool = True
+    # detect_drift() issues two full-repo GitHub list queries (all PRs, all
+    # issues) plus a GraphQL rate-limit check every time it runs -- heavier
+    # than quota_probe's single cheap Haiku subprocess call, so a longer flat
+    # cadence than quota_probe's 15 minutes is appropriate here. 30 minutes
+    # still comfortably beats "only ever runs when an operator remembers to
+    # run mop-up".
+    interval_minutes: int = 30
+
+
+@dataclass(frozen=True)
 class ReviewDispatchConfig:
     # Issue #370: concurrent reviewer launcher for queued PRs. This is a
     # deterministic loop stage, not a provider governor; reviewers use
@@ -1221,6 +1252,7 @@ class OrchestratorConfig:
     review: ReviewConfig = field(default_factory=ReviewConfig)
     review_dispatch: ReviewDispatchConfig = field(default_factory=ReviewDispatchConfig)
     quota_probe: QuotaProbeConfig = field(default_factory=QuotaProbeConfig)
+    reconcile_pass: ReconcilePassConfig = field(default_factory=ReconcilePassConfig)
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)
@@ -1511,6 +1543,26 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if qp_prompt is not None and not qp_prompt.strip():
         raise ConfigError("config section 'quota_probe' key 'prompt' must not be empty")
     quota_probe = _build_section(QuotaProbeConfig, "quota_probe", quota_probe_data)
+    reconcile_pass_data = _section(data, "reconcile_pass")
+    rp_enabled = reconcile_pass_data.get("enabled")
+    if rp_enabled is not None and not isinstance(rp_enabled, bool):
+        raise ConfigError(
+            f"config section 'reconcile_pass' key 'enabled' must be a bool, "
+            f"got {type(rp_enabled).__name__}"
+        )
+    rp_interval = reconcile_pass_data.get("interval_minutes")
+    if rp_interval is not None and (
+        isinstance(rp_interval, bool) or not isinstance(rp_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'reconcile_pass' key 'interval_minutes' must be an int, "
+            f"got {type(rp_interval).__name__}"
+        )
+    if rp_interval is not None and rp_interval < 1:
+        raise ConfigError(
+            f"config section 'reconcile_pass' key 'interval_minutes' must be >= 1, got {rp_interval}"
+        )
+    reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -2302,6 +2354,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         review=review,
         review_dispatch=review_dispatch,
         quota_probe=quota_probe,
+        reconcile_pass=reconcile_pass,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,
