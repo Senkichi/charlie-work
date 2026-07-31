@@ -1788,6 +1788,7 @@ def _capacity_pass(
         state_path=state_path,
         dry_run=dry_run,
         source="prologue",
+        full_pass_interval_seconds=300,
     )
 
 

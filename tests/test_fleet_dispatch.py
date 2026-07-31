@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from charlie_work import layout
+from charlie_work.doctor import _check_runner_allocation
 from charlie_work.config import (
     ConfigError,
     OrchestratorConfig,
@@ -38,6 +39,7 @@ from charlie_work.runner_allocation import (
     SlotChangeResult,
 )
 from charlie_work.runner_allocation_pass import AllocationPassResult
+from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME, load_allocation_stamp
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
@@ -2836,6 +2838,76 @@ def test_allocation_prologue_skips_when_no_repo_root_is_usable(tmp_path: Path) -
     assert [event["type"] for event in events] == ["runner_allocation_skipped"]
     assert "registry" in events[0]["reason"]
     pass_mock.assert_not_called()
+
+    # The skip also leaves state-file evidence so the doctor probe does not
+    # attribute a fresh unattended decline to "never ran" (issue #606).
+    state_file = fleet_dir / ALLOCATION_STATE_FILENAME
+    assert state_file.exists()
+    stamp = load_allocation_stamp(fleet_dir)
+    assert stamp.source == "prologue"
+    assert stamp.full_pass_interval_seconds == 300
+    assert stamp.skip_reason is not None
+    assert "no usable repo root" in stamp.skip_reason
+
+
+def test_allocation_prologue_skip_no_repo_root_is_usable_in_dry_run(
+    tmp_path: Path,
+) -> None:
+    """A dry-run preview must not bump the allocation state file."""
+    fleet_dir = tmp_path / "fleet"
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/gone": {"repo_root": str(tmp_path / "vanished"), "state_dir": ""}},
+    )
+
+    with patch("charlie_work.fleet_dispatch.run_allocation_pass") as pass_mock:
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=True
+        )
+
+    assert [event["type"] for event in events] == ["runner_allocation_skipped"]
+    pass_mock.assert_not_called()
+    assert not (fleet_dir / ALLOCATION_STATE_FILENAME).exists()
+
+
+def test_allocation_prologue_skip_no_repo_root_is_seen_by_doctor(
+    tmp_path: Path,
+) -> None:
+    """A prologue skip with allocation enabled must reach the doctor probe."""
+    fleet_dir = tmp_path / "fleet"
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/gone": {"repo_root": str(tmp_path / "vanished"), "state_dir": ""}},
+    )
+
+    with patch("charlie_work.fleet_dispatch.run_allocation_pass"):
+        _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    collected: list[tuple[str, bool, str, str]] = []
+
+    def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
+        collected.append((name, ok, detail, severity))
+
+    _check_runner_allocation(
+        add,
+        _allocation_config(enabled=True),
+        fleet_dir_override=str(fleet_dir),
+    )
+
+    assert len(collected) == 1
+    name, ok, detail, severity = collected[0]
+    assert name == "runner allocation"
+    assert ok is False
+    assert "declined to act" in detail
+    assert "no usable repo root" in detail
+    # A fresh unattended skip names its own cause; it must not be misread as
+    # the "never reached allocation" shape of issue #590.
+    assert "#590" not in detail
+    assert severity == "warning"
 
 
 def test_allocation_prologue_anchors_on_a_live_repo_and_passes_config_through(
