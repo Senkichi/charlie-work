@@ -362,6 +362,111 @@ def test_real_run_with_planned_start_actuates_and_writes_state(
     assert stamp.source == "cli"
 
 
+def _mature_slack_setup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path, _FakeGitHub]:
+    """One repo with two running listeners, zero demand, and a mature streak."""
+    root = tmp_path / "actions-runners"
+    root.mkdir()
+    _make_runner_dir(root, "cw-1", CW)
+    _make_runner_dir(root, "cw-2", CW)
+    _patch_liveness(monkeypatch, {"cw-1", "cw-2"})
+
+    fleet_dir = tmp_path / "fleet"
+    from charlie_work.runner_slots import save_idle_streaks
+
+    save_idle_streaks(fleet_dir, {CW: 3}, source="prologue")
+    assert load_idle_streaks(fleet_dir) == {CW: 3}
+
+    gh = _FakeGitHub()
+    return root, fleet_dir, gh
+
+
+def test_dry_run_with_planned_park_does_not_actuate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preview must not call park_runner_slot with dry_run=False or write state."""
+    root, fleet_dir, gh = _mature_slack_setup(tmp_path, monkeypatch)
+
+    parks: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.park_runner_slot",
+        lambda instance, *, dry_run=False: (
+            parks.append((instance.name, dry_run)),
+            (
+                True,
+                f"Would park {instance.name}" if dry_run else f"parked {instance.name}",
+            ),
+        )[1],
+    )
+
+    result = run_allocation_pass(
+        gh,
+        RunnerAllocationConfig(
+            enabled=True,
+            managed_root=str(root),
+            max_running_runners=1,
+            min_running_per_repo=0,
+            demand_idle_samples=3,
+        ),
+        fleet_dir_override=str(fleet_dir),
+        dry_run=True,
+        source="cli",
+    )
+
+    assert result.ok is True
+    assert result.parked == 2
+    assert result.started == 0
+    assert sorted(parks) == [("cw-1", True), ("cw-2", True)]
+    stamp = load_allocation_stamp(fleet_dir)
+    assert stamp is not None
+    assert stamp.source == "prologue"
+    assert load_idle_streaks(fleet_dir) == {CW: 3}
+
+
+def test_real_run_with_planned_park_actuates_and_writes_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real pass parks mature surplus slots, advancing both provenance and streak."""
+    root, fleet_dir, gh = _mature_slack_setup(tmp_path, monkeypatch)
+
+    parks: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.park_runner_slot",
+        lambda instance, *, dry_run=False: (
+            parks.append((instance.name, dry_run)),
+            (
+                True,
+                f"Would park {instance.name}" if dry_run else f"parked {instance.name}",
+            ),
+        )[1],
+    )
+
+    result = run_allocation_pass(
+        gh,
+        RunnerAllocationConfig(
+            enabled=True,
+            managed_root=str(root),
+            max_running_runners=1,
+            min_running_per_repo=0,
+            demand_idle_samples=3,
+        ),
+        fleet_dir_override=str(fleet_dir),
+        dry_run=False,
+        source="cli",
+    )
+
+    assert result.ok is True
+    assert result.parked == 2
+    assert result.started == 0
+    assert sorted(parks) == [("cw-1", False), ("cw-2", False)]
+    stamp = load_allocation_stamp(fleet_dir)
+    assert stamp is not None
+    assert stamp.source == "cli"
+    # The pre-actuation snapshot still saw two running slots and zero demand.
+    assert load_idle_streaks(fleet_dir) == {CW: 4}
+
+
 # --------------------------------------------------------------------------
 # busy_error path — errors as values
 # --------------------------------------------------------------------------
