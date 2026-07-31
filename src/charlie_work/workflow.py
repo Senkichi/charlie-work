@@ -11788,9 +11788,11 @@ class OrchestratorApp:
 
         Once ``max_attempts`` is exceeded, escalate using the same
         ``transition()`` helper the other escalation call sites use so
-        ``agent:human-needed`` actually lands (pr-lifecycle.md Finding 3: the
-        review-dispatch attempt-cap escalation was the one call site that
-        skipped this).
+        ``agent:human-needed`` actually lands. The review-dispatch attempt-cap
+        escalation used to skip this step, writing ``escalated`` to state
+        without applying the label edge and leaving the issue without
+        ``agent:human-needed`` on GitHub. This call site must not repeat that
+        failure mode.
         """
         pr_number = int(pr["number"])
         head_sha = str(pr.get("headRefOid") or "")
