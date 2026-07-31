@@ -6,6 +6,16 @@ on:
     branches:
       - main
 
+# Cancel superseded in-progress runs for the same branch. charlie-work has
+# only 2 registered self-hosted runners; without this, a run left in-progress
+# by a since-superseded push keeps occupying one of them to test a SHA that
+# can no longer appear in any PR's check set (checks are computed against the
+# head SHA). Push-to-main runs are exempt from cancellation: a main run is a
+# historical record that also feeds deployment, not a superseded draft.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 # SELF-HOSTED (2026-07): hosted-runner minutes exhausted mid-month; all jobs
 # run on the repo-registered self-hosted runner (cw-9800x3d-1, local Windows
 # box). The hosted ubuntu+windows matrix is suspended — restore it from git
