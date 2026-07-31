@@ -8016,6 +8016,150 @@ class OrchestratorApp:
                     )
                     save_state(self.paths.state_file, state)
 
+            # Infra-failure auto-rerun + escalation (issue #841): a job-level
+            # `timeout-minutes` kill on this repo's self-hosted runners reports
+            # CANCELLED (not TIMED_OUT), which summarize_checks correctly
+            # buckets into infra_failed (blocks merge via CheckSummary.ready),
+            # but nothing before this retried or escalated it --
+            # classify_check_failures only iterates summary.failed (a code push
+            # can't fix an infra kill), so an infra-failed PR sat blocked
+            # forever behind only a diagnostic merge_failed_attempt_alarm
+            # event. `gh run rerun RUN_ID` is dispatched WITHOUT --failed: the
+            # job never completed (cancelled/timed out, not failed), so
+            # --failed's "rerun the failed jobs in this run" semantics do not
+            # apply -- omitting it reruns the whole run, which is the correct
+            # behavior for a run that never produced a completed job to target.
+            if verdict.infra_rerun_run_ids:
+                infra_rerun_errors: list[str] = []
+                infra_triggered_run_ids: list[int] = []
+                for run_id in verdict.infra_rerun_run_ids:
+                    result = self.gh.run(["run", "rerun", str(run_id)], allow_failure=True)
+                    if isinstance(result, GitHubRunResult):
+                        if result.ok:
+                            infra_triggered_run_ids.append(run_id)
+                        else:
+                            infra_rerun_errors.append(
+                                result.error or f"gh run rerun {run_id} exited {result.returncode}"
+                            )
+                    elif isinstance(result, str):
+                        # Dry-run returns a descriptive string; treat as success.
+                        infra_triggered_run_ids.append(run_id)
+                    else:
+                        infra_rerun_errors.append(
+                            f"unexpected result from gh run rerun {run_id}: {result!r}"
+                        )
+
+                if infra_triggered_run_ids and not infra_rerun_errors:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)] = {
+                            **state["prs"].get(str(pr_number), {}),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "infra_rerun_attempts": verdict.infra_rerun_attempts,
+                        }
+                        state = append_event(
+                            state,
+                            "infra_rerun_triggered",
+                            {
+                                "pr_number": pr_number,
+                                "run_ids": infra_triggered_run_ids,
+                                "head_sha": pr.get("headRefOid"),
+                            },
+                            state_path=self.paths.state_file,
+                        )
+                        save_state(self.paths.state_file, state)
+                    return CommandResult(
+                        False,
+                        f"infra rerun triggered for PR #{pr_number}: run(s) "
+                        + ", ".join(str(rid) for rid in infra_triggered_run_ids),
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "infra_rerun_run_ids": infra_triggered_run_ids,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
+
+                # Rerun API error: record it, but do not consume the attempt.
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state = append_event(
+                        state,
+                        "infra_rerun_failed",
+                        {
+                            "pr_number": pr_number,
+                            "run_ids": list(verdict.infra_rerun_run_ids),
+                            "errors": infra_rerun_errors,
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                    save_state(self.paths.state_file, state)
+
+            if (
+                issue_number is not None
+                and verdict.is_infra_failure_block
+                and verdict.infra_definitive_failed
+            ):
+                # Attempt cap exhausted (or no parseable run id at all): there
+                # is no code-fix rework path for an infra failure, so escalate
+                # straight to a human instead of looping forever on a PR that
+                # can never clear the gate on its own -- this is the bug
+                # issue #841 fixes (previously: a diagnostic
+                # merge_failed_attempt_alarm event and nothing else).
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state["prs"][str(pr_number)] = {
+                        **state["prs"].get(str(pr_number), {}),
+                        "number": pr_number,
+                        "issue_number": issue_number,
+                        "status": "escalated",
+                        "escalation_reason": "infra_rerun_cap_exceeded",
+                        "infra_rerun_attempts": verdict.infra_rerun_attempts,
+                    }
+                    state["issues"][str(issue_number)] = {
+                        **state["issues"].get(str(issue_number), {}),
+                        "number": issue_number,
+                        "status": "escalated",
+                        "escalation_reason": "infra_rerun_cap_exceeded",
+                        "merge_alert": "OK",
+                        # Issue #841: an infra rerun attempt cap is a process
+                        # limit, not a judgment call -- mechanical (mirrors the
+                        # janitor rework cap's own reason_class at ~13230).
+                        "reason_class": escalation_reason_class("mechanical"),
+                    }
+                    state = append_event(
+                        state,
+                        "infra_rerun_escalated",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "checks": list(verdict.infra_definitive_failed),
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                    save_state(self.paths.state_file, state)
+                result = transition(self.gh, self.config.labels, issue_number, "escalated")
+                label_error = None
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "escalated",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+                return CommandResult(
+                    False,
+                    f"PR #{pr_number} infra-failed check(s) exhausted rerun cap: "
+                    + ", ".join(verdict.infra_definitive_failed),
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "infra_escalated": True,
+                        "label_error": label_error,
+                    },
+                )
+
             if issue_number is not None and verdict.is_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
