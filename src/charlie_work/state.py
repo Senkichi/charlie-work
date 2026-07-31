@@ -77,6 +77,22 @@ VALID_ISSUE_STATUSES: frozenset[str] = frozenset(
     }
 )
 
+# "closed" is the one VALID_ISSUE_STATUSES member the orchestrator does not
+# own: it is mirrored from GitHub's issue state, and GitHub can invalidate it
+# at any time via a reopen. Every other member is written exclusively by the
+# orchestrator's own dispatch -> review -> rework -> merge transitions, so
+# reconcile's status-normalization sweep is right to treat them as
+# self-validating -- but doing the same for "closed" turns a GitHub reopen
+# into a one-way gate: state can enter "closed" from GitHub, but can never
+# leave it, because the sweep never looks again (issue #789). Declaring the
+# split here means the sweep derives its skip-set from this frozenset
+# subtraction instead of a `!= "closed"` special case at the call site, so a
+# future externally-derived status is covered by construction.
+EXTERNALLY_DERIVED_ISSUE_STATUSES: frozenset[str] = frozenset({"closed"})
+ORCHESTRATOR_OWNED_ISSUE_STATUSES: frozenset[str] = (
+    VALID_ISSUE_STATUSES - EXTERNALLY_DERIVED_ISSUE_STATUSES
+)
+
 # The status the normal dispatch -> PR-open flow writes once a PR exists (for
 # an issue) or a fresh review packet has been generated (for a PR) and no
 # reviewer verdict has landed yet -- see workflow.py's
