@@ -75,6 +75,7 @@ from charlie_work.workflow import (
     _detect_and_handle_stalled_reviews,
     _parse_review_verdict_from_log,
     _reap_orphaned_review_checkouts,
+    _render_required_changes_section,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -33249,6 +33250,132 @@ def test_rework_brief_omits_required_changes_for_approved_verdict(tmp_path: Path
     assert "before this PR can be approved" not in brief
     assert "add a docstring" not in brief
     assert "rename foo to bar" not in brief
+
+
+def test_rework_brief_falls_back_to_summary_when_required_changes_empty(
+    tmp_path: Path,
+) -> None:
+    """Bug reproducer (F1): measured across the on-disk corpus, request_changes
+    verdicts with a populated required_changes are 0 of 20 -- prompts/review.md
+    historically documented the field as optional, so reviewers reliably fill
+    in `summary` and skip `required_changes`. Before F1,
+    _render_required_changes_section returned "" whenever required_changes
+    was empty, so the worker's rework brief contained none of that summary
+    content even though it was real, substantive review findings sitting
+    right there in review-decision.json. Must fail before F1, pass after."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    reviewer_summary = (
+        "BLOCKER - does not fix #649. The pin is a no-op over uv's resolver; "
+        "the underlying version conflict is still unresolved."
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary=reviewer_summary,
+        required_changes=[],
+    )
+
+    brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
+    assert reviewer_summary in brief, "reviewer summary missing from brief"
+    assert "## Required changes" in brief
+
+
+def test_render_required_changes_section_populated_list_unaffected_by_fallback() -> None:
+    """Non-regression: when required_changes IS populated, the enumerated
+    list renders exactly as before even though a summary is also present --
+    the summary-fallback and escape-hatch tiers must never fire when there is
+    real structured content to show."""
+    decision = {
+        "decision": "request_changes",
+        "summary": "This summary must not appear in the rendered section.",
+        "required_changes": ["fix the off-by-one", "add a regression test"],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "## Required changes" in section
+    assert "- fix the off-by-one" in section
+    assert "- add a regression test" in section
+    # The fallback/escape-hatch framing must not leak in alongside the list.
+    assert "did not record a structured findings list" not in section
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section
+    assert "This summary must not appear" not in section
+
+
+def test_render_required_changes_section_both_empty_renders_escape_hatch() -> None:
+    """Hard requirement (F1): when both required_changes and summary are
+    empty on a request_changes verdict, the section must never look like
+    "nothing to change" -- it must loudly say the findings are unavailable
+    and point the worker at the PR's review comments on GitHub instead of
+    silently rendering an empty section."""
+    decision = {"decision": "request_changes", "summary": "", "required_changes": []}
+
+    section = _render_required_changes_section(decision)
+
+    assert section.strip() != ""
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+    assert "is NOT a signal that there is nothing to change" in section
+    assert "GitHub" in section
+
+
+def test_render_required_changes_section_blocked_both_empty_renders_escape_hatch() -> None:
+    """Defensive extension of the same hard requirement to `blocked`: the
+    decision-agnostic janitor-gate rework routes (merge-conflict / no-op
+    repair) can carry forward whatever verdict was last on disk, including a
+    `blocked` one. Suppressing the enumerated list / summary fallback for
+    `blocked` (see the omits-for-approved-style suppression covered above)
+    is deliberate, but suppressing it AND leaving the worker with zero signal
+    that something was withheld is not -- the both-empty escape hatch still
+    fires."""
+    decision = {"decision": "blocked", "summary": "", "required_changes": []}
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+
+
+def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) -> None:
+    """F3: _request_no_op_rework_repair's hardcoded no-op note must not
+    displace the reviewer's findings. It routes through _route_to_rework,
+    which calls the shared _write_rework_prompt -- the same single point of
+    enforcement (issue #632) every other rework route uses -- so the
+    reviewer's on-disk verdict is read fresh from review-decision.json,
+    independent of the `summary` argument this method builds. Verified
+    concretely here rather than assumed: this test fails if that separation
+    is ever broken (e.g. a future edit threads the no-op text into
+    review-decision.json's own `summary`, or bypasses _write_rework_prompt)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    reviewer_summary = (
+        "BLOCKER - does not fix #649. The pin is a no-op over uv's resolver; "
+        "the underlying version conflict is still unresolved."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": reviewer_summary,
+        "required_changes": [],
+    }
+    (pr_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+    pr = fake_gh.pr_view(456)
+
+    result = app._request_no_op_rework_repair(pr, 123, decision)
+
+    assert result is None, f"expected a clean label transition, got {result!r}"
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    # The no-op operational note (the "dispatch_note") is present...
+    assert "no actual content change" in brief
+    # ...and the reviewer's original findings are still present alongside it,
+    # not replaced by it.
+    assert reviewer_summary in brief
 
 
 def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
