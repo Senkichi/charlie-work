@@ -91,6 +91,7 @@ from .reconcile import (
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    clean_worktrees,
     inspect_worktree_state,
     push_branch,
     remove_review_checkout,
@@ -120,12 +121,14 @@ from .state import (
     is_reviewer_probe_ready,
     is_reviewer_quota_exhausted,
     is_throttled,
+    is_worktree_reclamation_due,
     load_state,
     load_state_locked,
     mark_reviewer_quota_alerted,
     operator_claimed_issues,
     release_operator_claimed,
     save_state,
+    schedule_worktree_reclamation,
     set_operator_claimed,
     set_reviewer_quota_exhausted,
     set_throttled_until,
@@ -12311,6 +12314,100 @@ class OrchestratorApp:
                 state = self._record_event(state, "quota_probe_failed", {})
             save_state(state_file, state)
 
+    def _maybe_reclaim_worktrees(self) -> dict[str, Any] | None:
+        """Cadence-gated merged-PR worktree reclamation on the fleet pass.
+
+        Runs ``clean_worktrees`` -- the same junction-safe, merge-gated,
+        liveness-gated sweep behind ``charlie worktree-clean`` -- on a flat
+        ``worktree_reclamation.interval_minutes`` schedule. Before this call
+        site the sweep only ran when an operator remembered the standalone
+        subcommand, so worktrees for merged PRs accumulated indefinitely
+        (issue #636: 77 of 81 dead on the host this was measured on).
+
+        Two-phase lock pattern (same shape as ``_maybe_probe_quota_recovery``):
+        the schedule is advanced under the lock and the sweep itself runs
+        outside it, because ``clean_worktrees`` makes a live ``gh pr view`` call
+        per candidate worktree and must not hold ``state_lock`` while it does --
+        holding the lock across a per-candidate GitHub fan-out would block every
+        other state reader/writer in the process for the sweep's duration.
+
+        ``dry_run`` is threaded honestly: a ``--dry-run`` fleet pass runs the
+        sweep in preview mode, which removes nothing (the preview-vs-act class
+        tracked in #614-#619). A ``worktrees_reclaimed`` event is always emitted
+        when the sweep runs, so a maintenance action that left no trace is
+        indistinguishable from one that never ran (lesson from #595/#621).
+
+        The cadence schedule itself is advanced regardless of ``dry_run``.
+        This is deliberate, not an instance of the #614-#619 class:
+        ``clean_worktrees`` makes its live ``gh pr view`` call per candidate
+        unconditionally -- ``dry_run`` only gates the final ``git worktree
+        remove`` -- so the GitHub-quota cost this interval exists to bound is
+        identical in preview and live mode. Not advancing the schedule under
+        ``dry_run`` would let a repeated preview pass re-run the full
+        per-candidate fan-out every time, defeating the cadence gate.
+
+        Returns a small summary dict when the sweep ran (for the loop result's
+        ``data``), or ``None`` when reclamation is disabled or not due this
+        pass.
+        """
+        if not self.config.worktree_reclamation.enabled:
+            return None
+        state_file = self.paths.state_file
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_worktree_reclamation_due(state):
+                return None
+            # Advance the schedule BEFORE running the sweep so a concurrent
+            # pass (or a sweep that takes longer than one poll interval) cannot
+            # double-fire. The next run is interval_minutes away regardless of
+            # how long the sweep itself takes.
+            next_run_at = (
+                (
+                    datetime.now(UTC)
+                    + timedelta(minutes=self.config.worktree_reclamation.interval_minutes)
+                )
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            state = schedule_worktree_reclamation(state, next_run_at)
+            save_state(state_file, state)
+
+        # Use the same resolved worktrees root dispatch and `charlie
+        # worktree-clean` use (self._layout.worktrees, from
+        # paths.resolved_layout) rather than re-deriving the
+        # claude_code.worktrees_dir/runtime.state_dir sentinel logic inline --
+        # that duplication across call sites is the exact shape of bug
+        # layout.py's module docstring documents as a past production
+        # incident (create and sweep sides silently disagreeing on the root).
+        state = load_state_locked(state_file)
+        result = clean_worktrees(
+            self.repo_root,
+            self._layout.worktrees,
+            state,
+            self.config,
+            self.gh,
+            dry_run=self.dry_run,
+        )
+        orphans = result.data.get("orphans", {})
+        summary = {
+            "dry_run": self.dry_run,
+            "ok": result.ok,
+            "removed": len(result.data.get("removed", [])),
+            "planned": len(result.data.get("planned", [])),
+            "skipped": len(result.data.get("skipped", [])),
+            "failed": len(result.data.get("failed", [])),
+            "orphans_removed": len(orphans.get("removed", [])),
+            "orphans_planned": len(orphans.get("planned", [])),
+            "orphans_failed": len(orphans.get("failed", [])),
+            "message": result.message,
+        }
+        with state_lock(state_file):
+            state = load_state(state_file)
+            state = self._record_event(state, "worktrees_reclaimed", summary)
+            save_state(state_file, state)
+        return summary
+
     def _maybe_reconcile_drift(self) -> None:
         """Periodic in-loop repair of GitHub label / state.json divergence.
 
@@ -12876,6 +12973,15 @@ class OrchestratorApp:
             ):
                 if key in data[lane]:
                     data[key] = data[lane][key]
+        # Cadence-gated merged-PR worktree reclamation (issue #636). Runs at
+        # the END of the pass so the per-candidate `gh pr view` fan-out never
+        # contends with the dispatch/review/merge lanes for state_lock or
+        # GitHub quota during the critical window. Gated by
+        # worktree_reclamation.interval_minutes, so it fires at most once per
+        # interval regardless of poll frequency or backlog size.
+        reclamation = self._maybe_reclaim_worktrees()
+        if reclamation is not None:
+            data["worktrees_reclaimed"] = reclamation
         return CommandResult(
             ok,
             message,
