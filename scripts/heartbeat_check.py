@@ -767,9 +767,9 @@ def check_loop_pass_freshness(
     CRITICAL: the freshness comparison is done in Python on parsed
     ``datetime`` objects, never in SQL. ``ts`` values are ISO strings like
     ``2026-07-31T22:25:04Z`` (``T``/``Z``); SQLite's
-    ``datetime('now','-30 minutes')`` returns a space-separated,
+    ``datetime('now','-90 minutes')`` returns a space-separated,
     non-``Z`` string like ``2026-07-31 22:25:04``. A predicate such as
-    ``WHERE ts < datetime('now','-30 minutes')`` compares them as strings,
+    ``WHERE ts < datetime('now','-90 minutes')`` compares them as strings,
     where ``'T'`` (0x54) sorts after ``' '`` (0x20) -- this silently
     misclassifies rows in both directions instead of raising, so the bug
     doesn't fail loudly, it just returns the wrong answer.
@@ -827,6 +827,92 @@ def check_loop_pass_freshness(
             f"{marker_path} is one thing worth checking, not the only one. "
             f"({facts})",
         )
+    else:
+        report.ok(check, facts)
+
+
+def check_error_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface error-level events that fire but have no consumer (issue #866).
+
+    `self_deploy_alarm` and every other member of `instrumentation._ERROR_KINDS`
+    (e.g. PR #865's `supervisor_zero_pass_alarm`) are emitted, classified
+    error-level, documented, and unit-tested -- but before this check,
+    nothing in the codebase ever read them. A human had to manually open
+    `events.db` and know which `kind` string to search for. This check
+    closes that detection-to-delivery gap; `check_loop_pass_freshness` above
+    is a separate, coarser backstop (defense in depth), not a substitute --
+    that one answers "did the loop run recently," this one answers "did
+    anything already flag itself as an error."
+
+    Coverage is DERIVED, never a hardcoded `kind` list: `level` is computed
+    once and persisted per-row at write time by
+    `instrumentation._classify_level` (checked against `_ERROR_KINDS`/
+    `_WARNING_KINDS` there), so filtering on the persisted `level = 'error'`
+    column here picks up every current and future error kind without this
+    script importing `charlie_work` or restating its kind list. This is more
+    correct than importing `_ERROR_KINDS` directly would be, too:
+    `_ERROR_KINDS` reflects the currently-installed code, while a row's
+    `level` reflects what the classifier actually assigned when that row was
+    written -- the two can disagree across a deploy boundary, and the
+    persisted column is ground truth for "what actually happened."
+
+    Unlike `check_loop_pass_freshness` (missing db/table = OK, "no history
+    yet" -- a fresh install is not a failure), a missing or unreadable
+    events.db HERE is an ANOMALY: this check's entire job is "did any alarm
+    fire," and a registered repo this check cannot read is a repo it cannot
+    vouch for, not one it can call clean.
+
+    Only rows with `ts` strictly after `baseline` (the previous heartbeat
+    beat -- same mechanism as `check_dispatch_failures`) are reported, so an
+    already-seen alarm is not re-flagged forever. On a cold start (no prior
+    `heartbeat-state.json`), `main()` falls `baseline` back to
+    `now - LOG_FRESHNESS_STALE_MINUTES`, so alarms older than that fallback
+    window are silently out of scope on the very first run -- a deliberate,
+    bounded blind spot, not an oversight.
+
+    CRITICAL: timestamps are compared in Python, never in SQL -- the same
+    ISO-`T`/`Z`-vs-SQLite-space-format trap documented on
+    `check_loop_pass_freshness`. All `level='error'` rows are pulled
+    unfiltered by time and each `ts` is parsed with `parse_iso` and compared
+    against the `baseline` `datetime` in Python.
+    """
+    check = f"error-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check for alarms: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check for alarms: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check for alarms: events.db has no events table")
+                return
+            rows = conn.execute("SELECT ts, kind FROM events WHERE level = 'error'").fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check for alarms: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_alarms: list[str] = []
+    for ts, kind in rows:
+        ts_dt = parse_iso(ts)
+        # An unparseable ts fails toward visibility (reported), not silence.
+        if ts_dt is None or ts_dt > baseline:
+            new_alarms.append(f"{kind}@{ts}")
+
+    facts = f"error_rows={len(rows)} new_since_last_beat={len(new_alarms)}"
+    if new_alarms:
+        report.anom(check, f"new error-level event(s) since last beat: {new_alarms} ({facts})")
     else:
         report.ok(check, facts)
 
@@ -1048,6 +1134,7 @@ def main() -> int:
         )
         check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
+        check_error_events(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)

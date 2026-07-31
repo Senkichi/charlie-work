@@ -94,14 +94,19 @@ def _make_repo(hb: ModuleType, tmp_path: Path) -> Any:
     )
 
 
-def _write_events_db(state_dir: Path, rows: list[tuple[str, str]] | None = None) -> Path:
+def _write_events_db(
+    state_dir: Path,
+    rows: list[tuple[str, str] | tuple[str, str, str]] | None = None,
+) -> Path:
     """Create an events.db next to state.json with the production `events` schema.
 
-    `rows` is a list of (ts, kind) pairs inserted as minimal event rows.
-    Mirrors `charlie_work.instrumentation`'s `events` table by hand rather
-    than importing the package, since heartbeat_check.py deliberately
-    avoids that import (see `fleet_dir`'s docstring) and this check must be
-    tested the same way.
+    `rows` is a list of either (ts, kind) pairs (defaulting `level` to
+    `'info'`, matching the production schema's default) or (ts, kind, level)
+    triples for tests that need to seed error/warning-level rows. Mirrors
+    `charlie_work.instrumentation`'s `events` table by hand rather than
+    importing the package, since heartbeat_check.py deliberately avoids that
+    import (see `fleet_dir`'s docstring) and this check must be tested the
+    same way.
     """
     state_dir.mkdir(parents=True, exist_ok=True)
     db_path = state_dir / "events.db"
@@ -122,10 +127,12 @@ def _write_events_db(state_dir: Path, rows: list[tuple[str, str]] | None = None)
             )
             """
         )
-        for ts, kind in rows or []:
+        for row in rows or []:
+            ts, kind = row[0], row[1]
+            level = row[2] if len(row) > 2 else "info"
             conn.execute(
-                "INSERT INTO events (ts, kind, payload) VALUES (?, ?, '{}')",
-                (ts, kind),
+                "INSERT INTO events (ts, kind, payload, level) VALUES (?, ?, '{}', ?)",
+                (ts, kind, level),
             )
         conn.commit()
     finally:
@@ -836,3 +843,158 @@ def test_check_loop_pass_freshness_recent_iso_row_not_misjudged_stale(
     report = hb.Report()
     hb.check_loop_pass_freshness(report, repo)
     assert not report.anomaly, report.lines
+
+
+def test_check_error_events_surfaces_seeded_self_deploy_alarm(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Regression for issue #866: error-level events are emitted, classified,
+    documented, and tested -- and had NO consumer anywhere in the codebase.
+    A human had to manually open events.db and know which `kind` to search
+    for. `self_deploy_alarm` is a real production example of this (emitted
+    from `supervise.py`, classified error-level by
+    `instrumentation._classify_level` via `_ERROR_KINDS`).
+
+    This test must fail with an AttributeError before `check_error_events`
+    exists -- if it doesn't fail first, it isn't testing the gap.
+    """
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(2), "self_deploy_alarm", "error")])
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_error_events(report, repo, baseline)
+    assert report.anomaly
+    assert "self_deploy_alarm" in report.lines[-1]
+
+
+def test_check_error_events_ok_when_only_info_and_warning_events(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [
+            (_iso(1), "dispatch_started", "info"),
+            (_iso(1), "review_claim_stale", "warning"),
+        ],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_error_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "error_rows=0" in report.lines[0]
+
+
+def test_check_error_events_covers_synthetic_kind_not_hardcoded(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Coverage must be derived from the persisted `level` column, never a
+    hardcoded list of `kind` strings in heartbeat_check.py (issue #866,
+    acceptance criterion: coverage derived from `_ERROR_KINDS`, "or asserts
+    the check has no literal kind list"). A `kind` that doesn't exist in
+    `_ERROR_KINDS` today -- and never has -- must still be caught purely
+    because its row was persisted with `level='error'`. This is also what
+    makes PR #865's new `supervisor_zero_pass_alarm` kind land covered "for
+    free": nothing in this check needs to change when a new alarm kind is
+    added to `_ERROR_KINDS`, because it never enumerated kinds in the first
+    place.
+    """
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(1), "totally_novel_alarm_kind_xyz", "error")])
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_error_events(report, repo, baseline)
+    assert report.anomaly
+    assert "totally_novel_alarm_kind_xyz" in report.lines[-1]
+
+
+def test_check_error_events_excludes_old_row_despite_sql_trap_shape(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Positive control for the ISO-vs-SQLite string-comparison trap, in the
+    direction that matters for THIS check's query shape (`ts > baseline`,
+    selecting NEW rows -- the opposite predicate from
+    `check_loop_pass_freshness`'s `MAX(ts)`).
+
+    `ts` values are `...THH:MM:SSZ`. If baseline were bound into a SQL
+    predicate via a naive `str(datetime)` (space-separated, no `Z`, e.g.
+    `2026-07-31 22:25:04+00:00`), a genuinely OLD row's `T`-formatted `ts`
+    would still sort as "greater than" that space-formatted cutoff --
+    `'T'` (0x54) sorts after `' '` (0x20) -- producing a false alarm on an
+    old, already-seen event. This row is 60 minutes older than baseline and
+    must be excluded; if SQL-based comparison is ever substituted for the
+    Python-side `parse_iso` + `datetime` comparison, this test must go red.
+    """
+    repo = _make_repo(hb, tmp_path)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=5)
+    _write_events_db(repo.state_dir, [(_iso(60), "self_deploy_alarm", "error")])
+    report = hb.Report()
+    hb.check_error_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "error_rows=1" in report.lines[0]
+    assert "new_since_last_beat=0" in report.lines[0]
+
+
+def test_check_error_events_excludes_row_older_than_cold_start_fallback(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """On a cold start (no prior heartbeat-state.json), `main()` falls
+    `baseline` back to `now - LOG_FRESHNESS_STALE_MINUTES` (30m). An alarm
+    older than that fallback window is deliberately out of scope on the
+    very first run -- a bounded, intentional blind spot rather than an
+    oversight. Pins that boundary: a 40m-old alarm against the 30m
+    fallback baseline must NOT be reported.
+    """
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    fallback_baseline = now - timedelta(minutes=hb.LOG_FRESHNESS_STALE_MINUTES)
+    _write_events_db(repo.state_dir, [(_iso(40, base=now), "self_deploy_alarm", "error")])
+    report = hb.Report()
+    hb.check_error_events(report, repo, fallback_baseline)
+    assert not report.anomaly, report.lines
+
+
+def test_check_error_events_anomaly_when_db_missing(hb: ModuleType, tmp_path: Path) -> None:
+    """Unlike `check_loop_pass_freshness` (missing db = OK, "no history
+    yet"), a missing events.db here is an ANOMALY: this check's entire job
+    is "did any alarm fire," and a registered repo with no events.db is a
+    repo this check cannot vouch for -- reporting OK would be a silent
+    false negative in exactly the direction issue #866 exists to close.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_error_events(report, repo, baseline)
+    assert report.anomaly
+    assert "no events.db" in report.lines[-1]
+
+
+def test_check_error_events_anomaly_when_table_missing(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = repo.state_dir / "events.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_error_events(report, repo, baseline)
+    assert report.anomaly
+    assert "no events table" in report.lines[-1]
+
+
+def test_check_error_events_anomaly_when_db_unreadable(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    (repo.state_dir / "events.db").write_bytes(b"not a sqlite database at all")
+
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_error_events(report, repo, baseline)
+    assert report.anomaly
+    assert "unreadable" in report.lines[-1]
