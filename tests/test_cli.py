@@ -942,6 +942,48 @@ def test_run_runners_allocate_loud_on_absent_global_layer(
     )
 
 
+def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#6-G / G-AC3: doctor must not itself crash on the exact condition it
+    exists to diagnose.
+
+    Before this fix, ``run_doctor_command`` called ``load_layered_config``
+    unguarded, so a config parse failure (e.g. the 2026-07-29 incident's
+    unknown ``cross_family: auto_verdict`` key) propagated past this function
+    to ``main()``'s generic ``except (ConfigError, ValueError)`` handler,
+    which prints to stderr and exits 2 with no machine-readable finding --
+    the operator gets nothing to act on. Now the failure is caught locally
+    and rendered as a structured, blocking ``DoctorCheck`` finding instead.
+
+    Drives the REAL ``load_layered_config`` (not mocked) against a real
+    unparseable config file on disk, mirroring the exact incident shape used
+    in test_fleet_dispatch.py's
+    test_fleet_loop_real_unknown_config_key_reproduces_incident.
+    """
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    # Deliberately NOT mocking cli.load_layered_config.
+    (tmp_path / "orchestrator.config.yaml").write_text(
+        "labels:\n  ready: automated-ready\ncross_family:\n  totally_unknown_key: true\n",
+        encoding="utf-8",
+    )
+
+    args = cli.build_parser().parse_args(["--fleet-dir", str(tmp_path), "doctor"])
+    result = cli.run_doctor_command(args)
+
+    assert result.ok is False, "an unparseable config must fail the command, not crash it"
+    assert "1 finding" in result.message
+    checks = result.data["checks"]
+    assert len(checks) == 1, f"expected exactly one synthetic finding, got: {checks!r}"
+    check = checks[0]
+    assert check["name"] == "config file"
+    assert check["ok"] is False
+    assert check["severity"] == "error", "a config parse failure must be blocking, not a warning"
+    assert "totally_unknown_key" in check["detail"]
+    assert "cross_family" in check["detail"]
+
+
 # --------------------------------------------------------------------------
 # runners ensure-started: single-controller guard (issue #598)
 # --------------------------------------------------------------------------

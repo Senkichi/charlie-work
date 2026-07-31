@@ -14,7 +14,11 @@ from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import LabelConfig, OrchestratorConfig, PostMortemConfig
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.file_lock import try_acquire_byte_range_lock
-from charlie_work.github import GraphQLBudgetError, _LIST_LIMIT as github_list_limit
+from charlie_work.github import (
+    GitHubError,
+    GraphQLBudgetError,
+    _LIST_LIMIT as github_list_limit,
+)
 from charlie_work.instrumentation import read_event_log
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.reconcile import (
@@ -22,6 +26,8 @@ from charlie_work.reconcile import (
     AVIATOR_CHECK_NAME,
     DriftItem,
     _LIST_LIMIT as reconcile_list_limit,
+    _fetch_issues,
+    _fetch_prs,
     apply_fixes,
     detect_aviator_stale_blocked,
     detect_drift,
@@ -3307,3 +3313,71 @@ def test_apply_fixes_aviator_stale_blocked_records_label_write_failure() -> None
     assert any(
         "label_write_failed: true" in e.get("payload", {}).get("fix_actions", []) for e in events
     )
+
+
+class _EmptyStdoutGitHub:
+    """``gh`` exits 0 but writes nothing to stdout.
+
+    ``GitHub.run`` turns that into ``None`` (``if not output: return None`` on
+    the success path) -- the exact value both reconcile fetchers used to
+    coerce into ``[]``.
+    """
+
+    def run(
+        self,
+        args: list[str],
+        *,
+        json_output: bool = False,
+        allow_failure: bool = False,
+    ) -> Any:
+        return None
+
+    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int]:
+        return True, 10000, 0
+
+    def invalidate_list_cache(self) -> None:
+        return None
+
+
+def test_fetch_prs_raises_rather_than_degrading_to_empty_list() -> None:
+    """A PR snapshot that could not be read must not read as "zero PRs".
+
+    The old ``return result if isinstance(result, list) else []`` made an
+    unreadable snapshot bit-identical to an empty GitHub. ``detect_drift``
+    answers "GitHub has zero PRs" by flagging every tracked PR
+    ``state_pr_missing_on_github``, whose fix handler pops it out of
+    ``state["prs"]`` -- erasing ``decision``/``reviewed_head_sha`` fleet-wide.
+    """
+    with pytest.raises(GitHubError, match="refusing to treat an unreadable"):
+        _fetch_prs(_EmptyStdoutGitHub())  # type: ignore[arg-type]
+
+
+def test_fetch_issues_raises_rather_than_degrading_to_empty_list() -> None:
+    """Symmetric with the PR fetcher -- hardening one and not the other would
+    leave the identical coercion live on the issue side."""
+    with pytest.raises(GitHubError, match="refusing to treat an unreadable"):
+        _fetch_issues(_EmptyStdoutGitHub())  # type: ignore[arg-type]
+
+
+def test_detect_drift_leaves_state_untouched_when_snapshot_unreadable() -> None:
+    """End-to-end property: a failed read aborts the pass instead of mutating.
+
+    This is what makes the downstream sweep correct *by construction* -- once
+    an unreadable snapshot can no longer arrive as ``[]``, an empty ``prs``
+    genuinely means "GitHub has zero PRs" and no "suspiciously empty"
+    heuristic is needed to second-guess it.
+    """
+    config = OrchestratorConfig()
+    state = empty_state()
+    state["prs"]["999"] = {
+        "issue_number": 5,
+        "status": "reviewing",
+        "decision": "approved",
+    }
+    before = json.dumps(state, sort_keys=True)
+
+    with pytest.raises(GitHubError):
+        detect_drift(_EmptyStdoutGitHub(), state, config)  # type: ignore[arg-type]
+
+    assert json.dumps(state, sort_keys=True) == before
+    assert state["prs"]["999"]["decision"] == "approved"

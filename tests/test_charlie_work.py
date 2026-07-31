@@ -4529,6 +4529,90 @@ def test_dispatch_merged_pr_mention_flag_is_one_shot(tmp_path: Path) -> None:
     assert len(flagged_events_3) == 1  # still only the single pass-1 event
 
 
+def test_dispatch_merged_pr_mention_flag_skips_dedup_marker_on_partial_failure(
+    tmp_path: Path,
+) -> None:
+    """A PARTIAL_FAILURE label transition for merged_pr_mention_flagged must
+    NOT stamp merged_pr_mention_flagged_at. Before the fix, the dedup marker
+    was written unconditionally regardless of transition()'s outcome, so a
+    failed agent:human-needed label add still left the timestamp in state --
+    and the one-shot guard exercised by
+    test_dispatch_merged_pr_mention_flag_is_one_shot keys off exactly that
+    timestamp's presence, so the issue would never be retried even though
+    its label never actually changed.
+
+    Pass 2 then clears the injected failure and re-dispatches, proving the
+    withheld marker actually causes a retry -- not just that it is absent.
+    """
+    config = OrchestratorConfig()
+    human_needed = config.labels.human_needed
+
+    class LabelFailMentionGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_add = True
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            if label == human_needed and self.fail_add:
+                # Simulate a failed add (error-as-value) -> PARTIAL_FAILURE.
+                return False
+            return super().add_issue_label(number, label)
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailMentionGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Same mention-only setup as test_dispatch_merged_pr_mention_flag_is_one_shot:
+    # merged PR #456 only *mentions* issue #123 in free text -- no branch-prefix
+    # binding, no closing keyword -- so only the loose mention scan finds it.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+
+    # --- Pass 1: label add fails -> marker withheld, no event ---------------
+    result = app.dispatch(limit=1)
+    assert result.ok is True
+
+    # The add was attempted (proves the transition actually ran) but failed.
+    assert (123, human_needed) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"].get("123", {})
+    # The dedup marker must be ABSENT: a retry must occur on the next pass
+    # instead of being permanently suppressed by a marker stamped despite
+    # the label write having failed.
+    assert issue_entry.get("merged_pr_mention_flagged_at") is None
+
+    # The one-shot event is gated on the same success condition as the
+    # marker, so it must not have fired either.
+    flagged_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert flagged_events == []
+
+    # --- Pass 2: label add now succeeds -> the withheld marker must let the
+    # mention scan retry, not permanently suppress the issue. This is the
+    # behavior the marker's absence exists to enable -- proving it, not just
+    # the marker's absence, is what distinguishes "will retry" from "silently
+    # dropped."
+    fake_gh.fail_add = False
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    assert result2.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert (123, human_needed) in fake_gh.labels_added
+
+    state2 = load_state(paths.state_file)
+    assert state2["issues"]["123"].get("merged_pr_mention_flagged_at") is not None
+    flagged_events_2 = [
+        e
+        for e in state2.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert len(flagged_events_2) == 1
+    assert flagged_events_2[0]["payload"]["issue_numbers"] == [123]
+
+
 def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -> None:
     """Regression for the isCrossRepository guard (workflow.py,
     _merged_pr_referenced_issue_numbers): a merged PR whose provenance is
@@ -14488,6 +14572,161 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
     }
 
 
+def test_merge_ready_failed_attempt_alarm_reports_merge_state_not_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #751: when every check-summary bucket is empty (all required
+    checks pass) but the PR is still unmergeable for a reason none of the
+    explicitly modelled branches (merge_conflict, cross_pr_revert_detected,
+    mergequeue_handoff_failed, summary.failed) name, the terminal ``else``
+    branch must report GitHub's own ``mergeable``/``mergeStateStatus``
+    instead of discarding it as "check summary unknown" (the real #679
+    payload: all required checks green, alarm text still uninformative).
+
+    The scenario is built by forcing a genuine merge-base staleness
+    (compare_overrides) combined with a failed ``pr_update_branch`` — this
+    sets ``sync_failed`` (and therefore ``can_merge=False``) without ever
+    setting ``merge_conflict`` (which only looks at CONFLICTING/DIRTY), so
+    the alarm chain falls through every explicit branch into the ``else``.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            # No required checks -> the check-summary buckets are vacuously
+            # empty, isolating the terminal `else` branch under test.
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+    fake_gh.prs[0]["mergeStateStatus"] = "BLOCKED"
+    # Force the merge-base freshness check to see a stale base (independent of
+    # mergeStateStatus, which the real _is_base_current path never consults),
+    # then fail the resulting update-branch attempt so sync_failed=True without
+    # ever tripping the CONFLICTING/DIRTY-only merge_conflict detector.
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "main-tip"},
+        "merge_base_commit": {"sha": "main-tip-stale"},
+    }
+    fake_gh.update_branch_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "mergeable=MERGEABLE" in warning
+    assert "mergeStateStatus=BLOCKED" in warning
+    # The negative control: without this assertion the test would also pass
+    # against the pre-fix code, which always appended the literal fallback
+    # regardless of what pr_view returned.
+    assert "check summary unknown" not in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["mergeable"] == "MERGEABLE"
+    assert alarm_events[0]["payload"]["merge_state_status"] == "BLOCKED"
+
+
+def test_merge_ready_failed_attempt_alarm_falls_back_when_merge_state_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #751: the "check summary unknown" fallback must survive for the
+    genuinely-unknown case where GitHub reports neither ``mergeable`` nor
+    ``mergeStateStatus`` as a usable signal (both ``"UNKNOWN"``), so a later
+    refactor of the merge-state bucket can't silently delete the fallback.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeable"] = "UNKNOWN"
+    fake_gh.prs[0]["mergeStateStatus"] = "UNKNOWN"
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "main-tip"},
+        "merge_base_commit": {"sha": "main-tip-stale"},
+    }
+    fake_gh.update_branch_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "check summary unknown" in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["mergeable"] == "UNKNOWN"
+    assert alarm_events[0]["payload"]["merge_state_status"] == "UNKNOWN"
+
+
+def test_merge_ready_failed_attempt_alarm_reports_unavailable_not_passed(
+    tmp_path: Path,
+) -> None:
+    """When ``gh pr checks`` itself fails, summarize_checks(None, required)
+    puts every required check into ``summary.unavailable`` — missing,
+    pending, failed, and infra_failed all stay empty. The terminal ``else``
+    branch's bucket chain checked those four buckets but never
+    ``unavailable``, so it fell through to the "every bucket empty" fallback
+    and (after the mergeable/mergeStateStatus fix above) would have claimed
+    "all required checks passed" — an actively false statement when the
+    check status could not be fetched at all. This must report the
+    unavailable checks instead of asserting they passed.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests",),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["checks_unavailable"] is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "unavailable: Tests" in warning
+    # The negative control: an unavailable check is not a passed check.
+    assert "all required checks passed" not in warning
+    assert "check summary unknown" not in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["checks_summary"]["unavailable"] == ["Tests"]
+
+
 def test_merge_ready_failed_attempt_alarm_resets_on_merge(tmp_path: Path) -> None:
     """Issue #254: a successful merge resets the failed attempt counter."""
     from charlie_work.config import AutoMergeConfig
@@ -15707,7 +15946,22 @@ def test_loop_skips_review_for_approved_unmerged_pr(tmp_path: Path) -> None:
     merge_ready."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """loop() now runs a reconcile pass (merge-lane-recovery §6-B) that
+        calls gh.run(["pr", "list", ...]) via reconcile._fetch_prs. The base
+        FakeGitHub.run() generic fallback always returns [] for that query
+        regardless of self.prs, which makes detect_drift see an empty GitHub
+        snapshot against a non-empty tracked-PR state and misreport PR 456 as
+        missing on GitHub. Reflect self.prs for real here so the reconcile
+        pass sees the same PR the rest of this fake already knows about."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     # Record an approved decision in state (as record_review would).
     state = load_state(paths.state_file)
@@ -16447,7 +16701,20 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
 ) -> None:
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """See the identical override in
+        test_loop_skips_review_for_approved_unmerged_pr: loop()'s reconcile
+        pass (merge-lane-recovery §6-B) queries gh.run(["pr", "list", ...]),
+        and the base fake's generic run() fallback returns [] regardless of
+        self.prs, which misreports PR 456 as missing on GitHub."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     state = load_state(paths.state_file)
     state["prs"]["456"] = {
@@ -24284,6 +24551,628 @@ def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throt
     assert state.get("quota_probe", {}).get("next_probe_at") is None
     assert state["throttled_until"] == future
     assert state["throttle_adapter_kind"] == "devin"
+
+
+def _reclamation_app(
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    interval_minutes: int = 60,
+    dry_run: bool = False,
+) -> OrchestratorApp:
+    from charlie_work.config import WorktreeReclamationConfig
+
+    config = OrchestratorConfig(
+        worktree_reclamation=WorktreeReclamationConfig(
+            enabled=enabled, interval_minutes=interval_minutes
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=dry_run)
+
+
+def test_worktree_reclamation_config_defaults() -> None:
+    from charlie_work.config import WorktreeReclamationConfig
+
+    wr = WorktreeReclamationConfig()
+    assert wr.enabled is True
+    assert wr.interval_minutes == 60
+
+
+def test_worktree_reclamation_config_absent_block_defaults_enabled(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("labels:\n  ready: automated-ready\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.worktree_reclamation.enabled is True
+    assert config.worktree_reclamation.interval_minutes == 60
+
+
+def test_worktree_reclamation_config_parses(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "worktree_reclamation:\n  enabled: true\n  interval_minutes: 30\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.worktree_reclamation.enabled is True
+    assert config.worktree_reclamation.interval_minutes == 30
+
+
+def test_worktree_reclamation_config_rejects_non_int_interval(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("worktree_reclamation:\n  interval_minutes: soon\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="interval_minutes"):
+        load_config(path)
+
+
+def test_worktree_reclamation_config_rejects_zero_interval(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("worktree_reclamation:\n  interval_minutes: 0\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="interval_minutes"):
+        load_config(path)
+
+
+def test_is_worktree_reclamation_due_when_no_schedule() -> None:
+    from charlie_work.state import is_worktree_reclamation_due
+
+    # An absent schedule means "never run yet" -> due, so the first fleet pass
+    # after startup clears the existing backlog (issue #636).
+    assert is_worktree_reclamation_due({}) is True
+    assert is_worktree_reclamation_due({"worktree_reclamation": {}}) is True
+
+
+def test_is_worktree_reclamation_due_false_for_future_schedule() -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = schedule_worktree_reclamation({}, future)
+
+    assert is_worktree_reclamation_due(state) is False
+
+
+def test_is_worktree_reclamation_due_true_for_past_schedule() -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    past = (
+        (datetime.now(UTC) - timedelta(minutes=5))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = schedule_worktree_reclamation({}, past)
+
+    assert is_worktree_reclamation_due(state) is True
+
+
+def test_is_worktree_reclamation_due_treats_malformed_as_due() -> None:
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    state = schedule_worktree_reclamation({}, "not-a-timestamp")
+
+    # A corrupt value must not wedge reclamation off forever.
+    assert is_worktree_reclamation_due(state) is True
+
+
+def test_maybe_reclaim_worktrees_disabled_returns_none(tmp_path: Path) -> None:
+    from charlie_work import workflow as workflow_module
+
+    app = _reclamation_app(tmp_path, enabled=False)
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("disabled reclamation must never call clean_worktrees")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fail_if_called)
+    try:
+        assert app._maybe_reclaim_worktrees() is None
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("worktree_reclamation", {}).get("next_run_at") is None
+
+
+def test_maybe_reclaim_worktrees_not_due_does_not_sweep(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, schedule_worktree_reclamation
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    save_state(app.paths.state_file, schedule_worktree_reclamation({}, future))
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("must not sweep before the scheduled interval elapses")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fail_if_called)
+    try:
+        assert app._maybe_reclaim_worktrees() is None
+    finally:
+        monkeypatch.undo()
+
+    # Schedule is untouched when not due.
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] == future
+
+
+def test_maybe_reclaim_worktrees_dry_run_threads_and_removes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A --dry-run fleet pass must run the sweep in preview mode, which removes
+    nothing (the preview-vs-act class tracked in #614-#619). ``dry_run`` is
+    threaded from the app into ``clean_worktrees``."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, dry_run=True)
+
+    calls: list[dict] = []
+
+    def _fake_clean(*args: object, **kwargs: object) -> WorktreeCleanResult:
+        calls.append({"args": args, "kwargs": kwargs})
+        return WorktreeCleanResult(
+            ok=True,
+            message="worktree-clean (dry-run): 2 eligible, 0 skipped, 0 orphan(s)",
+            data={
+                "planned": [{"worktree": "a"}, {"worktree": "b"}],
+                "removed": [],
+                "skipped": [],
+                "failed": [],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert len(calls) == 1
+    # dry_run is threaded honestly into the sweep.
+    assert calls[0]["kwargs"]["dry_run"] is True
+    # The canonical resolved worktrees root is passed -- not a manual
+    # re-derivation -- so this call site can never diverge from dispatch's
+    # and `charlie worktree-clean`'s (the create/sweep split documented in
+    # layout.py's module docstring, "74-uncollected-worktrees").
+    assert calls[0]["args"][1] == app.layout.worktrees
+    # A preview removes nothing.
+    assert summary["removed"] == 0
+    assert summary["planned"] == 2
+    assert summary["dry_run"] is True
+    # The schedule is advanced even in dry-run: clean_worktrees makes its
+    # live `gh pr view` fan-out unconditionally (dry_run only gates the final
+    # `git worktree remove`), so the cadence gate's cost is identical in both
+    # modes and must be rate-limited in both.
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] is not None
+    # An event was emitted so the preview is observable.
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["dry_run"] is True
+    assert events[0]["payload"]["planned"] == 2
+    assert events[0]["payload"]["removed"] == 0
+
+
+def test_maybe_reclaim_worktrees_runs_and_emits_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live (non-dry-run) pass runs the sweep, records a
+    ``worktrees_reclaimed`` event with the counts, and advances the cadence
+    schedule (issue #636: a maintenance action that leaves no trace is
+    indistinguishable from one that never ran -- lesson from #595/#621)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+
+    def _fake_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
+        return WorktreeCleanResult(
+            ok=True,
+            message="worktree-clean: 3 removed, 1 skipped, 0 failed, 0 orphan(s)",
+            data={
+                "planned": [],
+                "removed": [{"issue_number": 1}, {"issue_number": 2}, {"issue_number": 3}],
+                "skipped": [{"issue_number": 4}],
+                "failed": [],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert summary["dry_run"] is False
+    assert summary["removed"] == 3
+    assert summary["skipped"] == 1
+    state = load_state(app.paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["removed"] == 3
+    # The schedule was advanced ~interval_minutes into the future, so the very
+    # next pass does not re-fire the per-candidate gh fan-out.
+    next_run_at = state["worktree_reclamation"]["next_run_at"]
+    parsed = datetime.fromisoformat(next_run_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=60)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+
+def test_maybe_reclaim_worktrees_advances_schedule_before_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The schedule is advanced BEFORE the sweep runs, so a sweep that errors
+    or takes longer than one poll interval cannot double-fire on the next
+    pass."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+
+    def _exploding_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
+        # Simulate a sweep that fails: the schedule must already have been
+        # advanced before this point.
+        state = load_state(app.paths.state_file)
+        assert state["worktree_reclamation"]["next_run_at"] is not None
+        return WorktreeCleanResult(
+            ok=False,
+            message="worktree-clean: 0 removed, 0 skipped, 1 failed",
+            data={
+                "planned": [],
+                "removed": [],
+                "skipped": [],
+                "failed": [{"worktree": "a"}],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _exploding_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert summary["ok"] is False
+    assert summary["failed"] == 1
+    # A failed sweep still records an event (observability) and keeps the
+    # advanced schedule (no immediate retry storm).
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] is not None
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["failed"] == 1
+
+
+def _reconcile_pass_app(
+    tmp_path: Path,
+    *,
+    interval_minutes: int = 30,
+    enabled: bool = True,
+    gh: Any = None,
+) -> OrchestratorApp:
+    from charlie_work.config import ReconcilePassConfig
+
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=enabled, interval_minutes=interval_minutes)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())
+
+
+def test_maybe_reconcile_drift_noop_when_disabled(tmp_path: Path) -> None:
+    """B-AC1/B-AC2: reconcile_pass.enabled=False must skip reconcile entirely --
+    no call to reconcile(), no schedule armed, no summary event."""
+    app = _reconcile_pass_app(tmp_path, enabled=False)
+
+    def _fail_if_called(*, fix: bool = False) -> CommandResult:
+        raise AssertionError("reconcile() must not be called when reconcile_pass is disabled")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _fail_if_called)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("reconcile_pass", {}).get("next_reconcile_at") is None
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+
+
+def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -> None:
+    """B-AC1/B-AC2: enabled + due calls _reconcile_locked(fix=True) exactly
+    once, arms the next-due schedule ~interval_minutes out, and records a
+    single reconcile_pass_completed summary event carrying drift counts.
+
+    Patches ``_reconcile_locked``, not ``reconcile`` (merge-lane-recovery
+    D-8a): ``_maybe_reconcile_drift`` calls ``_reconcile_locked`` directly
+    because loop()'s caller already holds supervisor.lock for the whole
+    pass, and re-entering ``reconcile()`` would re-acquire that same
+    non-reentrant lock and always no-op. Patching ``reconcile`` here would
+    silently never be invoked and this test would falsely pass with 0 calls
+    recorded as a bug, not a confirmation -- see
+    test_maybe_reconcile_drift_runs_while_supervisor_lock_held for the test
+    that actually exercises that lock-contention distinction end to end."""
+    from datetime import UTC, datetime
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+    original_reconcile_locked = app._reconcile_locked
+    calls: list[tuple[bool, bool]] = []
+
+    def _counting_reconcile_locked(
+        *, fix: bool = False, skip_dead_session_sweep: bool = False
+    ) -> CommandResult:
+        calls.append((fix, skip_dead_session_sweep))
+        return original_reconcile_locked(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "_reconcile_locked", _counting_reconcile_locked)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    # merge-lane-recovery §6-B follow-up: the in-loop caller must skip
+    # reconcile's own dead-session sweep -- the loop's stall/dead lanes
+    # (_detect_and_handle_stalled_sessions /
+    # _classify_dead_sessions_and_update_throttle_state) already ran this
+    # exact pass, immediately before this call, with grace-period semantics
+    # (max_inconclusive_probe_deferrals) that reconcile.py's sweep does not
+    # implement.
+    assert calls == [(True, True)]
+
+    state = load_state(app.paths.state_file)
+    next_at = state["reconcile_pass"]["next_reconcile_at"]
+    parsed = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=30)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+    events = state.get("events", [])
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1
+    assert completed[0]["payload"]["drift_detected"] == 0
+    assert completed[0]["payload"]["drift_fixed"] == 0
+    assert completed[0]["payload"]["drift_remaining"] == 0
+
+
+def test_maybe_reconcile_drift_waits_until_due(tmp_path: Path) -> None:
+    """The periodic cadence must not re-run reconcile before the armed
+    next_reconcile_at timestamp."""
+    from datetime import UTC, datetime
+
+    from charlie_work.state import arm_reconcile_pass
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+    not_due = (
+        (datetime.now(UTC) + timedelta(minutes=25))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_reconcile_pass(load_state(app.paths.state_file), not_due)
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(*, fix: bool = False) -> CommandResult:
+        raise AssertionError("must not reconcile before the scheduled time")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _fail_if_called)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state["reconcile_pass"]["next_reconcile_at"] == not_due
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+
+
+def test_maybe_reconcile_drift_defers_on_graphql_rate_limit(tmp_path: Path) -> None:
+    """B-AC3: reconcile()'s existing GraphQL rate-limit deferral must be
+    preserved, not bypassed -- surfaced as a distinguishable
+    reconcile_pass_deferred event rather than a silent no-op."""
+
+    class LowBudgetGitHub(FakeGitHub):
+        def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
+            return (False, 50, 1234567890)
+
+    app = _reconcile_pass_app(tmp_path, gh=LowBudgetGitHub())
+
+    app._maybe_reconcile_drift()
+
+    state = load_state(app.paths.state_file)
+    assert state["reconcile_pass"]["next_reconcile_at"] is not None
+    events = state.get("events", [])
+    deferred = [e for e in events if e.get("kind") == "reconcile_pass_deferred"]
+    assert len(deferred) == 1
+    assert deferred[0]["payload"]["deferred_reason"] == "graphql_rate_limit"
+    assert deferred[0]["payload"]["graphql_remaining"] == 50
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert completed == []
+
+
+def test_loop_corrects_escalated_label_divergence_via_reconcile_pass(tmp_path: Path) -> None:
+    """B-AC5 (critical wiring test): a state/label divergence of the
+    escalated_labels_converged shape -- state says status "escalated", GitHub
+    still carries the stale needs-rework label -- must be corrected by a
+    single app.loop() pass. This proves _maybe_reconcile_drift is actually
+    wired into _loop_body's production call path, not merely present and
+    independently callable. Must FAIL if the wiring call site is removed;
+    see the removal verification recorded in the PR description."""
+    from charlie_work.config import ReconcilePassConfig
+
+    class EscalatedDivergenceGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 40,
+                    "title": "issue 40",
+                    "url": "https://example.test/issues/40",
+                    "body": "",
+                    "labels": [{"name": "agent:needs-rework"}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = []
+
+        def run(
+            self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        ) -> Any:
+            if args[:2] == ["issue", "list"]:
+                return self.issues
+            if args[:2] == ["pr", "list"]:
+                return self.prs
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+        def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]:
+            return self.issues
+
+        def pr_list(self) -> list[dict[str, Any]]:
+            return self.prs
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {
+                issue["number"]
+                for issue in self.issues
+                if issue["number"] in issue_numbers and issue.get("state") == "OPEN"
+            }
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    names = {entry.get("name") for entry in issue["labels"]}
+                    if label not in names:
+                        issue["labels"].append({"name": label})
+            return True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            super().remove_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    issue["labels"] = [
+                        entry for entry in issue["labels"] if entry.get("name") != label
+                    ]
+            return True
+
+    gh = EscalatedDivergenceGitHub()
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=True, interval_minutes=30)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    state = load_state(app.paths.state_file)
+    state = {
+        **state,
+        "issues": {**state.get("issues", {}), "40": {"number": 40, "status": "escalated"}},
+    }
+    save_state(app.paths.state_file, state)
+
+    app.loop(limit=1)
+
+    assert (40, "agent:human-needed") in gh.labels_added
+    assert (40, "agent:needs-rework") in gh.labels_removed
+
+    # B-AC7 (critical safety invariant): reconcile must never rewrite status
+    # to match labels -- only `charlie unescalate` re-enters the machine.
+    final_state = load_state(app.paths.state_file)
+    assert final_state["issues"]["40"]["status"] == "escalated"
+
+
+def test_maybe_reconcile_drift_runs_while_supervisor_lock_held(tmp_path: Path) -> None:
+    """merge-lane-recovery D-8a: every production caller of loop() -- the
+    cli.py bash-rats handler, fleet_dispatch.py, and supervise.py's
+    `while True` -- already holds supervisor.lock for the whole call, so
+    _maybe_reconcile_drift must make progress under that exact condition.
+
+    The buggy predecessor called `self.reconcile(fix=True, ...)`, which
+    re-acquires supervisor.lock as its first action. Byte-range locks taken
+    via msvcrt.locking(LK_NBLCK) are per-handle and non-reentrant even
+    within one process (file_lock.py keeps no reentrancy bookkeeping), so
+    that reacquisition always failed and reconcile silently no-opped on
+    every one of the fleet's loop passes (0 reconcile events across 9,848
+    recorded events). The fix calls `self._reconcile_locked(...)` directly,
+    bypassing the lock acquisition entirely, since the precondition (lock
+    already held by loop()'s caller) is guaranteed by this method's callers.
+
+    A test that does not hold supervisor.lock during the call cannot
+    distinguish the two implementations -- both acquire/no-op fine when
+    unlocked, which is exactly how this shipped undetected.
+    """
+    from charlie_work import layout
+    from charlie_work.file_lock import try_acquire_byte_range_lock
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+
+    supervisor_lock = try_acquire_byte_range_lock(layout.supervisor_lock_path(app.paths.root))
+    assert supervisor_lock is not None, "test setup failed to acquire the supervisor lock"
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        supervisor_lock.release()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1, (
+        "reconcile_pass_completed must be recorded even while supervisor.lock "
+        f"is held by the loop() caller; events were: {events}"
+    )
+
+    # The assertion that actually discriminates the bug: the buggy code path
+    # (self.reconcile(fix=True, ...) re-acquiring the same non-reentrant
+    # lock) always produced this event with this exact reason instead.
+    lock_held_skips = [
+        e
+        for e in events
+        if e.get("kind") == "reconcile_pass_skipped"
+        and e.get("payload", {}).get("reason") == "supervisor_lock_held"
+    ]
+    assert lock_held_skips == [], (
+        "reconcile must not report supervisor_lock_held when the lock is "
+        "already held by this same in-process loop() call -- that reason is "
+        "reserved for a genuinely concurrent mop-up --fix"
+    )
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
