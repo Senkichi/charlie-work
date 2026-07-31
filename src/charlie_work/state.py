@@ -9,7 +9,8 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 STATE_VERSION = 1
 
@@ -122,10 +123,44 @@ PASSIVE_OPEN_STATUS = "reviewing"
 #     acceptance criterion, or a reviewer's explicit "blocked" verdict. Stays
 #     terminal; only a human running ``charlie unescalate`` may clear it.
 #
-# An escalation recorded with no ``reason_class`` at all (every escalation
-# that predates this field) is treated as "judgment" by the sweep -- fail
-# closed, never retroactively guessed.
+# A legacy escalation recorded with no ``reason_class`` at all may be
+# backfilled by ``workflow._maybe_deescalate_mechanical`` from the most
+# recent escalation-transition event in ``events.db``, but only when the
+# event kind unambiguously denotes a process failure. Ambiguous or
+# deliberately-preserved kinds stay fail-closed: ``reason_class`` remains
+# absent and the issue stays terminal.
 ESCALATION_REASON_CLASSES: frozenset[str] = frozenset({"mechanical", "judgment"})
+
+# Issue #797: legacy escalations may lack ``reason_class`` because the field
+# was added later. The backfill derives the class from the escalation event
+# kind. Only kinds that unambiguously indicate a process failure map to
+# ``"mechanical"``. Kinds in ``DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS``
+# are too ambiguous (or are intentionally preserved forensic records) and
+# must stay unclassified, so the backfill leaves the issue terminal.
+ESCALATION_REASON_CLASS_BY_EVENT_KIND: Mapping[str, str] = MappingProxyType(
+    {
+        # A rework worker's session dying, or a redispatch/no-op-rework cap
+        # being exceeded, is a pure process/infrastructure failure.
+        "session_failed_escalated": "mechanical",
+        # The review-dispatch attempt cap is an infrastructure-driven limit.
+        "review_dispatch_escalated": "mechanical",
+    }
+)
+DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
+    {
+        # Issue #662: a deliberately-preserved forensic record; the kind alone
+        # cannot distinguish a normal process failure from a record that must
+        # stay terminal.
+        "janitor_rework_escalated",
+        # Can carry either a human ``blocked`` verdict (judgment) or a
+        # request-changes/unparseable report (mechanical); the kind alone is
+        # ambiguous.
+        "rescue_review_escalated",
+        # Records review decisions including approved, request_changes, and
+        # blocked; the event kind alone does not identify an escalation.
+        "record_review",
+    }
+)
 
 
 def escalation_reason_class(reason_class: str) -> str:

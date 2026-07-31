@@ -862,6 +862,89 @@ def test_janitor_conflict_stalled_rework_requested_escalates(tmp_path: Path) -> 
     assert len(cap_events) == 0
 
 
+def test_janitor_conflict_stall_escalation_blocks_reentry_until_unescalated(
+    tmp_path: Path,
+) -> None:
+    """Issue #776 interaction with the #765/#774 stall bound: a stall
+    escalation leaves the issue in status "escalated" -- NOT
+    rework_requested/dispatched/dispatch_pending -- exactly like a
+    cap-exceeded escalation does. Issue #776's fix makes
+    _route_janitor_gate_failure_to_rework re-enter on every pass for an
+    "escalated" issue/PR (by design, so an UNRELATED lane's escalation
+    doesn't wall off this lane's remediation forever). Without a
+    lane-scoped escalation_reason recorded on the stall path too, that
+    re-entry would fall through the (now False) rework_pending check
+    straight to the attempts-increment/dispatch logic on the very next
+    pass -- silently redispatching a fresh rework attempt and undoing the
+    stall escalation's entire purpose (getting a human to look at a PR
+    nobody is actively working) the instant it fires. This pins that the
+    stall path's escalation_reason is recognized by the same guard the
+    cap-exceeded path uses, and that ``charlie unescalate`` remains the
+    sanctioned way back in.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+
+    result1 = app.review(456)
+    assert result1.ok is True
+    assert result1.data["routed_to_rework"] is True
+
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(minutes=61)
+    ).isoformat()
+    state["prs"]["456"]["conflict_rework_attempts_stall_head"] = app.gh.prs[0].get("headRefOid")
+    save_state(app.paths.state_file, state)
+
+    result2 = app.review(456)
+    assert result2.ok is False
+    assert result2.data["escalated"] is True
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["escalation_reason"] == "conflict_rework_attempts_stall_exceeded"
+    assert state["issues"]["123"]["escalation_reason"] == "conflict_rework_attempts_stall_exceeded"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+    # The regression this pins: without the fix, this third pass would
+    # silently redispatch (attempts_key bumped to 2, a new
+    # routed_to_rework/janitor_rework_escalated event) instead of staying
+    # blocked behind the escalated-issue early return.
+    result3 = app.review(456)
+    assert result3.ok is True
+    assert result3.data.get("skipped") is True
+    assert result3.data.get("routed_to_rework") is not True
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert state["issues"]["123"]["status"] == "escalated"
+    escalated_events = [e for e in state["events"] if e["kind"] == "janitor_rework_escalated"]
+    assert len(escalated_events) == 0
+    stalled_events = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
+    assert len(stalled_events) == 1  # only the original stall escalation, not re-fired
+
+    # charlie unescalate is still the sanctioned re-arm: it clears
+    # escalation_reason and the attempts counter on both records so a
+    # still-conflicting PR gets a genuinely fresh budget afterward.
+    unescalate_result = app.unescalate(issue_number=123)
+    assert unescalate_result.ok is True
+
+    state = load_state(app.paths.state_file)
+    assert "escalation_reason" not in state["prs"]["456"]
+    assert "escalation_reason" not in state["issues"]["123"]
+    assert "conflict_rework_attempts" not in state["prs"]["456"]
+
+    _set_decision(app, 456, "request_changes")
+    result4 = app.review(456)
+    assert result4.ok is True
+    assert result4.data["routed_to_rework"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+
 def test_janitor_no_op_rework_stalled_escalates(tmp_path: Path) -> None:
     """The no-op-rework early return has no settled-head concept at all --
     head-unchanged IS the detection signal -- so before this fix it could
