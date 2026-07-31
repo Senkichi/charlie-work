@@ -15507,6 +15507,224 @@ def test_merge_ready_mergequeue_label_add_failure_alarm_fires_at_threshold(
     assert "mergequeue" in (second.data["merge_attempt_warning"] or "")
 
 
+def test_merge_ready_mergequeue_silent_revert_increments_counter_across_passes(
+    tmp_path: Path,
+) -> None:
+    """Issue #823: Aviator can accept the mergequeue label POST and then
+    asynchronously strip it 2-3 seconds later (draft PR, failing required
+    check, base mismatch, paused queue, ...). add_pr_label's boolean return
+    only proves the POST succeeded, so a silent revert must be detected
+    cross-pass (existing_pr_state's prior status vs. this pass's live
+    labels) and must INCREMENT consecutive_failed_merge_attempts, never
+    reset it. A single-pass test would still pass throughout the entire live
+    incident this issue documents (PRs #690/#700, 2026-07-31) and is
+    explicitly insufficient per the issue's acceptance criteria -- this
+    drives three consecutive passes and asserts the counter actually climbs
+    (0, 1, 2), which also empirically exercises the ordering hazard between
+    the handoff-success zeroing write and the failed-attempt-alarm
+    increment: without guarding the zeroing on mergequeue_label_reverted,
+    every reverted pass would read a false 0 baseline and the sequence would
+    be 0, 1, 1 instead."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    # Pass 1: fresh handoff, succeeds. Counter starts/stays at 0.
+    first = app.merge_ready(456, merge=True)
+    assert first.data["mergequeue_label_applied"] is True
+    assert first.data["consecutive_failed_merge_attempts"] == 0
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
+
+    # FakeGitHub.add_pr_label only logs the call -- it never mutates
+    # fake_gh.prs[0]["labels"] -- so the live PR the next pass observes
+    # already shows the label absent, exactly like a real Aviator revert.
+    #
+    # Pass 2: existing_pr_state.status == "mergequeue" from pass 1, live
+    # label absent -> reverted. The re-add attempt succeeds again this pass
+    # (mergequeue_label_applied True), but the counter must climb to 1, not
+    # reset to 0.
+    second = app.merge_ready(456, merge=True)
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 1
+    assert second.data["merge_attempt_alarm"] is False
+
+    # Pass 3: reverted again -> counter keeps climbing, not stuck at 1.
+    third = app.merge_ready(456, merge=True)
+    assert third.data["mergequeue_label_applied"] is True
+    assert third.data["consecutive_failed_merge_attempts"] == 2
+    assert third.data["merge_attempt_alarm"] is False
+
+
+def test_merge_ready_mergequeue_silent_revert_escalation_reachable(tmp_path: Path) -> None:
+    """Issue #823 acceptance criterion 3: after the configured number of
+    consecutive reverted mergequeue handoffs, the PR must escalate exactly
+    as an outright add_pr_label failure already does -- the same shared
+    consecutive_failed_merge_attempts counter crossing the same
+    failed_attempt_alarm threshold, no new parallel alarm mechanism."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            mergequeue_label="mergequeue",
+            failed_attempt_alarm=2,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    first = app.merge_ready(456, merge=True)
+    assert first.data["merge_attempt_alarm"] is False
+    assert first.data["consecutive_failed_merge_attempts"] == 0
+
+    second = app.merge_ready(456, merge=True)
+    assert second.data["merge_attempt_alarm"] is False
+    assert second.data["consecutive_failed_merge_attempts"] == 1
+
+    third = app.merge_ready(456, merge=True)
+    assert third.data["merge_attempt_alarm"] is True
+    assert third.data["consecutive_failed_merge_attempts"] == 2
+
+
+def test_merge_ready_mergequeue_label_present_next_pass_not_treated_as_reverted(
+    tmp_path: Path,
+) -> None:
+    """Regression guard: a PR whose mergequeue label IS still present on the
+    live PR the next pass is the normal healthy path and must not be
+    misdetected as a silent revert -- the counter must stay at 0 and no
+    alarm must fire."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    first = app.merge_ready(456, merge=True)
+    assert first.data["consecutive_failed_merge_attempts"] == 0
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
+
+    # The label genuinely survived to the next pass -- simulate the live PR
+    # actually carrying it (unlike add_pr_label, which is a call log, not a
+    # label mutation on the fake).
+    fake_gh.prs[0]["labels"] = [{"name": "mergequeue"}]
+
+    second = app.merge_ready(456, merge=True)
+    assert second.data["mergequeue_label_applied"] is True
+    assert second.data["consecutive_failed_merge_attempts"] == 0
+    assert second.data["merge_attempt_alarm"] is False
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
+
+
+def test_merge_ready_mergequeue_revert_detector_ignores_non_mergequeue_prior_status(
+    tmp_path: Path,
+) -> None:
+    """Issue #823 acceptance criterion 4: existing_pr_state empty, or with a
+    status other than 'mergequeue', must never trip the revert detector --
+    only a PRIOR pass that itself recorded status == 'mergequeue' is
+    eligible. Seeds a plausible non-mergequeue prior status (freshly
+    approved, never yet handed off) to prove the detector keys off
+    status == 'mergequeue' specifically, not merely 'some prior state
+    exists'."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {
+        "status": "approved",
+        "issue_number": 123,
+        "consecutive_failed_merge_attempts": 0,
+    }
+    save_state(paths.state_file, seed)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["mergequeue_label_applied"] is True
+    assert result.data["consecutive_failed_merge_attempts"] == 0
+    assert result.data["merge_attempt_alarm"] is False
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
+
+
+def test_merge_ready_mergequeue_check_failure_still_routes_to_rework(tmp_path: Path) -> None:
+    """Issue #823 (advisor-flagged gap): a silent revert caused by a genuine
+    required-check failure must still reach check-failure-rework dispatch,
+    not be shadowed by mergequeue_label_reverted.
+
+    A prior pass's successful handoff leaves existing_pr_state.status ==
+    "mergequeue". If a required check then goes red and Aviator strips the
+    label for cause, the naive fold-in (mergequeue_label_reverted OR'd into
+    mergequeue_handoff_failed with no other condition) makes
+    mergequeue_handoff_failed True purely from the carried-over status. That
+    would shadow the check-failure-rework dispatch gate's `not
+    mergequeue_handoff_failed` term (workflow.py) and permanently block
+    rework for a PR whose check failure is exactly the fixable thing rework
+    exists for -- a strictly worse outcome than pre-#823 behavior. The revert
+    term is gated on can_merge so a real check failure (can_merge False for a
+    reason unrelated to the handoff) is still attributed and routed as a
+    check failure. Proven behaviorally: the check-failure-rework dispatch
+    (issue_status -> rework_requested, check_failure_rework_requested event)
+    only fires when mergequeue_handoff_failed is False, so its firing here is
+    direct proof the gate was not shadowed."""
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            mergequeue_label="mergequeue",
+            failed_attempt_alarm=1,
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[{"name": name, "state": "SUCCESS"} for name in required]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    # Pass 1: checks green, handoff succeeds, status becomes "mergequeue".
+    first = app.merge_ready(456, merge=True)
+    assert first.data["mergequeue_label_applied"] is True
+    assert load_state(paths.state_file)["prs"]["456"]["status"] == "mergequeue"
+
+    # Pass 2: a required check genuinely fails. FakeGitHub.add_pr_label never
+    # mutates fake_gh.prs[0]["labels"], so the live PR this pass already
+    # shows the mergequeue label absent -- indistinguishable, from the
+    # detector's point of view, from Aviator stripping it for cause. can_merge
+    # is False this pass because of the real check failure, not a handoff
+    # problem.
+    fake_gh.checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "state": "SUCCESS"},
+        {"name": "Pre-commit", "state": "SUCCESS"},
+    ]
+    second = app.merge_ready(456, merge=True)
+
+    assert second.data["can_merge"] is False
+    assert second.data["checks"]["failed"] == ("Tests passed",)
+    assert second.data["merge_attempt_alarm"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    check_failure_events = [
+        e for e in state["events"] if e["kind"] == "check_failure_rework_requested"
+    ]
+    assert len(check_failure_events) == 1
+    assert check_failure_events[0]["payload"]["pr_number"] == 456
+    assert check_failure_events[0]["payload"]["issue_number"] == 123
+    assert check_failure_events[0]["payload"]["failed_checks"] == ["Tests passed"]
+
+
 def test_linked_issue_number_rejects_bare_hash_in_attacker_title() -> None:
     # A bare #N substring in an attacker-controlled title must NOT bind the PR
     # to issue N (label/merge hijack). Only a closing keyword counts.
