@@ -1270,7 +1270,7 @@ def test_sanitize_env_drops_virtual_env_when_no_worktree_venv(
 def test_sanitize_env_sets_worktree_venv_when_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When worktree has .venv, VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT must be pinned to it."""
+    """When worktree has a real .venv, VIRTUAL_ENV must be set and UV_PROJECT_ENVIRONMENT dropped."""
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
     worktree_venv = worktree_path / ".venv"
@@ -1285,8 +1285,8 @@ def test_sanitize_env_sets_worktree_venv_when_present(
     assert env.get("VIRTUAL_ENV") == str(worktree_venv), (
         "VIRTUAL_ENV must be set to worktree .venv"
     )
-    assert env.get("UV_PROJECT_ENVIRONMENT") == str(worktree_venv), (
-        "UV_PROJECT_ENVIRONMENT must be pinned to worktree .venv (issue #649)"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT must be dropped; uv's default is the same .venv path (issue #649)"
     )
 
 

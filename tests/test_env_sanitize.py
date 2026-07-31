@@ -1,12 +1,14 @@
-"""Tests for env_sanitize's issue #646 dispatch-parallelism cap.
+"""Tests for env_sanitize's issue #646 dispatch-parallelism cap and issue #649
+shared-venv confinement.
 
 Covers the box-wide-saturation fix in isolation: sanitize_env()'s safe
-defaults for PYTEST_XDIST_AUTO_NUM_WORKERS/UV_NO_SYNC, and the
-resolve_pytest_cap()/resolve_uv_no_sync() precedence helpers used by the
-adapter launch sites for diagnostic logging. Adapter-level integration
-coverage (does launch_claude_worker/launch_devin_session actually persist the
-resolved values onto the sidecar) lives in test_claude_code_adapter.py /
-test_devin_shell.py alongside their existing sanitize_env merge-order tests.
+defaults for PYTEST_XDIST_AUTO_NUM_WORKERS/UV_NO_SYNC, the
+resolve_pytest_cap()/resolve_uv_no_sync() precedence helpers, and the handling
+of .venv reparse points (junctions/symlinks) so a worker cannot rewrite a
+shared venv. Adapter-level integration coverage (does
+launch_claude_worker/launch_devin_session actually persist the resolved values
+onto the sidecar) lives in test_claude_code_adapter.py / test_devin_shell.py
+alongside their existing sanitize_env merge-order tests.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from charlie_work.env_sanitize import (
     resolve_uv_no_sync,
     sanitize_env,
 )
+from charlie_work.worktree import _create_junction_or_symlink, is_junction
 
 # ---------------------------------------------------------------------------
 # sanitize_env: safe-default injection
@@ -58,11 +61,10 @@ def test_sanitize_env_respects_ambient_pytest_cap(
 def test_sanitize_env_sets_uv_no_sync_when_venv_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A worktree with its own .venv must get UV_NO_SYNC=1 by default.
+    """A worktree with its own real .venv must get UV_NO_SYNC=1 by default.
 
-    Guards the shared/junctioned-venv wipe risk: an uncapped `uv run`/`uv
-    sync` inside a worker must not be free to reinstall a venv that sibling
-    worktrees may be concurrently running out of.
+    UV_NO_SYNC is only ever paired with a confirmed, real local .venv — never
+    with a reparse point that points into a shared venv.
     """
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
@@ -247,32 +249,49 @@ def test_resolve_uv_no_sync_config_can_force_it_without_a_venv(
     assert (value, source) == ("1", "config")
 
 
-# ---------------------------------------------------------------------------
-# Issue #649: UV_PROJECT_ENVIRONMENT pin confines uv to the worktree's own venv
-# ---------------------------------------------------------------------------
-
-
-def test_sanitize_env_pins_uv_project_environment_when_venv_present(
+def test_resolve_uv_no_sync_reparse_point_reports_no_venv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A worktree with its own .venv must get UV_PROJECT_ENVIRONMENT pinned to it.
+    """A .venv that is a reparse point must not be reported as an owned venv."""
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    (worktree_path / ".git").write_text("gitdir: /fake/path", encoding="utf-8")
 
-    UV_NO_SYNC only gates `uv run`'s implicit sync — an explicit `uv sync` still
-    resolves and rewrites the project environment. VIRTUAL_ENV alone does not
-    bind uv (uv ignores it during project operations by default). Pinning
-    UV_PROJECT_ENVIRONMENT to the worktree's own .venv confines an explicit
-    `uv sync` to THIS venv by construction, so a junctioned shared venv cannot
-    be rewritten out from under sibling workers.
-    """
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    _create_junction_or_symlink(worktree_path / ".venv", shared_venv)
+    assert is_junction(worktree_path / ".venv")
+
+    monkeypatch.delenv(UV_NO_SYNC_VAR, raising=False)
+    sanitized = sanitize_env(worktree_path)
+    value, source = resolve_uv_no_sync(worktree_path, sanitized, None)
+
+    assert (value, source) == (None, "no-venv")
+
+
+# ---------------------------------------------------------------------------
+# Issue #649: a .venv reparse point must not masquerade as an owned local venv
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_env_sets_virtual_env_and_uv_no_sync_for_owned_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worktree with a real local .venv must get VIRTUAL_ENV and UV_NO_SYNC=1."""
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
     worktree_venv = worktree_path / ".venv"
     worktree_venv.mkdir()
     monkeypatch.delenv("UV_PROJECT_ENVIRONMENT", raising=False)
+    monkeypatch.delenv(UV_NO_SYNC_VAR, raising=False)
 
     env = sanitize_env(worktree_path)
 
-    assert env["UV_PROJECT_ENVIRONMENT"] == str(worktree_venv)
+    assert env.get("VIRTUAL_ENV") == str(worktree_venv)
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT is uv's default .venv path; setting it is a no-op"
+    )
+    assert env[UV_NO_SYNC_VAR] == "1"
 
 
 def test_sanitize_env_omits_uv_project_environment_when_no_venv(
@@ -300,14 +319,15 @@ def test_sanitize_env_orchestrator_uv_project_environment_never_survives_unchang
     worker unchanged — pins issue #117's leak guarantee, which this change must
     not erode.
 
-    When the worktree has a .venv, the orchestrator's value is popped and then
-    re-set to the worktree's own venv, so the leaked value is replaced rather
-    than passed through. When it has no .venv, the value is simply absent.
+    When the worktree has a real .venv, the orchestrator's value is popped and
+    not re-set. uv's default project environment is .venv in the project root,
+    which is the worktree's own venv, so the leaked value is replaced by
+    absence rather than passed through. When it has no .venv, the value is
+    simply absent.
     """
     orchestrator_venv = "/orchestrator/.venv"
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", orchestrator_venv)
 
-    # With a worktree .venv: the orchestrator's value is replaced by the pin.
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()
     worktree_venv = worktree_path / ".venv"
@@ -315,14 +335,11 @@ def test_sanitize_env_orchestrator_uv_project_environment_never_survives_unchang
 
     env = sanitize_env(worktree_path)
 
-    assert env.get("UV_PROJECT_ENVIRONMENT") == str(worktree_venv), (
-        "UV_PROJECT_ENVIRONMENT must be pinned to the worktree venv, not the "
-        "orchestrator's leaked value"
+    assert "UV_PROJECT_ENVIRONMENT" not in env, (
+        "UV_PROJECT_ENVIRONMENT must be dropped, not pinned to the worktree venv"
     )
-    assert env["UV_PROJECT_ENVIRONMENT"] != orchestrator_venv, (
-        "the orchestrator's ambient UV_PROJECT_ENVIRONMENT must not survive "
-        "into the returned env unchanged"
-    )
+    assert env.get("VIRTUAL_ENV") == str(worktree_venv)
+    assert env.get("VIRTUAL_ENV") != orchestrator_venv
 
 
 def test_sanitize_env_orchestrator_uv_project_environment_never_survives_unchanged_without_venv(
@@ -338,4 +355,76 @@ def test_sanitize_env_orchestrator_uv_project_environment_never_survives_unchang
 
     env = sanitize_env(worktree_path)
 
+    assert "UV_PROJECT_ENVIRONMENT" not in env
+
+
+def test_sanitize_env_unlinks_junctioned_shared_venv_in_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .venv reparse point in a worktree must be unlinked, not pinned.
+
+    Setting UV_PROJECT_ENVIRONMENT to the .venv path is a no-op over uv's
+    default project-environment lookup, and a junctioned .venv still resolves
+    to the shared target. sanitize_env must detect the reparse point and remove
+    it so uv is forced to create a real local .venv instead.
+    """
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    (worktree_path / ".git").write_text("gitdir: /fake/path", encoding="utf-8")
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    marker = shared_venv / "site-packages-marker.txt"
+    marker.write_text("shared\n", encoding="utf-8")
+
+    _create_junction_or_symlink(worktree_path / ".venv", shared_venv)
+    assert is_junction(worktree_path / ".venv")
+
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+    monkeypatch.delenv(UV_NO_SYNC_VAR, raising=False)
+
+    env = sanitize_env(worktree_path)
+
+    # The reparse point is gone; the shared venv is untouched.
+    assert not is_junction(worktree_path / ".venv")
+    assert not (worktree_path / ".venv").exists()
+    assert marker.read_text(encoding="utf-8") == "shared\n"
+
+    # No venv hints are passed to the worker.
+    assert "VIRTUAL_ENV" not in env
+    assert "UV_PROJECT_ENVIRONMENT" not in env
+    assert UV_NO_SYNC_VAR not in env
+
+
+def test_sanitize_env_does_not_unlink_repo_root_venv_junction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sanitize_env must not unlink a .venv reparse point at the repo root.
+
+    Repo roots have a .git directory, not a .git file. The sanitizer should
+    leave the venv alone there and simply not set any venv variables.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    marker = shared_venv / "site-packages-marker.txt"
+    marker.write_text("shared\n", encoding="utf-8")
+
+    _create_junction_or_symlink(repo_root / ".venv", shared_venv)
+    assert is_junction(repo_root / ".venv")
+
+    monkeypatch.setenv("VIRTUAL_ENV", "/orchestrator/.venv")
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", "/orchestrator/.venv")
+
+    env = sanitize_env(repo_root)
+
+    # Junction at repo root is not touched.
+    assert is_junction(repo_root / ".venv")
+    assert marker.read_text(encoding="utf-8") == "shared\n"
+
+    assert "VIRTUAL_ENV" not in env
     assert "UV_PROJECT_ENVIRONMENT" not in env
