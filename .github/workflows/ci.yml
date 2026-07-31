@@ -76,6 +76,12 @@ jobs:
           $pair = "x-access-token:$env:CI_RUNNERS_PAT"
           $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
           $auth = "AUTHORIZATION: basic $b64"
+          # Actions masks the *literal* secret string; the base64 of it is a
+          # different string and is NOT masked automatically. Basic-auth base64
+          # is encoding, not encryption -- anything that echoed $b64 or $auth
+          # would print a trivially reversible credential in the clear. Register
+          # it so the masker covers this form too.
+          Write-Host "::add-mask::$b64"
           if (Test-Path (Join-Path $dest '.git')) {
             git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
             if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
@@ -220,6 +226,12 @@ jobs:
           $pair = "x-access-token:$env:CI_RUNNERS_PAT"
           $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
           $auth = "AUTHORIZATION: basic $b64"
+          # Actions masks the *literal* secret string; the base64 of it is a
+          # different string and is NOT masked automatically. Basic-auth base64
+          # is encoding, not encryption -- anything that echoed $b64 or $auth
+          # would print a trivially reversible credential in the clear. Register
+          # it so the masker covers this form too.
+          Write-Host "::add-mask::$b64"
           if (Test-Path (Join-Path $dest '.git')) {
             git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
             if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
