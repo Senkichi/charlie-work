@@ -26,11 +26,13 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Sequence
 
 from . import fleet_registry, layout, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
+from .instrumentation import log_event
 from .safe_path import contains
+from .state import state_lock
 from .subprocess_runner import RunResult, run_captured
 from .worker import iter_workers
 
@@ -441,6 +443,24 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
     )
 
 
+def _command_failure_message(command: Sequence[str], result: RunResult, fallback: str) -> str:
+    """Build a diagnostic failure message that prefers the specific stderr.
+
+    ``run_captured`` (the real production runner) always populates
+    ``RunResult.error`` on any non-zero exit with a generic
+    ``"command exited {code}"``. Under the old ``result.error or result.stderr``
+    fallback chain that generic string was always truthy and permanently
+    shadowed ``.stderr`` in production, even when stderr carried the actual
+    diagnostic -- e.g. ``git pull --ff-only`` names the exact colliding paths
+    on a dirty-tree collision, and that name was unreachable (issue #817 item
+    3). Prefer ``.stderr``; fall back to ``.error``, then to ``fallback``, only
+    when stderr is empty. The failing argv is always included so the message
+    is actionable without cross-referencing a log.
+    """
+    detail = (result.stderr or "").strip() or (result.error or "").strip() or fallback
+    return f"{' '.join(command)}: {detail}"
+
+
 def _self_deploy_preview(
     repo_root: Path,
     marker_path: Path,
@@ -456,7 +476,8 @@ def _self_deploy_preview(
     that staleness is the deliberate price of not mutating the ref store.  A
     preview that fetched would be more accurate and less honest.
     """
-    head_res = run_command(["git", "rev-parse", "HEAD"], cwd=repo_root, timeout_seconds=timeout)
+    head_cmd = ["git", "rev-parse", "HEAD"]
+    head_res = run_command(head_cmd, cwd=repo_root, timeout_seconds=timeout)
     if not head_res.ok:
         # previewed=True on the failure paths too: the flag means "this result came
         # from the preview", not "the preview succeeded". Leaving it False here let a
@@ -467,14 +488,13 @@ def _self_deploy_preview(
             pulled=False,
             changed=False,
             synced=False,
-            error=head_res.error or head_res.stderr or "failed to read HEAD",
+            error=_command_failure_message(head_cmd, head_res, "failed to read HEAD"),
             previewed=True,
         )
     head_sha = head_res.stdout.strip()
 
-    target_res = run_command(
-        ["git", "rev-parse", "origin/main"], cwd=repo_root, timeout_seconds=timeout
-    )
+    target_cmd = ["git", "rev-parse", "origin/main"]
+    target_res = run_command(target_cmd, cwd=repo_root, timeout_seconds=timeout)
     if not target_res.ok:
         return SelfDeployResult(
             ok=False,
@@ -482,7 +502,7 @@ def _self_deploy_preview(
             changed=False,
             synced=False,
             from_sha=head_sha,
-            error=target_res.error or target_res.stderr or "failed to read origin/main",
+            error=_command_failure_message(target_cmd, target_res, "failed to read origin/main"),
             previewed=True,
         )
     target_sha = target_res.stdout.strip()
@@ -519,6 +539,132 @@ def _self_deploy_preview(
     )
 
 
+#: Default consecutive-failure count at which ``self_deploy`` fires a
+#: ``self_deploy_alarm`` events.db entry (issue #817 item 5). Mirrors
+#: ``config.AutoMergeConfig.failed_attempt_alarm``'s default and its "0
+#: disables the alarm" convention.
+DEFAULT_SELF_DEPLOY_FAILURE_ALARM = 3
+
+
+def _self_deploy_state_path(repo_root: Path) -> Path:
+    """Return the ``state.json`` path used to derive ``events.db`` for self-deploy.
+
+    ``self_deploy`` operates on the orchestrator's own checkout (``repo_root``
+    is ``orchestrator_root()`` at every real call site), not a per-repo fleet
+    target, so it logs against the *default* state root exactly the way
+    :func:`_pending_sync_marker_path` already does -- see that function's note
+    on deliberately ignoring a configured ``runtime.state_dir`` override.
+    """
+    return layout.state_file_path(layout.default_state_root(repo_root))
+
+
+def _self_deploy_failure_counter_path(repo_root: Path) -> Path:
+    """Return the consecutive-failure counter sidecar path for ``repo_root``."""
+    return layout.self_deploy_failure_state_path(layout.default_state_root(repo_root))
+
+
+def _self_deploy_event_kind(result: SelfDeployResult) -> str:
+    """Classify a :class:`SelfDeployResult` into an events.db event kind (item 4).
+
+    Three outcomes, matching the issue's explicit wording ("success ... skip,
+    and failure"): any ``not ok`` result is a failure; an ``ok`` result that
+    neither moved HEAD nor repaired the venv did nothing this pass (a skip);
+    everything else -- a code-only update, a full update-and-sync, a deferred
+    sync, or a venv repair -- actually changed something (a success).
+    """
+    if not result.ok:
+        return "self_deploy_failed"
+    if result.changed or result.venv_repaired:
+        return "self_deploy_succeeded"
+    return "self_deploy_skipped"
+
+
+def _log_self_deploy_outcome(repo_root: Path, result: SelfDeployResult) -> None:
+    """Record every real (non-preview) self_deploy outcome to events.db (item 4).
+
+    Best-effort via :func:`log_event`: a logging failure never fails the
+    deploy itself. Previews are deliberately excluded by the caller
+    (:func:`self_deploy`) -- a ``--dry-run`` touches nothing, so logging it as
+    a real outcome would misrepresent the deploy history.
+    """
+    log_event(
+        _self_deploy_state_path(repo_root),
+        _self_deploy_event_kind(result),
+        {
+            "ok": result.ok,
+            "from_sha": result.from_sha,
+            "to_sha": result.to_sha,
+            "changed": result.changed,
+            "synced": result.synced,
+            "venv_repaired": result.venv_repaired,
+            "message": result.message,
+            "error": result.error,
+        },
+    )
+
+
+def _read_failure_streak(path: Path) -> int:
+    """Read the persisted consecutive-failure count, defaulting to 0 on any error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    count = data.get("consecutive_failures", 0)
+    return count if isinstance(count, int) else 0
+
+
+def _write_failure_streak(path: Path, count: int) -> None:
+    """Persist the consecutive-failure count atomically (temp-file + replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"consecutive_failures": count}, indent=2) + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _record_self_deploy_failure_streak(
+    repo_root: Path, result: SelfDeployResult, *, threshold: int
+) -> None:
+    """Track consecutive self_deploy failures and escalate at ``threshold`` (item 5).
+
+    Mirrors ``workflow._merge_deferred_stale_base_result``'s alarm pattern: a
+    persisted counter increments on every failure and resets to 0 on success,
+    and a distinct ``self_deploy_alarm`` event fires exactly once -- the pass
+    the counter *reaches* ``threshold``, not on every subsequent pass past it
+    -- so a long-running outage produces one escalation, not one per pass
+    (the digest's own dedup already handles "don't repeat every pass" for the
+    plain ERROR entry; this is a second, coarser signal for "this has now
+    gone on long enough to be a distinct incident"). ``threshold <= 0``
+    disables the alarm entirely, matching ``failed_attempt_alarm``'s "0
+    disables" convention.
+    """
+    counter_path = _self_deploy_failure_counter_path(repo_root)
+    # Ensure the parent directory exists before state_lock tries to create the
+    # sibling .lock file (advisory_file_lock touches it directly) — mirrors the
+    # mkdir in _filter_fleet_health_transitions. Without this, a cold state dir
+    # (no prior events.db/state.json write in this pass) raises out of
+    # self_deploy(), which violates its documented never-raises contract.
+    counter_path.parent.mkdir(parents=True, exist_ok=True)
+    with state_lock(counter_path):
+        count = _read_failure_streak(counter_path)
+        if result.ok:
+            if count:
+                _write_failure_streak(counter_path, 0)
+            return
+        count += 1
+        _write_failure_streak(counter_path, count)
+        if threshold > 0 and count == threshold:
+            log_event(
+                _self_deploy_state_path(repo_root),
+                "self_deploy_alarm",
+                {
+                    "consecutive_failures": count,
+                    "threshold": threshold,
+                    "error": result.error,
+                },
+            )
+
+
 def self_deploy(
     repo_root: Path,
     *,
@@ -527,6 +673,7 @@ def self_deploy(
     pull_timeout: int = 60,
     sync_timeout: int = 300,
     dry_run: bool = False,
+    failure_alarm_threshold: int = DEFAULT_SELF_DEPLOY_FAILURE_ALARM,
 ) -> SelfDeployResult:
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
@@ -552,23 +699,55 @@ def self_deploy(
     must pass it: this function moves the deployed checkout's HEAD, and a HEAD
     move terminates a running ``fleet supervise`` by design (drift exit), so an
     ungated preview can end the fleet rather than describe it (issue #613).
+
+    Every *real* (non-preview) call is recorded to ``events.db`` and rolled
+    into a persisted consecutive-failure counter that escalates via a
+    ``self_deploy_alarm`` event at ``failure_alarm_threshold`` (issue #817
+    items 4-5). A preview is excluded from both: it is read-only by
+    construction and reports nothing that actually happened.
     """
     marker_path = _pending_sync_marker_path(repo_root)
     if dry_run:
         return _self_deploy_preview(
             repo_root, marker_path, run_command=run_command, timeout=pull_timeout
         )
+    result = _self_deploy_attempt(
+        repo_root,
+        marker_path,
+        fleet_dir_override=fleet_dir_override,
+        run_command=run_command,
+        pull_timeout=pull_timeout,
+        sync_timeout=sync_timeout,
+    )
+    _log_self_deploy_outcome(repo_root, result)
+    _record_self_deploy_failure_streak(repo_root, result, threshold=failure_alarm_threshold)
+    return result
+
+
+def _self_deploy_attempt(
+    repo_root: Path,
+    marker_path: Path,
+    *,
+    fleet_dir_override: str | None,
+    run_command: Callable[..., RunResult],
+    pull_timeout: int,
+    sync_timeout: int,
+) -> SelfDeployResult:
+    """Perform the real (non-preview) pull/diff/sync attempt.
+
+    Split out from :func:`self_deploy` so the public entry point can wrap
+    every return path once with events.db instrumentation and failure-streak
+    tracking (issue #817 items 4-5), instead of duplicating that wrapping at
+    each of this function's several return statements.
+    """
     try:
         venv_check = _check_venv(repo_root)
         if not venv_check.ok:
             return venv_check
         venv_repaired = venv_check.venv_repaired
 
-        before_res = run_command(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            timeout_seconds=pull_timeout,
-        )
+        before_cmd = ["git", "rev-parse", "HEAD"]
+        before_res = run_command(before_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
         if not before_res.ok:
             return SelfDeployResult(
                 ok=False,
@@ -576,15 +755,12 @@ def self_deploy(
                 changed=False,
                 synced=False,
                 venv_repaired=venv_repaired,
-                error=before_res.error or before_res.stderr or "failed to read HEAD",
+                error=_command_failure_message(before_cmd, before_res, "failed to read HEAD"),
             )
         before_sha = before_res.stdout.strip()
 
-        pull_res = run_command(
-            ["git", "pull", "--ff-only", "origin", "main"],
-            cwd=repo_root,
-            timeout_seconds=pull_timeout,
-        )
+        pull_cmd = ["git", "pull", "--ff-only", "origin", "main"]
+        pull_res = run_command(pull_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
         if not pull_res.ok:
             return SelfDeployResult(
                 ok=False,
@@ -593,14 +769,11 @@ def self_deploy(
                 synced=False,
                 from_sha=before_sha,
                 venv_repaired=venv_repaired,
-                error=pull_res.error or pull_res.stderr or "pull failed",
+                error=_command_failure_message(pull_cmd, pull_res, "pull failed"),
             )
 
-        after_res = run_command(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            timeout_seconds=pull_timeout,
-        )
+        after_cmd = ["git", "rev-parse", "HEAD"]
+        after_res = run_command(after_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
         if not after_res.ok:
             return SelfDeployResult(
                 ok=False,
@@ -609,7 +782,9 @@ def self_deploy(
                 synced=False,
                 from_sha=before_sha,
                 venv_repaired=venv_repaired,
-                error=after_res.error or after_res.stderr or "failed to read HEAD after pull",
+                error=_command_failure_message(
+                    after_cmd, after_res, "failed to read HEAD after pull"
+                ),
             )
         after_sha = after_res.stdout.strip()
 
@@ -633,11 +808,8 @@ def self_deploy(
 
         changed_files: set[str] = set()
         if head_changed:
-            diff_res = run_command(
-                ["git", "diff", "--name-only", f"{before_sha}..{after_sha}"],
-                cwd=repo_root,
-                timeout_seconds=pull_timeout,
-            )
+            diff_cmd = ["git", "diff", "--name-only", f"{before_sha}..{after_sha}"]
+            diff_res = run_command(diff_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
             if not diff_res.ok:
                 return SelfDeployResult(
                     ok=False,
@@ -647,7 +819,7 @@ def self_deploy(
                     from_sha=before_sha,
                     to_sha=after_sha,
                     venv_repaired=venv_repaired,
-                    error=diff_res.error or diff_res.stderr or "diff failed",
+                    error=_command_failure_message(diff_cmd, diff_res, "diff failed"),
                 )
             changed_files = {line.strip() for line in diff_res.stdout.splitlines() if line.strip()}
 
@@ -691,11 +863,8 @@ def self_deploy(
         # Persist marker before attempting sync so a crash between the pull and
         # the successful sync is retried on the next pass.
         _write_marker(marker_path, from_sha, to_sha)
-        sync_res = run_command(
-            ["uv", "sync"],
-            cwd=repo_root,
-            timeout_seconds=sync_timeout,
-        )
+        sync_cmd = ["uv", "sync"]
+        sync_res = run_command(sync_cmd, cwd=repo_root, timeout_seconds=sync_timeout)
         if not sync_res.ok:
             return SelfDeployResult(
                 ok=False,
@@ -705,7 +874,7 @@ def self_deploy(
                 from_sha=from_sha,
                 to_sha=to_sha,
                 venv_repaired=venv_repaired,
-                error=sync_res.error or sync_res.stderr or "uv sync failed",
+                error=_command_failure_message(sync_cmd, sync_res, "uv sync failed"),
             )
 
         _clear_marker(marker_path)

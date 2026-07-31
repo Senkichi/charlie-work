@@ -143,6 +143,15 @@ _ERROR_KINDS = frozenset(
         # reachable through query_events(level="error") without any new
         # query infrastructure.
         "fleet_pass_config_error",
+        # Issue #817 items 4-5: self_deploy failed this pass (venv repair,
+        # pull, HEAD read, diff, or uv sync), or a consecutive-failure streak
+        # just crossed the escalation threshold. Both are reachable via
+        # query_events(level="error") for the same reason as
+        # fleet_pass_config_error above -- deploy status was previously the
+        # least observable thing in the system (121 consecutive failures,
+        # zero events.db rows).
+        "self_deploy_failed",
+        "self_deploy_alarm",
     }
 )
 _WARNING_KINDS = frozenset(
