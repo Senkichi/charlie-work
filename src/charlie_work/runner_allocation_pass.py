@@ -44,6 +44,7 @@ from .runner_slots import (
     discover_runner_instances,
     fetch_busy_runner_names,
     load_idle_streaks,
+    load_tie_break_offset,
     measure_repo_demand,
     AllocationSource,
     save_allocation_skip,
@@ -232,6 +233,7 @@ def run_allocation_pass(
     observed = annotate_busy(instances, busy_by_repo)
     state_dir = fleet_dir(override=fleet_dir_override)
     previous_streaks = load_idle_streaks(state_dir)
+    tie_break_offset = load_tie_break_offset(state_dir)
 
     plan = plan_allocation(
         observed,
@@ -241,6 +243,7 @@ def run_allocation_pass(
         min_per_repo=inputs.min_per_repo,
         idle_streaks=previous_streaks,
         demand_idle_samples=inputs.demand_idle_samples,
+        tie_break_offset=tie_break_offset,
     )
 
     results = apply_allocation(plan, dry_run=dry_run)
@@ -251,6 +254,8 @@ def run_allocation_pass(
             next_idle_streaks(observed, demands, previous_streaks),
             source=source,
             full_pass_interval_seconds=full_pass_interval_seconds,
+            # Advance the rotation so a different repo wins the next name tie.
+            tie_break_offset=tie_break_offset + 1,
         )
 
     if state_path is not None:

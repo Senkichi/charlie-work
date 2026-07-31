@@ -323,6 +323,23 @@ def load_idle_streaks(fleet_dir: Path) -> dict[str, int]:
     return streaks
 
 
+def load_tie_break_offset(fleet_dir: Path) -> int:
+    """Read the persisted floor-shortfall tie-break rotation offset.
+
+    Degrades to 0 (no rotation) on any problem — a missing or corrupt file
+    simply means the first pass uses the base name order.
+    """
+    path = fleet_dir / ALLOCATION_STATE_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    offset = data.get("tie_break_offset")
+    return offset if isinstance(offset, int) else 0
+
+
 @dataclass(frozen=True)
 class AllocationStamp:
     """Provenance of the last persisted allocation pass.
@@ -400,6 +417,7 @@ def _write_allocation_state(
     source: AllocationSource,
     full_pass_interval_seconds: int,
     skip_reason: str | None,
+    tie_break_offset: int,
 ) -> None:
     """Atomic write of the allocation state file with full provenance.
 
@@ -409,6 +427,13 @@ def _write_allocation_state(
     which is exactly the guess-the-probe-was-built-to-eliminate failure. They
     are injected here, after the payload is built, so a caller cannot forget to
     thread them and leave the file asserting something nobody declared.
+
+    ``tie_break_offset`` persists the floor-shortfall tie-break rotation so the
+    same repo is not permanently starved when the budget cannot cover every
+    repo's floor (issue #601). Both callers below thread it explicitly —
+    ``save_idle_streaks`` from the caller's resolved rotation,
+    ``save_allocation_skip`` by reading back the prior persisted value — so a
+    skip never silently resets the rotation to 0.
     """
     # Issue #624: a virtualized fleet dir forks a private copy on this write,
     # so "I deployed runner_allocation" would be reported while the file the
@@ -423,6 +448,7 @@ def _write_allocation_state(
         "source": source,
         "full_pass_interval_seconds": full_pass_interval_seconds,
         "skip_reason": skip_reason,
+        "tie_break_offset": tie_break_offset,
         "repos": dict(repos_payload),
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -436,6 +462,7 @@ def save_idle_streaks(
     *,
     source: AllocationSource,
     full_pass_interval_seconds: int,
+    tie_break_offset: int = 0,
 ) -> None:
     """Persist slack streaks using the project's atomic temp-file + replace.
 
@@ -444,6 +471,11 @@ def save_idle_streaks(
     drove at, because a caller that silently inherited either default would
     make the state file assert that the daemon ran (and at a cadence) when it
     did not.
+
+    ``tie_break_offset`` persists the floor-shortfall tie-break rotation so the
+    same repo is not permanently starved when the budget cannot cover every
+    repo's floor (issue #601). Defaults to 0 for callers that predate the
+    rotation feature.
     """
     _write_allocation_state(
         fleet_dir,
@@ -451,6 +483,7 @@ def save_idle_streaks(
         source=source,
         full_pass_interval_seconds=full_pass_interval_seconds,
         skip_reason=None,
+        tie_break_offset=tie_break_offset,
     )
 
 
@@ -492,10 +525,12 @@ def save_allocation_skip(
     allocation" — both leave a stale file otherwise, and the probe used to
     attribute every one of them to issue #590 (issue #606).
 
-    The idle-streak map is preserved from the prior file (see
-    ``_read_prior_repos``) so a transient skip does not reset demotion
-    hysteresis. ``source`` and ``full_pass_interval_seconds`` are required for
-    the same reason as in :func:`save_idle_streaks`.
+    The idle-streak map and the tie-break rotation offset are both preserved
+    from the prior file (see ``_read_prior_repos`` and
+    ``load_tie_break_offset``), so a transient skip resets neither the
+    demotion hysteresis nor the floor-shortfall rotation (issue #601).
+    ``source`` and ``full_pass_interval_seconds`` are required for the same
+    reason as in :func:`save_idle_streaks`.
     """
     _write_allocation_state(
         fleet_dir,
@@ -503,6 +538,7 @@ def save_allocation_skip(
         source=source,
         full_pass_interval_seconds=full_pass_interval_seconds,
         skip_reason=skip_reason,
+        tie_break_offset=load_tie_break_offset(fleet_dir),
     )
 
 

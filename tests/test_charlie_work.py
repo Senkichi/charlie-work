@@ -48,13 +48,17 @@ from charlie_work.config import (
 from charlie_work.cross_family import (
     _CAVEAT,
     CrossFamilyResult,
+    CrossFamilyVerdict,
+    LEGACY_VACUOUS_SUMMARY,
+    MalformedCrossFamilyVerdict,
     extract_report_body,
+    parse_cross_family_verdict,
     render_command,
     report_body_is_valid,
     run_cross_family_review,
 )
 from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
-from charlie_work.paths import runtime_paths
+from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
     append_event,
@@ -70,10 +74,14 @@ from charlie_work.workflow import (
     CommandResult,
     ConcurrencyGovernorResult,
     OrchestratorApp,
+    _annotation_to_required_change,
     _append_sweep_events,
     _detect_and_handle_stalled_reviews,
+    _is_carry_forward_eligible,
     _parse_review_verdict_from_log,
     _reap_orphaned_review_checkouts,
+    _render_required_changes_section,
+    _required_changes_from_checks,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -2528,6 +2536,46 @@ def test_pr_checks_returns_none_on_gh_command_failure(monkeypatch, tmp_path: Pat
     assert checks is None
 
 
+def test_check_run_annotations_returns_parsed_list_on_success(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(
+                [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    result = github_module.GitHub(tmp_path).check_run_annotations(999)
+
+    assert result == [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+
+
+def test_check_run_annotations_returns_empty_list_on_api_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #771: the annotations accessor must return a value (empty list),
+    never raise, when the gh api call fails -- callers building required_changes
+    from it must never crash the review() codepath on a transient GitHub error."""
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr="HTTP 404: Not Found",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    result = github_module.GitHub(tmp_path).check_run_annotations(999)
+
+    assert result == []
+
+
 def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) -> None:
     """gh pr checks exits non-zero but with JSON list (failing checks) -> list."""
 
@@ -3088,6 +3136,11 @@ class FakeGitHub:
             {"name": "Pre-commit", "state": "SUCCESS"},
         ]
 
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        # Mirrors the real GitHub.check_run_annotations default: no
+        # annotations configured means an empty list, never a raise.
+        return []
+
     def pr_diff(self, number: int):
         # Return custom diff if set, otherwise default
         if number in self.diffs:
@@ -3388,6 +3441,22 @@ class FakeGitHubWithChecks(FakeGitHub):
             }
             for check in self.checks
         ]
+
+
+class FakeGitHubWithChecksAndAnnotations(FakeGitHubWithChecks):
+    """FakeGitHubWithChecks whose check_run_annotations returns a configurable
+    per-check-run-id mapping (issue #771 tests)."""
+
+    def __init__(
+        self,
+        checks: list[dict[str, Any]] | None = None,
+        annotations_by_check_run_id: dict[int, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        super().__init__(checks=checks)
+        self.annotations_by_check_run_id = annotations_by_check_run_id or {}
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        return self.annotations_by_check_run_id.get(check_run_id, [])
 
 
 class FakeGitHubWithMissingRequired(FakeGitHubWithChecks):
@@ -4528,6 +4597,90 @@ def test_dispatch_merged_pr_mention_flag_is_one_shot(tmp_path: Path) -> None:
     assert len(flagged_events_3) == 1  # still only the single pass-1 event
 
 
+def test_dispatch_merged_pr_mention_flag_skips_dedup_marker_on_partial_failure(
+    tmp_path: Path,
+) -> None:
+    """A PARTIAL_FAILURE label transition for merged_pr_mention_flagged must
+    NOT stamp merged_pr_mention_flagged_at. Before the fix, the dedup marker
+    was written unconditionally regardless of transition()'s outcome, so a
+    failed agent:human-needed label add still left the timestamp in state --
+    and the one-shot guard exercised by
+    test_dispatch_merged_pr_mention_flag_is_one_shot keys off exactly that
+    timestamp's presence, so the issue would never be retried even though
+    its label never actually changed.
+
+    Pass 2 then clears the injected failure and re-dispatches, proving the
+    withheld marker actually causes a retry -- not just that it is absent.
+    """
+    config = OrchestratorConfig()
+    human_needed = config.labels.human_needed
+
+    class LabelFailMentionGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_add = True
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            if label == human_needed and self.fail_add:
+                # Simulate a failed add (error-as-value) -> PARTIAL_FAILURE.
+                return False
+            return super().add_issue_label(number, label)
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = LabelFailMentionGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Same mention-only setup as test_dispatch_merged_pr_mention_flag_is_one_shot:
+    # merged PR #456 only *mentions* issue #123 in free text -- no branch-prefix
+    # binding, no closing keyword -- so only the loose mention scan finds it.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+
+    # --- Pass 1: label add fails -> marker withheld, no event ---------------
+    result = app.dispatch(limit=1)
+    assert result.ok is True
+
+    # The add was attempted (proves the transition actually ran) but failed.
+    assert (123, human_needed) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    issue_entry = state["issues"].get("123", {})
+    # The dedup marker must be ABSENT: a retry must occur on the next pass
+    # instead of being permanently suppressed by a marker stamped despite
+    # the label write having failed.
+    assert issue_entry.get("merged_pr_mention_flagged_at") is None
+
+    # The one-shot event is gated on the same success condition as the
+    # marker, so it must not have fired either.
+    flagged_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert flagged_events == []
+
+    # --- Pass 2: label add now succeeds -> the withheld marker must let the
+    # mention scan retry, not permanently suppress the issue. This is the
+    # behavior the marker's absence exists to enable -- proving it, not just
+    # the marker's absence, is what distinguishes "will retry" from "silently
+    # dropped."
+    fake_gh.fail_add = False
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    assert result2.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert (123, human_needed) in fake_gh.labels_added
+
+    state2 = load_state(paths.state_file)
+    assert state2["issues"]["123"].get("merged_pr_mention_flagged_at") is not None
+    flagged_events_2 = [
+        e
+        for e in state2.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_flagged"
+    ]
+    assert len(flagged_events_2) == 1
+    assert flagged_events_2[0]["payload"]["issue_numbers"] == [123]
+
+
 def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -> None:
     """Regression for the isCrossRepository guard (workflow.py,
     _merged_pr_referenced_issue_numbers): a merged PR whose provenance is
@@ -4828,7 +4981,7 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Create a session record for issue 123 with a live PID
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -5317,7 +5470,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # Create a session record for issue 123 with a live PID
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -5524,9 +5677,15 @@ def test_merge_ready_checks_unavailable_returns_false(tmp_path: Path) -> None:
 
 
 def _review_queue_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, dry_run: bool = True
 ) -> OrchestratorApp:
-    """Build an OrchestratorApp with FakeGitHub and a default state file."""
+    """Build an OrchestratorApp with FakeGitHub and a default state file.
+
+    ``dry_run`` defaults to ``True`` (unchanged from every existing caller of
+    this helper). Issue #784 AC-8 Case 2's stranded-verdict repair is
+    intentionally gated on ``not self.dry_run`` (it mutates state and GitHub
+    labels), so tests exercising that repair pass ``dry_run=False`` explicitly.
+    """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     (paths.root).mkdir(parents=True, exist_ok=True)
@@ -5537,7 +5696,7 @@ def _review_queue_app(
     fake_gh = FakeGitHub()
     if prs is not None:
         fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
 
 
 def _write_review_packet(
@@ -5655,12 +5814,19 @@ def test_review_queue_includes_missing_pending_and_stale_decisions(
     _write_review_packet(tmp_path, 100, "sha-100")
     # PR 200: current packet, pending decision
     _write_review_packet(tmp_path, 200, "sha-200", {"decision": "pending"})
-    # PR 300: current packet, request_changes from prior head -> stale
+    # PR 300: current packet, request_changes from prior head -> stale.
+    # Real (non-placeholder) summary so this exercises the stale/carry-
+    # forward path under test, not issue #784's content-free "vacuous"
+    # detection (a distinct concern covered by its own tests).
     _write_review_packet(
         tmp_path,
         300,
         "sha-300-new",
-        {"decision": "request_changes", "reviewed_head_sha": "sha-300-old"},
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-300-old",
+            "summary": "some prior finding that needs a rework brief",
+        },
     )
     # PR 400: current packet, approved on current head -> excluded
     _write_review_packet(
@@ -5861,6 +6027,12 @@ def test_review_queue_carries_forward_request_changes_on_identical_patch_id(
             "reviewed_head_sha": old_head,
             "reviewed_patch_id": patch_id,
             "carried_forward_from": [],
+            # Real (non-placeholder) summary: this test exercises identical-
+            # patch-id carry-forward (issue #411), not issue #784's
+            # content-free "vacuous" detection -- a content-free verdict
+            # would be ineligible for carry-forward entirely, which is
+            # covered by its own dedicated tests.
+            "summary": "some prior finding that needs a rework brief",
         },
     )
 
@@ -6953,6 +7125,263 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
     assert "carry_forward_tier" not in decision
 
 
+def test_update_approval_head_records_event_for_every_tier(tmp_path: Path) -> None:
+    """Issue #638: ``_update_approval_head`` must record a carry-forward event
+    itself, so a new call site cannot forget it. The event kind is
+    tier-dependent so the three mechanisms (patch-id, line-content,
+    verified-sync) stay separately auditable, and exactly one event is
+    emitted per call."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_number = 456
+    issue_number = 123
+    decision_dir = paths.prs / f"pr-{pr_number}"
+    decision_dir.mkdir(parents=True)
+
+    def _run(tier: str, old_head: str, new_head: str) -> dict[str, Any]:
+        decision = {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": "pid-xyz",
+        }
+        (decision_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+        app._update_approval_head(
+            pr_number,
+            decision,
+            new_head,
+            old_head=old_head,
+            issue_number=issue_number,
+            tier=tier,
+        )
+        return load_state(paths.state_file)
+
+    expected_kind = {
+        "patch-id": "verdict_carried_forward_clean_rebase",
+        "line-content": "verdict_carried_forward_line_content",
+        "verified-sync": "verdict_carried_forward_verified_sync",
+    }
+
+    for tier, kind in expected_kind.items():
+        state = _run(tier, f"old-{tier}", f"new-{tier}")
+        carry_events = [e for e in state["events"] if e["kind"] == kind]
+        assert len(carry_events) == 1, f"tier {tier}: expected 1 {kind} event"
+        payload = carry_events[0]["payload"]
+        assert payload["pr_number"] == pr_number
+        assert payload["issue_number"] == issue_number
+        assert payload["old_reviewed_head_sha"] == f"old-{tier}"
+        assert payload["new_head_sha"] == f"new-{tier}"
+        assert payload["carry_forward_tier"] == tier
+        assert payload["carried_forward_from"] == [f"old-{tier}"]
+
+
+def test_review_queue_carry_forward_records_event(tmp_path: Path) -> None:
+    """Issue #638: the ``review_queue()`` carry-forward path (one of the three
+    previously-silent call sites) must record a carry-forward event, not just
+    mutate ``review-decision.json`` and ``state.json``."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    app.gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+    assert result.ok is True
+
+    state = load_state(app.paths.state_file)
+    carry_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_clean_rebase"
+    ]
+    assert len(carry_events) == 1
+    payload = carry_events[0]["payload"]
+    assert payload["pr_number"] == pr_number
+    assert payload["issue_number"] == issue_number
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["new_head_sha"] == new_head
+    assert payload["carry_forward_tier"] == "patch-id"
+
+
+def test_merge_ready_post_update_branch_records_verified_sync_event(
+    tmp_path: Path,
+) -> None:
+    """Issue #638: the post-``pr_update_branch`` + ``_verify_synced_head``
+    carry-forward inside ``merge_ready`` (a previously-silent
+    ``verified-sync`` call site) must record a
+    ``verdict_carried_forward_verified_sync`` event."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_branch_strategy="broadcast",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    pr_number = 456
+    issue_number = 123
+    old_head = "sha-abc123"
+    fake_gh.prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": old_head,
+            "mergeStateStatus": "BEHIND",
+            "mergeable": "MERGEABLE",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(pr_number, "approved", summary="lgtm")
+
+    # Advance the base tip so the PR is stale and triggers pr_update_branch.
+    post_merge_base = "main-merged-sha"
+    fake_gh.base_head_sha = post_merge_base
+    fake_gh.commits[post_merge_base] = {"parents": [{"sha": "base-sha"}, {"sha": old_head}]}
+
+    result = app.merge_ready(pr_number, merge=False)
+    assert result.ok is True
+
+    state = load_state(paths.state_file)
+    sync_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_verified_sync"
+    ]
+    assert len(sync_events) == 1
+    payload = sync_events[0]["payload"]
+    assert payload["pr_number"] == pr_number
+    assert payload["issue_number"] == issue_number
+    assert payload["old_reviewed_head_sha"] == old_head
+    assert payload["carry_forward_tier"] == "verified-sync"
+
+
+def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
+    tmp_path: Path,
+) -> None:
+    """Issue #638: the front-of-train ``_update_open_agent_prs`` carry-forward
+    (a previously-silent ``verified-sync`` call site) must record a
+    ``verdict_carried_forward_verified_sync`` event."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+        {
+            "number": 789,
+            "title": "Fix #124: another",
+            "url": "https://example.test/pull/789",
+            "headRefName": "agent/issue-124-fix-another",
+            "baseRefName": "main",
+            "headRefOid": "sha-def456",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #124\n\nTests: added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(789, "approved", summary="lgtm")
+    for idx, pr_number in enumerate((456, 789)):
+        decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = f"2026-07-12T00:00:0{idx}Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
+
+    result = app.merge_ready(456, merge=True)
+    assert result.ok is True
+    assert result.data["merged"] is True
+
+    update_results = result.data["update_open_prs_results"]
+    assert update_results is not None
+    assert len(update_results) == 1
+    assert update_results[0]["pr_number"] == 789
+    assert update_results[0]["updated"] is True
+
+    state = load_state(paths.state_file)
+    sync_events = [
+        e for e in state["events"] if e["kind"] == "verdict_carried_forward_verified_sync"
+    ]
+    assert len(sync_events) == 1
+    payload = sync_events[0]["payload"]
+    assert payload["pr_number"] == 789
+    assert payload["issue_number"] == 124
+    assert payload["carry_forward_tier"] == "verified-sync"
+
+
 def _dispatch_reviews_app(
     tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
 ) -> OrchestratorApp:
@@ -7393,7 +7822,7 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
     _write_review_packet(tmp_path, 100, "sha-100")
 
     # Seed a stale reviewer sidecar + state claim.
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     old_dispatched = old_started
@@ -7531,7 +7960,7 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
         save_state(app.paths.state_file, state)
 
     # Write a sidecar + log with a verdict so _reap_review_verdicts finds it.
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     log_path = reviews_dir / "issue-100-review.claude.log"
     log_path.write_text(
@@ -7613,7 +8042,7 @@ def test_dispatch_reviews_turn_limit_posts_summary_comment(monkeypatch, tmp_path
         }
         save_state(app.paths.state_file, state)
 
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
 
     # Write a log with NO verdict block (simulates turn-limit exhaustion).
@@ -7735,7 +8164,7 @@ def test_dispatch_reviews_turn_limit_summary_not_posted_twice(monkeypatch, tmp_p
         }
         save_state(app.paths.state_file, state)
 
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = app._layout.reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     log_path = reviews_dir / "issue-100-review.claude.log"
     log_path.write_text("Some analysis without a verdict.\n", encoding="utf-8")
@@ -9876,11 +10305,775 @@ def test_report_body_is_valid_rejects_blocked_output_with_bold_markers() -> None
     assert report_body_is_valid(blocked_with_bold) is False
 
 
+def test_report_body_is_valid_accepts_heading_style_markers() -> None:
+    """Cross-family models (e.g. kimi-k3) emit findings as ``### NIT —`` headings
+    and a ``## Verdict`` heading instead of ``**NIT**`` bold / ``Verdict:`` line.
+    These are real reviews and must not be falsely rejected as UNAVAILABLE.
+    """
+    heading_severity = (
+        "### NIT — worktree.py:2977 (new): dead weight\n\n"
+        "## Verdict\n\n**Approve** — claims verified."
+    )
+    assert report_body_is_valid(heading_severity) is True
+    # Heading verdict alone (no severity heading) is also valid.
+    assert report_body_is_valid("## Verdict\n\nApprove") is True
+    # Heading severity alone (no verdict heading) is also valid.
+    assert report_body_is_valid("### MAJOR — bug.py:10: off-by-one\n\nfix it") is True
+
+
 def test_extract_report_body_strips_wrapper_but_preserves_model_output() -> None:
     body = "**MAJOR**\nissue\n\nVerdict: safe"
     wrapped = f"# Cross-family adversarial review — `codex`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     assert extract_report_body(wrapped) == body
     assert extract_report_body(body) == body
+
+
+def test_parse_cross_family_verdict_approved_no_blockers() -> None:
+    """A report with only MINOR/NIT findings parses to approved."""
+    body = "**MINOR**\nsmall issue\n\nVerdict: No BLOCKERs or MAJORs — fix is correct"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result.decision == "approved"
+    assert "No BLOCKERs" in result.summary
+    assert result.required_changes == ()
+
+
+def test_parse_cross_family_verdict_request_changes_with_blocker() -> None:
+    """A report with a BLOCKER finding parses to request_changes."""
+    body = "**BLOCKER**\ncritical bug\n\nVerdict: BLOCKER — does not fix the issue"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result.decision == "request_changes"
+    assert "BLOCKER" in result.summary
+    assert result.required_changes == ()
+
+
+def test_parse_cross_family_verdict_request_changes_with_major() -> None:
+    """A report with a MAJOR finding parses to request_changes."""
+    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result.decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_heading_style_major() -> None:
+    """Heading-style ``### MAJOR`` markers are detected as request_changes."""
+    body = "### MAJOR — bug.py:10: off-by-one\n\nfix it\n\n## Verdict\n\nMAJOR should be fixed"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result.decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_unavailable_returns_none() -> None:
+    """An UNAVAILABLE stub report returns None (skip, don't record a wrong verdict)."""
+    stub = "# Cross-family adversarial review — `glm-5.2` (UNAVAILABLE)\n\n> timed out\n"
+    assert parse_cross_family_verdict(stub) is None
+
+
+def test_parse_cross_family_verdict_empty_returns_none() -> None:
+    """Empty/blank report text returns None."""
+    assert parse_cross_family_verdict("") is None
+    assert parse_cross_family_verdict("   ") is None
+
+
+def test_parse_cross_family_verdict_invalid_body_returns_none() -> None:
+    """A report body that fails report_body_is_valid returns None."""
+    body = "some random text with no severity or verdict"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    assert parse_cross_family_verdict(wrapped) is None
+
+
+def test_parse_cross_family_verdict_json_block_populates_required_changes() -> None:
+    """The defect this covers: a new-format report's JSON verdict block carries
+    itemized findings into ``required_changes`` instead of leaving it empty."""
+    body = (
+        "**MAJOR**\nfile.py:10 does the wrong thing\n\n"
+        "Verdict: MAJOR issue blocks merge\n\n"
+        "```json\n"
+        '{"decision": "request_changes", '
+        '"summary": "file.py:10 has a real bug that breaks X", '
+        '"required_changes": ["Fix the off-by-one in file.py:10", '
+        '"Add a regression test for the empty-list case"]}\n'
+        "```\n"
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="file.py:10 has a real bug that breaks X",
+        required_changes=(
+            "Fix the off-by-one in file.py:10",
+            "Add a regression test for the empty-list case",
+        ),
+    )
+
+
+def test_parse_cross_family_verdict_json_approved_no_markdown_severity() -> None:
+    """A JSON-only body (no ``**SEVERITY**``/``Verdict:`` markers) still parses --
+    exercises report_body_is_valid's JSON-block fallback."""
+    body = (
+        '```json\n{"decision": "approved", "summary": "clean PR, only a style nit", '
+        '"required_changes": []}\n```\n'
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    assert report_body_is_valid(body) is True
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(decision="approved", summary="clean PR, only a style nit")
+
+
+def test_parse_cross_family_verdict_json_approved_overridden_by_body_severity() -> None:
+    """Fail-safe: a **MAJOR** marker in the Markdown findings always overrides a
+    JSON block that claims "approved" -- this verdict auto-records and can
+    unblock the merge lane, so a self-contradicting downgrade is never trusted."""
+    body = (
+        "**MAJOR**\nfile.py:20 real bug\n\nVerdict: MAJOR should block\n\n"
+        '```json\n{"decision": "approved", "summary": "looks fine overall", '
+        '"required_changes": []}\n```\n'
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result.decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_json_request_changes_empty_list_is_malformed() -> None:
+    """Issue #784 (AC-2): a JSON verdict block that declares request_changes
+    with an empty/missing required_changes list is a contract violation and
+    must NOT silently fall back to the legacy Markdown parse -- even though
+    the legacy parse would find a perfectly usable ``Verdict:`` line here.
+    Pre-#784, this test asserted exactly that fall-through as correct
+    behavior; that assertion encoded the defect itself (issue #784's root
+    cause: "a JSON verdict saying request_changes with empty
+    required_changes falls through to the weaker legacy path"), so it is
+    replaced rather than preserved. The contract is: once a reviewer elects
+    the structured JSON format, empty required_changes is untrusted on its
+    own, full stop -- regardless of what the Markdown body also says."""
+    body = (
+        "**MAJOR**\nfile.py:30 bug\n\nVerdict: MAJOR should block\n\n"
+        '```json\n{"decision": "request_changes", "summary": "bad but no list", '
+        '"required_changes": []}\n```\n'
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert isinstance(result, MalformedCrossFamilyVerdict)
+    assert result.reason == "json_verdict_request_changes_missing_required_changes"
+
+
+def test_parse_cross_family_verdict_json_block_drives_decision_legacy_would_not_reach() -> None:
+    """The JSON block is the decision authority, not a passenger on a legacy
+    verdict that happens to agree: a body with only a **MINOR** marker and no
+    ``Verdict:`` line -- which the legacy parser alone would call "approved"
+    (no BLOCKER/MAJOR marker present) -- must come back as request_changes
+    when the JSON block says so with a populated required_changes list. This
+    would fail if the JSON check were ever reordered below the legacy path."""
+    body = (
+        "**MINOR**\nfile.py:5 minor style issue, not a real bug\n\n"
+        "```json\n"
+        '{"decision": "request_changes", '
+        '"summary": "actually needs a behavioral fix despite the minor framing", '
+        '"required_changes": ["Handle the None case in file.py:5"]}\n'
+        "```\n"
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="actually needs a behavioral fix despite the minor framing",
+        required_changes=("Handle the None case in file.py:5",),
+    )
+
+
+def test_parse_cross_family_verdict_legacy_report_unchanged_by_json_support() -> None:
+    """Backward-compatibility regression guard: a historical report with no
+    JSON verdict block at all parses to the exact same decision/summary the
+    pre-JSON-support parser produced, with an empty required_changes."""
+    body = "**BLOCKER**\ncritical bug\n\nVerdict: BLOCKER — does not fix the issue"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="BLOCKER — does not fix the issue",
+        required_changes=(),
+    )
+
+
+def test_parse_cross_family_verdict_legacy_blocker_with_no_summary_is_malformed() -> None:
+    """Issue #784 AC-1: a BLOCKER/MAJOR marker with no ``Verdict:`` line to
+    extract a summary from is genuinely content-free -- it must return
+    MalformedCrossFamilyVerdict, never a request_changes verdict asserting
+    blockers exist while naming none. No hardcoded placeholder summary is
+    substituted (the pre-#784 behavior this fix replaces)."""
+    body = "**BLOCKER**\ncritical bug, but no Verdict: line anywhere in this report"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert isinstance(result, MalformedCrossFamilyVerdict)
+    assert result.reason == "blocker_or_major_with_no_extractable_summary"
+    assert "BLOCKER" in result.raw_body
+
+
+def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
+    """Issue #784 AC-6: the invalid state -- request_changes with neither
+    itemized required_changes nor a real summary -- must be unrepresentable
+    at construction, not just avoided by callers that remember to check."""
+    with pytest.raises(ValueError, match="content-free"):
+        CrossFamilyVerdict(decision="request_changes", summary="", required_changes=())
+
+
+def test_cross_family_verdict_post_init_rejects_whitespace_only_summary() -> None:
+    """Whitespace-only is not a real summary either -- ``.strip()`` is
+    applied before the emptiness check, so padding cannot smuggle a
+    content-free verdict past the guard."""
+    with pytest.raises(ValueError, match="content-free"):
+        CrossFamilyVerdict(decision="request_changes", summary="   \n  ", required_changes=())
+
+
+def test_cross_family_verdict_post_init_allows_request_changes_with_only_summary() -> None:
+    """Narrower than "always require required_changes": the legacy Markdown
+    parse path never itemizes findings, so a request_changes verdict with a
+    real extracted summary and empty required_changes remains legitimate
+    and constructible -- this is exactly what the legacy-path tests above
+    rely on."""
+    verdict = CrossFamilyVerdict(
+        decision="request_changes", summary="a real extracted summary", required_changes=()
+    )
+    assert verdict.summary == "a real extracted summary"
+
+
+def test_cross_family_verdict_post_init_allows_request_changes_with_only_required_changes() -> (
+    None
+):
+    """A JSON-block verdict with itemized required_changes but an empty
+    summary is also legitimate -- required_changes alone is something a
+    rework brief can act on."""
+    verdict = CrossFamilyVerdict(
+        decision="request_changes", summary="", required_changes=("fix the null check",)
+    )
+    assert verdict.required_changes == ("fix the null check",)
+
+
+def test_cross_family_verdict_post_init_allows_approved_with_empty_summary() -> None:
+    """The guard is scoped to ``request_changes`` only -- an approved
+    verdict never needs anything for a rework brief to act on, so an empty
+    summary there is unaffected."""
+    verdict = CrossFamilyVerdict(decision="approved", summary="")
+    assert verdict.decision == "approved"
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8: _is_carry_forward_eligible -- the single-point-of-
+# enforcement predicate that rejects carry-forward for a content-free
+# recorded verdict. Operates on plain dicts (never reconstructs a
+# CrossFamilyVerdict), which is the load-bearing fact resolving the
+# deserialization hazard: it must never raise on any of the 8 pre-#784
+# on-disk broken records, however malformed their shape.
+# --------------------------------------------------------------------------
+
+
+def test_is_carry_forward_eligible_true_for_approved() -> None:
+    assert _is_carry_forward_eligible({"decision": "approved", "summary": ""}) is True
+
+
+def test_is_carry_forward_eligible_true_for_blocked() -> None:
+    assert _is_carry_forward_eligible({"decision": "blocked", "summary": "why"}) is True
+
+
+def test_is_carry_forward_eligible_true_for_request_changes_with_required_changes() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": ["fix x"], "summary": ""}
+        )
+        is True
+    )
+
+
+def test_is_carry_forward_eligible_true_for_request_changes_with_real_summary() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": [], "summary": "Real prose."}
+        )
+        is True
+    )
+
+
+def test_is_carry_forward_eligible_false_for_empty_summary_and_required_changes() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": [], "summary": ""}
+        )
+        is False
+    )
+
+
+def test_is_carry_forward_eligible_false_for_missing_keys() -> None:
+    """A pre-#784 broken on-disk record may not even carry a
+    ``required_changes`` or ``summary`` key at all -- must classify as
+    ineligible via ``.get()`` defaults, never raise (KeyError or otherwise),
+    on a plain dict this predicate was built specifically to tolerate."""
+    assert _is_carry_forward_eligible({"decision": "request_changes"}) is False
+
+
+def test_is_carry_forward_eligible_false_for_legacy_placeholder_summary() -> None:
+    """The historical hardcoded placeholder is content-free by definition
+    even though ``summary`` is technically non-empty -- one of the 8
+    pre-#784 on-disk records has exactly this shape."""
+    assert (
+        _is_carry_forward_eligible(
+            {
+                "decision": "request_changes",
+                "required_changes": [],
+                "summary": LEGACY_VACUOUS_SUMMARY,
+            }
+        )
+        is False
+    )
+
+
+def test_is_carry_forward_eligible_false_for_whitespace_padded_placeholder() -> None:
+    """``summary`` is ``.strip()``-normalized before the comparison, so
+    whitespace padding around the exact placeholder cannot smuggle it past
+    the guard as if it were a distinct, real summary."""
+    assert (
+        _is_carry_forward_eligible(
+            {
+                "decision": "request_changes",
+                "required_changes": [],
+                "summary": f"  {LEGACY_VACUOUS_SUMMARY}  ",
+            }
+        )
+        is False
+    )
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8: review_queue() must never silently re-confirm a
+# content-free recorded verdict via the head-unchanged shortcut -- it is
+# queued as "vacuous" instead, regardless of whether the head moved.
+# --------------------------------------------------------------------------
+
+
+def test_review_queue_flags_content_free_request_changes_as_vacuous(tmp_path: Path) -> None:
+    """The dominant real-world shape: reviewed_head_sha == live head (a
+    label-strip requeue never moves the head). Pre-#784, this would hit the
+    head-unchanged shortcut and be silently excluded from the queue
+    forever, permanently blocking the merge lane."""
+    prs = [
+        {
+            "number": 700,
+            "title": "Fix #70: vacuous verdict on current head",
+            "url": "https://example.test/pull/700",
+            "headRefName": "agent/issue-70-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-700",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #70",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        700,
+        "sha-700",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-700",
+            "required_changes": [],
+            "summary": "",
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": 700,
+            "issue": 70,
+            "packet_head_sha": "sha-700",
+            "decision": "vacuous",
+            "reviewed_head_sha": "sha-700",
+        },
+    ]
+
+
+def test_review_queue_treats_legacy_placeholder_summary_as_vacuous(tmp_path: Path) -> None:
+    prs = [
+        {
+            "number": 701,
+            "title": "Fix #71: legacy placeholder summary",
+            "url": "https://example.test/pull/701",
+            "headRefName": "agent/issue-71-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-701",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #71",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        701,
+        "sha-701",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-701",
+            "required_changes": [],
+            "summary": LEGACY_VACUOUS_SUMMARY,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.data["queue"][0]["decision"] == "vacuous"
+
+
+def test_review_queue_stale_packet_excludes_vacuous_verdict(tmp_path: Path) -> None:
+    """A vacuous verdict is only queued when the packet head is current --
+    matching every other review_queue category's contract: a stale packet
+    cannot be re-reviewed from, so it is excluded rather than queued."""
+    prs = [
+        {
+            "number": 702,
+            "title": "Fix #72: vacuous verdict, stale packet",
+            "url": "https://example.test/pull/702",
+            "headRefName": "agent/issue-72-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-702-new",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #72",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        702,
+        "sha-702-old",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-702-old",
+            "required_changes": [],
+            "summary": "",
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.data["queue"] == []
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8, Case 2: review_queue()'s head-unchanged shortcut must not
+# treat "reviewed at live head" as "nothing to do" when a real, actionable,
+# non-escalated request_changes verdict was never actually routed to
+# rework_requested -- e.g. issue #789's reconcile one-way "closed" gate
+# clobbering the issue status after record_review set it. This is a repair
+# of a dropped transition (re-applying the same target record_review already
+# decided via the same generic _route_to_rework entry point), never a new
+# decision, and must be idempotent.
+# --------------------------------------------------------------------------
+
+
+def test_review_queue_reroutes_stranded_request_changes_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """Motivating real-world case: PR #693 -> issue #649. A real, actionable
+    request_changes verdict (non-empty prose summary, within the rework-cycle
+    budget -- ``escalated: False``) is recorded at the live head, but the
+    linked issue's status was left at (or clobbered to) something other than
+    ``rework_requested`` -- so ``dispatch_rework``'s
+    ``status == "rework_requested"`` selection never picks the issue up and
+    the PR is stranded forever, even though nothing is actually wrong with
+    the verdict itself.
+
+    review_queue() must detect this at the head-unchanged shortcut and
+    re-drive the SAME rework_requested transition via the SAME generic
+    ``_route_to_rework`` entry point ``record_review`` itself uses -- never
+    adding the PR to the returned ``queue`` (that would wrongly trigger a
+    brand-new reviewer dispatch for a PR that already has a valid verdict).
+
+    A second ``review_queue()`` call over the now-repaired state must not
+    dispatch or mutate anything further (coordinator's explicit, non-
+    negotiable requirement for this fix).
+    """
+    prs = [
+        {
+            "number": 693,
+            "title": "Fix #649: some change",
+            "url": "https://example.test/pull/693",
+            "headRefName": "agent/issue-649-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-693",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #649",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    _write_review_packet(
+        tmp_path,
+        693,
+        "sha-693",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-693",
+            "required_changes": [],
+            "summary": (
+                "The refactor drops the timeout guard added in #611; restore "
+                "it before merging, otherwise a hung subprocess call blocks "
+                "the orchestrator loop indefinitely."
+            ),
+            "escalated": False,
+        },
+    )
+    # Simulate issue #789: the linked issue's status is something other than
+    # rework_requested even though record_review's own contract says a
+    # non-escalated request_changes verdict must have set it there.
+    state = load_state(app.paths.state_file)
+    state["issues"]["649"] = {"number": 649, "status": "closed"}
+    save_state(app.paths.state_file, state)
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    state_after = load_state(app.paths.state_file)
+    assert state_after["issues"]["649"]["status"] == "rework_requested"
+    assert state_after["prs"]["693"]["status"] == "rework_requested"
+    assert any(
+        e["kind"] == "stranded_request_changes_rework_requested" for e in state_after["events"]
+    )
+    prompt_path = app.paths.prs / "pr-693" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert (649, app.config.labels.needs_rework) in app.gh.labels_added
+
+    # Idempotency: a second pass over the now-repaired state must dispatch
+    # and mutate nothing further. "Without that test I will not merge this."
+    events_before_second_pass = len(state_after["events"])
+    labels_added_before_second_pass = list(app.gh.labels_added)
+
+    result_2 = app.review_queue()
+
+    assert result_2.ok is True
+    assert result_2.data["queue"] == []
+    state_final = load_state(app.paths.state_file)
+    assert state_final["issues"]["649"]["status"] == "rework_requested"
+    assert state_final["prs"]["693"]["status"] == "rework_requested"
+    assert len(state_final["events"]) == events_before_second_pass
+    assert app.gh.labels_added == labels_added_before_second_pass
+
+
+def test_review_queue_does_not_reroute_escalated_request_changes(tmp_path: Path) -> None:
+    """The Case 2 repair is scoped to the non-escalated lane only: when
+    ``record_review`` already decided a verdict exceeded the rework-cycle
+    budget (``escalated: True``), review_queue() must not independently
+    re-decide that or invent a second rework lane bypassing
+    ``max_rework_cycles`` -- it defers entirely to the existing
+    escalation/rescue path.
+    """
+    prs = [
+        {
+            "number": 694,
+            "title": "Fix #650: some other change",
+            "url": "https://example.test/pull/694",
+            "headRefName": "agent/issue-650-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-694",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #650",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    _write_review_packet(
+        tmp_path,
+        694,
+        "sha-694",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-694",
+            "required_changes": [],
+            "summary": "Real reviewer prose describing a real problem to fix.",
+            "escalated": True,
+        },
+    )
+    state = load_state(app.paths.state_file)
+    state["issues"]["650"] = {"number": 650, "status": "closed"}
+    save_state(app.paths.state_file, state)
+
+    result = app.review_queue()
+
+    assert result.data["queue"] == []
+    state_after = load_state(app.paths.state_file)
+    # Untouched -- Case 2 must not fire for an escalated verdict.
+    assert state_after["issues"]["650"]["status"] == "closed"
+    prompt_path = app.paths.prs / "pr-694" / "rework-prompt.md"
+    assert not prompt_path.exists()
+    assert app.gh.labels_added == []
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8 bound: _handle_malformed_cross_family_verdict /
+# _record_cross_family_verdicts. A malformed verdict never increments
+# request_changes_count or dispatches rework (AC-3); a SEPARATE bounded
+# counter (cross_family_parse_failure_count) caps how many times the
+# content-free-verdict -> forced-regeneration cycle can repeat for one PR,
+# so removing the request_changes-cycle counter from this path does not
+# create an unbounded loop. Past the cap, cross-family review is abandoned
+# via a caveated, non-blocking "approved" verdict -- never
+# agent:human-needed, never a blocking request_changes.
+# --------------------------------------------------------------------------
+
+
+def _cross_family_auto_verdict_app(
+    tmp_path: Path, *, max_parse_failures: int = 2, prs: list[dict[str, Any]] | None = None
+) -> OrchestratorApp:
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(auto_verdict=True, max_parse_failures=max_parse_failures)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+
+def _malformed_cross_family_pr(number: int, head_sha: str) -> dict[str, Any]:
+    return {
+        "number": number,
+        "title": f"Fix #{number}: unparseable cross-family report",
+        "url": f"https://example.test/pull/{number}",
+        "headRefName": f"agent/issue-{number}-fix",
+        "baseRefName": "main",
+        "headRefOid": head_sha,
+        "mergeStateStatus": "CLEAN",
+        "body": f"Closes #{number}",
+        "labels": [],
+        "isCrossRepository": False,
+        "state": "OPEN",
+    }
+
+
+def test_handle_malformed_cross_family_verdict_below_cap_logs_without_recording(
+    tmp_path: Path,
+) -> None:
+    prs = [_malformed_cross_family_pr(800, "sha-800")]
+    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
+    _write_review_packet(tmp_path, 800, "sha-800", {"decision": "pending"})
+    pr_dir = app.paths.prs / "pr-800"
+    (pr_dir / "cross-family-review.md").write_text(
+        "# Cross-family adversarial review — `glm-5.2`\n\n"
+        "<!-- PR head SHA: sha-800 -->\n\n"
+        f"{_CAVEAT}\n\n---\n\n"
+        "**BLOCKER** something is wrong, no Verdict line here\n",
+        encoding="utf-8",
+    )
+
+    results = app._record_cross_family_verdicts()
+
+    assert results == [
+        {
+            "pr_number": 800,
+            "decision": "unparseable",
+            "ok": False,
+            "message": (
+                "cross-family verdict unparseable "
+                "(blocker_or_major_with_no_extractable_summary), attempt 1/2"
+            ),
+        }
+    ]
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["decision"] == "pending"
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["800"]["cross_family_parse_failure_count"] == 1
+    # AC-3: never touches the separate request_changes rework-cycle counter.
+    assert state["prs"]["800"].get("request_changes_count", 0) == 0
+
+
+def test_handle_malformed_cross_family_verdict_abandons_after_cap_exceeded(
+    tmp_path: Path,
+) -> None:
+    """The coordinator's required bound: past max_parse_failures, the cycle
+    terminates in a caveated, non-blocking approved verdict -- not
+    agent:human-needed, not an indefinitely-blocking request_changes."""
+    prs = [_malformed_cross_family_pr(801, "sha-801")]
+    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
+    _write_review_packet(tmp_path, 801, "sha-801", {"decision": "pending"})
+    pr_dir = app.paths.prs / "pr-801"
+    (pr_dir / "cross-family-review.md").write_text(
+        "# Cross-family adversarial review — `glm-5.2`\n\n"
+        "<!-- PR head SHA: sha-801 -->\n\n"
+        f"{_CAVEAT}\n\n---\n\n"
+        "**BLOCKER** something is wrong, no Verdict line here\n",
+        encoding="utf-8",
+    )
+
+    for expected_attempt in (1, 2):
+        results = app._record_cross_family_verdicts()
+        assert results[0]["decision"] == "unparseable"
+        assert results[0]["ok"] is False
+        decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+        assert decision["decision"] == "pending"
+        state = load_state(app.paths.state_file)
+        assert state["prs"]["801"]["cross_family_parse_failure_count"] == expected_attempt
+
+    results = app._record_cross_family_verdicts()
+
+    assert results[0]["decision"] == "approved"
+    assert results[0]["ok"] is True
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["decision"] == "approved"
+    assert decision["required_changes"] == []
+    assert "784" in decision["summary"]
+    assert "3 attempts" in decision["summary"]
+    state = load_state(app.paths.state_file)
+    # record_review resets the parse-failure budget on any real verdict.
+    assert state["prs"]["801"]["cross_family_parse_failure_count"] == 0
+    assert state["prs"]["801"].get("request_changes_count", 0) == 0
+
+
+def test_record_review_resets_cross_family_parse_failure_count(tmp_path: Path) -> None:
+    """Whenever ANY real verdict is subsequently recorded for a PR --
+    whether a genuine parse succeeds after prior failures, or this is
+    _handle_malformed_cross_family_verdict's own abandon-call -- the budget
+    resets, so a future review cycle (new head, new content) starts fresh
+    rather than inheriting an exhausted one."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {"number": 456, "cross_family_parse_failure_count": 5}
+        save_state(paths.state_file, state)
+
+    app.record_review(456, "approved", summary="all clear")
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["cross_family_parse_failure_count"] == 0
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
@@ -10173,6 +11366,68 @@ def test_clear_reviewer_quota_drops_alerted_at() -> None:
 
     assert "alerted_at" not in cleared["reviewer_quota"]
     assert "throttled_until" not in cleared["reviewer_quota"]
+
+
+def test_defer_reviewer_probe_after_bumps_past_probe_after() -> None:
+    """A red flat probe must bump reviewer_quota.probe_after forward so
+    dispatch_reviews's probe_mode gate defers instead of independently
+    launching a real reviewer session into the same still-closed window
+    (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    # Quota exhausted, probe_after in the past (ready to probe).
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="2020-01-01T00:00:00Z",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T00:30:00Z"
+    # throttled_until is untouched.
+    assert result["reviewer_quota"]["throttled_until"] == "2099-01-01T00:00:00Z"
+
+
+def test_defer_reviewer_probe_after_noop_when_quota_not_exhausted() -> None:
+    """Must not write probe_after on a non-exhausted quota -- that would
+    leave stale state for no reason (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert "probe_after" not in result.get("reviewer_quota", {})
+
+
+def test_defer_reviewer_probe_after_never_moves_earlier() -> None:
+    """If the reviewer quota's own exponential backoff already pushed
+    probe_after further out than the flat probe's interval, the bump must
+    not shorten it -- that would make dispatch_reviews probe more often,
+    not less (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="2026-08-01T04:00:00Z",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T04:00:00Z"
+
+
+def test_defer_reviewer_probe_after_overwrites_malformed_current() -> None:
+    """A malformed current probe_after must not wedge the bump -- overwrite
+    with the well-formed new value (issue #663)."""
+    from charlie_work.state import defer_reviewer_probe_after, set_reviewer_quota_exhausted
+
+    state: dict[str, Any] = {"version": 1, "issues": {}, "prs": {}, "events": []}
+    state = set_reviewer_quota_exhausted(
+        state,
+        throttled_until="2099-01-01T00:00:00Z",
+        probe_after="not-a-timestamp",
+    )
+    result = defer_reviewer_probe_after(state, "2026-08-01T00:30:00Z")
+    assert result["reviewer_quota"]["probe_after"] == "2026-08-01T00:30:00Z"
 
 
 def test_set_throttled_until_records_reason_and_adapter_kind() -> None:
@@ -11919,6 +13174,292 @@ def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> 
     assert "No interdiff is needed" in packet
 
 
+def test_annotation_to_required_change_full_annotation() -> None:
+    """Issue #771: a well-formed GitHub annotation renders check/path/line/message."""
+    entry = _annotation_to_required_change(
+        "Lint",
+        {
+            "path": "src/charlie_work/workflow.py",
+            "start_line": 42,
+            "message": "line too long (100 > 99)",
+        },
+    )
+    assert entry == "Lint: src/charlie_work/workflow.py:42 — line too long (100 > 99)"
+
+
+def test_annotation_to_required_change_no_message_returns_none() -> None:
+    """Never fabricate a placeholder when GitHub gives no explanatory message."""
+    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "start_line": 1}) is None
+    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "message": ""}) is None
+
+
+def test_annotation_to_required_change_missing_path_falls_back_to_message_only() -> None:
+    """No path/line data (e.g. a process-level crash) still surfaces the real
+    message rather than being dropped -- but with no fabricated location."""
+    entry = _annotation_to_required_change("Tests", {"message": "process exited with code 1"})
+    assert entry == "Tests: process exited with code 1"
+
+
+def test_annotation_to_required_change_path_without_line() -> None:
+    entry = _annotation_to_required_change(
+        "Lint", {"path": "src/foo.py", "message": "file-level issue"}
+    )
+    assert entry == "Lint: src/foo.py — file-level issue"
+
+
+def test_annotation_to_required_change_non_dict_returns_none() -> None:
+    assert _annotation_to_required_change("Lint", "not a dict") is None  # type: ignore[arg-type]
+
+
+def test_required_changes_from_checks_aggregates_annotations_for_failing_check() -> None:
+    checks = [
+        {"name": "Lint", "state": "FAILURE", "databaseId": 111},
+        {"name": "Tests", "state": "SUCCESS", "databaseId": 222},
+    ]
+    annotations_by_id = {
+        111: [
+            {"path": "src/foo.py", "start_line": 10, "message": "E501 line too long"},
+            {"path": "src/bar.py", "start_line": 20, "message": "F401 unused import"},
+        ],
+    }
+    required_changes = _required_changes_from_checks(
+        checks, ("Lint",), lambda check_run_id: annotations_by_id.get(check_run_id, [])
+    )
+    assert required_changes == [
+        "Lint: src/foo.py:10 — E501 line too long",
+        "Lint: src/bar.py:20 — F401 unused import",
+    ]
+
+
+def test_required_changes_from_checks_skips_passing_run_of_failed_name() -> None:
+    """A name with two runs (matrix legs) under worst-of semantics: only the
+    FAILURE run's annotations should be fetched, not the passing sibling's."""
+    fetched_ids: list[int] = []
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        fetched_ids.append(check_run_id)
+        return [{"path": "x.py", "start_line": 1, "message": "boom"}] if check_run_id == 2 else []
+
+    checks = [
+        {"name": "Tests", "state": "SUCCESS", "databaseId": 1},
+        {"name": "Tests", "state": "FAILURE", "databaseId": 2},
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Tests",), fetch)
+    assert fetched_ids == [2]
+    assert required_changes == ["Tests: x.py:1 — boom"]
+
+
+def test_required_changes_from_checks_no_databaseid_degrades_to_empty() -> None:
+    """No resolvable check-run id AND no link (e.g. a bare status check with
+    neither) -- degrade to [] without ever calling the annotations fetcher."""
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": None}]
+    called = False
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        nonlocal called
+        called = True
+        return []
+
+    assert _required_changes_from_checks(checks, ("Lint",), fetch) == []
+    assert called is False
+
+
+def test_required_changes_from_checks_no_databaseid_falls_back_to_link() -> None:
+    """No resolvable check-run id (e.g. an external status check) but a real
+    ``link`` from GitHub -- fall back to pointing at the link rather than
+    silently dropping the failure, and never call the annotations fetcher
+    (there is no check-run id to fetch with)."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": None,
+            "link": "https://example.com/status/lint",
+        }
+    ]
+    called = False
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        nonlocal called
+        called = True
+        return []
+
+    result = _required_changes_from_checks(checks, ("Lint",), fetch)
+    assert result == [
+        "Lint: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://example.com/status/lint",
+    ]
+    assert called is False
+
+
+def test_required_changes_from_checks_zero_annotations_degrades_to_empty() -> None:
+    """A resolvable check run with zero annotations and no link (common for a
+    process-level crash) degrades to [] -- never a fabricated file/line."""
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
+    assert _required_changes_from_checks(checks, ("Lint",), lambda _id: []) == []
+
+
+def test_required_changes_from_checks_zero_annotations_falls_back_to_link() -> None:
+    """A resolvable check run with zero annotations but a real ``link`` falls
+    back to the link -- more useful than silence, still not fabricated."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": 5,
+            "link": "https://github.com/o/r/actions/runs/1/jobs/5",
+        }
+    ]
+    result = _required_changes_from_checks(checks, ("Lint",), lambda _id: [])
+    assert result == [
+        "Lint: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://github.com/o/r/actions/runs/1/jobs/5",
+    ]
+
+
+def test_required_changes_from_checks_no_checks_available_degrades_to_empty() -> None:
+    assert _required_changes_from_checks(None, ("Lint",), lambda _id: []) == []
+
+
+def test_required_changes_from_checks_no_failed_names_degrades_to_empty() -> None:
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
+    assert _required_changes_from_checks(checks, (), lambda _id: [{"message": "x"}]) == []
+
+
+def test_review_ci_failure_with_annotations_populates_required_changes(tmp_path: Path) -> None:
+    """Issue #771: a required-check failure whose check run carries GitHub
+    annotations yields required_changes naming the real file/line, and the
+    rendered rework brief contains them -- not just the bare check-name
+    summary the route previously emitted."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={
+            9001: [
+                {
+                    "path": "src/charlie_work/workflow.py",
+                    "start_line": 7296,
+                    "message": "F821 undefined name 'checks'",
+                    "annotation_level": "failure",
+                },
+            ],
+        },
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == [
+        "Tests passed: src/charlie_work/workflow.py:7296 — F821 undefined name 'checks'",
+    ]
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "## Required changes" in prompt_text
+    assert "src/charlie_work/workflow.py:7296" in prompt_text
+    assert "F821 undefined name 'checks'" in prompt_text
+    # The failing check's own name reaches the brief via $dispatch_note (the
+    # rework_summary passed to _write_rework_prompt, kept as a separate
+    # template slot from $required_changes_section) regardless of which
+    # required_changes tier rendered -- a worker sees which check was red
+    # even when tier 1 (the enumerated list) is what fired.
+    assert "Tests passed" in prompt_text
+
+
+def test_review_ci_failure_without_annotations_degrades_without_fabricating(
+    tmp_path: Path,
+) -> None:
+    """Issue #771: a failing required check whose run carries zero GitHub
+    annotations AND no link (e.g. a process-level crash with nothing GitHub
+    can point at) must not fabricate a file/line -- required_changes stays
+    empty and the pre-existing summary-only fallback
+    (_render_required_changes_section tier 2) renders instead."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9002},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={},  # 9002 resolves to zero annotations
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == []
+    assert decision["summary"] == "CI failed on Tests passed; push a fix"
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    # Tier-2 fallback renders the real summary verbatim -- not a fabricated
+    # file/line, and still strictly more informative than an empty section.
+    assert "CI failed on Tests passed; push a fix" in prompt_text
+    assert "## Required changes" in prompt_text
+
+
+def test_review_ci_failure_without_annotations_but_with_link_uses_link_fallback(
+    tmp_path: Path,
+) -> None:
+    """Issue #771: a failing required check with zero GitHub annotations but a
+    real ``link`` (the common case: GitHub Actions always assigns a run URL,
+    but only some failure modes emit per-line annotations) falls back to
+    pointing the worker at the failing run instead of degrading all the way
+    to the bare check-name summary."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {
+                "name": "Tests passed",
+                "state": "FAILURE",
+                "databaseId": 9003,
+                "link": "https://github.com/o/r/actions/runs/1/jobs/9003",
+            },
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={},  # 9003 resolves to zero annotations
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == [
+        "Tests passed: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://github.com/o/r/actions/runs/1/jobs/9003",
+    ]
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "## Required changes" in prompt_text
+    assert "https://github.com/o/r/actions/runs/1/jobs/9003" in prompt_text
+
+
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
     """Issue #376: a definitive required-check failure on a linked issue routes to rework."""
     config = _required_checks_config()
@@ -13171,6 +14712,115 @@ def test_linked_issue_number_none_treats_as_cross_repository() -> None:
     )
 
 
+def test_linked_issue_number_negation_guard_rejects_negated_keyword() -> None:
+    # Issue #781 AC1: a closing keyword preceded by a negation must not
+    # bind -- "does not fix #649" is the real-world PR #766 -> issue #649
+    # text that produced a false LABEL TRANSITION (not a GitHub auto-close;
+    # this guard only affects charlie-work's own binding). The non-negated
+    # form of the identical keyword still binds.
+    assert (
+        linked_issue_number(
+            {"body": "does not fix #649"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+    assert (
+        linked_issue_number(
+            {"body": "Fixes #649"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        == 649
+    )
+
+
+def test_linked_issue_number_negation_guard_table() -> None:
+    # Issue #781 AC2: table-driven negation coverage (doesn't / never /
+    # without / cannot / does not), plus non-negated controls proving the
+    # guard doesn't over-trigger on unrelated text.
+    negated_cases = [
+        "doesn't close #1",
+        "never resolves #2",
+        # "without fixing #3" returns None via the BASE regex, not the
+        # negation guard: _CLOSING_KEYWORD_REF only matches fix/fixes/fixed
+        # (fix(?:e[sd])?) -- never the gerund "fixing". Included per the
+        # issue's explicit list, but see the dedicated assertion below for
+        # proof this is NOT evidence the negation guard itself fired.
+        "without fixing #3",
+        "cannot close #4",
+        "does not fix #5",
+    ]
+    for body in negated_cases:
+        assert (
+            linked_issue_number(
+                {"body": body},
+                is_cross_repository=False,
+                branch_prefix="agent/issue",
+            )
+            is None
+        ), f"expected no binding for negated text: {body!r}"
+
+    # Non-negated controls: the same keywords, without a preceding negation,
+    # still bind -- proves the guard isn't simply matching nothing.
+    non_negated_cases = [
+        ("Closes #1", 1),
+        ("This resolves #2", 2),
+        ("Fixes #5", 5),
+    ]
+    for body, expected in non_negated_cases:
+        assert (
+            linked_issue_number(
+                {"body": body},
+                is_cross_repository=False,
+                branch_prefix="agent/issue",
+            )
+            == expected
+        ), f"expected binding to {expected} for non-negated text: {body!r}"
+
+    # "fixing #3" alone (no negation at all) confirms the gerund truly never
+    # matches the base regex -- so the None result above for "without
+    # fixing #3" is not evidence the negation guard fired.
+    assert (
+        linked_issue_number(
+            {"body": "fixing #3"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+
+
+def test_linked_issue_number_negation_does_not_shadow_later_genuine_match() -> None:
+    # A negated match earlier in a text field must not prevent a later,
+    # genuine closing keyword from binding -- finditer-continuation, not
+    # search()-first-match-only. Monotone with respect to pre-#781 behavior:
+    # no input that previously returned a number now returns None because of
+    # this change; the negation guard can only turn a previously-binding
+    # negated match into None, never suppress a separate genuine one.
+    #
+    # The negation lookback window (32 chars, chosen to cover "does not "
+    # plus headroom) is deliberately wide enough to span a short clause, so
+    # a genuine match must sit outside that window to prove continuation
+    # rather than an accidental non-negation coincidence. Verified
+    # empirically: without the padding, "does not fix #649. Fixes #700"
+    # actually returns None (the 32-char window reaches back across the
+    # sentence boundary to "not") -- that cross-sentence over-triggering is
+    # the deliberate, sanctioned safe-direction tradeoff described on
+    # `_NEGATION_LOOKBEHIND_CHARS`, not a bug. This test instead places the
+    # genuine match far enough away to isolate the continuation behavior.
+    padded_body = "does not fix #649. " + ("x" * 50) + " Fixes #700"
+    assert (
+        linked_issue_number(
+            {"body": padded_body},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        == 700
+    )
+
+
 def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     # The P0: the counter used to derive from state["events"], which
     # append_event truncates to the last 200 - evicting a PR's earlier
@@ -14089,6 +15739,161 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
         "infra_failed",
         "unavailable",
     }
+
+
+def test_merge_ready_failed_attempt_alarm_reports_merge_state_not_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #751: when every check-summary bucket is empty (all required
+    checks pass) but the PR is still unmergeable for a reason none of the
+    explicitly modelled branches (merge_conflict, cross_pr_revert_detected,
+    mergequeue_handoff_failed, summary.failed) name, the terminal ``else``
+    branch must report GitHub's own ``mergeable``/``mergeStateStatus``
+    instead of discarding it as "check summary unknown" (the real #679
+    payload: all required checks green, alarm text still uninformative).
+
+    The scenario is built by forcing a genuine merge-base staleness
+    (compare_overrides) combined with a failed ``pr_update_branch`` — this
+    sets ``sync_failed`` (and therefore ``can_merge=False``) without ever
+    setting ``merge_conflict`` (which only looks at CONFLICTING/DIRTY), so
+    the alarm chain falls through every explicit branch into the ``else``.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            # No required checks -> the check-summary buckets are vacuously
+            # empty, isolating the terminal `else` branch under test.
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+    fake_gh.prs[0]["mergeStateStatus"] = "BLOCKED"
+    # Force the merge-base freshness check to see a stale base (independent of
+    # mergeStateStatus, which the real _is_base_current path never consults),
+    # then fail the resulting update-branch attempt so sync_failed=True without
+    # ever tripping the CONFLICTING/DIRTY-only merge_conflict detector.
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "main-tip"},
+        "merge_base_commit": {"sha": "main-tip-stale"},
+    }
+    fake_gh.update_branch_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "mergeable=MERGEABLE" in warning
+    assert "mergeStateStatus=BLOCKED" in warning
+    # The negative control: without this assertion the test would also pass
+    # against the pre-fix code, which always appended the literal fallback
+    # regardless of what pr_view returned.
+    assert "check summary unknown" not in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["mergeable"] == "MERGEABLE"
+    assert alarm_events[0]["payload"]["merge_state_status"] == "BLOCKED"
+
+
+def test_merge_ready_failed_attempt_alarm_falls_back_when_merge_state_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #751: the "check summary unknown" fallback must survive for the
+    genuinely-unknown case where GitHub reports neither ``mergeable`` nor
+    ``mergeStateStatus`` as a usable signal (both ``"UNKNOWN"``), so a later
+    refactor of the merge-state bucket can't silently delete the fallback.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeable"] = "UNKNOWN"
+    fake_gh.prs[0]["mergeStateStatus"] = "UNKNOWN"
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "main-tip"},
+        "merge_base_commit": {"sha": "main-tip-stale"},
+    }
+    fake_gh.update_branch_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "check summary unknown" in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["mergeable"] == "UNKNOWN"
+    assert alarm_events[0]["payload"]["merge_state_status"] == "UNKNOWN"
+
+
+def test_merge_ready_failed_attempt_alarm_reports_unavailable_not_passed(
+    tmp_path: Path,
+) -> None:
+    """When ``gh pr checks`` itself fails, summarize_checks(None, required)
+    puts every required check into ``summary.unavailable`` — missing,
+    pending, failed, and infra_failed all stay empty. The terminal ``else``
+    branch's bucket chain checked those four buckets but never
+    ``unavailable``, so it fell through to the "every bucket empty" fallback
+    and (after the mergeable/mergeStateStatus fix above) would have claimed
+    "all required checks passed" — an actively false statement when the
+    check status could not be fetched at all. This must report the
+    unavailable checks instead of asserting they passed.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests",),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["checks_unavailable"] is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "unavailable: Tests" in warning
+    # The negative control: an unavailable check is not a passed check.
+    assert "all required checks passed" not in warning
+    assert "check summary unknown" not in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["checks_summary"]["unavailable"] == ["Tests"]
 
 
 def test_merge_ready_failed_attempt_alarm_resets_on_merge(tmp_path: Path) -> None:
@@ -15310,7 +17115,22 @@ def test_loop_skips_review_for_approved_unmerged_pr(tmp_path: Path) -> None:
     merge_ready."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """loop() now runs a reconcile pass (merge-lane-recovery §6-B) that
+        calls gh.run(["pr", "list", ...]) via reconcile._fetch_prs. The base
+        FakeGitHub.run() generic fallback always returns [] for that query
+        regardless of self.prs, which makes detect_drift see an empty GitHub
+        snapshot against a non-empty tracked-PR state and misreport PR 456 as
+        missing on GitHub. Reflect self.prs for real here so the reconcile
+        pass sees the same PR the rest of this fake already knows about."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     # Record an approved decision in state (as record_review would).
     state = load_state(paths.state_file)
@@ -16050,7 +17870,20 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
 ) -> None:
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """See the identical override in
+        test_loop_skips_review_for_approved_unmerged_pr: loop()'s reconcile
+        pass (merge-lane-recovery §6-B) queries gh.run(["pr", "list", ...]),
+        and the base fake's generic run() fallback returns [] regardless of
+        self.prs, which misreports PR 456 as missing on GitHub."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     state = load_state(paths.state_file)
     state["prs"]["456"] = {
@@ -22118,11 +23951,12 @@ def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypa
     }
     fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
 
-    # Mock fleet_dir to point to our test fleet dir
-    def mock_fleet_dir(override=None):
-        return fleet_dir
-
-    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", mock_fleet_dir)
+    # Redirect fleet_dir resolution to our test fleet dir via the env var
+    # fleet_paths.fleet_dir() itself supports (checked before the platform
+    # default). Patching the module-level name directly no longer works since
+    # fleet_registry composes fleet paths through layout.py, which binds its
+    # own reference to fleet_paths.fleet_dir at import time.
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
 
     # Count fleet live sessions
     live_count, skipped_repos = count_fleet_live_sessions(None)
@@ -23630,6 +25464,147 @@ def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_thro
     assert any(e["kind"] == "quota_probe_failed" for e in state["events"])
 
 
+def test_maybe_probe_quota_recovery_red_also_defers_reviewer_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A red flat probe must also bump reviewer_quota.probe_after so
+    dispatch_reviews's probe_mode gate defers instead of independently
+    launching a real reviewer session into the same still-closed window
+    (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        is_reviewer_probe_ready,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    # Reviewer quota exhausted with probe_after in the past (ready to probe).
+    state = set_reviewer_quota_exhausted(
+        state, throttled_until=future, probe_after="2020-01-01T00:00:00Z"
+    )
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    next_probe_at = state["quota_probe"]["next_probe_at"]
+    # probe_after must now be bumped to the flat probe's next attempt, so
+    # dispatch_reviews's is_reviewer_probe_ready returns False.
+    assert state["reviewer_quota"]["probe_after"] == next_probe_at
+    assert is_reviewer_probe_ready(state) is False
+    # consecutive_probe_failures is not touched by the flat probe.
+    assert state["reviewer_quota"].get("consecutive_probe_failures", 0) == 0
+
+
+def test_maybe_probe_quota_recovery_red_does_not_shorten_existing_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the reviewer quota's own exponential backoff already pushed
+    probe_after further out than the flat probe's interval, a red flat
+    probe must not shorten it (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import (
+        arm_quota_probe,
+        save_state,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    far_future = (
+        (datetime.now(UTC) + timedelta(hours=4))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=far_future)
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # probe_after stays at the existing (further-out) backoff target.
+    assert state["reviewer_quota"]["probe_after"] == far_future
+
+
+def test_maybe_probe_quota_recovery_red_skips_reviewer_probe_when_only_root_throttled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A red flat probe must not write reviewer_quota.probe_after when the
+    reviewer quota is not exhausted -- only the root throttle is active
+    (issue #663)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import arm_quota_probe, save_state, set_throttled_until
+
+    app = _quota_probe_app(tmp_path, interval_minutes=15)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
+    )
+    due = (
+        (datetime.now(UTC) - timedelta(minutes=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_quota_probe(state, due)
+    save_state(app.paths.state_file, state)
+
+    monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
+
+    app._maybe_probe_quota_recovery()
+
+    state = load_state(app.paths.state_file)
+    # No reviewer_quota.probe_after written -- reviewer quota was not exhausted.
+    assert "probe_after" not in state.get("reviewer_quota", {})
+
+
 def test_maybe_probe_quota_recovery_disabled_config_never_probes(tmp_path: Path) -> None:
     from datetime import UTC, datetime
 
@@ -23745,6 +25720,628 @@ def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throt
     assert state.get("quota_probe", {}).get("next_probe_at") is None
     assert state["throttled_until"] == future
     assert state["throttle_adapter_kind"] == "devin"
+
+
+def _reclamation_app(
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    interval_minutes: int = 60,
+    dry_run: bool = False,
+) -> OrchestratorApp:
+    from charlie_work.config import WorktreeReclamationConfig
+
+    config = OrchestratorConfig(
+        worktree_reclamation=WorktreeReclamationConfig(
+            enabled=enabled, interval_minutes=interval_minutes
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=dry_run)
+
+
+def test_worktree_reclamation_config_defaults() -> None:
+    from charlie_work.config import WorktreeReclamationConfig
+
+    wr = WorktreeReclamationConfig()
+    assert wr.enabled is True
+    assert wr.interval_minutes == 60
+
+
+def test_worktree_reclamation_config_absent_block_defaults_enabled(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("labels:\n  ready: automated-ready\n", encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.worktree_reclamation.enabled is True
+    assert config.worktree_reclamation.interval_minutes == 60
+
+
+def test_worktree_reclamation_config_parses(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text(
+        "worktree_reclamation:\n  enabled: true\n  interval_minutes: 30\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.worktree_reclamation.enabled is True
+    assert config.worktree_reclamation.interval_minutes == 30
+
+
+def test_worktree_reclamation_config_rejects_non_int_interval(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("worktree_reclamation:\n  interval_minutes: soon\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="interval_minutes"):
+        load_config(path)
+
+
+def test_worktree_reclamation_config_rejects_zero_interval(tmp_path: Path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("worktree_reclamation:\n  interval_minutes: 0\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="interval_minutes"):
+        load_config(path)
+
+
+def test_is_worktree_reclamation_due_when_no_schedule() -> None:
+    from charlie_work.state import is_worktree_reclamation_due
+
+    # An absent schedule means "never run yet" -> due, so the first fleet pass
+    # after startup clears the existing backlog (issue #636).
+    assert is_worktree_reclamation_due({}) is True
+    assert is_worktree_reclamation_due({"worktree_reclamation": {}}) is True
+
+
+def test_is_worktree_reclamation_due_false_for_future_schedule() -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = schedule_worktree_reclamation({}, future)
+
+    assert is_worktree_reclamation_due(state) is False
+
+
+def test_is_worktree_reclamation_due_true_for_past_schedule() -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    past = (
+        (datetime.now(UTC) - timedelta(minutes=5))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = schedule_worktree_reclamation({}, past)
+
+    assert is_worktree_reclamation_due(state) is True
+
+
+def test_is_worktree_reclamation_due_treats_malformed_as_due() -> None:
+    from charlie_work.state import is_worktree_reclamation_due, schedule_worktree_reclamation
+
+    state = schedule_worktree_reclamation({}, "not-a-timestamp")
+
+    # A corrupt value must not wedge reclamation off forever.
+    assert is_worktree_reclamation_due(state) is True
+
+
+def test_maybe_reclaim_worktrees_disabled_returns_none(tmp_path: Path) -> None:
+    from charlie_work import workflow as workflow_module
+
+    app = _reclamation_app(tmp_path, enabled=False)
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("disabled reclamation must never call clean_worktrees")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fail_if_called)
+    try:
+        assert app._maybe_reclaim_worktrees() is None
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("worktree_reclamation", {}).get("next_run_at") is None
+
+
+def test_maybe_reclaim_worktrees_not_due_does_not_sweep(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.state import save_state, schedule_worktree_reclamation
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+    future = (
+        (datetime.now(UTC) + timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    save_state(app.paths.state_file, schedule_worktree_reclamation({}, future))
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("must not sweep before the scheduled interval elapses")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fail_if_called)
+    try:
+        assert app._maybe_reclaim_worktrees() is None
+    finally:
+        monkeypatch.undo()
+
+    # Schedule is untouched when not due.
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] == future
+
+
+def test_maybe_reclaim_worktrees_dry_run_threads_and_removes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A --dry-run fleet pass must run the sweep in preview mode, which removes
+    nothing (the preview-vs-act class tracked in #614-#619). ``dry_run`` is
+    threaded from the app into ``clean_worktrees``."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, dry_run=True)
+
+    calls: list[dict] = []
+
+    def _fake_clean(*args: object, **kwargs: object) -> WorktreeCleanResult:
+        calls.append({"args": args, "kwargs": kwargs})
+        return WorktreeCleanResult(
+            ok=True,
+            message="worktree-clean (dry-run): 2 eligible, 0 skipped, 0 orphan(s)",
+            data={
+                "planned": [{"worktree": "a"}, {"worktree": "b"}],
+                "removed": [],
+                "skipped": [],
+                "failed": [],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert len(calls) == 1
+    # dry_run is threaded honestly into the sweep.
+    assert calls[0]["kwargs"]["dry_run"] is True
+    # The canonical resolved worktrees root is passed -- not a manual
+    # re-derivation -- so this call site can never diverge from dispatch's
+    # and `charlie worktree-clean`'s (the create/sweep split documented in
+    # layout.py's module docstring, "74-uncollected-worktrees").
+    assert calls[0]["args"][1] == app.layout.worktrees
+    # A preview removes nothing.
+    assert summary["removed"] == 0
+    assert summary["planned"] == 2
+    assert summary["dry_run"] is True
+    # The schedule is advanced even in dry-run: clean_worktrees makes its
+    # live `gh pr view` fan-out unconditionally (dry_run only gates the final
+    # `git worktree remove`), so the cadence gate's cost is identical in both
+    # modes and must be rate-limited in both.
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] is not None
+    # An event was emitted so the preview is observable.
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["dry_run"] is True
+    assert events[0]["payload"]["planned"] == 2
+    assert events[0]["payload"]["removed"] == 0
+
+
+def test_maybe_reclaim_worktrees_runs_and_emits_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A live (non-dry-run) pass runs the sweep, records a
+    ``worktrees_reclaimed`` event with the counts, and advances the cadence
+    schedule (issue #636: a maintenance action that leaves no trace is
+    indistinguishable from one that never ran -- lesson from #595/#621)."""
+    from datetime import UTC, datetime
+
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+
+    def _fake_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
+        return WorktreeCleanResult(
+            ok=True,
+            message="worktree-clean: 3 removed, 1 skipped, 0 failed, 0 orphan(s)",
+            data={
+                "planned": [],
+                "removed": [{"issue_number": 1}, {"issue_number": 2}, {"issue_number": 3}],
+                "skipped": [{"issue_number": 4}],
+                "failed": [],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert summary["dry_run"] is False
+    assert summary["removed"] == 3
+    assert summary["skipped"] == 1
+    state = load_state(app.paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["removed"] == 3
+    # The schedule was advanced ~interval_minutes into the future, so the very
+    # next pass does not re-fire the per-candidate gh fan-out.
+    next_run_at = state["worktree_reclamation"]["next_run_at"]
+    parsed = datetime.fromisoformat(next_run_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=60)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+
+def test_maybe_reclaim_worktrees_advances_schedule_before_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The schedule is advanced BEFORE the sweep runs, so a sweep that errors
+    or takes longer than one poll interval cannot double-fire on the next
+    pass."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+
+    def _exploding_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
+        # Simulate a sweep that fails: the schedule must already have been
+        # advanced before this point.
+        state = load_state(app.paths.state_file)
+        assert state["worktree_reclamation"]["next_run_at"] is not None
+        return WorktreeCleanResult(
+            ok=False,
+            message="worktree-clean: 0 removed, 0 skipped, 1 failed",
+            data={
+                "planned": [],
+                "removed": [],
+                "skipped": [],
+                "failed": [{"worktree": "a"}],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _exploding_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert summary["ok"] is False
+    assert summary["failed"] == 1
+    # A failed sweep still records an event (observability) and keeps the
+    # advanced schedule (no immediate retry storm).
+    state = load_state(app.paths.state_file)
+    assert state["worktree_reclamation"]["next_run_at"] is not None
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    assert events[0]["payload"]["failed"] == 1
+
+
+def _reconcile_pass_app(
+    tmp_path: Path,
+    *,
+    interval_minutes: int = 30,
+    enabled: bool = True,
+    gh: Any = None,
+) -> OrchestratorApp:
+    from charlie_work.config import ReconcilePassConfig
+
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=enabled, interval_minutes=interval_minutes)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())
+
+
+def test_maybe_reconcile_drift_noop_when_disabled(tmp_path: Path) -> None:
+    """B-AC1/B-AC2: reconcile_pass.enabled=False must skip reconcile entirely --
+    no call to reconcile(), no schedule armed, no summary event."""
+    app = _reconcile_pass_app(tmp_path, enabled=False)
+
+    def _fail_if_called(*, fix: bool = False) -> CommandResult:
+        raise AssertionError("reconcile() must not be called when reconcile_pass is disabled")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _fail_if_called)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state.get("reconcile_pass", {}).get("next_reconcile_at") is None
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+
+
+def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -> None:
+    """B-AC1/B-AC2: enabled + due calls _reconcile_locked(fix=True) exactly
+    once, arms the next-due schedule ~interval_minutes out, and records a
+    single reconcile_pass_completed summary event carrying drift counts.
+
+    Patches ``_reconcile_locked``, not ``reconcile`` (merge-lane-recovery
+    D-8a): ``_maybe_reconcile_drift`` calls ``_reconcile_locked`` directly
+    because loop()'s caller already holds supervisor.lock for the whole
+    pass, and re-entering ``reconcile()`` would re-acquire that same
+    non-reentrant lock and always no-op. Patching ``reconcile`` here would
+    silently never be invoked and this test would falsely pass with 0 calls
+    recorded as a bug, not a confirmation -- see
+    test_maybe_reconcile_drift_runs_while_supervisor_lock_held for the test
+    that actually exercises that lock-contention distinction end to end."""
+    from datetime import UTC, datetime
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+    original_reconcile_locked = app._reconcile_locked
+    calls: list[tuple[bool, bool]] = []
+
+    def _counting_reconcile_locked(
+        *, fix: bool = False, skip_dead_session_sweep: bool = False
+    ) -> CommandResult:
+        calls.append((fix, skip_dead_session_sweep))
+        return original_reconcile_locked(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "_reconcile_locked", _counting_reconcile_locked)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    # merge-lane-recovery §6-B follow-up: the in-loop caller must skip
+    # reconcile's own dead-session sweep -- the loop's stall/dead lanes
+    # (_detect_and_handle_stalled_sessions /
+    # _classify_dead_sessions_and_update_throttle_state) already ran this
+    # exact pass, immediately before this call, with grace-period semantics
+    # (max_inconclusive_probe_deferrals) that reconcile.py's sweep does not
+    # implement.
+    assert calls == [(True, True)]
+
+    state = load_state(app.paths.state_file)
+    next_at = state["reconcile_pass"]["next_reconcile_at"]
+    parsed = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+    expected = datetime.now(UTC) + timedelta(minutes=30)
+    assert abs((parsed - expected).total_seconds()) < 5
+
+    events = state.get("events", [])
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1
+    assert completed[0]["payload"]["drift_detected"] == 0
+    assert completed[0]["payload"]["drift_fixed"] == 0
+    assert completed[0]["payload"]["drift_remaining"] == 0
+
+
+def test_maybe_reconcile_drift_waits_until_due(tmp_path: Path) -> None:
+    """The periodic cadence must not re-run reconcile before the armed
+    next_reconcile_at timestamp."""
+    from datetime import UTC, datetime
+
+    from charlie_work.state import arm_reconcile_pass
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+    not_due = (
+        (datetime.now(UTC) + timedelta(minutes=25))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state = arm_reconcile_pass(load_state(app.paths.state_file), not_due)
+    save_state(app.paths.state_file, state)
+
+    def _fail_if_called(*, fix: bool = False) -> CommandResult:
+        raise AssertionError("must not reconcile before the scheduled time")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(app, "reconcile", _fail_if_called)
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    assert state["reconcile_pass"]["next_reconcile_at"] == not_due
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("reconcile_pass")]
+
+
+def test_maybe_reconcile_drift_defers_on_graphql_rate_limit(tmp_path: Path) -> None:
+    """B-AC3: reconcile()'s existing GraphQL rate-limit deferral must be
+    preserved, not bypassed -- surfaced as a distinguishable
+    reconcile_pass_deferred event rather than a silent no-op."""
+
+    class LowBudgetGitHub(FakeGitHub):
+        def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
+            return (False, 50, 1234567890)
+
+    app = _reconcile_pass_app(tmp_path, gh=LowBudgetGitHub())
+
+    app._maybe_reconcile_drift()
+
+    state = load_state(app.paths.state_file)
+    assert state["reconcile_pass"]["next_reconcile_at"] is not None
+    events = state.get("events", [])
+    deferred = [e for e in events if e.get("kind") == "reconcile_pass_deferred"]
+    assert len(deferred) == 1
+    assert deferred[0]["payload"]["deferred_reason"] == "graphql_rate_limit"
+    assert deferred[0]["payload"]["graphql_remaining"] == 50
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert completed == []
+
+
+def test_loop_corrects_escalated_label_divergence_via_reconcile_pass(tmp_path: Path) -> None:
+    """B-AC5 (critical wiring test): a state/label divergence of the
+    escalated_labels_converged shape -- state says status "escalated", GitHub
+    still carries the stale needs-rework label -- must be corrected by a
+    single app.loop() pass. This proves _maybe_reconcile_drift is actually
+    wired into _loop_body's production call path, not merely present and
+    independently callable. Must FAIL if the wiring call site is removed;
+    see the removal verification recorded in the PR description."""
+    from charlie_work.config import ReconcilePassConfig
+
+    class EscalatedDivergenceGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 40,
+                    "title": "issue 40",
+                    "url": "https://example.test/issues/40",
+                    "body": "",
+                    "labels": [{"name": "agent:needs-rework"}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = []
+
+        def run(
+            self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+        ) -> Any:
+            if args[:2] == ["issue", "list"]:
+                return self.issues
+            if args[:2] == ["pr", "list"]:
+                return self.prs
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+        def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]:
+            return self.issues
+
+        def pr_list(self) -> list[dict[str, Any]]:
+            return self.prs
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {
+                issue["number"]
+                for issue in self.issues
+                if issue["number"] in issue_numbers and issue.get("state") == "OPEN"
+            }
+
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    names = {entry.get("name") for entry in issue["labels"]}
+                    if label not in names:
+                        issue["labels"].append({"name": label})
+            return True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            super().remove_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    issue["labels"] = [
+                        entry for entry in issue["labels"] if entry.get("name") != label
+                    ]
+            return True
+
+    gh = EscalatedDivergenceGitHub()
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=True, interval_minutes=30)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    state = load_state(app.paths.state_file)
+    state = {
+        **state,
+        "issues": {**state.get("issues", {}), "40": {"number": 40, "status": "escalated"}},
+    }
+    save_state(app.paths.state_file, state)
+
+    app.loop(limit=1)
+
+    assert (40, "agent:human-needed") in gh.labels_added
+    assert (40, "agent:needs-rework") in gh.labels_removed
+
+    # B-AC7 (critical safety invariant): reconcile must never rewrite status
+    # to match labels -- only `charlie unescalate` re-enters the machine.
+    final_state = load_state(app.paths.state_file)
+    assert final_state["issues"]["40"]["status"] == "escalated"
+
+
+def test_maybe_reconcile_drift_runs_while_supervisor_lock_held(tmp_path: Path) -> None:
+    """merge-lane-recovery D-8a: every production caller of loop() -- the
+    cli.py bash-rats handler, fleet_dispatch.py, and supervise.py's
+    `while True` -- already holds supervisor.lock for the whole call, so
+    _maybe_reconcile_drift must make progress under that exact condition.
+
+    The buggy predecessor called `self.reconcile(fix=True, ...)`, which
+    re-acquires supervisor.lock as its first action. Byte-range locks taken
+    via msvcrt.locking(LK_NBLCK) are per-handle and non-reentrant even
+    within one process (file_lock.py keeps no reentrancy bookkeeping), so
+    that reacquisition always failed and reconcile silently no-opped on
+    every one of the fleet's loop passes (0 reconcile events across 9,848
+    recorded events). The fix calls `self._reconcile_locked(...)` directly,
+    bypassing the lock acquisition entirely, since the precondition (lock
+    already held by loop()'s caller) is guaranteed by this method's callers.
+
+    A test that does not hold supervisor.lock during the call cannot
+    distinguish the two implementations -- both acquire/no-op fine when
+    unlocked, which is exactly how this shipped undetected.
+    """
+    from charlie_work import layout
+    from charlie_work.file_lock import try_acquire_byte_range_lock
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+
+    supervisor_lock = try_acquire_byte_range_lock(layout.supervisor_lock_path(app.paths.root))
+    assert supervisor_lock is not None, "test setup failed to acquire the supervisor lock"
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        supervisor_lock.release()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1, (
+        "reconcile_pass_completed must be recorded even while supervisor.lock "
+        f"is held by the loop() caller; events were: {events}"
+    )
+
+    # The assertion that actually discriminates the bug: the buggy code path
+    # (self.reconcile(fix=True, ...) re-acquiring the same non-reentrant
+    # lock) always produced this event with this exact reason instead.
+    lock_held_skips = [
+        e
+        for e in events
+        if e.get("kind") == "reconcile_pass_skipped"
+        and e.get("payload", {}).get("reason") == "supervisor_lock_held"
+    ]
+    assert lock_held_skips == [], (
+        "reconcile must not report supervisor_lock_held when the lock is "
+        "already held by this same in-process loop() call -- that reason is "
+        "reserved for a genuinely concurrent mop-up --fix"
+    )
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
@@ -26485,11 +29082,11 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("charlie_work.cli.GitHub", fake_github)
 
-    # Mock fleet_dir to use tmp_path
-    def fake_fleet_dir(*, override: str | None = None) -> Path:
-        return tmp_path / "fleet"
-
-    monkeypatch.setattr("charlie_work.fleet_registry.fleet_dir", fake_fleet_dir)
+    # Redirect fleet_dir resolution to tmp_path via the env var fleet_paths.fleet_dir()
+    # itself supports. Patching the module-level name directly no longer works since
+    # fleet_registry composes fleet paths through layout.py, which binds its own
+    # reference to fleet_paths.fleet_dir at import time.
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
 
     # Build args
     import argparse
@@ -27344,7 +29941,7 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
 
     # Create a session record for issue 123 with a live PID and stale log
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-123.json"
     log_file = sessions_dir / "issue-123.log"
@@ -27423,7 +30020,7 @@ def test_loop_advances_inconclusive_probe_deferral_counter_once_per_pass(
     fake_gh.prs = []
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-343.json"
     log_file = sessions_dir / "issue-343.log"
@@ -27517,7 +30114,7 @@ def test_standalone_dispatch_and_rework_advance_inconclusive_probe_counter_once(
     fake_gh.prs = []
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
 
-    sessions_dir = app._resolve(config.devin.sessions_dir)
+    sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     session_file = sessions_dir / "issue-356.json"
     log_file = sessions_dir / "issue-356.log"
@@ -27854,6 +30451,175 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
     assert recovered_events[0]["payload"]["issue_number"] == 207
     assert recovered_events[0]["payload"]["pr_number"] == 100
     assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
+
+    # Issue #773 measurement-first requirement: even the legacy no-terminal-
+    # record fallback path now reports pid/exit_code/duration_seconds on the
+    # event (exit_code/duration None since no terminal record exists).
+    assert recovered_events[0]["payload"]["pid"] == 99999
+    assert recovered_events[0]["payload"]["exit_code"] is None
+    assert recovered_events[0]["payload"]["duration_seconds"] is None
+
+
+def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
+    """Issue #773: a worker that exited 0 (clean, no-op) must not be reset to
+    rework_requested or burn a redispatch attempt, even though its dead PID and
+    unchanged head otherwise look identical to a crash under
+    ``_worker_pid_alive`` alone.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",  # Unchanged since request_changes
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Durable terminal-status record a real worker's watcher thread would have
+    # written at exit (process_utils.start_terminal_status_watcher): exit
+    # code 0 means the worker completed cleanly rather than crashing.
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 0,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:05:00Z",
+                "duration_seconds": 300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Must NOT be reset to rework_requested -- that would burn a redispatch
+    # attempt on a worker that never had anything to change.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("dispatched_at") == "2024-01-01T00:00:00Z"
+    assert entry["worker_pid"] == 99999
+
+    events = state.get("events", [])
+    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    payload = drift_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_clean_exit_no_op"
+    assert payload["pid"] == 99999
+    assert payload["exit_code"] == 0
+    assert payload["duration_seconds"] == 300.0
+
+
+def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Path) -> None:
+    """Issue #773: a non-zero exit code recorded in the terminal-status file
+    must still take the pre-#773 recovery path (reset to rework_requested) --
+    the fix only special-cases a confirmed clean (exit code 0) exit, never a
+    confirmed abnormal one.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 1,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:00:05Z",
+                "duration_seconds": 5.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    payload = recovered_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_with_request_changes"
+    assert payload["pid"] == 99999
+    assert payload["exit_code"] == 1
+    assert payload["duration_seconds"] == 5.0
 
 
 def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
@@ -29823,7 +32589,7 @@ def test_detect_drift_api_dead_session_provider_auth(
     gh.prs = []
     state = empty_state()
 
-    sessions_dir = tmp_path / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, tmp_path).sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
     write_api_sidecar(sessions_dir, 4805, provider="example", pid=99996)
 
@@ -31265,7 +34031,7 @@ def test_reap_review_verdicts_records_valid_verdict(monkeypatch, tmp_path: Path)
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31319,7 +34085,7 @@ def test_reap_review_verdicts_records_session_metrics(monkeypatch, tmp_path: Pat
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31392,7 +34158,7 @@ def test_reap_review_verdicts_folds_review_effort_arm_into_session_metrics(
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31453,7 +34219,7 @@ def test_reap_review_verdicts_missing_events_file_records_verdict_with_no_metric
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -31573,7 +34339,7 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
@@ -31626,6 +34392,54 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+def test_cross_family_request_changes_verdict_persists_required_changes(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a cross-family report's parsed request_changes verdict,
+    recorded the same way ``_record_cross_family_verdicts`` does (workflow.py),
+    ends up with a populated ``required_changes`` in review-decision.json --
+    the exact defect this fix closes (8 of 20 request_changes verdicts had it
+    silently empty)."""
+    body = (
+        "**MAJOR**\nfile.py:10 does the wrong thing\n\n"
+        "Verdict: MAJOR issue blocks merge\n\n"
+        "```json\n"
+        '{"decision": "request_changes", '
+        '"summary": "file.py:10 has a real bug that breaks X", '
+        '"required_changes": ["Fix the off-by-one in file.py:10", '
+        '"Add a regression test for the empty-list case"]}\n'
+        "```\n"
+    )
+    report_text = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    parsed = parse_cross_family_verdict(report_text)
+    assert parsed is not None
+    assert parsed.decision == "request_changes"
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Mirrors workflow.py's _record_cross_family_verdicts call site exactly.
+    # PR 456 is FakeGitHub's seeded default PR.
+    result = app.record_review(
+        456,
+        parsed.decision,
+        summary=parsed.summary,
+        required_changes=parsed.required_changes,
+    )
+    assert result.ok
+
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["required_changes"] == [
+        "Fix the off-by-one in file.py:10",
+        "Add a regression test for the empty-list case",
+    ]
+    assert decision["summary"] == "file.py:10 has a real bug that breaks X"
 
 
 def test_rework_brief_contains_required_changes_from_verdict(tmp_path: Path) -> None:
@@ -31821,6 +34635,315 @@ def test_rework_brief_omits_required_changes_for_approved_verdict(tmp_path: Path
     assert "before this PR can be approved" not in brief
     assert "add a docstring" not in brief
     assert "rename foo to bar" not in brief
+
+
+def test_rework_brief_falls_back_to_summary_when_required_changes_empty(
+    tmp_path: Path,
+) -> None:
+    """Bug reproducer (F1): measured across the on-disk corpus, request_changes
+    verdicts with a populated required_changes are 0 of 20 -- prompts/review.md
+    historically documented the field as optional, so reviewers reliably fill
+    in `summary` and skip `required_changes`. Before F1,
+    _render_required_changes_section returned "" whenever required_changes
+    was empty, so the worker's rework brief contained none of that summary
+    content even though it was real, substantive review findings sitting
+    right there in review-decision.json. Must fail before F1, pass after.
+
+    The reviewer_summary text here is the real PR #766 reproduction string
+    from issue #781 -- it contains a live closing keyword ("does not fix
+    #649") that must reach the brief DEFANGED (issue #781 outbound fix), so
+    this test also doubles as an AC4-adjacent regression guard: the summary
+    fallback tier must not leak `fix #649` verbatim into a worker's brief."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    reviewer_summary = (
+        "BLOCKER - does not fix #649. The pin is a no-op over uv's resolver; "
+        "the underlying version conflict is still unresolved."
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary=reviewer_summary,
+        required_changes=[],
+    )
+
+    brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
+    assert "## Required changes" in brief
+    # Content (the reviewer's findings) survives, defanged of the live
+    # closing-keyword syntax that would otherwise let GitHub or a worker's
+    # own PR body auto-close/mis-bind issue #649.
+    assert "does not fix issue 649" in brief, "reviewer summary missing from brief"
+    assert "does not fix #649" not in brief, "live closing keyword leaked into brief"
+
+
+def test_render_required_changes_section_populated_list_unaffected_by_fallback() -> None:
+    """Non-regression: when required_changes IS populated, the enumerated
+    list renders exactly as before even though a summary is also present --
+    the summary-fallback and escape-hatch tiers must never fire when there is
+    real structured content to show."""
+    decision = {
+        "decision": "request_changes",
+        "summary": "This summary must not appear in the rendered section.",
+        "required_changes": ["fix the off-by-one", "add a regression test"],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "## Required changes" in section
+    assert "- fix the off-by-one" in section
+    assert "- add a regression test" in section
+    # The fallback/escape-hatch framing must not leak in alongside the list.
+    assert "did not record a structured findings list" not in section
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section
+    assert "This summary must not appear" not in section
+
+
+def test_render_required_changes_section_both_empty_renders_escape_hatch() -> None:
+    """Hard requirement (F1): when both required_changes and summary are
+    empty on a request_changes verdict, the section must never look like
+    "nothing to change" -- it must loudly say the findings are unavailable
+    and point the worker at the PR's review comments on GitHub instead of
+    silently rendering an empty section."""
+    decision = {"decision": "request_changes", "summary": "", "required_changes": []}
+
+    section = _render_required_changes_section(decision)
+
+    assert section.strip() != ""
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+    assert "is NOT a signal that there is nothing to change" in section
+    assert "GitHub" in section
+
+
+def test_render_required_changes_section_blocked_both_empty_renders_escape_hatch() -> None:
+    """Defensive extension of the same hard requirement to `blocked`: the
+    decision-agnostic janitor-gate rework routes (merge-conflict / no-op
+    repair) can carry forward whatever verdict was last on disk, including a
+    `blocked` one. Suppressing the enumerated list / summary fallback for
+    `blocked` (see the omits-for-approved-style suppression covered above)
+    is deliberate, but suppressing it AND leaving the worker with zero signal
+    that something was withheld is not -- the both-empty escape hatch still
+    fires."""
+    decision = {"decision": "blocked", "summary": "", "required_changes": []}
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+
+
+def test_defang_closing_keywords_strips_live_keyword_but_keeps_number_legible() -> None:
+    # Issue #781 AC3: defang_closing_keywords rewrites `<keyword> #N` to
+    # `<keyword> issue N` -- the rewritten text no longer matches the
+    # closing-keyword regex (so it can no longer auto-close or falsely bind
+    # via linked_issue_number), but the issue number stays legible to a
+    # human reader.
+    from charlie_work.github import _CLOSING_KEYWORD_REF, defang_closing_keywords
+
+    text = "does not fix #649"
+    defanged = defang_closing_keywords(text)
+
+    assert _CLOSING_KEYWORD_REF.search(defanged) is None
+    assert "649" in defanged, "issue number must remain legible to a human"
+    assert defanged == "does not fix issue 649"
+
+
+def test_defang_closing_keywords_preserves_non_keyword_hash_refs() -> None:
+    # Bare `#N` (no preceding closing keyword) and `issue #N` mentions pass
+    # through untouched -- defang targets only the live auto-close syntax.
+    # Multiple keyword refs in one string are each independently defanged.
+    from charlie_work.github import defang_closing_keywords
+
+    assert defang_closing_keywords("see #5 for context") == "see #5 for context"
+    assert defang_closing_keywords("related to issue #5") == "related to issue #5"
+    assert (
+        defang_closing_keywords("Closes #1 and also fixes #2")
+        == "Closes issue 1 and also fixes issue 2"
+    )
+
+
+def test_render_required_changes_section_defangs_live_keyword_in_list_tier() -> None:
+    # Issue #781 AC4: reviewer prose in the required_changes list tier must
+    # not carry a live closing keyword into the rendered brief -- a worker
+    # reads this brief and writes its own PR body from it, a boundary
+    # linked_issue_number's hijack-safety check never sees.
+    from charlie_work.github import _CLOSING_KEYWORD_REF
+
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["this does not fix #649, dig deeper"],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "does not fix issue 649" in section
+    assert _CLOSING_KEYWORD_REF.search(section) is None, "live keyword survived"
+
+
+def test_render_required_changes_section_defangs_live_keyword_in_summary_tier() -> None:
+    # Same guarantee for the summary-fallback tier (tier 2).
+    from charlie_work.github import _CLOSING_KEYWORD_REF
+
+    decision = {
+        "decision": "request_changes",
+        "summary": "BLOCKER - does not fix #649. Still broken.",
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "does not fix issue 649" in section
+    assert _CLOSING_KEYWORD_REF.search(section) is None, "live keyword survived"
+
+
+def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) -> None:
+    """F3: _request_no_op_rework_repair's hardcoded no-op note must not
+    displace the reviewer's findings. It routes through _route_to_rework,
+    which calls the shared _write_rework_prompt -- the same single point of
+    enforcement (issue #632) every other rework route uses -- so the
+    reviewer's on-disk verdict is read fresh from review-decision.json,
+    independent of the `summary` argument this method builds. Verified
+    concretely here rather than assumed: this test fails if that separation
+    is ever broken (e.g. a future edit threads the no-op text into
+    review-decision.json's own `summary`, or bypasses _write_rework_prompt)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    reviewer_summary = (
+        "BLOCKER - does not fix #649. The pin is a no-op over uv's resolver; "
+        "the underlying version conflict is still unresolved."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": reviewer_summary,
+        "required_changes": [],
+    }
+    (pr_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+    pr = fake_gh.pr_view(456)
+
+    result = app._request_no_op_rework_repair(pr, 123, decision)
+
+    assert result is None, f"expected a clean label transition, got {result!r}"
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    # The no-op operational note (the "dispatch_note") is present...
+    assert "no actual content change" in brief
+    # ...and the reviewer's original findings are still present alongside it,
+    # not replaced by it -- defanged of the live closing keyword (issue
+    # #781 outbound fix) the same way as the summary-fallback test above.
+    assert "does not fix issue 649" in brief
+    assert "does not fix #649" not in brief, "live closing keyword leaked into brief"
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse whitespace (including the template's hard line-wraps) so
+    substring assertions don't depend on exact word-wrap columns."""
+    return " ".join(text.split())
+
+
+def test_rework_brief_orders_findings_before_demoted_base_merge_bullet(
+    tmp_path: Path,
+) -> None:
+    """F4 (docs/plans/rework-findings-channel.md, #6): the base-merge bullet
+    used to be the unconditional, first bullet of `## Required behavior`. When
+    a verdict rendered zero findings, that made "merge the base branch" the
+    only concrete instruction in the brief -- workers complied, the head
+    advanced by a merge commit only, and the janitor correctly flagged the
+    result a no-op. The findings-action bullet must now open the section, and
+    the base-merge bullet must be demoted (present, but neither first nor
+    unconditional)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "round-1 summary",
+                "required_changes": ["fix the off-by-one", "add a regression test"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+    }
+    app._write_rework_prompt(pr, 123, "")
+
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    # The findings render well above `## Required behavior` at all.
+    assert brief.index("fix the off-by-one") < brief.index("## Required behavior")
+
+    behavior = brief.split("## Required behavior", 1)[1].split("\n## ", 1)[0]
+    bullets = [_normalize_ws(b) for b in behavior.split("\n- ") if b.strip()]
+    findings_bullet_idx = next(i for i, b in enumerate(bullets) if "the review above" in b)
+    merge_bullet_idx = next(i for i, b in enumerate(bullets) if "merge the PR's base branch" in b)
+
+    # The findings-action bullet opens the section; the base-merge bullet
+    # comes strictly later -- reordered, not just co-present.
+    assert findings_bullet_idx == 0
+    assert findings_bullet_idx < merge_bullet_idx
+
+    norm_behavior = _normalize_ws(behavior)
+    # Demoted to a self-conditional trigger, not the mandated opening action.
+    assert "If your branch is behind its base or the PR shows a merge conflict" in norm_behavior
+    assert "First, merge the PR's base branch" not in norm_behavior
+
+
+def test_rework_brief_omits_unconditional_address_findings_sentence_without_findings(
+    tmp_path: Path,
+) -> None:
+    """F4: the brief used to assert 'Address every Critical and Important
+    finding directly' unconditionally, instructing the worker to act on an
+    empty set whenever the verdict rendered zero findings. That sentence must
+    never render, in favor of self-conditional wording that references "the
+    findings above" without asserting they exist. Uses an approved verdict
+    (not request_changes with an empty required_changes list) so this keeps
+    exercising the empty-findings path even after F1's summary fallback lands
+    for request_changes verdicts."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "summary": "lgtm"}),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+    }
+    operational_note = (
+        "The PR branch has a merge conflict. Merge the base branch and resolve. "
+        "The code changes are already approved; do not re-litigate the review."
+    )
+    app._write_rework_prompt(pr, 123, operational_note)
+
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    norm_brief = _normalize_ws(brief)
+    assert "## Required changes" not in brief
+    assert "Address every Critical and Important finding directly" not in norm_brief
+    # The demoted base-merge bullet is still present for the route that
+    # genuinely needs it (the merge-conflict rework path) -- demoted, not
+    # deleted.
+    assert "If your branch is behind its base or the PR shows a merge conflict" in norm_brief
 
 
 def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
@@ -32212,7 +35335,7 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
     ]
     app = _dispatch_reviews_app(tmp_path, prs=prs)
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(

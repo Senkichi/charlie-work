@@ -11,9 +11,17 @@
 # cwd MUST be a registered repo so the fleet command resolves the global config
 # layer (%LOCALAPPDATA%\charlie-work\config.yaml) for the notify digest.
 $ErrorActionPreference = 'Stop'   # fail fast on setup (bad root / unwritable log dir)
-$root = 'C:\Users\senki\repos\charlie-work'
+# Derived from this script's own location ($PSScriptRoot = .../scripts) rather
+# than hardcoded, so the scheduled task keeps working if the repo is ever
+# relocated or checked out under a different user profile.
+$root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+# NOTE: '.var\charlie-work' mirrors the default `runtime.state_dir`
+# (config.RuntimeConfig, default ".var/charlie-work"). This path is
+# deliberately NOT derived from config here (no Python/charlie invocation
+# has happened yet at this point in the script) -- if a repo's config ever
+# overrides runtime.state_dir, this literal must be updated to match.
 $logDir = Join-Path $root '.var\charlie-work\logs'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 $log = Join-Path $logDir 'fleet-pass.log'
