@@ -910,13 +910,18 @@ def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> 
 
 
 def _detect_stalled_sessions(
-    sessions_dir: Path, config: OrchestratorConfig
+    sessions_dir: Path, config: OrchestratorConfig, *, now: datetime | None = None
 ) -> list[dict[str, Any]]:
     """Detect stalled sessions (live PID but dead agent) without handling them.
 
     A session is stalled when its PID is alive but its log file's mtime is
     older than the configured threshold, or the log contains a terminal error
     marker. This is a read-only detection function for status/roll-call.
+
+    ``now`` (issue #828) is the injectable clock, following the convention
+    established by PR #827 / ``get_rate_limit_defer_until``: defaults to
+    ``datetime.now(UTC)`` when omitted, so production behavior is
+    byte-identical.
 
     Returns a list of {issue, pid, health, terminal_tool, terminal_reason}
     dicts for stalled sessions. ``health`` distinguishes STALLED from DEAD
@@ -933,7 +938,8 @@ def _detect_stalled_sessions(
         return []
 
     stalled_entries: list[dict[str, Any]] = []
-    now = datetime.now(UTC)
+    if now is None:
+        now = datetime.now(UTC)
 
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
@@ -984,7 +990,11 @@ def _kill_orphan_pid(pid: int) -> None:
 
 
 def _detect_and_handle_stalled_sessions(
-    sessions_dir: Path, state_file: Path, config: OrchestratorConfig
+    sessions_dir: Path,
+    state_file: Path,
+    config: OrchestratorConfig,
+    *,
+    now: datetime | None = None,
 ) -> list[dict[str, int]]:
     """Detect stalled sessions (live PID but dead agent) and handle them.
 
@@ -1005,6 +1015,14 @@ def _detect_and_handle_stalled_sessions(
     persisted to state.json (same as the dead-session lane) so the next
     dispatch pass defers instead of relaunching into the same window. A
     session_stalled event is logged with the resolved failure_kind.
+
+    ``now`` (issue #828) is the injectable clock for this sweep, following
+    the convention established by PR #827. It is sampled once here and
+    threaded down to ``real_activity_probe_for``, ``classify_worker_health``,
+    ``get_rate_limit_defer_until``, and ``classify_and_record`` so a single
+    pass never straddles two different clock samples. Defaults to
+    ``datetime.now(UTC)`` when omitted, so production behavior is
+    byte-identical.
 
     Returns a list of {issue, pid} dicts for stalled sessions (for exclusion from
     dispatch in the same pass).
@@ -1028,7 +1046,8 @@ def _detect_and_handle_stalled_sessions(
         return []
 
     stalled_entries: list[dict[str, int]] = []
-    now = datetime.now(UTC)
+    if now is None:
+        now = datetime.now(UTC)
 
     def _parse_defer_until(value: str | None) -> datetime | None:
         if not value:
@@ -2362,6 +2381,8 @@ def _detect_and_handle_stalled_reviews(
     state_file: Path,
     config: OrchestratorConfig,
     repo_root: Path,
+    *,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Detect reviewer processes that died without a verdict and free their claims.
 
@@ -2388,7 +2409,17 @@ def _detect_and_handle_stalled_reviews(
     PRs whose log has no parseable verdict fall through to the failed-claim
     retry/backoff path. This function is intentionally simpler than
     ``_detect_and_handle_stalled_sessions``: it performs claim/slot cleanup.
+
+    ``now`` (issue #828) is the injectable clock for this sweep: it seeds
+    ``resolved_now`` below, which both internal ``datetime.now(UTC)`` samples
+    in the throttled-reviewer branch (the parsed-reset-time lookup and the
+    quota-exhaustion backoff) resolve from, instead of each independently
+    racing the wall clock. Defaults to ``datetime.now(UTC)`` when omitted, so
+    production behavior is byte-identical; tests can freeze it and assert
+    exact equality on the resulting ``throttled_until`` instead of a
+    wall-clock-tolerance proximity check.
     """
+    resolved_now = now if now is not None else datetime.now(UTC)
     stalled: list[dict[str, Any]] = []
     sweep_events: list[tuple[str, dict[str, Any]]] = []
     state = load_state_locked(state_file)
@@ -2481,7 +2512,7 @@ def _detect_and_handle_stalled_reviews(
             # already-applied backoff, matching the one-increment-per-wave
             # guard below.
             if throttled and not throttle_backoff_applied:
-                reset_at = parse_reset_clock_time(tail, datetime.now(UTC))
+                reset_at = parse_reset_clock_time(tail, resolved_now)
 
         if throttled:
             # A green flat-interval probe may have already cleared
@@ -2512,7 +2543,7 @@ def _detect_and_handle_stalled_reviews(
                 throttled_until = None
             else:
                 if not throttle_backoff_applied:
-                    now_dt = datetime.now(UTC)
+                    now_dt = resolved_now
                     state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
                         state, config, now_dt, reset_at=reset_at
                     )
@@ -13812,12 +13843,18 @@ class OrchestratorApp:
         merge: bool | None = None,
         now: datetime | None = None,
     ) -> CommandResult:
-        # ``now`` (issue #822) is the injectable clock for the dead-session
-        # throttle classification lane -- see
-        # ``_classify_dead_sessions_and_update_throttle_state``. Defaults to
-        # ``datetime.now(UTC)`` there when omitted, so production behavior is
-        # byte-identical; tests can freeze it to assert exact equality on
-        # ``throttled_until`` instead of a wall-clock-tolerance proximity check.
+        # ``now`` (issue #822, extended #828) is this pass's injectable clock.
+        # ``_loop_body`` forwards it, unresolved, to every cadence-gated lane
+        # that samples wall-clock time: dead-session throttle classification
+        # (``_classify_dead_sessions_and_update_throttle_state``), the
+        # stalled-session reaper (``_detect_and_handle_stalled_sessions``),
+        # and the quota-probe/worktree-reclaim/drift-reconcile schedulers
+        # (``_maybe_probe_quota_recovery``, ``_maybe_reclaim_worktrees``,
+        # ``_maybe_reconcile_drift``). Each callee independently defaults to
+        # ``datetime.now(UTC)`` when it receives None, so production behavior
+        # is byte-identical when this argument is omitted (as all current
+        # production callers do); tests can freeze one ``now`` and assert
+        # exact equality instead of a wall-clock-tolerance proximity check.
         return self._loop_impl(limit, merge=merge, now=now)
 
     def _loop_impl(
@@ -13865,7 +13902,7 @@ class OrchestratorApp:
             )
             return result
 
-    def _maybe_probe_quota_recovery(self) -> None:
+    def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
         """Flat-interval Haiku probe for early quota/rate-limit throttle recovery.
 
         Runs every loop pass but is a near-no-op unless a throttle that a
@@ -13895,10 +13932,20 @@ class OrchestratorApp:
           2. Outside the lock: run the actual probe subprocess.
           3. Under the lock again: re-read state (it may have changed while
              unlocked) and apply the outcome.
+
+        ``now`` (issue #828) is the injectable clock for this whole method:
+        both internal ``datetime.now(UTC)`` samples below (the first-arm
+        branch and the red-probe reschedule branch) resolve from the same
+        seeded instant instead of each independently racing the wall clock.
+        Defaults to ``datetime.now(UTC)`` when omitted, so production
+        behavior is byte-identical; tests can freeze it and assert exact
+        equality on the scheduled ``next_probe_at`` instead of a
+        wall-clock-tolerance proximity check.
         """
         if not self.config.quota_probe.enabled:
             return
 
+        resolved_now = now if now is not None else datetime.now(UTC)
         state_file = self.paths.state_file
         with state_lock(state_file):
             state = load_state(state_file)
@@ -13909,10 +13956,7 @@ class OrchestratorApp:
                 return
             if not is_quota_probe_armed(state):
                 next_probe_at = (
-                    (
-                        datetime.now(UTC)
-                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
-                    )
+                    (resolved_now + timedelta(minutes=self.config.quota_probe.interval_minutes))
                     .replace(microsecond=0)
                     .isoformat()
                     .replace("+00:00", "Z")
@@ -13938,10 +13982,7 @@ class OrchestratorApp:
                 state = self._record_event(state, "quota_probe_succeeded", {})
             else:
                 next_probe_at = (
-                    (
-                        datetime.now(UTC)
-                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
-                    )
+                    (resolved_now + timedelta(minutes=self.config.quota_probe.interval_minutes))
                     .replace(microsecond=0)
                     .isoformat()
                     .replace("+00:00", "Z")
@@ -13957,7 +13998,7 @@ class OrchestratorApp:
                 state = self._record_event(state, "quota_probe_failed", {})
             save_state(state_file, state)
 
-    def _maybe_reclaim_worktrees(self) -> dict[str, Any] | None:
+    def _maybe_reclaim_worktrees(self, *, now: datetime | None = None) -> dict[str, Any] | None:
         """Cadence-gated merged-PR worktree reclamation on the fleet pass.
 
         Runs ``clean_worktrees`` -- the same junction-safe, merge-gated,
@@ -13992,9 +14033,18 @@ class OrchestratorApp:
         Returns a small summary dict when the sweep ran (for the loop result's
         ``data``), or ``None`` when reclamation is disabled or not due this
         pass.
+
+        ``now`` (issue #828) is the injectable clock used to compute
+        ``next_run_at`` below, BEFORE the ``clean_worktrees`` call's live
+        ``gh pr view`` fan-out. Defaults to ``datetime.now(UTC)`` when
+        omitted, so production behavior is byte-identical; tests can freeze
+        it and assert exact equality on the scheduled ``next_run_at`` instead
+        of a wall-clock-tolerance proximity check that would otherwise race
+        the fan-out's own duration.
         """
         if not self.config.worktree_reclamation.enabled:
             return None
+        resolved_now = now if now is not None else datetime.now(UTC)
         state_file = self.paths.state_file
         with state_lock(state_file):
             state = load_state(state_file)
@@ -14006,7 +14056,7 @@ class OrchestratorApp:
             # how long the sweep itself takes.
             next_run_at = (
                 (
-                    datetime.now(UTC)
+                    resolved_now
                     + timedelta(minutes=self.config.worktree_reclamation.interval_minutes)
                 )
                 .replace(microsecond=0)
@@ -14051,7 +14101,7 @@ class OrchestratorApp:
             save_state(state_file, state)
         return summary
 
-    def _maybe_reconcile_drift(self) -> None:
+    def _maybe_reconcile_drift(self, *, now: datetime | None = None) -> None:
         """Periodic in-loop repair of GitHub label / state.json divergence.
 
         merge-lane-recovery plan §6-B / D-8. ``OrchestratorApp.reconcile()``
@@ -14134,10 +14184,20 @@ class OrchestratorApp:
         path. A failed pass re-arms the timer like any other outcome, so a
         persistent failure degrades to one logged error per interval instead
         of a hot loop.
+
+        ``now`` (issue #828) is the injectable clock used to compute
+        ``next_reconcile_at`` below, BEFORE ``self._reconcile_locked(...)``
+        acquires ``state_lock`` and does its own (potentially slow) drift
+        detection/repair. Defaults to ``datetime.now(UTC)`` when omitted, so
+        production behavior is byte-identical; tests can freeze it and
+        assert exact equality on the scheduled ``next_reconcile_at`` instead
+        of a wall-clock-tolerance proximity check that would otherwise race
+        the reconcile call's own duration.
         """
         if not self.config.reconcile_pass.enabled:
             return
 
+        resolved_now = now if now is not None else datetime.now(UTC)
         state_file = self.paths.state_file
         with state_lock(state_file):
             state = load_state(state_file)
@@ -14145,7 +14205,7 @@ class OrchestratorApp:
                 return
 
         next_reconcile_at = (
-            (datetime.now(UTC) + timedelta(minutes=self.config.reconcile_pass.interval_minutes))
+            (resolved_now + timedelta(minutes=self.config.reconcile_pass.interval_minutes))
             .replace(microsecond=0)
             .isoformat()
             .replace("+00:00", "Z")
@@ -14638,8 +14698,11 @@ class OrchestratorApp:
         # dispatch lane advanced the counter up to 3x per pass, collapsing the
         # max_inconclusive_probe_deferrals "N passes of grace" into a single pass
         # (issue #343 Finding 2).
+        # now=now (issue #828): forward this pass's clock so the reaper's
+        # rate-limit-defer classification shares one sample with the other
+        # cadence-gated lanes below instead of re-sampling independently.
         loop_stalled_entries = _detect_and_handle_stalled_sessions(
-            sessions_dir, self.paths.state_file, self.config
+            sessions_dir, self.paths.state_file, self.config, now=now
         )
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
@@ -14670,7 +14733,10 @@ class OrchestratorApp:
 
         # Flat-interval Haiku probe for early quota/rate-limit recovery (see
         # docstring): only does real work when a throttle indicator is active.
-        self._maybe_probe_quota_recovery()
+        # `now` (issue #828) is this pass's single injected clock, forwarded
+        # so the probe's own cadence-scheduling samples stay consistent with
+        # the rest of this pass instead of independently racing wall clock.
+        self._maybe_probe_quota_recovery(now=now)
 
         # Periodic in-loop reconcile (merge-lane-recovery §6-B): repairs
         # GitHub label / state.json divergence on a fixed cadence instead of
@@ -14678,7 +14744,7 @@ class OrchestratorApp:
         # the dispatch calls below so labels it repairs (e.g. a stale
         # `needs-rework` on an issue state already marked `escalated`) are
         # visible to this same pass's dispatch decisions, not just the next.
-        self._maybe_reconcile_drift()
+        self._maybe_reconcile_drift(now=now)
 
         # Issue #783: periodic re-evaluation of `mechanical` escalations --
         # the only automated re-entry from `agent:human-needed` for pure
@@ -15075,8 +15141,10 @@ class OrchestratorApp:
         # contends with the dispatch/review/merge lanes for state_lock or
         # GitHub quota during the critical window. Gated by
         # worktree_reclamation.interval_minutes, so it fires at most once per
-        # interval regardless of poll frequency or backlog size.
-        reclamation = self._maybe_reclaim_worktrees()
+        # interval regardless of poll frequency or backlog size. `now`
+        # (issue #828) is this pass's single injected clock -- see
+        # `_loop_body`'s other cadence-gated calls above.
+        reclamation = self._maybe_reclaim_worktrees(now=now)
         if reclamation is not None:
             data["worktrees_reclaimed"] = reclamation
         return CommandResult(

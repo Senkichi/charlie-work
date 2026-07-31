@@ -27842,18 +27842,28 @@ def test_maybe_probe_quota_recovery_arms_on_first_pass_without_probing(tmp_path:
     def _fail_if_called(**_kwargs: object) -> bool:
         raise AssertionError("first pass after onset must arm, not probe")
 
+    # frozen_now (issue #828) is injected so the schedule assertion below is
+    # exact instead of racing wall-clock time under CI runner contention --
+    # no downstream real-clock-dependent step follows in this test, so no
+    # offset is needed (contrast test_loop_classifies_dead_sessions_...,
+    # which offsets +1h because a later dispatch() reads real wall clock).
+    frozen_now = datetime.now(UTC)
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(workflow_module, "run_quota_probe", _fail_if_called)
     try:
-        app._maybe_probe_quota_recovery()
+        app._maybe_probe_quota_recovery(now=frozen_now)
     finally:
         monkeypatch.undo()
 
     state = load_state(app.paths.state_file)
     next_probe_at = state["quota_probe"]["next_probe_at"]
-    parsed = datetime.fromisoformat(next_probe_at.replace("Z", "+00:00"))
-    expected = datetime.now(UTC) + timedelta(minutes=15)
-    assert abs((parsed - expected).total_seconds()) < 5
+    expected = (
+        (frozen_now + timedelta(minutes=15))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    assert next_probe_at == expected
 
 
 def test_maybe_probe_quota_recovery_waits_until_due(tmp_path: Path) -> None:
@@ -27977,14 +27987,21 @@ def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_thro
 
     monkeypatch.setattr(workflow_module, "run_quota_probe", lambda **_kwargs: False)
 
-    app._maybe_probe_quota_recovery()
+    # frozen_now (issue #828) injected for an exact schedule assertion; no
+    # downstream real-clock dependency follows, so no offset is needed.
+    frozen_now = datetime.now(UTC)
+    app._maybe_probe_quota_recovery(now=frozen_now)
 
     state = load_state(app.paths.state_file)
     # Flat interval: rescheduled ~15 minutes out again, not a growing backoff.
     next_probe_at = state["quota_probe"]["next_probe_at"]
-    parsed = datetime.fromisoformat(next_probe_at.replace("Z", "+00:00"))
-    expected = datetime.now(UTC) + timedelta(minutes=15)
-    assert abs((parsed - expected).total_seconds()) < 5
+    expected = (
+        (frozen_now + timedelta(minutes=15))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    assert next_probe_at == expected
     assert state["throttled_until"] == future
     assert any(e["kind"] == "quota_probe_failed" for e in state["events"])
 
@@ -28505,7 +28522,12 @@ def test_maybe_reclaim_worktrees_runs_and_emits_event(
 
     monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
 
-    summary = app._maybe_reclaim_worktrees()
+    # frozen_now (issue #828) injected so the schedule assertion below is
+    # exact instead of racing the sweep's own duration (or a CI stall
+    # between the schedule computation and this assertion). No downstream
+    # real-clock dependency follows in this test, so no offset is needed.
+    frozen_now = datetime.now(UTC)
+    summary = app._maybe_reclaim_worktrees(now=frozen_now)
 
     assert summary is not None
     assert summary["dry_run"] is False
@@ -28518,9 +28540,13 @@ def test_maybe_reclaim_worktrees_runs_and_emits_event(
     # The schedule was advanced ~interval_minutes into the future, so the very
     # next pass does not re-fire the per-candidate gh fan-out.
     next_run_at = state["worktree_reclamation"]["next_run_at"]
-    parsed = datetime.fromisoformat(next_run_at.replace("Z", "+00:00"))
-    expected = datetime.now(UTC) + timedelta(minutes=60)
-    assert abs((parsed - expected).total_seconds()) < 5
+    expected = (
+        (frozen_now + timedelta(minutes=60))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    assert next_run_at == expected
 
 
 def test_maybe_reclaim_worktrees_advances_schedule_before_sweep(
@@ -28587,6 +28613,70 @@ def _reconcile_pass_app(
     return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())
 
 
+def test_loop_forwards_shared_now_to_cadence_gated_lanes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #828 (critical wiring test): a single frozen ``now`` passed to
+    ``loop()`` must reach every cadence-gated lane's ``now`` keyword
+    unchanged -- ``_maybe_probe_quota_recovery``, ``_maybe_reconcile_drift``,
+    ``_maybe_reclaim_worktrees``, and the module-level
+    ``_detect_and_handle_stalled_sessions`` reaper. Each of those functions
+    is exercised directly (not via loop()) by its own dedicated test
+    elsewhere in this file, so none of those tests would notice a future
+    edit that deleted the ``now=now`` forwarding at loop()'s call sites in
+    ``_loop_body`` -- this test exists specifically to catch that class of
+    regression (L3 "wired", not merely L2 "exists and works standalone").
+    Every lane is stubbed to a no-op recorder rather than asserted on
+    cadence state, so the test is immune to each lane's own due/not-due
+    gating and to the unrelated behavior each lane performs.
+    """
+    from charlie_work import workflow as workflow_module
+
+    app = _reconcile_pass_app(tmp_path)
+    frozen_now = datetime.now(UTC)
+    received: dict[str, datetime | None] = {}
+
+    def _record_probe(self: OrchestratorApp, *, now: datetime | None = None) -> None:
+        received["probe_quota_recovery"] = now
+
+    def _record_reconcile(self: OrchestratorApp, *, now: datetime | None = None) -> None:
+        received["reconcile_drift"] = now
+
+    def _record_reclaim(
+        self: OrchestratorApp, *, now: datetime | None = None
+    ) -> dict[str, Any] | None:
+        received["reclaim_worktrees"] = now
+        return None
+
+    def _record_stalled_sessions(
+        sessions_dir: Path,
+        state_file: Path,
+        config: OrchestratorConfig,
+        *,
+        now: datetime | None = None,
+    ) -> list[dict[str, int]]:
+        received["stalled_sessions"] = now
+        return []
+
+    monkeypatch.setattr(OrchestratorApp, "_maybe_probe_quota_recovery", _record_probe)
+    monkeypatch.setattr(OrchestratorApp, "_maybe_reconcile_drift", _record_reconcile)
+    monkeypatch.setattr(OrchestratorApp, "_maybe_reclaim_worktrees", _record_reclaim)
+    monkeypatch.setattr(
+        workflow_module, "_detect_and_handle_stalled_sessions", _record_stalled_sessions
+    )
+
+    app.loop(limit=0, now=frozen_now)
+
+    assert received.keys() == {
+        "probe_quota_recovery",
+        "reconcile_drift",
+        "reclaim_worktrees",
+        "stalled_sessions",
+    }
+    for lane, value in received.items():
+        assert value is frozen_now, f"{lane} did not receive the pass's frozen now"
+
+
 def test_maybe_reconcile_drift_noop_when_disabled(tmp_path: Path) -> None:
     """B-AC1/B-AC2: reconcile_pass.enabled=False must skip reconcile entirely --
     no call to reconcile(), no schedule armed, no summary event."""
@@ -28634,10 +28724,15 @@ def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -
         calls.append((fix, skip_dead_session_sweep))
         return original_reconcile_locked(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
 
+    # frozen_now (issue #828) injected so the schedule assertion below is
+    # exact instead of racing _reconcile_locked's own duration (or a CI
+    # stall). No downstream real-clock dependency follows in this test, so
+    # no offset is needed.
+    frozen_now = datetime.now(UTC)
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(app, "_reconcile_locked", _counting_reconcile_locked)
     try:
-        app._maybe_reconcile_drift()
+        app._maybe_reconcile_drift(now=frozen_now)
     finally:
         monkeypatch.undo()
 
@@ -28652,9 +28747,13 @@ def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -
 
     state = load_state(app.paths.state_file)
     next_at = state["reconcile_pass"]["next_reconcile_at"]
-    parsed = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-    expected = datetime.now(UTC) + timedelta(minutes=30)
-    assert abs((parsed - expected).total_seconds()) < 5
+    expected = (
+        (frozen_now + timedelta(minutes=30))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    assert next_at == expected
 
     events = state.get("events", [])
     completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
