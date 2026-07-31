@@ -22,6 +22,7 @@ from charlie_work.fleet_dispatch import (
     ApiWorkerFleetReport,
     _build_fleet_attention_digest,
     _extract_attention_events,
+    _fleet_has_configured_repos,
     _is_fleet_pass_active,
     _lane_failure_state_path,
     _run_fleet_allocation_prologue,
@@ -3899,6 +3900,264 @@ def test_run_fleet_supervise_self_deploy_success_clears_error_baseline(
 
     state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
     assert _load_state(state_file) == {"self-deploy:-1": "OK"}
+
+
+# ---------------------------------------------------------------------------
+# Zero-repo-pass streak (issue #855, the general shape behind #851)
+# ---------------------------------------------------------------------------
+
+
+def test_fleet_has_configured_repos_true_with_registered_repo(tmp_path: Path) -> None:
+    fleet_dir = tmp_path / "fleet"
+    _make_fleet_json(tmp_path, fleet_dir, {"owner/repo": {"repo_root": str(tmp_path / "repo")}})
+    assert _fleet_has_configured_repos(str(fleet_dir), None) is True
+
+
+def test_fleet_has_configured_repos_false_with_empty_registry(tmp_path: Path) -> None:
+    fleet_dir = tmp_path / "fleet"
+    _make_fleet_json(tmp_path, fleet_dir, {})
+    assert _fleet_has_configured_repos(str(fleet_dir), None) is False
+
+
+def test_fleet_has_configured_repos_false_with_no_registry_file(tmp_path: Path) -> None:
+    """A fleet.json that was never written (fresh host, nothing registered
+    yet) must read the same as an explicitly empty registry."""
+    assert _fleet_has_configured_repos(str(tmp_path / "never-written"), None) is False
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #855 acceptance criterion 7: replay the #851 outage shape.
+
+    N consecutive supervisor *process* restarts -- each modeled as a
+    separate ``run_fleet_supervise()`` call, exactly like the Task Scheduler
+    watchdog relaunching the process every cycle -- every one exiting via
+    the self-deploy HEAD-moved break before ``fleet_loop`` ever runs: exit
+    code 0 every cycle, ``repo_passes == 0`` every cycle (the log line the
+    issue's evidence quotes: "1 pass(es) ... 0 repo pass(es)"), despite a
+    repo being registered in the fleet. Exactly one
+    ``supervisor_zero_pass_alarm`` must fire, at the cycle the persisted
+    streak reaches the configured threshold (3) -- not one per restart.
+    """
+    mock_lock.return_value = MagicMock()
+
+    fleet_dir = tmp_path / "fleet"
+    isolated_root = tmp_path / "orchestrator-root"
+    isolated_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _make_fleet_json(tmp_path, fleet_dir, {"owner/repo": {"repo_root": str(repo_root)}})
+
+    # Isolate orchestrator_root() so the streak counter and alarm event
+    # land under an ephemeral tmp_path state dir, never the real checkout
+    # this test suite runs from.
+    monkeypatch.setattr("charlie_work.fleet_dispatch.orchestrator_root", lambda: isolated_root)
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+            zero_pass_alarm=3,
+        )
+    )
+    mock_load_config.return_value = cfg
+
+    # Every self_deploy call reports a HEAD move -> run_fleet_supervise
+    # exits (break) right after pass 1, before ever reaching fleet_loop this
+    # process's lifetime.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        lambda _repo_root, **_kwargs: SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            from_sha="a" * 12,
+            to_sha="b" * 12,
+            message="updated and synced: " + "b" * 12,
+        ),
+    )
+
+    state_path = layout.state_file_path(layout.default_state_root(isolated_root))
+
+    for cycle in range(1, 4):
+        fc = _FakeClock(auto_advance=1.0)
+        result = run_fleet_supervise(
+            fleet_dir_override=str(fleet_dir),
+            max_passes=5,
+            clock=fc.now,
+            sleep=fc.sleep,
+        )
+        assert result.ok is True
+        assert result.data["passes"] == 1
+        assert result.data["total_repo_passes"] == 0
+        # fleet_loop must never run -- every cycle exits before reaching it.
+        assert mock_fleet_loop.call_count == 0
+
+        alarms = query_events(state_path, kind="supervisor_zero_pass_alarm")
+        if cycle < 3:
+            assert alarms == [], f"alarm fired early at cycle {cycle}"
+        else:
+            assert len(alarms) == 1, f"expected exactly one alarm by cycle {cycle}"
+            assert alarms[0]["payload"]["consecutive_zero_pass_cycles"] == 3
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #855 acceptance criterion 4, exercised end to end: a fleet with
+    zero registered repos never fires the alarm, no matter how many
+    consecutive zero-repo-pass cycles it runs -- that is a configuration
+    state, not an incident.
+    """
+    mock_lock.return_value = MagicMock()
+
+    fleet_dir = tmp_path / "fleet"
+    isolated_root = tmp_path / "orchestrator-root"
+    isolated_root.mkdir()
+    # Deliberately no _make_fleet_json call: the registry is empty.
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.orchestrator_root", lambda: isolated_root)
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        lambda _repo_root, **_kwargs: SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            from_sha="a" * 12,
+            to_sha="b" * 12,
+            message="updated and synced: " + "b" * 12,
+        ),
+    )
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+            zero_pass_alarm=3,
+        )
+    )
+    mock_load_config.return_value = cfg
+
+    state_path = layout.state_file_path(layout.default_state_root(isolated_root))
+
+    for _ in range(6):
+        fc = _FakeClock(auto_advance=1.0)
+        result = run_fleet_supervise(
+            fleet_dir_override=str(fleet_dir),
+            max_passes=5,
+            clock=fc.now,
+            sleep=fc.sleep,
+        )
+        assert result.ok is True
+        assert result.data["total_repo_passes"] == 0
+
+    assert mock_fleet_loop.call_count == 0
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A cycle that actually reaches fleet_loop and performs repo work resets
+    the streak to 0, so a later zero-pass streak has to build back up to the
+    threshold instead of alarming immediately off carried-over count.
+    """
+    mock_lock.return_value = MagicMock()
+
+    fleet_dir = tmp_path / "fleet"
+    isolated_root = tmp_path / "orchestrator-root"
+    isolated_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _make_fleet_json(tmp_path, fleet_dir, {"owner/repo": {"repo_root": str(repo_root)}})
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.orchestrator_root", lambda: isolated_root)
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+            zero_pass_alarm=3,
+        )
+    )
+    mock_load_config.return_value = cfg
+    state_path = layout.state_file_path(layout.default_state_root(isolated_root))
+
+    head_moved = SelfDeployResult(
+        ok=True,
+        pulled=True,
+        changed=True,
+        synced=False,
+        from_sha="a" * 12,
+        to_sha="b" * 12,
+        message="updated and synced: " + "b" * 12,
+    )
+    no_op = SelfDeployResult(
+        ok=True, pulled=True, changed=False, synced=False, message="already up to date"
+    )
+
+    # Two zero-repo-pass cycles (streak -> 2, below threshold 3).
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: head_moved
+    )
+    for _ in range(2):
+        fc = _FakeClock(auto_advance=1.0)
+        run_fleet_supervise(
+            fleet_dir_override=str(fleet_dir), max_passes=5, clock=fc.now, sleep=fc.sleep
+        )
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
+
+    # A cycle that actually performs repo work: self_deploy is a no-op, so
+    # the loop proceeds to fleet_loop, which reports one repo processed.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: no_op
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(
+        fleet_dir_override=str(fleet_dir), max_passes=1, clock=fc.now, sleep=fc.sleep
+    )
+    assert result.data["total_repo_passes"] == 1
+
+    # Two more zero-repo-pass cycles: if the streak had not reset, this
+    # would already be 4 (past threshold 3) and would have alarmed already;
+    # since it reset to 0, two more cycles land at 2 -- still below 3.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: head_moved
+    )
+    for _ in range(2):
+        fc = _FakeClock(auto_advance=1.0)
+        run_fleet_supervise(
+            fleet_dir_override=str(fleet_dir), max_passes=5, clock=fc.now, sleep=fc.sleep
+        )
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
 
 
 def test_filter_fleet_health_transitions_reconciles_stale_key_when_repo_observed(

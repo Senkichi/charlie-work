@@ -27,8 +27,10 @@ from charlie_work.supervise import (
     _record_self_deploy_failure_streak,
     _self_deploy_failure_counter_path,
     _self_deploy_state_path,
+    _zero_pass_streak_counter_path,
     has_delta,
     orchestrator_root,
+    record_zero_pass_streak,
     run_supervised,
     self_deploy,
     should_exit,
@@ -1486,6 +1488,108 @@ def test_self_deploy_failure_alarm_threshold_zero_disables(
     for _ in range(5):
         self_deploy(tmp_path, run_command=_fake_pull_failure_runner(), failure_alarm_threshold=0)
     assert query_events(state_path, kind="self_deploy_alarm") == []
+
+
+def test_zero_pass_streak_fires_alarm_once_at_threshold(tmp_path: Path) -> None:
+    """Issue #855: three consecutive zero-repo-pass cycles (with at least one
+    repo configured) cross the default threshold (3) and fire exactly one
+    ``supervisor_zero_pass_alarm`` event -- not one per cycle past the
+    threshold -- and a subsequent cycle with repo_passes > 0 resets the
+    counter so a later 0-pass streak starts counting from zero again instead
+    of re-alarming immediately. Mirrors
+    test_self_deploy_failure_streak_fires_alarm_once_at_threshold exactly.
+    """
+    state_path = _self_deploy_state_path(tmp_path)
+    counter_path = _zero_pass_streak_counter_path(tmp_path)
+
+    record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=True, threshold=3)
+    record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=True, threshold=3)
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
+
+    record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=True, threshold=3)
+    alarms = query_events(state_path, kind="supervisor_zero_pass_alarm")
+    assert len(alarms) == 1
+    assert alarms[0]["payload"]["consecutive_zero_pass_cycles"] == 3
+    assert alarms[0]["payload"]["threshold"] == 3
+    assert alarms[0]["level"] == "error"
+
+    # A fourth consecutive zero-pass cycle must not fire a second alarm.
+    record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=True, threshold=3)
+    assert len(query_events(state_path, kind="supervisor_zero_pass_alarm")) == 1
+
+    counter = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert counter["consecutive_zero_pass_cycles"] == 4
+
+    # A cycle with repo_passes > 0 resets the streak.
+    record_zero_pass_streak(tmp_path, repo_passes=2, repos_configured=True, threshold=3)
+    counter_after_reset = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert counter_after_reset["consecutive_zero_pass_cycles"] == 0
+
+    # Two more zero-pass cycles after the reset must not re-fire the alarm
+    # yet (streak restarted at 0, threshold is 3).
+    record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=True, threshold=3)
+    record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=True, threshold=3)
+    assert len(query_events(state_path, kind="supervisor_zero_pass_alarm")) == 1
+
+
+def test_zero_pass_streak_never_fires_when_repos_not_configured(tmp_path: Path) -> None:
+    """Issue #855 acceptance criterion 4: a fleet with zero configured repos
+    is a configuration state, not an incident. Any number of zero-repo-pass
+    cycles with ``repos_configured=False`` must never fire the alarm, and
+    must not move the counter in either direction (the counter file is not
+    even created).
+    """
+    state_path = _self_deploy_state_path(tmp_path)
+    counter_path = _zero_pass_streak_counter_path(tmp_path)
+
+    for _ in range(10):
+        record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=False, threshold=3)
+
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
+    assert not counter_path.exists()
+
+
+def test_zero_pass_streak_never_fires_when_repo_passes_positive(tmp_path: Path) -> None:
+    """A cycle that performs repo work (repo_passes > 0) never emits the
+    alarm, however many times it repeats.
+    """
+    state_path = _self_deploy_state_path(tmp_path)
+
+    for _ in range(10):
+        record_zero_pass_streak(tmp_path, repo_passes=1, repos_configured=True, threshold=3)
+
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
+
+
+def test_record_zero_pass_streak_creates_state_dir_when_absent(tmp_path: Path) -> None:
+    """``record_zero_pass_streak`` must create its own state directory
+    before acquiring ``state_lock`` -- it must not rely on some other call
+    having already created it as a side effect. Calling it directly, with no
+    prior state-dir-creating call in this process, isolates the bug: without
+    the pre-lock ``mkdir``, ``state_lock`` tries to create a sibling
+    ``.lock`` file in a nonexistent directory and raises, which would
+    propagate out of run_fleet_supervise's post-loop bookkeeping. Mirrors
+    test_record_self_deploy_failure_streak_creates_state_dir_when_absent.
+    """
+    counter_path = _zero_pass_streak_counter_path(tmp_path)
+    assert not counter_path.parent.exists()
+
+    # must not raise
+    record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=True, threshold=3)
+
+    assert counter_path.exists()
+    counter = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert counter["consecutive_zero_pass_cycles"] == 1
+
+
+def test_zero_pass_alarm_threshold_zero_disables(tmp_path: Path) -> None:
+    """``threshold<=0`` disables the alarm entirely, matching
+    ``self_deploy_failure_alarm``'s "0 disables" convention.
+    """
+    state_path = _self_deploy_state_path(tmp_path)
+    for _ in range(5):
+        record_zero_pass_streak(tmp_path, repo_passes=0, repos_configured=True, threshold=0)
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
 
 
 def test_orchestrator_root_contains_pyproject_toml() -> None:

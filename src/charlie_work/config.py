@@ -1245,6 +1245,12 @@ class SupervisorConfig:
     ``self_deploy_failure_alarm``: consecutive ``self_deploy`` failures before
     a ``self_deploy_alarm`` events.db entry fires (default 3, mirrors
     ``AutoMergeConfig.failed_attempt_alarm``). 0 disables the alarm.
+    ``zero_pass_alarm``: consecutive fleet-supervisor cycles that complete
+    with zero repo passes, despite at least one repo being configured,
+    before a ``supervisor_zero_pass_alarm`` events.db entry fires (default 3,
+    mirrors ``self_deploy_failure_alarm``). 0 disables the alarm. A cycle
+    with zero repos configured never counts toward this streak in either
+    direction -- that is a configuration state, not an incident (issue #855).
     """
 
     poll_interval_seconds: int = 20
@@ -1252,6 +1258,7 @@ class SupervisorConfig:
     active_cooldown_seconds: int = 30
     max_runtime_minutes: int = 0
     self_deploy_failure_alarm: int = 3
+    zero_pass_alarm: int = 3
 
 
 @dataclass(frozen=True)
@@ -2361,6 +2368,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         "active_cooldown_seconds",
         "max_runtime_minutes",
         "self_deploy_failure_alarm",
+        "zero_pass_alarm",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):
