@@ -295,18 +295,29 @@ def _canonical_started_at(started_at: Any, process_start_time: Any | None = None
 
 
 def is_claim_stale(
-    claim_timestamp: str | None, *, timeout_minutes: int = _STALE_CLAIM_TIMEOUT_MINUTES
+    claim_timestamp: str | None,
+    *,
+    timeout_minutes: int = _STALE_CLAIM_TIMEOUT_MINUTES,
+    now: datetime | None = None,
 ) -> bool:
     """Check if a dispatch_pending claim is stale and should be re-dispatchable.
 
     A claim is stale if it's older than ``timeout_minutes``.
     This prevents crashed phase-2 processes from wedging issues permanently.
+
+    ``now`` is the injectable clock (issue #828): defaults to
+    ``datetime.now(UTC)`` when not supplied, so production behavior is
+    byte-identical. A caller evaluating several claims against one shared
+    instant (e.g. a single sweep pass) should sample ``now`` once and pass
+    the same value through, instead of letting each check independently
+    race the wall clock.
     """
     if not claim_timestamp:
         return False
     try:
         claim_time = datetime.fromisoformat(claim_timestamp.replace("Z", "+00:00"))
-        age = datetime.now(UTC) - claim_time
+        resolved_now = now if now is not None else datetime.now(UTC)
+        age = resolved_now - claim_time
         return age > timedelta(minutes=timeout_minutes)
     except (ValueError, TypeError):
         # Malformed timestamp — treat as stale to be safe

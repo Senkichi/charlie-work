@@ -1455,6 +1455,7 @@ def _is_review_dispatchable(
     candidate: dict[str, Any],
     *,
     max_attempts: int = 3,
+    now: datetime | None = None,
 ) -> bool:
     """Return True if ``pr_number`` is free to receive a new reviewer dispatch.
 
@@ -1467,6 +1468,13 @@ def _is_review_dispatchable(
 
     This reuses ``is_claim_stale`` for the timeout and ``_reviewer_pid_alive``
     for liveness, avoiding a parallel mechanism.
+
+    ``now`` is the injectable clock (issue #828), forwarded to every
+    ``is_claim_stale`` call below: defaults to ``datetime.now(UTC)`` there
+    when not supplied, so production behavior is byte-identical. Callers
+    evaluating a whole candidate list against one shared instant (e.g.
+    ``dispatch_reviews``) should sample ``now`` once and pass the same value
+    to each ``_is_review_dispatchable`` call.
     """
     pr_state = state["prs"].get(str(pr_number), {})
     status = pr_state.get("review_dispatch_status")
@@ -1485,7 +1493,7 @@ def _is_review_dispatchable(
     if status == "review_dispatch_pending":
         pending_at = pr_state.get("review_dispatch_pending_at")
         return pending_at is None or is_claim_stale(
-            pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
         )
 
     if status == "review_dispatch_dispatched":
@@ -1502,13 +1510,13 @@ def _is_review_dispatchable(
         # (e.g. died before its sidecar was written).
         dispatched_at = pr_state.get("review_dispatched_at")
         return dispatched_at is None or is_claim_stale(
-            dispatched_at, timeout_minutes=_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES
+            dispatched_at, timeout_minutes=_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES, now=now
         )
 
     if status == "review_dispatch_failed":
         failed_at = pr_state.get("review_dispatch_failed_at")
         return failed_at is None or is_claim_stale(
-            failed_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            failed_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
         )
 
     # Unknown status: treat as free so we don't silently orphan PRs.
@@ -2362,6 +2370,8 @@ def _detect_and_handle_stalled_reviews(
     state_file: Path,
     config: OrchestratorConfig,
     repo_root: Path,
+    *,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Detect reviewer processes that died without a verdict and free their claims.
 
@@ -2388,6 +2398,12 @@ def _detect_and_handle_stalled_reviews(
     PRs whose log has no parseable verdict fall through to the failed-claim
     retry/backoff path. This function is intentionally simpler than
     ``_detect_and_handle_stalled_sessions``: it performs claim/slot cleanup.
+
+    ``now`` is the injectable clock (issue #828), forwarded to every
+    ``is_claim_stale`` check in this sweep: defaults to ``datetime.now(UTC)``
+    when not supplied, so production behavior is byte-identical, and every
+    claim in one sweep is evaluated against a single consistent instant
+    instead of each check independently racing the wall clock.
     """
     stalled: list[dict[str, Any]] = []
     sweep_events: list[tuple[str, dict[str, Any]]] = []
@@ -2423,7 +2439,9 @@ def _detect_and_handle_stalled_reviews(
         # Respect the stale-claim timeout so a very recently dead reviewer is
         # not immediately re-dispatched (which can thrash if the underlying
         # launch path is flaky). Old dead reviewers become re-dispatchable.
-        if not is_claim_stale(w.started_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
+        if not is_claim_stale(
+            w.started_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
+        ):
             continue
 
         seen_pr_keys.add(pr_key)
@@ -2680,7 +2698,7 @@ def _detect_and_handle_stalled_reviews(
         if status == "review_dispatch_pending":
             pending_at = pr_state.get("review_dispatch_pending_at")
             if pending_at and is_claim_stale(
-                pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+                pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
             ):
                 state["prs"][pr_key] = {
                     **pr_state,
@@ -2719,7 +2737,7 @@ def _detect_and_handle_stalled_reviews(
                 continue
             dispatched_at = pr_state.get("review_dispatched_at")
             if dispatched_at and is_claim_stale(
-                dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+                dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
             ):
                 state["prs"][pr_key] = {
                     **pr_state,
@@ -2784,7 +2802,9 @@ def _detect_and_handle_stalled_reviews(
                 .isoformat()
                 .replace("+00:00", "Z")
             )
-            if not is_claim_stale(packet_age, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
+            if not is_claim_stale(
+                packet_age, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
+            ):
                 continue
 
             state["prs"][pr_key] = {
@@ -8912,7 +8932,9 @@ class OrchestratorApp:
         }
 
     @_guard_state_lock
-    def dispatch_reviews(self, limit: int | None = None) -> CommandResult:
+    def dispatch_reviews(
+        self, limit: int | None = None, *, now: datetime | None = None
+    ) -> CommandResult:
         """Launch Claude Code reviewer sessions concurrently for queued PRs.
 
         Issue #370: a deterministic loop stage that turns ``review_queue()```
@@ -8929,6 +8951,15 @@ class OrchestratorApp:
         and skip until it goes stale. A reviewer that dies without a verdict is
         freed by ``_detect_and_handle_stalled_reviews`` after the stale-claim
         timeout, making the PR re-dispatchable.
+
+        ``now`` (issue #828) is the injectable clock for this entire pass: it
+        is resolved once below and forwarded to every ``is_claim_stale`` check
+        this method drives, directly (via ``_is_review_dispatchable``) and
+        indirectly (via ``_detect_and_handle_stalled_reviews``), instead of
+        each one independently racing the wall clock. Defaults to
+        ``datetime.now(UTC)`` when omitted, so production behavior is
+        byte-identical; tests can freeze it and assert exact equality instead
+        of a wall-clock-tolerance proximity check.
         """
         if not self.config.review_dispatch.enabled:
             return CommandResult(
@@ -8942,6 +8973,7 @@ class OrchestratorApp:
                 },
             )
 
+        resolved_now = now if now is not None else datetime.now(UTC)
         reviews_dir = self._layout.reviews_dir
 
         # Run the verdict-reaper and orphan/stalled sweeps BEFORE the quota
@@ -8954,7 +8986,11 @@ class OrchestratorApp:
         if not self.dry_run:
             verdict_result = self._reap_review_verdicts(reviews_dir)
             _detect_and_handle_stalled_reviews(
-                reviews_dir, self.paths.state_file, self.config, self.repo_root
+                reviews_dir,
+                self.paths.state_file,
+                self.config,
+                self.repo_root,
+                now=resolved_now,
             )
             _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
             _reap_orphaned_review_checkouts(
@@ -9230,7 +9266,9 @@ class OrchestratorApp:
                 c
                 for c in candidates
                 if c["pr"] not in escalated_skipped_set
-                and _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
+                and _is_review_dispatchable(
+                    state, c["pr"], c, max_attempts=max_attempts, now=resolved_now
+                )
             ]
 
         # Apply the human-needed label edge for each fresh escalation, outside
@@ -9412,8 +9450,11 @@ class OrchestratorApp:
         # Claim the selected PRs as pending before launching. This is the only
         # place that writes review_dispatch_pending; the upgrade happens after
         # each launch so a crash between claim and upgrade is recoverable via
-        # the stale-claim timeout.
-        now = utc_now()
+        # the stale-claim timeout. Named distinctly from `now`/`resolved_now`
+        # above (issue #828's injectable clock) -- this is a write-time stamp,
+        # not a staleness-comparison read, and utc_now() returns a formatted
+        # string rather than a datetime.
+        claim_stamp = utc_now()
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             review_effort_assignments: list[dict[str, Any]] = []
@@ -9436,7 +9477,7 @@ class OrchestratorApp:
                     "number": pr_number,
                     "issue_number": candidate["issue"],
                     "review_dispatch_status": "review_dispatch_pending",
-                    "review_dispatch_pending_at": now,
+                    "review_dispatch_pending_at": claim_stamp,
                     "review_dispatched_at": None,
                     "review_dispatch_failed_at": None,
                     "reviewer_pid": None,
@@ -14748,7 +14789,10 @@ class OrchestratorApp:
         # dispatch so a completed worker's review packet can be picked up by the
         # same loop pass only if the reviewer finishes immediately (tests); in
         # production the per-PR merge lane below fires on the next poll.
-        dispatch_reviews = self.dispatch_reviews()
+        # `now` (issue #822/#828) is this pass's injectable clock, threaded
+        # through so dispatch_reviews's is_claim_stale checks share the same
+        # instant as the rest of this pass instead of resampling.
+        dispatch_reviews = self.dispatch_reviews(now=now)
 
         # Auto-record cross-family verdicts for pending PRs when the
         # cross-family pass is the sole automated review (review_dispatch
