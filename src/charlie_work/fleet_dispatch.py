@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig
+from .config import ApiWorkerConfig, ConfigError, OrchestratorConfig, SupervisorConfig
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, count_fleet_runners
 from . import layout
@@ -26,7 +26,7 @@ from .supervise import (
     try_acquire_supervisor_lock,
 )
 from .runner_allocation_pass import run_allocation_pass
-from .runner_slots import UNATTENDED_ALLOCATION_SOURCE
+from .runner_slots import save_allocation_skip, UNATTENDED_ALLOCATION_SOURCE
 from .runners import (
     decide_autoscale,
     FleetTotals,
@@ -373,8 +373,21 @@ def _run_fleet_allocation_prologue(
             anchor_state = layout.state_file_path(Path(state_dir)) if state_dir else None
             break
 
+    full_pass_interval_seconds = getattr(
+        getattr(global_config, "supervisor", None),
+        "full_pass_interval_seconds",
+        SupervisorConfig().full_pass_interval_seconds,
+    )
+
     if anchor_root is None:
         logger.info("Fleet allocation prologue: no usable repo root in registry, skipping")
+        if not dry_run:
+            save_allocation_skip(
+                fleet_dir(override=fleet_dir_override),
+                source=UNATTENDED_ALLOCATION_SOURCE,
+                full_pass_interval_seconds=full_pass_interval_seconds,
+                skip_reason="no usable repo root in the fleet registry",
+            )
         return skipped("no usable repo root in the fleet registry")
 
     runtime = getattr(global_config, "runtime", None)
@@ -389,6 +402,7 @@ def _run_fleet_allocation_prologue(
         state_path=anchor_state,
         dry_run=dry_run,
         source=UNATTENDED_ALLOCATION_SOURCE,
+        full_pass_interval_seconds=full_pass_interval_seconds,
     )
 
     if result.error:
