@@ -129,8 +129,8 @@ draft/closed/conflicting/red-CI PR still exits at the existing `run_janitor` sho
    `ok=True` with a `warnings` entry ("diff unparseable — test-adequacy skipped"). It must **never**
    raise into `review()` (SF6; do not rely on the missing-key precedent for exception safety).
 2. **Partition** changed files into `test` / `product` / `exempt` using `TestAdequacyConfig` globs
-   (`test_path_globs`, `exempt_path_globs`), matched against the file path. Exempt = docs, lockfiles,
-   config, etc. `test_path_globs` wins over product classification (a file matching a test glob is a
+   (`test_path_globs`, `exempt_path_globs`), matched against the file path. Exempt = docs, examples,
+   lockfiles, config, etc. `test_path_globs` wins over product classification (a file matching a test glob is a
    test file). **Accepted limitation (SF8):** product-grade logic hidden in `conftest.py` (blanket-
    globbed as test) is invisible to `added_product_loc`; documented, not defended in v1.
 3. **Count added lines (MF3a/b).** An **added line** = a line in a file's hunk body beginning with `+`
@@ -320,7 +320,7 @@ class TestAdequacyConfig:
     enabled: bool = False                       # D5 — opt-in; absent block = no-op
     min_product_lines: int = 10                 # below this, skip (small fixes may ride existing tests)
     test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
-    exempt_path_globs: tuple[str, ...] = ("*.md", "docs/**", "*.lock", "*.toml", "*.cfg", "*.ini")
+    exempt_path_globs: tuple[str, ...] = ("*.md", "docs/**", "examples/**", "*.lock", "*.toml", "*.cfg", "*.ini")
     assertion_markers: tuple[str, ...] = (
         "assert ", "pytest.raises", "raises(", "assert_called", "self.assert",
     )
