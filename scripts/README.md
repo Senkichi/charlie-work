@@ -40,3 +40,14 @@ stdlib-only; see the notes below before "fixing" one.
   module docstring). Deliberately **stdlib-only** (plus `psutil`/`yaml`,
   already project dependencies) so a broken package install can never break
   the check that would detect it. Do not add a `charlie_work` import here.
+- **`backfill_stale_rework_briefs.py`** — one-shot operator tool (F6 of
+  `docs/plans/rework-findings-channel.md`) that bumps a `review-decision.json`
+  verdict's mtime (`os.utime` only — never rewrites its contents) for PRs
+  whose existing `rework-prompt.md` brief will otherwise be reused verbatim
+  forever, so the next `dispatch_rework` pass regenerates the brief through a
+  fixed renderer. Dry-run by default; `--apply` refuses to run unless
+  `--require-commit` proves the renderer fix is an ancestor of the target
+  repo's live HEAD (not bypassable). See the module docstring before use —
+  applying before the fix is deployed silently burns the backfill's only
+  lever. Accepts `--repo` to target a different checkout's `.var/` state
+  (e.g. running from an isolated worktree against the main checkout).
