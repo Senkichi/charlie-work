@@ -11586,6 +11586,8 @@ class OrchestratorApp:
         pr_number = int(pr["number"])
         head_sha = str(pr.get("headRefOid") or "")
         last_head_key = f"{attempts_key}_last_head"
+        stall_since_key = f"{attempts_key}_stall_since"
+        stall_head_key = f"{attempts_key}_stall_head"
         # The attempt count is read here but persisted under a later, separate
         # lock (this write for the burn path, _route_to_rework's for the
         # routing path) -- a deliberate deviation from the single-lock RMW
@@ -11608,6 +11610,34 @@ class OrchestratorApp:
                 and head_sha != counted_head
             )
             if not settled_new_conflicted_head:
+                # Issue #765: "no progress at all" and "progress still in
+                # flight" both land here (a live dispatched session's WIP
+                # pushes, and a stalled rework_requested queue item with an
+                # unmoved head, are indistinguishable from settled_new_
+                # conflicted_head's point of view). The cap/rescue check
+                # below is unreachable from here -- it only runs once a
+                # cycle SETTLES -- so a PR that never settles can wait here
+                # forever. _check_janitor_rework_stall separates the two
+                # cases, but NOT by issue status alone -- reconcile's
+                # issue_active_label_with_open_pr self-heal periodically
+                # flips issue_status away from rework_requested without the
+                # head moving, so status is only used to decide whether to
+                # ADVANCE the clock; only a head change (or escalation)
+                # clears it.
+                stall_result = self._check_janitor_rework_stall(
+                    pr_number=pr_number,
+                    issue_number=issue_number,
+                    issue_status=issue_status,
+                    head_sha=head_sha,
+                    reason=reason,
+                    attempts_key=attempts_key,
+                    stall_since_key=stall_since_key,
+                    stall_head_key=stall_head_key,
+                    stall_since=existing_pr_state.get(stall_since_key),
+                    stall_head=existing_pr_state.get(stall_head_key),
+                )
+                if stall_result is not None:
+                    return stall_result
                 return None
             if not counted_head:
                 with state_lock(self.paths.state_file):
@@ -11617,6 +11647,14 @@ class OrchestratorApp:
                         "number": pr_number,
                         "issue_number": issue_number,
                         last_head_key: head_sha,
+                        # Defensive: the stall clock is only ever set from
+                        # the not-settled branch above, so this should
+                        # already be unset -- but a head that was
+                        # transiently unavailable (see settled_new_
+                        # conflicted_head's bool(head_sha) guard) could have
+                        # started the clock before this baseline existed.
+                        stall_since_key: None,
+                        stall_head_key: None,
                     }
                     save_state(self.paths.state_file, state)
                 return None
@@ -11769,6 +11807,12 @@ class OrchestratorApp:
                     "issue_number": issue_number,
                     attempts_key: attempts,
                     last_head_key: head_sha,
+                    # Issue #765: the head moved -- real progress -- so any
+                    # stall clock started while it was stuck no longer
+                    # applies. A later re-stall must count from zero, not
+                    # from a timestamp accumulated during unrelated history.
+                    stall_since_key: None,
+                    stall_head_key: None,
                 }
                 state = self._record_event(
                     state,
@@ -11785,6 +11829,12 @@ class OrchestratorApp:
             return None
 
         decision = self._review_decision(pr_number)
+        # Issue #765: no unconditional stall_since_key/stall_head_key clear
+        # here. A genuinely fresh rework request has no clock running yet, so
+        # omitting the keys is a no-op; a reconcile-induced re-route (the
+        # head is unchanged, only issue_status flipped and flipped back) must
+        # NOT lose already-accumulated stall time, since that would let
+        # reconcile's unrelated label self-heal silently defeat this bound.
         route_extra_state: dict[str, Any] = {attempts_key: attempts}
         if head_sha:
             route_extra_state[last_head_key] = head_sha
@@ -11797,6 +11847,176 @@ class OrchestratorApp:
                 "issue": issue_number,
                 "routed_to_rework": True,
                 "rework_reason": reason,
+                "label_error": label_error,
+            },
+        )
+
+    def _check_janitor_rework_stall(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        issue_status: str | None,
+        head_sha: str,
+        reason: str,
+        attempts_key: str,
+        stall_since_key: str,
+        stall_head_key: str,
+        stall_since: Any,
+        stall_head: Any,
+    ) -> CommandResult | None:
+        """Stall bound orthogonal to the settled-head signal (issue #765).
+
+        Called only from ``_route_janitor_gate_failure_to_rework``'s
+        not-settled branch, where a rework is pending but has not produced
+        that function's own progress signal. That combination is ambiguous
+        on its own -- it covers both a live ``dispatched``/``dispatch_
+        pending`` session still doing real work (must NOT escalate here; a
+        genuinely dead session is WatchdogConfig.stall_minutes's job, not
+        this function's) and a PR that is queued with nobody working it at
+        all (``rework_requested``, no progress). The latter can never reach
+        the cap/rescue check in the caller, because that check only runs
+        once a cycle SETTLES, and a stalled PR's cycle never settles -- so
+        without this, it waits here forever (issue #765: PR #696, 55
+        ``rework_already_pushed`` events, attempts already at cap, rescue
+        never attempted).
+
+        HOLD vs. RESET is deliberately split on two different signals:
+
+        - Only a HEAD CHANGE since the clock started clears it. This is
+          checked regardless of ``issue_status`` -- a live ``dispatched``
+          session pushing WIP commits is real progress and must reset the
+          clock even though it isn't the "stalled" status itself, and (the
+          motivating case, found while building this fix) reconcile's
+          ``issue_active_label_with_open_pr`` self-heal flips ``issue_status``
+          away from ``rework_requested`` on its own periodic cadence
+          *without touching the branch* -- an earlier draft keyed the clear
+          on status alone, which reconcile would have reset roughly every
+          reconcile pass, making the bound practically unreachable whenever
+          reconcile is enabled (the common case). Head-only clearing makes
+          the clock immune to that oscillation.
+        - Only ``issue_status == "rework_requested"`` ADVANCES the clock
+          (starts it, or lets elapsed time accrue toward the threshold). Any
+          other pending status (``dispatched``, ``dispatch_pending``, or a
+          transient reconcile-driven flip with the head unchanged) HOLDS --
+          returns ``None`` without escalating and without touching the
+          clock, so already-accumulated stall time survives status churn
+          that isn't accompanied by real progress.
+
+        Returns ``None`` while waiting/holding, or after clearing a clock
+        whose head moved. Returns a terminal ``CommandResult`` --
+        ``agent:human-needed`` applied via the same ``transition()`` helper
+        the cap-exceeded path uses -- once the threshold is exceeded.
+        """
+        progressed = (
+            stall_since is not None
+            and stall_head is not None
+            and bool(head_sha)
+            and head_sha != stall_head
+        )
+        if progressed:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "number": pr_number,
+                    "issue_number": issue_number,
+                    stall_since_key: None,
+                    stall_head_key: None,
+                }
+                save_state(self.paths.state_file, state)
+            stall_since = None
+            stall_head = None
+
+        stalled_candidate = issue_status == "rework_requested"
+        if not stalled_candidate:
+            # HOLD: do not clear. Only a head change (above) clears the
+            # clock; a live worker or a transient status flip with the head
+            # unchanged must not lose accumulated stall time.
+            return None
+
+        started = _parse_iso_timestamp(stall_since) if stall_since is not None else None
+        if started is None or stall_head is None:
+            # (Re)start the clock. Covers: no clock running yet; an
+            # unparseable/corrupt timestamp; and a clock inherited from
+            # before this bound had a head anchor at all (stall_since set,
+            # stall_head missing -- pre-redesign state, or any other write
+            # path that recorded one key without the other). In that last
+            # case we cannot tell whether the head moved during the
+            # already-elapsed time, so we discard it and re-anchor rather
+            # than trust elapsed time of unknown provenance -- the safe
+            # direction on rollout is one extra window before the bound can
+            # fire, never a spurious escalation from state that never
+            # actually observed a stalled head.
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    "number": pr_number,
+                    "issue_number": issue_number,
+                    stall_since_key: utc_now(),
+                    stall_head_key: head_sha or None,
+                }
+                save_state(self.paths.state_file, state)
+            return None
+
+        threshold_minutes = self.config.review.rework_stall_minutes
+        if threshold_minutes <= 0:
+            return None
+        elapsed_minutes = (datetime.now(UTC) - started).total_seconds() / 60
+        if elapsed_minutes < threshold_minutes:
+            return None
+
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            attempts_so_far = int(state["prs"].get(str(pr_number), {}).get(attempts_key, 0))
+            state["prs"][str(pr_number)] = {
+                **state["prs"].get(str(pr_number), {}),
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": "escalated",
+                stall_since_key: None,
+                stall_head_key: None,
+            }
+            state["issues"][str(issue_number)] = {
+                **state["issues"].get(str(issue_number), {}),
+                "number": issue_number,
+                "status": "escalated",
+                "merge_alert": "OK",
+            }
+            state = self._record_event(
+                state,
+                "janitor_rework_stalled",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "reason": reason,
+                    "attempts": attempts_so_far,
+                    "stalled_minutes": round(elapsed_minutes, 1),
+                    "stall_since": stall_since,
+                    "head_sha": head_sha,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        result = transition(self.gh, self.config.labels, issue_number, "escalated")
+        label_error = None
+        if result.outcome != TransitionOutcome.APPLIED:
+            label_error = {
+                "edge": "escalated",
+                "outcome": result.outcome.value,
+                "add_failures": result.add_failures,
+                "remove_failures": result.remove_failures,
+            }
+        return CommandResult(
+            False,
+            f"PR #{pr_number} janitor {reason} rework stalled "
+            f"({round(elapsed_minutes)}m with no progress while {issue_status}); escalated",
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "janitor_ok": False,
+                "escalated": True,
+                "escalation_reason": "stalled",
                 "label_error": label_error,
             },
         )
