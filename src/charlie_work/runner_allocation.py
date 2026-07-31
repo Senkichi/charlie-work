@@ -552,6 +552,34 @@ def next_idle_streaks(
     return streaks
 
 
+def runner_capacity_starved_events(plan: AllocationPlan) -> list[dict[str, Any]]:
+    """Return one event payload per repo whose demand exceeds its registered
+    runner count while the host still has spare budget.
+
+    The condition is intentionally split between the repo (``demand > capacity``)
+    and the host (``budget - sum(running) > 0``).  A repo cannot use a spare
+    budget slot it does not have a registered runner for, so this is the
+    precise signal that provisioning is needed.
+    """
+    total_running = sum(t.running for t in plan.targets)
+    spare = plan.budget - total_running
+    if spare <= 0:
+        return []
+
+    events: list[dict[str, Any]] = []
+    for target in plan.targets:
+        if target.demand > target.capacity:
+            events.append(
+                {
+                    "repo": target.repo,
+                    "demand": target.demand,
+                    "capacity": target.capacity,
+                    "spare_budget": spare,
+                }
+            )
+    return events
+
+
 def plan_summary(plan: AllocationPlan) -> dict[str, Any]:
     """Serializable summary for CLI output and event payloads."""
     return {

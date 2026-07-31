@@ -38,6 +38,7 @@ from .runner_allocation import (
     next_idle_streaks,
     plan_allocation,
     plan_summary,
+    runner_capacity_starved_events,
 )
 from .runner_slots import (
     apply_allocation,
@@ -230,6 +231,14 @@ def run_allocation_pass(
         )
 
     if state_path is not None:
+        for starved in runner_capacity_starved_events(plan):
+            log_event(
+                state_path,
+                "runner_capacity_starved",
+                starved,
+                repo=starved["repo"],
+            )
+
         summary = plan_summary(plan)
         summary["dry_run"] = dry_run
         summary["source"] = source
