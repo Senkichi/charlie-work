@@ -9411,6 +9411,42 @@ def test_loop_checks_unavailable_review_lands_in_errors_bucket(tmp_path: Path) -
     assert "checks unavailable" in result.data["errors"][0]["error"].lower()
 
 
+def test_loop_zero_checks_pr_does_not_land_in_errors_bucket(tmp_path: Path) -> None:
+    """Issue #846: a PR with zero checks (pr_checks() == []) must not be
+    counted as a loop-pass error the way checks_unavailable (pr_checks() is
+    None) is. This mirrors test_loop_checks_unavailable_review_lands_in_errors_bucket
+    above but exercises the other outcome the client boundary must now
+    produce: [] means "genuinely no checks yet" (e.g. a conflicted/dirty PR
+    CI never ran on), which is a normal review outcome, not an
+    infrastructure failure.
+
+    This is a downstream-contract characterization test: it stubs
+    GitHub.pr_checks() directly, the same way the sibling test above does, so
+    it does not exercise GitHubClient.pr_checks()'s own gh-subprocess
+    disambiguation logic -- that regression coverage lives in
+    tests/test_github.py (test_pr_checks_zero_checks_returns_empty_list_not_none
+    and friends). What this test proves is that once the client returns []
+    (as it now correctly does for a zero-check PR), workflow.py's loop() does
+    not misclassify it as an error the way it misclassifies None.
+    """
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithZeroChecks(FakeGitHub):
+        def pr_checks(self, number: int):
+            return []
+
+    fake_gh = FakeGitHubWithZeroChecks()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.loop(merge=False)
+
+    assert result.data["errors"] == []
+    assert result.data["merges"] == []
+    assert len(result.data["reviews"]) == 1
+    assert result.data["reviews"][0]["pr"] == 456
+
+
 def _arm_unauthorized_merge_tripwire(paths, pre_existing: tuple[int, ...] = ()) -> None:
     """Declare the #502 tripwire already armed, so a test sees its steady state.
 
