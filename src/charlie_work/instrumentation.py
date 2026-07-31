@@ -158,6 +158,13 @@ _WARNING_KINDS = frozenset(
         # analogous session_rate_limit_deferred. Distinct from the per-PR
         # review_dispatch_stalled (error) that fires alongside it.
         "review_quota_exhausted",
+        # Issue #799: demand exceeding registered capacity while the host has
+        # spare budget is actionable (provision more runners for the repo),
+        # not a crash — warning, so it is reachable via
+        # query_events(level="warning") alongside the other handled-but-
+        # actionable backoff kinds above. The paired "runner_capacity_recovered"
+        # event stays at the default "info" level.
+        "runner_capacity_starved",
     }
 )
 
