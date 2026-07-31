@@ -41,7 +41,31 @@ MERGED_PR_LOOKBACK_LIMIT = 5
 QUEUED_STALE_MINUTES = 20
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
-LOOP_PASS_STALE_MINUTES = 30
+# Measured production cadence (charlie-work `loop_started` gaps, last 39
+# intervals, 2026-07-31): min=5.5m median=10.4m p90=20.2m max=53.9m.
+# `loop_started` is logged per repo (workflow.py's `_loop_impl`, into that
+# repo's own events.db), and the supervisor processes repos sequentially in
+# one pass, so a single repo's gap is gated by how long its SIBLING repos
+# take, not by supervisor health -- job-cannon's reconcile alone walks
+# ~690 issues / ~877 PRs and can push charlie-work's gap past 50 minutes on
+# a perfectly healthy fleet.
+#
+# Set to 90: comfortably above the observed healthy maximum (53.9m) so a
+# slow-but-alive fleet cannot false-alarm (at 30m this fired on 1 of 39
+# healthy intervals, ~3-4 false alarms/day). This deliberately means it
+# will NOT catch a sub-90-minute stall -- the outage that motivated this
+# check (issues #851/#854) was only ~45 minutes, shorter than charlie-work's
+# own legitimate worst-case gap, so no per-repo threshold can separate a
+# real stall of that length from a healthy-but-slow pass. This check is a
+# coarse backstop for prolonged, total fleet death (fresh log, zero passes,
+# for well over an hour) -- not a detector for the #851/#854 class. That
+# class is caught by PR #865 (issue #855), which escalates consecutive
+# zero-repo-pass supervisor cycles: edge-triggered on the actual failure
+# mode, needs no cadence-based threshold, and can't be confused with a
+# merely slow loop. Do not lower this value to "catch" that outage faster --
+# it will just reintroduce the false-alarm noise measured above; extend
+# PR #865's check instead.
+LOOP_PASS_STALE_MINUTES = 90
 MERGEQUEUE_STALL_BEATS = 2
 GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
@@ -717,18 +741,22 @@ def check_loop_pass_freshness(
     now: datetime | None = None,
     stale_minutes: int = LOOP_PASS_STALE_MINUTES,
 ) -> None:
-    """Detect a fleet loop that has stopped taking real repo passes.
+    """Coarse backstop for prolonged, total fleet death -- NOT a detector
+    for the #851/#854 outage class specifically (see ``LOOP_PASS_STALE_MINUTES``
+    for the measured cadence data and why: that outage was shorter than this
+    repo's own legitimate worst-case gap between loop passes, so no per-repo
+    threshold can separate the two; PR #865 / issue #855 catches that class
+    instead, by watching for consecutive zero-repo-pass cycles rather than
+    elapsed time).
 
-    Issues #851/#854: a defect made the supervisor exit immediately every
-    ~5min for a "watchdog restart" while doing ZERO repo passes, for 32+
-    minutes. It was invisible to every other check: the process exited 0,
-    the scheduled task reported success, and the state dir kept getting
-    touched (``self_deploy_succeeded`` fires every beat), so
-    ``check_log_freshness`` saw a fresh file the entire time and never
-    tripped. The only ground truth is the ABSENCE of ``loop_started`` rows
-    in ``events.db`` -- that event is only written from inside the real
-    loop body (``workflow.py``'s ``_loop_impl``), which a watchdog-restart
-    short-circuit never reaches.
+    What this still catches: the process exited 0, the scheduled task
+    reported success, and the state dir kept getting touched
+    (``self_deploy_succeeded`` fires every beat), so ``check_log_freshness``
+    reads healthy indefinitely even though the loop body itself
+    (``workflow.py``'s ``_loop_impl``, which is the only place that logs
+    ``loop_started``) has not run in any of this repo's passes for well
+    over an hour. The only ground truth for "is the loop actually running"
+    is the ABSENCE of ``loop_started`` rows in ``events.db``.
 
     ``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``.
 
@@ -792,9 +820,11 @@ def check_loop_pass_freshness(
         marker_path = repo.state_dir / "pending-sync.json"
         report.anom(
             check,
-            f"no fleet loop pass in {round(age_min)}m (newest loop_started {newest_ts}), "
-            f"threshold={stale_minutes}m. The supervisor may be exiting for watchdog "
-            f"restarts without doing work - check {marker_path} for a stale marker. "
+            f"no loop pass in {repo.slug} for {round(age_min)}m "
+            f"(newest loop_started {newest_ts}), threshold={stale_minutes}m -- "
+            f"at or beyond the observed healthy worst case, so the supervisor "
+            f"may be dead or wedged. Cause is open-ended at this duration; "
+            f"{marker_path} is one thing worth checking, not the only one. "
             f"({facts})",
         )
     else:

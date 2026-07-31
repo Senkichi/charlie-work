@@ -718,21 +718,26 @@ def test_check_runners_anomaly_on_windows_with_bad_result(
 def test_check_loop_pass_freshness_anomaly_when_stale_but_log_fresh(
     hb: ModuleType, tmp_path: Path
 ) -> None:
-    """Regression for the #851/#854 fleet outage.
+    """Regression for the log-fresh-but-loop-stale failure shape (#851/#854).
 
-    A defect made the supervisor exit immediately every ~5min for a
-    "watchdog restart" while doing ZERO repo passes, for 32+ minutes.
-    During the real incident `check_log_freshness` passed the entire time --
-    state.json kept getting touched every beat even though no real loop
-    pass ran -- so log freshness was structurally blind to this outage
-    class. This test reproduces exactly that shape (fresh state.json, stale
-    `loop_started` row) and pins that `check_loop_pass_freshness` is the
-    check that catches it.
+    The #851/#854 outage made the supervisor exit immediately every ~5min
+    for a "watchdog restart" while doing ZERO repo passes; state.json kept
+    getting touched every beat even though no real loop pass ran, so
+    `check_log_freshness` read healthy the entire time. That outage was
+    only ~45 minutes -- shorter than charlie-work's own measured healthy
+    worst-case gap between loop passes (53.9m), so `LOOP_PASS_STALE_MINUTES`
+    is deliberately set to 90 and this check no longer catches that specific
+    45-minute magnitude (PR #865 / issue #855 does, via consecutive
+    zero-repo-pass cycles instead of elapsed time). What this test still
+    pins down is the mechanism: a gap comfortably past the 90m threshold,
+    with a fresh log, must still trip this check -- proving
+    `check_loop_pass_freshness` is not itself fooled by the fresh-log
+    artifact that fooled `check_log_freshness` during the real incident.
     """
     repo = _make_repo(hb, tmp_path)
     repo.state_dir.mkdir(parents=True, exist_ok=True)
     (repo.state_dir / "state.json").write_text("{}", encoding="utf-8")
-    _write_events_db(repo.state_dir, [(_iso(45), "loop_started")])
+    _write_events_db(repo.state_dir, [(_iso(120), "loop_started")])
 
     log_report = hb.Report()
     hb.check_log_freshness(log_report, repo)
@@ -751,6 +756,25 @@ def test_check_loop_pass_freshness_ok_when_recent(hb: ModuleType, tmp_path: Path
     hb.check_loop_pass_freshness(report, repo)
     assert not report.anomaly
     assert "newest_loop_started=" in report.lines[0]
+
+
+def test_check_loop_pass_freshness_ok_at_measured_healthy_worst_case(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Pins the false-alarm fix: 54m must NOT trip the 90m threshold.
+
+    Measured production `loop_started` gaps (charlie-work, 39 intervals):
+    max=53.9m. At the original LOOP_PASS_STALE_MINUTES=30 this magnitude of
+    gap fired on a healthy fleet (~3-4 false alarms/day); at 90 it must not.
+    If this threshold is ever lowered back toward 30-45 without addressing
+    the repo-ordering cause described on LOOP_PASS_STALE_MINUTES, this test
+    goes red before the false alarms return to production.
+    """
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(54), "loop_started")])
+    report = hb.Report()
+    hb.check_loop_pass_freshness(report, repo)
+    assert not report.anomaly, report.lines
 
 
 def test_check_loop_pass_freshness_ok_when_db_missing(hb: ModuleType, tmp_path: Path) -> None:
@@ -797,10 +821,10 @@ def test_check_loop_pass_freshness_recent_iso_row_not_misjudged_stale(
 ) -> None:
     """Positive control for the ISO-vs-SQLite string-comparison trap.
 
-    `ts` values are `...THH:MM:SSZ`. SQLite's `datetime('now','-30
+    `ts` values are `...THH:MM:SSZ`. SQLite's `datetime('now','-90
     minutes')` returns a space-separated, non-`Z` string like
     `2026-07-31 22:25:04`. A predicate such as
-    `WHERE ts < datetime('now','-30 minutes')` string-compares these, and
+    `WHERE ts < datetime('now','-90 minutes')` string-compares these, and
     `'T'` (0x54) sorting after `' '` (0x20) makes the comparison
     unreliable in either direction. This row is genuinely 2 minutes old and
     must read as fresh; if the SQL-based comparison is ever reintroduced in
