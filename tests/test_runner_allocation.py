@@ -31,6 +31,7 @@ from charlie_work.runner_allocation import (
     repo_slug_from_github_url,
     starved_repos,
 )
+from charlie_work.github import GitHubError
 from charlie_work.runner_allocation_pass import resolve_inputs, run_allocation_pass
 from charlie_work.runner_slots import (
     apply_allocation,
@@ -1413,6 +1414,513 @@ def test_allocation_stamp_treats_a_naive_timestamp_as_utc(tmp_path: Path) -> Non
     assert stamp is not None
     assert stamp.updated_at is not None
     assert stamp.updated_at.tzinfo is not None
+
+
+# --------------------------------------------------------------------------
+# Process matchers — real body
+# --------------------------------------------------------------------------
+#
+# ``is_runner_launched`` / ``get_runner_launcher_process`` /
+# ``get_runner_listener_process`` are the host-facing matchers that decide
+# whether a runner directory has a live listener or a launch script mid-startup.
+# Every other test in this file (and the discover tests below) either
+# monkeypatches them wholesale or calls them without asserting the
+# ``RunnerInstance.running`` field they populate — so a matcher that always
+# returned False (or always True) would keep the suite green. These drive the
+# real bodies by faking ``psutil.process_iter`` one level down, the same shape
+# the busy-detection tests above use for ``has_active_job``.
+
+
+def _platform_launch_script() -> str:
+    return "run.cmd" if sys.platform == "win32" else "run.sh"
+
+
+class _FakeInfo:
+    """Mapping that yields canned attrs, or raises a psutil error on access.
+
+    ``psutil.process_iter(attrs)`` populates ``proc.info`` with the requested
+    attrs (None when unreadable). The matchers index ``proc.info[...]`` inside
+    a ``try/except (NoSuchProcess, AccessDenied, ZombieProcess)`` block, so to
+    exercise the skip-and-continue path the info object itself has to raise.
+    """
+
+    def __init__(
+        self, data: dict[str, object] | None = None, raises: BaseException | None = None
+    ) -> None:
+        self._data = data or {}
+        self._raises = raises
+
+    def __getitem__(self, key: str) -> object:
+        if self._raises is not None:
+            raise self._raises
+        return self._data.get(key)
+
+
+class _FakeProc:
+    """Stand-in for a ``psutil.Process`` yielded by ``process_iter``."""
+
+    def __init__(self, pid: int, info: _FakeInfo) -> None:
+        self.pid = pid
+        self.info = info
+
+
+def _fake_process_iter(monkeypatch: pytest.MonkeyPatch, procs: list[_FakeProc]) -> None:
+    """Point ``psutil.process_iter`` at a fixed list of fake processes."""
+    psutil = pytest.importorskip("psutil")
+    monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: iter(procs))
+
+
+def _launcher_proc(runner_dir: Path, pid: int = 100) -> _FakeProc:
+    """A process whose cmdline names this runner's launch script.
+
+    The launcher matcher restricts its scan to plausible wrapper image names
+    (``cmd.exe``/``conhost.exe`` on Windows, POSIX shells on Unix) before the
+    cmdline substring test, so the fake must carry a name in that allow-list
+    or it is skipped before the cmdline is ever inspected.
+    """
+    script = runner_dir / _platform_launch_script()
+    name = "cmd.exe" if sys.platform == "win32" else "bash"
+    return _FakeProc(pid, _FakeInfo({"pid": pid, "name": name, "cmdline": [str(script)]}))
+
+
+def _listener_proc(runner_dir: Path, pid: int = 200) -> _FakeProc:
+    """A process matching the listener matcher for the current platform."""
+    if sys.platform == "win32":
+        info = _FakeInfo(
+            {"pid": pid, "name": "Runner.Listener.exe", "cwd": str(runner_dir), "exe": None}
+        )
+    else:
+        script = runner_dir / "run.sh"
+        info = _FakeInfo({"pid": pid, "name": None, "cwd": None, "exe": str(script)})
+    return _FakeProc(pid, info)
+
+
+def test_get_runner_launcher_process_matches_a_cmdline_naming_the_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launcher matcher finds a wrapper whose cmdline contains run.cmd/sh."""
+    from charlie_work.runners import get_runner_launcher_process
+
+    runner_dir = _make_runner_dir(
+        tmp_path / "r",
+        "cw-1",
+        f"https://github.com/{CW}",
+        "cw-1",
+        script=_platform_launch_script(),
+    )
+    _fake_process_iter(monkeypatch, [_launcher_proc(runner_dir)])
+
+    proc = get_runner_launcher_process(runner_dir)
+
+    assert proc is not None
+    assert proc.pid == 100
+
+
+def test_get_runner_launcher_process_returns_none_when_no_cmdline_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrelated process must not be mistaken for this runner's wrapper."""
+    from charlie_work.runners import get_runner_launcher_process
+
+    runner_dir = _make_runner_dir(
+        tmp_path / "r",
+        "cw-1",
+        f"https://github.com/{CW}",
+        "cw-1",
+        script=_platform_launch_script(),
+    )
+    # A plausible wrapper image (so it clears the name filter) but an
+    # unrelated cmdline — the matcher must reject it on the substring test,
+    # not vacuously skip it on the name filter.
+    other_name = "cmd.exe" if sys.platform == "win32" else "bash"
+    other = _FakeProc(
+        300, _FakeInfo({"pid": 300, "name": other_name, "cmdline": ["cmd", "/c", "unrelated.cmd"]})
+    )
+    _fake_process_iter(monkeypatch, [other])
+
+    assert get_runner_launcher_process(runner_dir) is None
+
+
+def test_get_runner_launcher_process_returns_none_when_the_script_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory without a launch script has nothing to match against."""
+    from charlie_work.runners import get_runner_launcher_process
+
+    runner_dir = tmp_path / "r" / "cw-1"
+    runner_dir.mkdir(parents=True)
+    _fake_process_iter(monkeypatch, [_launcher_proc(runner_dir)])
+
+    assert get_runner_launcher_process(runner_dir) is None
+
+
+def test_get_runner_launcher_process_skips_a_process_that_became_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A process that vanished mid-scan cannot be a launcher; siblings still can."""
+    psutil = pytest.importorskip("psutil")
+    from charlie_work.runners import get_runner_launcher_process
+
+    runner_dir = _make_runner_dir(
+        tmp_path / "r",
+        "cw-1",
+        f"https://github.com/{CW}",
+        "cw-1",
+        script=_platform_launch_script(),
+    )
+    dead = _FakeProc(400, _FakeInfo(raises=psutil.NoSuchProcess(pid=400)))
+    live = _launcher_proc(runner_dir, pid=401)
+    _fake_process_iter(monkeypatch, [dead, live])
+
+    proc = get_runner_launcher_process(runner_dir)
+
+    assert proc is not None
+    assert proc.pid == 401
+
+
+def test_is_runner_launched_is_true_when_only_the_wrapper_is_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mid-startup: the launch script is up but the listener is not yet.
+
+    This is the window ``is_runner_launched`` exists to cover — a start path
+    that only looked for the listener would launch a second copy of a runner
+    already coming up.
+    """
+    from charlie_work.runners import is_runner_launched
+
+    runner_dir = _make_runner_dir(
+        tmp_path / "r",
+        "cw-1",
+        f"https://github.com/{CW}",
+        "cw-1",
+        script=_platform_launch_script(),
+    )
+    _fake_process_iter(monkeypatch, [_launcher_proc(runner_dir)])
+
+    assert is_runner_launched(runner_dir) is True
+
+
+def test_is_runner_launched_is_true_when_the_listener_is_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from charlie_work.runners import is_runner_launched
+
+    runner_dir = _make_runner_dir(
+        tmp_path / "r",
+        "cw-1",
+        f"https://github.com/{CW}",
+        "cw-1",
+        script=_platform_launch_script(),
+    )
+    _fake_process_iter(monkeypatch, [_listener_proc(runner_dir)])
+
+    assert is_runner_launched(runner_dir) is True
+
+
+def test_is_runner_launched_is_false_when_neither_wrapper_nor_listener_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative case: a configured runner with nothing live is not launched."""
+    from charlie_work.runners import is_runner_launched
+
+    runner_dir = _make_runner_dir(
+        tmp_path / "r",
+        "cw-1",
+        f"https://github.com/{CW}",
+        "cw-1",
+        script=_platform_launch_script(),
+    )
+    _fake_process_iter(monkeypatch, [])
+
+    assert is_runner_launched(runner_dir) is False
+
+
+def test_discovery_marks_a_runner_running_when_its_wrapper_is_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gap the issue names: discover tests never asserted ``.running``.
+
+    A matcher that always returned False would leave every discovered runner
+    parked; one that always returned True would start nothing. Driving the real
+    ``is_runner_launched`` body through ``discover_runner_instances`` pins the
+    field that the start/park planner reads.
+    """
+    root = tmp_path / "runners"
+    root.mkdir()
+    runner_dir = _make_runner_dir(
+        root, "cw-1", f"https://github.com/{CW}", "cw-1", script=_platform_launch_script()
+    )
+    _fake_process_iter(monkeypatch, [_launcher_proc(runner_dir)])
+
+    instances, _ = discover_runner_instances(root)
+
+    assert len(instances) == 1
+    assert instances[0].running is True
+
+
+def test_discovery_marks_a_runner_parked_when_nothing_is_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "runners"
+    root.mkdir()
+    _make_runner_dir(
+        root, "cw-1", f"https://github.com/{CW}", "cw-1", script=_platform_launch_script()
+    )
+    _fake_process_iter(monkeypatch, [])
+
+    instances, _ = discover_runner_instances(root)
+
+    assert len(instances) == 1
+    assert instances[0].running is False
+
+
+# --------------------------------------------------------------------------
+# run_allocation_pass — end-to-end
+# --------------------------------------------------------------------------
+#
+# The pass wires discovery, GitHub observation, planning, actuation, and state
+# persistence together. Three of its branches had no direct coverage (issue
+# #602): the dry-run state-write guard, the zero-runner early skip, and the
+# mapping of a busy-list API failure onto a pinned (unmeasurable) repo. These
+# drive the real pass body with a fake GitHub client and actuation stubbed at
+# the runner_slots boundary, so the assertions target the pass's own logic
+# rather than the matchers covered above.
+
+
+class _FakeGitHub:
+    """Routing fake for the two ``gh.run`` shapes the pass issues.
+
+    ``fetch_busy_runner_names`` calls ``repos/{repo}/actions/runners`` and
+    treats a raised ``GitHubError`` as a busy-list failure (the pinned path).
+    ``measure_repo_demand`` calls ``repos/{repo}/actions/runs?status=...`` and
+    ``repos/{repo}/actions/runs/{id}/jobs``. Routes on the API path so one
+    object can serve several repos with different responses.
+    """
+
+    def __init__(
+        self,
+        *,
+        runner_errors: set[str] | None = None,
+        runs: dict[str, dict] | None = None,
+        jobs: dict[str, dict] | None = None,
+    ) -> None:
+        self._runner_errors = runner_errors or set()
+        self._runs = runs or {}
+        self._jobs = jobs or {}
+        self.calls: list[list[str]] = []
+
+    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+        self.calls.append(args)
+        path = args[1] if len(args) > 1 else ""
+        repo = path.split("repos/", 1)[1].split("/actions", 1)[0] if "repos/" in path else ""
+
+        # runners list: repos/{repo}/actions/runners?per_page=100
+        if "/actions/runners" in path and "/runs/" not in path:
+            if repo in self._runner_errors:
+                raise GitHubError(f"simulated runners-list failure for {repo}")
+            return {"runners": []}
+
+        # jobs for one run: repos/{repo}/actions/runs/{run_id}/jobs?per_page=100
+        if "/runs/" in path and "/jobs" in path:
+            run_id = path.split("/runs/", 1)[1].split("/", 1)[0]
+            return self._jobs.get(run_id, {"jobs": []})
+
+        # runs by status: repos/{repo}/actions/runs?status=...&per_page=...
+        if "/actions/runs?" in path:
+            return self._runs.get(repo, {"workflow_runs": []})
+
+        return {}
+
+
+def _make_managed_root(tmp_path: Path, runners: list[tuple[str, str, str]]) -> Path:
+    """Build a managed root with one directory per (name, repo, agent_name)."""
+    root = tmp_path / "actions-runners"
+    root.mkdir()
+    script = _platform_launch_script()
+    for name, repo, agent in runners:
+        _make_runner_dir(root, name, f"https://github.com/{repo}", agent, script=script)
+    return root
+
+
+def _stub_actuation(monkeypatch: pytest.MonkeyPatch, *, launched: bool) -> None:
+    """Stop the pass from touching real processes.
+
+    Discovery and the start re-check both call ``is_runner_launched``; park
+    calls ``has_active_job`` and the two process matchers. Pointing all of
+    them at fixed returns keeps the pass deterministic without bypassing the
+    pass's own logic — the matchers themselves are tested above.
+    """
+    monkeypatch.setattr("charlie_work.runner_slots.is_runner_launched", lambda _path: launched)
+    monkeypatch.setattr("charlie_work.runner_slots.has_active_job", lambda _path: False)
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.get_runner_listener_process", lambda _path: None
+    )
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.get_runner_launcher_process", lambda _path: None
+    )
+    monkeypatch.setattr(
+        "charlie_work.runner_slots.launch_runner_listener",
+        lambda path, dry_run=False: (True, f"launched {path.name} (dry_run={dry_run})"),
+    )
+
+
+def test_run_allocation_pass_skips_early_when_no_runners_are_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty managed root short-circuits before any GitHub call."""
+    root = tmp_path / "actions-runners"
+    root.mkdir()
+    gh = _FakeGitHub()
+
+    result = run_allocation_pass(
+        gh,
+        RunnerAllocationConfig(enabled=True, managed_root=str(root), max_running_runners=4),
+        fleet_dir_override=str(tmp_path / "fleet"),
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+
+    assert result.ok is True
+    assert result.skipped is True
+    assert any("no configured runners" in note for note in result.notes)
+    # The early skip must not have reached GitHub observation.
+    assert gh.calls == []
+
+
+def test_run_allocation_pass_pins_a_repo_whose_busy_list_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A busy-list API failure maps to an unmeasurable, pinned repo.
+
+    The allocator must not reallocate capacity away from a repo it cannot see
+    — a transient API blip would otherwise strand a queue. ``fetch_busy_runner_names``
+    returns a busy_error, the pass builds a ``RepoDemand(ok=False)``, and the
+    planner pins that repo to its current running count.
+    """
+    root = _make_managed_root(
+        tmp_path,
+        [("cw-1", CW, "cw-1"), ("jc-1", JC, "jc-1")],
+    )
+    _stub_actuation(monkeypatch, launched=True)
+    gh = _FakeGitHub(runner_errors={JC})
+
+    result = run_allocation_pass(
+        gh,
+        RunnerAllocationConfig(enabled=True, managed_root=str(root), max_running_runners=4),
+        fleet_dir_override=str(tmp_path / "fleet"),
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+
+    assert result.ok is True
+    assert result.plan is not None
+    pinned = {t.repo: t.pinned for t in result.plan.targets}
+    assert pinned[JC] is True
+    assert pinned[CW] is False
+    assert any("demand unmeasurable" in note and JC in note for note in result.plan.notes)
+
+
+def test_run_allocation_pass_dry_run_does_not_persist_idle_streaks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run plans and reports but must not advance the hysteresis counters.
+
+    The ``if not dry_run: save_idle_streaks(...)`` guard is what keeps a preview
+    pass from writing the state file the next real pass reads — advancing the
+    slack streak while previewing would let a later real pass park a slot based
+    on passes that never actually happened.
+    """
+    root = _make_managed_root(tmp_path, [("cw-1", CW, "cw-1"), ("cw-2", CW, "cw-2")])
+    _stub_actuation(monkeypatch, launched=False)
+    gh = _FakeGitHub(
+        runs={CW: {"workflow_runs": [{"id": 11}]}},
+        jobs={"11": {"jobs": [{"status": "queued", "labels": ["self-hosted"]}] * 5}},
+    )
+    fleet = tmp_path / "fleet"
+    state_path = tmp_path / "state.json"
+
+    save_calls: list[bool] = []
+    log_payloads: list[dict] = []
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.save_idle_streaks",
+        lambda *a, **k: save_calls.append(True),
+    )
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.log_event",
+        lambda _sp, _kind, payload, **_k: log_payloads.append(payload),
+    )
+
+    result = run_allocation_pass(
+        gh,
+        RunnerAllocationConfig(
+            enabled=True, managed_root=str(root), max_running_runners=4, min_running_per_repo=1
+        ),
+        fleet_dir_override=str(fleet),
+        state_path=state_path,
+        dry_run=True,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+
+    assert result.ok is True
+    # The plan wants both parked runners started (demand 5, capacity 2). The
+    # stubbed launcher reports success for both, but dry_run is the pass's
+    # state-write concern, not the result count — the guard is asserted below.
+    assert result.started == 2
+    assert all("dry_run=True" in r.message for r in result.results)
+    assert save_calls == []
+    assert not (fleet / "runner-allocation.json").exists()
+    assert log_payloads and log_payloads[-1]["dry_run"] is True
+
+
+def test_run_allocation_pass_real_run_persists_idle_streaks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The non-dry-run path writes the state file and logs dry_run=False."""
+    root = _make_managed_root(tmp_path, [("cw-1", CW, "cw-1"), ("cw-2", CW, "cw-2")])
+    _stub_actuation(monkeypatch, launched=False)
+    gh = _FakeGitHub(
+        runs={CW: {"workflow_runs": [{"id": 11}]}},
+        jobs={"11": {"jobs": [{"status": "queued", "labels": ["self-hosted"]}] * 5}},
+    )
+    fleet = tmp_path / "fleet"
+    state_path = tmp_path / "state.json"
+
+    save_calls: list[bool] = []
+    log_payloads: list[dict] = []
+    # Delegate to the real writer so the state file actually lands.
+    real_save = save_idle_streaks
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.save_idle_streaks",
+        lambda *a, **k: (save_calls.append(True), real_save(*a, **k))[1],
+    )
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.log_event",
+        lambda _sp, _kind, payload, **_k: log_payloads.append(payload),
+    )
+
+    try:
+        result = run_allocation_pass(
+            gh,
+            RunnerAllocationConfig(
+                enabled=True, managed_root=str(root), max_running_runners=4, min_running_per_repo=1
+            ),
+            fleet_dir_override=str(fleet),
+            state_path=state_path,
+            dry_run=False,
+            source="prologue",
+            full_pass_interval_seconds=300,
+        )
+
+        assert result.ok is True
+        assert result.started == 2  # both parked runners were started (stubbed)
+        assert save_calls == [True]
+        assert (fleet / "runner-allocation.json").exists()
+        assert log_payloads and log_payloads[-1]["dry_run"] is False
+        assert log_payloads[-1]["source"] == "prologue"
+    finally:
+        close_db(state_path)
 
 
 # --------------------------------------------------------------------------

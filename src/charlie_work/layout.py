@@ -55,6 +55,7 @@ DEFAULT_STATE_DIR = ".var/charlie-work"
 STATE_FILENAME = "state.json"
 SUPERVISOR_LOCK_FILENAME = "supervisor.lock"
 PENDING_SYNC_FILENAME = "pending-sync.json"
+SELF_DEPLOY_FAILURE_STATE_FILENAME = "self-deploy-failures.json"
 
 ISSUES_DIRNAME = "issues"
 PRS_DIRNAME = "prs"
@@ -135,6 +136,17 @@ def supervisor_lock_path(state_root: Path) -> Path:
 def pending_sync_path(state_root: Path) -> Path:
     """Return the deferred-``uv sync`` marker path under ``state_root``."""
     return state_root / PENDING_SYNC_FILENAME
+
+
+def self_deploy_failure_state_path(state_root: Path) -> Path:
+    """Return the consecutive self-deploy-failure counter path under ``state_root``.
+
+    Tracks how many ``self_deploy`` attempts in a row have failed, so a
+    persistent deploy outage can escalate rather than merely repeating the
+    same latched digest entry (issue #817 item 5). Sibling of
+    :func:`pending_sync_path` -- same directory, same atomic-write contract.
+    """
+    return state_root / SELF_DEPLOY_FAILURE_STATE_FILENAME
 
 
 def worktrees_dir(state_root: Path) -> Path:

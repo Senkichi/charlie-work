@@ -149,6 +149,15 @@ class JanitorVerdict:
     # patch-id or head-SHA unchanged since the last request_changes verdict).
     # Consumers must branch on this, never on the failure-message text.
     is_no_op_rework: bool = False
+    # Structured flags for _check_draft's finding (issue #818). is_draft is
+    # true whenever GitHub reports the PR as a draft, regardless of any other
+    # failure. is_draft_only_block is true only when draft is the SOLE janitor
+    # failure -- i.e. every other gate (checks, mergeable, linked issue, body,
+    # ...) already passed -- which is the "otherwise ready" condition workflow
+    # review() uses to decide whether auto-readying the PR is safe. Consumers
+    # must branch on these flags, never on the failure-message text.
+    is_draft: bool = False
+    is_draft_only_block: bool = False
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -301,7 +310,7 @@ def run_janitor(
     if summary is not None:
         failed_required_checks = summary.failed
 
-    _check_draft(pr, failures)
+    is_draft = _check_draft(pr, failures)
     _check_state(pr, failures)
     _check_mergeable(pr, failures)
     _check_required_checks(summary, failures, warnings)
@@ -345,6 +354,12 @@ def run_janitor(
     if failed_required_checks:
         failures.append(f"Required check(s) failed: {', '.join(failed_required_checks)}")
 
+    # "Otherwise ready" (issue #818): draft is the ONLY failure once every
+    # other gate above (state, mergeable, required checks, linked issue,
+    # body, no-op-rework, ...) has had its say. A real failing check or any
+    # other janitor failure lengthens `failures` and disqualifies auto-ready.
+    is_draft_only_block = is_draft and len(failures) == 1
+
     return JanitorVerdict(
         ok=not failures,
         failures=tuple(failures),
@@ -354,14 +369,19 @@ def run_janitor(
         rerun_run_ids=rerun_run_ids,
         check_rerun_attempts=check_rerun_attempts,
         is_no_op_rework=is_no_op_rework,
+        is_draft=is_draft,
+        is_draft_only_block=is_draft_only_block,
     )
 
 
-def _check_draft(pr: dict[str, Any], failures: list[str]) -> None:
+def _check_draft(pr: dict[str, Any], failures: list[str]) -> bool:
+    """Detect a draft PR. Returns True iff the draft failure was appended."""
     if "isDraft" not in pr:
-        return
+        return False
     if bool(pr.get("isDraft")):
         failures.append("PR is a draft")
+        return True
+    return False
 
 
 def _check_state(pr: dict[str, Any], failures: list[str]) -> None:

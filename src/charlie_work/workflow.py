@@ -90,6 +90,7 @@ from .reconcile import (
     apply_fixes as apply_drift_fixes,
     detect_aviator_stale_blocked,
     detect_drift,
+    detect_mergequeue_not_approved,
 )
 from .worktree import (
     OPERATOR_MARKER_KIND,
@@ -4517,6 +4518,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     config: OrchestratorConfig,
     *,
     persist_inconclusive_probe_counter: bool = True,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Check for dead sessions, classify their failures, and update throttle state.
 
@@ -4557,6 +4559,15 @@ def _classify_dead_sessions_and_update_throttle_state(
     lane -- or how many passes ago -- last wrote it, so suppressing the
     write here never affects the DEAD-vs-deferred decision made below,
     only which lane's write ends up on disk for a given pass.
+
+    ``now`` (issue #822) is the injectable clock for this entire pass: it
+    seeds ``now_for_health`` (worker-health/probe timing) and is forwarded
+    to every throttle classification call below, so a single instant is used
+    consistently for the whole pass instead of each call independently
+    racing the wall clock. Defaults to ``datetime.now(UTC)`` when omitted,
+    so production behavior is byte-identical; tests can freeze it and assert
+    exact equality on the resulting ``throttled_until`` instead of a
+    wall-clock-tolerance proximity check.
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
@@ -4571,7 +4582,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     )
     from .worktree import WorktreeState
 
-    now_for_health = datetime.now(UTC)
+    now_for_health = now if now is not None else datetime.now(UTC)
 
     # Fetch open PRs for the "no open PR" guard
     prs = gh.pr_list()
@@ -4604,6 +4615,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                     w.issue_number,
                     fallback_kind=failure_kind,
                     config=config,
+                    now=now_for_health,
                 )
             elif w.adapter_kind == "claude-code":
                 failure_kind, throttled_until = update_worker_record_with_failure_classification(
@@ -4611,6 +4623,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                     w.issue_number,
                     fallback_kind=failure_kind,
                     config=config,
+                    now=now_for_health,
                 )
             elif w.adapter_kind == "api":
                 failure_kind, throttled_until = update_worker_record_with_failure_classification(
@@ -4619,6 +4632,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                     fallback_kind=failure_kind,
                     config=config,
                     adapter_kind="api",
+                    now=now_for_health,
                 )
             if failure_kind and throttled_until:
                 # A throttle-caused launch failure must persist its window just
@@ -4788,6 +4802,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind="unpublished_work",
                             config=config,
                             session_completed=True,
+                            now=now_for_health,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -4798,6 +4813,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind="unpublished_work",
                             config=config,
                             session_completed=True,
+                            now=now_for_health,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -4809,6 +4825,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             config=config,
                             adapter_kind="api",
                             session_completed=True,
+                            now=now_for_health,
                         )
                     )
                 else:
@@ -4826,6 +4843,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind=fallback_kind,
                             config=config,
+                            now=now_for_health,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -4835,6 +4853,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind=fallback_kind,
                             config=config,
+                            now=now_for_health,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -4845,6 +4864,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind=fallback_kind,
                             config=config,
                             adapter_kind="api",
+                            now=now_for_health,
                         )
                     )
                 else:
@@ -7652,6 +7672,52 @@ class OrchestratorApp:
         verdict = run_janitor(
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
+
+        # Issue #820: reconcile the operator merge-hold marker for the #818
+        # draft-auto-ready actuator unconditionally, on every review() pass
+        # for this PR -- not only when we're about to act on it below --
+        # so the stored reason can never go stale from a *different*
+        # branch (packet success further down, a co-occurring second
+        # failure routed to the general janitor_blocked path, a merge-
+        # conflict/no-op-rework/flake-rerun branch, ...) that doesn't
+        # revisit the held branch and therefore wouldn't otherwise touch
+        # this field. A marker only cleared by its own branch needs a
+        # clear-site at every other exit from review() -- miss one and the
+        # dedup below silently stops re-firing after a lift/re-park cycle
+        # that passed through one of those other branches in between.
+        # Reconciling here once, unconditionally, is the single point of
+        # truth instead.
+        #
+        # Semantics mirror merge_ready's mergequeue-handoff hold check:
+        # PR-label-or-issue-label, with an unavailable/degraded check
+        # failing safe (treated the same as "held", never as "no hold").
+        # `issue` was already fetched unconditionally above for packet
+        # building, so this adds no extra `gh` calls.
+        merge_hold = self.config.labels.merge_hold in label_names(pr)
+        merge_hold_check_unavailable = False
+        if not merge_hold and issue_number is not None:
+            if not isinstance(issue, dict) or "labels" not in issue:
+                merge_hold_check_unavailable = True
+            else:
+                merge_hold = self.config.labels.merge_hold in label_names(issue)
+        draft_hold_reason = (
+            ("operator_merge_hold" if merge_hold else "merge_hold_check_unavailable")
+            if verdict.is_draft_only_block and (merge_hold or merge_hold_check_unavailable)
+            else None
+        )
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            existing_pr_state = state["prs"].get(str(pr_number), {})
+            draft_hold_reason_changed = (
+                existing_pr_state.get("draft_ready_held_reason") != draft_hold_reason
+            )
+            if draft_hold_reason_changed:
+                state["prs"][str(pr_number)] = {
+                    **existing_pr_state,
+                    "draft_ready_held_reason": draft_hold_reason,
+                }
+                save_state(self.paths.state_file, state)
+
         if not verdict.ok:
             # Issue #558: a PR that is CLOSED (unmerged) on GitHub is dead --
             # every other janitor failure is moot. Converge the state PR
@@ -7691,6 +7757,132 @@ class OrchestratorApp:
                         "closed_unmerged_converged": True,
                     },
                 )
+
+            # Auto-ready otherwise-mergeable draft PRs (issue #818): a draft
+            # is an externally-imposed state like any other the fleet
+            # reconciles (base movement, flaky checks, ...). When draft is
+            # the ONLY janitor failure -- every other gate already passed --
+            # call `gh pr ready` and defer the actual review to the next
+            # poll, mirroring the flake-rerun debounce below: trigger a
+            # cheap, idempotent, self-correcting actuator rather than
+            # mutating this frozen verdict and continuing same-pass. Errors
+            # come back as values (GitHubRunResult.ok/.error), never
+            # exceptions, so a failed `gh pr ready` must NOT be treated as
+            # success -- the PR stays janitor_blocked and is not routed
+            # toward merge.
+            if verdict.is_draft_only_block:
+                # Issue #820: an operator can park a PR by drafting it, which
+                # is indistinguishable from the externally-imposed draft state
+                # #818 was written to auto-clear. `draft_hold_reason` /
+                # `draft_hold_reason_changed` were already computed and
+                # reconciled into state unconditionally above (single point
+                # of truth -- see the comment there for why a branch-local
+                # clear was insufficient); this only decides whether to act
+                # on the already-current value.
+                if draft_hold_reason is not None:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        existing_pr_state = state["prs"].get(str(pr_number), {})
+                        state["prs"][str(pr_number)] = {
+                            **existing_pr_state,
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "janitor_blocked",
+                            "janitor_ok": False,
+                            "janitor_failures": list(verdict.failures),
+                        }
+                        if draft_hold_reason_changed:
+                            state = self._record_event(
+                                state,
+                                "draft_pr_ready_held",
+                                {
+                                    "pr_number": pr_number,
+                                    "issue_number": issue_number,
+                                    "reason": draft_hold_reason,
+                                },
+                            )
+                        save_state(self.paths.state_file, state)
+                    return CommandResult(
+                        False,
+                        f"PR #{pr_number} is a draft; auto-ready held ({draft_hold_reason})",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "draft_ready_held": True,
+                            "draft_ready_held_reason": draft_hold_reason,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
+
+                ready_result = self.gh.pr_ready(pr_number)
+                if ready_result.ok:
+                    log_event(
+                        self.paths.state_file,
+                        "draft_pr_ready_triggered",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "head_sha": pr.get("headRefOid"),
+                        },
+                        repo=self.repo_root.name,
+                    )
+                    return CommandResult(
+                        False,
+                        f"PR #{pr_number} was a draft; marked ready for review "
+                        "(deferring to next pass)",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "draft_readied": True,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
+                # `gh pr ready` failed: park as janitor_blocked (same as the
+                # pre-fix behavior) plus a dedicated error field so repeated
+                # identical failures dedupe instead of re-firing the event
+                # every pass -- the underlying `verdict.failures` is constant
+                # ("PR is a draft") regardless of the actuator's outcome, so
+                # the existing failures_changed dedup below would never fire
+                # on its own for this class of park.
+                draft_ready_error = (
+                    ready_result.error or f"gh pr ready exited {ready_result.returncode}"
+                )
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    existing_pr_state = state["prs"].get(str(pr_number), {})
+                    error_changed = existing_pr_state.get("draft_ready_error") != draft_ready_error
+                    state["prs"][str(pr_number)] = {
+                        **existing_pr_state,
+                        "number": pr_number,
+                        "issue_number": issue_number,
+                        "status": "janitor_blocked",
+                        "janitor_ok": False,
+                        "janitor_failures": list(verdict.failures),
+                        "draft_ready_error": draft_ready_error,
+                    }
+                    if error_changed:
+                        state = append_event(
+                            state,
+                            "draft_pr_ready_failed",
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "error": draft_ready_error,
+                            },
+                            state_path=self.paths.state_file,
+                        )
+                    save_state(self.paths.state_file, state)
+                return CommandResult(
+                    False,
+                    f"PR #{pr_number} is a draft and `gh pr ready` failed: {draft_ready_error}",
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "draft_ready_failed": True,
+                        "checks_unavailable": checks is None,
+                    },
+                )
+
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework
@@ -7860,9 +8052,17 @@ class OrchestratorApp:
                     "check_rerun_attempts": verdict.check_rerun_attempts,
                 }
                 if failures_changed:
+                    # Issue #818: a draft co-occurring with another real
+                    # failure (e.g. draft + empty body) is not auto-readied
+                    # -- `is_draft_only_block` is False -- but the park is
+                    # still worth distinguishing from routine janitor_gate
+                    # bookkeeping so it's greppable via
+                    # query_events(kind="draft_pr_blocked") rather than a
+                    # manual `gh pr list` sweep.
+                    event_kind = "draft_pr_blocked" if verdict.is_draft else "janitor_gate"
                     state = self._record_event(
                         state,
-                        "janitor_gate",
+                        event_kind,
                         {"pr_number": pr_number, "failures": list(verdict.failures)},
                     )
                 save_state(self.paths.state_file, state)
@@ -10557,6 +10757,22 @@ class OrchestratorApp:
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
+        # Aviator MergeQueue silent-revert detector (issue #823): add_pr_label's
+        # boolean return only proves the POST succeeded, not that the label
+        # survived -- Aviator can accept the mergequeue label and then
+        # asynchronously strip it 2-3 seconds later (draft PR, a failing
+        # required check, base mismatch, paused queue, ...), and every such
+        # rejection was previously indistinguishable from success. Detected
+        # cross-pass, never same-pass: existing_pr_state is the PRIOR pass's
+        # persisted status (loaded above, before this pass's live fetch) and
+        # label_names(pr) is THIS pass's live labels. A same-pass re-read
+        # would race Aviator's 2-3s revert window and could still observe the
+        # label present.
+        mergequeue_label_reverted = bool(
+            self.config.auto_merge.mergequeue_label
+            and existing_pr_state.get("status") == "mergequeue"
+            and self.config.auto_merge.mergequeue_label not in label_names(pr)
+        )
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -10824,7 +11040,9 @@ class OrchestratorApp:
                 if not already_in_mergequeue and self._should_update_pr_branch(pr, base_current):
                     if self.gh.pr_update_branch(pr_number):
                         new_head = self._verify_synced_head(pr_number, live_head_sha)
-                        if new_head and new_head != live_head_sha:
+                        if new_head is None:
+                            sync_failed = True
+                        elif new_head != live_head_sha:
                             self._update_approval_head(
                                 pr_number,
                                 decision,
@@ -10834,11 +11052,9 @@ class OrchestratorApp:
                             )
                             pr = self.gh.pr_view(pr_number) or pr
                             decision = self._review_decision(pr_number)
-                        elif new_head == live_head_sha:
+                        else:
                             # Already up-to-date; nothing to do.
                             pass
-                        else:
-                            sync_failed = True
                     else:
                         sync_failed = True
             # merge-base freshness gate: mergeStateStatus can lag, so verify
@@ -11034,13 +11250,29 @@ class OrchestratorApp:
                 if mergequeue_label_applied:
                     with state_lock(self.paths.state_file):
                         state = load_state(self.paths.state_file)
-                        state["prs"][str(pr_number)] = {
-                            **state["prs"].get(str(pr_number), {}),
+                        _existing_pr_entry = state["prs"].get(str(pr_number), {})
+                        _pr_update: dict[str, Any] = {
+                            **_existing_pr_entry,
                             "number": pr_number,
                             "issue_number": issue_number,
                             "status": "mergequeue",
-                            "consecutive_failed_merge_attempts": 0,
                         }
+                        # Issue #823 ordering hazard: do NOT zero the counter
+                        # when this re-add is recovering from a cross-pass
+                        # revert (mergequeue_label_reverted). This write runs
+                        # BEFORE mergequeue_handoff_failed is computed and its
+                        # increment is persisted further down in this same
+                        # pass -- unconditionally zeroing here would hand that
+                        # later increment a false 0 baseline every single
+                        # reverted pass, so the counter would land on 1
+                        # forever instead of accumulating, making the
+                        # escalation this issue adds permanently unreachable
+                        # for any threshold > 1. Verified empirically: without
+                        # this guard a 3-pass simulation (revert, revert,
+                        # revert) produces 1, 1, 1; with it, 1, 2, 3.
+                        if not mergequeue_label_reverted:
+                            _pr_update["consecutive_failed_merge_attempts"] = 0
+                        state["prs"][str(pr_number)] = _pr_update
                         if issue_number is not None:
                             _issue_key = str(issue_number)
                             _issue_entry = state["issues"].get(_issue_key, {})
@@ -11122,9 +11354,29 @@ class OrchestratorApp:
         # swallowed as best-effort cleanup. can_merge is True here (checks
         # green, approved), so the "approved and not can_merge" alarm gate
         # below would otherwise never fire for this failure mode.
+        #
+        # Issue #823: folded into the SAME signal (rather than a parallel
+        # mechanism) is mergequeue_label_reverted -- an outright POST failure
+        # and a POST that succeeded but was silently reverted by Aviator by
+        # the next pass are the same underlying failure (the PR never
+        # actually made it into Aviator's queue) and must share the same
+        # counter-increment/escalation path.
+        #
+        # The revert term is additionally gated on can_merge: a revert can
+        # also be Aviator declining the PR for a genuine reason (e.g. a
+        # required check went red), in which case can_merge is False on this
+        # pass and the failure is a check failure, not a handoff failure. If
+        # mergequeue_handoff_failed were True here it would shadow the
+        # check-failure-rework dispatch gate below (`not
+        # mergequeue_handoff_failed`), permanently blocking rework for a
+        # fixable check failure. The counter still increments in that case
+        # via the pre-existing "approved and not can_merge" disjunct in the
+        # final counter-persistence block, so escalation is unaffected --
+        # only the handoff-specific attribution and the handoff-specific
+        # (non-)dispatch of check-failure-rework are.
         mergequeue_handoff_failed = bool(
             self.config.auto_merge.mergequeue_label and mergequeue_label_applied is False
-        )
+        ) or (mergequeue_label_reverted and can_merge)
         # Conflict-rework dispatch is debounced to the failed-attempt alarm
         # threshold so a single transient/stale CONFLICTING reading does not
         # clobber an approved verdict. Re-read the issue status and the PR
@@ -11776,14 +12028,20 @@ class OrchestratorApp:
                     )
                 new_state = state
                 try:
-                    drift = detect_drift(
-                        self.gh,
-                        state,
-                        self.config,
-                        repo_root=self.repo_root,
-                        skip_dead_session_sweep=skip_dead_session_sweep,
-                    ) + detect_aviator_stale_blocked(
-                        self.gh, self.config, repo_root=self.repo_root
+                    drift = (
+                        detect_drift(
+                            self.gh,
+                            state,
+                            self.config,
+                            repo_root=self.repo_root,
+                            skip_dead_session_sweep=skip_dead_session_sweep,
+                        )
+                        + detect_aviator_stale_blocked(
+                            self.gh, self.config, repo_root=self.repo_root
+                        )
+                        + detect_mergequeue_not_approved(
+                            self.gh, self.config, repo_root=self.repo_root
+                        )
                     )
                     fixed = False
                     post_fix_drift: list[DriftItem] = []
@@ -11801,14 +12059,20 @@ class OrchestratorApp:
                         # for failed adds/removes, and apply_fixes records the outcome in the
                         # reconcile event. Re-detect against the new state to verify the repairs
                         # actually landed before reporting success.
-                        post_fix_drift = detect_drift(
-                            self.gh,
-                            new_state,
-                            self.config,
-                            repo_root=self.repo_root,
-                            skip_dead_session_sweep=skip_dead_session_sweep,
-                        ) + detect_aviator_stale_blocked(
-                            self.gh, self.config, repo_root=self.repo_root
+                        post_fix_drift = (
+                            detect_drift(
+                                self.gh,
+                                new_state,
+                                self.config,
+                                repo_root=self.repo_root,
+                                skip_dead_session_sweep=skip_dead_session_sweep,
+                            )
+                            + detect_aviator_stale_blocked(
+                                self.gh, self.config, repo_root=self.repo_root
+                            )
+                            + detect_mergequeue_not_approved(
+                                self.gh, self.config, repo_root=self.repo_root
+                            )
                         )
                         fixed = len(post_fix_drift) == 0
                 except GraphQLBudgetError as exc:
@@ -13342,7 +13606,7 @@ class OrchestratorApp:
             )
             save_state(self.paths.state_file, state)
 
-    def _verify_synced_head(self, pr_number: int, old_head_sha: str) -> str | None:
+    def _verify_synced_head(self, pr_number: int, old_head_sha: str | None) -> str | None:
         """Verify that the new head of a PR is a valid base-sync merge commit.
 
         After ``gh pr update-branch`` advances the PR head, we must not bless the
@@ -13350,7 +13614,16 @@ class OrchestratorApp:
         whose parents include the previously approved head. This closes the
         approval-integrity TOCTOU: a racing push to the PR branch could otherwise
         be mistaken for a base update and auto-merged without review.
+
+        ``old_head_sha`` must be a real SHA the caller observed before the sync
+        attempt. A ``None``/falsy value means the caller never had a valid
+        pre-sync head to verify against, so verification cannot succeed;
+        return early rather than falling through to the parent-SHA check below,
+        where ``None not in parent_shas`` would otherwise be vacuously true for
+        any two-parent web-flow merge commit and mask this as a normal miss.
         """
+        if not old_head_sha:
+            return None
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return None
@@ -13541,10 +13814,24 @@ class OrchestratorApp:
         return True
 
     @_guard_state_lock
-    def loop(self, limit: int | None = None, *, merge: bool | None = None) -> CommandResult:
-        return self._loop_impl(limit, merge=merge)
+    def loop(
+        self,
+        limit: int | None = None,
+        *,
+        merge: bool | None = None,
+        now: datetime | None = None,
+    ) -> CommandResult:
+        # ``now`` (issue #822) is the injectable clock for the dead-session
+        # throttle classification lane -- see
+        # ``_classify_dead_sessions_and_update_throttle_state``. Defaults to
+        # ``datetime.now(UTC)`` there when omitted, so production behavior is
+        # byte-identical; tests can freeze it to assert exact equality on
+        # ``throttled_until`` instead of a wall-clock-tolerance proximity check.
+        return self._loop_impl(limit, merge=merge, now=now)
 
-    def _loop_impl(self, limit: int | None, *, merge: bool | None) -> CommandResult:
+    def _loop_impl(
+        self, limit: int | None, *, merge: bool | None, now: datetime | None = None
+    ) -> CommandResult:
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
         # evaluation + labels) but skips the actual `gh pr merge` — for
         # operators sequencing same-surface PR cascades by hand, where the
@@ -13560,7 +13847,7 @@ class OrchestratorApp:
                 correlation_id=cid,
             )
             record_loop_pass(self.paths.state_file, cid, start_ts)
-            result = self._loop_body(limit, merge=merge)
+            result = self._loop_body(limit, merge=merge, now=now)
             elapsed = time.monotonic() - loop_start
             log_event(
                 self.paths.state_file,
@@ -14335,7 +14622,9 @@ class OrchestratorApp:
             )
             save_state(state_file, state)
 
-    def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
+    def _loop_body(
+        self, limit: int | None, *, merge: bool | None, now: datetime | None = None
+    ) -> CommandResult:
         # Every pass must observe a fresh GitHub snapshot. The list cache
         # dedupes calls within one pass, but a long-running supervisor
         # (charlie fleet supervise) reuses this app -- and therefore one
@@ -14385,6 +14674,7 @@ class OrchestratorApp:
             self.gh,
             self.config,
             persist_inconclusive_probe_counter=False,
+            now=now,
         )
 
         # Flat-interval Haiku probe for early quota/rate-limit recovery (see

@@ -16,12 +16,17 @@ from typing import Any, Callable
 import pytest
 
 from charlie_work.config import OrchestratorConfig, SupervisorConfig
+from charlie_work.instrumentation import query_events
 from charlie_work.paths import resolved_layout
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.supervise import (
     SelfDeployResult,
     _check_venv,
+    _command_failure_message,
     _pending_sync_marker_path,
+    _record_self_deploy_failure_streak,
+    _self_deploy_failure_counter_path,
+    _self_deploy_state_path,
     has_delta,
     orchestrator_root,
     run_supervised,
@@ -1244,6 +1249,243 @@ def test_self_deploy_loud_warning_on_repeated_deferral(
     assert "WARNING: pending dependency sync still deferred" in out
     assert "3 runners active" in out
     assert "abc123..def456" in out
+
+
+def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
+    tmp_path: Path, no_fleet_live_sessions: None
+) -> None:
+    """Issue #817 item 3: a realistic failed RunResult -- as ``run_captured``
+    actually produces on any non-zero exit, with ``.error`` always populated
+    with the generic ``"command exited N"`` rather than left at the
+    dataclass default ``None`` -- must still surface git's specific stderr
+    (which names the colliding path) instead of the uninformative generic
+    message.
+
+    ``test_self_deploy_pull_failure_is_non_fatal`` above never caught the
+    old ``result.error or result.stderr`` bug because it constructs
+    ``RunResult(1, "", "fatal: ...")`` without ``.error``, leaving it at the
+    ``None`` default -- under the old fallback chain that made ``.stderr``
+    win "by accident" (None is falsy), masking the real production
+    shadowing where ``.error`` is always truthy.
+    """
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(
+                returncode=1,
+                stdout="",
+                stderr=(
+                    "error: Your local changes to the following files would be "
+                    "overwritten by merge:\n\tsrc/charlie_work/config.py\n"
+                    "Please commit your changes or stash them before you merge."
+                ),
+                error="command exited 1",
+            ),
+        ]
+    )
+    result = self_deploy(tmp_path, run_command=runner)
+    assert result.ok is False
+    assert result.error is not None
+    assert "src/charlie_work/config.py" in result.error
+    assert "command exited 1" not in result.error
+    assert result.error.startswith("git pull --ff-only origin main: ")
+    assert len(calls) == 2
+
+
+def test_command_failure_message_falls_back_to_error_then_fallback() -> None:
+    """``_command_failure_message`` prefers stderr, then .error, then fallback."""
+    stderr_result = RunResult(1, "", "  stderr detail  ")
+    assert _command_failure_message(["git", "pull"], stderr_result, "pull failed") == (
+        "git pull: stderr detail"
+    )
+
+    error_only_result = RunResult(returncode=None, stdout="", stderr="", error="boom")
+    assert _command_failure_message(["uv", "sync"], error_only_result, "sync failed") == (
+        "uv sync: boom"
+    )
+
+    empty_result = RunResult(returncode=1, stdout="", stderr="")
+    assert _command_failure_message(["git", "diff"], empty_result, "diff failed") == (
+        "git diff: diff failed"
+    )
+
+
+def test_self_deploy_records_events_db_outcome_for_every_pass(
+    tmp_path: Path, no_fleet_live_sessions: None
+) -> None:
+    """Issue #817 item 4: every real self_deploy pass -- success, skip, and
+    failure -- is durably recorded to events.db, queryable via
+    ``query_events``. Before this fix, self_deploy had zero events.db
+    instrumentation; the live fleet accumulated 121 consecutive real deploy
+    failures with zero rows to show for it.
+    """
+    state_path = _self_deploy_state_path(tmp_path)
+
+    # Pass 1: code-only success.
+    runner1, _ = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),
+            RunResult(0, "", ""),
+            RunResult(0, "def456\n", ""),
+            RunResult(0, "src/foo.py\n", ""),
+        ]
+    )
+    self_deploy(tmp_path, run_command=runner1)
+
+    # Pass 2: already up to date -- ok, but nothing changed (a skip).
+    runner2, _ = _make_fake_runner(
+        [
+            RunResult(0, "def456\n", ""),
+            RunResult(0, "Already up to date.\n", ""),
+            RunResult(0, "def456\n", ""),
+        ]
+    )
+    self_deploy(tmp_path, run_command=runner2)
+
+    # Pass 3: pull failure.
+    runner3, _ = _make_fake_runner(
+        [
+            RunResult(0, "def456\n", ""),
+            RunResult(
+                returncode=1,
+                stdout="",
+                stderr="fatal: could not read from remote repository.",
+                error="command exited 1",
+            ),
+        ]
+    )
+    self_deploy(tmp_path, run_command=runner3)
+
+    succeeded = query_events(state_path, kind="self_deploy_succeeded")
+    skipped = query_events(state_path, kind="self_deploy_skipped")
+    failed = query_events(state_path, kind="self_deploy_failed")
+    assert len(succeeded) == 1
+    assert len(skipped) == 1
+    assert len(failed) == 1
+    assert failed[0]["level"] == "error"
+    assert "could not read from remote" in failed[0]["payload"]["error"]
+
+    # query_events(level="error") -- the general-purpose alerting query
+    # already used elsewhere in the codebase -- surfaces the failure without
+    # any self-deploy-specific query infrastructure.
+    errors = query_events(state_path, level="error")
+    assert any(e["kind"] == "self_deploy_failed" for e in errors)
+
+
+def test_self_deploy_preview_does_not_record_events_db(
+    tmp_path: Path, no_fleet_live_sessions: None
+) -> None:
+    """A ``dry_run`` preview touches nothing, including events.db (item 4)."""
+    state_path = _self_deploy_state_path(tmp_path)
+    runner, _ = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),
+            RunResult(0, "abc123\n", ""),
+        ]
+    )
+    result = self_deploy(tmp_path, run_command=runner, dry_run=True)
+    assert result.previewed is True
+    assert query_events(state_path, kind="self_deploy_succeeded") == []
+    assert query_events(state_path, kind="self_deploy_skipped") == []
+    assert query_events(state_path, kind="self_deploy_failed") == []
+
+
+def _fake_pull_failure_runner() -> Callable[..., RunResult]:
+    runner, _ = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),
+            RunResult(
+                returncode=1,
+                stdout="",
+                stderr="fatal: unable to access remote",
+                error="command exited 1",
+            ),
+        ]
+    )
+    return runner
+
+
+def test_self_deploy_failure_streak_fires_alarm_once_at_threshold(
+    tmp_path: Path, no_fleet_live_sessions: None
+) -> None:
+    """Issue #817 item 5: three consecutive self_deploy failures cross the
+    default threshold (3) and fire exactly one ``self_deploy_alarm`` event --
+    not one per failure past the threshold -- and a subsequent success
+    resets the counter so a later failure streak starts counting from zero
+    again instead of re-alarming immediately.
+    """
+    state_path = _self_deploy_state_path(tmp_path)
+    counter_path = _self_deploy_failure_counter_path(tmp_path)
+
+    self_deploy(tmp_path, run_command=_fake_pull_failure_runner(), failure_alarm_threshold=3)
+    self_deploy(tmp_path, run_command=_fake_pull_failure_runner(), failure_alarm_threshold=3)
+    assert query_events(state_path, kind="self_deploy_alarm") == []
+
+    self_deploy(tmp_path, run_command=_fake_pull_failure_runner(), failure_alarm_threshold=3)
+    alarms = query_events(state_path, kind="self_deploy_alarm")
+    assert len(alarms) == 1
+    assert alarms[0]["payload"]["consecutive_failures"] == 3
+    assert alarms[0]["level"] == "error"
+
+    # A fourth consecutive failure must not fire a second alarm.
+    self_deploy(tmp_path, run_command=_fake_pull_failure_runner(), failure_alarm_threshold=3)
+    assert len(query_events(state_path, kind="self_deploy_alarm")) == 1
+
+    counter = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert counter["consecutive_failures"] == 4
+
+    # A success resets the streak.
+    success_runner, _ = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),
+            RunResult(0, "Already up to date.\n", ""),
+            RunResult(0, "abc123\n", ""),
+        ]
+    )
+    self_deploy(tmp_path, run_command=success_runner, failure_alarm_threshold=3)
+    counter_after_success = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert counter_after_success["consecutive_failures"] == 0
+
+    # Two more failures after the reset must not re-fire the alarm yet
+    # (streak restarted at 0, threshold is 3).
+    self_deploy(tmp_path, run_command=_fake_pull_failure_runner(), failure_alarm_threshold=3)
+    self_deploy(tmp_path, run_command=_fake_pull_failure_runner(), failure_alarm_threshold=3)
+    assert len(query_events(state_path, kind="self_deploy_alarm")) == 1
+
+
+def test_record_self_deploy_failure_streak_creates_state_dir_when_absent(
+    tmp_path: Path,
+) -> None:
+    """``_record_self_deploy_failure_streak`` must create its own state
+    directory before acquiring ``state_lock`` -- it must not rely on
+    ``_log_self_deploy_outcome``'s ``log_event()`` call (which shares the same
+    parent directory) having already created it as a side effect. Calling it
+    directly, with no prior state-dir-creating call in this process, isolates
+    the bug: without the pre-lock ``mkdir``, ``state_lock`` tries to create a
+    sibling ``.lock`` file in a nonexistent directory and raises, which would
+    violate ``self_deploy``'s documented never-raises contract.
+    """
+    counter_path = _self_deploy_failure_counter_path(tmp_path)
+    assert not counter_path.parent.exists()
+
+    failure = SelfDeployResult(ok=False, pulled=False, changed=False, synced=False, error="boom")
+    _record_self_deploy_failure_streak(tmp_path, failure, threshold=3)  # must not raise
+
+    assert counter_path.exists()
+    counter = json.loads(counter_path.read_text(encoding="utf-8"))
+    assert counter["consecutive_failures"] == 1
+
+
+def test_self_deploy_failure_alarm_threshold_zero_disables(
+    tmp_path: Path, no_fleet_live_sessions: None
+) -> None:
+    """``failure_alarm_threshold<=0`` disables the alarm entirely, matching
+    ``AutoMergeConfig.failed_attempt_alarm``'s "0 disables" convention.
+    """
+    state_path = _self_deploy_state_path(tmp_path)
+    for _ in range(5):
+        self_deploy(tmp_path, run_command=_fake_pull_failure_runner(), failure_alarm_threshold=0)
+    assert query_events(state_path, kind="self_deploy_alarm") == []
 
 
 def test_orchestrator_root_contains_pyproject_toml() -> None:
