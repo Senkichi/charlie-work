@@ -42,8 +42,8 @@ from .labels import TransitionOutcome, transition
 from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
 from .state import (
+    ORCHESTRATOR_OWNED_ISSUE_STATUSES,
     PASSIVE_OPEN_STATUS,
-    VALID_ISSUE_STATUSES,
     append_event,
     is_claim_stale,
     set_throttled_until,
@@ -91,13 +91,15 @@ class DriftItem:
 # finalized; the terminal human_needed label is intentionally preserved.
 # INVARIANT (guarded by test_fix_reconcile's coverage test): every
 # VALID_ISSUE_STATUSES member except the deliberate exclusions below must be
-# in this set. The status-normalization sweep skips anything in
-# VALID_ISSUE_STATUSES, so a valid status missing here is invisible to BOTH
-# sweeps -- a closed issue stuck in it would never be finalized (the exact
-# dead zone adding manifest_written/dispatch_failed to the valid set briefly
-# created). Deliberate exclusions: "closed" (already terminal), "approved"/
-# "blocked" (finalization of closed approved/blocked issues is owned by the
-# merged-PR finalization flow, pre-existing behavior).
+# in this set. The status-normalization sweep below skips anything in
+# ORCHESTRATOR_OWNED_ISSUE_STATUSES (VALID_ISSUE_STATUSES minus the
+# externally-derived "closed" -- issue #789), so a valid orchestrator-owned
+# status missing here is invisible to BOTH sweeps -- a closed issue stuck in
+# it would never be finalized (the exact dead zone adding
+# manifest_written/dispatch_failed to the valid set briefly created).
+# Deliberate exclusions: "closed" (already terminal), "approved"/"blocked"
+# (finalization of closed approved/blocked issues is owned by the merged-PR
+# finalization flow, pre-existing behavior).
 ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
     {
         "dispatched",
@@ -1219,6 +1221,16 @@ def detect_drift(
         # actually differs from the current value, so a second pass over an
         # already-normalized record (including the "no status key" baseline)
         # is a no-op.
+        #
+        # Issue #789: "closed" is deliberately excluded from the skip-set
+        # (ORCHESTRATOR_OWNED_ISSUE_STATUSES, not the full VALID_ISSUE_STATUSES)
+        # because GitHub -- not the orchestrator -- owns that value and can
+        # invalidate it at any time via a reopen. Re-examining it costs no
+        # extra GitHub call: `issues_by_number` below is the same in-memory
+        # snapshot the rest of this function already uses, so the common
+        # both-closed case (the overwhelming majority of "closed" entries)
+        # just confirms target_status == current_status and continues without
+        # emitting drift.
         for issue_number_str, entry in state_issues.items():
             if not isinstance(entry, dict):
                 continue
@@ -1229,10 +1241,22 @@ def detect_drift(
             if issue_number in issues_status_repaired:
                 continue  # already normalized by issue_active_label_with_open_pr above
             current_status = entry.get("status")
-            if current_status in VALID_ISSUE_STATUSES:
+            if current_status in ORCHESTRATOR_OWNED_ISSUE_STATUSES:
                 continue
             issue = issues_by_number.get(issue_number)
-            if issue is not None and _issue_state(issue) == "CLOSED":
+            if issue is None:
+                # The snapshot cannot support any conclusion about an issue it
+                # doesn't contain -- absence here is an unanswered query, not
+                # evidence the issue is gone (issue #789 review). This matters
+                # once the repo passes _LIST_LIMIT: an older closed issue can
+                # fall off the `--state all` page while still being genuinely
+                # closed, and falling through to `target_status = None` would
+                # strip its "closed" status -- a mass wipe with no signal in
+                # the drift log to explain it. Skip unconditionally rather
+                # than gating on issue_snapshot_truncated: a missing issue is
+                # equally unanswerable regardless of *why* it's missing.
+                continue
+            if _issue_state(issue) == "CLOSED":
                 target_status: str | None = "closed"
             elif open_prs_by_issue.get(issue_number):
                 target_status = PASSIVE_OPEN_STATUS
@@ -1612,11 +1636,13 @@ def apply_fixes(
                 new_issues.pop(issue_key, None)
 
         elif item.kind == "issue_status_normalized":
-            # A status outside VALID_ISSUE_STATUSES (or missing entirely) is
-            # recomputed from ground truth in detect_drift and carried here
-            # via item.new_status. None means "no status" (the baseline a
-            # never-dispatched issue naturally has) -- drop the key rather
-            # than write a synthesized placeholder string.
+            # A status outside ORCHESTRATOR_OWNED_ISSUE_STATUSES (missing
+            # entirely, never assigned by any code path, or "closed" but no
+            # longer accurate because the issue was reopened on GitHub --
+            # issue #789) is recomputed from ground truth in detect_drift and
+            # carried here via item.new_status. None means "no status" (the
+            # baseline a never-dispatched issue naturally has) -- drop the key
+            # rather than write a synthesized placeholder string.
             if item.issue_number is not None:
                 issue_key = str(item.issue_number)
                 existing_issue = new_issues.get(issue_key, {})

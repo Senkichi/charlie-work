@@ -6,6 +6,16 @@ on:
     branches:
       - main
 
+# Cancel superseded in-progress runs for the same branch. charlie-work has
+# only 2 registered self-hosted runners; without this, a run left in-progress
+# by a since-superseded push keeps occupying one of them to test a SHA that
+# can no longer appear in any PR's check set (checks are computed against the
+# head SHA). Push-to-main runs are exempt from cancellation: a main run is a
+# historical record that also feeds deployment, not a superseded draft.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 # SELF-HOSTED (2026-07): hosted-runner minutes exhausted mid-month; all jobs
 # run on the repo-registered self-hosted runner (cw-9800x3d-1, local Windows
 # box). The hosted ubuntu+windows matrix is suspended — restore it from git
@@ -51,6 +61,34 @@ jobs:
     # a true wedge vs GitHub's 360-min default. Sibling: job-cannon PR #1443
     # set 10 min on its required aggregate gate (13s healthy).
     timeout-minutes: 15
+    # Explicit permissions block, required by the closing-keyword gate step
+    # below: repo default_workflow_permissions is "read", but that does not
+    # extend to the PR GraphQL query `gh pr view` issues (GitHub.pr_view in
+    # github.py). One live failure on this branch needed a real scope grant:
+    #   run 30607061237, job 91081435392: "GraphQL: Resource not accessible
+    #   by integration (repository.pullRequest)" -- fixed by adding
+    #   pull-requests: read; the PR object itself isn't visible without it.
+    # A second failure surfaced a deeper scope, one level down the same
+    # query: run 30609781476, job 91089795120: "GraphQL: Resource not
+    # accessible by integration (repository.pullRequest.statusCheckRollup
+    # .nodes.0.commit.statusCheckRollup)". Rather than chase individual
+    # nested-connection scopes field by field, the fix was at the query
+    # layer instead: the gate never needed statusCheckRollup at all (it only
+    # reads PR title/body/branch), so GitHub.pr_view() now takes an explicit
+    # `fields` override and the CLI passes the narrow
+    # CLOSING_KEYWORD_PR_FIELDS (github.py) instead of the general-purpose
+    # PR_VIEW_FIELDS. checks: read is therefore NOT listed below -- nothing
+    # in this job's steps requests a checks-scoped field anymore, so whether
+    # checks: read alone would also have resolved failure #2 is moot for
+    # this gate either way; least-privilege favors the narrower query over
+    # the broader grant regardless.
+    # Once ANY explicit permissions: key is set, GitHub treats every
+    # unlisted scope as none for this job, so contents: read (needed by
+    # actions/checkout@v4) must stay listed alongside pull-requests: read,
+    # not just the newly-added scope alone.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
@@ -62,3 +100,25 @@ jobs:
         run: uv run ruff check --no-cache .
       - name: Ruff format
         run: uv run ruff format --check --no-cache .
+      - name: Closing-keyword gate (issue 790)
+        # PR-only: push-to-main has no PR number, and GitHub's native
+        # auto-close scan only ever runs against a PR's body + commits.
+        #
+        # Deliberately a step of the existing "Lint" job, not a new job:
+        # GitHub reports check-run status per JOB, not per step, so this
+        # rides the already-required "Lint" context and becomes a de facto
+        # blocking gate the moment a PR branch includes this workflow
+        # change -- no branch-protection edit, no orchestrator.config.yaml
+        # or .aviator/config.yml change, no separate promotion step at all.
+        # pull_request-triggered workflows run the version of ci.yml on the
+        # PR's own head branch, so a PR branch cut before this merges simply
+        # has no such step yet and is unaffected -- nothing is stranded.
+        #
+        # Scans the PR body and every commit message for a closing keyword
+        # (close(s/d)/fix(es/ed)/resolve(s/d)) bound to an issue number other
+        # than this PR's own declared target -- the surface GitHub's native
+        # auto-close-on-merge scans, which has no negation awareness at all.
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uv run charlie closing-keyword-check --pr ${{ github.event.pull_request.number }}

@@ -12,11 +12,34 @@ Ordering matters and is deliberate:
 2. Measure each repo's live demand and busy set.
 3. Plan against the *whole* host, then actuate.
 4. Persist slack history last, and only for a real run — a ``--dry-run`` must
-   not advance the hysteresis counters it is previewing.
+   not advance the hysteresis counters it is previewing. The same guard covers
+   the ``runner_capacity_starved``/``runner_capacity_recovered`` events (issue
+   #799): a dry-run's whole point is to preview without side effects, and an
+   event write is a side effect.
 
 The caller is expected to hold the fleet lock (the fleet pass does). Actuation
 re-checks liveness per slot, so a concurrent pass degrades to redundant no-ops
 rather than double-starting a listener.
+
+Capacity-starvation signaling (issue #799) is edge-triggered, not
+level-triggered. ``demand > capacity`` while the budget has slack can be this
+host's steady state for days — registration only changes on a separate, much
+slower provisioning cadence (``runners.py``) that may be disabled entirely. A
+naive "emit while true" write would turn one real signal into an unbounded
+stream of identical rows in the append-only ``events`` table, one per repo per
+pass, forever. Instead ``_emit_capacity_events`` fires ``runner_capacity_starved``
+once on the pass a repo's condition turns true, then stays silent every
+subsequent pass the condition holds, and fires ``runner_capacity_recovered``
+once when it turns false again — so a reader can always tell "still starved"
+from "signal stopped working" instead of the silence being ambiguous.
+
+Because ``run_allocation_pass`` is invoked as a fresh process every fleet pass,
+this dedup state cannot live in memory. It is derived entirely from
+``events.db`` itself (no new state file): the prior signaled state for a repo
+is "more ``runner_capacity_starved`` rows than ``runner_capacity_recovered``
+rows", which is immune to same-second timestamp collisions (``_now_iso()``
+truncates to whole seconds) because it counts rows rather than ordering them
+by timestamp.
 """
 
 from __future__ import annotations
@@ -28,7 +51,7 @@ from pathlib import Path
 from .config import RunnerAllocationConfig
 from .fleet_paths import fleet_dir
 from .github import GitHubLike
-from .instrumentation import log_event
+from .instrumentation import log_event, query_events
 from .runner_allocation import (
     AllocationPlan,
     RepoDemand,
@@ -38,6 +61,7 @@ from .runner_allocation import (
     next_idle_streaks,
     plan_allocation,
     plan_summary,
+    starved_repos,
 )
 from .runner_slots import (
     apply_allocation,
@@ -47,6 +71,7 @@ from .runner_slots import (
     load_tie_break_offset,
     measure_repo_demand,
     AllocationSource,
+    save_allocation_skip,
     save_idle_streaks,
 )
 
@@ -136,6 +161,69 @@ def resolve_inputs(
     )
 
 
+def _emit_capacity_events(state_path: Path, plan: AllocationPlan) -> None:
+    """Edge-triggered ``runner_capacity_starved``/``_recovered`` events (#799).
+
+    Fires ``runner_capacity_starved`` the pass a repo's condition (``demand >
+    capacity`` while ``starved_repos`` sees host-wide budget slack) turns
+    true, and ``runner_capacity_recovered`` the pass it turns back false.
+    Silent on every pass in between, however long the condition persists —
+    see the module docstring for why level-triggered emission is wrong here.
+
+    Prior state is derived from ``events.db`` itself, per repo: strictly more
+    ``runner_capacity_starved`` rows than ``runner_capacity_recovered`` rows
+    means "currently signaled starved". The two kinds are only ever written
+    in strict alternation (this function is the sole writer of both), so a
+    row *count* comparison determines "which fired last" without needing to
+    order across kinds by timestamp — ``_now_iso()`` truncates to whole
+    seconds, so two kinds written in the same second would tie under a
+    timestamp comparison but never under a count comparison.
+
+    Iterates ``plan.targets`` — the same computed, live-discovered set
+    ``plan_allocation`` builds — so no repo name is ever hardcoded here.
+    """
+    starved_by_repo = {s.repo: s for s in starved_repos(plan)}
+    targets_by_repo = {t.repo: t for t in plan.targets}
+    spare_budget = plan.budget - sum(t.running for t in plan.targets)
+
+    for repo in sorted(targets_by_repo):
+        starved_count = len(query_events(state_path, repo=repo, kind="runner_capacity_starved"))
+        recovered_count = len(
+            query_events(state_path, repo=repo, kind="runner_capacity_recovered")
+        )
+        was_starved = starved_count > recovered_count
+        is_starved = repo in starved_by_repo
+
+        if is_starved and not was_starved:
+            s = starved_by_repo[repo]
+            log_event(
+                state_path,
+                "runner_capacity_starved",
+                {
+                    "repo": s.repo,
+                    "demand": s.demand,
+                    "capacity": s.capacity,
+                    "running": s.running,
+                    "spare_budget": s.spare_budget,
+                },
+                repo=s.repo,
+            )
+        elif was_starved and not is_starved:
+            t = targets_by_repo[repo]
+            log_event(
+                state_path,
+                "runner_capacity_recovered",
+                {
+                    "repo": t.repo,
+                    "demand": t.demand,
+                    "capacity": t.capacity,
+                    "running": t.running,
+                    "spare_budget": spare_budget,
+                },
+                repo=t.repo,
+            )
+
+
 def run_allocation_pass(
     gh: GitHubLike,
     allocation: RunnerAllocationConfig,
@@ -145,6 +233,7 @@ def run_allocation_pass(
     state_path: Path | None = None,
     dry_run: bool = False,
     source: AllocationSource,
+    full_pass_interval_seconds: int,
 ) -> AllocationPassResult:
     """Rebalance this host's running runner listeners across repos by demand.
 
@@ -162,6 +251,13 @@ def run_allocation_pass(
             the doctor probe can tell an unattended pass from an operator's
             manual ``charlie runners allocate`` — both write the same file, and
             only the former is evidence the daemon is rebalancing (issue #590).
+        full_pass_interval_seconds: The cadence this pass is being driven at
+            (``supervisor.full_pass_interval_seconds`` from the *caller's*
+            resolved config). Persisted with the state file so the doctor probe
+            measures staleness against the interval the daemon actually used
+            rather than re-resolving config through its own load call — a
+            per-repo layer that sets the interval would otherwise make the probe
+            measure against a cadence the daemon is not running at (issue #606).
 
     Returns:
         AllocationPassResult — never raises.
@@ -175,12 +271,31 @@ def run_allocation_pass(
 
     inputs, error = resolve_inputs(allocation, managed_root_fallback)
     if inputs is None:
+        # A misconfigured root leaves no positive evidence the pass ran, so the
+        # doctor probe used to attribute it to "the daemon never reached
+        # allocation" (#590) — a different problem with a different fix. Record
+        # the actual reason instead (issue #606). A dry-run must not write state
+        # (the preview would otherwise bump ``updated_at`` and look like a pass).
+        if not dry_run:
+            save_allocation_skip(
+                fleet_dir(override=fleet_dir_override),
+                source=source,
+                full_pass_interval_seconds=full_pass_interval_seconds,
+                skip_reason=error or "runner_allocation inputs could not be resolved",
+            )
         return AllocationPassResult(ok=False, error=error)
 
     instances, discovery_notes = discover_runner_instances(inputs.managed_root)
     notes = list(inputs.notes) + list(discovery_notes)
 
     if not instances:
+        if not dry_run:
+            save_allocation_skip(
+                fleet_dir(override=fleet_dir_override),
+                source=source,
+                full_pass_interval_seconds=full_pass_interval_seconds,
+                skip_reason=f"no configured runners found under {inputs.managed_root}",
+            )
         return AllocationPassResult(
             ok=True,
             skipped=True,
@@ -225,9 +340,18 @@ def run_allocation_pass(
             state_dir,
             next_idle_streaks(observed, demands, previous_streaks),
             source=source,
+            full_pass_interval_seconds=full_pass_interval_seconds,
             # Advance the rotation so a different repo wins the next name tie.
             tie_break_offset=tie_break_offset + 1,
         )
+
+        # Promote the "demand exceeds registered capacity, budget has slack"
+        # condition from a stdout-only note to a queryable, edge-triggered
+        # event (issue #799). Gated on ``not dry_run`` for the same reason
+        # the hysteresis persist above is: a dry-run previews the plan and
+        # must not have side effects (including event writes).
+        if state_path is not None:
+            _emit_capacity_events(state_path, plan)
 
     if state_path is not None:
         summary = plan_summary(plan)

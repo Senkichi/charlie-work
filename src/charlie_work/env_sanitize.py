@@ -19,12 +19,25 @@ wins and the orchestrator's config/token never reaches the worker process.
 
 Dispatch parallelism cap (issue #646): the same "sanitize once, merge
 worker_env after" chokepoint also injects a safe-default
-``PYTEST_XDIST_AUTO_NUM_WORKERS`` and, when the target worktree has a
-``.venv``, ``UV_NO_SYNC=1`` — both via ``dict.setdefault``, so an ambient
-value already present in the orchestrator's own environment, or an operator
-override supplied via ``worker_env``, always wins over the default. See
-``resolve_pytest_cap``/``resolve_uv_no_sync`` for the precedence helper used
+``PYTEST_XDIST_AUTO_NUM_WORKERS`` and, when the target has a real local
+``.venv`` (not a reparse point), ``UV_NO_SYNC=1`` — both via ``dict.setdefault``,
+so an ambient value already present in the orchestrator's own environment, or
+an operator override supplied via ``worker_env``, always wins over the default.
+See ``resolve_pytest_cap``/``resolve_uv_no_sync`` for the precedence helper used
 by callers that need to log which layer supplied the final value.
+
+Shared-venv confinement (issue #649): ``sanitize_env`` does not rely on a
+``UV_PROJECT_ENVIRONMENT`` pin to protect a junctioned shared venv. Once the
+orchestrator's value is popped, pinning the variable to ``.venv`` is a no-op
+over uv's default project-environment lookup, and a junctioned ``.venv`` still
+resolves to the shared target. Instead, ``sanitize_env`` treats a ``.venv`` that
+is a Windows junction or POSIX symlink (a reparse point) as a view into a
+shared venv, not an owned local environment. Inside a git worktree, that
+reparse point is unlinked (the target is never touched) so a worker's
+``uv sync`` cannot rewrite the shared venv through it. A real local ``.venv``
+directory keeps ``VIRTUAL_ENV`` and the ``UV_NO_SYNC`` convenience guard;
+``UV_PROJECT_ENVIRONMENT`` is intentionally not set because uv's default
+project environment is already ``.venv`` in the project root.
 """
 
 from __future__ import annotations
@@ -33,6 +46,7 @@ import os
 from pathlib import Path
 
 from . import layout
+from .worktree import _unlink_reparse_point, is_junction
 
 # Issue #646: box-wide dispatch parallelism cap. A consuming repo's own
 # pyproject.toml commonly ships `addopts = "... -n auto --dist loadscope"`
@@ -51,17 +65,33 @@ from . import layout
 PYTEST_XDIST_AUTO_NUM_WORKERS_VAR = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 
-# Issue #646: pairs with the cap above. Worktrees in this fleet commonly share
-# a junctioned/copied .venv (see create_worktree's venv_source handling) —
-# when one worker's `uv run`/`uv sync` is left free to resolve/reinstall that
-# shared venv while sibling workers are concurrently running out of it, the
-# reinstall can wipe site-packages out from under them mid-run (2 prior
-# incidents referenced from job-cannon's own CLAUDE.md; the risk here is
-# analogous whenever venv_source is configured). UV_NO_SYNC must only ever be
-# set alongside a confirmed .venv — never unconditionally, since a worktree
-# legitimately without one still wants uv to manage its own.
+# Issue #646 / #649: pairs with the cap above. UV_NO_SYNC gates only `uv run`'s
+# *implicit* sync (the `--no-sync` flag, per uv docs) — it does NOT gate an
+# explicit `uv sync`, which still resolves and rewrites the project environment.
+# So UV_NO_SYNC alone cannot protect a shared/junctioned .venv from a worker's
+# explicit `uv sync` rewriting it out from under sibling workers. The real
+# protection comes from `sanitize_env` treating only a real, non-reparse-point
+# .venv as an owned local venv, and unlinking a .venv reparse point inside a
+# git worktree so uv is forced to create and manage a real local .venv instead.
+# UV_NO_SYNC is still worth keeping alongside a confirmed real .venv: it
+# prevents `uv run`'s implicit sync from pruning extras a worker needs, but it
+# is a convenience guard, not the shared-venv safety boundary. UV_NO_SYNC must
+# only ever be set alongside a confirmed real .venv — never unconditionally,
+# since a worktree that legitimately manages its own venv still wants uv to
+# manage its own.
 UV_NO_SYNC_VAR = "UV_NO_SYNC"
 _UV_NO_SYNC_DEFAULT = "1"
+
+
+def _is_owned_venv(path: Path) -> bool:
+    """Return True if ``path`` is a real directory, not a reparse point."""
+    return path.is_dir() and not is_junction(path)
+
+
+def _is_git_worktree(path: Path) -> bool:
+    """Return True if ``path`` looks like a git worktree (has a .git file)."""
+    git_meta = path / ".git"
+    return git_meta.exists() and not git_meta.is_dir()
 
 
 def sanitize_env(target_path: Path) -> dict[str, str]:
@@ -69,11 +99,21 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
 
     Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
     to prevent the orchestrator's venv from leaking into worker sessions. If the
-    target path contains a .venv directory, VIRTUAL_ENV is set to that path
-    instead of being dropped.
+    target path contains a real local ``.venv`` directory, VIRTUAL_ENV is set to
+    that path and ``UV_NO_SYNC`` is defaulted to ``1`` so ``uv run`` does not
+    implicitly re-sync an already-good environment.
 
-    This is a defense-in-depth measure: workers should resolve their own
-    environment via uv run --active or similar, not inherit the orchestrator's.
+    A ``.venv`` that is a Windows junction or POSIX symlink is *not* an owned
+    local venv; it is a window into a shared venv. Inside a git worktree (a
+    ``.git`` file, not a directory), that reparse point is unlinked so a
+    worker's ``uv sync`` cannot rewrite the shared venv through it. The target
+    of the reparse point is never touched.
+
+    ``UV_PROJECT_ENVIRONMENT`` is intentionally not set by this function. After
+    the orchestrator's value is popped, uv's default project environment is
+    already ``.venv`` in the project root, so setting the variable would be a
+    no-op. The previous attempt to use it as a safety pin for a junctioned
+    shared venv did not work (issue #649).
 
     Args:
         target_path: The worktree or repo path to check for a .venv directory.
@@ -84,14 +124,32 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     target_venv = target_path / ".venv"
 
-    # Always pop UV_PROJECT_ENVIRONMENT first to prevent leaks
+    # Always pop these first to prevent leaks from the orchestrator (issue #117):
+    # any ambient UV_PROJECT_ENVIRONMENT at this point is by definition the
+    # orchestrator's.
     env.pop("UV_PROJECT_ENVIRONMENT", None)
 
-    if target_venv.is_dir():
-        # Target has its own venv — use it
+    # A .venv reparse point (junction/symlink) is a view into a shared venv,
+    # not an owned local venv. Unlink it inside a worktree so uv cannot
+    # resolve/rewrite the shared venv through it.
+    if is_junction(target_venv) and _is_git_worktree(target_path):
+        try:
+            _unlink_reparse_point(target_venv)
+        except OSError:
+            # Best-effort: if we cannot unlink, fall through and at least do
+            # not pin uv to the shared venv.
+            pass
+
+    if _is_owned_venv(target_venv):
+        # Target has its own real local venv — let direct `python` invocations
+        # find it. uv ignores VIRTUAL_ENV and resolves .venv by default, which
+        # is the same path, so we do not need to set UV_PROJECT_ENVIRONMENT.
         env["VIRTUAL_ENV"] = str(target_venv)
+        # Convenience guard: don't let `uv run` implicitly prune extras the
+        # worker may have added; explicit `uv sync` is still possible.
+        env.setdefault(UV_NO_SYNC_VAR, _UV_NO_SYNC_DEFAULT)
     else:
-        # No target venv — drop VIRTUAL_ENV to prevent leaks
+        # No owned local venv — drop VIRTUAL_ENV to prevent leaks.
         env.pop("VIRTUAL_ENV", None)
 
     # Issue #502: never inherit the orchestrator's GitHub auth tokens. Workers
@@ -115,17 +173,15 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     gh_config_dir.mkdir(parents=True, exist_ok=True)
     env["GH_CONFIG_DIR"] = str(gh_config_dir)
 
-    # Issue #646: cap xdist worker fan-out and guard a shared/junctioned
-    # .venv from a concurrent uv sync. setdefault() so an already-exported
-    # ambient value always wins over the built-in safety-net default — and a
-    # caller merging a config-level worker_env override AFTER this function
-    # returns (the established pattern in claude_code.py/devin_shell.py) can
-    # still override either value. See resolve_pytest_cap()/
-    # resolve_uv_no_sync() for the full 3-way precedence (config > env >
-    # default) used at the launch sites for logging.
+    # Issue #646: cap xdist worker fan-out and guard a real local .venv from a
+    # concurrent uv sync. setdefault() so an already-exported ambient value
+    # always wins over the built-in safety-net default — and a caller merging
+    # a config-level worker_env override AFTER this function returns (the
+    # established pattern in claude_code.py/devin_shell.py) can still override
+    # either value. See resolve_pytest_cap()/resolve_uv_no_sync() for the full
+    # 3-way precedence (config > env > default) used at the launch sites for
+    # logging.
     env.setdefault(PYTEST_XDIST_AUTO_NUM_WORKERS_VAR, DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS)
-    if target_venv.is_dir():
-        env.setdefault(UV_NO_SYNC_VAR, _UV_NO_SYNC_DEFAULT)
 
     return env
 
@@ -170,13 +226,13 @@ def resolve_uv_no_sync(
     """Return ``(value, source)`` for ``UV_NO_SYNC`` after the same 3-way
     merge described in ``resolve_pytest_cap``.
 
-    ``value`` is ``None`` only when ``target_path`` has no ``.venv``, no
-    override forced one, AND no ambient ``UV_NO_SYNC`` was already exported —
+    ``value`` is ``None`` only when ``target_path`` has no real local ``.venv``,
+    no override forced one, AND no ambient ``UV_NO_SYNC`` was already exported —
     the safety-net default is only ever injected alongside a real ``.venv``
     (see ``sanitize_env``'s docstring for why an unconditional default would
     be wrong for a worktree that legitimately manages its own venv). But
     ``sanitize_env`` never *pops* an ambient ``UV_NO_SYNC`` — it only skips
-    the ``setdefault`` when there's no ``.venv`` — so an operator-exported
+    the ``setdefault`` when there's no owned ``.venv`` — so an operator-exported
     value still reaches the child process regardless of ``.venv``
     presence. The ambient-env check must therefore run BEFORE the no-venv
     short-circuit, or this function reports ``None`` while the subprocess
@@ -190,7 +246,7 @@ def resolve_uv_no_sync(
         return str(override), "config"
     if UV_NO_SYNC_VAR in os.environ:
         return sanitized_env[UV_NO_SYNC_VAR], "env"
-    if not (target_path / ".venv").is_dir():
+    if not _is_owned_venv(target_path / ".venv"):
         return None, "no-venv"
     return sanitized_env.get(UV_NO_SYNC_VAR, _UV_NO_SYNC_DEFAULT), "default"
 

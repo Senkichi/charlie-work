@@ -37,3 +37,27 @@ Markdown to stdout. For each finding: **SEVERITY** (BLOCKER / MAJOR / MINOR / NI
 `file:line`, the problem, the **code evidence you verified**, and a concrete fix. Rank
 BLOCKERs first. End with a one-line verdict. A finding without a code citation is worth
 little — cite the evidence you actually checked.
+
+## Verdict block
+
+After the Markdown findings and verdict line above, end your response with a fenced
+JSON block. The orchestrator parses this block to auto-record your verdict and to carry
+each finding into a rework brief; without it, only the Markdown above is kept for a
+human to read manually, and none of your findings reach the worker that would act on
+them.
+
+The block must have this exact shape:
+
+```json
+{
+  "decision": "approved" | "request_changes",
+  "summary": "one or two sentence explanation of the decision",
+  "required_changes": ["specific required change", "..."]
+}
+```
+
+Use `request_changes` if you raised any BLOCKER or MAJOR finding above, `approved`
+otherwise. `summary` must be non-empty for both. `required_changes` is **mandatory**
+when `decision` is `request_changes` — list every BLOCKER/MAJOR finding as one
+concrete, actionable item each; an empty or missing list is treated as non-compliant
+and discarded.

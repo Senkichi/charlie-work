@@ -402,19 +402,41 @@ def _check_runner_allocation(
     pass records which path wrote it and only the unattended one is accepted as
     evidence here; a manual write is reported as "cannot confirm" rather than
     "fine", because the file keeps just the latest write.
+
+    Two things the probe used to *guess* are now read from the file (issue #606):
+
+    * **The driving interval.** The staleness bound was
+      ``config.supervisor.full_pass_interval_seconds * 3``, resolved through the
+      probe's own config load — a different call from the one the daemon used. The
+      pass now records the interval it was driven at, and the bound is computed
+      from that recorded value (falling back to config only for a file written
+      before the interval was recorded).
+    * **The skip reason.** A pass that declines to act (no runners under
+      ``managed_root``, an unresolvable root) now records *why*. The probe reports
+      the recorded reason instead of asserting "not running unattended (#590)" for
+      every stale-or-absent file — "the daemon never reached allocation" and "the
+      daemon ran it and found no runners" are different problems with different
+      fixes.
     """
     allocation = getattr(config, "runner_allocation", None)
     if allocation is None or not allocation.enabled:
         return
 
     state_dir = fleet_dir(override=fleet_dir_override)
-    interval = max(config.supervisor.full_pass_interval_seconds, 1)
-    # Three intervals: one missed pass is normal jitter (a pass can run long), a
-    # sustained gap is not.
-    stale_after = interval * 3
     budget = allocation.max_running_runners
 
     stamp = load_allocation_stamp(state_dir)
+    # Measure staleness against the interval the pass was *actually* driven at,
+    # not the one this probe re-resolves — a per-repo layer that sets the
+    # interval would otherwise make the probe measure against a cadence the
+    # daemon is not running at (issue #606). Fall back to config only for a file
+    # written before the interval was recorded.
+    recorded_interval = stamp.full_pass_interval_seconds if stamp is not None else None
+    interval = max(recorded_interval or config.supervisor.full_pass_interval_seconds, 1)
+    # Three intervals: one missed pass is normal jitter (a pass can run long), a
+    # sustained gap is not.
+    stale_after = interval * 3
+
     if stamp is None:
         add(
             "runner allocation",
@@ -441,6 +463,41 @@ def _check_runner_allocation(
     now = datetime.datetime.now(datetime.timezone.utc)
     age = max(0, int((now - stamp.updated_at).total_seconds()))
     writer = _allocation_writer_label(stamp.source)
+
+    # A recorded skip reason is the pass saying "I ran, and here is why I did not
+    # act." Report that instead of guessing #590: a fresh unattended skip is the
+    # daemon reaching allocation and declining — a named, different problem — not
+    # the "never reached it" shape #590 describes. A *stale* skip is both: the
+    # daemon last found <reason> and has not been back, so the #590 reading joins
+    # the recorded reason rather than replacing it.
+    #
+    # A skip written by a non-unattended source (a manual `charlie runners
+    # allocate`, or a file predating provenance) still cannot confirm the daemon
+    # is rebalancing — the writer overwrites the same host-wide file, so its
+    # skip reason is not evidence the daemon reached allocation. That clause
+    # joins the recorded reason the same way staleness does, so a fresh manual
+    # skip names *why* it declined *and* flags that it cannot speak for the
+    # daemon (issue #590). When both apply (a stale manual skip) the clauses are
+    # joined so #590 is cited once rather than duplicated.
+    if stamp.skip_reason is not None:
+        detail = (
+            f"enabled (budget {budget}) but the last pass ({writer}) {age}s ago "
+            f"declined to act: {stamp.skip_reason}"
+        )
+        clauses: list[str] = []
+        if stamp.source != UNATTENDED_ALLOCATION_SOURCE:
+            clauses.append(
+                "this overwrites the same file the unattended pass uses, "
+                "so it cannot confirm the daemon is rebalancing"
+            )
+        if age > stale_after:
+            clauses.append(
+                f"over the {stale_after}s staleness bound, allocation is not running unattended"
+            )
+        if clauses:
+            detail += " — " + "; ".join(clauses) + " (issue #590)"
+        add("runner allocation", False, detail, severity="warning")
+        return
 
     if age > stale_after:
         add(
