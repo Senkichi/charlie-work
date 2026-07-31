@@ -14572,6 +14572,161 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
     }
 
 
+def test_merge_ready_failed_attempt_alarm_reports_merge_state_not_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #751: when every check-summary bucket is empty (all required
+    checks pass) but the PR is still unmergeable for a reason none of the
+    explicitly modelled branches (merge_conflict, cross_pr_revert_detected,
+    mergequeue_handoff_failed, summary.failed) name, the terminal ``else``
+    branch must report GitHub's own ``mergeable``/``mergeStateStatus``
+    instead of discarding it as "check summary unknown" (the real #679
+    payload: all required checks green, alarm text still uninformative).
+
+    The scenario is built by forcing a genuine merge-base staleness
+    (compare_overrides) combined with a failed ``pr_update_branch`` — this
+    sets ``sync_failed`` (and therefore ``can_merge=False``) without ever
+    setting ``merge_conflict`` (which only looks at CONFLICTING/DIRTY), so
+    the alarm chain falls through every explicit branch into the ``else``.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            # No required checks -> the check-summary buckets are vacuously
+            # empty, isolating the terminal `else` branch under test.
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeable"] = "MERGEABLE"
+    fake_gh.prs[0]["mergeStateStatus"] = "BLOCKED"
+    # Force the merge-base freshness check to see a stale base (independent of
+    # mergeStateStatus, which the real _is_base_current path never consults),
+    # then fail the resulting update-branch attempt so sync_failed=True without
+    # ever tripping the CONFLICTING/DIRTY-only merge_conflict detector.
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "main-tip"},
+        "merge_base_commit": {"sha": "main-tip-stale"},
+    }
+    fake_gh.update_branch_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "mergeable=MERGEABLE" in warning
+    assert "mergeStateStatus=BLOCKED" in warning
+    # The negative control: without this assertion the test would also pass
+    # against the pre-fix code, which always appended the literal fallback
+    # regardless of what pr_view returned.
+    assert "check summary unknown" not in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["mergeable"] == "MERGEABLE"
+    assert alarm_events[0]["payload"]["merge_state_status"] == "BLOCKED"
+
+
+def test_merge_ready_failed_attempt_alarm_falls_back_when_merge_state_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #751: the "check summary unknown" fallback must survive for the
+    genuinely-unknown case where GitHub reports neither ``mergeable`` nor
+    ``mergeStateStatus`` as a usable signal (both ``"UNKNOWN"``), so a later
+    refactor of the merge-state bucket can't silently delete the fallback.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["mergeable"] = "UNKNOWN"
+    fake_gh.prs[0]["mergeStateStatus"] = "UNKNOWN"
+    fake_gh.compare_overrides[("main", "sha-abc123")] = {
+        "base_commit": {"sha": "main-tip"},
+        "merge_base_commit": {"sha": "main-tip-stale"},
+    }
+    fake_gh.update_branch_ok = False
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "check summary unknown" in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["mergeable"] == "UNKNOWN"
+    assert alarm_events[0]["payload"]["merge_state_status"] == "UNKNOWN"
+
+
+def test_merge_ready_failed_attempt_alarm_reports_unavailable_not_passed(
+    tmp_path: Path,
+) -> None:
+    """When ``gh pr checks`` itself fails, summarize_checks(None, required)
+    puts every required check into ``summary.unavailable`` — missing,
+    pending, failed, and infra_failed all stay empty. The terminal ``else``
+    branch's bucket chain checked those four buckets but never
+    ``unavailable``, so it fell through to the "every bucket empty" fallback
+    and (after the mergeable/mergeStateStatus fix above) would have claimed
+    "all required checks passed" — an actively false statement when the
+    check status could not be fetched at all. This must report the
+    unavailable checks instead of asserting they passed.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests",),
+            require_approved_review=True,
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithChecksUnavailable(FakeGitHub):
+        def pr_checks(self, number: int):
+            return None
+
+    fake_gh = FakeGitHubWithChecksUnavailable()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    result = app.merge_ready(456, merge=False)
+    assert result.data["checks_unavailable"] is True
+    assert result.data["can_merge"] is False
+    assert result.data["merge_attempt_alarm"] is True
+    warning = result.data["merge_attempt_warning"]
+    assert warning is not None
+    assert "unavailable: Tests" in warning
+    # The negative control: an unavailable check is not a passed check.
+    assert "all required checks passed" not in warning
+    assert "check summary unknown" not in warning
+
+    state = load_state(paths.state_file)
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["checks_summary"]["unavailable"] == ["Tests"]
+
+
 def test_merge_ready_failed_attempt_alarm_resets_on_merge(tmp_path: Path) -> None:
     """Issue #254: a successful merge resets the failed attempt counter."""
     from charlie_work.config import AutoMergeConfig
