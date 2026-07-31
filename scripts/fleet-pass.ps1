@@ -72,6 +72,23 @@ $env:PYTHONIOENCODING = 'utf-8'
 # (FF-pull origin/main + uv sync on dep changes) before each fleet_loop pass.
 # The one-pass lag applies: a pass pulls new code but runs the already-imported
 # module; the pulled code takes effect on the NEXT pass.
-$cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" charlie fleet supervise --max-runtime 0 >> `"$log`" 2>&1"
+#
+# INVOKED AS `python -m charlie_work`, NOT AS THE `charlie` CONSOLE SCRIPT.
+# This is load-bearing and must not be "simplified" back (issue #854).
+#
+# `uv sync` reinstalls the editable project on every run, and its uninstall half
+# must delete `.venv/Scripts/charlie.exe`. Windows locks running executables, so
+# launching via the console script means the supervisor holds an exclusive handle
+# on the exact file its own in-process self-deploy has to replace:
+#
+#   error: failed to remove file `...\.venv\...\../../Scripts/charlie.exe`:
+#          Access is denied. (os error 5)
+#
+# That is structural, not a race — the process invoking the sync IS the lock
+# holder, so no retry or backoff can ever succeed. Entering through
+# `python -m charlie_work` (src/charlie_work/__main__.py, same `cli:main`) means
+# the locked image is python.exe, which `uv sync` never replaces, leaving
+# charlie.exe free to be rewritten.
+$cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" python -m charlie_work fleet supervise --max-runtime 0 >> `"$log`" 2>&1"
 & cmd /c $cmdLine
 "--- fleet supervise exit=$LASTEXITCODE $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
