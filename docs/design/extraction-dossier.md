@@ -150,7 +150,9 @@ Empty command → clear error. This is the module most in need of a shared subpr
 utility.
 
 ### `paths.py` (52/53 lines, byte-identical)
-`find_repo_root` via `git rev-parse --show-toplevel` with a `.git`-scan fallback.
+`find_repo_root` resolves the shared main worktree root via `git rev-parse --git-dir` /
+`--git-common-dir` (so a linked worktree resolves to the main root, not its own toplevel),
+falling back to `git rev-parse --show-toplevel` with a `.git`-scan fallback.
 `runtime_paths(repo_root, state_dir)` derives all artifact paths under a configurable root
 (default `.var/devin-orchestrator`).
 
