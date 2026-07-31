@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from string import Template
@@ -108,3 +109,43 @@ def render_prompt(
     # Single substitution over the template: attacker-supplied values are leaf
     # replacements that are never re-scanned.
     return template.safe_substitute(final_safe_values)
+
+
+def prompt_template_digest(template_name: str, search_dirs: Sequence[Path] = ()) -> str:
+    """Return a stable SHA-256 digest of the template text plus every section
+    partial it actually references.
+
+    The digest is computed from *resolved source*, mirroring ``render_prompt``:
+    the template file ``resolve_template`` picks (repo-local override or
+    package default) and the section partials ``section_variables`` supplies
+    that the template references via ``$section_<stem>``. Unused partials never
+    reach the rendered output, so a stale unused partial must not invalidate
+    packets -- only referenced ones are hashed.
+
+    This lets a caller treat a template change as a packet-staleness trigger
+    alongside a head-SHA change (issue #592): the packet's freshness becomes a
+    function of all of its inputs, not just one, with no version constant to
+    bump and no list of template names to maintain. The digest derives from
+    the files on disk, so repo-local overrides, package templates, and section
+    partials are all covered uniformly.
+    """
+    from .prompt_sections import section_variables
+
+    template_path = resolve_template(template_name, search_dirs)
+    template_text = template_path.read_text(encoding="utf-8")
+    template = Template(template_text)
+    sections = section_variables(search_dirs=tuple(search_dirs))
+    referenced = set(template.get_identifiers()) & set(sections)
+
+    hasher = hashlib.sha256()
+    hasher.update(template_name.encode("utf-8"))
+    hasher.update(b"\x00")
+    hasher.update(template_text.encode("utf-8"))
+    # Deterministic order: section keys are sorted so the digest is stable
+    # across processes and platforms regardless of dict iteration order.
+    for key in sorted(referenced):
+        hasher.update(b"\x00")
+        hasher.update(key.encode("utf-8"))
+        hasher.update(b"\x00")
+        hasher.update(sections[key].encode("utf-8"))
+    return hasher.hexdigest()
