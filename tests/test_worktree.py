@@ -3576,6 +3576,36 @@ def test_inspect_worktree_state_empty_path_returns_unknown(tmp_path: Path) -> No
     assert "empty" in inspection.error
 
 
+def test_inspect_worktree_state_empty_path_short_circuits_before_completed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Coverage gap in test_inspect_worktree_state_empty_path_returns_unknown:
+    that test chdirs into a bare ``tmp_path`` (not a git repo), so removing the
+    guard entirely still returns UNKNOWN there -- git merge-base/rev-list fail
+    with "not a git repository" regardless of the guard, and only the error
+    *string* assertion would catch a regression, not the state assertion.
+
+    The actual danger (issue #660) requires a cwd that IS a real git checkout
+    with commits ahead of its own base -- that is what turns the misprobe into
+    WorktreeState.COMPLETED (see the merge-ahead branch a few lines below the
+    guard). This test reproduces that exact precondition: a real repo, checked
+    out with an unpublished commit ahead of origin/main, clean working tree.
+    Without the guard this asserts COMPLETED (empirically confirmed by
+    temporarily deleting the guard and re-running this exact scenario); with
+    the guard it must stay UNKNOWN.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    (repo / "extra.txt").write_text("extra\n", encoding="utf-8")
+    _git(repo, "add", "extra.txt")
+    _git(repo, "commit", "-m", "ahead of origin/main")
+    monkeypatch.chdir(repo)
+
+    inspection = inspect_worktree_state(Path(""))
+    assert inspection.state == WorktreeState.UNKNOWN
+    assert inspection.error is not None
+    assert "empty" in inspection.error
+
+
 def test_push_branch_publishes_and_verifies(tmp_path: Path) -> None:
     """push_branch pushes a local branch to origin and verifies the remote tip."""
     remote, repo = _init_repo_with_remote(tmp_path)
