@@ -11731,39 +11731,69 @@ class OrchestratorApp:
                             "graphql_threshold": threshold,
                         },
                     )
-                drift = detect_drift(
-                    self.gh,
-                    state,
-                    self.config,
-                    repo_root=self.repo_root,
-                    skip_dead_session_sweep=skip_dead_session_sweep,
-                ) + detect_aviator_stale_blocked(self.gh, self.config, repo_root=self.repo_root)
-                fixed = False
-                post_fix_drift: list[DriftItem] = []
-                if fix and drift:
-                    new_state = apply_drift_fixes(
+                new_state = state
+                try:
+                    drift = detect_drift(
                         self.gh,
                         state,
-                        drift,
-                        self.config,
-                        repo_root=self.repo_root,
-                        state_path=self.paths.state_file,
-                    )
-                    save_state(self.paths.state_file, new_state)
-                    # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
-                    # for failed adds/removes, and apply_fixes records the outcome in the
-                    # reconcile event. Re-detect against the new state to verify the repairs
-                    # actually landed before reporting success.
-                    post_fix_drift = detect_drift(
-                        self.gh,
-                        new_state,
                         self.config,
                         repo_root=self.repo_root,
                         skip_dead_session_sweep=skip_dead_session_sweep,
                     ) + detect_aviator_stale_blocked(
                         self.gh, self.config, repo_root=self.repo_root
                     )
-                    fixed = len(post_fix_drift) == 0
+                    fixed = False
+                    post_fix_drift: list[DriftItem] = []
+                    if fix and drift:
+                        new_state = apply_drift_fixes(
+                            self.gh,
+                            state,
+                            drift,
+                            self.config,
+                            repo_root=self.repo_root,
+                            state_path=self.paths.state_file,
+                        )
+                        save_state(self.paths.state_file, new_state)
+                        # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
+                        # for failed adds/removes, and apply_fixes records the outcome in the
+                        # reconcile event. Re-detect against the new state to verify the repairs
+                        # actually landed before reporting success.
+                        post_fix_drift = detect_drift(
+                            self.gh,
+                            new_state,
+                            self.config,
+                            repo_root=self.repo_root,
+                            skip_dead_session_sweep=skip_dead_session_sweep,
+                        ) + detect_aviator_stale_blocked(
+                            self.gh, self.config, repo_root=self.repo_root
+                        )
+                        fixed = len(post_fix_drift) == 0
+                except GraphQLBudgetError as exc:
+                    # Defensive: detect_drift re-checks the budget and may raise.
+                    new_state = self._record_event(
+                        new_state,
+                        "reconcile_pass_deferred",
+                        {
+                            "remaining": exc.remaining,
+                            "reset": exc.reset_at,
+                            "threshold": exc.threshold,
+                            "fix": fix,
+                            "deferred_reason": "graphql_rate_limit",
+                        },
+                    )
+                    save_state(self.paths.state_file, new_state)
+                    return CommandResult(
+                        True,
+                        "reconcile deferred: GraphQL rate limit below threshold",
+                        {
+                            "deferred": True,
+                            "deferred_reason": "graphql_rate_limit",
+                            "graphql_remaining": exc.remaining,
+                            "graphql_reset": exc.reset_at,
+                            "graphql_threshold": exc.threshold,
+                            "reconcile_pass_event_recorded": True,
+                        },
+                    )
             message = f"found {len(drift)} drift item(s)"
             if fixed:
                 message += " — fixed"
@@ -11784,19 +11814,6 @@ class OrchestratorApp:
                     "drift_before": len(drift),
                     "drift_after": len(post_fix_drift),
                     "remaining_drift": [asdict(item) for item in post_fix_drift],
-                },
-            )
-        except GraphQLBudgetError as exc:
-            # Defensive: detect_drift re-checks the budget and may raise.
-            return CommandResult(
-                True,
-                "reconcile deferred: GraphQL rate limit below threshold",
-                {
-                    "deferred": True,
-                    "deferred_reason": "graphql_rate_limit",
-                    "graphql_remaining": exc.remaining,
-                    "graphql_reset": exc.reset_at,
-                    "graphql_threshold": exc.threshold,
                 },
             )
         except StateLockBusy:
@@ -13775,16 +13792,17 @@ class OrchestratorApp:
                     {"reason": data.get("reason")},
                 )
             elif data.get("deferred"):
-                state = self._record_event(
-                    state,
-                    "reconcile_pass_deferred",
-                    {
-                        "deferred_reason": data.get("deferred_reason"),
-                        "graphql_remaining": data.get("graphql_remaining"),
-                        "graphql_reset": data.get("graphql_reset"),
-                        "graphql_threshold": data.get("graphql_threshold"),
-                    },
-                )
+                if not data.get("reconcile_pass_event_recorded"):
+                    state = self._record_event(
+                        state,
+                        "reconcile_pass_deferred",
+                        {
+                            "deferred_reason": data.get("deferred_reason"),
+                            "graphql_remaining": data.get("graphql_remaining"),
+                            "graphql_reset": data.get("graphql_reset"),
+                            "graphql_threshold": data.get("graphql_threshold"),
+                        },
+                    )
             else:
                 drift_before = data.get("drift_before", 0)
                 drift_after = data.get("drift_after", 0)
