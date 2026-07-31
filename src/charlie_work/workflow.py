@@ -527,6 +527,33 @@ def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
     return not _summary_is_vacuous(str(decision.get("summary") or ""))
 
 
+def _escalation_flags(
+    pr_state: dict[str, Any], issue_state: dict[str, Any] | None
+) -> tuple[bool, bool]:
+    """Return ``(pr_escalated, issue_escalated)`` -- the shared escalation check.
+
+    A PR or its linked issue is "escalated" when its state entry's ``status``
+    is exactly ``"escalated"`` (a human has been asked to intervene via
+    ``agent:human-needed``). ``issue_state`` may be ``None`` when the PR has
+    no resolvable linked issue (cross-repo/fork PRs, or branches outside the
+    configured prefix) -- in that case only ``pr_escalated`` can be True.
+
+    This is the single predicate shared by ``review()`` (issue #384: gates
+    ALL packet generation and label transitions at entry, unconditionally,
+    once escalated) and ``merge_ready()`` (issue #833: gates only the
+    specific mutation sites that had NO escalation awareness at all).
+    ``merge_ready()`` deliberately does NOT call this at function entry --
+    several of its remediation lanes must keep running while escalated for
+    an unrelated reason (issue #776; real corpus: issues #592/#648/#606), so
+    a blanket entry gate would silently re-break that fix. See the
+    "escalation policy is per-route" comment inside ``merge_ready()`` for the
+    full breakdown of which lanes exclude "escalated" and which don't.
+    """
+    pr_escalated = pr_state.get("status") == "escalated"
+    issue_escalated = issue_state is not None and issue_state.get("status") == "escalated"
+    return pr_escalated, issue_escalated
+
+
 # Statuses that mean an issue already has a rework routed (or an equivalent
 # gate) in flight, or is otherwise spoken for -- shared by every "should I
 # route this PR to rework_requested" check so they cannot drift apart.
@@ -7555,11 +7582,12 @@ class OrchestratorApp:
         # falling through to the janitor gate and losing their escalated marker.
         state = load_state_locked(self.paths.state_file)
         pr_state = state.get("prs", {}).get(str(pr_number), {})
-        pr_escalated = pr_state.get("status") == "escalated"
-        issue_escalated = False
-        if issue_number is not None:
-            issue_state = state.get("issues", {}).get(str(issue_number), {})
-            issue_escalated = issue_state.get("status") == "escalated"
+        issue_state = (
+            state.get("issues", {}).get(str(issue_number), {})
+            if issue_number is not None
+            else None
+        )
+        pr_escalated, issue_escalated = _escalation_flags(pr_state, issue_state)
         if pr_escalated or issue_escalated:
             reason = (
                 f"issue #{issue_number} is escalated; review skipped"
@@ -10870,44 +10898,78 @@ class OrchestratorApp:
             if head_moved and not carried_forward:
                 message = "PR head moved since approval — re-review required"
                 label_error: dict[str, Any] | None = None
-                if issue_number is not None:
-                    result = transition(
-                        self.gh, self.config.labels, issue_number, "review_started"
-                    )
-                    if result.outcome != TransitionOutcome.APPLIED:
-                        label_error = {
-                            "edge": "review_started",
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        }
-                with state_lock(self.paths.state_file):
-                    state = load_state(self.paths.state_file)
-                    state["prs"][str(pr_number)] = {
-                        **state["prs"].get(str(pr_number), {}),
-                        "number": pr_number,
-                        "issue_number": issue_number,
-                        "status": "reviewing",
-                        "head_moved": True,
-                        "reviewed_head_sha": reviewed_head_sha,
-                        "live_head_sha": live_head_sha,
-                        "consecutive_failed_merge_attempts": 0,
-                        "consecutive_stale_base_deferrals": 0,
-                    }
+                # Escalation gate (issue #833). merge_ready()'s escalation
+                # handling is per-route by design, not a single top-of-function
+                # gate: the readiness-no-CI-stall (below), check-failure, and
+                # cross-PR-revert lanes already exclude "escalated"; the
+                # merge-conflict-rework lane deliberately does NOT (issue #776
+                # -- an unrelated-cause escalation must not permanently wall
+                # off a PR from its own capped remediation; real corpus:
+                # issues #592/#648/#606). This head_moved branch had NO
+                # escalation awareness at all: it unconditionally re-applied
+                # the "review_started" label transition and rewrote status to
+                # "reviewing" on every ~30 min loop pass, even for a PR
+                # already flagged agent:human-needed -- a livelock, not a
+                # remediation, because nothing was waiting on the re-review it
+                # kept re-requesting (real corpus: issue #602 / PR #679).
+                # Mirrors review()'s entry gate (which uses the same
+                # ``_escalation_flags`` predicate) but scoped to just these two
+                # mutations, not the whole function, so the merge-conflict-
+                # rework lane a few lines below keeps working.
+                #
+                # State is re-read here rather than reusing a flag computed at
+                # function entry: ``_check_carry_forward``/
+                # ``_update_approval_head`` above, and the merge-conflict-
+                # rework dispatch further below, can each write a new status
+                # for this PR/issue mid-call, so only a read taken at this
+                # exact point is trustworthy.
+                escalation_state = load_state_locked(self.paths.state_file)
+                pr_escalated, issue_escalated = _escalation_flags(
+                    escalation_state.get("prs", {}).get(str(pr_number), {}),
+                    escalation_state.get("issues", {}).get(str(issue_number), {})
+                    if issue_number is not None
+                    else None,
+                )
+                escalated = pr_escalated or issue_escalated
+                if not escalated:
                     if issue_number is not None:
-                        _issue_key = str(issue_number)
-                        _issue_entry = state["issues"].get(_issue_key, {})
-                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
-                    state = self._record_event(
-                        state,
-                        "head_moved",
-                        {
-                            "pr_number": pr_number,
+                        result = transition(
+                            self.gh, self.config.labels, issue_number, "review_started"
+                        )
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            label_error = {
+                                "edge": "review_started",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)] = {
+                            **state["prs"].get(str(pr_number), {}),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "reviewing",
+                            "head_moved": True,
                             "reviewed_head_sha": reviewed_head_sha,
                             "live_head_sha": live_head_sha,
-                        },
-                    )
-                    save_state(self.paths.state_file, state)
+                            "consecutive_failed_merge_attempts": 0,
+                            "consecutive_stale_base_deferrals": 0,
+                        }
+                        if issue_number is not None:
+                            _issue_key = str(issue_number)
+                            _issue_entry = state["issues"].get(_issue_key, {})
+                            state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                        state = self._record_event(
+                            state,
+                            "head_moved",
+                            {
+                                "pr_number": pr_number,
+                                "reviewed_head_sha": reviewed_head_sha,
+                                "live_head_sha": live_head_sha,
+                            },
+                        )
+                        save_state(self.paths.state_file, state)
                 return CommandResult(
                     False,
                     message,
@@ -10921,6 +10983,7 @@ class OrchestratorApp:
                         "live_head_sha": live_head_sha,
                         "review_decision": decision,
                         "label_error": label_error,
+                        "escalated": escalated,
                     },
                 )
             # Genuine merge conflict: gh pr update-branch cannot resolve this.

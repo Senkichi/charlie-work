@@ -19617,6 +19617,79 @@ def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> N
     assert fake_gh.merged_merge_flags == []
 
 
+def test_merge_ready_escalated_head_moved_makes_no_label_or_status_mutations(
+    tmp_path: Path,
+) -> None:
+    """Issue #833: merge_ready()'s head_moved branch must not keep re-asserting
+    itself once the PR/issue is escalated.
+
+    review() has always had an entry-level escalation gate (issue #384); this
+    is the twin gate for merge_ready(), scoped to the specific head_moved
+    mutation the reported bug is about rather than the whole function --
+    merge_ready() also owns the merge-conflict-rework dispatch lane, which
+    issue #776 requires to keep running while escalated for an unrelated
+    reason (see test_merge_ready_conflict_escalated_for_unrelated_reason_
+    routes_to_rework below), so a blanket top-of-function gate would silently
+    reintroduce #776's bug while fixing this one.
+
+    Real corpus: issue #602 / PR #679 -- once the issue was escalated
+    (agent:human-needed), merge_ready() kept re-adding agent:reviewing and
+    rewriting state status to "reviewing" on every ~30 min loop pass forever,
+    because this branch had no escalation awareness at all. Nothing was
+    waiting on the re-review it kept re-requesting, so it never resolved --
+    a livelock.
+
+    Positive control: test_merge_ready_refuses_when_head_moved_after_approval
+    (immediately above) is the byte-identical scenario MINUS the escalated
+    status write, and it DOES assert the label add and the status write --
+    proving this test's negative assertions would fail on unpatched code.
+    """
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    # Simulate the fleet state a livelocked issue #602/PR #679 was actually
+    # in: escalated with the human-needed / reviewing labels already applied
+    # from a prior pass.
+    fake_gh.issues[0] = {
+        **fake_gh.issues[0],
+        "labels": [{"name": "agent:human-needed"}, {"name": "agent:reviewing"}],
+    }
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    labels_added_before = list(fake_gh.labels_added)
+    labels_removed_before = list(fake_gh.labels_removed)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is False
+    assert "PR head moved since approval" in result.message
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert result.data["head_moved"] is True
+    assert result.data["escalated"] is True
+    assert fake_gh.merged == []
+    assert fake_gh.merged_merge_flags == []
+    # The actual reported bug: zero new label mutations on this pass.
+    assert fake_gh.labels_added == labels_added_before
+    assert fake_gh.labels_removed == labels_removed_before
+    assert (123, "agent:reviewing") not in fake_gh.labels_added[len(labels_added_before) :]
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] != "reviewing"
+    assert state["issues"]["123"]["status"] == "escalated"
+
+
 def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -> None:
     config = OrchestratorConfig(auto_merge=_approved_automerge())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
