@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -712,7 +713,16 @@ def test_cleanup_pool_samples(tmp_path: Path) -> None:
 
 
 def test_is_pool_idle_for_minutes(tmp_path: Path) -> None:
-    """is_pool_idle_for_minutes returns True when pool has been idle for required duration."""
+    """is_pool_idle_for_minutes returns True when pool has been idle for required duration.
+
+    ``now`` is frozen and injected into both the sample construction and the
+    ``is_pool_idle_for_minutes`` call (issue #828's clock seam -- see
+    ``runners.load_pool_samples``) so the cutoff filter reads the same instant
+    the samples were built against, instead of racing a fresh
+    ``datetime.now(UTC)`` sample inside production. An arbitrarily long stall
+    between building the samples and calling the function cannot move the
+    cutoff, so this stays deterministic under CI contention.
+    """
     from datetime import datetime, timedelta, UTC
 
     # Create samples spanning 20 minutes, all idle
@@ -723,13 +733,18 @@ def test_is_pool_idle_for_minutes(tmp_path: Path) -> None:
         save_pool_sample(tmp_path, sample)
 
     # Pool should be idle for 15 minutes
-    assert is_pool_idle_for_minutes(tmp_path, 15) is True
+    assert is_pool_idle_for_minutes(tmp_path, 15, now=now) is True
     # But not for 25 minutes
-    assert is_pool_idle_for_minutes(tmp_path, 25) is False
+    assert is_pool_idle_for_minutes(tmp_path, 25, now=now) is False
 
 
 def test_is_pool_idle_for_minutes_with_activity(tmp_path: Path) -> None:
-    """is_pool_idle_for_minutes returns False when pool has activity."""
+    """is_pool_idle_for_minutes returns False when pool has activity.
+
+    ``now`` is frozen and injected (issue #828) so the cutoff filter cannot
+    drop the busy sample under a stall between sample construction and the
+    call below.
+    """
     from datetime import datetime, timedelta, UTC
 
     now = datetime.now(UTC)
@@ -744,11 +759,16 @@ def test_is_pool_idle_for_minutes_with_activity(tmp_path: Path) -> None:
         save_pool_sample(tmp_path, sample)
 
     # Pool should not be idle due to busy sample
-    assert is_pool_idle_for_minutes(tmp_path, 15) is False
+    assert is_pool_idle_for_minutes(tmp_path, 15, now=now) is False
 
 
 def test_is_pool_idle_for_minutes_with_queued_jobs(tmp_path: Path) -> None:
-    """is_pool_idle_for_minutes returns False when pool has queued jobs."""
+    """is_pool_idle_for_minutes returns False when pool has queued jobs.
+
+    ``now`` is frozen and injected (issue #828) so the cutoff filter cannot
+    drop the queued-jobs sample under a stall between sample construction and
+    the call below.
+    """
     from datetime import datetime, timedelta, UTC
 
     now = datetime.now(UTC)
@@ -763,7 +783,7 @@ def test_is_pool_idle_for_minutes_with_queued_jobs(tmp_path: Path) -> None:
         save_pool_sample(tmp_path, sample)
 
     # Pool should not be idle due to queued jobs
-    assert is_pool_idle_for_minutes(tmp_path, 15) is False
+    assert is_pool_idle_for_minutes(tmp_path, 15, now=now) is False
 
 
 def test_discover_managed_runners(tmp_path: Path) -> None:
@@ -1028,12 +1048,23 @@ def test_is_in_cooldown_no_event(tmp_path: Path) -> None:
 
 
 def test_is_in_cooldown_in_cooldown(tmp_path: Path) -> None:
-    """is_in_cooldown returns True when in cooldown period."""
+    """is_in_cooldown returns True when in cooldown period.
+
+    ``now`` is frozen once and passed to both ``record_scale_event`` (the
+    write) and ``is_in_cooldown`` (the read) -- issue #828's clock seam, the
+    smallest-margin case in this sweep since there is no deliberate buffer
+    between the two, only ``cooldown_minutes`` itself. With both calls
+    sharing the same instant, ``elapsed`` is exactly 0 regardless of any
+    stall between them.
+    """
+    from datetime import UTC
+
+    frozen_now = datetime.now(UTC)
     # Record a recent event
-    record_scale_event(tmp_path, "down")
+    record_scale_event(tmp_path, "down", now=frozen_now)
 
     # Should be in cooldown
-    assert is_in_cooldown(tmp_path, cooldown_minutes=5) is True
+    assert is_in_cooldown(tmp_path, cooldown_minutes=5, now=frozen_now) is True
 
 
 def test_is_in_cooldown_expired(tmp_path: Path) -> None:
@@ -1056,7 +1087,16 @@ def test_is_in_cooldown_expired(tmp_path: Path) -> None:
 
 
 def test_scale_down_idle_runners_in_cooldown(tmp_path: Path) -> None:
-    """scale_down_idle_runners returns 0 when in cooldown."""
+    """scale_down_idle_runners returns 0 when in cooldown.
+
+    ``now`` is frozen once and passed to both ``record_scale_event`` (the
+    write) and ``scale_down_idle_runners`` (which forwards it to the
+    ``is_in_cooldown`` read) -- issue #828's clock seam, inherited from the
+    zero-buffer cooldown mechanism. With both sharing the same instant,
+    ``elapsed`` is exactly 0 regardless of any stall between them.
+    """
+    from datetime import UTC
+
     gh = MagicMock(spec=GitHub)
     config = RunnerScalingConfig(
         enabled=True,
@@ -1067,7 +1107,8 @@ def test_scale_down_idle_runners_in_cooldown(tmp_path: Path) -> None:
     )
 
     # Record a recent event to trigger cooldown
-    record_scale_event(tmp_path, "down")
+    frozen_now = datetime.now(UTC)
+    record_scale_event(tmp_path, "down", now=frozen_now)
 
     removed, errors = scale_down_idle_runners(
         Path(config.managed_root),
@@ -1076,6 +1117,7 @@ def test_scale_down_idle_runners_in_cooldown(tmp_path: Path) -> None:
         config,
         tmp_path,
         dry_run=False,
+        now=frozen_now,
     )
 
     assert removed == 0
@@ -1108,7 +1150,14 @@ def test_scale_down_idle_runners_not_idle(tmp_path: Path) -> None:
 
 
 def test_scale_down_idle_runners_at_min(tmp_path: Path) -> None:
-    """scale_down_idle_runners returns 0 when at min_runners floor."""
+    """scale_down_idle_runners returns 0 when at min_runners floor.
+
+    ``now`` is frozen and injected into ``scale_down_idle_runners`` (issue
+    #828's clock seam -- see ``runners.is_pool_idle_for_minutes``) using the
+    same instant the idle samples were built against, so the pool-idle check
+    inside cannot flip to False under a stall and mask the min_runners-floor
+    assertion below with "Pool not idle" instead.
+    """
     gh = MagicMock(spec=GitHub)
     config = RunnerScalingConfig(
         enabled=True,
@@ -1140,17 +1189,23 @@ def test_scale_down_idle_runners_at_min(tmp_path: Path) -> None:
         config,
         tmp_path,
         dry_run=False,
+        now=now,
     )
 
     assert removed == 0
     assert "At min_runners floor" in errors
 
 
-def _seed_scale_down_ready_pool(tmp_path: Path) -> RunnerScalingConfig:
+def _seed_scale_down_ready_pool(tmp_path: Path) -> tuple[RunnerScalingConfig, datetime]:
     """Set up two managed runners above the floor with a long idle history.
 
     Shared by the two dry-run gate tests below so they differ only in the flag.
-    Returns the config; the state dir and managed root are both ``tmp_path``.
+    Returns ``(config, now)``: the state dir and managed root are both
+    ``tmp_path``, and ``now`` is the frozen instant the idle samples were built
+    against -- callers must pass it into ``scale_down_idle_runners(..., now=now)``
+    (issue #828's clock seam -- see ``runners.is_pool_idle_for_minutes``) so the
+    idle-duration check cannot race a stall between sample construction and the
+    call.
     """
     config = RunnerScalingConfig(
         enabled=True,
@@ -1177,7 +1232,8 @@ def _seed_scale_down_ready_pool(tmp_path: Path) -> RunnerScalingConfig:
                 queued_jobs=0,
             ),
         )
-    return config
+
+    return config, now
 
 
 def test_scale_down_dry_run_records_no_scale_event(
@@ -1192,13 +1248,16 @@ def test_scale_down_dry_run_records_no_scale_event(
     ``cooldown_minutes``.
 
     The removal itself is stubbed so this targets the state-write gate rather than the
-    removal machinery.
+    removal machinery. ``now`` (issue #828) is frozen by ``_seed_scale_down_ready_pool``
+    and threaded into ``scale_down_idle_runners`` so the idle-duration check cannot
+    flip under a stall and make ``removed`` 0 instead of 1 before the real assertion
+    (the cooldown-write gate) is even exercised.
     """
     monkeypatch.setattr(
         "charlie_work.runners.gracefully_remove_runner",
         lambda runner_dir, gh, dry_run=False: (True, None),
     )
-    config = _seed_scale_down_ready_pool(tmp_path)
+    config, now = _seed_scale_down_ready_pool(tmp_path)
 
     removed, errors = scale_down_idle_runners(
         Path(config.managed_root),
@@ -1207,6 +1266,7 @@ def test_scale_down_dry_run_records_no_scale_event(
         config,
         tmp_path,
         dry_run=True,
+        now=now,
     )
 
     assert removed == 1, errors
@@ -1216,12 +1276,17 @@ def test_scale_down_dry_run_records_no_scale_event(
 def test_scale_down_without_dry_run_records_the_scale_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The other direction: a real scale-down still records the cooldown."""
+    """The other direction: a real scale-down still records the cooldown.
+
+    ``now`` (issue #828) is frozen by ``_seed_scale_down_ready_pool`` and
+    threaded into ``scale_down_idle_runners`` so ``removed == 1`` cannot flip
+    to 0 under a stall between sample construction and the call.
+    """
     monkeypatch.setattr(
         "charlie_work.runners.gracefully_remove_runner",
         lambda runner_dir, gh, dry_run=False: (True, None),
     )
-    config = _seed_scale_down_ready_pool(tmp_path)
+    config, now = _seed_scale_down_ready_pool(tmp_path)
 
     removed, errors = scale_down_idle_runners(
         Path(config.managed_root),
@@ -1230,6 +1295,7 @@ def test_scale_down_without_dry_run_records_the_scale_event(
         config,
         tmp_path,
         dry_run=False,
+        now=now,
     )
 
     assert removed == 1, errors
