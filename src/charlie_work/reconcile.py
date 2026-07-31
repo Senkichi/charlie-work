@@ -366,22 +366,21 @@ def detect_drift(
     issue_snapshot_truncated = len(issues) >= _LIST_LIMIT
     state_prs: dict[str, Any] = state.get("prs", {})
     # PR-side counterpart of issue_snapshot_truncated, guarding
-    # state_pr_missing_on_github below. Two distinct signals both mean "this
-    # gh.run() response cannot be trusted to represent every PR the
-    # orchestrator is tracking":
-    #   - truncated-from-above: `--limit _LIST_LIMIT` returned exactly that
-    #     many, so real GitHub has strictly more PRs than fit in this
-    #     snapshot.
-    #   - suspiciously-empty: the fetch returned zero PRs while state.json is
-    #     actively tracking PRs. GitHub never deletes closed/merged PRs, so a
-    #     repo with tracked PR history can never legitimately report zero PRs
-    #     via `--state all`. `_fetch_prs` has no exception handling around
-    #     `gh.run(json_output=True)`, so a transient CLI/API failure that
-    #     degrades to an empty result is indistinguishable, at this layer,
-    #     from "GitHub really has none" -- without this guard it reads as
-    #     "every tracked PR was deleted" and state_pr_missing_on_github drops
-    #     every single one in that pass.
-    pr_snapshot_incomplete = len(prs) >= _LIST_LIMIT or (not prs and bool(state_prs))
+    # state_pr_missing_on_github below: truncated-from-above only.
+    # `--limit _LIST_LIMIT` returning exactly that many means real GitHub has
+    # strictly more PRs than fit in this snapshot, so the sweep can't be
+    # trusted to see every tracked PR.
+    #
+    # Deliberately NOT "prs is empty while state.json tracks PRs" -- that
+    # signal is unsatisfiable at this layer: detect_drift receives
+    # bit-identical inputs (prs=[], non-empty state_prs) from a genuinely
+    # empty GitHub snapshot (state_pr_missing_on_github must fire; see
+    # test_detect_drift_finds_state_pr_missing_on_github) and from a
+    # test-double gap that isn't a real production signal at all. Adding an
+    # "empty implies incomplete" branch here to work around the latter always
+    # breaks the former -- confirmed by running both variants. The actual
+    # fidelity gap belongs in the test double, not in production logic.
+    pr_snapshot_incomplete = len(prs) >= _LIST_LIMIT
 
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}

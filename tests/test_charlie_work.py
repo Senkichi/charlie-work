@@ -15707,7 +15707,22 @@ def test_loop_skips_review_for_approved_unmerged_pr(tmp_path: Path) -> None:
     merge_ready."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """loop() now runs a reconcile pass (merge-lane-recovery §6-B) that
+        calls gh.run(["pr", "list", ...]) via reconcile._fetch_prs. The base
+        FakeGitHub.run() generic fallback always returns [] for that query
+        regardless of self.prs, which makes detect_drift see an empty GitHub
+        snapshot against a non-empty tracked-PR state and misreport PR 456 as
+        missing on GitHub. Reflect self.prs for real here so the reconcile
+        pass sees the same PR the rest of this fake already knows about."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     # Record an approved decision in state (as record_review would).
     state = load_state(paths.state_file)
@@ -16447,7 +16462,20 @@ def test_loop_skips_review_and_merges_when_head_unchanged_after_approval(
 ) -> None:
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """See the identical override in
+        test_loop_skips_review_for_approved_unmerged_pr: loop()'s reconcile
+        pass (merge-lane-recovery §6-B) queries gh.run(["pr", "list", ...]),
+        and the base fake's generic run() fallback returns [] regardless of
+        self.prs, which misreports PR 456 as missing on GitHub."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     state = load_state(paths.state_file)
     state["prs"]["456"] = {
