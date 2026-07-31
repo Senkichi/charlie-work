@@ -2545,6 +2545,22 @@ def inspect_worktree_state(
     This is the single enforcement point for worktree inspection; it is used by
     both the workflow dead-session lane and reconcile.py drift detection.
     """
+    # Issue #660: api workers set worktree_path="" (they do not use dedicated
+    # worktrees). Path("") normalizes to Path("."), which would pass the
+    # is_dir() check below and probe the *caller's* cwd with real git
+    # merge-base/rev-list calls. If that cwd has local commits ahead of its
+    # resolved default branch (a normal state for a live checkout), the
+    # inspection returns COMPLETED, which forces the dead-session
+    # classification lanes (workflow.py / reconcile.py) to "unpublished_work"
+    # and skips the log-tail based provider-auth/quota/crash classification
+    # entirely. Short-circuit an empty/unset path to UNKNOWN so those lanes
+    # fall through to log-tail analysis instead.
+    if worktree_path == Path(""):
+        return WorktreeInspection(
+            WorktreeState.UNKNOWN,
+            error="worktree_path is empty (api workers have no dedicated worktree)",
+        )
+
     if not worktree_path.is_dir():
         return WorktreeInspection(
             WorktreeState.UNKNOWN,

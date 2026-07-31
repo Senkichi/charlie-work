@@ -91,6 +91,7 @@ from .reconcile import (
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    clean_worktrees,
     inspect_worktree_state,
     push_branch,
     remove_review_checkout,
@@ -120,12 +121,14 @@ from .state import (
     is_reviewer_probe_ready,
     is_reviewer_quota_exhausted,
     is_throttled,
+    is_worktree_reclamation_due,
     load_state,
     load_state_locked,
     mark_reviewer_quota_alerted,
     operator_claimed_issues,
     release_operator_claimed,
     save_state,
+    schedule_worktree_reclamation,
     set_operator_claimed,
     set_reviewer_quota_exhausted,
     set_throttled_until,
@@ -2144,6 +2147,99 @@ def _set_reviewer_quota_exhausted_with_backoff(
     return state, quota_record
 
 
+def _merge_on_write_save(
+    state_file: Path,
+    state: dict[str, Any],
+    *,
+    snapshot_prs: dict[str, Any],
+    snapshot_reviewer_quota: Any,
+    snapshot_events: list[dict[str, Any]],
+    event_ring_cap: int,
+) -> None:
+    """Merge a sweep's computed changes onto fresh on-disk state and save
+    (issue #594).
+
+    Any ``dispatch_reviews`` sweep that loads a state snapshot via
+    ``load_state_locked``, does slow work (filesystem or network I/O) with no
+    lock held, then wants to persist what it computed must call this instead
+    of a bare ``save_state(state_file, state)``. Writing the sweep's `state`
+    wholesale would restore every field a concurrent writer (e.g. ``charlie
+    unescalate``) changed in the gap between the snapshot load and this save
+    to its pre-commit value, with no event explaining the reversal -- a
+    classic read-modify-write lost update. ``unescalate`` itself already
+    defends against this hazard in the other direction with the same
+    re-load-and-re-apply-inside-the-lock pattern; this extends the same
+    courtesy to the loop's sweeps.
+
+    Re-loads fresh state under the lock and, per PR entry, applies only the
+    fields that differ between ``state`` (the sweep's post-work view) and
+    ``snapshot_prs`` (the entry-pass view) -- i.e. only the fields the sweep
+    itself actually changed. Entries the sweep never touched are left exactly
+    as fresh on-disk state has them, so a concurrent writer's commit to an
+    untouched entry survives. For a PR the sweep DID touch, its overrides
+    (e.g. a terminal ``status`` written because GitHub said the PR merged)
+    still win over whatever a concurrent writer set on that same entry in the
+    gap -- the sweep is the authority on the fact it just observed.
+
+    The durable event audit is unaffected by any of this: every event was
+    already dual-written to events.db via ``append_event(state_path=...)``
+    before this call; this only keeps the bounded ``state.json`` event ring
+    consistent by appending the sweep's new events onto the fresh ring.
+    """
+    with state_lock(state_file):
+        fresh = load_state(state_file)
+        fresh_prs = dict(fresh.get("prs") or {})
+        for pr_key, new_entry in (state.get("prs") or {}).items():
+            if not isinstance(new_entry, dict):
+                fresh_prs[pr_key] = new_entry
+                continue
+            if new_entry == snapshot_prs.get(pr_key):
+                # Untouched by this sweep: preserve the fresh on-disk value so
+                # a concurrent writer's commit survives.
+                continue
+            # Apply only the fields the sweep computed onto the fresh entry:
+            # overrides = new_entry fields that differ from the entry-pass
+            # snapshot. Fields the sweep did not touch stay as the fresh
+            # on-disk value (preserving concurrent writes to them), and the
+            # sweep's overrides win for the fields it legitimately owns.
+            snapshot_entry = snapshot_prs.get(pr_key) or {}
+            overrides = {
+                field: value
+                for field, value in new_entry.items()
+                if value != snapshot_entry.get(field)
+            }
+            fresh_entry = fresh_prs.get(pr_key)
+            fresh_prs[pr_key] = {
+                **(fresh_entry if isinstance(fresh_entry, dict) else {}),
+                **overrides,
+            }
+        merged: dict[str, Any] = dict(fresh)
+        merged["prs"] = fresh_prs
+        if state.get("reviewer_quota") != snapshot_reviewer_quota:
+            merged["reviewer_quota"] = state["reviewer_quota"]
+        # Identity diff, not a length-based slice: ``append_event`` always
+        # rebuilds the events list via ``list(old) + [new]`` (never mutates
+        # entries in place), so every snapshot event dict retains its
+        # original ``id()`` for the life of this pass. When the ring is at
+        # its cap (the normal steady-state -- 2000 entries by default), each
+        # append truncates from the front, so the post-sweep list is the SAME
+        # length as the snapshot and a length-based slice
+        # ``current[len(snapshot):]`` wrongly evaluates to empty, silently
+        # dropping this sweep's own events from the merged ring. Filtering by
+        # identity against the snapshot's ids is correct regardless of
+        # whether eviction happened.
+        snapshot_event_ids = {id(e) for e in snapshot_events}
+        sweep_appended_events = [
+            e for e in (state.get("events") or []) if id(e) not in snapshot_event_ids
+        ]
+        if sweep_appended_events:
+            ring = list(fresh.get("events") or []) + sweep_appended_events
+            if len(ring) > event_ring_cap:
+                ring = ring[-event_ring_cap:]
+            merged["events"] = ring
+        save_state(state_file, merged)
+
+
 def _detect_and_handle_stalled_reviews(
     reviews_dir: Path,
     state_file: Path,
@@ -2179,6 +2275,16 @@ def _detect_and_handle_stalled_reviews(
     stalled: list[dict[str, Any]] = []
     sweep_events: list[tuple[str, dict[str, Any]]] = []
     state = load_state_locked(state_file)
+    # Capture the entry-pass snapshot so the save block below can diff against
+    # it and apply ONLY the entries/fields this sweep computed. Writing the
+    # stale snapshot wholesale at save time would clobber any concurrent writer
+    # (e.g. ``charlie unescalate``) that committed between this load and the
+    # save -- a lost update across the sweep's read-modify-write window (issue
+    # #594). The prs values are rebound (never mutated in place) by every
+    # branch below, so a shallow copy of the mapping preserves the originals.
+    snapshot_prs = dict(state.get("prs") or {})
+    snapshot_reviewer_quota = state.get("reviewer_quota")
+    snapshot_events = list(state.get("events") or [])
     changed = False
     seen_pr_keys: set[str] = set()
     # One provider-throttle condition per sweep, no matter how many dead
@@ -2565,7 +2671,17 @@ def _detect_and_handle_stalled_reviews(
         state = _append_sweep_events(
             state, sweep_events, max_size=config.runtime.event_ring_size, state_file=state_file
         )
-        save_state(state_file, state)
+        # Merge-on-write (issue #594) -- see ``_merge_on_write_save`` for why a
+        # bare ``save_state(state_file, state)`` here would clobber a
+        # concurrent writer (e.g. ``charlie unescalate``).
+        _merge_on_write_save(
+            state_file,
+            state,
+            snapshot_prs=snapshot_prs,
+            snapshot_reviewer_quota=snapshot_reviewer_quota,
+            snapshot_events=snapshot_events,
+            event_ring_cap=config.runtime.event_ring_size,
+        )
 
     return stalled
 
@@ -2646,6 +2762,17 @@ def _reap_orphaned_review_checkouts(
     session is not interrupted.
     """
     state = load_state_locked(state_file)
+    # Capture the entry-pass snapshot so the save block below can merge-on-write
+    # instead of restoring this stale snapshot wholesale (issue #594). The
+    # candidate loop below does a ``gh.pr_view`` network call per candidate PR,
+    # potentially many, before the save -- the same shape of unlocked
+    # read-modify-write window that let a concurrent ``charlie unescalate``
+    # get silently reverted in ``_detect_and_handle_stalled_reviews``. ``prs``
+    # entries are rebound (never mutated in place) below, so a shallow copy of
+    # the mapping preserves the originals.
+    snapshot_prs = dict(state.get("prs") or {})
+    snapshot_reviewer_quota = state.get("reviewer_quota")
+    snapshot_events = list(state.get("events") or [])
     candidate_pr_numbers: set[int] = set()
 
     review_dispatch_keys = (
@@ -2733,7 +2860,20 @@ def _reap_orphaned_review_checkouts(
         state = _append_sweep_events(
             state, sweep_events, max_size=config.runtime.event_ring_size, state_file=state_file
         )
-        save_state(state_file, state)
+        # Merge-on-write (issue #594) -- see ``_merge_on_write_save`` for why a
+        # bare ``save_state(state_file, state)`` here would clobber a
+        # concurrent writer (e.g. ``charlie unescalate``). A PR this reap DID
+        # touch keeps its terminal ``status`` ("merged"/"closed") regardless
+        # of what a concurrent writer set on that same entry in the gap --
+        # GitHub's lifecycle state is authoritative once observed.
+        _merge_on_write_save(
+            state_file,
+            state,
+            snapshot_prs=snapshot_prs,
+            snapshot_reviewer_quota=snapshot_reviewer_quota,
+            snapshot_events=snapshot_events,
+            event_ring_cap=config.runtime.event_ring_size,
+        )
 
     return reaped
 
@@ -12174,6 +12314,100 @@ class OrchestratorApp:
                 state = self._record_event(state, "quota_probe_failed", {})
             save_state(state_file, state)
 
+    def _maybe_reclaim_worktrees(self) -> dict[str, Any] | None:
+        """Cadence-gated merged-PR worktree reclamation on the fleet pass.
+
+        Runs ``clean_worktrees`` -- the same junction-safe, merge-gated,
+        liveness-gated sweep behind ``charlie worktree-clean`` -- on a flat
+        ``worktree_reclamation.interval_minutes`` schedule. Before this call
+        site the sweep only ran when an operator remembered the standalone
+        subcommand, so worktrees for merged PRs accumulated indefinitely
+        (issue #636: 77 of 81 dead on the host this was measured on).
+
+        Two-phase lock pattern (same shape as ``_maybe_probe_quota_recovery``):
+        the schedule is advanced under the lock and the sweep itself runs
+        outside it, because ``clean_worktrees`` makes a live ``gh pr view`` call
+        per candidate worktree and must not hold ``state_lock`` while it does --
+        holding the lock across a per-candidate GitHub fan-out would block every
+        other state reader/writer in the process for the sweep's duration.
+
+        ``dry_run`` is threaded honestly: a ``--dry-run`` fleet pass runs the
+        sweep in preview mode, which removes nothing (the preview-vs-act class
+        tracked in #614-#619). A ``worktrees_reclaimed`` event is always emitted
+        when the sweep runs, so a maintenance action that left no trace is
+        indistinguishable from one that never ran (lesson from #595/#621).
+
+        The cadence schedule itself is advanced regardless of ``dry_run``.
+        This is deliberate, not an instance of the #614-#619 class:
+        ``clean_worktrees`` makes its live ``gh pr view`` call per candidate
+        unconditionally -- ``dry_run`` only gates the final ``git worktree
+        remove`` -- so the GitHub-quota cost this interval exists to bound is
+        identical in preview and live mode. Not advancing the schedule under
+        ``dry_run`` would let a repeated preview pass re-run the full
+        per-candidate fan-out every time, defeating the cadence gate.
+
+        Returns a small summary dict when the sweep ran (for the loop result's
+        ``data``), or ``None`` when reclamation is disabled or not due this
+        pass.
+        """
+        if not self.config.worktree_reclamation.enabled:
+            return None
+        state_file = self.paths.state_file
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_worktree_reclamation_due(state):
+                return None
+            # Advance the schedule BEFORE running the sweep so a concurrent
+            # pass (or a sweep that takes longer than one poll interval) cannot
+            # double-fire. The next run is interval_minutes away regardless of
+            # how long the sweep itself takes.
+            next_run_at = (
+                (
+                    datetime.now(UTC)
+                    + timedelta(minutes=self.config.worktree_reclamation.interval_minutes)
+                )
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            state = schedule_worktree_reclamation(state, next_run_at)
+            save_state(state_file, state)
+
+        # Use the same resolved worktrees root dispatch and `charlie
+        # worktree-clean` use (self._layout.worktrees, from
+        # paths.resolved_layout) rather than re-deriving the
+        # claude_code.worktrees_dir/runtime.state_dir sentinel logic inline --
+        # that duplication across call sites is the exact shape of bug
+        # layout.py's module docstring documents as a past production
+        # incident (create and sweep sides silently disagreeing on the root).
+        state = load_state_locked(state_file)
+        result = clean_worktrees(
+            self.repo_root,
+            self._layout.worktrees,
+            state,
+            self.config,
+            self.gh,
+            dry_run=self.dry_run,
+        )
+        orphans = result.data.get("orphans", {})
+        summary = {
+            "dry_run": self.dry_run,
+            "ok": result.ok,
+            "removed": len(result.data.get("removed", [])),
+            "planned": len(result.data.get("planned", [])),
+            "skipped": len(result.data.get("skipped", [])),
+            "failed": len(result.data.get("failed", [])),
+            "orphans_removed": len(orphans.get("removed", [])),
+            "orphans_planned": len(orphans.get("planned", [])),
+            "orphans_failed": len(orphans.get("failed", [])),
+            "message": result.message,
+        }
+        with state_lock(state_file):
+            state = load_state(state_file)
+            state = self._record_event(state, "worktrees_reclaimed", summary)
+            save_state(state_file, state)
+        return summary
+
     def _maybe_reconcile_drift(self) -> None:
         """Periodic in-loop repair of GitHub label / state.json divergence.
 
@@ -12739,6 +12973,15 @@ class OrchestratorApp:
             ):
                 if key in data[lane]:
                     data[key] = data[lane][key]
+        # Cadence-gated merged-PR worktree reclamation (issue #636). Runs at
+        # the END of the pass so the per-candidate `gh pr view` fan-out never
+        # contends with the dispatch/review/merge lanes for state_lock or
+        # GitHub quota during the critical window. Gated by
+        # worktree_reclamation.interval_minutes, so it fires at most once per
+        # interval regardless of poll frequency or backlog size.
+        reclamation = self._maybe_reclaim_worktrees()
+        if reclamation is not None:
+            data["worktrees_reclaimed"] = reclamation
         return CommandResult(
             ok,
             message,
