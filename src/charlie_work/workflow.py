@@ -11946,10 +11946,23 @@ class OrchestratorApp:
         # watchdog redispatch cap -- does NOT match here and remediation of
         # that unrelated Y still proceeds below. Checking both records
         # covers the PR-only-escalated edge case.
-        current_escalation_reason = f"{attempts_key}_cap_exceeded"
+        #
+        # Both this lane's cap-exceeded escalation AND its stall escalation
+        # (_check_janitor_rework_stall, issue #765/#774) must be recognized
+        # here. Without the stall reason, an issue escalated for a stalled
+        # rework (nobody working it -- the whole point of that escalation is
+        # to get a human to look) would fall through: its status is
+        # "escalated", not "rework_requested"/"dispatched"/"dispatch_pending",
+        # so `rework_pending` below is False and the function would proceed
+        # straight to the attempts-increment/dispatch logic and silently
+        # redispatch a fresh rework attempt on the very next pass --
+        # defeating the stall escalation the moment it fires.
+        current_escalation_reasons = frozenset(
+            {f"{attempts_key}_cap_exceeded", f"{attempts_key}_stall_exceeded"}
+        )
         if (
-            issue_state.get("escalation_reason") == current_escalation_reason
-            or existing_pr_state.get("escalation_reason") == current_escalation_reason
+            issue_state.get("escalation_reason") in current_escalation_reasons
+            or existing_pr_state.get("escalation_reason") in current_escalation_reasons
         ):
             return None
         rework_pending = issue_status in ("rework_requested", "dispatched", "dispatch_pending")
@@ -12331,6 +12344,15 @@ class OrchestratorApp:
         if elapsed_minutes < threshold_minutes:
             return None
 
+        # Issue #776 follow-up: record a lane-scoped escalation_reason here
+        # too (parallel to the cap-exceeded branch above), not just a status
+        # flip. Without it, _route_janitor_gate_failure_to_rework's same-lane
+        # guard has nothing to match on the next pass -- the issue's status
+        # is "escalated" (so rework_pending is False, skipping straight past
+        # the not-settled branch) and the wrapper would silently redispatch a
+        # fresh rework attempt (or re-escalate) immediately, undoing the stall
+        # escalation's entire purpose the moment it fires.
+        escalation_reason = f"{attempts_key}_stall_exceeded"
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             attempts_so_far = int(state["prs"].get(str(pr_number), {}).get(attempts_key, 0))
@@ -12339,6 +12361,7 @@ class OrchestratorApp:
                 "number": pr_number,
                 "issue_number": issue_number,
                 "status": "escalated",
+                "escalation_reason": escalation_reason,
                 stall_since_key: None,
                 stall_head_key: None,
             }
@@ -12346,6 +12369,7 @@ class OrchestratorApp:
                 **state["issues"].get(str(issue_number), {}),
                 "number": issue_number,
                 "status": "escalated",
+                "escalation_reason": escalation_reason,
                 "merge_alert": "OK",
             }
             state = self._record_event(
@@ -12355,6 +12379,7 @@ class OrchestratorApp:
                     "pr_number": pr_number,
                     "issue_number": issue_number,
                     "reason": reason,
+                    "escalation_reason": escalation_reason,
                     "attempts": attempts_so_far,
                     "stalled_minutes": round(elapsed_minutes, 1),
                     "stall_since": stall_since,
