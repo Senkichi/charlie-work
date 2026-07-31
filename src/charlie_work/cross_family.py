@@ -54,10 +54,14 @@ _BLOCKED_RE = re.compile(
     re.IGNORECASE,
 )
 
-# ``Verdict:`` line OR a ``## Verdict`` heading — cross-family models
-# (e.g. kimi-k3) emit the verdict as a markdown heading without a colon.
+# ``Verdict:`` line, a ``## Verdict`` heading, OR a bold-inline ``**Verdict:**``
+# marker — cross-family models (e.g. kimi-k3) emit the verdict as a markdown
+# heading without a colon, while others (e.g. glm-5.2) emit it as a bold-inline
+# marker within a paragraph (``**Verdict:** Approve with a required
+# follow-up...``) that the first two alternatives never matched, silently
+# routing every such report into the "no extractable summary" failure path.
 _VERDICT_RE = re.compile(
-    r"^\s*verdict\s*:|^#+\s*verdict\b",
+    r"^\s*verdict\s*:|^#+\s*verdict\b|\*\*\s*verdict\s*:?\s*\*\*\s*:?",
     re.IGNORECASE | re.MULTILINE,
 )
 

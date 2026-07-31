@@ -10517,6 +10517,32 @@ def test_parse_cross_family_verdict_legacy_blocker_with_no_summary_is_malformed(
     assert "BLOCKER" in result.raw_body
 
 
+def test_parse_cross_family_verdict_bold_inline_verdict_marker() -> None:
+    """Regression: some cross-family models (e.g. glm-5.2) emit the verdict as
+    a bold-inline ``**Verdict:**`` marker within a paragraph, rather than a
+    bare ``Verdict:`` line or a ``## Verdict`` heading. The pre-fix
+    ``_VERDICT_RE`` matched neither the bare-colon nor the heading form, so
+    every such report (PRs #680, #690, #692, #699, #700 in production, all
+    with real BLOCKER/MAJOR findings and a readable verdict) fell through to
+    the "no extractable summary" branch and was misclassified as
+    ``MalformedCrossFamilyVerdict`` despite the verdict being right there."""
+    body = (
+        "**MAJOR**\nfile.py:10 real bug\n\n"
+        "**Verdict:** Approve with a required follow-up — MAJOR 1 is a real "
+        "correctness bug that must be fixed before this claim can be trusted."
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary=(
+            "Approve with a required follow-up — MAJOR 1 is a real "
+            "correctness bug that must be fixed before this claim can be trusted."
+        ),
+        required_changes=(),
+    )
+
+
 def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
     """Issue #784 AC-6: the invalid state -- request_changes with neither
     itemized required_changes nor a real summary -- must be unrepresentable
