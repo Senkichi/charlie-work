@@ -49,6 +49,8 @@ from charlie_work.cross_family import (
     _CAVEAT,
     CrossFamilyResult,
     CrossFamilyVerdict,
+    LEGACY_VACUOUS_SUMMARY,
+    MalformedCrossFamilyVerdict,
     extract_report_body,
     parse_cross_family_verdict,
     render_command,
@@ -75,6 +77,7 @@ from charlie_work.workflow import (
     _annotation_to_required_change,
     _append_sweep_events,
     _detect_and_handle_stalled_reviews,
+    _is_carry_forward_eligible,
     _parse_review_verdict_from_log,
     _reap_orphaned_review_checkouts,
     _render_required_changes_section,
@@ -5674,9 +5677,15 @@ def test_merge_ready_checks_unavailable_returns_false(tmp_path: Path) -> None:
 
 
 def _review_queue_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, dry_run: bool = True
 ) -> OrchestratorApp:
-    """Build an OrchestratorApp with FakeGitHub and a default state file."""
+    """Build an OrchestratorApp with FakeGitHub and a default state file.
+
+    ``dry_run`` defaults to ``True`` (unchanged from every existing caller of
+    this helper). Issue #784 AC-8 Case 2's stranded-verdict repair is
+    intentionally gated on ``not self.dry_run`` (it mutates state and GitHub
+    labels), so tests exercising that repair pass ``dry_run=False`` explicitly.
+    """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     (paths.root).mkdir(parents=True, exist_ok=True)
@@ -5687,7 +5696,7 @@ def _review_queue_app(
     fake_gh = FakeGitHub()
     if prs is not None:
         fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
 
 
 def _write_review_packet(
@@ -5805,12 +5814,19 @@ def test_review_queue_includes_missing_pending_and_stale_decisions(
     _write_review_packet(tmp_path, 100, "sha-100")
     # PR 200: current packet, pending decision
     _write_review_packet(tmp_path, 200, "sha-200", {"decision": "pending"})
-    # PR 300: current packet, request_changes from prior head -> stale
+    # PR 300: current packet, request_changes from prior head -> stale.
+    # Real (non-placeholder) summary so this exercises the stale/carry-
+    # forward path under test, not issue #784's content-free "vacuous"
+    # detection (a distinct concern covered by its own tests).
     _write_review_packet(
         tmp_path,
         300,
         "sha-300-new",
-        {"decision": "request_changes", "reviewed_head_sha": "sha-300-old"},
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-300-old",
+            "summary": "some prior finding that needs a rework brief",
+        },
     )
     # PR 400: current packet, approved on current head -> excluded
     _write_review_packet(
@@ -6011,6 +6027,12 @@ def test_review_queue_carries_forward_request_changes_on_identical_patch_id(
             "reviewed_head_sha": old_head,
             "reviewed_patch_id": patch_id,
             "carried_forward_from": [],
+            # Real (non-placeholder) summary: this test exercises identical-
+            # patch-id carry-forward (issue #411), not issue #784's
+            # content-free "vacuous" detection -- a content-free verdict
+            # would be ineligible for carry-forward entirely, which is
+            # covered by its own dedicated tests.
+            "summary": "some prior finding that needs a rework brief",
         },
     )
 
@@ -10419,11 +10441,18 @@ def test_parse_cross_family_verdict_json_approved_overridden_by_body_severity() 
     assert result.decision == "request_changes"
 
 
-def test_parse_cross_family_verdict_json_request_changes_empty_list_falls_back() -> None:
-    """Contract violation: request_changes with an empty/missing required_changes
-    list is not trusted on its own -- falls back to the legacy Markdown parse
-    (today's behavior) rather than recording a request_changes verdict with
-    nothing for a rework brief to act on."""
+def test_parse_cross_family_verdict_json_request_changes_empty_list_is_malformed() -> None:
+    """Issue #784 (AC-2): a JSON verdict block that declares request_changes
+    with an empty/missing required_changes list is a contract violation and
+    must NOT silently fall back to the legacy Markdown parse -- even though
+    the legacy parse would find a perfectly usable ``Verdict:`` line here.
+    Pre-#784, this test asserted exactly that fall-through as correct
+    behavior; that assertion encoded the defect itself (issue #784's root
+    cause: "a JSON verdict saying request_changes with empty
+    required_changes falls through to the weaker legacy path"), so it is
+    replaced rather than preserved. The contract is: once a reviewer elects
+    the structured JSON format, empty required_changes is untrusted on its
+    own, full stop -- regardless of what the Markdown body also says."""
     body = (
         "**MAJOR**\nfile.py:30 bug\n\nVerdict: MAJOR should block\n\n"
         '```json\n{"decision": "request_changes", "summary": "bad but no list", '
@@ -10431,12 +10460,8 @@ def test_parse_cross_family_verdict_json_request_changes_empty_list_falls_back()
     )
     wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     result = parse_cross_family_verdict(wrapped)
-    assert result is not None
-    assert result.decision == "request_changes"
-    assert result.required_changes == ()
-    # The legacy parse picks up the body's own Verdict: line, not the JSON
-    # block's (untrusted) summary.
-    assert result.summary == "MAJOR should block"
+    assert isinstance(result, MalformedCrossFamilyVerdict)
+    assert result.reason == "json_verdict_request_changes_missing_required_changes"
 
 
 def test_parse_cross_family_verdict_json_block_drives_decision_legacy_would_not_reach() -> None:
@@ -10475,6 +10500,580 @@ def test_parse_cross_family_verdict_legacy_report_unchanged_by_json_support() ->
         summary="BLOCKER — does not fix the issue",
         required_changes=(),
     )
+
+
+def test_parse_cross_family_verdict_legacy_blocker_with_no_summary_is_malformed() -> None:
+    """Issue #784 AC-1: a BLOCKER/MAJOR marker with no ``Verdict:`` line to
+    extract a summary from is genuinely content-free -- it must return
+    MalformedCrossFamilyVerdict, never a request_changes verdict asserting
+    blockers exist while naming none. No hardcoded placeholder summary is
+    substituted (the pre-#784 behavior this fix replaces)."""
+    body = "**BLOCKER**\ncritical bug, but no Verdict: line anywhere in this report"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert isinstance(result, MalformedCrossFamilyVerdict)
+    assert result.reason == "blocker_or_major_with_no_extractable_summary"
+    assert "BLOCKER" in result.raw_body
+
+
+def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
+    """Issue #784 AC-6: the invalid state -- request_changes with neither
+    itemized required_changes nor a real summary -- must be unrepresentable
+    at construction, not just avoided by callers that remember to check."""
+    with pytest.raises(ValueError, match="content-free"):
+        CrossFamilyVerdict(decision="request_changes", summary="", required_changes=())
+
+
+def test_cross_family_verdict_post_init_rejects_whitespace_only_summary() -> None:
+    """Whitespace-only is not a real summary either -- ``.strip()`` is
+    applied before the emptiness check, so padding cannot smuggle a
+    content-free verdict past the guard."""
+    with pytest.raises(ValueError, match="content-free"):
+        CrossFamilyVerdict(decision="request_changes", summary="   \n  ", required_changes=())
+
+
+def test_cross_family_verdict_post_init_allows_request_changes_with_only_summary() -> None:
+    """Narrower than "always require required_changes": the legacy Markdown
+    parse path never itemizes findings, so a request_changes verdict with a
+    real extracted summary and empty required_changes remains legitimate
+    and constructible -- this is exactly what the legacy-path tests above
+    rely on."""
+    verdict = CrossFamilyVerdict(
+        decision="request_changes", summary="a real extracted summary", required_changes=()
+    )
+    assert verdict.summary == "a real extracted summary"
+
+
+def test_cross_family_verdict_post_init_allows_request_changes_with_only_required_changes() -> (
+    None
+):
+    """A JSON-block verdict with itemized required_changes but an empty
+    summary is also legitimate -- required_changes alone is something a
+    rework brief can act on."""
+    verdict = CrossFamilyVerdict(
+        decision="request_changes", summary="", required_changes=("fix the null check",)
+    )
+    assert verdict.required_changes == ("fix the null check",)
+
+
+def test_cross_family_verdict_post_init_allows_approved_with_empty_summary() -> None:
+    """The guard is scoped to ``request_changes`` only -- an approved
+    verdict never needs anything for a rework brief to act on, so an empty
+    summary there is unaffected."""
+    verdict = CrossFamilyVerdict(decision="approved", summary="")
+    assert verdict.decision == "approved"
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8: _is_carry_forward_eligible -- the single-point-of-
+# enforcement predicate that rejects carry-forward for a content-free
+# recorded verdict. Operates on plain dicts (never reconstructs a
+# CrossFamilyVerdict), which is the load-bearing fact resolving the
+# deserialization hazard: it must never raise on any of the 8 pre-#784
+# on-disk broken records, however malformed their shape.
+# --------------------------------------------------------------------------
+
+
+def test_is_carry_forward_eligible_true_for_approved() -> None:
+    assert _is_carry_forward_eligible({"decision": "approved", "summary": ""}) is True
+
+
+def test_is_carry_forward_eligible_true_for_blocked() -> None:
+    assert _is_carry_forward_eligible({"decision": "blocked", "summary": "why"}) is True
+
+
+def test_is_carry_forward_eligible_true_for_request_changes_with_required_changes() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": ["fix x"], "summary": ""}
+        )
+        is True
+    )
+
+
+def test_is_carry_forward_eligible_true_for_request_changes_with_real_summary() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": [], "summary": "Real prose."}
+        )
+        is True
+    )
+
+
+def test_is_carry_forward_eligible_false_for_empty_summary_and_required_changes() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": [], "summary": ""}
+        )
+        is False
+    )
+
+
+def test_is_carry_forward_eligible_false_for_missing_keys() -> None:
+    """A pre-#784 broken on-disk record may not even carry a
+    ``required_changes`` or ``summary`` key at all -- must classify as
+    ineligible via ``.get()`` defaults, never raise (KeyError or otherwise),
+    on a plain dict this predicate was built specifically to tolerate."""
+    assert _is_carry_forward_eligible({"decision": "request_changes"}) is False
+
+
+def test_is_carry_forward_eligible_false_for_legacy_placeholder_summary() -> None:
+    """The historical hardcoded placeholder is content-free by definition
+    even though ``summary`` is technically non-empty -- one of the 8
+    pre-#784 on-disk records has exactly this shape."""
+    assert (
+        _is_carry_forward_eligible(
+            {
+                "decision": "request_changes",
+                "required_changes": [],
+                "summary": LEGACY_VACUOUS_SUMMARY,
+            }
+        )
+        is False
+    )
+
+
+def test_is_carry_forward_eligible_false_for_whitespace_padded_placeholder() -> None:
+    """``summary`` is ``.strip()``-normalized before the comparison, so
+    whitespace padding around the exact placeholder cannot smuggle it past
+    the guard as if it were a distinct, real summary."""
+    assert (
+        _is_carry_forward_eligible(
+            {
+                "decision": "request_changes",
+                "required_changes": [],
+                "summary": f"  {LEGACY_VACUOUS_SUMMARY}  ",
+            }
+        )
+        is False
+    )
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8: review_queue() must never silently re-confirm a
+# content-free recorded verdict via the head-unchanged shortcut -- it is
+# queued as "vacuous" instead, regardless of whether the head moved.
+# --------------------------------------------------------------------------
+
+
+def test_review_queue_flags_content_free_request_changes_as_vacuous(tmp_path: Path) -> None:
+    """The dominant real-world shape: reviewed_head_sha == live head (a
+    label-strip requeue never moves the head). Pre-#784, this would hit the
+    head-unchanged shortcut and be silently excluded from the queue
+    forever, permanently blocking the merge lane."""
+    prs = [
+        {
+            "number": 700,
+            "title": "Fix #70: vacuous verdict on current head",
+            "url": "https://example.test/pull/700",
+            "headRefName": "agent/issue-70-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-700",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #70",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        700,
+        "sha-700",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-700",
+            "required_changes": [],
+            "summary": "",
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": 700,
+            "issue": 70,
+            "packet_head_sha": "sha-700",
+            "decision": "vacuous",
+            "reviewed_head_sha": "sha-700",
+        },
+    ]
+
+
+def test_review_queue_treats_legacy_placeholder_summary_as_vacuous(tmp_path: Path) -> None:
+    prs = [
+        {
+            "number": 701,
+            "title": "Fix #71: legacy placeholder summary",
+            "url": "https://example.test/pull/701",
+            "headRefName": "agent/issue-71-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-701",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #71",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        701,
+        "sha-701",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-701",
+            "required_changes": [],
+            "summary": LEGACY_VACUOUS_SUMMARY,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.data["queue"][0]["decision"] == "vacuous"
+
+
+def test_review_queue_stale_packet_excludes_vacuous_verdict(tmp_path: Path) -> None:
+    """A vacuous verdict is only queued when the packet head is current --
+    matching every other review_queue category's contract: a stale packet
+    cannot be re-reviewed from, so it is excluded rather than queued."""
+    prs = [
+        {
+            "number": 702,
+            "title": "Fix #72: vacuous verdict, stale packet",
+            "url": "https://example.test/pull/702",
+            "headRefName": "agent/issue-72-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-702-new",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #72",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        702,
+        "sha-702-old",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-702-old",
+            "required_changes": [],
+            "summary": "",
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.data["queue"] == []
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8, Case 2: review_queue()'s head-unchanged shortcut must not
+# treat "reviewed at live head" as "nothing to do" when a real, actionable,
+# non-escalated request_changes verdict was never actually routed to
+# rework_requested -- e.g. issue #789's reconcile one-way "closed" gate
+# clobbering the issue status after record_review set it. This is a repair
+# of a dropped transition (re-applying the same target record_review already
+# decided via the same generic _route_to_rework entry point), never a new
+# decision, and must be idempotent.
+# --------------------------------------------------------------------------
+
+
+def test_review_queue_reroutes_stranded_request_changes_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """Motivating real-world case: PR #693 -> issue #649. A real, actionable
+    request_changes verdict (non-empty prose summary, within the rework-cycle
+    budget -- ``escalated: False``) is recorded at the live head, but the
+    linked issue's status was left at (or clobbered to) something other than
+    ``rework_requested`` -- so ``dispatch_rework``'s
+    ``status == "rework_requested"`` selection never picks the issue up and
+    the PR is stranded forever, even though nothing is actually wrong with
+    the verdict itself.
+
+    review_queue() must detect this at the head-unchanged shortcut and
+    re-drive the SAME rework_requested transition via the SAME generic
+    ``_route_to_rework`` entry point ``record_review`` itself uses -- never
+    adding the PR to the returned ``queue`` (that would wrongly trigger a
+    brand-new reviewer dispatch for a PR that already has a valid verdict).
+
+    A second ``review_queue()`` call over the now-repaired state must not
+    dispatch or mutate anything further (coordinator's explicit, non-
+    negotiable requirement for this fix).
+    """
+    prs = [
+        {
+            "number": 693,
+            "title": "Fix #649: some change",
+            "url": "https://example.test/pull/693",
+            "headRefName": "agent/issue-649-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-693",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #649",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    _write_review_packet(
+        tmp_path,
+        693,
+        "sha-693",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-693",
+            "required_changes": [],
+            "summary": (
+                "The refactor drops the timeout guard added in #611; restore "
+                "it before merging, otherwise a hung subprocess call blocks "
+                "the orchestrator loop indefinitely."
+            ),
+            "escalated": False,
+        },
+    )
+    # Simulate issue #789: the linked issue's status is something other than
+    # rework_requested even though record_review's own contract says a
+    # non-escalated request_changes verdict must have set it there.
+    state = load_state(app.paths.state_file)
+    state["issues"]["649"] = {"number": 649, "status": "closed"}
+    save_state(app.paths.state_file, state)
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    state_after = load_state(app.paths.state_file)
+    assert state_after["issues"]["649"]["status"] == "rework_requested"
+    assert state_after["prs"]["693"]["status"] == "rework_requested"
+    assert any(
+        e["kind"] == "stranded_request_changes_rework_requested" for e in state_after["events"]
+    )
+    prompt_path = app.paths.prs / "pr-693" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert (649, app.config.labels.needs_rework) in app.gh.labels_added
+
+    # Idempotency: a second pass over the now-repaired state must dispatch
+    # and mutate nothing further. "Without that test I will not merge this."
+    events_before_second_pass = len(state_after["events"])
+    labels_added_before_second_pass = list(app.gh.labels_added)
+
+    result_2 = app.review_queue()
+
+    assert result_2.ok is True
+    assert result_2.data["queue"] == []
+    state_final = load_state(app.paths.state_file)
+    assert state_final["issues"]["649"]["status"] == "rework_requested"
+    assert state_final["prs"]["693"]["status"] == "rework_requested"
+    assert len(state_final["events"]) == events_before_second_pass
+    assert app.gh.labels_added == labels_added_before_second_pass
+
+
+def test_review_queue_does_not_reroute_escalated_request_changes(tmp_path: Path) -> None:
+    """The Case 2 repair is scoped to the non-escalated lane only: when
+    ``record_review`` already decided a verdict exceeded the rework-cycle
+    budget (``escalated: True``), review_queue() must not independently
+    re-decide that or invent a second rework lane bypassing
+    ``max_rework_cycles`` -- it defers entirely to the existing
+    escalation/rescue path.
+    """
+    prs = [
+        {
+            "number": 694,
+            "title": "Fix #650: some other change",
+            "url": "https://example.test/pull/694",
+            "headRefName": "agent/issue-650-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-694",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #650",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    _write_review_packet(
+        tmp_path,
+        694,
+        "sha-694",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-694",
+            "required_changes": [],
+            "summary": "Real reviewer prose describing a real problem to fix.",
+            "escalated": True,
+        },
+    )
+    state = load_state(app.paths.state_file)
+    state["issues"]["650"] = {"number": 650, "status": "closed"}
+    save_state(app.paths.state_file, state)
+
+    result = app.review_queue()
+
+    assert result.data["queue"] == []
+    state_after = load_state(app.paths.state_file)
+    # Untouched -- Case 2 must not fire for an escalated verdict.
+    assert state_after["issues"]["650"]["status"] == "closed"
+    prompt_path = app.paths.prs / "pr-694" / "rework-prompt.md"
+    assert not prompt_path.exists()
+    assert app.gh.labels_added == []
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8 bound: _handle_malformed_cross_family_verdict /
+# _record_cross_family_verdicts. A malformed verdict never increments
+# request_changes_count or dispatches rework (AC-3); a SEPARATE bounded
+# counter (cross_family_parse_failure_count) caps how many times the
+# content-free-verdict -> forced-regeneration cycle can repeat for one PR,
+# so removing the request_changes-cycle counter from this path does not
+# create an unbounded loop. Past the cap, cross-family review is abandoned
+# via a caveated, non-blocking "approved" verdict -- never
+# agent:human-needed, never a blocking request_changes.
+# --------------------------------------------------------------------------
+
+
+def _cross_family_auto_verdict_app(
+    tmp_path: Path, *, max_parse_failures: int = 2, prs: list[dict[str, Any]] | None = None
+) -> OrchestratorApp:
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(auto_verdict=True, max_parse_failures=max_parse_failures)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+
+def _malformed_cross_family_pr(number: int, head_sha: str) -> dict[str, Any]:
+    return {
+        "number": number,
+        "title": f"Fix #{number}: unparseable cross-family report",
+        "url": f"https://example.test/pull/{number}",
+        "headRefName": f"agent/issue-{number}-fix",
+        "baseRefName": "main",
+        "headRefOid": head_sha,
+        "mergeStateStatus": "CLEAN",
+        "body": f"Closes #{number}",
+        "labels": [],
+        "isCrossRepository": False,
+        "state": "OPEN",
+    }
+
+
+def test_handle_malformed_cross_family_verdict_below_cap_logs_without_recording(
+    tmp_path: Path,
+) -> None:
+    prs = [_malformed_cross_family_pr(800, "sha-800")]
+    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
+    _write_review_packet(tmp_path, 800, "sha-800", {"decision": "pending"})
+    pr_dir = app.paths.prs / "pr-800"
+    (pr_dir / "cross-family-review.md").write_text(
+        "# Cross-family adversarial review — `glm-5.2`\n\n"
+        "<!-- PR head SHA: sha-800 -->\n\n"
+        f"{_CAVEAT}\n\n---\n\n"
+        "**BLOCKER** something is wrong, no Verdict line here\n",
+        encoding="utf-8",
+    )
+
+    results = app._record_cross_family_verdicts()
+
+    assert results == [
+        {
+            "pr_number": 800,
+            "decision": "unparseable",
+            "ok": False,
+            "message": (
+                "cross-family verdict unparseable "
+                "(blocker_or_major_with_no_extractable_summary), attempt 1/2"
+            ),
+        }
+    ]
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["decision"] == "pending"
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["800"]["cross_family_parse_failure_count"] == 1
+    # AC-3: never touches the separate request_changes rework-cycle counter.
+    assert state["prs"]["800"].get("request_changes_count", 0) == 0
+
+
+def test_handle_malformed_cross_family_verdict_abandons_after_cap_exceeded(
+    tmp_path: Path,
+) -> None:
+    """The coordinator's required bound: past max_parse_failures, the cycle
+    terminates in a caveated, non-blocking approved verdict -- not
+    agent:human-needed, not an indefinitely-blocking request_changes."""
+    prs = [_malformed_cross_family_pr(801, "sha-801")]
+    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
+    _write_review_packet(tmp_path, 801, "sha-801", {"decision": "pending"})
+    pr_dir = app.paths.prs / "pr-801"
+    (pr_dir / "cross-family-review.md").write_text(
+        "# Cross-family adversarial review — `glm-5.2`\n\n"
+        "<!-- PR head SHA: sha-801 -->\n\n"
+        f"{_CAVEAT}\n\n---\n\n"
+        "**BLOCKER** something is wrong, no Verdict line here\n",
+        encoding="utf-8",
+    )
+
+    for expected_attempt in (1, 2):
+        results = app._record_cross_family_verdicts()
+        assert results[0]["decision"] == "unparseable"
+        assert results[0]["ok"] is False
+        decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+        assert decision["decision"] == "pending"
+        state = load_state(app.paths.state_file)
+        assert state["prs"]["801"]["cross_family_parse_failure_count"] == expected_attempt
+
+    results = app._record_cross_family_verdicts()
+
+    assert results[0]["decision"] == "approved"
+    assert results[0]["ok"] is True
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["decision"] == "approved"
+    assert decision["required_changes"] == []
+    assert "784" in decision["summary"]
+    assert "3 attempts" in decision["summary"]
+    state = load_state(app.paths.state_file)
+    # record_review resets the parse-failure budget on any real verdict.
+    assert state["prs"]["801"]["cross_family_parse_failure_count"] == 0
+    assert state["prs"]["801"].get("request_changes_count", 0) == 0
+
+
+def test_record_review_resets_cross_family_parse_failure_count(tmp_path: Path) -> None:
+    """Whenever ANY real verdict is subsequently recorded for a PR --
+    whether a genuine parse succeeds after prior failures, or this is
+    _handle_malformed_cross_family_verdict's own abandon-call -- the budget
+    resets, so a future review cycle (new head, new content) starts fresh
+    rather than inheriting an exhausted one."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {"number": 456, "cross_family_parse_failure_count": 5}
+        save_state(paths.state_file, state)
+
+    app.record_review(456, "approved", summary="all clear")
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["cross_family_parse_failure_count"] == 0
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
