@@ -2550,7 +2550,17 @@ def test_api_worker_fleet_report_to_dict() -> None:
 
 
 def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
-    """The report reads spend from the representative (enabled) repo's ledger."""
+    """The report reads spend from the representative (enabled) repo's ledger.
+
+    Regression for issue #828 (originally #822's class): production derives
+    its own `today = now.strftime("%Y-%m-%d")` ledger key independently of
+    this test's fixture write. If the wall clock crosses UTC midnight between
+    the write and `compute_api_worker_fleet_report`'s read, the lookup misses
+    and the report shows $0.00 instead of the expected spend -- a real (if
+    rare) production defect, not just a test flake. `now` is frozen and
+    passed to both the fixture and the report call so the ledger key always
+    matches regardless of any stall or midnight boundary in between.
+    """
     from datetime import UTC, datetime
 
     fleet_dir = tmp_path / "fleet"
@@ -2559,7 +2569,8 @@ def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
     state_dir0 = repo0 / ".var" / "charlie-work"
 
     # Write a ledger with today's spend.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    frozen_now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    today = frozen_now.strftime("%Y-%m-%d")
     ledger_data = {
         "days": {today: {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "usd": 2.25}},
         "lifetime_usd": 8.75,
@@ -2581,7 +2592,7 @@ def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
     }
     _make_fleet_json(tmp_path, fleet_dir, repos_map)
 
-    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir), now=frozen_now)
 
     assert report is not None
     assert report.today_usd == 2.25

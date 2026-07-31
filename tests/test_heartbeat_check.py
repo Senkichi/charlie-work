@@ -70,9 +70,17 @@ class FakeProcess:
         return self._create_time_value
 
 
-def _iso(minutes_ago: float = 0.0) -> str:
-    """Return an ISO-8601 UTC timestamp relative to right now."""
-    ts = datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)
+def _iso(minutes_ago: float = 0.0, *, base: datetime | None = None) -> str:
+    """Return an ISO-8601 UTC timestamp `minutes_ago` before `base`.
+
+    `base` defaults to the real wall clock, sampled here, for the many
+    wide-margin callers below. Tests with a tight margin against a rounded
+    or exact-value assertion (issue #828) should pass a frozen `base` so the
+    fixture and the production `now` it is compared against derive from the
+    same instant instead of racing an unbounded CI stall.
+    """
+    reference = base if base is not None else datetime.now(timezone.utc)
+    ts = reference - timedelta(minutes=minutes_ago)
     return ts.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
@@ -273,6 +281,17 @@ def test_check_review_liveness_ok_for_dead_pid_inside_grace_window(
 def test_check_review_liveness_uses_pending_timestamp(
     hb: ModuleType, monkeypatch: Any, tmp_path: Path
 ) -> None:
+    """Regression for issue #828 (originally #822's class): exact rounded-minute
+    match against an injected clock, not two independently-sampled `now()`s.
+
+    Production formats `oldest_min={round(age_min)}` where `age_min` is
+    computed from `now - claim_time`. With two independent samples this flips
+    from 5 to 6 (round(5.5) == 6) once ~30s passes between the fixture write
+    and the production check -- comfortably within an observed CI stall. `now`
+    is frozen and passed to both the fixture and the check so `age_min` is
+    exactly 5.0 regardless of how long the process stalls in between.
+    """
+    frozen_now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
     repo = _make_repo(hb, tmp_path)
     _patch_gh(monkeypatch, hb, [100])
     _make_pr_dirs(repo.state_dir, 100)
@@ -281,12 +300,12 @@ def test_check_review_liveness_uses_pending_timestamp(
         100,
         {
             "review_dispatch_status": "review_dispatch_pending",
-            "review_dispatch_pending_at": _iso(5),
+            "review_dispatch_pending_at": _iso(5, base=frozen_now),
         },
     )
 
     report = hb.Report()
-    hb.check_review_liveness(report, repo)
+    hb.check_review_liveness(report, repo, now=frozen_now)
 
     assert not report.anomaly
     assert "pid=None" in report.lines[0]
@@ -375,14 +394,20 @@ def test_check_dispatch_throttle_ok_when_not_throttled(hb: ModuleType, tmp_path:
 
 
 def test_check_dispatch_throttle_ok_within_threshold(hb: ModuleType, tmp_path: Path) -> None:
+    """Regression for issue #828: the fixture write and the check call are back-to-back
+    statements, but a substring assertion against text that flips at the 10-minute
+    remaining-time boundary is still exposed on a sufficiently long stall. Freeze `now`
+    so `until` and `resolved_now` never drift apart regardless of scheduling delay.
+    """
+    frozen_now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
     repo = _make_repo(hb, tmp_path)
     repo.state_dir.mkdir(parents=True, exist_ok=True)
-    # _iso(-10) = 10 minutes in the future (throttle still active)
+    # _iso(-10, base=frozen_now) = 10 minutes ahead of frozen_now (throttle still active)
     (repo.state_dir / "state.json").write_text(
-        json.dumps({"throttled_until": _iso(-10)}), encoding="utf-8"
+        json.dumps({"throttled_until": _iso(-10, base=frozen_now)}), encoding="utf-8"
     )
     report = hb.Report()
-    hb.check_dispatch_throttle(report, repo)
+    hb.check_dispatch_throttle(report, repo, now=frozen_now)
     assert not report.anomaly
     assert "throttled until" in report.lines[0]
 
@@ -390,14 +415,18 @@ def test_check_dispatch_throttle_ok_within_threshold(hb: ModuleType, tmp_path: P
 def test_check_dispatch_throttle_anomaly_when_exceeds_threshold(
     hb: ModuleType, tmp_path: Path
 ) -> None:
+    """Regression for issue #828: same class as the "within threshold" test above,
+    frozen against the 30-minute anomaly boundary instead of the 10-minute one.
+    """
+    frozen_now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
     repo = _make_repo(hb, tmp_path)
     repo.state_dir.mkdir(parents=True, exist_ok=True)
-    # _iso(-60) = 60 minutes in the future, beyond the 30-min threshold
+    # _iso(-60, base=frozen_now) = 60 minutes ahead of frozen_now, beyond the 30-min threshold
     (repo.state_dir / "state.json").write_text(
-        json.dumps({"throttled_until": _iso(-60)}), encoding="utf-8"
+        json.dumps({"throttled_until": _iso(-60, base=frozen_now)}), encoding="utf-8"
     )
     report = hb.Report()
-    hb.check_dispatch_throttle(report, repo)
+    hb.check_dispatch_throttle(report, repo, now=frozen_now)
     assert report.anomaly
     assert "cooldown exceeds threshold" in report.lines[0]
 
