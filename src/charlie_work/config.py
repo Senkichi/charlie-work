@@ -1055,7 +1055,15 @@ class TestAdequacyConfig:
     enabled: bool = False
     min_product_lines: int = 10
     test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
-    exempt_path_globs: tuple[str, ...] = ("*.md", "docs/**", "*.lock", "*.toml", "*.cfg", "*.ini")
+    exempt_path_globs: tuple[str, ...] = (
+        "*.md",
+        "docs/**",
+        "examples/**",
+        "*.lock",
+        "*.toml",
+        "*.cfg",
+        "*.ini",
+    )
     assertion_markers: tuple[str, ...] = (
         "assert ",
         "pytest.raises",
