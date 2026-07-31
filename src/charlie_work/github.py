@@ -8,7 +8,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from .config import RuntimeConfig
@@ -157,6 +157,85 @@ class _MergedPRSearchResult(list):
     def __init__(self, items: list[Any], ok: bool = True) -> None:
         super().__init__(items)
         self.ok = ok
+
+
+@runtime_checkable
+class GitHubLike(Protocol):
+    """Structural interface for the GitHub surface the orchestrator calls.
+
+    Concrete :class:`GitHub` satisfies this protocol, and test doubles can
+    satisfy it structurally without subclassing the frozen dataclass. This
+    keeps the contract explicit and makes drift (missing methods on a double)
+    a type-check error instead of a runtime ``AttributeError``.
+    """
+
+    def invalidate_list_cache(self) -> None: ...
+
+    def run(
+        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> Any: ...
+
+    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None: ...
+
+    def check_graphql_rate_limit(
+        self, threshold: int = _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD
+    ) -> tuple[bool, int, int | None]: ...
+
+    def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]: ...
+
+    def issue_view(self, number: int) -> dict[str, Any]: ...
+
+    def pr_list(self) -> list[dict[str, Any]]: ...
+
+    def merged_pr_list(self) -> list[dict[str, Any]]: ...
+
+    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str) -> Any: ...
+
+    def pr_view(self, number: int) -> dict[str, Any]: ...
+
+    def pr_diff(self, number: int) -> str: ...
+
+    def pr_checks(self, number: int) -> list[dict[str, Any]] | None: ...
+
+    def actions_job(self, job_id: int) -> dict[str, Any] | None: ...
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]: ...
+
+    def commit(self, sha: str) -> dict[str, Any] | None: ...
+
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None: ...
+
+    def compare(self, base: str, head: str) -> dict[str, Any] | None: ...
+
+    def compare_diff(self, base: str, head: str) -> str | None: ...
+
+    def add_issue_label(self, number: int, label: str) -> bool: ...
+
+    def remove_issue_label(self, number: int, label: str) -> bool: ...
+
+    def add_pr_label(self, number: int, label: str) -> bool: ...
+
+    def remove_pr_label(self, number: int, label: str) -> bool: ...
+
+    def close_issue(self, number: int) -> bool: ...
+
+    def pr_comment(self, number: int, body_file: Path) -> None: ...
+
+    def label_list(self) -> list[dict[str, Any]]: ...
+
+    def label_create(self, label: str, color: str, description: str) -> None: ...
+
+    def merge_pr(
+        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
+    ) -> str: ...
+
+    def delete_branch(self, branch: str) -> bool: ...
+
+    def pr_update_branch(self, pr_number: int) -> bool: ...
+
+    def are_issues_open(self, issue_numbers: list[int]) -> set[int]: ...
+
+    def name_with_owner(self) -> str: ...
 
 
 # Matches the job-id segment of a GitHub Actions check link, e.g.
@@ -1497,7 +1576,7 @@ def detect_prose_only_dependencies(text: str) -> bool:
     return False
 
 
-def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
+def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int]:
     """Fetch GitHub's native issue dependencies (blocked_by relationships).
 
     Uses the GitHub API to check for issue dependencies. Tolerates 404/410 errors
@@ -1560,7 +1639,7 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
 
 
 def cancel_superseded_runs(
-    gh: GitHub,
+    gh: GitHubLike,
     default_branch: str,
     workflow_name: str,
 ) -> dict[str, Any]:

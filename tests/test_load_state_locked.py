@@ -4,6 +4,7 @@ import ast
 import threading
 from pathlib import Path
 
+from _stubs import StubGitHubLike
 from charlie_work import state as state_module
 from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
@@ -17,7 +18,7 @@ from charlie_work.state import (
 from charlie_work.workflow import OrchestratorApp
 
 
-class FakeGitHub:
+class FakeGitHub(StubGitHubLike):
     """Minimal stub sufficient for OrchestratorApp.status()."""
 
     def __init__(self) -> None:

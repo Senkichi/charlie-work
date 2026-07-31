@@ -27,7 +27,7 @@ from pathlib import Path
 
 from .config import RunnerAllocationConfig
 from .fleet_paths import fleet_dir
-from .github import GitHub
+from .github import GitHubLike
 from .instrumentation import log_event
 from .runner_allocation import (
     AllocationPlan,
@@ -137,7 +137,7 @@ def resolve_inputs(
 
 
 def run_allocation_pass(
-    gh: GitHub,
+    gh: GitHubLike,
     allocation: RunnerAllocationConfig,
     *,
     managed_root_fallback: str = "",

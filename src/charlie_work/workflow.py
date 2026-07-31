@@ -54,6 +54,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    GitHubLike,
     GitHubNotFoundError,
     GitHubRunResult,
     GraphQLBudgetError,
@@ -2622,7 +2623,7 @@ def _reap_completed_review_checkouts(
 
 
 def _reap_orphaned_review_checkouts(
-    gh: GitHub,
+    gh: GitHubLike,
     repo_root: Path,
     reviews_dir: Path,
     state_file: Path,
@@ -2786,7 +2787,7 @@ def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
     config: OrchestratorConfig,
-    gh: GitHub,
+    gh: GitHubLike,
     *,
     review_callback: Callable[[int], Any] | None = None,
 ) -> None:
@@ -3373,7 +3374,7 @@ def _rework_pr_for_worker(
 
 def _reap_restore_rework_requested(
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     open_prs_by_issue: dict[int, list[dict[str, Any]]],
     worker: WorkerView,
@@ -3755,7 +3756,7 @@ def _is_readiness_no_ci_stall(
 
 def _route_dead_worker_to_pre_review_rework(
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     pr: dict[str, Any],
     issue_number: int,
@@ -3903,7 +3904,7 @@ def _route_dead_worker_to_pre_review_rework(
 def _classify_dead_sessions_and_update_throttle_state(
     sessions_dir: Path,
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     *,
     persist_inconclusive_probe_counter: bool = True,
@@ -4462,7 +4463,7 @@ def _classify_dead_sessions_and_update_throttle_state(
 
 def _attempt_salvage(
     *,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     repo_root: Path,
     worktree_path: Path,
@@ -4685,7 +4686,7 @@ class OrchestratorApp:
         repo_root: Path,
         paths: RuntimePaths,
         config: OrchestratorConfig,
-        gh: GitHub,
+        gh: GitHubLike,
         *,
         dry_run: bool = False,
         fleet_dir_override: str | None = None,
@@ -5053,7 +5054,7 @@ class OrchestratorApp:
                 # threaded anyway so the call site stays honest if one is ever
                 # added, and so the dry-run call-site guard stays a bright line.
                 pool_state = observe_runner_pool(
-                    self.gh, self.config.runner_scaling, dry_run=self.gh.dry_run
+                    self.gh, self.config.runner_scaling, dry_run=self.dry_run
                 )
                 runners_data = format_runner_pool_state(pool_state)
             except Exception:

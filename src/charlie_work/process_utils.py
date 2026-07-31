@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -130,9 +131,6 @@ def _enumerate_child_pids(pid: int) -> list[int]:
     if os.name == "nt":
         # Windows: use PowerShell CIM (primary) with wmic fallback
         try:
-            import subprocess
-            import shutil
-
             # Try PowerShell CIM first (modern Windows 11+)
             if shutil.which("powershell"):
                 result = subprocess.run(
@@ -379,8 +377,6 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     try:
         if os.name == "nt":
             # Windows: use taskkill to terminate the process tree
-            import subprocess
-
             result = subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(pid)],
                 capture_output=True,
@@ -443,8 +439,6 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
         return orphans
 
     try:
-        import shutil
-
         if not shutil.which("powershell"):
             return orphans
 

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .config import LabelConfig
-from .github import GitHub
+from .github import GitHubLike
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
     }
 
 
-def transition(gh: GitHub, labels: LabelConfig, issue_number: int, event: str) -> TransitionResult:
+def transition(gh: GitHubLike, labels: LabelConfig, issue_number: int, event: str) -> TransitionResult:
     add, remove = _edges(labels)[event]
     add_failures: list[tuple[int, str]] = []
     remove_failures: list[tuple[int, str]] = []

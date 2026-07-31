@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from _stubs import StubGitHubLike
 from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
@@ -142,7 +143,7 @@ def test_check_worktree_marker_owned_session_allowed(
     assert read_worktree_marker(worktree_path) is not None
 
 
-class _MinimalGitHub:
+class _MinimalGitHub(StubGitHubLike):
     def __init__(self) -> None:
         pass
 

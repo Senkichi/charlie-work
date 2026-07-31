@@ -10,6 +10,7 @@ import os
 import subprocess
 import time
 
+from _stubs import StubGitHubLike
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.claude_code import _sidecar_path as claude_sidecar_path
 from charlie_work.config import (
@@ -862,7 +863,7 @@ def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
     assert sidecar_path.exists()
 
     # Create a fake GitHub instance (no PRs for this issue)
-    class FakeGitHub:
+    class FakeGitHub(StubGitHubLike):
         def __init__(self) -> None:
             self.issues = [
                 {
@@ -955,7 +956,7 @@ def test_workflow_classify_dead_sessions_reaps_probe_error_sidecar(
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
-    class FakeGitHub:
+    class FakeGitHub(StubGitHubLike):
         def __init__(self) -> None:
             self.issues = [
                 {
@@ -1125,7 +1126,7 @@ def _wf_write_dead_session_sidecar(
     return sidecar_path
 
 
-class _NoOpGitHub:
+class _NoOpGitHub(StubGitHubLike):
     """Minimal GitHub stub for the dead-session lane.
 
     Returns no open PRs and an issue carrying only a non-active label, so the

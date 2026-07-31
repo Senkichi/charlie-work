@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+from _stubs import StubGitHubLike
 from charlie_work.config import (
     ApiBudgetConfig,
     AutoMergeConfig,
@@ -22,7 +23,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.subprocess_runner import RunResult
 
 
-class FakeDoctorGitHub:
+class FakeDoctorGitHub(StubGitHubLike):
     def __init__(self, labels: list[str] | None = None) -> None:
         self.labels = labels if labels is not None else []
 

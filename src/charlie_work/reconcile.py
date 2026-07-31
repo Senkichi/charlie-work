@@ -29,7 +29,7 @@ from typing import Any
 
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .github import (
-    GitHub,
+    GitHubLike,
     GraphQLBudgetError,
     _LIST_LIMIT,
     RECONCILE_ISSUE_FIELDS,
@@ -121,7 +121,7 @@ def _issue_state(issue: dict[str, Any] | None) -> str:
     return str(issue.get("state") or "OPEN").upper()
 
 
-def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
+def _fetch_prs(gh: GitHubLike) -> list[dict[str, Any]]:
     result = gh.run(
         [
             "pr",
@@ -138,7 +138,7 @@ def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
     return result if isinstance(result, list) else []
 
 
-def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
+def _fetch_issues(gh: GitHubLike) -> list[dict[str, Any]]:
     result = gh.run(
         [
             "issue",
@@ -197,7 +197,7 @@ def _pr_review_approved_at_head(
 
 
 def detect_aviator_stale_blocked(
-    gh: GitHub, config: OrchestratorConfig, *, repo_root: Path | None = None
+    gh: GitHubLike, config: OrchestratorConfig, *, repo_root: Path | None = None
 ) -> list[DriftItem]:
     """Detect PRs stuck behind a stale Aviator ``blocked`` label.
 
@@ -311,7 +311,7 @@ def detect_aviator_stale_blocked(
 
 
 def detect_drift(
-    gh: GitHub, state: dict[str, Any], config: OrchestratorConfig, *, repo_root: Path | None = None
+    gh: GitHubLike, state: dict[str, Any], config: OrchestratorConfig, *, repo_root: Path | None = None
 ) -> list[DriftItem]:
     """Read-only comparison of GitHub reality against ``state``.
 
@@ -1204,7 +1204,7 @@ def detect_drift(
 
 
 def apply_fixes(
-    gh: GitHub,
+    gh: GitHubLike,
     state: dict[str, Any],
     drift: list[DriftItem],
     config: OrchestratorConfig,

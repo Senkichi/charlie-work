@@ -21,8 +21,8 @@ from .config import ApiWorkerConfig, OrchestratorConfig
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
 from .github import (
-    GitHub,
     GitHubError,
+    GitHubLike,
     ISSUE_LIST_FIELDS,
     ISSUE_VIEW_FIELDS,
     LABEL_LIST_FIELDS,
@@ -599,7 +599,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     )
 
 
-def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
+def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
     """Validate gh --json field lists against the live gh CLI.
 
     Executes each field list as a read-only query with --limit 1 and reports
@@ -728,7 +728,7 @@ def run_doctor(
     paths: RuntimePaths,
     config: OrchestratorConfig,
     config_path: Path | None,
-    gh: GitHub,
+    gh: GitHubLike,
     *,
     adapter_probe: bool = False,
     live: bool = False,

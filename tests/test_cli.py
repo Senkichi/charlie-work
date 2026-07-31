@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+
+from _stubs import StubGitHubLike
 
 from charlie_work import cli
 from charlie_work.config import (
@@ -20,7 +23,7 @@ from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
 
 
-class _FakeGitHub:
+class _FakeGitHub(StubGitHubLike):
     """Stub GitHub client sufficient to drive cli.main through the verdict path."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:

@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
+from _stubs import StubGitHubLike
 from charlie_work.config import LabelConfig, OrchestratorConfig, PostMortemConfig
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.file_lock import try_acquire_byte_range_lock
@@ -35,7 +36,7 @@ from charlie_work.workflow import OrchestratorApp
 _config_labels = LabelConfig()
 
 
-class FakeGitHub:
+class FakeGitHub(StubGitHubLike):
     """Records every call so tests can assert detect_drift never mutates."""
 
     def __init__(

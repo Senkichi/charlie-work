@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
-from .github import GitHub, GitHubError
+from .github import GitHub, GitHubError, GitHubLike
 from .paths import RuntimePaths
 from .state import save_state, state_lock
 from .worker import iter_workers
@@ -74,7 +74,7 @@ def touch_repo(
     fleet_dir_override: str | None,
     repo_root: Path,
     paths: RuntimePaths,
-    gh: GitHub,
+    gh: GitHubLike,
 ) -> dict[str, Any]:
     """Register or update a repo in the fleet registry.
 

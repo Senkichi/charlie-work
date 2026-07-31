@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from _sessions_db_fixtures import make_sessions_db
+from _stubs import StubGitHubLike
 from charlie_work import cli
 from charlie_work import github as github_module
 from charlie_work.checks import _run_id_from_link, summarize_checks
@@ -2940,7 +2941,7 @@ def _required_checks_config(**kwargs) -> OrchestratorConfig:
     return OrchestratorConfig(auto_merge=auto_merge)
 
 
-class FakeGitHub:
+class FakeGitHub(StubGitHubLike):
     def __init__(self, repo_root: Any = None) -> None:
         self.repo_root = repo_root
         self.issues = [

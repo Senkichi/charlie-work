@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from _stubs import StubGitHubLike
 from charlie_work.prompt_sections import section_variables
 from charlie_work.prompts import render_prompt
 
@@ -235,7 +236,7 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
     from charlie_work.paths import runtime_paths
 
     # Minimal mock GitHub client - only what _write_rework_prompt needs
-    class MinimalFakeGitHub:
+    class MinimalFakeGitHub(StubGitHubLike):
         def __init__(self):
             self.labels_added = []
             self.labels_removed = []
