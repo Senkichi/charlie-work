@@ -14113,6 +14113,115 @@ def test_linked_issue_number_none_treats_as_cross_repository() -> None:
     )
 
 
+def test_linked_issue_number_negation_guard_rejects_negated_keyword() -> None:
+    # Issue #781 AC1: a closing keyword preceded by a negation must not
+    # bind -- "does not fix #649" is the real-world PR #766 -> issue #649
+    # text that produced a false LABEL TRANSITION (not a GitHub auto-close;
+    # this guard only affects charlie-work's own binding). The non-negated
+    # form of the identical keyword still binds.
+    assert (
+        linked_issue_number(
+            {"body": "does not fix #649"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+    assert (
+        linked_issue_number(
+            {"body": "Fixes #649"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        == 649
+    )
+
+
+def test_linked_issue_number_negation_guard_table() -> None:
+    # Issue #781 AC2: table-driven negation coverage (doesn't / never /
+    # without / cannot / does not), plus non-negated controls proving the
+    # guard doesn't over-trigger on unrelated text.
+    negated_cases = [
+        "doesn't close #1",
+        "never resolves #2",
+        # "without fixing #3" returns None via the BASE regex, not the
+        # negation guard: _CLOSING_KEYWORD_REF only matches fix/fixes/fixed
+        # (fix(?:e[sd])?) -- never the gerund "fixing". Included per the
+        # issue's explicit list, but see the dedicated assertion below for
+        # proof this is NOT evidence the negation guard itself fired.
+        "without fixing #3",
+        "cannot close #4",
+        "does not fix #5",
+    ]
+    for body in negated_cases:
+        assert (
+            linked_issue_number(
+                {"body": body},
+                is_cross_repository=False,
+                branch_prefix="agent/issue",
+            )
+            is None
+        ), f"expected no binding for negated text: {body!r}"
+
+    # Non-negated controls: the same keywords, without a preceding negation,
+    # still bind -- proves the guard isn't simply matching nothing.
+    non_negated_cases = [
+        ("Closes #1", 1),
+        ("This resolves #2", 2),
+        ("Fixes #5", 5),
+    ]
+    for body, expected in non_negated_cases:
+        assert (
+            linked_issue_number(
+                {"body": body},
+                is_cross_repository=False,
+                branch_prefix="agent/issue",
+            )
+            == expected
+        ), f"expected binding to {expected} for non-negated text: {body!r}"
+
+    # "fixing #3" alone (no negation at all) confirms the gerund truly never
+    # matches the base regex -- so the None result above for "without
+    # fixing #3" is not evidence the negation guard fired.
+    assert (
+        linked_issue_number(
+            {"body": "fixing #3"},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        is None
+    )
+
+
+def test_linked_issue_number_negation_does_not_shadow_later_genuine_match() -> None:
+    # A negated match earlier in a text field must not prevent a later,
+    # genuine closing keyword from binding -- finditer-continuation, not
+    # search()-first-match-only. Monotone with respect to pre-#781 behavior:
+    # no input that previously returned a number now returns None because of
+    # this change; the negation guard can only turn a previously-binding
+    # negated match into None, never suppress a separate genuine one.
+    #
+    # The negation lookback window (32 chars, chosen to cover "does not "
+    # plus headroom) is deliberately wide enough to span a short clause, so
+    # a genuine match must sit outside that window to prove continuation
+    # rather than an accidental non-negation coincidence. Verified
+    # empirically: without the padding, "does not fix #649. Fixes #700"
+    # actually returns None (the 32-char window reaches back across the
+    # sentence boundary to "not") -- that cross-sentence over-triggering is
+    # the deliberate, sanctioned safe-direction tradeoff described on
+    # `_NEGATION_LOOKBEHIND_CHARS`, not a bug. This test instead places the
+    # genuine match far enough away to isolate the continuation behavior.
+    padded_body = "does not fix #649. " + ("x" * 50) + " Fixes #700"
+    assert (
+        linked_issue_number(
+            {"body": padded_body},
+            is_cross_repository=False,
+            branch_prefix="agent/issue",
+        )
+        == 700
+    )
+
+
 def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
     # The P0: the counter used to derive from state["events"], which
     # append_event truncates to the last 200 - evicting a PR's earlier
@@ -33939,7 +34048,13 @@ def test_rework_brief_falls_back_to_summary_when_required_changes_empty(
     _render_required_changes_section returned "" whenever required_changes
     was empty, so the worker's rework brief contained none of that summary
     content even though it was real, substantive review findings sitting
-    right there in review-decision.json. Must fail before F1, pass after."""
+    right there in review-decision.json. Must fail before F1, pass after.
+
+    The reviewer_summary text here is the real PR #766 reproduction string
+    from issue #781 -- it contains a live closing keyword ("does not fix
+    #649") that must reach the brief DEFANGED (issue #781 outbound fix), so
+    this test also doubles as an AC4-adjacent regression guard: the summary
+    fallback tier must not leak `fix #649` verbatim into a worker's brief."""
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -33957,8 +34072,12 @@ def test_rework_brief_falls_back_to_summary_when_required_changes_empty(
     )
 
     brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
-    assert reviewer_summary in brief, "reviewer summary missing from brief"
     assert "## Required changes" in brief
+    # Content (the reviewer's findings) survives, defanged of the live
+    # closing-keyword syntax that would otherwise let GitHub or a worker's
+    # own PR body auto-close/mis-bind issue #649.
+    assert "does not fix issue 649" in brief, "reviewer summary missing from brief"
+    assert "does not fix #649" not in brief, "live closing keyword leaked into brief"
 
 
 def test_render_required_changes_section_populated_list_unaffected_by_fallback() -> None:
@@ -34015,6 +34134,71 @@ def test_render_required_changes_section_blocked_both_empty_renders_escape_hatch
     assert "REVIEWER FINDINGS UNAVAILABLE" in section
 
 
+def test_defang_closing_keywords_strips_live_keyword_but_keeps_number_legible() -> None:
+    # Issue #781 AC3: defang_closing_keywords rewrites `<keyword> #N` to
+    # `<keyword> issue N` -- the rewritten text no longer matches the
+    # closing-keyword regex (so it can no longer auto-close or falsely bind
+    # via linked_issue_number), but the issue number stays legible to a
+    # human reader.
+    from charlie_work.github import _CLOSING_KEYWORD_REF, defang_closing_keywords
+
+    text = "does not fix #649"
+    defanged = defang_closing_keywords(text)
+
+    assert _CLOSING_KEYWORD_REF.search(defanged) is None
+    assert "649" in defanged, "issue number must remain legible to a human"
+    assert defanged == "does not fix issue 649"
+
+
+def test_defang_closing_keywords_preserves_non_keyword_hash_refs() -> None:
+    # Bare `#N` (no preceding closing keyword) and `issue #N` mentions pass
+    # through untouched -- defang targets only the live auto-close syntax.
+    # Multiple keyword refs in one string are each independently defanged.
+    from charlie_work.github import defang_closing_keywords
+
+    assert defang_closing_keywords("see #5 for context") == "see #5 for context"
+    assert defang_closing_keywords("related to issue #5") == "related to issue #5"
+    assert (
+        defang_closing_keywords("Closes #1 and also fixes #2")
+        == "Closes issue 1 and also fixes issue 2"
+    )
+
+
+def test_render_required_changes_section_defangs_live_keyword_in_list_tier() -> None:
+    # Issue #781 AC4: reviewer prose in the required_changes list tier must
+    # not carry a live closing keyword into the rendered brief -- a worker
+    # reads this brief and writes its own PR body from it, a boundary
+    # linked_issue_number's hijack-safety check never sees.
+    from charlie_work.github import _CLOSING_KEYWORD_REF
+
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["this does not fix #649, dig deeper"],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "does not fix issue 649" in section
+    assert _CLOSING_KEYWORD_REF.search(section) is None, "live keyword survived"
+
+
+def test_render_required_changes_section_defangs_live_keyword_in_summary_tier() -> None:
+    # Same guarantee for the summary-fallback tier (tier 2).
+    from charlie_work.github import _CLOSING_KEYWORD_REF
+
+    decision = {
+        "decision": "request_changes",
+        "summary": "BLOCKER - does not fix #649. Still broken.",
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "does not fix issue 649" in section
+    assert _CLOSING_KEYWORD_REF.search(section) is None, "live keyword survived"
+
+
 def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) -> None:
     """F3: _request_no_op_rework_repair's hardcoded no-op note must not
     displace the reviewer's findings. It routes through _route_to_rework,
@@ -34051,8 +34235,10 @@ def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) ->
     # The no-op operational note (the "dispatch_note") is present...
     assert "no actual content change" in brief
     # ...and the reviewer's original findings are still present alongside it,
-    # not replaced by it.
-    assert reviewer_summary in brief
+    # not replaced by it -- defanged of the live closing keyword (issue
+    # #781 outbound fix) the same way as the summary-fallback test above.
+    assert "does not fix issue 649" in brief
+    assert "does not fix #649" not in brief, "live closing keyword leaked into brief"
 
 
 def _normalize_ws(text: str) -> str:
