@@ -10576,6 +10576,22 @@ class OrchestratorApp:
         pr = self.gh.pr_view(pr_number)
         if not pr:
             return CommandResult(False, f"PR #{pr_number} was not found", {})
+        # Aviator MergeQueue silent-revert detector (issue #823): add_pr_label's
+        # boolean return only proves the POST succeeded, not that the label
+        # survived -- Aviator can accept the mergequeue label and then
+        # asynchronously strip it 2-3 seconds later (draft PR, a failing
+        # required check, base mismatch, paused queue, ...), and every such
+        # rejection was previously indistinguishable from success. Detected
+        # cross-pass, never same-pass: existing_pr_state is the PRIOR pass's
+        # persisted status (loaded above, before this pass's live fetch) and
+        # label_names(pr) is THIS pass's live labels. A same-pass re-read
+        # would race Aviator's 2-3s revert window and could still observe the
+        # label present.
+        mergequeue_label_reverted = bool(
+            self.config.auto_merge.mergequeue_label
+            and existing_pr_state.get("status") == "mergequeue"
+            and self.config.auto_merge.mergequeue_label not in label_names(pr)
+        )
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -11053,13 +11069,29 @@ class OrchestratorApp:
                 if mergequeue_label_applied:
                     with state_lock(self.paths.state_file):
                         state = load_state(self.paths.state_file)
-                        state["prs"][str(pr_number)] = {
-                            **state["prs"].get(str(pr_number), {}),
+                        _existing_pr_entry = state["prs"].get(str(pr_number), {})
+                        _pr_update: dict[str, Any] = {
+                            **_existing_pr_entry,
                             "number": pr_number,
                             "issue_number": issue_number,
                             "status": "mergequeue",
-                            "consecutive_failed_merge_attempts": 0,
                         }
+                        # Issue #823 ordering hazard: do NOT zero the counter
+                        # when this re-add is recovering from a cross-pass
+                        # revert (mergequeue_label_reverted). This write runs
+                        # BEFORE mergequeue_handoff_failed is computed and its
+                        # increment is persisted further down in this same
+                        # pass -- unconditionally zeroing here would hand that
+                        # later increment a false 0 baseline every single
+                        # reverted pass, so the counter would land on 1
+                        # forever instead of accumulating, making the
+                        # escalation this issue adds permanently unreachable
+                        # for any threshold > 1. Verified empirically: without
+                        # this guard a 3-pass simulation (revert, revert,
+                        # revert) produces 1, 1, 1; with it, 1, 2, 3.
+                        if not mergequeue_label_reverted:
+                            _pr_update["consecutive_failed_merge_attempts"] = 0
+                        state["prs"][str(pr_number)] = _pr_update
                         if issue_number is not None:
                             _issue_key = str(issue_number)
                             _issue_entry = state["issues"].get(_issue_key, {})
@@ -11141,9 +11173,29 @@ class OrchestratorApp:
         # swallowed as best-effort cleanup. can_merge is True here (checks
         # green, approved), so the "approved and not can_merge" alarm gate
         # below would otherwise never fire for this failure mode.
+        #
+        # Issue #823: folded into the SAME signal (rather than a parallel
+        # mechanism) is mergequeue_label_reverted -- an outright POST failure
+        # and a POST that succeeded but was silently reverted by Aviator by
+        # the next pass are the same underlying failure (the PR never
+        # actually made it into Aviator's queue) and must share the same
+        # counter-increment/escalation path.
+        #
+        # The revert term is additionally gated on can_merge: a revert can
+        # also be Aviator declining the PR for a genuine reason (e.g. a
+        # required check went red), in which case can_merge is False on this
+        # pass and the failure is a check failure, not a handoff failure. If
+        # mergequeue_handoff_failed were True here it would shadow the
+        # check-failure-rework dispatch gate below (`not
+        # mergequeue_handoff_failed`), permanently blocking rework for a
+        # fixable check failure. The counter still increments in that case
+        # via the pre-existing "approved and not can_merge" disjunct in the
+        # final counter-persistence block, so escalation is unaffected --
+        # only the handoff-specific attribution and the handoff-specific
+        # (non-)dispatch of check-failure-rework are.
         mergequeue_handoff_failed = bool(
             self.config.auto_merge.mergequeue_label and mergequeue_label_applied is False
-        )
+        ) or (mergequeue_label_reverted and can_merge)
         # Conflict-rework dispatch is debounced to the failed-attempt alarm
         # threshold so a single transient/stale CONFLICTING reading does not
         # clobber an approved verdict. Re-read the issue status and the PR
