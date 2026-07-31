@@ -1777,6 +1777,7 @@ def test_run_allocation_pass_skips_early_when_no_runners_are_configured(
         RunnerAllocationConfig(enabled=True, managed_root=str(root), max_running_runners=4),
         fleet_dir_override=str(tmp_path / "fleet"),
         source="prologue",
+        full_pass_interval_seconds=300,
     )
 
     assert result.ok is True
@@ -1808,6 +1809,7 @@ def test_run_allocation_pass_pins_a_repo_whose_busy_list_failed(
         RunnerAllocationConfig(enabled=True, managed_root=str(root), max_running_runners=4),
         fleet_dir_override=str(tmp_path / "fleet"),
         source="prologue",
+        full_pass_interval_seconds=300,
     )
 
     assert result.ok is True
@@ -1857,6 +1859,7 @@ def test_run_allocation_pass_dry_run_does_not_persist_idle_streaks(
         state_path=state_path,
         dry_run=True,
         source="prologue",
+        full_pass_interval_seconds=300,
     )
 
     assert result.ok is True
@@ -1905,6 +1908,7 @@ def test_run_allocation_pass_real_run_persists_idle_streaks(
         state_path=state_path,
         dry_run=False,
         source="prologue",
+        full_pass_interval_seconds=300,
     )
 
     assert result.ok is True
