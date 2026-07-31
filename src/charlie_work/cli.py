@@ -1241,6 +1241,7 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
         state_path=paths.state_file,
         dry_run=dry_run,
         source=CLI_ALLOCATION_SOURCE,
+        full_pass_interval_seconds=config.supervisor.full_pass_interval_seconds,
     )
 
     if result.error:
