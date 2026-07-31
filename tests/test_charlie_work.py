@@ -18049,6 +18049,203 @@ def test_merge_ready_failed_attempt_alarm_skips_pending_only_checks(tmp_path: Pa
     assert len(alarm_events) == 0
 
 
+def test_merge_ready_failed_attempt_alarm_preserves_count_across_pending_only_pass(
+    tmp_path: Path,
+) -> None:
+    """Issue #861: a pending-only pass must PRESERVE an already-accumulated
+    failed-attempt count, not clobber it back to 0.
+
+    ``test_merge_ready_failed_attempt_alarm_skips_pending_only_checks`` above
+    only proves the counter stays 0 when it *starts* at 0 -- that also passed
+    on the pre-#861 code, since the old default was an unconditional 0 every
+    pass. This test seeds a nonzero count first, so it actually distinguishes
+    "reset to 0" from "preserve the existing value."
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    app.merge_ready(456, merge=False)
+    app.merge_ready(456, merge=False)
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 2
+
+    # Checks are now merely still running (pending-only) -- not failed, not
+    # passed, not new information worth resetting the streak.
+    pending_checks = [
+        {"name": "Tests passed", "state": "PENDING"},
+        {"name": "Lint & Format", "state": "PENDING"},
+        {"name": "Pre-commit", "state": "PENDING"},
+    ]
+    pending_gh = FakeGitHubWithChecks(checks=pending_checks)
+    app = OrchestratorApp(tmp_path, paths, config, pending_gh)
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["can_merge"] is False
+    assert result.data["consecutive_failed_merge_attempts"] == 2
+    assert result.data["merge_attempt_alarm"] is False
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 2
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 0
+
+
+def test_merge_ready_failed_attempt_alarm_pending_passes_do_not_delay_threshold(
+    tmp_path: Path,
+) -> None:
+    """Issue #861: interleaved pending-only passes must not reset progress
+    toward the alarm threshold. Replays fail, pending, fail, pending, fail
+    with threshold=3 and asserts the counter climbs 1, 1, 2, 2, 3 -- i.e. the
+    pending passes hold steady rather than either incrementing or clobbering
+    -- with exactly one alarm firing, on the final structural failure.
+
+    Before the #861 fix this sequence never crossed the threshold: every
+    pending-only pass reset the counter to 0, so the structural failures
+    never accumulated past 1.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    pending_checks = [
+        {"name": "Tests passed", "state": "PENDING"},
+        {"name": "Lint & Format", "state": "PENDING"},
+        {"name": "Pre-commit", "state": "PENDING"},
+    ]
+    fail_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fail_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    expected_sequence = [1, 1, 2, 2, 3]
+    is_pending_step = [False, True, False, True, False]
+    for expected, pending_step in zip(expected_sequence, is_pending_step, strict=True):
+        if pending_step:
+            app = OrchestratorApp(
+                tmp_path, paths, config, FakeGitHubWithChecks(checks=pending_checks)
+            )
+        else:
+            app = OrchestratorApp(tmp_path, paths, config, FakeGitHubWithMissingRequired())
+        result = app.merge_ready(456, merge=False)
+        assert result.data["consecutive_failed_merge_attempts"] == expected
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 3
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["attempts"] == 3
+
+
+def test_merge_ready_failed_attempt_alarm_clamps_at_threshold_plus_one(
+    tmp_path: Path,
+) -> None:
+    """Issue #777(b), pinned against regression by #861: many consecutive
+    structural failures must clamp the counter at ``threshold + 1`` (not grow
+    unbounded, and not clamp AT threshold -- see the comment above the clamp
+    in ``merge_ready`` for why threshold+1 is required for the alarm's
+    one-shot semantics) and the alarm must fire exactly once, not on every
+    pass once clamped.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    threshold = 3
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=threshold,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    results = [app.merge_ready(456, merge=False) for _ in range(6)]
+
+    for result in results[:2]:
+        assert result.data["consecutive_failed_merge_attempts"] < threshold
+    assert results[2].data["consecutive_failed_merge_attempts"] == threshold
+    for result in results[3:]:
+        assert result.data["consecutive_failed_merge_attempts"] == threshold + 1
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == threshold + 1
+    alarm_events = [e for e in state["events"] if e["kind"] == "merge_failed_attempt_alarm"]
+    assert len(alarm_events) == 1
+    assert alarm_events[0]["payload"]["attempts"] == threshold
+
+
+def test_merge_ready_failed_attempt_alarm_resets_when_can_merge_without_merging(
+    tmp_path: Path,
+) -> None:
+    """Issue #861: when an evaluation-only pass (``merge=False``) finds the PR
+    genuinely mergeable, the counter must reset to 0 even though no merge (or
+    mergequeue handoff) actually ran to reset it via those separate write
+    paths. This is the one scenario that exercises the ``elif can_merge:``
+    reset in ``merge_ready`` directly -- every other passing test that resets
+    the counter does so through an earlier, unconditional write (a completed
+    merge or mergequeue handoff), which zeroes ``existing`` before this
+    method's shared write block re-reads it.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    required = ("Tests passed", "Lint & Format", "Pre-commit")
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=required,
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fail_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fail_gh)
+    app.record_review(456, "approved", summary="lgtm")
+    app.merge_ready(456, merge=False)
+    app.merge_ready(456, merge=False)
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 2
+
+    passing_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, passing_gh)
+    result = app.merge_ready(456, merge=False)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merged"] is False
+    assert result.data["consecutive_failed_merge_attempts"] == 0
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
+
+
 def test_merge_ready_stale_base_alarm_fires_after_threshold(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
