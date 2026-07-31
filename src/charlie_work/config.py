@@ -234,6 +234,33 @@ class ReviewConfig:
     # but never consumed by anything (pr-lifecycle.md "janitor_blocked zero
     # readers" finding).
     max_no_op_rework_attempts: int = 2
+    # Issue #765: orthogonal stall bound for _route_janitor_gate_failure_to_
+    # rework's passive wait. max_conflict_rework_attempts/max_no_op_rework_
+    # attempts only advance on a SETTLED head change (merge_conflict) or a
+    # fresh non-pending detection (no_op_rework) -- both require the issue to
+    # leave `rework_requested` at least once. A PR whose head simply stops
+    # moving while queued (nobody dispatched a worker, or the worker's rework
+    # brief was empty -- see issue #765's "relationship to the empty-findings
+    # defect") never produces that signal, so it can sit in the passive
+    # janitor_blocked wait forever: PR #696 spun 55 `rework_already_pushed`
+    # events over 24h+ with its attempt count already AT the cap and the
+    # rescue tier never even attempted, because the cap/rescue check below is
+    # only reachable via progress. This bound fires independently of attempts
+    # count: once the head has been observed unchanged for this long while
+    # the issue is `rework_requested` (queued, nobody actively working),
+    # escalate regardless of how many attempts have been burned. Only a HEAD
+    # CHANGE resets the clock -- a live `dispatched` session pushing a real
+    # commit resets it, but idle dispatched time (and a same-head status
+    # flip, e.g. reconcile's issue_active_label_with_open_pr self-heal
+    # normalizing the label away from rework_requested and back) still
+    # counts toward the bound; see the call site. 240 minutes (4h)
+    # matches WatchdogConfig.redispatch_window_minutes, this codebase's
+    # existing convention for "how long a stuck fleet item may sit before
+    # it's treated as abnormal" -- long enough to absorb normal dispatch
+    # queueing latency under fleet load, short enough to bound the failure
+    # mode to hours instead of the unbounded, indefinite spin this issue was
+    # filed over.
+    rework_stall_minutes: int = 240
 
 
 @dataclass(frozen=True)
@@ -300,6 +327,45 @@ class ReconcilePassConfig:
     # still comfortably beats "only ever runs when an operator remembers to
     # run mop-up".
     interval_minutes: int = 30
+
+
+@dataclass(frozen=True)
+class DeescalationConfig:
+    """Periodic sweep that re-evaluates ``mechanical`` escalations (issue #783).
+
+    Escalating to ``agent:human-needed`` on a process failure (dead worker,
+    redispatch/rework-cycle cap, stalled worker) when the PR artifact itself
+    is fine is a category error -- it was a one-way door with no automated
+    re-entry. This sweep re-checks ONLY escalations recorded with
+    ``reason_class == "mechanical"`` (see ``state.escalation_reason_class``);
+    ``"judgment"`` escalations and any escalation with no recorded reason
+    class are never auto-cleared (fail closed).
+
+    ``max_auto_deescalations`` bounds the auto de-escalate/redispatch/
+    re-escalate cycle per issue (the ``auto_deescalation_count`` field on the
+    issue's state entry, never reset by this sweep -- only a human running
+    ``charlie unescalate`` resets it). This is deliberately independent from
+    every per-mechanism attempt cap (``max_rework_cycles``,
+    ``max_auto_redispatch``, ...): this sweep never resets those counters, so
+    a condition that keeps re-failing keeps re-tripping its own cap
+    immediately; this counter instead bounds how many times the SWEEP itself
+    may clear the human_needed door for the same issue before also leaving it
+    terminal, so the outer escalate/de-escalate cycle cannot spin forever
+    even if the underlying condition oscillates.
+    """
+
+    enabled: bool = True
+    # Cheaper per-item than reconcile (one gh pr_view + pr_checks + pr_diff
+    # per escalated-mechanical issue, no full-repo list queries), but there is
+    # no urgency to re-evaluate faster than an operator would notice a fixed
+    # escalation sitting idle -- 30 minutes matches reconcile_pass's cadence.
+    interval_minutes: int = 30
+    # Bounds the auto de-escalate -> redispatch -> re-escalate cycle per
+    # issue. Once reached, the sweep stops clearing this issue's escalation
+    # even if reason_class is still "mechanical" and the PR looks healthy;
+    # a distinct one-time event (deescalation_cap_exhausted) makes the
+    # terminal state diagnosable rather than a silently renamed one-way door.
+    max_auto_deescalations: int = 2
 
 
 @dataclass(frozen=True)
@@ -828,6 +894,13 @@ class CrossFamilyConfig:
     )
     timeout_seconds: int = 300
     auto_verdict: bool = False
+    # Issue #784: bounds the "content-free verdict -> forced regeneration ->
+    # still content-free" cycle. Counts distinct parse-failure attempts (one
+    # per genuinely new report/head, never per loop-pass re-read of a cached
+    # one) per PR. Once exceeded, the PR is released from the cross-family
+    # gate (recorded as a caveated "approved") instead of looping forever or
+    # escalating to a human — see workflow._record_cross_family_verdicts.
+    max_parse_failures: int = 2
 
 
 @dataclass(frozen=True)
@@ -1253,6 +1326,7 @@ class OrchestratorConfig:
     review_dispatch: ReviewDispatchConfig = field(default_factory=ReviewDispatchConfig)
     quota_probe: QuotaProbeConfig = field(default_factory=QuotaProbeConfig)
     reconcile_pass: ReconcilePassConfig = field(default_factory=ReconcilePassConfig)
+    deescalation: DeescalationConfig = field(default_factory=DeescalationConfig)
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)

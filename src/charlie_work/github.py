@@ -1090,13 +1090,84 @@ def label_names(item: dict[str, Any]) -> set[str]:
 
 
 # GitHub's own issue-closing keyword set, used here to decide whether a `#N`
-# reference in freeform text actually links the PR to issue N.
-_CLOSING_KEYWORD_REF = re.compile(
-    r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", flags=re.IGNORECASE
+# reference in freeform text actually links the PR to issue N. Shared between
+# the matching regex below and `_CLOSING_KEYWORD_DEFANG_RE` so the two
+# patterns cannot drift apart.
+_CLOSING_KEYWORDS_ALT = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+_CLOSING_KEYWORD_REF = re.compile(_CLOSING_KEYWORDS_ALT + r"\s+#(\d+)", flags=re.IGNORECASE)
+# Rewrites `<keyword> #N` to `<keyword> issue N` — used by
+# `defang_closing_keywords` to strip the auto-close/binding syntax from text
+# that will be embedded in a PR body/comment charlie-work does not control
+# downstream (e.g. a rework brief a worker reads and copies into its own PR).
+_CLOSING_KEYWORD_DEFANG_RE = re.compile(
+    r"(" + _CLOSING_KEYWORDS_ALT + r")(\s+)#(\d+)", flags=re.IGNORECASE
 )
 # The orchestrator's own branch convention (agent/issue-N-slug). A head ref is
 # the trusted signal because the orchestrator created it at dispatch.
 _BRANCH_ISSUE_REF = re.compile(r"issue[-_/](\d+)", flags=re.IGNORECASE)
+
+# Negation words/contractions that, when found shortly before a closing
+# keyword match, mean the keyword is being negated ("does not fix #649")
+# rather than asserting a real closing action. Kept as a module-level
+# constant — never inline literals at the match site — so the vocabulary is
+# audited and extended in exactly one place.
+_NEGATION_WHOLE_WORDS = ("not", "never", "without", "cannot")
+# Matched as a bare substring (no leading \b): "doesn't"/"can't" have no word
+# boundary immediately before the "n" in "n't" — the apostrophe is not a
+# \w character, so "doesn" + "'t" is one continuous \w-run from \b's
+# perspective and a \b-anchored "n't" would silently never match.
+_NEGATION_CONTRACTION_SUFFIX = "n't"
+_NEGATION_RE = re.compile(
+    r"\b(?:" + "|".join(_NEGATION_WHOLE_WORDS) + r")\b|" + re.escape(_NEGATION_CONTRACTION_SUFFIX),
+    flags=re.IGNORECASE,
+)
+# How many characters back to look for a negation word before a closing
+# keyword. 32 comfortably covers every negation phrase in the acceptance
+# criteria ("does not " = 9 chars, "without " = 8) with headroom for a short
+# intervening clause. The tradeoff is deliberate and biased toward the safe
+# direction: at this width, "This is not a revert. Fixes #700" is treated as
+# negated even though the negation and the keyword sit in different
+# sentences. A missed binding leaves the issue in its current label state
+# (safe); a false binding silently marks live work done (unsafe) — so
+# over-triggering the guard is acceptable, under-triggering is not.
+_NEGATION_LOOKBEHIND_CHARS = 32
+
+
+def _has_preceding_negation(text: str, match_start: int) -> bool:
+    """True if a negation word/contraction appears shortly before match_start."""
+    window_start = max(0, match_start - _NEGATION_LOOKBEHIND_CHARS)
+    # Pass pos/endpos (not a string slice) so \b at the window edge is still
+    # resolved against the real surrounding text, not an artificial cut.
+    return bool(_NEGATION_RE.search(text, window_start, match_start))
+
+
+def _first_unnegated_closing_keyword_match(text: str) -> re.Match[str] | None:
+    """Return the first `_CLOSING_KEYWORD_REF` match not preceded by negation.
+
+    A negated match (e.g. "does not fix #649") must not shadow a later,
+    genuine match in the same field (e.g. "...but this PR also fixes #700") —
+    scanning continues past it instead of giving up on the whole field.
+    """
+    for match in _CLOSING_KEYWORD_REF.finditer(text):
+        if not _has_preceding_negation(text, match.start()):
+            return match
+    return None
+
+
+def defang_closing_keywords(text: str) -> str:
+    """Rewrite `<keyword> #N` to `<keyword> issue N` in freeform text.
+
+    Used to sanitize text that charlie-work writes into a PR body, comment,
+    or rework brief that a downstream reader (GitHub's auto-close, or a
+    worker agent copying reviewer prose into its own PR) does not go through
+    `linked_issue_number`'s hijack-safety checks. The issue number stays
+    legible to a human; only the syntax that triggers a live closing
+    reference or label-transition binding is removed. Unconditional — unlike
+    the negation guard above, this rewrites every keyword match regardless
+    of surrounding negation, since the goal here is to remove the trigger
+    syntax entirely, not to judge intent.
+    """
+    return _CLOSING_KEYWORD_DEFANG_RE.sub(r"\g<1>\g<2>issue \g<3>", text)
 
 
 def linked_issue_number(
@@ -1119,6 +1190,12 @@ def linked_issue_number(
     When is_cross_repository is None (provenance unknown), treat as
     cross-repo for trust purposes — bind nothing via branch name or closing
     keyword (fail closed).
+
+    A closing keyword preceded by a negation ("does not fix #649") also does
+    not bind — see `_first_unnegated_closing_keyword_match`. This prevents a
+    false LABEL TRANSITION in charlie-work's own state machine; it has no
+    effect on GitHub's own issue auto-close, which is a separate mechanism
+    charlie-work does not control.
     """
     # Cross-repo PRs or unknown provenance never bind for lifecycle purposes
     if is_cross_repository is True or is_cross_repository is None:
@@ -1133,9 +1210,11 @@ def linked_issue_number(
         has_correct_prefix = head.startswith(branch_prefix)
         if has_correct_prefix:
             return int(match.group(1))
-    # For same-repo PRs, trust closing keywords in title/body
+    # For same-repo PRs, trust closing keywords in title/body — but a
+    # negated keyword ("does not fix #649") must not bind; see
+    # `_first_unnegated_closing_keyword_match`.
     for text in (str(pr.get("title") or ""), str(pr.get("body") or "")):
-        match = _CLOSING_KEYWORD_REF.search(text)
+        match = _first_unnegated_closing_keyword_match(text)
         if match:
             return int(match.group(1))
     return None

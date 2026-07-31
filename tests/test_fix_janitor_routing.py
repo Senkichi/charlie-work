@@ -20,6 +20,7 @@ and CLEAN checks) rather than duplicating that fixture.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -783,3 +784,578 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     assert len(routed_events) == 1
     assert routed_events[0]["payload"]["routed"] is False
     assert routed_events[0]["payload"]["review_ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #765: stall bound orthogonal to the settled-head signal. The cap
+# checks above (max_conflict_rework_attempts / max_no_op_rework_attempts)
+# are only reachable via a SETTLED head change (merge_conflict) or a fresh
+# non-pending detection (no_op_rework) -- both require the issue to leave
+# rework_requested at least once. A PR whose head simply stops moving while
+# queued (rework_requested, nobody dispatched) never produces that signal
+# and previously waited in the passive janitor_blocked branch forever (live
+# evidence: PR #696, 55 rework_already_pushed events, attempts already at
+# cap, rescue tier never even attempted because the cap check was
+# unreachable). These tests inject an already-elapsed
+# "{attempts_key}_stall_since" timestamp directly into state -- the same
+# past-timestamp-injection pattern test_worker_health.py uses for
+# stall_minutes -- rather than sleeping or monkeypatching utc_now.
+# ---------------------------------------------------------------------------
+
+
+def test_janitor_conflict_stalled_rework_requested_escalates(tmp_path: Path) -> None:
+    """A merge-conflict rework that never settles -- head unchanged while
+    the issue sits in ``rework_requested`` (queued, nobody working it) --
+    must escalate once ``rework_stall_minutes`` elapses, independent of the
+    attempt cap. This is the exact PR #696 shape: attempts already at 1 (of
+    a cap of 2), head frozen, status stuck at rework_requested.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+
+    result1 = app.review(456)
+    assert result1.ok is True
+    assert result1.data["routed_to_rework"] is True
+
+    # Same head, same status, but the stall clock started 61 minutes ago --
+    # past the 60-minute threshold. Anchored to the current (unmoved) head,
+    # matching what the real first-passive-wait code path writes -- a
+    # stall_since with no matching stall_head anchor is legacy/untrusted
+    # state, covered separately by
+    # test_janitor_conflict_legacy_stall_since_without_head_reanchors_instead_of_escalating.
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(minutes=61)
+    ).isoformat()
+    state["prs"]["456"]["conflict_rework_attempts_stall_head"] = app.gh.prs[0].get("headRefOid")
+    save_state(app.paths.state_file, state)
+
+    result2 = app.review(456)
+
+    assert result2.ok is False
+    assert result2.data["escalated"] is True
+    assert result2.data["escalation_reason"] == "stalled"
+
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["status"] == "escalated"
+    # The stall path never burns an attempt -- it is a distinct escalation
+    # reason from the cap, not a disguised extra cap check.
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+
+    stalled_events = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
+    assert len(stalled_events) == 1
+    assert stalled_events[0]["payload"]["reason"] == "merge_conflict"
+    assert stalled_events[0]["payload"]["pr_number"] == 456
+    assert stalled_events[0]["payload"]["issue_number"] == 123
+    # The stalled head must be in the payload -- without it, confirming from
+    # the event stream alone that the head genuinely didn't move requires
+    # reconstructing state.json snapshots after the fact (exactly what was
+    # needed to forensically confirm PR #696's real escalation mechanism).
+    assert stalled_events[0]["payload"]["head_sha"] == app.gh.prs[0].get("headRefOid")
+    # Distinguishable in the event stream from the cap-exceeded escalation.
+    cap_events = [e for e in state["events"] if e["kind"] == "janitor_rework_escalated"]
+    assert len(cap_events) == 0
+
+
+def test_janitor_conflict_stall_escalation_blocks_reentry_until_unescalated(
+    tmp_path: Path,
+) -> None:
+    """Issue #776 interaction with the #765/#774 stall bound: a stall
+    escalation leaves the issue in status "escalated" -- NOT
+    rework_requested/dispatched/dispatch_pending -- exactly like a
+    cap-exceeded escalation does. Issue #776's fix makes
+    _route_janitor_gate_failure_to_rework re-enter on every pass for an
+    "escalated" issue/PR (by design, so an UNRELATED lane's escalation
+    doesn't wall off this lane's remediation forever). Without a
+    lane-scoped escalation_reason recorded on the stall path too, that
+    re-entry would fall through the (now False) rework_pending check
+    straight to the attempts-increment/dispatch logic on the very next
+    pass -- silently redispatching a fresh rework attempt and undoing the
+    stall escalation's entire purpose (getting a human to look at a PR
+    nobody is actively working) the instant it fires. This pins that the
+    stall path's escalation_reason is recognized by the same guard the
+    cap-exceeded path uses, and that ``charlie unescalate`` remains the
+    sanctioned way back in.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+
+    result1 = app.review(456)
+    assert result1.ok is True
+    assert result1.data["routed_to_rework"] is True
+
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(minutes=61)
+    ).isoformat()
+    state["prs"]["456"]["conflict_rework_attempts_stall_head"] = app.gh.prs[0].get("headRefOid")
+    save_state(app.paths.state_file, state)
+
+    result2 = app.review(456)
+    assert result2.ok is False
+    assert result2.data["escalated"] is True
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["escalation_reason"] == "conflict_rework_attempts_stall_exceeded"
+    assert state["issues"]["123"]["escalation_reason"] == "conflict_rework_attempts_stall_exceeded"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+    # The regression this pins: without the fix, this third pass would
+    # silently redispatch (attempts_key bumped to 2, a new
+    # routed_to_rework/janitor_rework_escalated event) instead of staying
+    # blocked behind the escalated-issue early return.
+    result3 = app.review(456)
+    assert result3.ok is True
+    assert result3.data.get("skipped") is True
+    assert result3.data.get("routed_to_rework") is not True
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert state["issues"]["123"]["status"] == "escalated"
+    escalated_events = [e for e in state["events"] if e["kind"] == "janitor_rework_escalated"]
+    assert len(escalated_events) == 0
+    stalled_events = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
+    assert len(stalled_events) == 1  # only the original stall escalation, not re-fired
+
+    # charlie unescalate is still the sanctioned re-arm: it clears
+    # escalation_reason and the attempts counter on both records so a
+    # still-conflicting PR gets a genuinely fresh budget afterward.
+    unescalate_result = app.unescalate(issue_number=123)
+    assert unescalate_result.ok is True
+
+    state = load_state(app.paths.state_file)
+    assert "escalation_reason" not in state["prs"]["456"]
+    assert "escalation_reason" not in state["issues"]["123"]
+    assert "conflict_rework_attempts" not in state["prs"]["456"]
+
+    _set_decision(app, 456, "request_changes")
+    result4 = app.review(456)
+    assert result4.ok is True
+    assert result4.data["routed_to_rework"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+
+def test_janitor_no_op_rework_stalled_escalates(tmp_path: Path) -> None:
+    """The no-op-rework early return has no settled-head concept at all --
+    head-unchanged IS the detection signal -- so before this fix it could
+    NEVER reach the cap/rescue check no matter how long it sat in
+    rework_requested doing nothing (issue #765 calls this out explicitly:
+    "the current early return blocks no-op unconditionally"). The stall
+    bound must fire for this reason too.
+    """
+    config = OrchestratorConfig(
+        review=ReviewConfig(max_no_op_rework_attempts=2, rework_stall_minutes=60)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+    # record_review leaves the issue in rework_requested directly -- the
+    # common real-world shape: no_op_rework's own "fresh route" baseline
+    # write is never reached because the issue is already pending by the
+    # time the janitor first observes it.
+
+    # First pass: no stall clock recorded yet -- it starts here.
+    result1 = app.review(456)
+    assert result1.ok is False
+    assert "janitor gate blocked" in result1.message
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"].get("no_op_rework_attempts", 0) == 0
+    assert state["prs"]["456"].get("no_op_rework_attempts_stall_since") is not None
+
+    # Backdate the clock past the threshold.
+    state["prs"]["456"]["no_op_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(minutes=61)
+    ).isoformat()
+    save_state(app.paths.state_file, state)
+
+    result2 = app.review(456)
+
+    assert result2.ok is False
+    assert result2.data["escalated"] is True
+    assert result2.data["escalation_reason"] == "stalled"
+
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert state["prs"]["456"].get("no_op_rework_attempts", 0) == 0
+    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+
+    stalled_events = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
+    assert len(stalled_events) == 1
+    assert stalled_events[0]["payload"]["reason"] == "no_op_rework"
+
+
+def test_janitor_conflict_stall_clock_under_threshold_still_waits(tmp_path: Path) -> None:
+    """Regression guard: a stall clock that has started but has not yet
+    crossed ``rework_stall_minutes`` must still fall through to the passive
+    wait -- this pins that the fix does not make escalation fire MORE
+    eagerly, only reachable for a genuinely-stalled PR. This test passes
+    both before and after the fix (before: the field is inert; after: 5min
+    < 60min threshold) -- it is a guard against a regression, not proof the
+    fix works.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+    result1 = app.review(456)
+    assert result1.data["routed_to_rework"] is True
+
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(minutes=5)
+    ).isoformat()
+    save_state(app.paths.state_file, state)
+
+    result2 = app.review(456)
+
+    assert result2.ok is False
+    assert result2.data.get("escalated") is not True
+    assert "janitor gate blocked" in result2.message
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert (123, app.config.labels.human_needed) not in app.gh.labels_added
+
+
+def test_janitor_conflict_dispatched_status_holds_stall_clock(tmp_path: Path) -> None:
+    """A live ``dispatched`` session must never TRIP the stall clock -- only
+    a queued, nobody-working ``rework_requested`` PR is a stall candidate,
+    and a genuinely dead ``dispatched`` session is WatchdogConfig's job
+    (``stall_minutes``), not this cap's, so escalating a live worker here
+    would be a false alarm.
+
+    But with the head unchanged, ``dispatched`` must HOLD the clock rather
+    than clear it (revised from an earlier draft that cleared on any
+    non-``rework_requested`` status): a status-only signal is not reliable
+    enough to mean "clear", because reconcile's
+    ``issue_active_label_with_open_pr`` self-heal flips ``issue_status`` away
+    from ``rework_requested`` on its own periodic cadence without the head
+    moving at all -- if that cleared the clock, it would reset on
+    essentially every reconcile pass and the bound could never fire whenever
+    reconcile is enabled (the common case; see
+    test_janitor_conflict_reconcile_status_oscillation_does_not_reset_stall_clock).
+    So a same-head status flip -- dispatched or reconcile-driven -- holds:
+    no escalation now, but the accumulated timestamp survives so idle
+    dispatched time still counts toward the bound once the issue is back in
+    rework_requested.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+    result1 = app.review(456)
+    assert result1.data["routed_to_rework"] is True
+
+    _force_issue_status(app, 123, "dispatched")
+    # A stale clock somehow already on record -- 10 hours old, far past the
+    # 60-minute threshold -- must NOT trip escalation while dispatched...
+    stale_since = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = stale_since
+    state["prs"]["456"]["conflict_rework_attempts_stall_head"] = state["prs"]["456"].get(
+        "conflict_rework_attempts_last_head"
+    )
+    save_state(app.paths.state_file, state)
+
+    result2 = app.review(456)
+
+    assert result2.ok is False
+    assert result2.data.get("escalated") is not True
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+    assert (123, app.config.labels.human_needed) not in app.gh.labels_added
+    # ...and, being held rather than cleared, the timestamp survives.
+    assert state["prs"]["456"].get("conflict_rework_attempts_stall_since") == stale_since
+
+
+def test_janitor_conflict_dispatched_status_with_head_progress_clears_stall_clock(
+    tmp_path: Path,
+) -> None:
+    """Unlike a same-head status flip (held, see the test above), a real
+    head change while ``dispatched`` -- the worker actually pushing a commit
+    -- IS progress and must clear the clock, even though ``dispatched``
+    itself is never a stall candidate. This exercises
+    ``_check_janitor_rework_stall``'s own head-comparison clear, distinct
+    from the settled-cycle burn-attempt branch in the caller (which only
+    fires for ``issue_status == "rework_requested"``, never ``dispatched``).
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+    result1 = app.review(456)
+    assert result1.data["routed_to_rework"] is True
+
+    _force_issue_status(app, 123, "dispatched")
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(hours=10)
+    ).isoformat()
+    state["prs"]["456"]["conflict_rework_attempts_stall_head"] = state["prs"]["456"].get(
+        "conflict_rework_attempts_last_head"
+    )
+    save_state(app.paths.state_file, state)
+
+    # The dispatched worker pushes a new commit.
+    app.gh.pr_head_shas[456] = "sha-wip-push"
+    result2 = app.review(456)
+
+    assert result2.ok is False
+    assert result2.data.get("escalated") is not True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"].get("conflict_rework_attempts_stall_since") is None
+    assert state["prs"]["456"].get("conflict_rework_attempts_stall_head") is None
+
+
+def test_janitor_conflict_reconcile_status_oscillation_does_not_reset_stall_clock(
+    tmp_path: Path,
+) -> None:
+    """The discriminating regression test for the reconcile interaction
+    found while building this fix: reconcile's
+    ``issue_active_label_with_open_pr`` self-heal periodically normalizes a
+    stale active label on an issue with an open PR, and as part of that fix
+    rewrites ``state["issues"][n]["status"]`` away from ``rework_requested``
+    (to the passive "reviewing" placeholder) -- WITHOUT touching the PR
+    branch at all. The very next ``review()`` pass then sees a non-pending
+    status and takes ``_route_janitor_gate_failure_to_rework``'s FRESH-ROUTE
+    branch (not the passive-wait branch): it burns an attempt and calls the
+    router, which puts the issue straight back into ``rework_requested`` --
+    same head throughout, no real progress. An earlier draft of this fix
+    unconditionally cleared the stall clock in that fresh-route branch
+    (``route_extra_state = {attempts_key: attempts, stall_since_key: None}``),
+    which this oscillation would trip on every reconcile pass (observed
+    cadence ~30min in production, well under any reasonable stall
+    threshold), making the bound practically unreachable whenever reconcile
+    is enabled -- the common case. This test fails against that earlier
+    draft (the post-flip assertion below) and passes against the
+    head-keyed hold/reset design, where the fresh-route branch no longer
+    touches the stall keys at all and the caller's merge (``_route_to_
+    rework``, itself re-reading state fresh under its own lock) preserves
+    whatever was already on record.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+    result1 = app.review(456)
+    assert result1.data["routed_to_rework"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+    # Step 1: clock starts on the first passive wait, head H, attempts still 1
+    # (the not-settled branch never burns).
+    result_wait = app.review(456)
+    assert result_wait.ok is False
+    state = load_state(app.paths.state_file)
+    started_at = state["prs"]["456"].get("conflict_rework_attempts_stall_since")
+    assert started_at is not None
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+    # Step 2: reconcile-style status flip away from rework_requested, head
+    # unchanged. review() now takes the fresh-route branch: it burns an
+    # attempt (1 -> 2, exactly at the cap but not exceeding it) and the
+    # router puts the issue straight back into rework_requested. The stall
+    # clock must survive this round-trip, not reset.
+    _force_issue_status(app, 123, "reviewing")
+    result_flip = app.review(456)
+    assert result_flip.ok is True
+    assert result_flip.data["routed_to_rework"] is True
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 2
+    assert state["prs"]["456"].get("conflict_rework_attempts_stall_since") == started_at
+
+    # Step 3: another passive wait, status and head both unchanged since the
+    # flip -- still short of the threshold, so it must keep waiting rather
+    # than escalate, and must not burn a further attempt (back in the
+    # not-settled branch, not fresh-route, since status is rework_requested
+    # again).
+    result_wait2 = app.review(456)
+    assert result_wait2.ok is False
+    assert result_wait2.data.get("escalated") is not True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 2
+    assert state["prs"]["456"].get("conflict_rework_attempts_stall_since") == started_at
+
+    # Step 4: back-date that same original timestamp past the threshold and
+    # confirm escalation fires -- proving the elapsed time carried through
+    # the oscillation rather than resetting when reconcile intervened.
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(minutes=61)
+    ).isoformat()
+    save_state(app.paths.state_file, state)
+    result_final = app.review(456)
+    assert result_final.ok is False
+    assert result_final.data["escalated"] is True
+    assert result_final.data["escalation_reason"] == "stalled"
+    state = load_state(app.paths.state_file)
+    # The stall path escalates independent of the cap -- attempts stays at
+    # whatever the fresh-route burn left it at, not bumped further.
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 2
+
+
+def test_janitor_conflict_head_progress_clears_stall_clock(tmp_path: Path) -> None:
+    """A settled head change (a rework cycle completing, even one that still
+    conflicts) is real progress and must clear any stall clock that had
+    started -- a later re-stall must count elapsed time from zero, not from
+    a timestamp accumulated during unrelated history before this cycle.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=3, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+    result1 = app.review(456)
+    assert result1.data["routed_to_rework"] is True
+
+    # Clock starts on the first passive wait.
+    result_wait = app.review(456)
+    assert result_wait.ok is False
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"].get("conflict_rework_attempts_stall_since") is not None
+
+    # Head moves (a settled cycle completes, still conflicting): the clock
+    # must clear even though the cap has not been hit.
+    app.gh.pr_head_shas[456] = "sha-cycle-2"
+    result2 = app.review(456)
+    assert result2.ok is False
+    assert result2.data.get("escalated") is not True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 2
+    assert state["prs"]["456"].get("conflict_rework_attempts_stall_since") is None
+
+
+def test_janitor_conflict_legacy_stall_since_without_head_reanchors_instead_of_escalating(
+    tmp_path: Path,
+) -> None:
+    """A ``_stall_since`` timestamp with no matching ``_stall_head`` (state
+    written before this bound existed, or any other path that could set one
+    key without the other) has unknown provenance: it is impossible to tell
+    whether the head moved during that already-elapsed time, since nothing
+    was ever compared against. Trusting it would let a single deploy of this
+    fix instantly escalate every PR that happened to have an old, unrelated
+    timestamp sitting in state. The safe direction is to re-anchor (discard
+    the timestamp, start fresh against the current head) rather than
+    escalate off data collected before the head-comparison existed.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+    result1 = app.review(456)
+    assert result1.data["routed_to_rework"] is True
+
+    # Simulate legacy state: a stale stall_since with no stall_head at all,
+    # far past the threshold.
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(hours=10)
+    ).isoformat()
+    assert "conflict_rework_attempts_stall_head" not in state["prs"]["456"]
+    save_state(app.paths.state_file, state)
+
+    result2 = app.review(456)
+
+    # Must NOT escalate off the untrustworthy legacy timestamp.
+    assert result2.ok is False
+    assert result2.data.get("escalated") is not True
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert (123, app.config.labels.human_needed) not in app.gh.labels_added
+
+    # The clock was re-anchored, not left stale or cleared to None: it must
+    # now be recent (not the 10-hour-old value) and carry a head anchor.
+    new_since = state["prs"]["456"].get("conflict_rework_attempts_stall_since")
+    assert new_since is not None
+    reanchored_at = datetime.fromisoformat(new_since)
+    assert (datetime.now(UTC) - reanchored_at).total_seconds() < 60
+    assert state["prs"]["456"].get("conflict_rework_attempts_stall_head") == app.gh.prs[0].get(
+        "headRefOid"
+    )
+
+    # And the re-anchored clock behaves normally going forward: still under
+    # threshold, no escalation yet.
+    result3 = app.review(456)
+    assert result3.ok is False
+    assert result3.data.get("escalated") is not True
+
+
+def test_janitor_no_op_rework_reconcile_status_oscillation_does_not_reset_stall_clock(
+    tmp_path: Path,
+) -> None:
+    """Coverage-insurance sibling of
+    ``test_janitor_conflict_reconcile_status_oscillation_does_not_reset_stall_clock``
+    for the ``no_op_rework`` reason. The no-op detection
+    (``verdict.is_no_op_rework``) is recomputed from the janitor gate every
+    pass from the PR's diff/patch-id, entirely independent of
+    ``issue_status`` -- so a reconcile-style status flip away from
+    ``rework_requested`` does not stop no-op detection from firing on the
+    next pass either. It flows through the exact same shared
+    ``_route_janitor_gate_failure_to_rework`` function and the exact same
+    fresh-route branch as the merge_conflict case (this is already visible
+    in ``test_janitor_no_op_rework_routes_to_rework``, which forces
+    ``issue_status`` to ``reviewing`` before the route fires), so the fix
+    (no longer unconditionally clearing the stall keys in that branch's
+    ``route_extra_state``) protects both reasons identically, not just
+    ``merge_conflict``.
+    """
+    config = OrchestratorConfig(
+        review=ReviewConfig(max_no_op_rework_attempts=2, rework_stall_minutes=60)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Clock starts on the first passive wait (issue already rework_requested).
+    result_wait = app.review(456)
+    assert result_wait.ok is False
+    state = load_state(app.paths.state_file)
+    started_at = state["prs"]["456"].get("no_op_rework_attempts_stall_since")
+    assert started_at is not None
+    assert state["prs"]["456"].get("no_op_rework_attempts", 0) == 0
+
+    # Reconcile-style status flip, head/diff unchanged: fresh-route fires,
+    # burns an attempt, router puts the issue back in rework_requested.
+    _force_issue_status(app, 123, "reviewing")
+    result_flip = app.review(456)
+    assert result_flip.ok is True
+    assert result_flip.data["routed_to_rework"] is True
+    assert result_flip.data["rework_reason"] == "no_op_rework"
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["no_op_rework_attempts"] == 1
+    assert state["prs"]["456"].get("no_op_rework_attempts_stall_since") == started_at
+
+    # Back-date the surviving timestamp past threshold: escalation fires,
+    # proving the clock carried through the oscillation instead of resetting.
+    state["prs"]["456"]["no_op_rework_attempts_stall_since"] = (
+        datetime.now(UTC) - timedelta(minutes=61)
+    ).isoformat()
+    save_state(app.paths.state_file, state)
+    result_final = app.review(456)
+    assert result_final.ok is False
+    assert result_final.data["escalated"] is True
+    assert result_final.data["escalation_reason"] == "stalled"
