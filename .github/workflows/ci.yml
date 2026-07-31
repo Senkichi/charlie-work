@@ -39,7 +39,7 @@ jobs:
     # box (job-cannon #1440: 40, 51, 86 min). Tests is a required status
     # check, so a spurious timeout wedges merges -- 3x median headroom
     # avoids firing on ordinary contention. Sibling: job-cannon PR #1443.
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
