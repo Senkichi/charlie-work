@@ -933,6 +933,33 @@ class WatchdogConfig:
 
 
 @dataclass(frozen=True)
+class WorktreeReclamationConfig:
+    """Cadence-gated reclamation of merged-PR worker worktrees from the fleet
+    pass (issue #636).
+
+    ``clean_worktrees`` is the junction-safe, merge-gated, liveness-gated sweep
+    that ``charlie worktree-clean`` runs on demand. Before this config drove a
+    fleet-pass call site, reclamation never fired on the fleet's own cadence --
+    worktrees for merged PRs accumulated indefinitely (77 of 81 dead on the
+    host this was measured on; ``git worktree list`` became unusable as an
+    operator instrument and ``du`` on the worktrees dir timed out).
+
+    ``enabled`` defaults True so the fleet reclaims by default; set False to
+    revert to operator-only ``charlie worktree-clean``. ``interval_minutes``
+    gates the sweep so the per-candidate ``gh pr view`` cost is proportional to
+    elapsed time, not to backlog size or loop frequency -- the sweep makes one
+    live REST call per candidate worktree, so running it every pass against an
+    80+ backlog would be a per-pass quota spike. The sweep itself is
+    idempotent, merge-gated, liveness-gated, and fails closed on an erroring
+    ``gh`` (see ``worktree.clean_worktrees``), which are the properties required
+    to run it unattended.
+    """
+
+    enabled: bool = True
+    interval_minutes: int = 60
+
+
+@dataclass(frozen=True)
 class TestAdequacyConfig:
     """Config for the opt-in test-adequacy gate (janitor.check_test_adequacy).
 
@@ -1234,6 +1261,9 @@ class OrchestratorConfig:
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+    worktree_reclamation: WorktreeReclamationConfig = field(
+        default_factory=WorktreeReclamationConfig
+    )
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
@@ -2033,6 +2063,29 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             str(item) for item in worktree_mtime_exclude_dirs
         )
     watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
+    worktree_reclamation_data = _section(data, "worktree_reclamation")
+    wr_enabled = worktree_reclamation_data.get("enabled")
+    if wr_enabled is not None and not isinstance(wr_enabled, bool):
+        raise ConfigError(
+            "config section 'worktree_reclamation' key 'enabled' must be a bool, "
+            f"got {type(wr_enabled).__name__}"
+        )
+    wr_interval = worktree_reclamation_data.get("interval_minutes")
+    if wr_interval is not None and (
+        isinstance(wr_interval, bool) or not isinstance(wr_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'worktree_reclamation' key 'interval_minutes' must be an int, "
+            f"got {type(wr_interval).__name__}"
+        )
+    if wr_interval is not None and wr_interval < 1:
+        raise ConfigError(
+            "config section 'worktree_reclamation' key 'interval_minutes' must be >= 1, "
+            f"got {wr_interval}"
+        )
+    worktree_reclamation = _build_section(
+        WorktreeReclamationConfig, "worktree_reclamation", worktree_reclamation_data
+    )
     test_adequacy_data = _section(data, "test_adequacy")
 
     # Six tuple-of-str fields: reject non-list, coerce elements to str.
@@ -2310,6 +2363,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         cross_family=cross_family,
         rescue=rescue,
         watchdog=watchdog,
+        worktree_reclamation=worktree_reclamation,
         test_adequacy=test_adequacy,
         fleet=fleet,
         notify=notify,
