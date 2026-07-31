@@ -479,6 +479,12 @@ class AutoMergeConfig:
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
     failed_attempt_alarm: int = 3
+    # Maximum `gh run rerun` attempts per workflow run id for a required check
+    # that is infra-failed (CANCELLED/INFRA_FAILURE/TIMED_OUT -- see
+    # checks.classify_infra_failures, issue #841). Once every infra-failing
+    # run id for a check has been retried this many times on the current
+    # head, the PR escalates to a human instead of retrying forever.
+    infra_rerun_attempt_cap: int = 2
     # Maximum minutes after the PR's last update (updatedAt) to wait for any
     # required check run to appear before routing an approved PR to readiness
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
