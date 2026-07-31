@@ -9,7 +9,8 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 STATE_VERSION = 1
 
@@ -77,6 +78,22 @@ VALID_ISSUE_STATUSES: frozenset[str] = frozenset(
     }
 )
 
+# "closed" is the one VALID_ISSUE_STATUSES member the orchestrator does not
+# own: it is mirrored from GitHub's issue state, and GitHub can invalidate it
+# at any time via a reopen. Every other member is written exclusively by the
+# orchestrator's own dispatch -> review -> rework -> merge transitions, so
+# reconcile's status-normalization sweep is right to treat them as
+# self-validating -- but doing the same for "closed" turns a GitHub reopen
+# into a one-way gate: state can enter "closed" from GitHub, but can never
+# leave it, because the sweep never looks again (issue #789). Declaring the
+# split here means the sweep derives its skip-set from this frozenset
+# subtraction instead of a `!= "closed"` special case at the call site, so a
+# future externally-derived status is covered by construction.
+EXTERNALLY_DERIVED_ISSUE_STATUSES: frozenset[str] = frozenset({"closed"})
+ORCHESTRATOR_OWNED_ISSUE_STATUSES: frozenset[str] = (
+    VALID_ISSUE_STATUSES - EXTERNALLY_DERIVED_ISSUE_STATUSES
+)
+
 # The status the normal dispatch -> PR-open flow writes once a PR exists (for
 # an issue) or a fresh review packet has been generated (for a PR) and no
 # reviewer verdict has landed yet -- see workflow.py's
@@ -89,6 +106,75 @@ VALID_ISSUE_STATUSES: frozenset[str] = frozenset(
 # "rework_requested" -- which would trigger a fresh worker dispatch -- purely
 # by fixing a label or a corrupt status field.
 PASSIVE_OPEN_STATUS = "reviewing"
+
+# Issue #783: every transition into the ``human_needed`` label must record
+# WHY, durably and atomically with the label change, so an automated
+# de-escalation sweep can tell a process failure from a substantive judgment
+# call. Escalating on a dead worker process when the PR artifact itself is
+# fine is a category error -- these two classes exist to stop treating that
+# the same as a human product/security decision that must stay terminal.
+#
+#   "mechanical" -- a process/infrastructure failure: dead worker session,
+#     redispatch/rework-cycle cap exhausted, a stalled worker, or a
+#     janitor-detected merge conflict/CI failure past its retry cap.
+#     Self-clearing: workflow.py's ``_maybe_deescalate_mechanical`` sweep may
+#     re-evaluate and auto-clear it once the PR is mergeable and janitor_ok.
+#   "judgment" -- a human product or security decision, an unimplementable
+#     acceptance criterion, or a reviewer's explicit "blocked" verdict. Stays
+#     terminal; only a human running ``charlie unescalate`` may clear it.
+#
+# A legacy escalation recorded with no ``reason_class`` at all may be
+# backfilled by ``workflow._maybe_deescalate_mechanical`` from the most
+# recent escalation-transition event in ``events.db``, but only when the
+# event kind unambiguously denotes a process failure. Ambiguous or
+# deliberately-preserved kinds stay fail-closed: ``reason_class`` remains
+# absent and the issue stays terminal.
+ESCALATION_REASON_CLASSES: frozenset[str] = frozenset({"mechanical", "judgment"})
+
+# Issue #797: legacy escalations may lack ``reason_class`` because the field
+# was added later. The backfill derives the class from the escalation event
+# kind. Only kinds that unambiguously indicate a process failure map to
+# ``"mechanical"``. Kinds in ``DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS``
+# are too ambiguous (or are intentionally preserved forensic records) and
+# must stay unclassified, so the backfill leaves the issue terminal.
+ESCALATION_REASON_CLASS_BY_EVENT_KIND: Mapping[str, str] = MappingProxyType(
+    {
+        # A rework worker's session dying, or a redispatch/no-op-rework cap
+        # being exceeded, is a pure process/infrastructure failure.
+        "session_failed_escalated": "mechanical",
+        # The review-dispatch attempt cap is an infrastructure-driven limit.
+        "review_dispatch_escalated": "mechanical",
+    }
+)
+DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
+    {
+        # Issue #662: a deliberately-preserved forensic record; the kind alone
+        # cannot distinguish a normal process failure from a record that must
+        # stay terminal.
+        "janitor_rework_escalated",
+        # Can carry either a human ``blocked`` verdict (judgment) or a
+        # request-changes/unparseable report (mechanical); the kind alone is
+        # ambiguous.
+        "rescue_review_escalated",
+        # Records review decisions including approved, request_changes, and
+        # blocked; the event kind alone does not identify an escalation.
+        "record_review",
+    }
+)
+
+
+def escalation_reason_class(reason_class: str) -> str:
+    """Validate an escalation ``reason_class`` value before it is persisted.
+
+    Raises ``ValueError`` on anything other than ``"mechanical"`` or
+    ``"judgment"`` so a typo at a call site fails loudly at write time
+    instead of silently producing an escalation the de-escalation sweep can
+    never recognize as mechanical (a safe-but-pointless failure direction).
+    """
+    if reason_class not in ESCALATION_REASON_CLASSES:
+        raise ValueError(f"invalid escalation reason_class: {reason_class!r}")
+    return reason_class
+
 
 logger = logging.getLogger(__name__)
 
@@ -694,7 +780,12 @@ def mark_reviewer_quota_alerted(data: dict[str, Any]) -> dict[str, Any]:
 def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     """Clear reviewer quota exhaustion state.
 
-    Returns a new state dict; does not mutate ``data``.
+    Returns a new state dict; does not mutate ``data``. The
+    ``last_probe_cleared_at`` recovery marker (written by
+    ``clear_quota_throttles`` and by the verdict-reap recovery path in
+    ``workflow.dispatch_reviews``) is deliberately preserved across clears so
+    the dead-reviewer reap sweep can compare it against a dead session's death
+    time across exhaustion episodes (issue #662).
     """
     quota = _reviewer_quota(data)
     if not quota:
@@ -706,6 +797,23 @@ def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     # a stale value does not linger after the quota window is proven open.
     quota.pop("reset_at", None)
     return {**data, "reviewer_quota": quota}
+
+
+def reviewer_quota_last_probe_cleared_at(data: dict[str, Any]) -> str | None:
+    """Return the timestamp of the last green probe or verdict that cleared a
+    throttle.
+
+    Written by ``clear_quota_throttles`` whenever a green ambient-CLI probe
+    clears a claude-code-shaped throttle, and by the verdict-reap recovery
+    path in ``workflow.dispatch_reviews`` whenever a dead reviewer's verdict
+    proves the provider window is open. Consumed by the dead-reviewer reap
+    sweep (``_detect_and_handle_stalled_reviews``) to suppress re-poisoning
+    ``reviewer_quota`` from a throttle signature frozen in a dead session's
+    log tail when a recovery has already happened after that session died
+    (issue #662). None when no green probe/verdict has cleared the quota
+    since the last exhaustion episode (or ever).
+    """
+    return _reviewer_quota(data).get("last_probe_cleared_at")
 
 
 def defer_reviewer_probe_after(data: dict[str, Any], probe_after: str) -> dict[str, Any]:
@@ -821,6 +929,140 @@ def disarm_quota_probe(data: dict[str, Any]) -> dict[str, Any]:
     return {**data, "quota_probe": probe}
 
 
+def _worktree_reclamation(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the worktree-reclamation scheduling sub-dict from ``data``.
+
+    Tracks the ``next_run_at`` timestamp that gates the cadence-gated
+    ``clean_worktrees`` sweep fired from the fleet pass (issue #636). Returns a
+    mutable copy so callers can build new state without mutating ``data``.
+    """
+    sched = data.get("worktree_reclamation")
+    if not isinstance(sched, dict):
+        return {}
+    return dict(sched)
+
+
+def is_worktree_reclamation_due(data: dict[str, Any]) -> bool:
+    """True when the reclamation sweep's interval has elapsed.
+
+    An absent schedule means "never run yet", which is treated as due so the
+    first fleet pass after startup clears the existing backlog of merged-PR
+    worktrees (the exact accumulation issue #636 exists to fix). Malformed
+    timestamps are also treated as due so a corrupt value cannot wedge
+    reclamation off forever.
+    """
+    next_at = _worktree_reclamation(data).get("next_run_at")
+    if not next_at:
+        return True
+    try:
+        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= next_time
+    except (ValueError, TypeError):
+        return True
+
+
+def schedule_worktree_reclamation(data: dict[str, Any], next_run_at: str) -> dict[str, Any]:
+    """Set the next reclamation sweep timestamp.
+
+    Called after a sweep runs (or is skipped as not-due-armed) so the next
+    sweep fires roughly ``interval_minutes`` later rather than on the very next
+    pass. Returns a new state dict; does not mutate ``data``.
+    """
+    sched = _worktree_reclamation(data)
+    sched["next_run_at"] = next_run_at
+    return {**data, "worktree_reclamation": sched}
+
+
+def _reconcile_pass(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the periodic in-loop reconcile scheduling sub-dict from ``data``.
+
+    Distinct from ``quota_probe``: tracks the merge-lane-recovery §6-B
+    cadence (``OrchestratorApp._maybe_reconcile_drift``), not the quota
+    probe. Ensures a mutable copy so callers can build new state without
+    mutating the original ``data``.
+    """
+    section = data.get("reconcile_pass")
+    if not isinstance(section, dict):
+        return {}
+    return dict(section)
+
+
+def is_reconcile_due(data: dict[str, Any]) -> bool:
+    """True when the periodic in-loop reconcile pass should run.
+
+    Unlike the quota probe (which only arms once a throttle indicator is
+    observed, deliberately delaying the first real probe), reconcile has no
+    "is something wrong" precondition to wait on -- it is a plain periodic
+    cadence, so an absent schedule (never run before, e.g. right after a
+    fresh deploy) is treated as due immediately rather than requiring one
+    full interval to elapse first. This matters for G1: the divergence class
+    this closes has already been sitting unrepaired indefinitely, so the
+    first pass after this lands should not wait `interval_minutes` before
+    doing anything. Malformed timestamps are treated as due, mirroring
+    ``is_quota_probe_due``, so a corrupt value cannot wedge reconcile off
+    forever.
+    """
+    next_at = _reconcile_pass(data).get("next_reconcile_at")
+    if not next_at:
+        return True
+    try:
+        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= next_time
+    except (ValueError, TypeError):
+        return True
+
+
+def arm_reconcile_pass(data: dict[str, Any], next_reconcile_at: str) -> dict[str, Any]:
+    """Schedule the next periodic in-loop reconcile attempt.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    section = _reconcile_pass(data)
+    section["next_reconcile_at"] = next_reconcile_at
+    return {**data, "reconcile_pass": section}
+
+
+def _deescalation_pass(data: dict[str, Any]) -> dict[str, Any]:
+    """Return the periodic de-escalation sweep scheduling sub-dict from ``data``.
+
+    Mirrors ``_reconcile_pass``: tracks issue #783's
+    ``OrchestratorApp._maybe_deescalate_mechanical`` cadence. Ensures a
+    mutable copy so callers can build new state without mutating ``data``.
+    """
+    section = data.get("deescalation_pass")
+    if not isinstance(section, dict):
+        return {}
+    return dict(section)
+
+
+def is_deescalation_due(data: dict[str, Any]) -> bool:
+    """True when the periodic de-escalation sweep should run.
+
+    Same "absent schedule is due immediately" semantics as
+    ``is_reconcile_due`` -- a fresh deploy should not wait a full interval
+    before its first pass, and a malformed timestamp is treated as due
+    rather than wedging the sweep off forever.
+    """
+    next_at = _deescalation_pass(data).get("next_deescalation_at")
+    if not next_at:
+        return True
+    try:
+        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
+        return datetime.now(UTC) >= next_time
+    except (ValueError, TypeError):
+        return True
+
+
+def arm_deescalation_pass(data: dict[str, Any], next_deescalation_at: str) -> dict[str, Any]:
+    """Schedule the next periodic de-escalation sweep attempt.
+
+    Returns a new state dict; does not mutate ``data``.
+    """
+    section = _deescalation_pass(data)
+    section["next_deescalation_at"] = next_deescalation_at
+    return {**data, "deescalation_pass": section}
+
+
 def any_quota_exhausted_indicator(data: dict[str, Any]) -> bool:
     """True when either throttle mechanism is currently active.
 
@@ -880,10 +1122,18 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
     check before running a probe at all -- see that function's docstring
     for what is and is not cleared here and why.
 
+    The ``last_probe_cleared_at`` recovery marker is only stamped when this
+    call actually cleared something (a claude-code-shaped root throttle or
+    reviewer-quota exhaustion), so a caller that bypasses the
+    ``is_quota_probe_actionable`` guard cannot seed a false recovery marker.
+    It is stored with microsecond precision so sub-second comparisons against
+    a dead session's log mtime are not flipped (issue #662).
+
     Returns a new state dict; does not mutate ``data``.
     """
     cleared = data
-    if _root_throttle_is_claude_code_shaped(data):
+    cleared_root = _root_throttle_is_claude_code_shaped(data)
+    if cleared_root:
         cleared = {
             **cleared,
             "throttled_until": None,
@@ -891,10 +1141,22 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
             "throttle_adapter_kind": None,
         }
     cleared = clear_reviewer_quota(cleared)
-    reviewer_quota = cleared.get("reviewer_quota")
-    if reviewer_quota:
-        cleared = {
-            **cleared,
-            "reviewer_quota": {**reviewer_quota, "consecutive_probe_failures": 0},
+    reviewer_quota = cleared.get("reviewer_quota") or {}
+    # Stamp the recovery time so the dead-reviewer reap sweep can suppress
+    # backoff for sessions whose throttle signature predates this recovery
+    # (issue #662): a dead reviewer's log tail is frozen at death time and
+    # does not reflect a quota window that has since reopened, so re-applying
+    # backoff from it would re-poison reviewer_quota anchored to "now" rather
+    # than the original death time. Only populate the marker when we actually
+    # cleared a claude-code-shaped root throttle or reviewer_quota (the
+    # exhaustion checks treat a missing throttled_until/probe_after as "not
+    # exhausted", so an ever-present recovery marker is benign but only useful
+    # when a real recovery happened).
+    if is_reviewer_quota_exhausted(data) or cleared_root:
+        reviewer_quota = {
+            **reviewer_quota,
+            "consecutive_probe_failures": 0,
+            "last_probe_cleared_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         }
+        cleared = {**cleared, "reviewer_quota": reviewer_quota}
     return cleared

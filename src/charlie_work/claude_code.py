@@ -32,7 +32,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
+from charlie_work.process_utils import (
+    is_pid_alive,
+    parse_proc_stat_starttime,
+    popen_worker,
+    start_terminal_status_watcher,
+    worker_terminal_status_path,
+)
 from .config import (
     CLAUDE_CODE_PROMPT_FILENAME,
     ClaudeCodeConfig,
@@ -1314,6 +1320,20 @@ def launch_claude_worker(
 
     # Capture process creation time immediately after spawn to verify identity later
     process_start_time = _get_process_start_time(process.pid)
+
+    # Issue #773: persist this worker's terminal status (exit code + duration)
+    # once it exits, so a later orphan-detection pass can tell a clean exit-0
+    # no-op apart from a genuine crash instead of inferring it from PID
+    # liveness alone. Scoped to non-review launches -- orphan detection
+    # (workflow._detect_and_handle_orphaned_workers) only concerns dispatched
+    # worker/rework sessions, never reviewer sessions, which have their own,
+    # separate stall-detection path. Does not block this function's return;
+    # see start_terminal_status_watcher's docstring.
+    if not review:
+        start_terminal_status_watcher(
+            process,
+            worker_terminal_status_path(sessions_dir, issue_number, _sidecar_suffix(adapter_kind)),
+        )
 
     try:
         write_worktree_marker(worktree.path, process.pid, session_id)

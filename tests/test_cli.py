@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Any
@@ -14,8 +15,11 @@ from charlie_work.config import (
     RunnerAllocationConfig,
     RunnerScalingConfig,
 )
+from charlie_work.cross_family import LEGACY_VACUOUS_SUMMARY
 from charlie_work.fleet_dispatch import ApiWorkerFleetReport
 from charlie_work.fleet_paths import fleet_dir
+from charlie_work.quiesce import QuiesceReport
+from charlie_work.state_migration import MigrationChild, MigrationOutcome, MigrationPlan
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
 
@@ -191,6 +195,79 @@ def test_cli_verdict_missing_summary_file_json_output(
     assert payload["ok"] is False
     assert "OS error" in payload["message"]
     assert not (repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json").exists()
+
+
+def test_cli_verdict_request_changes_derives_required_changes_from_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #792 AC-6, third producer path: `charlie verdict` has no
+    --required-changes flag at all -- every request_changes/blocked verdict
+    recorded through this CLI command arrives at record_review with
+    required_changes=None, so real reviewer prose supplied via
+    --summary-file must be derived into required_changes rather than
+    persisted empty."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    summary = repo / "summary.md"
+    prose = "The retry wrapper swallows the exception type; push a fix before merging."
+    summary.write_text(prose, encoding="utf-8")
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "request_changes",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "review recorded" in captured.out
+    decision_path = repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["decision"] == "request_changes"
+    assert decision["required_changes"] == [prose]
+    assert decision["findings_channel"] == "derived"
+
+
+def test_cli_verdict_request_changes_persists_vacuous_marker_for_legacy_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same manual-CLI producer path, the nothing-derivable outcome: a
+    --summary-file containing the historical content-free placeholder
+    records ok=True with required_changes: [] and findings_channel:
+    "vacuous" -- never a non-zero exit, matching record_review's
+    never-reject invariant (issue #792 AC-3)."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    summary = repo / "summary.md"
+    summary.write_text(LEGACY_VACUOUS_SUMMARY, encoding="utf-8")
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "request_changes",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+
+    assert rc == 0
+    decision_path = repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == []
+    assert decision["findings_channel"] == "vacuous"
 
 
 def test_cli_verdict_isolates_fleet_registry(
@@ -939,6 +1016,48 @@ def test_run_runners_allocate_loud_on_absent_global_layer(
     )
 
 
+def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#6-G / G-AC3: doctor must not itself crash on the exact condition it
+    exists to diagnose.
+
+    Before this fix, ``run_doctor_command`` called ``load_layered_config``
+    unguarded, so a config parse failure (e.g. the 2026-07-29 incident's
+    unknown ``cross_family: auto_verdict`` key) propagated past this function
+    to ``main()``'s generic ``except (ConfigError, ValueError)`` handler,
+    which prints to stderr and exits 2 with no machine-readable finding --
+    the operator gets nothing to act on. Now the failure is caught locally
+    and rendered as a structured, blocking ``DoctorCheck`` finding instead.
+
+    Drives the REAL ``load_layered_config`` (not mocked) against a real
+    unparseable config file on disk, mirroring the exact incident shape used
+    in test_fleet_dispatch.py's
+    test_fleet_loop_real_unknown_config_key_reproduces_incident.
+    """
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    # Deliberately NOT mocking cli.load_layered_config.
+    (tmp_path / "orchestrator.config.yaml").write_text(
+        "labels:\n  ready: automated-ready\ncross_family:\n  totally_unknown_key: true\n",
+        encoding="utf-8",
+    )
+
+    args = cli.build_parser().parse_args(["--fleet-dir", str(tmp_path), "doctor"])
+    result = cli.run_doctor_command(args)
+
+    assert result.ok is False, "an unparseable config must fail the command, not crash it"
+    assert "1 finding" in result.message
+    checks = result.data["checks"]
+    assert len(checks) == 1, f"expected exactly one synthetic finding, got: {checks!r}"
+    check = checks[0]
+    assert check["name"] == "config file"
+    assert check["ok"] is False
+    assert check["severity"] == "error", "a config parse failure must be blocking, not a warning"
+    assert "totally_unknown_key" in check["detail"]
+    assert "cross_family" in check["detail"]
+
+
 # --------------------------------------------------------------------------
 # runners ensure-started: single-controller guard (issue #598)
 # --------------------------------------------------------------------------
@@ -1177,3 +1296,283 @@ def test_global_dry_run_reaches_runners_allocate_in_either_position() -> None:
     assert parser.parse_args(["--dry-run", "runners", "allocate"]).dry_run is True
     assert parser.parse_args(["runners", "allocate", "--dry-run"]).dry_run is True
     assert parser.parse_args(["runners", "allocate"]).dry_run is False
+
+
+# --------------------------------------------------------------------------
+# migrate-state-dir
+# --------------------------------------------------------------------------
+
+
+def _refuse_to_call(*args: Any, **kwargs: Any) -> Any:
+    raise AssertionError("must not be called on this path")
+
+
+def _fake_migration_plan(tmp_path: Path, *, blocked: bool = False) -> MigrationPlan:
+    src_root = tmp_path / "src-state"
+    dst_root = tmp_path / "dst-state"
+    if blocked:
+        child = MigrationChild(
+            name="dispatches",
+            src_path=src_root / "dispatches",
+            dst_path=dst_root / "dispatches",
+            disposition="blocked",
+            reasons=("2 registered git worktrees nested inside this child: a, b",),
+            remediation=(f'git -C "{tmp_path}" worktree move "a" "{dst_root / "a"}"',),
+        )
+        return MigrationPlan(src_root=src_root, dst_root=dst_root, children=(child,))
+    child = MigrationChild(
+        name="issues",
+        src_path=src_root / "issues",
+        dst_path=dst_root / "issues",
+        disposition="move",
+    )
+    return MigrationPlan(src_root=src_root, dst_root=dst_root, children=(child,))
+
+
+def _migrate_args(repo: Path, *extra: str) -> argparse.Namespace:
+    return cli.build_parser().parse_args(["--repo", str(repo), "migrate-state-dir", *extra])
+
+
+def test_migrate_state_dir_parser_defaults_plan_only_and_apply_flips_it() -> None:
+    """Requirement 1: acting requires the explicit ``--apply`` opt-in."""
+    parser = cli.build_parser()
+
+    plan_only = parser.parse_args(["migrate-state-dir"])
+    assert plan_only.apply is False
+    assert plan_only.src is None
+    assert plan_only.dst is None
+    assert plan_only.quiesce_patterns is None
+
+    applied = parser.parse_args(["migrate-state-dir", "--apply"])
+    assert applied.apply is True
+
+
+def test_migrate_state_dir_src_equals_dst_reports_already_migrated_without_planning(
+    tmp_path: Path,
+) -> None:
+    """A repo that never overrode ``runtime.state_dir`` has src == dst by
+    default -- there is nothing to migrate, and the planner must never run.
+    """
+    repo = _make_repo(tmp_path)
+    args = _migrate_args(repo)
+
+    result = cli.run_migrate_state_dir_command(args, planner=_refuse_to_call)
+
+    assert result.ok is True
+    assert "already migrated" in result.message
+    assert result.data["already_migrated"] is True
+
+    # Both derived roots must be fully resolved, not just joined. If dst were a
+    # bare join (as ``layout.default_state_root`` alone returns) while src goes
+    # through ``runtime_paths`` (which calls ``.resolve()``), a repo whose
+    # ``.var`` is a symlink/junction would make this comparison see two
+    # different-looking paths for the same on-disk location -- the false
+    # negative this short circuit exists to prevent.
+    expected = (repo / ".var" / "charlie-work").resolve()
+    assert Path(result.data["src_root"]) == expected
+    assert Path(result.data["dst_root"]) == expected
+
+
+def test_migrate_state_dir_overridden_runtime_state_dir_derives_distinct_roots(
+    tmp_path: Path,
+) -> None:
+    """The actual scenario the command exists for: a repo whose
+    ``orchestrator.config.yaml`` still points ``runtime.state_dir`` at a
+    legacy location. With no ``--src``/``--dst`` given, derivation must
+    produce two distinct, fully-resolved roots and hand them both to the
+    planner -- exercising the real default derivation end-to-end rather than
+    only the short-circuit-when-equal path covered above.
+    """
+    repo = tmp_path
+    (repo / ".git").mkdir()
+    legacy = repo / "legacy-orchestrator-state"
+    legacy.mkdir()
+    (legacy / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    (repo / "orchestrator.config.yaml").write_text(
+        "runtime:\n  state_dir: legacy-orchestrator-state\n", encoding="utf-8"
+    )
+    args = _migrate_args(repo)
+    captured: dict[str, Path] = {}
+
+    def _capture_and_plan(*, repo_root: Path, src_root: Path, dst_root: Path) -> MigrationPlan:
+        captured["src_root"] = src_root
+        captured["dst_root"] = dst_root
+        return _fake_migration_plan(tmp_path)
+
+    result = cli.run_migrate_state_dir_command(args, planner=_capture_and_plan)
+
+    # Assert against what was actually handed to the planner -- not
+    # ``result.data``, which reports the *plan's own* ``src_root``/``dst_root``
+    # (here the fake plan's fixture paths, unrelated to the derivation this
+    # test exercises).
+    expected_src = legacy.resolve()
+    expected_dst = (repo / ".var" / "charlie-work").resolve()
+    assert captured["src_root"] == expected_src
+    assert captured["dst_root"] == expected_dst
+    assert captured["src_root"] != captured["dst_root"]
+    assert "already_migrated" not in result.data
+
+
+def test_migrate_state_dir_apply_refuses_without_any_quiesce_pattern(tmp_path: Path) -> None:
+    """Fail-closed: no built-in pattern list exists (CLAUDE.md rule 9), so
+    ``--apply`` with none supplied cannot prove quiescence and must refuse.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(repo, "--src", str(src), "--dst", str(dst), "--apply")
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        actuator=_refuse_to_call,
+    )
+
+    assert result.ok is False
+    assert "no --quiesce-pattern given" in result.message
+
+
+def test_migrate_state_dir_apply_refuses_when_quiesce_not_ok(tmp_path: Path) -> None:
+    """Requirement 3: ``--apply`` calls ``check_quiescence`` and refuses to
+    act when the fleet is not quiescent, saying exactly why.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    not_quiescent = QuiesceReport(
+        ok=False,
+        matched=(),
+        excluded_pids=frozenset(),
+        summary="NOT quiescent: 1 matching process(es)",
+    )
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: not_quiescent,
+        actuator=_refuse_to_call,
+    )
+
+    assert result.ok is False
+    assert "fleet is not quiescent" in result.message
+    assert "NOT quiescent: 1 matching process(es)" in result.message
+
+
+def test_migrate_state_dir_apply_refuses_when_plan_has_blocked_children(tmp_path: Path) -> None:
+    """Requirement 5: on refusal, the blocked child's name, reasons, and
+    remediation command lines must appear VERBATIM -- the operator runs them
+    by hand.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    plan = _fake_migration_plan(tmp_path, blocked=True)
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: plan,
+        quiescence_checker=lambda **kwargs: quiescent,
+    )
+
+    assert result.ok is False
+    (blocked_child,) = plan.blocked
+    assert blocked_child.name in result.message
+    for reason in blocked_child.reasons:
+        assert reason in result.message
+    for step in blocked_child.remediation:
+        assert step in result.message
+
+
+def test_migrate_state_dir_dry_run_succeeds_even_when_quiesce_not_ok(tmp_path: Path) -> None:
+    """Requirement 3: a dry run must keep working on a live fleet -- quiesce
+    is reported informationally only and never gates a non-``--apply`` run.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo, "--src", str(src), "--dst", str(dst), "--quiesce-pattern", "fleet supervise"
+    )
+    assert args.apply is False
+    not_quiescent = QuiesceReport(
+        ok=False,
+        matched=(),
+        excluded_pids=frozenset(),
+        summary="NOT quiescent: 1 matching process(es)",
+    )
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: not_quiescent,
+        actuator=_refuse_to_call,
+    )
+
+    assert result.ok is True
+    assert "NOT quiescent" in result.message
+
+
+def test_migrate_state_dir_dry_run_flag_overrides_apply_and_never_actuates(tmp_path: Path) -> None:
+    """The global/subcommand ``--dry-run`` overrides ``--apply``, and this
+    path never touches quiescence gating either -- it is still a non-acting
+    path.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(repo, "--src", str(src), "--dst", str(dst), "--apply", "--dry-run")
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        actuator=_refuse_to_call,
+    )
+
+    assert result.ok is True
+    assert "--apply ignored" in result.message
+
+
+def test_migrate_state_dir_apply_happy_path_actuates_when_quiescent(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+    outcome = MigrationOutcome(ok=True, moved=("issues",))
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: quiescent,
+        actuator=lambda plan_arg: outcome,
+    )
+
+    assert result.ok is True
+    assert "moved 1 children" in result.message

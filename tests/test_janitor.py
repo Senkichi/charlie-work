@@ -15,6 +15,7 @@ from charlie_work.config import (
 from charlie_work.github import PR_VIEW_FIELDS
 from charlie_work.janitor import (
     _calculate_patch_id,
+    _get_unpushed_commit_info,
     CONVENTIONAL_COMMIT_TYPES,
     detect_cross_pr_revert,
     JANITOR_PR_KEYS,
@@ -2000,6 +2001,298 @@ def test_no_op_rework_unpushed_commit_enrichment(tmp_path: Path) -> None:
     )
 
 
+def test_get_unpushed_commit_info_excludes_base_update_merge_noise(tmp_path: Path) -> None:
+    """A worktree whose only local-not-remote commits are base-update merges reports
+    no unpushed content.
+
+    Regression test: ``_get_unpushed_commit_info`` used to count with plain
+    ``git rev-list --count origin/{branch}..HEAD``, which counts every commit a
+    local ``git merge origin/main`` transitively drags in — including other PRs'
+    already-landed squash-merge commits — as "unpushed". None of that is genuine
+    unpushed work.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    (remote_repo / "test.txt").write_text("initial content")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=remote_repo, check=True, capture_output=True
+    )
+
+    # Clone the remote repo to create a local repo. A plain clone still reports
+    # itself as a worktree via `git worktree list --porcelain`, so it doubles as
+    # "the branch's worktree" for _get_unpushed_commit_info's lookup.
+    local_repo = tmp_path / "local"
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(local_repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Create and push the agent branch (nothing unpushed yet)
+    subprocess.run(
+        ["git", "checkout", "-b", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Simulate two other PRs landing on main via squash-merge (each a single
+    # non-merge commit, exactly like GitHub's squash-merge default)
+    subprocess.run(["git", "checkout", "main"], cwd=remote_repo, check=True, capture_output=True)
+    for i in range(2):
+        (remote_repo / f"squash-{i}.txt").write_text(f"squashed PR #{i}")
+        subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", f"squash-merged PR #{i}"],
+            cwd=remote_repo,
+            check=True,
+            capture_output=True,
+        )
+
+    # In the local worktree, pull those in via a base-update merge — but don't push.
+    # Old behavior (`rev-list --count origin/branch..HEAD`) would report 3
+    # "unpushed" commits here (the 2 squashed commits + the merge commit itself),
+    # all of them already on origin/main, none of them genuine unpushed work.
+    subprocess.run(
+        ["git", "checkout", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "fetch", "origin"], cwd=local_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "origin/main"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    result = _get_unpushed_commit_info("agent/issue-123-test", local_repo, base_ref="main")
+    assert result is None, f"expected no unpushed-commit message, got: {result!r}"
+
+
+def test_get_unpushed_commit_info_reports_genuine_unpushed_commit(tmp_path: Path) -> None:
+    """A worktree with a real unpushed non-merge commit still reports it, with the
+    correct count, even when a base_ref is supplied for exclusion."""
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    (remote_repo / "test.txt").write_text("initial content")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=remote_repo, check=True, capture_output=True
+    )
+
+    local_repo = tmp_path / "local"
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(local_repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(
+        ["git", "checkout", "-b", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # A genuine unpushed content commit
+    (local_repo / "worker-change.txt").write_text("real unpushed work")
+    subprocess.run(["git", "add", "."], cwd=local_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "real unpushed work"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    result = _get_unpushed_commit_info("agent/issue-123-test", local_repo, base_ref="main")
+    assert result is not None
+    assert "1 unpushed commit(s)" in result
+    assert "git push origin agent/issue-123-test" in result
+
+
+def test_no_op_rework_merge_only_ignores_unpushed_base_merge_noise(tmp_path: Path) -> None:
+    """Merge-only-advance no-op failures don't get a false "unpushed commit(s)"
+    remediation when the worktree's only local-not-remote commits are further
+    base-update merge noise.
+
+    Regression test for the PR #680 false diagnostic: the janitor reported "26
+    unpushed commit(s)" for a merge-only-advance failure when 25 of those were
+    already-landed squash-merge commits pulled in transitively and the 26th was
+    the merge commit itself — zero genuine unpushed content. The remediation text
+    ("run 'git push origin <branch>'") could not have fixed anything, and risked
+    inviting a no-op push that advances the PR head SHA without real rework.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    (remote_repo / "test.txt").write_text("initial content")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"], cwd=remote_repo, check=True, capture_output=True
+    )
+    initial_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    local_repo = tmp_path / "local"
+    subprocess.run(
+        ["git", "clone", str(remote_repo), str(local_repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    subprocess.run(
+        ["git", "checkout", "-b", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # First base-update: a merge-only advance that IS pushed. This becomes the
+    # PR's recorded head (matches the merge-only-advance no-op path).
+    subprocess.run(["git", "checkout", "main"], cwd=remote_repo, check=True, capture_output=True)
+    (remote_repo / "main-change-1.txt").write_text("main branch change 1")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "main branch change 1"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "fetch", "origin"], cwd=local_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "origin/main"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    merge_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "push", "origin", "agent/issue-123-test"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+
+    # Second base-update: another merge in the SAME local worktree, left unpushed.
+    # Mirrors production: an operator/worker re-synced locally with main after the
+    # last push, dragging in another already-landed commit, without pushing.
+    (remote_repo / "main-change-2.txt").write_text("main branch change 2")
+    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "main branch change 2"],
+        cwd=remote_repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "fetch", "origin"], cwd=local_repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "merge", "--no-ff", "origin/main"],
+        cwd=local_repo,
+        check=True,
+        capture_output=True,
+    )
+    # Deliberately NOT pushed — local_repo's HEAD is now ahead of both the PR's
+    # recorded headRefOid (merge_sha) and origin/agent/issue-123-test.
+
+    # The PR still reports the earlier (pushed) merge-only SHA as its head
+    pr = _green_pr(headRefOid=merge_sha, headRefName="agent/issue-123-test")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": initial_sha,
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=local_repo)
+
+    # Should still FAIL as a merge-only no-op rework
+    assert verdict.ok is False
+    assert any("only by merge commits" in f for f in verdict.failures)
+    # Should NOT falsely claim there are unpushed commits to push — the only
+    # local-not-remote commits are base-update merge noise, not real content
+    assert not any("unpushed commit(s)" in f for f in verdict.failures), (
+        f"expected no false unpushed-commit claim, got: {verdict.failures}"
+    )
+    assert any(
+        "check the branch worktree for unpushed work before re-reviewing" in f
+        for f in verdict.failures
+    )
+
+
 def test_body_word_boundary_matching_prevents_false_positives() -> None:
     """Word-boundary matching prevents 'test' in 'latest' from passing the gate (regression test for issue #2)."""
     pr = _green_pr(body="Closes #123. Updated to latest version.")
@@ -2824,6 +3117,143 @@ def test_no_op_rework_accepts_valid_sha_and_ref_values() -> None:
     assert isinstance(verdict, JanitorVerdict)
     assert not verdict.is_no_op_rework
     assert any("git fetch/rev-list failed" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_head_ref_patch_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-like headRefName on the patch-id branch must not reach
+    ``_get_unpushed_commit_info`` (issue #659).
+
+    Pins the conflict-resolution hunk that merges 694's validation with PR
+    #761's ``base_ref`` addition: a naive marker-only merge-conflict
+    resolution dedents the ``_get_unpushed_commit_info`` call out of the
+    ``except ValueError`` block, so it runs unconditionally with the raw,
+    unvalidated ref even when validation just rejected it. This test fails
+    against that regression.
+    """
+    from charlie_work import janitor as janitor_module
+
+    diff = """diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    current_patch_id = _calculate_patch_id(diff)
+    pr = _green_pr(headRefName="--upload-pack=evil")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_patch_id": current_patch_id,
+    }
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_get_unpushed_commit_info should not be called with an invalid ref")
+
+    monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
+
+    verdict = run_janitor(
+        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+    )
+
+    assert verdict.ok is False
+    assert any("_check_no_op_rework head_ref (patch-id)" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_base_ref_patch_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-like baseRefName on the patch-id branch must not reach
+    ``_get_unpushed_commit_info`` (issue #659, same hunk as the head_ref
+    variant above).
+    """
+    from charlie_work import janitor as janitor_module
+
+    diff = """diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    current_patch_id = _calculate_patch_id(diff)
+    pr = _green_pr(headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_patch_id": current_patch_id,
+    }
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_get_unpushed_commit_info should not be called with an invalid ref")
+
+    monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
+
+    verdict = run_janitor(
+        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+    )
+
+    assert verdict.ok is False
+    assert any("_check_no_op_rework base_ref (patch-id)" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_head_ref_sha_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-like headRefName on the sha-match branch must not reach
+    ``_get_unpushed_commit_info`` (issue #659). Pins the second
+    conflict-resolution hunk against the same marker-strip dedent hazard as
+    the patch-id variant above.
+    """
+    from charlie_work import janitor as janitor_module
+
+    pr = _green_pr(headRefOid="abc123", headRefName="--upload-pack=evil")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_get_unpushed_commit_info should not be called with an invalid ref")
+
+    monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert any("_check_no_op_rework head_ref (sha-match)" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_base_ref_sha_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-like baseRefName on the sha-match branch must not reach
+    ``_get_unpushed_commit_info`` (issue #659, same hunk as the head_ref
+    variant above).
+    """
+    from charlie_work import janitor as janitor_module
+
+    pr = _green_pr(
+        headRefOid="abc123", headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil"
+    )
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_get_unpushed_commit_info should not be called with an invalid ref")
+
+    monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert any("_check_no_op_rework base_ref (sha-match)" in w for w in verdict.warnings)
 
 
 def test_detect_cross_pr_revert_skips_invalid_head_ref(

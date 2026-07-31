@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -9,17 +10,26 @@ from typing import Any
 import yaml
 
 from . import CLI_NAME
+from .closing_keyword_gate import find_unexpected_closing_references
 from .config import ConfigError, find_config_path
-from .doctor import run_doctor
+from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import compute_api_worker_fleet_report, fleet_loop, run_fleet_supervise
-from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
-from .github import GitHub, GitHubError
+from .github import (
+    CLOSING_KEYWORD_PR_FIELDS,
+    GitHub,
+    GitHubError,
+    defang_closing_keywords,
+    linked_issue_number,
+)
+from . import layout
 from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
-from .paths import RepoNotFoundError, find_repo_root, runtime_paths
+from .paths import RepoNotFoundError, find_repo_root, resolved_layout, runtime_paths
+from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
+from .state_migration import apply_state_dir_migration, gather_migration_inputs
 from .supervise import orchestrator_root, self_deploy
 from .runner_allocation import plan_summary
 from .runner_allocation_pass import run_allocation_pass
@@ -289,7 +299,92 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_dry_run(allocate_parser)
 
-    subparsers.add_parser("worktree-clean")
+    worktree_clean_parser = subparsers.add_parser("worktree-clean")
+    _add_dry_run(worktree_clean_parser)
+
+    closing_keyword_check = subparsers.add_parser(
+        "closing-keyword-check",
+        help=(
+            "CI gate (issue #790): fail if the PR body or any commit message "
+            "contains an unnegated closing keyword (Closes/Fixes/Resolves #N) "
+            "referencing an issue other than this PR's own declared target. "
+            "GitHub's native auto-close-on-merge scans both surfaces with no "
+            "negation awareness at all; this is a required PR check, not a "
+            "label-transition helper."
+        ),
+    )
+    closing_keyword_check.add_argument("--pr", type=int, required=True)
+
+    migrate_parser = subparsers.add_parser(
+        "migrate-state-dir",
+        help="Plan (and optionally apply) a move of a legacy state dir to its new root",
+    )
+    # --src/--dst are optional overrides. Their defaults are derived, never a
+    # repeated literal: src is wherever this repo's config currently points
+    # runtime.state_dir at (the "legacy" location for the duration of the
+    # migration window), dst is the package-wide default state root from
+    # layout.py. Overrides exist so an operator can rehearse against a copied
+    # tree instead of the live one.
+    migrate_parser.add_argument(
+        "--src",
+        default=None,
+        help="Legacy state dir to move from (default: this repo's configured runtime.state_dir)",
+    )
+    migrate_parser.add_argument(
+        "--dst",
+        default=None,
+        help="New state dir to move into (default: the package's default state root)",
+    )
+    migrate_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually move. Without this the command only plans and prints.",
+    )
+    migrate_parser.add_argument(
+        "--quiesce-pattern",
+        action="append",
+        dest="quiesce_patterns",
+        default=None,
+        metavar="REGEX",
+        help=(
+            "Regex matched against live process command lines to prove the fleet is "
+            "stopped before --apply acts; repeatable. With --apply and no pattern given, "
+            "quiescence cannot be established and the move is refused. Without --apply, "
+            "patterns (if given) are only reported informationally."
+        ),
+    )
+    _add_dry_run(migrate_parser)
+
+    tripwire = subparsers.add_parser(
+        "tripwire",
+        help="Manage the #502 post-merge unauthorized-merge tripwire",
+    )
+    tripwire_sub = tripwire.add_subparsers(dest="tripwire_command", required=True)
+    tripwire_ack = tripwire_sub.add_parser(
+        "ack",
+        help=(
+            "Acknowledge a post-arming unauthorized-merge finding so it stops "
+            "pinning ok=False on every pass (issue #673). Requires an explicit "
+            "--reason; the tripwire never auto-acknowledges."
+        ),
+    )
+    tripwire_ack.add_argument("pr", type=int, help="PR number to acknowledge")
+    tripwire_ack.add_argument(
+        "--reason",
+        default=None,
+        help=(
+            "Why this finding is triaged (e.g. 'root cause fixed in #N', "
+            "'confirmed benign per #634 audit'). Mandatory — a tripwire that "
+            "can be silenced silently is no control. Validated by the handler "
+            "so a missing reason exits 1 (a command failure) rather than 2 "
+            "(an argparse usage error), matching every other command."
+        ),
+    )
+    tripwire_ack.add_argument(
+        "--by",
+        default=None,
+        help="Operator who acknowledged the finding (recorded for audit).",
+    )
 
     return parser
 
@@ -308,7 +403,26 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
 def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config_path = find_config_path(repo_root, args.config)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    # #6-G: doctor exists to diagnose a broken repo, so it must not itself
+    # crash on the exact condition it is meant to diagnose (e.g. the
+    # unknown-config-key ConfigError that silently killed the cw fleet lane
+    # three times on 2026-07-29). Render the parse failure as a structured
+    # finding instead of letting it propagate to main()'s generic
+    # `except (ConfigError, ValueError)` handler, which prints to stderr and
+    # exits 2 with no machine-readable finding at all.
+    try:
+        config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    except ConfigError as exc:
+        check = DoctorCheck(
+            name="config file",
+            ok=False,
+            detail=f"{config_path or 'orchestrator.config.yaml'}: {exc}",
+        )
+        return CommandResult(
+            False,
+            "doctor: 1 finding(s), at least one blocking",
+            {"checks": [check.to_dict()]},
+        )
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
     touch_repo(args.fleet_dir, repo_root, paths, gh)
@@ -341,13 +455,260 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     state = load_state_locked(paths.state_file)
     result = clean_worktrees(
         repo_root,
-        paths.root / "worktrees",
+        resolved_layout(config, repo_root).worktrees,
         state,
         config,
         gh,
         dry_run=args.dry_run,
     )
     return CommandResult(result.ok, result.message, result.data)
+
+
+def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult:
+    """CI gate (issue #790): fail on any unnegated closing keyword pointing off-target.
+
+    Fetches the PR's title/body/branch (`GitHub.pr_view`, deliberately scoped
+    to `CLOSING_KEYWORD_PR_FIELDS` rather than the general-purpose
+    `PR_VIEW_FIELDS` — this gate never touches CI/review/label state, and
+    `PR_VIEW_FIELDS`'s `statusCheckRollup` triggers a nested GraphQL
+    connection the default Actions `GITHUB_TOKEN` cannot read without
+    additional scope grants; see `CLOSING_KEYWORD_PR_FIELDS`'s docstring for
+    the two live failures this caused) and every commit's raw message
+    (`GitHub.pr_commits` — the REST endpoint, not `gh pr view --json commits`, whose GraphQL fields
+    truncate/corrupt long commit messages; see `GitHub.pr_commits`'s
+    docstring). The PR's own declared target issue is resolved the same way
+    charlie-work's own label-transition binding resolves it
+    (`linked_issue_number`: same-repo branch-prefix first, then an unnegated
+    closing keyword in the PR's own title/body) — that single number is the
+    only exemption `find_unexpected_closing_references` allows. Everything
+    else it finds is a reference GitHub's native auto-close-on-merge will act
+    on regardless of what this codebase intends, because that GitHub feature
+    scans PR body + every commit message with no negation awareness (issue
+    #790; PR #788's own commit text is the regression fixture proving this).
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
+
+    pr = gh.pr_view(args.pr, fields=CLOSING_KEYWORD_PR_FIELDS)
+    if not pr:
+        return CommandResult(False, f"closing-keyword-check: could not fetch PR #{args.pr}", {})
+
+    commits = gh.pr_commits(args.pr)
+    if commits is None:
+        return CommandResult(
+            False, f"closing-keyword-check: could not fetch commits for PR #{args.pr}", {}
+        )
+    commit_messages = [str((c.get("commit") or {}).get("message") or "") for c in commits]
+
+    intended = linked_issue_number(
+        pr,
+        is_cross_repository=pr.get("isCrossRepository"),
+        branch_prefix=config.dispatch.branch_prefix,
+    )
+
+    findings = find_unexpected_closing_references(
+        pr_body=str(pr.get("body") or ""),
+        commit_messages=commit_messages,
+        intended_issue_number=intended,
+    )
+
+    data = {
+        "pr": args.pr,
+        "intended_issue_number": intended,
+        "findings": [
+            {
+                "issue_number": finding.issue_number,
+                "source": finding.source,
+                "matched_text": finding.matched_text,
+            }
+            for finding in findings
+        ],
+    }
+
+    if findings:
+        lines = [
+            f"  issue #{finding.issue_number} via {finding.source}: "
+            f"{finding.matched_text!r} -> reword to {defang_closing_keywords(finding.matched_text)!r}"
+            for finding in findings
+        ]
+        message = (
+            f"closing-keyword-check: {len(findings)} unexpected closing reference(s) on "
+            f"PR #{args.pr} (declared target: "
+            f"{'#' + str(intended) if intended is not None else 'none resolved'})\n"
+            + "\n".join(lines)
+            + "\nGitHub will auto-close these issues on merge unless the wording above is "
+            "changed to the suggested rewrite (or the reference is dropped entirely)."
+        )
+        return CommandResult(False, message, data)
+
+    return CommandResult(
+        True,
+        f"closing-keyword-check: clean (PR #{args.pr}, declared target: "
+        f"{'#' + str(intended) if intended is not None else 'none resolved'})",
+        data,
+    )
+
+
+def _resolve_migration_root(raw: str, repo_root: Path) -> Path:
+    """Resolve a ``--src``/``--dst`` argument against *repo_root* when relative."""
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = repo_root / candidate
+    return candidate
+
+
+def _migration_path_key(path: Path) -> str:
+    """Fold case/separator so a resolved src/dst pair compares equal correctly.
+
+    Mirrors the normalization discipline ``state_migration._normalize_path_key``
+    applies for the same hazard (git-porcelain forward slashes vs. disk
+    backslashes, drive-letter case) without importing a private name across
+    that module's boundary.
+    """
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _render_migration_plan(plan) -> str:
+    """Human-readable rendering of a plan: counts, then every blocked child.
+
+    Blocked children are printed with their reasons *and* remediation, because the
+    operator's next action is always "clear the blockers, re-plan" -- a bare count
+    would send them back to the filesystem to work out why.
+    """
+    lines = [
+        f"src: {plan.src_root}",
+        f"dst: {plan.dst_root}",
+        f"children: {len(plan.children)}  movable: {len(plan.movable)}  "
+        f"blocked: {len(plan.blocked)}",
+    ]
+    for child in plan.blocked:
+        lines.append(f"  BLOCKED {child.name}")
+        for reason in child.reasons:
+            lines.append(f"      reason: {reason}")
+        for step in child.remediation:
+            lines.append(f"      remediate: {step}")
+    return "\n".join(lines)
+
+
+def run_migrate_state_dir_command(
+    args: argparse.Namespace,
+    *,
+    planner=gather_migration_inputs,
+    actuator=apply_state_dir_migration,
+    quiescence_checker=check_quiescence,
+) -> CommandResult:
+    """Plan, and with ``--apply``, actuate a legacy state-dir move.
+
+    Plan-only is the default; ``--apply`` is the explicit opt-in. A global or
+    subcommand ``--dry-run`` *overrides* ``--apply`` rather than the other way
+    round, so the two flags together can only ever be safe: the failure mode of
+    the opposite precedence is an operator who wrote ``--dry-run`` watching a
+    real migration run.
+
+    ``--src``/``--dst`` default to the repo's *currently configured*
+    ``runtime.state_dir`` and the package's default state root respectively --
+    never a literal re-spelled here -- so the common case needs no flags at
+    all. If they resolve to the same place there is nothing to migrate.
+
+    Quiescence (proof the fleet is stopped) gates ``--apply`` only. A dry run
+    must keep working against a live fleet -- that is how an operator inspects
+    a plan before committing -- so it only *reports* quiesce status. Patterns
+    are supplied by the caller via ``--quiesce-pattern`` (repeatable); there is
+    no built-in default list (CLAUDE.md rule 9: no embedded manual lists), so
+    ``--apply`` with none given is refused rather than silently skipping the
+    check.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+
+    src_root = (
+        _resolve_migration_root(args.src, repo_root)
+        if args.src is not None
+        else runtime_paths(repo_root, config.runtime.state_dir).root
+    )
+    dst_root = (
+        _resolve_migration_root(args.dst, repo_root)
+        if args.dst is not None
+        # ``.resolve()`` here (not just in ``layout.default_state_root``) matters:
+        # ``runtime_paths`` above resolves symlinks/junctions in the *whole* src
+        # path, not just ``repo_root``. Without a matching resolve on this side,
+        # a repo whose ``.var`` is itself a symlink/junction would make the two
+        # roots compare unequal even when they name the same on-disk location,
+        # producing a same-place migration plan instead of the intended
+        # already-migrated short-circuit. Safe on a not-yet-created dst: Path
+        # .resolve() does not require the path to exist.
+        else layout.default_state_root(repo_root).resolve()
+    )
+
+    if _migration_path_key(src_root) == _migration_path_key(dst_root):
+        return CommandResult(
+            True,
+            f"already migrated: src and dst both resolve to {dst_root}",
+            {
+                "src_root": str(src_root),
+                "dst_root": str(dst_root),
+                "already_migrated": True,
+                "applied": False,
+            },
+        )
+
+    patterns = tuple(args.quiesce_patterns) if args.quiesce_patterns else ()
+
+    plan = planner(repo_root=repo_root, src_root=src_root, dst_root=dst_root)
+    rendered = _render_migration_plan(plan)
+    data = {
+        "src_root": str(plan.src_root),
+        "dst_root": str(plan.dst_root),
+        "children": len(plan.children),
+        "movable": len(plan.movable),
+        "blocked": [child.name for child in plan.blocked],
+        "applied": False,
+    }
+
+    if not plan.ok:
+        return CommandResult(False, f"{rendered}\nplan failed: {plan.error}", data)
+
+    acting = args.apply and not args.dry_run
+
+    if not acting:
+        if args.apply and args.dry_run:
+            note = "(dry-run: --apply ignored, nothing moved)"
+        else:
+            note = "(plan only; pass --apply to move)"
+        if patterns:
+            report = quiescence_checker(patterns=patterns)
+            note = f"{note}\nquiesce (informational, not enforced for a dry run): {report.summary}"
+        else:
+            note = f"{note}\nquiesce: not checked (no --quiesce-pattern given)"
+        return CommandResult(True, f"{rendered}\n{note}", data)
+
+    if not patterns:
+        return CommandResult(
+            False,
+            f"{rendered}\nrefusing to apply: no --quiesce-pattern given, "
+            "quiescence cannot be established",
+            data,
+        )
+
+    report = quiescence_checker(patterns=patterns)
+    if not report.ok:
+        return CommandResult(
+            False,
+            f"{rendered}\nrefusing to apply: fleet is not quiescent\n{report.summary}",
+            data,
+        )
+
+    outcome = actuator(plan)
+    data = {**data, "applied": outcome.ok, "moved": list(outcome.moved)}
+    if not outcome.ok:
+        data = {**data, "aborted_at": outcome.aborted_at}
+        return CommandResult(
+            False,
+            f"{rendered}\nmigration failed after {len(outcome.moved)} moved: {outcome.error}",
+            data,
+        )
+    return CommandResult(True, f"{rendered}\nmoved {len(outcome.moved)} children", data)
 
 
 def run_fleet_work(args: argparse.Namespace) -> CommandResult:
@@ -531,7 +892,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     Note: This command does not include per-worker health fields yet. That will be added
     in a follow-up issue (#167) once the worker health abstraction lands.
     """
-    fleet_json_path = fleet_dir() / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path()
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -576,7 +937,7 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
     - Aggregates per-repo queue entries keyed by repo_key (nameWithOwner)
     - Isolates per-repo errors (missing/broken repos) without aborting aggregation
     """
-    fleet_json_path = fleet_dir() / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path()
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -1017,6 +1378,7 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
         state_path=paths.state_file,
         dry_run=dry_run,
         source=CLI_ALLOCATION_SOURCE,
+        full_pass_interval_seconds=config.supervisor.full_pass_interval_seconds,
     )
 
     if result.error:
@@ -1098,6 +1460,10 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
+    if args.command == "tripwire":
+        if args.tripwire_command == "ack":
+            return app.ack_unauthorized_merge(args.pr, args.reason or "", by=args.by)
+        return CommandResult(False, f"unknown tripwire command: {args.tripwire_command}", {})
     if args.command == "bash-rats":
         from .supervise import run_supervised, try_acquire_supervisor_lock
 
@@ -1105,7 +1471,7 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             # Single-pass mode: check the supervisor lock first to avoid double-
             # dispatching through the governor read→launch window when a supervised
             # loop is already running.
-            lock_path = app.paths.root / "supervisor.lock"
+            lock_path = layout.supervisor_lock_path(app.paths.root)
             lock = try_acquire_supervisor_lock(lock_path)
             if lock is None:
                 return CommandResult(
@@ -1189,6 +1555,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
         elif args.command == "worktree-clean":
             result = run_worktree_clean_command(args)
+        elif args.command == "migrate-state-dir":
+            result = run_migrate_state_dir_command(args)
+        elif args.command == "closing-keyword-check":
+            result = run_closing_keyword_check_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)

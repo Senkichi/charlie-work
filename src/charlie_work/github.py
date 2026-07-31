@@ -6,6 +6,7 @@ import random
 import re
 import subprocess
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -59,6 +60,24 @@ PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # object, and on the REST path it is already present in the payload as
 # head.sha, so adding it costs neither an extra request nor a graph walk.
 MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+# Fields needed by `charlie closing-keyword-check` (issue #790): the gate only
+# scans PR body/title text for closing keywords and resolves the PR's own
+# declared-target binding via linked_issue_number(), which reads headRefName
+# and is_cross_repository. It touches no CI/review/label state at all, so it
+# must not go through the general-purpose PR_VIEW_FIELDS -- that list's
+# `statusCheckRollup` forces gh's GraphQL query to walk the PR's check-run
+# connection, which the default Actions GITHUB_TOKEN cannot read by default.
+# This surfaced twice on the same branch, each a step deeper into the same
+# query: run 30607061237 ("repository.pullRequest" itself inaccessible,
+# fixed by granting `pull-requests: read`), then run 30609781476
+# ("...statusCheckRollup.nodes.0.commit.statusCheckRollup" inaccessible one
+# level further in, before `checks: read` had been granted at all). Rather
+# than keep granting one nested-connection scope at a time and re-running to
+# find the next one, the fix is at the query layer: the gate never needed
+# statusCheckRollup in the first place, so a narrow field list sidesteps the
+# whole class of integration-context permission gaps instead of chasing them
+# field by field.
+CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,isCrossRepository"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
@@ -661,14 +680,24 @@ class GitHub:
                 matched.append(pr)
         return _MergedPRSearchResult(matched, ok=True)
 
-    def pr_view(self, number: int) -> dict[str, Any]:
+    def pr_view(self, number: int, *, fields: str = PR_VIEW_FIELDS) -> dict[str, Any]:
+        """Fetch a PR via ``gh pr view --json <fields>``.
+
+        ``fields`` defaults to the general-purpose ``PR_VIEW_FIELDS`` (CI/review/
+        label state included). Callers that only need a narrow slice -- e.g.
+        the closing-keyword-check gate, which never touches CI status and
+        must not risk `statusCheckRollup`'s token-scope failure (see
+        `CLOSING_KEYWORD_PR_FIELDS`) -- should pass their own narrower field
+        list rather than filtering the wide result after the fact, so the gh
+        invocation itself never requests a field it doesn't need.
+        """
         result = self.run(
             [
                 "pr",
                 "view",
                 str(number),
                 "--json",
-                PR_VIEW_FIELDS,
+                fields,
             ],
             json_output=True,
         )
@@ -790,6 +819,32 @@ class GitHub:
             return None
         check_runs = value.get("check_runs")
         return check_runs if isinstance(check_runs, list) else None
+
+    def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
+        """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.
+
+        Each item's ``commit.message`` is the exact, untruncated raw commit
+        message text (subject + blank line + body), matching ``git show
+        --format=%B``. Deliberately NOT ``gh pr view --json commits``: that
+        GraphQL field set truncates ``messageHeadline`` at a fixed length
+        (~70 chars observed) and splits the remainder into ``messageBody``
+        without preserving the original text — verified on PR #788's own
+        commit, where the GraphQL fields split the subject line mid-word
+        ("defang o" / "utbound reviewer prose...") and would silently corrupt
+        the very "keyword #N" text `closing_keyword_gate` (issue #790) needs
+        to scan intact. ``per_page=100`` covers every PR this codebase
+        produces (worker branches are single- or few-commit); a PR with more
+        commits than that is outside this project's workflow. Returns
+        ``None`` on failure — errors are returned as values, never raised.
+        """
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/pulls/{number}/commits?per_page=100"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, list) else None
+        return result if isinstance(result, list) else None
 
     def compare(self, base: str, head: str) -> dict[str, Any] | None:
         """Compare two commits and return the comparison metadata.
@@ -1090,13 +1145,105 @@ def label_names(item: dict[str, Any]) -> set[str]:
 
 
 # GitHub's own issue-closing keyword set, used here to decide whether a `#N`
-# reference in freeform text actually links the PR to issue N.
-_CLOSING_KEYWORD_REF = re.compile(
-    r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)", flags=re.IGNORECASE
+# reference in freeform text actually links the PR to issue N. Shared between
+# the matching regex below and `_CLOSING_KEYWORD_DEFANG_RE` so the two
+# patterns cannot drift apart.
+_CLOSING_KEYWORDS_ALT = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+_CLOSING_KEYWORD_REF = re.compile(_CLOSING_KEYWORDS_ALT + r"\s+#(\d+)", flags=re.IGNORECASE)
+# Rewrites `<keyword> #N` to `<keyword> issue N` — used by
+# `defang_closing_keywords` to strip the auto-close/binding syntax from text
+# that will be embedded in a PR body/comment charlie-work does not control
+# downstream (e.g. a rework brief a worker reads and copies into its own PR).
+_CLOSING_KEYWORD_DEFANG_RE = re.compile(
+    r"(" + _CLOSING_KEYWORDS_ALT + r")(\s+)#(\d+)", flags=re.IGNORECASE
 )
 # The orchestrator's own branch convention (agent/issue-N-slug). A head ref is
 # the trusted signal because the orchestrator created it at dispatch.
 _BRANCH_ISSUE_REF = re.compile(r"issue[-_/](\d+)", flags=re.IGNORECASE)
+
+# Negation words/contractions that, when found shortly before a closing
+# keyword match, mean the keyword is being negated ("does not fix #649")
+# rather than asserting a real closing action. Kept as a module-level
+# constant — never inline literals at the match site — so the vocabulary is
+# audited and extended in exactly one place.
+_NEGATION_WHOLE_WORDS = ("not", "never", "without", "cannot")
+# Matched as a bare substring (no leading \b): "doesn't"/"can't" have no word
+# boundary immediately before the "n" in "n't" — the apostrophe is not a
+# \w character, so "doesn" + "'t" is one continuous \w-run from \b's
+# perspective and a \b-anchored "n't" would silently never match.
+_NEGATION_CONTRACTION_SUFFIX = "n't"
+_NEGATION_RE = re.compile(
+    r"\b(?:" + "|".join(_NEGATION_WHOLE_WORDS) + r")\b|" + re.escape(_NEGATION_CONTRACTION_SUFFIX),
+    flags=re.IGNORECASE,
+)
+# How many characters back to look for a negation word before a closing
+# keyword. 32 comfortably covers every negation phrase in the acceptance
+# criteria ("does not " = 9 chars, "without " = 8) with headroom for a short
+# intervening clause. The tradeoff is deliberate and biased toward the safe
+# direction: at this width, "This is not a revert. Fixes #700" is treated as
+# negated even though the negation and the keyword sit in different
+# sentences. A missed binding leaves the issue in its current label state
+# (safe); a false binding silently marks live work done (unsafe) — so
+# over-triggering the guard is acceptable, under-triggering is not.
+_NEGATION_LOOKBEHIND_CHARS = 32
+
+
+def _has_preceding_negation(text: str, match_start: int) -> bool:
+    """True if a negation word/contraction appears shortly before match_start."""
+    window_start = max(0, match_start - _NEGATION_LOOKBEHIND_CHARS)
+    # Pass pos/endpos (not a string slice) so \b at the window edge is still
+    # resolved against the real surrounding text, not an artificial cut.
+    return bool(_NEGATION_RE.search(text, window_start, match_start))
+
+
+def iter_unnegated_closing_keyword_matches(text: str) -> Iterator[re.Match[str]]:
+    """Yield every `_CLOSING_KEYWORD_REF` match in ``text`` not preceded by negation.
+
+    This is the shared core scanning primitive (finditer over every
+    keyword+``#N`` occurrence, filtered by the negation lookback) behind both
+    consumers that need it:
+
+    - `_first_unnegated_closing_keyword_match` (below) takes only the first —
+      `linked_issue_number`'s label-transition binding only ever needs one
+      match to bind an issue.
+    - `closing_keyword_gate.find_unexpected_closing_references` (issue #790)
+      needs *every* match across a whole PR body plus every commit message,
+      because GitHub's native auto-close-on-merge scans all of those
+      surfaces for every closing-keyword reference, not just the first.
+
+    Both consume this one generator rather than each hand-rolling their own
+    `finditer` + negation-lookback scan, so the two callers cannot drift
+    apart on what counts as a live closing reference.
+    """
+    for match in _CLOSING_KEYWORD_REF.finditer(text):
+        if not _has_preceding_negation(text, match.start()):
+            yield match
+
+
+def _first_unnegated_closing_keyword_match(text: str) -> re.Match[str] | None:
+    """Return the first `_CLOSING_KEYWORD_REF` match not preceded by negation.
+
+    A negated match (e.g. "does not fix #649") must not shadow a later,
+    genuine match in the same field (e.g. "...but this PR also fixes #700") —
+    scanning continues past it instead of giving up on the whole field.
+    """
+    return next(iter_unnegated_closing_keyword_matches(text), None)
+
+
+def defang_closing_keywords(text: str) -> str:
+    """Rewrite `<keyword> #N` to `<keyword> issue N` in freeform text.
+
+    Used to sanitize text that charlie-work writes into a PR body, comment,
+    or rework brief that a downstream reader (GitHub's auto-close, or a
+    worker agent copying reviewer prose into its own PR) does not go through
+    `linked_issue_number`'s hijack-safety checks. The issue number stays
+    legible to a human; only the syntax that triggers a live closing
+    reference or label-transition binding is removed. Unconditional — unlike
+    the negation guard above, this rewrites every keyword match regardless
+    of surrounding negation, since the goal here is to remove the trigger
+    syntax entirely, not to judge intent.
+    """
+    return _CLOSING_KEYWORD_DEFANG_RE.sub(r"\g<1>\g<2>issue \g<3>", text)
 
 
 def linked_issue_number(
@@ -1119,6 +1266,12 @@ def linked_issue_number(
     When is_cross_repository is None (provenance unknown), treat as
     cross-repo for trust purposes — bind nothing via branch name or closing
     keyword (fail closed).
+
+    A closing keyword preceded by a negation ("does not fix #649") also does
+    not bind — see `_first_unnegated_closing_keyword_match`. This prevents a
+    false LABEL TRANSITION in charlie-work's own state machine; it has no
+    effect on GitHub's own issue auto-close, which is a separate mechanism
+    charlie-work does not control.
     """
     # Cross-repo PRs or unknown provenance never bind for lifecycle purposes
     if is_cross_repository is True or is_cross_repository is None:
@@ -1133,9 +1286,11 @@ def linked_issue_number(
         has_correct_prefix = head.startswith(branch_prefix)
         if has_correct_prefix:
             return int(match.group(1))
-    # For same-repo PRs, trust closing keywords in title/body
+    # For same-repo PRs, trust closing keywords in title/body — but a
+    # negated keyword ("does not fix #649") must not bind; see
+    # `_first_unnegated_closing_keyword_match`.
     for text in (str(pr.get("title") or ""), str(pr.get("body") or "")):
-        match = _CLOSING_KEYWORD_REF.search(text)
+        match = _first_unnegated_closing_keyword_match(text)
         if match:
             return int(match.group(1))
     return None

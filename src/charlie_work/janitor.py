@@ -596,7 +596,15 @@ def _check_no_op_rework(
                     validated_head_ref = require_valid_ref_name(
                         head_ref, context="_check_no_op_rework head_ref (patch-id)"
                     )
-                    unpushed_info = _get_unpushed_commit_info(validated_head_ref, repo_root)
+                    validated_base_ref = None
+                    base_ref_raw = pr.get("baseRefName")
+                    if base_ref_raw:
+                        validated_base_ref = require_valid_ref_name(
+                            base_ref_raw, context="_check_no_op_rework base_ref (patch-id)"
+                        )
+                    unpushed_info = _get_unpushed_commit_info(
+                        validated_head_ref, repo_root, base_ref=validated_base_ref
+                    )
                     if unpushed_info:
                         failure_msg += f"; {unpushed_info}"
                     else:
@@ -655,7 +663,15 @@ def _check_no_op_rework(
                 validated_head_ref = require_valid_ref_name(
                     head_ref, context="_check_no_op_rework head_ref (sha-match)"
                 )
-                unpushed_info = _get_unpushed_commit_info(validated_head_ref, repo_root)
+                validated_base_ref = None
+                base_ref_raw = pr.get("baseRefName")
+                if base_ref_raw:
+                    validated_base_ref = require_valid_ref_name(
+                        base_ref_raw, context="_check_no_op_rework base_ref (sha-match)"
+                    )
+                unpushed_info = _get_unpushed_commit_info(
+                    validated_head_ref, repo_root, base_ref=validated_base_ref
+                )
                 if unpushed_info:
                     failure_msg += f"; {unpushed_info}"
                 else:
@@ -734,7 +750,7 @@ def _check_no_op_rework(
             )
 
             # Enrich with unpushed-commit count if worktree exists
-            unpushed_info = _get_unpushed_commit_info(head_ref, repo_root)
+            unpushed_info = _get_unpushed_commit_info(head_ref, repo_root, base_ref=base_ref)
             if unpushed_info:
                 failure_msg += f"; {unpushed_info}"
             else:
@@ -760,11 +776,21 @@ def _check_no_op_rework(
 def _get_unpushed_commit_info(
     branch: str,
     repo_root: Path,
+    base_ref: str | None = None,
 ) -> str | None:
-    """Check if the branch has unpushed commits in its local worktree.
+    """Check if the branch has genuinely unpushed content commits in its local worktree.
+
+    Counts only non-merge commits that are reachable from the worktree's local
+    HEAD but not from ``origin/{branch}`` (i.e. not yet pushed) and, when
+    ``base_ref`` is available, not already reachable from ``origin/{base_ref}``
+    either. Without the base-ref exclusion, a local ``git merge origin/{base_ref}``
+    (e.g. to resolve conflicts before a re-review) drags in every already-landed
+    squash-merge commit from the base branch's history and reports them as
+    "unpushed commits" even though the remote is fully caught up on real content.
 
     Returns a message with the unpushed commit count and push remediation if
-    unpushed commits exist, None otherwise.
+    genuine unpushed content commits exist, None otherwise (including when the
+    only local-not-remote commits are base-update merges).
     """
     # Try to find the worktree for this branch
     try:
@@ -793,9 +819,17 @@ def _get_unpushed_commit_info(
         if not worktree_path or not worktree_path.exists():
             return None
 
-        # Check for unpushed commits in the worktree
+        # Count non-merge commits since origin/{branch}, excluding base-reachable
+        # commits. Mirrors the merge-only-advance check above: --no-merges drops
+        # base-update merge commits themselves, and ^origin/{base_ref} drops any
+        # commits those merges transitively pulled in that are already on the
+        # base branch (e.g. other PRs' squash-merge commits).
+        rev_list_args = ["git", "rev-list", "--no-merges", "--count", "HEAD"]
+        rev_list_args.append(f"^origin/{branch}")
+        if base_ref:
+            rev_list_args.append(f"^origin/{base_ref}")
         result = subprocess.run(
-            ["git", "rev-list", "--count", f"origin/{branch}..HEAD"],
+            rev_list_args,
             cwd=worktree_path,
             capture_output=True,
             check=True,

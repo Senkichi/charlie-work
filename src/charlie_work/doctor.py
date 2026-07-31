@@ -20,6 +20,8 @@ import yaml
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
+from . import layout
+from .instrumentation import _db_path, query_events
 from .github import (
     GitHub,
     GitHubError,
@@ -32,7 +34,7 @@ from .github import (
     RECONCILE_ISSUE_FIELDS,
     RECONCILE_PR_FIELDS,
 )
-from .paths import RuntimePaths
+from .paths import RuntimePaths, resolved_layout
 from .prompts import resolve_template
 from .runner_slots import (
     ALLOCATION_STATE_FILENAME,
@@ -271,7 +273,7 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
     from .claude_code import read_worker_records
     from .devin_shell import is_session_alive, read_session_records
 
-    sessions_dir = repo_root / config.devin.sessions_dir
+    sessions_dir = resolved_layout(config, repo_root).sessions_dir
     if not sessions_dir.is_dir():
         add("launched sessions", True, "no sessions directory yet", severity="warning")
         return
@@ -400,19 +402,41 @@ def _check_runner_allocation(
     pass records which path wrote it and only the unattended one is accepted as
     evidence here; a manual write is reported as "cannot confirm" rather than
     "fine", because the file keeps just the latest write.
+
+    Two things the probe used to *guess* are now read from the file (issue #606):
+
+    * **The driving interval.** The staleness bound was
+      ``config.supervisor.full_pass_interval_seconds * 3``, resolved through the
+      probe's own config load — a different call from the one the daemon used. The
+      pass now records the interval it was driven at, and the bound is computed
+      from that recorded value (falling back to config only for a file written
+      before the interval was recorded).
+    * **The skip reason.** A pass that declines to act (no runners under
+      ``managed_root``, an unresolvable root) now records *why*. The probe reports
+      the recorded reason instead of asserting "not running unattended (#590)" for
+      every stale-or-absent file — "the daemon never reached allocation" and "the
+      daemon ran it and found no runners" are different problems with different
+      fixes.
     """
     allocation = getattr(config, "runner_allocation", None)
     if allocation is None or not allocation.enabled:
         return
 
     state_dir = fleet_dir(override=fleet_dir_override)
-    interval = max(config.supervisor.full_pass_interval_seconds, 1)
-    # Three intervals: one missed pass is normal jitter (a pass can run long), a
-    # sustained gap is not.
-    stale_after = interval * 3
     budget = allocation.max_running_runners
 
     stamp = load_allocation_stamp(state_dir)
+    # Measure staleness against the interval the pass was *actually* driven at,
+    # not the one this probe re-resolves — a per-repo layer that sets the
+    # interval would otherwise make the probe measure against a cadence the
+    # daemon is not running at (issue #606). Fall back to config only for a file
+    # written before the interval was recorded.
+    recorded_interval = stamp.full_pass_interval_seconds if stamp is not None else None
+    interval = max(recorded_interval or config.supervisor.full_pass_interval_seconds, 1)
+    # Three intervals: one missed pass is normal jitter (a pass can run long), a
+    # sustained gap is not.
+    stale_after = interval * 3
+
     if stamp is None:
         add(
             "runner allocation",
@@ -439,6 +463,41 @@ def _check_runner_allocation(
     now = datetime.datetime.now(datetime.timezone.utc)
     age = max(0, int((now - stamp.updated_at).total_seconds()))
     writer = _allocation_writer_label(stamp.source)
+
+    # A recorded skip reason is the pass saying "I ran, and here is why I did not
+    # act." Report that instead of guessing #590: a fresh unattended skip is the
+    # daemon reaching allocation and declining — a named, different problem — not
+    # the "never reached it" shape #590 describes. A *stale* skip is both: the
+    # daemon last found <reason> and has not been back, so the #590 reading joins
+    # the recorded reason rather than replacing it.
+    #
+    # A skip written by a non-unattended source (a manual `charlie runners
+    # allocate`, or a file predating provenance) still cannot confirm the daemon
+    # is rebalancing — the writer overwrites the same host-wide file, so its
+    # skip reason is not evidence the daemon reached allocation. That clause
+    # joins the recorded reason the same way staleness does, so a fresh manual
+    # skip names *why* it declined *and* flags that it cannot speak for the
+    # daemon (issue #590). When both apply (a stale manual skip) the clauses are
+    # joined so #590 is cited once rather than duplicated.
+    if stamp.skip_reason is not None:
+        detail = (
+            f"enabled (budget {budget}) but the last pass ({writer}) {age}s ago "
+            f"declined to act: {stamp.skip_reason}"
+        )
+        clauses: list[str] = []
+        if stamp.source != UNATTENDED_ALLOCATION_SOURCE:
+            clauses.append(
+                "this overwrites the same file the unattended pass uses, "
+                "so it cannot confirm the daemon is rebalancing"
+            )
+        if age > stale_after:
+            clauses.append(
+                f"over the {stale_after}s staleness bound, allocation is not running unattended"
+            )
+        if clauses:
+            detail += " — " + "; ".join(clauses) + " (issue #590)"
+        add("runner allocation", False, detail, severity="warning")
+        return
 
     if age > stale_after:
         add(
@@ -516,7 +575,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     repo's per-repo supervisor lock is checked individually. A single supervised
     repo no longer hides an unsupervised one.
     """
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     if not fleet_json_path.exists():
         return
     registry = _load_registry(fleet_json_path)
@@ -524,7 +583,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     if not repos:
         return
 
-    fleet_lock_path = fleet_dir(override=fleet_dir_override) / "fleet-supervisor.lock"
+    fleet_lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     if fleet_lock_path.exists():
         fleet_lock = try_acquire_supervisor_lock(fleet_lock_path)
         if fleet_lock is None:
@@ -544,7 +603,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
         if not state_dir.exists():
             unreachable_repo_keys.append(repo_key)
             continue
-        repo_lock_path = state_dir / "supervisor.lock"
+        repo_lock_path = layout.supervisor_lock_path(state_dir)
         if repo_lock_path.exists():
             repo_lock = try_acquire_supervisor_lock(repo_lock_path)
             if repo_lock is None:
@@ -721,6 +780,137 @@ def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
                     False,
                     f"probe failed (not a field error): {error_msg}",
                 )
+
+
+def _check_state_dir_split_brain(add: Any, repo_root: Path, paths: RuntimePaths) -> None:
+    """Warn when the default state tree still holds residue after a
+    ``runtime.state_dir`` override (issue #712).
+
+    Dispatch creates worktrees under ``layout.default_state_root(repo_root)``
+    regardless of ``runtime.state_dir`` (until A2 lands), while
+    ``charlie worktree-clean`` and every other subsystem use the *configured*
+    ``paths.root`` (see ``layout.py``'s module docstring). When a repo
+    overrides ``state_dir``, those are two different directories: cleanup
+    enumerates an empty tree while dispatch keeps writing to the default one,
+    and nothing ever looks at the default tree again. That is exactly how
+    job-cannon accumulated 74 uncollected worktrees under a 0-byte
+    ``events.db`` — a state nobody noticed because nothing diagnosed it.
+
+    This check does not fix the divergence (that is A2's job) — it turns the
+    silent residue into a named, warned-about condition. Silent when
+    ``state_dir`` is not overridden: the two trees are the same tree, so there
+    is nothing to diagnose.
+    """
+    default_root = layout.default_state_root(repo_root)
+    if paths.root == default_root:
+        return
+
+    residue: list[str] = []
+
+    default_state_file = layout.state_file_path(default_root)
+    if default_state_file.exists():
+        residue.append(layout.STATE_FILENAME)
+
+    default_worktrees = layout.worktrees_dir(default_root)
+    if default_worktrees.is_dir():
+        worktree_count = sum(1 for _ in default_worktrees.iterdir())
+        if worktree_count:
+            residue.append(f"{layout.WORKTREES_DIRNAME}/ ({worktree_count} entries)")
+
+    default_events_db = _db_path(default_state_file)
+    if default_events_db.exists() and default_events_db.stat().st_size > 0:
+        residue.append("events.db")
+
+    if not residue:
+        return
+
+    add(
+        "state dir split-brain",
+        False,
+        f"configured state_dir is {paths.root}, but the default tree "
+        f"{default_root} still contains {', '.join(residue)} — some subsystem "
+        f"is writing there while the rest of the orchestrator uses the "
+        f"configured tree (issue #712); nothing currently cleans up "
+        f"{default_root}, so this residue only grows",
+        severity="warning",
+    )
+
+
+def _check_worktrees_root_agreement(
+    add: Any, repo_root: Path, paths: RuntimePaths, config: OrchestratorConfig
+) -> None:
+    """Report the effective worktrees root that dispatch and ``worktree-clean``
+    both use.
+
+    Before A2, this was a real pass/fail comparison: dispatch fell back to
+    ``layout.worktrees_dir(layout.default_state_root(repo_root))`` (ignoring
+    ``runtime.state_dir``) while ``worktree-clean`` swept
+    ``layout.worktrees_dir(paths.root)`` (honouring it) — the #712 divergence.
+    A2 fixed the root cause by routing both call sites
+    (``OrchestratorApp._layout.worktrees`` and
+    ``run_worktree_clean_command``'s call into ``clean_worktrees``) through
+    the identical ``paths.resolved_layout(config, repo_root).worktrees``. With
+    one function computing both sides, there is no second, independently
+    derived value left to compare — reintroducing a comparison here would
+    necessarily be ``x == x`` (an ``ok=False`` branch that can never fire) and
+    would only ever measure whether *this check* also calls the same
+    function, not whether dispatch and clean agree. So this is now an
+    unconditional report line rather than a pass/fail check; the real
+    regression gate for #712 / the ``claude_code.worktrees_dir`` axis lives in
+    ``tests/test_paths.py``, exercised against the two actual production call
+    sites (``OrchestratorApp._adapter_settings()`` and
+    ``run_worktree_clean_command``'s ``clean_worktrees`` call).
+    """
+    effective_root = resolved_layout(config, repo_root).worktrees
+    add(
+        "worktrees root",
+        True,
+        f"{effective_root} (dispatch and `worktree-clean` both resolve here)",
+    )
+
+
+_LANE_FAILURE_LOOKBACK_HOURS = 24
+
+
+def _check_recent_lane_failures(add: Any, paths: RuntimePaths) -> None:
+    """Warn when this repo's own fleet lane recently failed to start (#6-G).
+
+    A lane that fails before ``app.loop()`` runs (e.g. ``load_layered_config``
+    raising ``ConfigError`` on an unknown config key, cw 2026-07-29) is caught
+    by ``fleet_loop``'s per-repo ``except Exception`` isolation boundary and
+    durably recorded here via ``log_event(..., "fleet_pass_config_error",
+    ...)`` — see ``fleet_dispatch._record_lane_failure_event``. Without this
+    check, that record is only reachable by directly querying events.db; this
+    surfaces it in the same preflight report an operator already runs.
+
+    Severity is a warning, not a hard error: the failure already happened and
+    may since be fixed — this reports "did this recently happen", not a live
+    health gate. (Recording and reading agree only when the fleet registry's
+    ``state_dir`` for this repo matches ``paths.state_file`` — see the
+    divergence note on ``fleet_dispatch._lane_failure_state_path``.)
+    """
+    cutoff = (
+        (
+            datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(hours=_LANE_FAILURE_LOOKBACK_HOURS)
+        )
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    events = query_events(paths.state_file, kind="fleet_pass_config_error", since=cutoff, limit=5)
+    if not events:
+        return
+    latest = events[-1]
+    payload = latest.get("payload") if isinstance(latest.get("payload"), dict) else {}
+    add(
+        "recent lane failures",
+        False,
+        f"{len(events)} fleet-pass lane failure(s) in the last "
+        f"{_LANE_FAILURE_LOOKBACK_HOURS}h, most recent at {latest.get('ts')}: "
+        f"{payload.get('error')}",
+        severity="warning",
+    )
 
 
 def run_doctor(
@@ -926,6 +1116,11 @@ def run_doctor(
         str(template_path) if template_path.is_file() else f"not found: {template_path}",
     )
 
+    # -- state-dir split-brain (issue #712) ----------------------------------
+    # Read-only: only stats/lists the default tree, never touches it.
+    _check_state_dir_split_brain(add, repo_root, paths)
+    _check_worktrees_root_agreement(add, repo_root, paths, config)
+
     # -- fleet supervisor ----------------------------------------------------
     _check_fleet_supervisor(add, fleet_dir_override=fleet_dir_override)
 
@@ -939,6 +1134,12 @@ def run_doctor(
     # Read-only: compares the allocation state file's age against the pass
     # interval. Never starts, parks, or plans anything.
     _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override)
+
+    # -- recent lane-startup failures (#6-G) ---------------------------------
+    # Read-only: queries this repo's own events.db for past
+    # fleet_pass_config_error records. Never raises: query_events() itself
+    # returns [] rather than propagating on a query error.
+    _check_recent_lane_failures(add, paths)
 
     hard_failures = [check for check in checks if not check.ok and check.severity == "error"]
     return (not hard_failures, checks)

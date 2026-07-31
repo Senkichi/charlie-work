@@ -14,9 +14,11 @@ from pathlib import Path
 import pytest
 
 from charlie_work.config import RunnerAllocationConfig
+from charlie_work.instrumentation import close_db, query_events
 from charlie_work.runner_allocation import (
     AllocationPlan,
     RepoDemand,
+    RepoTarget,
     RunnerInstance,
     SlotAction,
     SlotChange,
@@ -27,6 +29,7 @@ from charlie_work.runner_allocation import (
     plan_allocation,
     plan_summary,
     repo_slug_from_github_url,
+    starved_repos,
 )
 from charlie_work.runner_allocation_pass import resolve_inputs, run_allocation_pass
 from charlie_work.runner_slots import (
@@ -516,6 +519,28 @@ def test_plan_defers_demotion_while_nobody_is_waiting() -> None:
 
 
 def test_plan_demotes_once_the_slack_streak_matures() -> None:
+    """A mature streak still parks when the budget is already fully used."""
+    instances = _instances({CW: [("cw-1", True, False), ("cw-2", True, False)]})
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW)},
+        budget=2,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 3},
+        demand_idle_samples=3,
+    )
+    parks = [c for c in plan.changes if c.action is SlotAction.PARK]
+    assert [c.runner_name for c in parks] == ["cw-2"]
+
+
+def test_plan_holds_mature_slack_when_budget_undersubscribed() -> None:
+    """Mature streaks must not park idle slots when the budget has spare room.
+
+    Reproduced from issue #628: a host with budget to spare should not bounce
+    the same listeners through park/restore cycles, because the restore latency
+    costs real CI time while the parked slots were not displacing any work.
+    """
     instances = _instances({CW: [("cw-1", True, False), ("cw-2", True, False)]})
     plan = plan_allocation(
         instances,
@@ -526,8 +551,129 @@ def test_plan_demotes_once_the_slack_streak_matures() -> None:
         idle_streaks={CW: 3},
         demand_idle_samples=3,
     )
+    assert [c for c in plan.changes if c.action is SlotAction.PARK] == []
+    assert any(
+        "budget undersubscribed" in note and "no repo is waiting" in note for note in plan.notes
+    )
+
+
+def test_plan_does_not_displace_idle_slots_when_pending_starts_fit() -> None:
+    """A repo that can start its own runners using spare budget should not force
+    an idle repo to park first. Issue #628: the budget-undersubscribed guard
+    must not turn into a hard floor when another repo is merely ramping up.
+    """
+    instances = _instances(
+        {
+            CW: [
+                ("cw-1", True, False),
+                ("cw-2", True, False),
+                ("cw-3", True, False),
+                ("cw-4", True, False),
+            ],
+            JC: [
+                ("jc-1", True, False),
+                ("jc-2", False, False),
+                ("jc-3", False, False),
+                ("jc-4", False, False),
+            ],
+        }
+    )
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW), JC: RepoDemand(JC, queued_jobs=4)},
+        budget=8,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 3},
+        demand_idle_samples=3,
+    )
+    assert [c for c in plan.changes if c.action is SlotAction.PARK] == []
+    starts = [c for c in plan.changes if c.action is SlotAction.START]
+    assert [c.runner_name for c in starts] == ["jc-2", "jc-3", "jc-4"]
+    assert not any("above the" in note and "budget" in note for note in plan.notes)
+    assert any("budget undersubscribed" in note for note in plan.notes)
+    # The note must report the post-plan occupancy (8/8), not the pre-plan count (5/8).
+    assert any("8/8 running" in note for note in plan.notes)
+
+
+def test_plan_demotes_when_pending_starts_would_exceed_budget() -> None:
+    """If pending starts do not fit in the spare budget, the surplus must still
+    be reclaimed so the host stays within its configured ceiling."""
+    instances = _instances(
+        {
+            CW: [
+                ("cw-1", True, False),
+                ("cw-2", True, False),
+                ("cw-3", True, False),
+                ("cw-4", True, False),
+                ("cw-5", True, False),
+            ],
+            JC: [
+                ("jc-1", True, False),
+                ("jc-2", False, False),
+                ("jc-3", False, False),
+                ("jc-4", False, False),
+            ],
+        }
+    )
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW), JC: RepoDemand(JC, queued_jobs=4)},
+        budget=8,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 3},
+        demand_idle_samples=3,
+    )
     parks = [c for c in plan.changes if c.action is SlotAction.PARK]
-    assert [c.runner_name for c in parks] == ["cw-2"]
+    assert [c.runner_name for c in parks] == ["cw-5", "cw-4", "cw-3", "cw-2"]
+    starts = [c for c in plan.changes if c.action is SlotAction.START]
+    assert [c.runner_name for c in starts] == ["jc-2", "jc-3", "jc-4"]
+
+
+def test_plan_holds_mature_slack_with_busy_runners() -> None:
+    """A budget-undersubscribed hold still reports surplus listeners that are
+    executing jobs, so the hold does not look like purely idle slots."""
+    instances = _instances(
+        {CW: [("cw-1", True, True), ("cw-2", True, True), ("cw-3", True, False)]}
+    )
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW)},
+        budget=8,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 3},
+        demand_idle_samples=3,
+    )
+    assert [c for c in plan.changes if c.action is SlotAction.PARK] == []
+    budget_notes = [n for n in plan.notes if "budget undersubscribed" in n]
+    assert len(budget_notes) == 1
+    assert "executing jobs" in budget_notes[0]
+
+
+def test_plan_holds_mixed_hysteresis_and_budget_surplus() -> None:
+    """One repo in its grace period and another with a mature streak can both be
+    held in the same pass when the budget is undersubscribed."""
+    instances = _instances(
+        {
+            CW: [("cw-1", True, False), ("cw-2", True, False)],
+            JC: [("jc-1", True, False), ("jc-2", True, False)],
+        }
+    )
+    plan = plan_allocation(
+        instances,
+        {CW: RepoDemand(CW), JC: RepoDemand(JC)},
+        budget=8,
+        budget_reason="test",
+        min_per_repo=1,
+        idle_streaks={CW: 1, JC: 3},
+        demand_idle_samples=3,
+    )
+    assert [c for c in plan.changes if c.action is SlotAction.PARK] == []
+    assert any("slack for 1/3" in note for note in plan.notes)
+    assert any("budget undersubscribed" in note for note in plan.notes)
+    assert not any("above the" in note and "budget" in note for note in plan.notes)
 
 
 def test_plan_reclaims_immediately_when_another_repo_is_waiting() -> None:
@@ -812,7 +958,7 @@ def test_discovery_uses_the_platform_launch_script(tmp_path: Path) -> None:
 
 
 def test_idle_streaks_round_trip(tmp_path: Path) -> None:
-    save_idle_streaks(tmp_path, {CW: 2, JC: 0}, source="prologue")
+    save_idle_streaks(tmp_path, {CW: 2, JC: 0}, source="prologue", full_pass_interval_seconds=300)
     assert load_idle_streaks(tmp_path) == {CW: 2, JC: 0}
 
 
@@ -820,7 +966,9 @@ def test_tie_break_offset_round_trip(tmp_path: Path) -> None:
     """The floor-shortfall rotation offset persists across passes (issue #601)."""
     from charlie_work.runner_slots import load_tie_break_offset
 
-    save_idle_streaks(tmp_path, {CW: 1}, source="prologue", tie_break_offset=3)
+    save_idle_streaks(
+        tmp_path, {CW: 1}, source="prologue", full_pass_interval_seconds=300, tie_break_offset=3
+    )
     assert load_tie_break_offset(tmp_path) == 3
 
 
@@ -839,7 +987,7 @@ def test_tie_break_offset_defaults_to_zero_on_corrupt_state(tmp_path: Path) -> N
 
 def test_idle_streak_write_is_atomic(tmp_path: Path) -> None:
     """Temp-file + replace, per the project's JSON-write invariant."""
-    save_idle_streaks(tmp_path, {CW: 1}, source="prologue")
+    save_idle_streaks(tmp_path, {CW: 1}, source="prologue", full_pass_interval_seconds=300)
     assert list(tmp_path.glob("*.tmp")) == []
     payload = json.loads((tmp_path / "runner-allocation.json").read_text(encoding="utf-8"))
     assert payload["version"] == 1
@@ -1004,6 +1152,85 @@ def test_resolve_inputs_is_quiet_when_the_budget_is_configured(tmp_path: Path) -
 
 
 # --------------------------------------------------------------------------
+# run_allocation_pass: skip provenance (issue #606)
+#
+# A pass that declines to act used to leave the state file absent-or-stale, so
+# the doctor probe attributed every skip to "the daemon never reached
+# allocation" (#590). The pass now records the actual reason. ``gh`` is never
+# reached on either skip path, so a stand-in is safe here.
+# --------------------------------------------------------------------------
+
+
+def test_run_allocation_pass_records_a_skip_when_no_runners_are_found(
+    tmp_path: Path,
+) -> None:
+    """A real pass with no runners under managed_root writes a skip record."""
+    from charlie_work.runner_allocation_pass import run_allocation_pass
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    result = run_allocation_pass(
+        gh=None,  # type: ignore[arg-type]
+        allocation=RunnerAllocationConfig(enabled=True, managed_root=str(tmp_path)),
+        fleet_dir_override=str(tmp_path),
+        dry_run=False,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+
+    assert result.skipped is True
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.skip_reason is not None
+    assert "no configured runners" in stamp.skip_reason
+    assert stamp.source == "prologue"
+    assert stamp.full_pass_interval_seconds == 300
+
+
+def test_run_allocation_pass_records_a_skip_when_inputs_cannot_resolve(
+    tmp_path: Path,
+) -> None:
+    """An unresolvable managed_root writes a skip record naming the cause."""
+    from charlie_work.runner_allocation_pass import run_allocation_pass
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    result = run_allocation_pass(
+        gh=None,  # type: ignore[arg-type]
+        allocation=RunnerAllocationConfig(enabled=True),  # no managed_root, no fallback
+        fleet_dir_override=str(tmp_path),
+        dry_run=False,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+
+    assert result.ok is False
+    assert result.error is not None
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.skip_reason is not None
+    assert "managed_root" in stamp.skip_reason
+
+
+def test_run_allocation_pass_does_not_write_state_on_a_dry_run_skip(
+    tmp_path: Path,
+) -> None:
+    """A dry-run skip must not bump updated_at — that would look like a pass."""
+    from charlie_work.runner_allocation_pass import run_allocation_pass
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    run_allocation_pass(
+        gh=None,  # type: ignore[arg-type]
+        allocation=RunnerAllocationConfig(enabled=True, managed_root=str(tmp_path)),
+        fleet_dir_override=str(tmp_path),
+        dry_run=True,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+
+    # Dry-run isolation: no state file at all.
+    assert load_allocation_stamp(tmp_path) is None
+
+
+# --------------------------------------------------------------------------
 # Busy detection (real body)
 # --------------------------------------------------------------------------
 #
@@ -1146,7 +1373,7 @@ def test_saved_state_records_which_path_wrote_it(tmp_path: Path) -> None:
     """Provenance is what lets the doctor probe distinguish daemon from operator."""
     from charlie_work.runner_slots import load_allocation_stamp
 
-    save_idle_streaks(tmp_path, {CW: 1}, source="cli")
+    save_idle_streaks(tmp_path, {CW: 1}, source="cli", full_pass_interval_seconds=300)
     payload = json.loads((tmp_path / "runner-allocation.json").read_text(encoding="utf-8"))
     assert payload["source"] == "cli"
 
@@ -1186,6 +1413,152 @@ def test_allocation_stamp_treats_a_naive_timestamp_as_utc(tmp_path: Path) -> Non
     assert stamp is not None
     assert stamp.updated_at is not None
     assert stamp.updated_at.tzinfo is not None
+
+
+# --------------------------------------------------------------------------
+# Provenance: driving interval + skip reason (issue #606)
+# --------------------------------------------------------------------------
+
+
+def test_save_idle_streaks_records_the_driving_interval(tmp_path: Path) -> None:
+    """The interval the pass was driven at is persisted, not re-resolved later."""
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    save_idle_streaks(tmp_path, {CW: 1}, source="prologue", full_pass_interval_seconds=120)
+    payload = json.loads((tmp_path / "runner-allocation.json").read_text(encoding="utf-8"))
+    assert payload["full_pass_interval_seconds"] == 120
+    assert payload["skip_reason"] is None
+
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.full_pass_interval_seconds == 120
+    assert stamp.skip_reason is None
+
+
+def test_allocation_stamp_reads_interval_and_skip_reason(tmp_path: Path) -> None:
+    """Both new provenance fields round-trip through the state file."""
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    (tmp_path / "runner-allocation.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-07-28T00:00:00+00:00",
+                "source": "prologue",
+                "full_pass_interval_seconds": 90,
+                "skip_reason": "no configured runners found under /x",
+                "repos": {CW: {"idle_streak": 2}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.full_pass_interval_seconds == 90
+    assert stamp.skip_reason == "no configured runners found under /x"
+
+
+def test_allocation_stamp_treats_a_pre_interval_file_as_unknown_interval(
+    tmp_path: Path,
+) -> None:
+    """A file written before interval recording falls back to None, not a guess."""
+    from charlie_work.runner_slots import load_allocation_stamp
+
+    (tmp_path / "runner-allocation.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-07-28T00:00:00+00:00",
+                "source": "prologue",
+                "repos": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.full_pass_interval_seconds is None
+    assert stamp.skip_reason is None
+
+
+def test_save_allocation_skip_records_the_reason_without_touching_repos(
+    tmp_path: Path,
+) -> None:
+    """A skip writes provenance + reason and preserves the prior idle streaks."""
+    from charlie_work.runner_slots import load_allocation_stamp, save_allocation_skip
+
+    # A real pass accumulated hysteresis history first.
+    save_idle_streaks(tmp_path, {CW: 2, JC: 1}, source="prologue", full_pass_interval_seconds=300)
+
+    save_allocation_skip(
+        tmp_path,
+        source="prologue",
+        full_pass_interval_seconds=300,
+        skip_reason="no configured runners found under /runners",
+    )
+
+    payload = json.loads((tmp_path / "runner-allocation.json").read_text(encoding="utf-8"))
+    assert payload["skip_reason"] == "no configured runners found under /runners"
+    assert payload["source"] == "prologue"
+    assert payload["full_pass_interval_seconds"] == 300
+    # The streaks are preserved, not reset — a transient skip must not zero
+    # demotion hysteresis.
+    assert payload["repos"][CW]["idle_streak"] == 2
+    assert payload["repos"][JC]["idle_streak"] == 1
+
+    stamp = load_allocation_stamp(tmp_path)
+    assert stamp is not None
+    assert stamp.skip_reason == "no configured runners found under /runners"
+    assert stamp.full_pass_interval_seconds == 300
+
+
+def test_save_allocation_skip_preserves_repos_when_no_prior_state(tmp_path: Path) -> None:
+    """A skip with no prior file writes an empty repos map, not a missing one."""
+    from charlie_work.runner_slots import save_allocation_skip
+
+    save_allocation_skip(
+        tmp_path,
+        source="prologue",
+        full_pass_interval_seconds=300,
+        skip_reason="managed_root does not exist: /nope",
+    )
+    payload = json.loads((tmp_path / "runner-allocation.json").read_text(encoding="utf-8"))
+    assert payload["repos"] == {}
+    assert payload["skip_reason"] == "managed_root does not exist: /nope"
+
+
+def test_save_allocation_skip_write_is_atomic(tmp_path: Path) -> None:
+    """The skip writer shares the temp-file + replace invariant."""
+    from charlie_work.runner_slots import save_allocation_skip
+
+    save_allocation_skip(
+        tmp_path,
+        source="prologue",
+        full_pass_interval_seconds=300,
+        skip_reason="none",
+    )
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_save_allocation_skip_preserves_the_tie_break_offset(tmp_path: Path) -> None:
+    """A skip must not reset the floor-shortfall rotation (issues #601 + #606).
+
+    save_idle_streaks and save_allocation_skip share one writer; without an
+    explicit read-back the skip would write the default 0 and re-starve the
+    repo the rotation had just moved past.
+    """
+    from charlie_work.runner_slots import load_tie_break_offset, save_allocation_skip
+
+    save_idle_streaks(
+        tmp_path, {CW: 1}, source="prologue", full_pass_interval_seconds=300, tie_break_offset=3
+    )
+    save_allocation_skip(
+        tmp_path,
+        source="prologue",
+        full_pass_interval_seconds=300,
+        skip_reason="no runners",
+    )
+    assert load_tie_break_offset(tmp_path) == 3
 
 
 # --------------------------------------------------------------------------
@@ -1258,6 +1631,7 @@ def test_run_allocation_pass_threads_and_persists_tie_break_offset_across_passes
         config,
         fleet_dir_override=str(fleet_dir),
         source="prologue",
+        full_pass_interval_seconds=300,
     )
     assert r1.ok is True
     assert r1.plan is not None
@@ -1271,9 +1645,312 @@ def test_run_allocation_pass_threads_and_persists_tie_break_offset_across_passes
         config,
         fleet_dir_override=str(fleet_dir),
         source="prologue",
+        full_pass_interval_seconds=300,
     )
     assert r2.ok is True
     assert r2.plan is not None
     t2 = {t.repo: t.target for t in r2.plan.targets}
     assert t2 == {"o/A": 1, "o/B": 0, "o/C": 1}
     assert load_tie_break_offset(fleet_dir) == 2
+
+
+# --------------------------------------------------------------------------
+# starved_repos — pure detection (issue #799)
+# --------------------------------------------------------------------------
+#
+# Fast, direct checks of the pure function against hand-built plans. These do
+# not exercise run_allocation_pass's edge-triggering — see the
+# run_allocation_pass section below for that, driven through the real entry
+# point rather than a synthesized plan.
+
+
+def test_starved_repos_detects_demand_exceeding_capacity_with_spare_budget() -> None:
+    """demand > capacity, with the host budget undersubscribed, is starvation."""
+    plan = AllocationPlan(
+        budget=4,
+        budget_reason="test",
+        targets=(RepoTarget(repo="Fake/repo-xyz", target=2, running=2, demand=9, capacity=2),),
+        changes=(),
+    )
+
+    starved = starved_repos(plan)
+
+    assert len(starved) == 1
+    signal = starved[0]
+    assert signal.repo == "Fake/repo-xyz"
+    assert signal.demand == 9
+    assert signal.capacity == 2
+    assert signal.running == 2
+    assert signal.spare_budget == 2  # budget 4 - running 2
+
+
+def test_starved_repos_silent_when_demand_within_capacity() -> None:
+    """Positive control: a healthy target set must signal nothing.
+
+    Without this, a detector that always fires (or never fires) would still
+    pass a "fires when starved" test alone.
+    """
+    plan = AllocationPlan(
+        budget=4,
+        budget_reason="test",
+        targets=(
+            RepoTarget(repo="Fake/repo-a", target=1, running=1, demand=1, capacity=2),
+            RepoTarget(repo="Fake/repo-b", target=1, running=1, demand=1, capacity=1),
+        ),
+        changes=(),
+    )
+
+    assert starved_repos(plan) == ()
+
+
+def test_starved_repos_silent_when_budget_fully_subscribed() -> None:
+    """demand > capacity alone is not enough; a saturated budget has no slack
+    a bigger registration could use, so the signal must stay silent."""
+    plan = AllocationPlan(
+        budget=2,
+        budget_reason="test",
+        targets=(RepoTarget(repo="Fake/repo-xyz", target=2, running=2, demand=9, capacity=2),),
+        changes=(),
+    )
+
+    assert starved_repos(plan) == ()
+
+
+# --------------------------------------------------------------------------
+# run_allocation_pass — runner_capacity_starved / _recovered events (#799)
+# --------------------------------------------------------------------------
+#
+# These drive the REAL run_allocation_pass entrypoint — the same function
+# both `charlie runners allocate` (cli.py's run_runners_allocate, which calls
+# run_allocation_pass with state_path=paths.state_file) and the fleet
+# prologue (fleet_dispatch.py's _run_fleet_allocation_prologue, which calls
+# it with state_path=anchor_state) invoke — rather than the private
+# _emit_capacity_events helper directly. A test that only called the helper
+# would keep passing even if it were no longer wired into the real pass.
+
+
+def _capacity_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    repo: str,
+    demand: int,
+    capacity: int,
+    budget: int,
+    state_path: Path | None,
+    dry_run: bool = False,
+):
+    """Run the real run_allocation_pass against one synthesized repo.
+
+    ``repo`` is caller-supplied and deliberately not one of this module's
+    CW/JC/PUB constants in most callers below, so a repo that only exists
+    because this test invented it still drives the signal correctly --
+    proving nothing in the detector or the pass is keyed off a known name.
+    """
+    managed_root = tmp_path / "runners"
+    managed_root.mkdir(exist_ok=True)
+    for i in range(capacity):
+        dirname = f"{repo.replace('/', '-')}-{i}"
+        if not (managed_root / dirname).exists():
+            _make_runner_dir(managed_root, dirname, f"https://github.com/{repo}", dirname)
+
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.measure_repo_demand",
+        lambda gh, r, max_runs_scanned: RepoDemand(repo=r, queued_jobs=demand),
+    )
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.fetch_busy_runner_names",
+        lambda gh, r: (set(), None),
+    )
+    # No real actuation: these runner dirs have no listener process, so
+    # starting/parking them would touch the host. The plan and the event log
+    # are what these tests inspect.
+    monkeypatch.setattr(
+        "charlie_work.runner_allocation_pass.apply_allocation",
+        lambda plan, dry_run=False: [],
+    )
+
+    config = RunnerAllocationConfig(
+        enabled=True,
+        managed_root=str(managed_root),
+        max_running_runners=budget,
+        min_running_per_repo=0,
+        demand_idle_samples=3,
+    )
+
+    class _FakeGh:
+        """Stand-in: every gh.run call is intercepted by the monkeypatches above."""
+
+    return run_allocation_pass(
+        _FakeGh(),  # type: ignore[arg-type]
+        config,
+        fleet_dir_override=str(tmp_path / "fleet"),
+        state_path=state_path,
+        dry_run=dry_run,
+        source="prologue",
+        full_pass_interval_seconds=300,
+    )
+
+
+def test_run_allocation_pass_emits_runner_capacity_starved_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A synthesized starved target set produces exactly one starved event,
+    written through the real run_allocation_pass entrypoint."""
+    state_path = tmp_path / "state.json"
+    try:
+        result = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=9,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+        )
+        assert result.ok is True
+
+        events = query_events(state_path, kind="runner_capacity_starved")
+        assert len(events) == 1
+        assert events[0]["repo"] == "Fake/repo-xyz"
+        assert events[0]["payload"]["demand"] == 9
+        assert events[0]["payload"]["capacity"] == 1
+        assert events[0]["payload"]["spare_budget"] == 4
+        assert events[0]["level"] == "warning"
+    finally:
+        close_db(state_path)
+
+
+def test_run_allocation_pass_positive_control_silence_on_healthy_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mandatory positive control: a healthy synthesized target set (demand <=
+    capacity) must write zero capacity events through the real entrypoint."""
+    state_path = tmp_path / "state.json"
+    try:
+        result = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-healthy",
+            demand=1,
+            capacity=2,
+            budget=4,
+            state_path=state_path,
+        )
+        assert result.ok is True
+
+        assert query_events(state_path, kind="runner_capacity_starved") == []
+        assert query_events(state_path, kind="runner_capacity_recovered") == []
+    finally:
+        close_db(state_path)
+
+
+def test_run_allocation_pass_dry_run_writes_no_capacity_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--dry-run previews a starved plan without writing the event -- an
+    event write is a side effect, and dry-run must have none."""
+    state_path = tmp_path / "state.json"
+    try:
+        result = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=9,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+            dry_run=True,
+        )
+        assert result.ok is True
+
+        assert query_events(state_path, kind="runner_capacity_starved") == []
+    finally:
+        close_db(state_path)
+
+
+def test_run_allocation_pass_emits_exactly_one_starved_event_across_n_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance criterion: N consecutive passes with a persistently starved
+    repo produce exactly ONE runner_capacity_starved event, not N.
+
+    demand > capacity while the budget has slack is this host's steady state
+    for days at a time (registration only moves on a separate, much slower,
+    possibly-disabled provisioning cadence) -- a level-triggered emit would
+    write one row per repo per pass forever. This is the test that would have
+    passed under that broken design; it is the one that actually matters.
+    """
+    state_path = tmp_path / "state.json"
+    try:
+        for _ in range(4):
+            result = _capacity_pass(
+                tmp_path,
+                monkeypatch,
+                repo="Fake/repo-xyz",
+                demand=9,
+                capacity=1,
+                budget=4,
+                state_path=state_path,
+            )
+            assert result.ok is True
+
+        events = query_events(state_path, kind="runner_capacity_starved")
+        assert len(events) == 1
+    finally:
+        close_db(state_path)
+
+
+def test_run_allocation_pass_emits_recovery_event_on_transition_out_of_starvation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repo transitioning from starved to healthy fires exactly one
+    runner_capacity_recovered event -- and staying healthy afterward does not
+    re-fire it. Without this, a reader cannot tell "recovered" from "the
+    signal stopped working"."""
+    state_path = tmp_path / "state.json"
+    try:
+        r1 = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=9,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+        )
+        assert r1.ok is True
+        assert len(query_events(state_path, kind="runner_capacity_starved")) == 1
+        assert query_events(state_path, kind="runner_capacity_recovered") == []
+
+        # Demand drops to at-or-below capacity: the repo recovers.
+        r2 = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=1,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+        )
+        assert r2.ok is True
+        assert len(query_events(state_path, kind="runner_capacity_starved")) == 1
+        recovered = query_events(state_path, kind="runner_capacity_recovered")
+        assert len(recovered) == 1
+        assert recovered[0]["repo"] == "Fake/repo-xyz"
+
+        # A further healthy pass must not re-fire the recovery event.
+        r3 = _capacity_pass(
+            tmp_path,
+            monkeypatch,
+            repo="Fake/repo-xyz",
+            demand=1,
+            capacity=1,
+            budget=4,
+            state_path=state_path,
+        )
+        assert r3.ok is True
+        assert len(query_events(state_path, kind="runner_capacity_starved")) == 1
+        assert len(query_events(state_path, kind="runner_capacity_recovered")) == 1
+    finally:
+        close_db(state_path)
