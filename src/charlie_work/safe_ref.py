@@ -28,9 +28,9 @@ _SHA_RE = re.compile(r"\A[0-9a-fA-F]{4,64}\Z")
 # rejecting every rev-syntax metacharacter. First char must be alphanumeric
 # (rejects leading ``-`` for flag-injection prevention, and leading ``.``/``/``
 # per git check-ref-format rules). Subsequent chars: alphanumerics plus
-# ``. _ / -``. Metacharacters ``~ ^ : ? * [ \`` and whitespace/control chars
+# ``. _ / - +``. Metacharacters ``~ ^ : ? * [ \`` and whitespace/control chars
 # are excluded by the allowlist; ``..`` and ``@{`` are checked separately.
-_REF_NAME_RE = re.compile(r"\A[0-9A-Za-z][0-9A-Za-z._/-]*\Z")
+_REF_NAME_RE = re.compile(r"\A[0-9A-Za-z][0-9A-Za-z._+/-]*\Z")
 
 
 def require_valid_sha(value: str, *, context: str) -> str:
@@ -53,14 +53,14 @@ def require_valid_ref_name(value: str, *, context: str) -> str:
 
     Rejects anything starting with ``-`` (flag injection) or containing
     rev-syntax metacharacters, ``..``, ``@{``, or trailing ``/``/``.``.
-    Conservative allowlist: alphanumerics plus ``. _ / -``. See issue #659.
+    Conservative allowlist: alphanumerics plus ``. _ / - +``. See issue #659.
     """
     if not isinstance(value, str) or not value:
         raise ValueError(f"{context}: ref name is empty or not a string")
     if not _REF_NAME_RE.match(value):
         raise ValueError(
             f"{context}: {value!r} is not a valid git ref name "
-            f"(must start alphanumeric; only alphanumerics, '.', '_', '/', '-' allowed)"
+            f"(must start alphanumeric; only alphanumerics, '.', '_', '/', '-', '+' allowed)"
         )
     if ".." in value:
         raise ValueError(f"{context}: {value!r} contains '..' (not a valid git ref name)")

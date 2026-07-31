@@ -84,6 +84,10 @@ class TestRequireValidRefName:
     def test_accepts_remote_tracking_ref(self) -> None:
         assert require_valid_ref_name("origin/main", context="test") == "origin/main"
 
+    def test_accepts_plus_in_branch(self) -> None:
+        """Git-legal ref names containing '+' must not be rejected."""
+        assert require_valid_ref_name("feature/+hotfix", context="test") == "feature/+hotfix"
+
     def test_accepts_head(self) -> None:
         assert require_valid_ref_name("HEAD", context="test") == "HEAD"
 
