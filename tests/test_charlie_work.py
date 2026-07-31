@@ -29395,6 +29395,175 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
     assert recovered_events[0]["payload"]["pr_number"] == 100
     assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
 
+    # Issue #773 measurement-first requirement: even the legacy no-terminal-
+    # record fallback path now reports pid/exit_code/duration_seconds on the
+    # event (exit_code/duration None since no terminal record exists).
+    assert recovered_events[0]["payload"]["pid"] == 99999
+    assert recovered_events[0]["payload"]["exit_code"] is None
+    assert recovered_events[0]["payload"]["duration_seconds"] is None
+
+
+def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
+    """Issue #773: a worker that exited 0 (clean, no-op) must not be reset to
+    rework_requested or burn a redispatch attempt, even though its dead PID and
+    unchanged head otherwise look identical to a crash under
+    ``_worker_pid_alive`` alone.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",  # Unchanged since request_changes
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    # Durable terminal-status record a real worker's watcher thread would have
+    # written at exit (process_utils.start_terminal_status_watcher): exit
+    # code 0 means the worker completed cleanly rather than crashing.
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 0,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:05:00Z",
+                "duration_seconds": 300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Must NOT be reset to rework_requested -- that would burn a redispatch
+    # attempt on a worker that never had anything to change.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("dispatched_at") == "2024-01-01T00:00:00Z"
+    assert entry["worker_pid"] == 99999
+
+    events = state.get("events", [])
+    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    payload = drift_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_clean_exit_no_op"
+    assert payload["pid"] == 99999
+    assert payload["exit_code"] == 0
+    assert payload["duration_seconds"] == 300.0
+
+
+def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Path) -> None:
+    """Issue #773: a non-zero exit code recorded in the terminal-status file
+    must still take the pre-#773 recovery path (reset to rework_requested) --
+    the fix only special-cases a confirmed clean (exit code 0) exit, never a
+    confirmed abnormal one.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 1,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:00:05Z",
+                "duration_seconds": 5.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    payload = recovered_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_with_request_changes"
+    assert payload["pid"] == 99999
+    assert payload["exit_code"] == 1
+    assert payload["duration_seconds"] == 5.0
+
 
 def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
     """Regression test for issue #207: dead worker with head change should emit drift event, not auto-reset."""

@@ -139,7 +139,12 @@ from .state import (
 )
 from .instrumentation import correlation_context, log_event, record_loop_pass
 from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
-from .process_utils import is_pid_alive, kill_process_tree, sweep_orphan_processes
+from .process_utils import (
+    find_worker_terminal_status,
+    is_pid_alive,
+    kill_process_tree,
+    sweep_orphan_processes,
+)
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
 from .routing import AdapterChoice, record_adapter_choice, select_adapter
 
@@ -3127,23 +3132,88 @@ def _detect_and_handle_orphaned_workers(
                 reviewed_head_sha = pr_state.get("reviewed_head_sha")
                 live_head_sha = pr_data.get("headRefOid")
 
+                # Issue #773: measurement-first payload enrichment. A dead PID
+                # alone cannot distinguish a worker that crashed from one that
+                # exited 0 having pushed nothing -- both present identically
+                # to `_worker_pid_alive`. `find_worker_terminal_status` reads
+                # the durable record `start_terminal_status_watcher`
+                # (process_utils.py) writes at the moment a claude-code worker
+                # actually exits; it returns None for legacy sessions, sessions
+                # from adapters that don't write one (e.g. devin-shell), or
+                # any session whose watcher never got to run (e.g. orchestrator
+                # restart mid-session). `terminal_exit_code` is deliberately
+                # left as None in all of those cases rather than guessed at --
+                # every event below records it as-is so the two populations
+                # (confirmed clean exit vs. everything else) are queryable
+                # retrospectively even before they're fully separable.
+                terminal = find_worker_terminal_status(sessions_dir, issue_number)
+                terminal_pid = entry.get("worker_pid")
+                terminal_exit_code = terminal.get("exit_code") if terminal else None
+                terminal_duration_seconds = terminal.get("duration_seconds") if terminal else None
+
                 if last_decision == "request_changes" and reviewed_head_sha and live_head_sha:
                     if reviewed_head_sha == live_head_sha:
-                        # Safe to reset to rework_requested - PR head unchanged since request_changes
-                        entry["status"] = "rework_requested"
-                        entry["dispatched_at"] = None
-                        sweep_events.append(
-                            (
-                                "orphaned_worker_recovered",
-                                {
-                                    "issue_number": issue_number,
-                                    "pr_number": pr_number,
-                                    "previous_status": "dispatched",
-                                    "new_status": "rework_requested",
-                                    "reason": "dead_worker_with_request_changes",
-                                },
+                        if terminal_exit_code == 0:
+                            # The worker exited cleanly (exit code 0) rather
+                            # than crashing -- e.g. it was handed an empty
+                            # rework brief with nothing left to act on. Do NOT
+                            # auto-reset to rework_requested: that would spend
+                            # one of max_auto_redispatch's attempts on a
+                            # worker that never had anything to change,
+                            # eventually escalating a benign no-op to
+                            # agent:human-needed (issue #773). Surface it once
+                            # instead, via the same fingerprinted
+                            # surface-once convergence the other drift
+                            # branches below already use, so a human/janitor
+                            # can decide whether the review itself needs
+                            # revisiting -- retrying a dispatch that already
+                            # proved it produces no change on this exact head
+                            # would just repeat the no-op.
+                            fingerprint = _drift_fingerprint(
+                                reason="dead_worker_clean_exit_no_op",
+                                reviewed_head_sha=reviewed_head_sha,
                             )
-                        )
+                            if entry.get("orphan_drift_fingerprint") == fingerprint:
+                                state["issues"][str(issue_number)] = entry
+                                continue
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "reason": "dead_worker_clean_exit_no_op",
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
+                        else:
+                            # No terminal record, or a non-zero/None exit code:
+                            # unchanged from pre-#773 behavior -- safe to reset
+                            # to rework_requested (PR head unchanged since
+                            # request_changes).
+                            entry["status"] = "rework_requested"
+                            entry["dispatched_at"] = None
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_recovered",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "new_status": "rework_requested",
+                                        "reason": "dead_worker_with_request_changes",
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
                     else:
                         # PR head has changed - route to review if possible,
                         # otherwise surface as a drift finding (once per fingerprint).
@@ -3181,6 +3251,9 @@ def _detect_and_handle_orphaned_workers(
                                         "reviewed_head_sha": reviewed_head_sha,
                                         "live_head_sha": live_head_sha,
                                         "reason": "dead_worker_with_head_change",
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
                                     },
                                 )
                             )
@@ -3203,6 +3276,9 @@ def _detect_and_handle_orphaned_workers(
                                     "previous_status": "dispatched",
                                     "last_decision": last_decision,
                                     "reason": "dead_worker_unsafe_to_auto_reset",
+                                    "pid": terminal_pid,
+                                    "exit_code": terminal_exit_code,
+                                    "duration_seconds": terminal_duration_seconds,
                                 },
                             )
                         )
