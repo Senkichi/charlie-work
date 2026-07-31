@@ -29,7 +29,6 @@ from charlie_work.runner_allocation import (
     plan_allocation,
     plan_summary,
     repo_slug_from_github_url,
-    runner_capacity_starved_events,
     starved_repos,
 )
 from charlie_work.runner_allocation_pass import resolve_inputs, run_allocation_pass
@@ -772,65 +771,6 @@ def test_plan_target_capped_by_capacity_when_demand_exceeds_registered_runners()
 
 
 # --------------------------------------------------------------------------
-# runner_capacity_starved_events — synthesized target set
-# --------------------------------------------------------------------------
-
-
-def test_runner_capacity_starved_detected_from_synthesized_targets() -> None:
-    """A repo whose demand exceeds its registered runner count while the host
-    still has spare budget is reported as capacity-starved."""
-    plan = AllocationPlan(
-        budget=8,
-        budget_reason="test",
-        targets=(
-            RepoTarget(repo=CW, target=2, running=2, demand=13, capacity=2),
-            RepoTarget(repo=JC, target=1, running=3, demand=0, capacity=5),
-            RepoTarget(repo=PUB, target=1, running=1, demand=0, capacity=1),
-        ),
-        changes=(),
-    )
-    events = runner_capacity_starved_events(plan)
-    assert len(events) == 1
-    assert events[0]["repo"] == CW
-    assert events[0]["demand"] == 13
-    assert events[0]["capacity"] == 2
-    assert events[0]["spare_budget"] == 2
-
-
-def test_runner_capacity_starved_is_quiet_when_demand_fits_capacity() -> None:
-    """Positive control: every repo has demand <= capacity, so the detector
-    stays silent.  A detector that only fires on the broken state is not yet
-    evidence of correct behavior."""
-    plan = AllocationPlan(
-        budget=8,
-        budget_reason="test",
-        targets=(
-            RepoTarget(repo=CW, target=2, running=2, demand=2, capacity=2),
-            RepoTarget(repo=JC, target=3, running=3, demand=0, capacity=5),
-            RepoTarget(repo=PUB, target=1, running=1, demand=0, capacity=1),
-        ),
-        changes=(),
-    )
-    assert runner_capacity_starved_events(plan) == []
-
-
-def test_runner_capacity_starved_is_quiet_when_budget_is_full() -> None:
-    """A repo with demand above capacity is not reported when the host has no
-    spare budget to use."""
-    plan = AllocationPlan(
-        budget=6,
-        budget_reason="test",
-        targets=(
-            RepoTarget(repo=CW, target=2, running=2, demand=13, capacity=2),
-            RepoTarget(repo=JC, target=3, running=3, demand=0, capacity=5),
-            RepoTarget(repo=PUB, target=1, running=1, demand=0, capacity=1),
-        ),
-        changes=(),
-    )
-    assert runner_capacity_starved_events(plan) == []
-
-
-# --------------------------------------------------------------------------
 # annotate_busy / next_idle_streaks
 # --------------------------------------------------------------------------
 
@@ -1483,70 +1423,6 @@ def test_run_allocation_pass_threads_and_persists_tie_break_offset_across_passes
     t2 = {t.repo: t.target for t in r2.plan.targets}
     assert t2 == {"o/A": 1, "o/B": 0, "o/C": 1}
     assert load_tie_break_offset(fleet_dir) == 2
-
-
-def test_run_allocation_pass_logs_runner_capacity_starved_event(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A pass that sees demand above capacity with spare budget persists a
-    runner_capacity_starved event to events.db so provisioning can consume it."""
-    managed_root = tmp_path / "runners"
-    managed_root.mkdir()
-    _make_runner_dir(managed_root, "cw-1", f"https://github.com/{CW}", "cw-1")
-    _make_runner_dir(managed_root, "cw-2", f"https://github.com/{CW}", "cw-2")
-
-    def fake_measure(gh: object, repo: str, max_runs_scanned: int) -> RepoDemand:
-        if repo == CW:
-            return RepoDemand(repo=repo, queued_jobs=13)
-        return RepoDemand(repo=repo)
-
-    monkeypatch.setattr("charlie_work.runner_allocation_pass.measure_repo_demand", fake_measure)
-    monkeypatch.setattr(
-        "charlie_work.runner_allocation_pass.fetch_busy_runner_names",
-        lambda gh, repo: (set(), None),
-    )
-    # Pretend both listeners are already running so the plan is converged and
-    # does not try to start/park real host processes.
-    monkeypatch.setattr(
-        "charlie_work.runner_slots.is_runner_launched",
-        lambda _path: True,
-    )
-
-    fleet_dir = tmp_path / "fleet"
-    state_path = fleet_dir / "state.json"
-
-    config = RunnerAllocationConfig(
-        enabled=True,
-        managed_root=str(managed_root),
-        max_running_runners=8,
-        min_running_per_repo=1,
-        demand_idle_samples=3,
-    )
-
-    class _FakeGh:
-        pass
-
-    result = run_allocation_pass(
-        _FakeGh(),  # type: ignore[arg-type]
-        config,
-        fleet_dir_override=str(fleet_dir),
-        state_path=state_path,
-        source="prologue",
-    )
-
-    assert result.ok is True
-    assert result.plan is not None
-    assert result.plan.changes == ()
-
-    close_db(state_path)
-    events = query_events(state_path, kind="runner_capacity_starved")
-    assert len(events) == 1
-    payload = events[0]["payload"]
-    assert payload["repo"] == CW
-    assert payload["demand"] == 13
-    assert payload["capacity"] == 2
-    assert payload["spare_budget"] == 6
 
 
 # --------------------------------------------------------------------------
