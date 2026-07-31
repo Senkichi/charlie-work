@@ -3,6 +3,15 @@
 Runs in a loop, checking every 60 seconds for new events since the last
 check. Reports event counts by kind, level, and correlation ID, plus
 any errors or warnings seen.
+
+Usage:
+    python scripts/monitor_events.py [path/to/state.json]
+
+The state.json path is optional. When omitted, it is resolved from the
+current repo's layered config (``runtime.state_dir``, default
+``.var/charlie-work``) via ``charlie_work.global_config.load_layered_config``,
+so this script targets the right tree on any repo that overrides
+``runtime.state_dir`` instead of silently assuming the default.
 """
 
 from __future__ import annotations
@@ -13,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from charlie_work.instrumentation import (
+    _db_path,
     close_db,
     event_counts_by_kind,
     read_event_log,
@@ -23,7 +33,10 @@ def monitor(state_path: Path, interval: int = 60) -> None:
     last_count = 0
     last_check = datetime.now(UTC)
 
-    print(f"Monitoring events.db at {state_path.parent / 'events.db'}")
+    # Ask instrumentation for the path instead of re-deriving it: this banner
+    # is the operator's evidence about *which* file is being watched, so a
+    # second spelling that drifts turns it into a confident lie.
+    print(f"Monitoring events.db at {_db_path(state_path)}")
     print(f"Checking every {interval}s. Press Ctrl+C to stop.\n")
 
     while True:
@@ -92,7 +105,16 @@ def monitor(state_path: Path, interval: int = 60) -> None:
 
 
 if __name__ == "__main__":
-    state_path = Path(r"C:\Users\senki\repos\charlie-work\.var\charlie-work\state.json")
+    if len(sys.argv) > 1:
+        state_path = Path(sys.argv[1])
+    else:
+        from charlie_work.global_config import load_layered_config
+        from charlie_work.paths import find_repo_root, runtime_paths
+
+        repo_root = find_repo_root()
+        config = load_layered_config(repo_root)
+        state_path = runtime_paths(repo_root, config.runtime.state_dir).state_file
+
     try:
         monitor(state_path, interval=60)
     except KeyboardInterrupt:
