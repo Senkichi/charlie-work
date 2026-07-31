@@ -3678,47 +3678,112 @@ def _rework_prompt_search_dirs(
 def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     """Render the ``$required_changes_section`` for a rework brief.
 
-    The findings are read from ``review-decision.json``'s ``required_changes``
-    list — the most actionable output the review pipeline produces. Giving
-    them their own rendered section (instead of multiplexing one prose slot)
-    means an operational dispatch note can no longer displace them.
+    The findings are read from ``review-decision.json``. ``required_changes``
+    -- the most actionable output the review pipeline produces -- is the
+    primary source. Giving it its own rendered section (instead of
+    multiplexing one prose slot) means an operational dispatch note can no
+    longer displace it.
 
-    Only rendered for a ``request_changes`` verdict. An ``approved`` or
-    ``blocked`` verdict may carry a non-empty ``required_changes`` list
-    (the field is optional for every decision), but rendering "what must
-    change before this PR can be approved" into an already-approved PR's
-    operational rework brief (merge-conflict / no-CI / cross-pr-revert
-    routes, which explicitly say "do not re-litigate the review") would be
-    contradictory. The findings for non-request_changes verdicts reach the
-    reviewer via ``$prior_review_section`` instead.
+    Measured across the on-disk corpus, ``request_changes`` verdicts with a
+    populated ``required_changes`` are the exception (0 of 20 observed):
+    ``prompts/review.md`` historically documented the field as optional, so
+    reviewers reliably fill in ``summary`` and skip ``required_changes``.
+    That ``summary`` is real, substantive review content -- discarding it
+    because the structured list is empty silently sends a worker a brief
+    with nothing to act on. So for a ``request_changes`` verdict this
+    function degrades through three tiers: (1) the enumerated
+    ``required_changes`` list when non-empty, (2) the verdict's ``summary``
+    rendered verbatim and clearly labelled as prose when the list is empty,
+    (3) an explicit, loud "findings unavailable, check the PR on GitHub"
+    instruction when BOTH are empty. Tier 3 is a hard invariant: this
+    function must never render (or omit into silence) something a worker
+    could read as "there is nothing to change" when a decision actively
+    requires rework.
 
-    Returns an empty string when there is no decision, no list, an empty
-    list, or a non-request_changes decision — the section is omitted
-    entirely rather than rendering a hollow or contradictory header, so a
-    brief with no findings looks the same as before.
+    Rendered for ``request_changes`` and, defensively, ``blocked`` verdicts
+    (routing to rework via the decision-agnostic janitor gates -- merge
+    conflict / no-op-rework repair -- can carry forward whatever verdict was
+    last on disk, including ``blocked``). ``approved`` never renders
+    anything here; its findings (if any) reach the reviewer via
+    ``$prior_review_section`` instead, not the worker's rework brief.
+
+    For ``blocked`` specifically, the enumerated list and the summary
+    fallback (tiers 1-2) are intentionally suppressed even when populated.
+    ``prompts/review.md`` requires ``required_changes`` for ``blocked`` just
+    as it does for ``request_changes``, but "what must change before this PR
+    can be approved" language is the wrong framing for the routes that reach
+    this decision-agnostic branch (merge-conflict / no-CI / cross-pr-revert
+    routes, which explicitly tell the worker "do not re-litigate the
+    review") -- an ``approved`` verdict can also legitimately carry a
+    non-empty ``required_changes`` left over from an earlier round, which is
+    the same contradiction. Tier 3 (the both-empty escape hatch) still
+    applies to ``blocked`` -- suppressing content is fine, but suppressing
+    it AND leaving the worker with no signal that something was withheld is
+    not.
+
+    Returns an empty string only when there is no decision, or the decision
+    is not ``request_changes``/``blocked``, or it is ``blocked`` with some
+    (but not zero) findings content -- every other case renders something.
     """
     if not isinstance(decision, dict):
         return ""
-    if decision.get("decision") != "request_changes":
+    verdict = decision.get("decision")
+    if verdict not in ("request_changes", "blocked"):
         return ""
-    required_changes = decision.get("required_changes")
-    if not isinstance(required_changes, list) or not required_changes:
-        return ""
-    lines = [
-        "## Required changes",
-        "",
-        "Address every item below. These are the reviewer's structured "
-        "findings — the authoritative list of what must change before this "
-        "PR can be approved.",
-        "",
-    ]
-    for change in required_changes:
-        text = str(change).strip()
-        if not text:
-            continue
-        lines.append(f"- {text}")
-    lines.append("")
-    return "\n".join(lines)
+
+    raw_required_changes = decision.get("required_changes")
+    changes = (
+        [str(item).strip() for item in raw_required_changes if str(item).strip()]
+        if isinstance(raw_required_changes, list)
+        else []
+    )
+    raw_summary = decision.get("summary")
+    summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
+
+    if verdict == "request_changes" and changes:
+        lines = [
+            "## Required changes",
+            "",
+            "Address every item below. These are the reviewer's structured "
+            "findings — the authoritative list of what must change before this "
+            "PR can be approved.",
+            "",
+        ]
+        lines.extend(f"- {change}" for change in changes)
+        lines.append("")
+        return "\n".join(lines)
+
+    if verdict == "request_changes" and summary_text:
+        lines = [
+            "## Required changes",
+            "",
+            "The reviewer did not record a structured findings list for this "
+            "verdict. This is their summary, rendered verbatim so it is not "
+            "lost — treat it as the findings to address before this PR can "
+            "be approved:",
+            "",
+            summary_text,
+            "",
+        ]
+        return "\n".join(lines)
+
+    if not changes and not summary_text:
+        lines = [
+            "## Required changes",
+            "",
+            "**REVIEWER FINDINGS UNAVAILABLE.** No structured findings list "
+            "and no summary were recorded for this verdict. This is NOT a "
+            "signal that there is nothing to change — it means the findings "
+            "did not make it into `review-decision.json`. Inspect the PR's "
+            "review comments and review threads on GitHub directly before "
+            "doing anything else.",
+            "",
+        ]
+        return "\n".join(lines)
+
+    # blocked verdict carrying required_changes and/or a summary (but not
+    # both empty): suppressed by design (see docstring) so nothing renders.
+    return ""
 
 
 def _read_review_decision(decision_path: Path) -> dict[str, Any] | None:
