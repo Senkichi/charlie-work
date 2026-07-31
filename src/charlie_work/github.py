@@ -863,6 +863,41 @@ class GitHub:
             return result.value if result.ok and isinstance(result.value, dict) else None
         return result if isinstance(result, dict) else None
 
+    def branch_protection(self, base: str) -> dict[str, Any] | None:
+        """Return branch protection settings for ``base``, or None on failure.
+
+        Wraps ``gh api repos/{owner}/{repo}/branches/{base}/protection``.
+        Returns ``None`` on any failure -- 404 (no protection configured),
+        rate limit, transient network error, gh not installed. Errors are
+        returned as values, never raised.
+
+        Cached per orchestrator pass in ``_list_cache`` (issue #812): callers
+        use this to derive base-freshness policy (``required_status_checks.
+        strict``) instead of a hardcoded config constant, and need exactly
+        one API call per base ref per pass, not one per PR. A failed read is
+        cached as ``None`` too, so a 404/rate-limit does not turn into a
+        per-PR retry storm within the same pass.
+
+        Safety note for callers: ``None`` means "could not be read", not "no
+        freshness required". Any caller gating a safety check on this value
+        must fail closed on ``None``.
+        """
+        cache_key = ("branch_protection", base)
+        if cache_key in self._list_cache:
+            return self._list_cache[cache_key]
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/branches/{base}/protection"],
+            json_output=True,
+            allow_failure=True,
+        )
+        value: dict[str, Any] | None = None
+        if isinstance(result, GitHubRunResult):
+            value = result.value if result.ok and isinstance(result.value, dict) else None
+        elif isinstance(result, dict):
+            value = result
+        self._list_cache[cache_key] = value
+        return value
+
     def compare_diff(self, base: str, head: str) -> str | None:
         """Return the plain unified-diff text between two commits (three-dot compare).
 
@@ -1084,6 +1119,26 @@ class GitHub:
             return True
         except GitHubError:
             return False
+
+    def pr_ready(self, number: int) -> GitHubRunResult:
+        """Mark a draft PR as ready for review via ``gh pr ready`` (issue #818).
+
+        Returns a structured result so callers can distinguish success from
+        failure without inferring from output shape -- errors from external
+        processes come back as values here, never exceptions. Dry-run mode
+        returns a synthetic ok=True result (the operation would succeed if not
+        for dry-run); this mirrors ``_run_bool``'s explicit guard because
+        ``.run()`` itself returns a bare string under dry-run, not a
+        ``GitHubRunResult``.
+        """
+        args = ["pr", "ready", str(number)]
+        if self.dry_run and _is_mutating(args):
+            return GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        result = self.run(args, allow_failure=True)
+        assert isinstance(result, GitHubRunResult)
+        return result
 
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
         """Check which of the given issue numbers are currently open.

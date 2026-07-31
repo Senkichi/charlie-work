@@ -144,7 +144,13 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
         )
 
 
-def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig) -> None:
+def _probe_api_worker(
+    add: Any,
+    paths: RuntimePaths,
+    config: OrchestratorConfig,
+    *,
+    now: datetime.datetime | None = None,
+) -> None:
     """Observability probes for the paid ``api`` worker tier (issue #483).
 
     When the ``api_worker`` section is configured (non-default):
@@ -161,6 +167,11 @@ def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig)
     ``api_budget.load_ledger`` quarantines a corrupt ledger file (renames it to
     a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
     filesystem mutation. Errors surface as check details, never raised.
+
+    ``now`` is the injectable clock used to derive the ledger's ``today`` key
+    (issue #828): defaults to ``datetime.now(UTC)`` when not supplied, so
+    production behavior is byte-identical. ``run_doctor`` samples one ``now``
+    per doctor run and passes it here and to ``_check_runner_allocation``.
     """
     # ``configured`` = the section is not the package default. A bare
     # ``api_worker: {enabled: false}`` with no providers/budget is the default
@@ -250,7 +261,8 @@ def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig)
         )
 
     # 4. Remaining daily/lifetime budget headroom.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    resolved_now = now if now is not None else datetime.now(UTC)
+    today = resolved_now.strftime("%Y-%m-%d")
     status = budget_status(ledger, config.api_worker.budget, today)
     daily_remaining = max(0.0, config.api_worker.budget.max_usd_per_day - status.spent_today_usd)
     lifetime_remaining = max(
@@ -380,7 +392,11 @@ def _allocation_writer_label(source: str | None) -> str:
 
 
 def _check_runner_allocation(
-    add: Any, config: OrchestratorConfig, fleet_dir_override: str | None = None
+    add: Any,
+    config: OrchestratorConfig,
+    fleet_dir_override: str | None = None,
+    *,
+    now: datetime.datetime | None = None,
 ) -> None:
     """Report whether host-wide runner allocation is actually running (issue #590).
 
@@ -417,6 +433,12 @@ def _check_runner_allocation(
       every stale-or-absent file — "the daemon never reached allocation" and "the
       daemon ran it and found no runners" are different problems with different
       fixes.
+
+    ``now`` is the injectable clock used for the age computation below (issue
+    #828): defaults to ``datetime.datetime.now(datetime.timezone.utc)`` when
+    not supplied, so production behavior is byte-identical. ``run_doctor``
+    samples one ``now`` per doctor run and passes it here and to
+    ``_probe_api_worker``.
     """
     allocation = getattr(config, "runner_allocation", None)
     if allocation is None or not allocation.enabled:
@@ -460,8 +482,8 @@ def _check_runner_allocation(
     # Clock skew or a hand-edited stamp can date the write in the future. A
     # negative age is not freshness evidence, so clamp it instead of reporting
     # "last pass -42s ago" as healthy.
-    now = datetime.datetime.now(datetime.timezone.utc)
-    age = max(0, int((now - stamp.updated_at).total_seconds()))
+    resolved_now = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    age = max(0, int((resolved_now - stamp.updated_at).total_seconds()))
     writer = _allocation_writer_label(stamp.source)
 
     # A recorded skip reason is the pass saying "I ran, and here is why I did not
@@ -923,8 +945,17 @@ def run_doctor(
     adapter_probe: bool = False,
     live: bool = False,
     fleet_dir_override: str | None = None,
+    now: datetime.datetime | None = None,
 ) -> tuple[bool, list[DoctorCheck]]:
     checks: list[DoctorCheck] = []
+
+    # Sampled once for this entire doctor run (issue #828) and threaded into
+    # every sub-check that reads the wall clock, instead of each one
+    # independently racing it -- see _probe_api_worker's today-derivation and
+    # _check_runner_allocation's age computation. Defaults to
+    # datetime.datetime.now(datetime.timezone.utc), so production behavior is
+    # byte-identical when now is not passed.
+    resolved_now = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
 
     def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
         checks.append(DoctorCheck(name=name, ok=ok, detail=detail, severity=severity))
@@ -1076,7 +1107,7 @@ def run_doctor(
     # -- api worker observability (issue #483) ------------------------------
     # Always runs (not gated on --adapter-probe): these are config/environment
     # checks, not external CLI probes. Read-only — never mutates the ledger.
-    _probe_api_worker(add, paths, config)
+    _probe_api_worker(add, paths, config, now=resolved_now)
 
     if adapter_probe:
         _probe_adapter(add, repo_root, config)
@@ -1133,7 +1164,7 @@ def run_doctor(
     # -- host-wide runner allocation (issue #590) ----------------------------
     # Read-only: compares the allocation state file's age against the pass
     # interval. Never starts, parks, or plans anything.
-    _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override)
+    _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override, now=resolved_now)
 
     # -- recent lane-startup failures (#6-G) ---------------------------------
     # Read-only: queries this repo's own events.db for past

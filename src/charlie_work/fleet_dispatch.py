@@ -139,6 +139,7 @@ def compute_api_worker_fleet_report(
     *,
     fleet_dir_override: str | None = None,
     preloaded_configs: dict[str, OrchestratorConfig] | None = None,
+    now: datetime.datetime | None = None,
 ) -> ApiWorkerFleetReport | None:
     """Compute the fleet-wide api-worker report line (issue #483).
 
@@ -162,6 +163,12 @@ def compute_api_worker_fleet_report(
     a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
     filesystem mutation. All errors surface as report values (zeroed spend,
     zero live), never raised.
+
+    ``now`` is the injectable clock used to derive the ledger's ``today`` key
+    (issue #828): defaults to ``datetime.now(UTC)`` when not supplied, so
+    production behavior is byte-identical. Without it, the day-granularity
+    lookup below can miss a UTC-midnight boundary crossed between a caller
+    writing the ledger and this function reading it.
     """
     from datetime import UTC, datetime
 
@@ -219,7 +226,8 @@ def compute_api_worker_fleet_report(
         try:
             ledger_file = ledger_path(Path(state_dir_str))
             ledger = load_ledger(ledger_file)
-            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            resolved_now = now if now is not None else datetime.now(UTC)
+            today = resolved_now.strftime("%Y-%m-%d")
             status = budget_status(ledger, rep_config.api_worker.budget, today)
             today_usd = status.spent_today_usd
             lifetime_usd = status.lifetime_spent_usd
@@ -968,6 +976,7 @@ def _filter_fleet_health_transitions(
     state_file: Path,
     *,
     persistent_mask: list[bool] | None = None,
+    observed_repo_keys: frozenset[str] | None = None,
 ) -> list[AttentionEntry]:
     """Stateful filter: keep only persistent-health entries whose health changed.
 
@@ -994,8 +1003,32 @@ def _filter_fleet_health_transitions(
     Entries are processed in order so a within-pass health change (e.g.
     ERROR then OK for the same issue) emits both transitions; the persisted
     baseline ends at the final health.
+
+    ``observed_repo_keys`` (issue #817 item 2) reconciles the baseline
+    against issues that were genuinely re-checked this pass and found
+    healthy. Persistent-health entries only ever exist for *unhealthy*
+    observations (stalled/error/health_transition) -- a healthy issue
+    produces no event at all, so without this the baseline can only ever
+    move *into* an unhealthy value and never back out, latching every
+    tracked issue at its first failure forever (the same defect item 1 fixes
+    for self-deploy, whose producer always has a distinct success value to
+    feed; issue health has no such value to hang a recovery entry on). After
+    the loop above, any *other* persisted key whose ``adapter_kind`` (the
+    part before the first ``:``) is in ``observed_repo_keys`` -- meaning
+    that repo's lane ran to completion this pass, so every issue it tracks
+    was genuinely looked at -- and that was not itself re-affirmed unhealthy
+    in this same call is silently cleared, not re-emitted as a recovery
+    entry (there is no "issue confirmed healthy" event to attach one to).
+    This does not create a false transition; it lets the *next* unhealthy
+    observation for that key read ``previous_health: null`` and emit as a
+    fresh incident instead of being suppressed by a latch that could never
+    leave its last value. A repo lane that did not run this pass (missing
+    repo_root, supervisor lock held, an unhandled per-repo exception) is not
+    in ``observed_repo_keys``, so its keys are left untouched -- absence of
+    a check is not evidence of health.
     """
     emitted: list[AttentionEntry] = []
+    touched_keys: set[str] = set()
     # Ensure the parent directory exists before state_lock tries to create the
     # sibling .lock file (advisory_file_lock touches it directly).
     state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1010,11 +1043,19 @@ def _filter_fleet_health_transitions(
                 emitted.append(entry)
                 continue
             key = f"{entry.adapter_kind}:{entry.issue_number}"
+            touched_keys.add(key)
             last = baselines.get(key)
             if last == entry.health:
                 continue
             emitted.append(replace(entry, previous_health=last))
             baselines[key] = entry.health
+        if observed_repo_keys:
+            for key in list(baselines):
+                if key in touched_keys:
+                    continue
+                adapter_kind = key.split(":", 1)[0]
+                if adapter_kind in observed_repo_keys:
+                    del baselines[key]
         _save_fleet_health_state(state_file, baselines)
     return emitted
 
@@ -1046,6 +1087,7 @@ def _emit_fleet_transition(
 def _build_fleet_attention_digest(
     attention_events: list[dict[str, Any]],
     state_file: Path | None = None,
+    observed_repo_keys: frozenset[str] | None = None,
 ) -> AttentionDigest:
     """Convert fleet-aggregated event dicts into a single AttentionDigest.
 
@@ -1071,6 +1113,12 @@ def _build_fleet_attention_digest(
     entries with ``previous_health: null`` (issue #554). The returned digest
     always carries the post-filter entries; callers that pass ``state_file``
     should still check ``digest.transitions`` for emptiness before emitting.
+
+    ``observed_repo_keys`` (issue #817 item 2) is forwarded to
+    ``_filter_fleet_health_transitions`` so a persistent baseline key whose
+    issue was genuinely re-checked this pass and found healthy is reconciled
+    away instead of latching at its last unhealthy value forever -- see that
+    function's docstring for the exact semantics.
     """
     entries: list[AttentionEntry] = []
     # Parallel to ``entries``: True for persistent-health event types subject
@@ -1200,7 +1248,10 @@ def _build_fleet_attention_digest(
 
     if state_file is not None:
         entries = _filter_fleet_health_transitions(
-            entries, state_file, persistent_mask=persistent_mask
+            entries,
+            state_file,
+            persistent_mask=persistent_mask,
+            observed_repo_keys=observed_repo_keys,
         )
 
     return AttentionDigest(
@@ -1302,6 +1353,14 @@ def fleet_loop(
 
     per_repo_results: dict[str, CommandResult] = {}
     attention_events: list[dict[str, Any]] = []
+    # repo_keys whose lane actually ran app.loop()/app.dispatch() to
+    # completion this pass -- i.e. every issue that repo tracks was genuinely
+    # looked at. Threaded into _build_fleet_attention_digest so a healthy
+    # issue's stale health-baseline entry can be reconciled away instead of
+    # latching forever (issue #817 item 2). A repo that was skipped (missing
+    # repo_root, supervisor lock held) or raised is deliberately excluded --
+    # absence of a check is not evidence of health.
+    observed_repo_keys: set[str] = set()
     orphan_sweep_calls = 0
     # Collect each selected repo's raw layered config so the api-worker fleet
     # report below can reuse it instead of re-loading every config each pass
@@ -1406,6 +1465,7 @@ def fleet_loop(
 
                 per_repo_results[repo_key] = result
                 attention_events.extend(_extract_attention_events(repo_key, result))
+                observed_repo_keys.add(repo_key)
 
                 # Count orphan sweep calls (B6a interaction)
                 # Each loop() call internally triggers orphan sweep via
@@ -1468,7 +1528,9 @@ def fleet_loop(
     if notify_config is not None and getattr(notify_config, "enabled", False):
         health_state_file = _fleet_health_state_path(fleet_dir_override)
         attention_digest = _build_fleet_attention_digest(
-            attention_events, state_file=health_state_file
+            attention_events,
+            state_file=health_state_file,
+            observed_repo_keys=frozenset(observed_repo_keys),
         )
         if attention_digest.transitions:
             notify_result = emit_digest(notify_config, attention_digest)
@@ -1732,19 +1794,19 @@ def run_fleet_supervise(
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
             deploy = self_deploy(
-                orchestrator_root(), fleet_dir_override=fleet_dir_override, dry_run=dry_run
+                orchestrator_root(),
+                fleet_dir_override=fleet_dir_override,
+                dry_run=dry_run,
+                failure_alarm_threshold=cfg.self_deploy_failure_alarm,
             )
+            notify_config = getattr(global_config, "notify", None)
+            notify_enabled = notify_config is not None and getattr(notify_config, "enabled", False)
             if not deploy.ok:
                 print(
                     f"[{now_str}] self-deploy skipped: {deploy.error}",
                     flush=True,
                 )
-                notify_config = getattr(global_config, "notify", None)
-                if (
-                    deploy.alertable
-                    and notify_config is not None
-                    and getattr(notify_config, "enabled", False)
-                ):
+                if deploy.alertable and notify_enabled:
                     entry = AttentionEntry(
                         issue_number=-1,
                         adapter_kind="self-deploy",
@@ -1756,16 +1818,26 @@ def run_fleet_supervise(
                     _emit_fleet_transition(notify_config, entry, fleet_dir_override)
             elif deploy.previewed:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
-            elif deploy.synced:
-                print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
-            elif deploy.venv_repaired:
-                print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
-                notify_config = getattr(global_config, "notify", None)
-                if notify_config is not None and getattr(notify_config, "enabled", False):
+            else:
+                # Real (non-previewed) success. Console output is unchanged from
+                # before this fix -- print only on the previously-notable
+                # outcomes -- but the notify digest gets a health-OK entry
+                # unconditionally, on *every* real success, not only when the
+                # venv was repaired. This is the single-point fix for issue
+                # #817: _filter_fleet_health_transitions is a correct
+                # recovery-edge detector, but it can only detect a recovery if
+                # *some* entry carries a non-ERROR health value -- before this
+                # fix only the venv_repaired branch ever produced one, so a
+                # plain successful deploy fed the baseline nothing and the
+                # first failure latched "self-deploy:-1" at ERROR forever
+                # (34/34 tracked keys were latched this way).
+                if deploy.synced or deploy.venv_repaired:
+                    print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
+                if notify_enabled:
                     entry = AttentionEntry(
                         issue_number=-1,
                         adapter_kind="self-deploy",
-                        health="REPAIRED",
+                        health="REPAIRED" if deploy.venv_repaired else "OK",
                         previous_health=None,
                         last_log_line=deploy.message,
                         pid=None,

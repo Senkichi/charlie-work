@@ -204,6 +204,31 @@ AVIATOR_CHECK_NAME = "aviator/checks"
 AVIATOR_BLOCKED_MESSAGE = "PR has a blocked label, remove to re-queue"
 
 
+def _read_review_decision(
+    config: OrchestratorConfig, repo_root: Path, pr_number: int
+) -> dict[str, Any] | None:
+    """Best-effort read of ``review-decision.json`` for *pr_number*.
+
+    Returns ``None`` on any absence/read/parse failure (missing file, OS
+    error, malformed JSON, or a JSON value that isn't an object) -- never
+    raises. Callers that need fail-closed behavior treat ``None`` the same
+    as "not approved"; callers building a human-readable explanation (e.g.
+    ``detect_mergequeue_not_approved``) use it to distinguish *why*.
+    """
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
+    if not decision_path.exists():
+        return None
+    try:
+        with decision_path.open("r", encoding="utf-8") as handle:
+            decision = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(decision, dict):
+        return None
+    return decision
+
+
 def _pr_review_approved_at_head(
     config: OrchestratorConfig, repo_root: Path | None, pr_number: int, head_sha: str
 ) -> bool:
@@ -219,19 +244,15 @@ def _pr_review_approved_at_head(
     own admission check knows nothing about ``review-decision.json``.
     Returns ``False`` (fail closed) when *repo_root* is unavailable or no
     matching approved-at-head decision can be read.
+
+    ``detect_mergequeue_not_approved`` (issue #819) reuses this exact
+    predicate as its revocation gate: the label is removed whenever this
+    returns ``False``, for any of the reasons documented above.
     """
     if repo_root is None:
         return False
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
-    decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
-    if not decision_path.exists():
-        return False
-    try:
-        with decision_path.open("r", encoding="utf-8") as handle:
-            decision = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return False
-    if not isinstance(decision, dict) or decision.get("decision") != "approved":
+    decision = _read_review_decision(config, repo_root, pr_number)
+    if decision is None or decision.get("decision") != "approved":
         return False
     return decision.get("reviewed_head_sha") == head_sha
 
@@ -345,6 +366,180 @@ def detect_aviator_stale_blocked(
                 fix_actions=tuple(fix_actions),
                 remove_labels=("blocked",),
                 add_labels=add_labels,
+            )
+        )
+    return drift
+
+
+def _mergequeue_revocation_detail(
+    config: OrchestratorConfig,
+    repo_root: Path,
+    pr_number: int,
+    head_sha: str,
+    mergequeue_label: str,
+) -> str:
+    """Human-readable explanation for why ``mergequeue`` is being revoked.
+
+    Distinguishes "genuinely not approved" (missing/unreadable decision
+    file, or a recorded ``request_changes``/never-reviewed verdict -- the
+    PR #695 / issue #819 case) from "approved, but at an older head that a
+    rebase has since moved past" -- a case ``merge_ready``'s own
+    carry-forward machinery (``_check_carry_forward``) may still legitimately
+    re-validate and re-approve on a later pass. Both are revoked (see
+    ``detect_mergequeue_not_approved``'s docstring for why leaving the
+    stale-head case alone is not safe either), but the emitted detail/event
+    payload makes the distinction explicit rather than collapsing both into
+    one indistinguishable string.
+    """
+    decision = _read_review_decision(config, repo_root, pr_number)
+    if decision is None:
+        return f"no readable review-decision.json for PR #{pr_number}"
+    verdict = decision.get("decision")
+    if verdict != "approved":
+        return f"recorded decision is {verdict!r}, not 'approved'"
+    reviewed_head = decision.get("reviewed_head_sha")
+    reviewed_head_display = str(reviewed_head)[:12] if reviewed_head else repr(reviewed_head)
+    return (
+        f"approved at stale head {reviewed_head_display} but current head is "
+        f"{head_sha[:12]} -- deferring re-validation to merge_ready's carry-forward "
+        f"check rather than {mergequeue_label!r} staying authorized on an unvalidated head"
+    )
+
+
+def detect_mergequeue_not_approved(
+    gh: GitHub, config: OrchestratorConfig, *, repo_root: Path | None = None
+) -> list[DriftItem]:
+    """Revoke the Aviator ``mergequeue`` label from any open PR not approved at its head.
+
+    Production incident this exists for (issue #819): PR #695 carried
+    ``mergequeue`` after its recorded review verdict flipped to
+    ``request_changes`` at the live head, and nothing in the orchestrator
+    ever calls ``remove_pr_label`` for ``mergequeue`` -- ``remove_pr_label``
+    has exactly one call site anywhere in the repo before this change (the
+    Aviator ``blocked`` label in ``detect_aviator_stale_blocked``, above).
+    ``merge_ready``'s own carry-forward-failure path (workflow.py's
+    ``head_moved and not carried_forward`` branch) transitions issue labels
+    and returns ``can_merge: False`` but never strips the PR-level
+    ``mergequeue`` label either. With ``.aviator/config.yml``'s
+    ``number_of_approvals: 0``, the label plus green Lint/Tests checks IS
+    Aviator's merge decision -- Aviator never reads ``review-decision.json``.
+    Once applied, ``mergequeue`` was otherwise irrevocable, so Aviator
+    merged #695 over a standing ``request_changes`` verdict.
+
+    Deliberately NOT folded into ``detect_drift``, for the same reason
+    ``detect_aviator_stale_blocked`` is separate: that function's contract
+    (``test_detect_drift_makes_zero_mutating_calls``) pins ``detect_drift``
+    itself to exactly two ``gh.run`` list calls, to avoid repeating issue
+    #361 (an unconditional per-PR GraphQL walk caused 502s). ``_fetch_prs``
+    calls ``gh.run`` directly (via ``_fetch_snapshot``), bypassing
+    ``GitHub``'s ``_list_cache`` entirely -- that cache only covers
+    ``gh.pr_list()``/``gh.issue_list()``, not the raw ``_fetch_snapshot``
+    path, and ``_fetch_snapshot`` has no memoization of its own. So this is
+    honestly a *third* full ``gh pr list --state all`` round trip per
+    reconcile pass: ``detect_drift`` fetches once, ``detect_aviator_stale_blocked``
+    already duplicates that fetch (a pre-existing, accepted wart -- same
+    file, same list command, same cost class), and this function is a third
+    instance of the identical pattern, not a new one. What it does NOT add
+    is any *per-PR* call: ``RECONCILE_PR_FIELDS`` already includes ``labels``
+    and ``headRefOid`` for every PR that one list call returns, so
+    label-membership and head-sha checks are free once the list is in hand.
+    The one filesystem read (``_pr_review_approved_at_head`` /
+    ``_read_review_decision``) is gated behind PR state == OPEN *and* the PR
+    already carrying ``mergequeue`` -- matching ``detect_aviator_stale_blocked``'s
+    "gate on the cheap already-fetched labels field first" discipline -- so
+    that cost scales with how many PRs are actually in the merge queue, not
+    with the total open-PR count. (Collapsing all three ``_fetch_prs`` calls
+    into one shared fetch per pass is a legitimate follow-up; out of scope
+    for issue #819, which is about closing the revocation gap, not this
+    pre-existing duplication.)
+
+    Gate resolution (issue #819's item 4 -- carry-forward interaction):
+    reuses ``_pr_review_approved_at_head`` verbatim as a single,
+    undifferentiated revocation gate. The label is removed whenever that
+    predicate returns ``False``, for *any* of its reasons: recorded decision
+    isn't ``"approved"``, the decision file is missing/unreadable, or the
+    decision is ``"approved"`` but at a stale head a rebase has since moved
+    past. That last sub-case is deliberately revoked rather than deferred,
+    for two independent reasons:
+
+    1. Safety gap: leaving it alone is not safe. ``merge_ready``'s
+       carry-forward-failure path never strips ``mergequeue`` either (see
+       above), so an approved-at-stale-head PR whose rebase turns out to
+       have changed real content would keep an unvalidated label and sail
+       through Aviator once CI goes green -- the same failure class as #695,
+       through a second door.
+    2. Cost: reconcile.py cannot cheaply arbitrate this case itself.
+       Answering "is this stale-head approval still valid" requires
+       ``_check_carry_forward``'s patch-id / line-content diff comparison
+       (workflow.py), which needs a per-PR ``gh.pr_diff()`` call -- exactly
+       the issue-#361 cost class ``detect_drift`` and this module exist to
+       stay out of.
+
+    Revoking does not "fight" carry-forward -- it cannot, because
+    carry-forward is unreachable in both directions here: ``merge_ready``
+    only attempts ``_check_carry_forward`` ``if approved:`` (the recorded
+    decision is already ``"approved"``), so a ``request_changes``/absent
+    decision never reaches carry-forward logic at all. For the genuine
+    stale-head-approved case, revoke-then-reapply is cooperative rather than
+    adversarial: on the PR's next ``merge_ready`` evaluation, a *clean*
+    rebase re-validates via carry-forward, ``_update_approval_head`` records
+    approval at the new head, and ``add_pr_label`` is idempotent (per its
+    own inline comment at the call site) -- so ``mergequeue`` comes right
+    back. ``_maybe_reconcile_drift`` running before the per-PR
+    ``merge_ready`` loop within the same ``_loop_body`` pass shortens that
+    window to sub-pass latency, but that ordering is a latency detail, not
+    the safety argument -- revoke-first-then-cooperative-readd is correct
+    regardless of pass ordering, because the alternative (never revoking a
+    stale-head approval) is the one with a real unreviewed-merge hole.
+
+    ``repo_root is None`` means this function is globally blind, not that
+    any individual PR is unapproved: it returns ``[]`` rather than revoking
+    ``mergequeue`` fleet-wide from every currently-labeled PR. A blanket
+    revocation storm triggered by the detector's own blindness would be a
+    false-positive catastrophe, not fail-closed behavior -- exactly what the
+    negative (approved-at-head, left alone) test guards against.
+    """
+    mergequeue_label = config.auto_merge.mergequeue_label
+    if not mergequeue_label:
+        return []
+    if repo_root is None:
+        return []
+    drift: list[DriftItem] = []
+    for pr in _fetch_prs(gh):
+        if str(pr.get("state") or "").upper() != "OPEN":
+            continue
+        if mergequeue_label not in label_names(pr):
+            continue
+        pr_number = pr.get("number")
+        head_sha = pr.get("headRefOid")
+        if pr_number is None or not head_sha:
+            continue
+        pr_number = int(pr_number)
+        head_sha = str(head_sha)
+
+        if _pr_review_approved_at_head(config, repo_root, pr_number, head_sha):
+            continue
+
+        issue_number = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        reason = _mergequeue_revocation_detail(
+            config, repo_root, pr_number, head_sha, mergequeue_label
+        )
+        drift.append(
+            DriftItem(
+                kind="mergequeue_revoked",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                detail=(
+                    f"PR #{pr_number} carries {mergequeue_label!r} but is not approved "
+                    f"at its current head {head_sha[:12]} ({reason}); revoking to close "
+                    "the irrevocable-mergequeue gap (issue #819)"
+                ),
+                fix_actions=(f"remove label {mergequeue_label!r} from PR #{pr_number}",),
+                remove_labels=(mergequeue_label,),
             )
         )
     return drift
@@ -1360,8 +1555,14 @@ def apply_fixes(
     ``state_path`` is threaded through to ``append_event`` so each
     ``"reconcile"`` event is also dual-written to the unlimited ``events.db``
     log, not just the capped 200-entry ring in ``state.json`` — without it,
-    fixes like ``merged_outside_orchestrator`` and ``aviator_stale_blocked``
-    are invisible to ``query_events``/``event_counts_by_kind`` entirely.
+    fixes like ``merged_outside_orchestrator``, ``aviator_stale_blocked``,
+    and ``mergequeue_revoked`` are invisible to
+    ``query_events``/``event_counts_by_kind`` entirely. The event's
+    top-level ``kind`` is always the literal ``"reconcile"``; the specific
+    drift kind (e.g. ``"mergequeue_revoked"``) lives in
+    ``payload["kind"]`` — this module's established convention (see
+    ``aviator_stale_blocked``) for a "distinct, greppable" event without a
+    special case in this emit path for every new drift kind.
     """
     new_issues: dict[str, Any] = dict(state.get("issues", {}))
     new_prs: dict[str, Any] = dict(state.get("prs", {}))
@@ -1607,7 +1808,7 @@ def apply_fixes(
                         add_labels=item.add_labels,
                     )
 
-        elif item.kind == "aviator_stale_blocked":
+        elif item.kind in ("aviator_stale_blocked", "mergequeue_revoked"):
             if item.pr_number is not None:
                 label_ok = True
                 for label in item.remove_labels:

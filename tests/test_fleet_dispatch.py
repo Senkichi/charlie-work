@@ -2550,7 +2550,17 @@ def test_api_worker_fleet_report_to_dict() -> None:
 
 
 def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
-    """The report reads spend from the representative (enabled) repo's ledger."""
+    """The report reads spend from the representative (enabled) repo's ledger.
+
+    Regression for issue #828 (originally #822's class): production derives
+    its own `today = now.strftime("%Y-%m-%d")` ledger key independently of
+    this test's fixture write. If the wall clock crosses UTC midnight between
+    the write and `compute_api_worker_fleet_report`'s read, the lookup misses
+    and the report shows $0.00 instead of the expected spend -- a real (if
+    rare) production defect, not just a test flake. `now` is frozen and
+    passed to both the fixture and the report call so the ledger key always
+    matches regardless of any stall or midnight boundary in between.
+    """
     from datetime import UTC, datetime
 
     fleet_dir = tmp_path / "fleet"
@@ -2559,7 +2569,8 @@ def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
     state_dir0 = repo0 / ".var" / "charlie-work"
 
     # Write a ledger with today's spend.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    frozen_now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    today = frozen_now.strftime("%Y-%m-%d")
     ledger_data = {
         "days": {today: {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "usd": 2.25}},
         "lifetime_usd": 8.75,
@@ -2581,7 +2592,7 @@ def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
     }
     _make_fleet_json(tmp_path, fleet_dir, repos_map)
 
-    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir), now=frozen_now)
 
     assert report is not None
     assert report.today_usd == 2.25
@@ -3715,3 +3726,341 @@ def test_build_fleet_attention_digest_stateful_mixed_persistent_and_occurrence(
     healths3 = [t.health for t in digest3.transitions]
     assert healths3 == ["STALLED", "OK"]
     assert digest3.transitions[0].previous_health == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Issue #817: fleet health latch (producer never fed a recovery observation)
+# ---------------------------------------------------------------------------
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_self_deploy_failure_success_failure_emits_three_transitions(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_emit_digest: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #817 AC1: failure -> success -> failure must emit three digest
+    entries, not one.
+
+    Before this fix, the producer only ever constructed an AttentionEntry
+    for a *failed* self_deploy (item 1's defect): the recovery pass built no
+    entry at all, so the baseline sidecar stayed latched at ERROR from the
+    first failure onward. ``_filter_fleet_health_transitions`` itself was
+    already a correct edge-detector -- the second failure would read
+    ERROR -> ERROR against that latched baseline and be suppressed as a
+    non-transition, even though a real recovery happened in between.
+    """
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import _fleet_health_state_path
+    from charlie_work.fleet_dispatch import _load_fleet_health_state as _load_state
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        ),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    mock_lock.return_value = MagicMock()
+
+    deploy_mock = MagicMock(
+        side_effect=[
+            SelfDeployResult(
+                ok=False,
+                pulled=False,
+                changed=False,
+                synced=False,
+                error="fatal: Not possible to fast-forward, aborting.",
+            ),
+            SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=False,
+                synced=False,
+                from_sha="abc123",
+                to_sha="abc123",
+                message="already up to date",
+            ),
+            SelfDeployResult(
+                ok=False,
+                pulled=False,
+                changed=False,
+                synced=False,
+                error="fatal: Not possible to fast-forward, aborting.",
+            ),
+        ]
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    # from_sha == to_sha on the success pass deliberately: a real HEAD move
+    # would trigger the supervisor's separate restart-for-fresh-code exit
+    # (see test_run_fleet_supervise_restarts_when_self_deploy_moves_head),
+    # which would end the loop after pass 2 and never reach the third
+    # failure this test needs to observe.
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(
+        max_passes=3,
+        clock=fc.now,
+        sleep=fc.sleep,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    assert mock_emit_digest.call_count == 3
+    healths = [call.args[1].transitions[0].health for call in mock_emit_digest.call_args_list]
+    assert healths == ["ERROR", "OK", "ERROR"]
+    previous = [
+        call.args[1].transitions[0].previous_health for call in mock_emit_digest.call_args_list
+    ]
+    assert previous == [None, "ERROR", "OK"]
+
+    # Final persisted baseline reflects the third (failed) pass.
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    assert _load_state(state_file) == {"self-deploy:-1": "ERROR"}
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_self_deploy_success_clears_error_baseline(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_emit_digest: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #817 AC2: after a failure -> success sequence, the *persisted*
+    baseline sidecar itself reads back the healthy value -- not just the
+    digest object returned in-process for that pass -- proving state
+    genuinely moved off the ERROR latch. This is the fact AC1's third
+    (failure) emission depends on: if the sidecar file did not actually
+    change, the in-memory digest assertion alone would not distinguish a
+    real fix from one that merely happens to return the right object once.
+    """
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import _fleet_health_state_path
+    from charlie_work.fleet_dispatch import _load_fleet_health_state as _load_state
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        ),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    mock_lock.return_value = MagicMock()
+
+    deploy_mock = MagicMock(
+        side_effect=[
+            SelfDeployResult(
+                ok=False, pulled=False, changed=False, synced=False, error="pull failed"
+            ),
+            SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=False,
+                synced=False,
+                from_sha="abc123",
+                to_sha="abc123",
+                message="already up to date",
+            ),
+        ]
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(
+        max_passes=2,
+        clock=fc.now,
+        sleep=fc.sleep,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    assert _load_state(state_file) == {"self-deploy:-1": "OK"}
+
+
+def test_filter_fleet_health_transitions_reconciles_stale_key_when_repo_observed(
+    tmp_path: Path,
+) -> None:
+    """Issue #817 item 2/AC5: a stale ERROR baseline for an issue that is
+    healthy again (produces no unhealthy event this pass) is cleared once
+    its repo's lane is confirmed observed, instead of latching forever.
+
+    This is also the drain mechanism for the pre-existing 34 latched keys
+    (issue #817's diagnosis): each key's repo needs exactly one observed
+    pass with no matching unhealthy entry to clear it, after which the next
+    real failure emits with ``previous_health: null`` again instead of
+    staying permanently suppressed by a baseline that could never move
+    except deeper into an unhealthy value.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entry = AttentionEntry(
+        issue_number=42,
+        adapter_kind="owner/repo",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="failed to launch claude: OSError",
+        pid=None,
+    )
+
+    # Pass 1: latch ERROR.
+    first = _filter_fleet_health_transitions([entry], state_file)
+    assert len(first) == 1
+    assert _load_fleet_health_state(state_file) == {"owner/repo:42": "ERROR"}
+
+    # Pass 2: issue #42 recovered -- no unhealthy entry for it this pass, but
+    # its repo's lane still ran to completion (observed_repo_keys includes
+    # "owner/repo"). The stale key must be cleared, not re-emitted as a
+    # synthetic recovery entry.
+    second = _filter_fleet_health_transitions(
+        [], state_file, observed_repo_keys=frozenset({"owner/repo"})
+    )
+    assert second == []
+    assert _load_fleet_health_state(state_file) == {}
+
+    # Pass 3: the same issue fails again. Because the baseline was cleared,
+    # this is a fresh null -> ERROR transition, not a suppressed repeat.
+    third = _filter_fleet_health_transitions([entry], state_file)
+    assert len(third) == 1
+    assert third[0].previous_health is None
+
+
+def test_filter_fleet_health_transitions_leaves_unobserved_repo_keys_untouched(
+    tmp_path: Path,
+) -> None:
+    """A repo whose lane did NOT run this pass (missing repo_root, lock held,
+    unhandled exception) must not have its stale keys reconciled away --
+    absence of a check is not evidence of health. Only keys under repos
+    present in ``observed_repo_keys`` are eligible for clearing.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entry = AttentionEntry(
+        issue_number=7,
+        adapter_kind="owner/skipped-repo",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="stalled",
+        pid=None,
+    )
+    first = _filter_fleet_health_transitions([entry], state_file)
+    assert len(first) == 1
+
+    # A different repo's lane ran this pass; "owner/skipped-repo" did not.
+    second = _filter_fleet_health_transitions(
+        [], state_file, observed_repo_keys=frozenset({"owner/other-repo"})
+    )
+    assert second == []
+    assert _load_fleet_health_state(state_file) == {"owner/skipped-repo:7": "ERROR"}
+
+
+def test_filter_fleet_health_transitions_self_deploy_key_survives_repo_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Item 1's ``self-deploy:-1`` baseline key and item 2's per-repo
+    reconciliation share the same sidecar file within one supervisor pass
+    (self_deploy emits first, then fleet_loop's digest reconciles). The
+    ``self-deploy`` adapter_kind is a fixed literal, never a real repo's
+    ``name_with_owner``, so it can never appear in ``observed_repo_keys`` and
+    must never be cleared by issue-health reconciliation -- confirmed here by
+    a test rather than left as an unverified by-construction claim.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    self_deploy_entry = AttentionEntry(
+        issue_number=-1,
+        adapter_kind="self-deploy",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="pull failed",
+        pid=None,
+    )
+    _filter_fleet_health_transitions([self_deploy_entry], state_file)
+    assert _load_fleet_health_state(state_file) == {"self-deploy:-1": "ERROR"}
+
+    # A real repo's lane runs and reconciles this pass; self-deploy's key
+    # must not be touched even though no self-deploy entry was emitted.
+    result = _filter_fleet_health_transitions(
+        [], state_file, observed_repo_keys=frozenset({"owner/repo"})
+    )
+    assert result == []
+    assert _load_fleet_health_state(state_file) == {"self-deploy:-1": "ERROR"}
+
+
+def test_build_fleet_attention_digest_observed_repo_keys_reconciles_stale_error(
+    tmp_path: Path,
+) -> None:
+    """Issue #817 item 2: ``_build_fleet_attention_digest`` forwards
+    ``observed_repo_keys`` through to ``_filter_fleet_health_transitions``,
+    so ``fleet_loop``'s per-pass reconciliation actually reaches the
+    baseline sidecar rather than being silently dropped somewhere in
+    between.
+    """
+    from charlie_work.fleet_dispatch import (
+        _build_fleet_attention_digest,
+        _fleet_health_state_path,
+        _load_fleet_health_state,
+    )
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo",
+            "type": "error",
+            "issue_number": 100,
+            "error": "PR #100 review failed: timeout",
+        }
+    ]
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert _load_fleet_health_state(state_file) == {"owner/repo:100": "ERROR"}
+
+    # Next pass: issue #100 is healthy again (no error event for it), but
+    # the repo's lane ran to completion -- observed_repo_keys reconciles the
+    # stale key away.
+    digest2 = _build_fleet_attention_digest(
+        [], state_file=state_file, observed_repo_keys=frozenset({"owner/repo"})
+    )
+    assert digest2.transitions == ()
+    assert _load_fleet_health_state(state_file) == {}

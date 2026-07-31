@@ -1260,13 +1260,15 @@ def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None
     )
 
     now = datetime.now(UTC)
-    failure_kind, throttled_until = _classify_session_failure(log_path, resume_margin_seconds=90)
+    failure_kind, throttled_until = _classify_session_failure(
+        log_path, resume_margin_seconds=90, now=now
+    )
 
     assert failure_kind == "rate_limited"
     assert throttled_until is not None
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    expected = now + timedelta(minutes=3, seconds=90)
-    assert abs((parsed - expected).total_seconds()) < 1
+    expected = (now + timedelta(minutes=3, seconds=90)).replace(microsecond=0)
+    assert parsed == expected
 
 
 def test_update_worker_record_with_failure_classification(tmp_path: Path) -> None:
@@ -1347,16 +1349,16 @@ def test_update_worker_record_with_failure_classification_includes_resume_margin
     )
 
     config = OrchestratorConfig(runtime=RuntimeConfig(throttle_resume_margin_s=90))
+    now = datetime.now(UTC)
     failure_kind, throttled_until = update_worker_record_with_failure_classification(
-        sessions_dir, 42, config=config
+        sessions_dir, 42, config=config, now=now
     )
 
     assert failure_kind == "rate_limited"
     assert throttled_until is not None
-    now = datetime.now(UTC)
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    expected = now + timedelta(minutes=5, seconds=90)
-    assert abs((parsed - expected).total_seconds()) < 1
+    expected = (now + timedelta(minutes=5, seconds=90)).replace(microsecond=0)
+    assert parsed == expected
 
 
 def test_update_worker_record_with_failure_classification_session_completed_skips_log_tail(
@@ -3858,13 +3860,14 @@ def test_classify_session_failure_provider_auth_cooldown_24h(tmp_path: Path) -> 
     log_path.write_text("Error: 401 Unauthorized\n", encoding="utf-8")
 
     now = datetime.now(UTC)
-    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+    failure_kind, throttled_until = _classify_session_failure(
+        log_path, adapter_kind="api", now=now
+    )
 
     assert failure_kind == "provider_auth"
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    expected = now + timedelta(hours=24)
-    # Allow a few seconds of slack for test execution time.
-    assert abs((parsed - expected).total_seconds()) < 5
+    expected = (now + timedelta(hours=24)).replace(microsecond=0)
+    assert parsed == expected
 
 
 def test_update_worker_record_api_provider_auth_classification(
