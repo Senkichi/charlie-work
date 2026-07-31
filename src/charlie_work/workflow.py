@@ -7652,6 +7652,52 @@ class OrchestratorApp:
         verdict = run_janitor(
             pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
         )
+
+        # Issue #820: reconcile the operator merge-hold marker for the #818
+        # draft-auto-ready actuator unconditionally, on every review() pass
+        # for this PR -- not only when we're about to act on it below --
+        # so the stored reason can never go stale from a *different*
+        # branch (packet success further down, a co-occurring second
+        # failure routed to the general janitor_blocked path, a merge-
+        # conflict/no-op-rework/flake-rerun branch, ...) that doesn't
+        # revisit the held branch and therefore wouldn't otherwise touch
+        # this field. A marker only cleared by its own branch needs a
+        # clear-site at every other exit from review() -- miss one and the
+        # dedup below silently stops re-firing after a lift/re-park cycle
+        # that passed through one of those other branches in between.
+        # Reconciling here once, unconditionally, is the single point of
+        # truth instead.
+        #
+        # Semantics mirror merge_ready's mergequeue-handoff hold check:
+        # PR-label-or-issue-label, with an unavailable/degraded check
+        # failing safe (treated the same as "held", never as "no hold").
+        # `issue` was already fetched unconditionally above for packet
+        # building, so this adds no extra `gh` calls.
+        merge_hold = self.config.labels.merge_hold in label_names(pr)
+        merge_hold_check_unavailable = False
+        if not merge_hold and issue_number is not None:
+            if not isinstance(issue, dict) or "labels" not in issue:
+                merge_hold_check_unavailable = True
+            else:
+                merge_hold = self.config.labels.merge_hold in label_names(issue)
+        draft_hold_reason = (
+            ("operator_merge_hold" if merge_hold else "merge_hold_check_unavailable")
+            if verdict.is_draft_only_block and (merge_hold or merge_hold_check_unavailable)
+            else None
+        )
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            existing_pr_state = state["prs"].get(str(pr_number), {})
+            draft_hold_reason_changed = (
+                existing_pr_state.get("draft_ready_held_reason") != draft_hold_reason
+            )
+            if draft_hold_reason_changed:
+                state["prs"][str(pr_number)] = {
+                    **existing_pr_state,
+                    "draft_ready_held_reason": draft_hold_reason,
+                }
+                save_state(self.paths.state_file, state)
+
         if not verdict.ok:
             # Issue #558: a PR that is CLOSED (unmerged) on GitHub is dead --
             # every other janitor failure is moot. Converge the state PR
@@ -7705,6 +7751,49 @@ class OrchestratorApp:
             # success -- the PR stays janitor_blocked and is not routed
             # toward merge.
             if verdict.is_draft_only_block:
+                # Issue #820: an operator can park a PR by drafting it, which
+                # is indistinguishable from the externally-imposed draft state
+                # #818 was written to auto-clear. `draft_hold_reason` /
+                # `draft_hold_reason_changed` were already computed and
+                # reconciled into state unconditionally above (single point
+                # of truth -- see the comment there for why a branch-local
+                # clear was insufficient); this only decides whether to act
+                # on the already-current value.
+                if draft_hold_reason is not None:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        existing_pr_state = state["prs"].get(str(pr_number), {})
+                        state["prs"][str(pr_number)] = {
+                            **existing_pr_state,
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "janitor_blocked",
+                            "janitor_ok": False,
+                            "janitor_failures": list(verdict.failures),
+                        }
+                        if draft_hold_reason_changed:
+                            state = self._record_event(
+                                state,
+                                "draft_pr_ready_held",
+                                {
+                                    "pr_number": pr_number,
+                                    "issue_number": issue_number,
+                                    "reason": draft_hold_reason,
+                                },
+                            )
+                        save_state(self.paths.state_file, state)
+                    return CommandResult(
+                        False,
+                        f"PR #{pr_number} is a draft; auto-ready held ({draft_hold_reason})",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "draft_ready_held": True,
+                            "draft_ready_held_reason": draft_hold_reason,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
+
                 ready_result = self.gh.pr_ready(pr_number)
                 if ready_result.ok:
                     log_event(

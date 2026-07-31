@@ -174,6 +174,15 @@ _WARNING_KINDS = frozenset(
         # "info" level, matching "flake_rerun_triggered".
         "draft_pr_ready_failed",
         "draft_pr_blocked",
+        # Issue #820: an operator merge-hold (or an unavailable hold check,
+        # which fails safe the same way) suppresses the #818 auto-ready
+        # actuator. Grouped as a warning alongside its two siblings above --
+        # even though the hold itself may be a deliberate operator action,
+        # not an error -- so all three "why is this draft PR not moving"
+        # signals are reachable together via query_events(level="warning")
+        # rather than the deliberate-park case being invisible next to the
+        # other two.
+        "draft_pr_ready_held",
     }
 )
 
