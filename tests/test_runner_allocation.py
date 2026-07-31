@@ -1737,8 +1737,9 @@ def _make_managed_root(tmp_path: Path, runners: list[tuple[str, str, str]]) -> P
     """Build a managed root with one directory per (name, repo, agent_name)."""
     root = tmp_path / "actions-runners"
     root.mkdir()
+    script = _platform_launch_script()
     for name, repo, agent in runners:
-        _make_runner_dir(root, name, f"https://github.com/{repo}", agent)
+        _make_runner_dir(root, name, f"https://github.com/{repo}", agent, script=script)
     return root
 
 
@@ -1899,24 +1900,27 @@ def test_run_allocation_pass_real_run_persists_idle_streaks(
         lambda _sp, _kind, payload, **_k: log_payloads.append(payload),
     )
 
-    result = run_allocation_pass(
-        gh,
-        RunnerAllocationConfig(
-            enabled=True, managed_root=str(root), max_running_runners=4, min_running_per_repo=1
-        ),
-        fleet_dir_override=str(fleet),
-        state_path=state_path,
-        dry_run=False,
-        source="prologue",
-        full_pass_interval_seconds=300,
-    )
+    try:
+        result = run_allocation_pass(
+            gh,
+            RunnerAllocationConfig(
+                enabled=True, managed_root=str(root), max_running_runners=4, min_running_per_repo=1
+            ),
+            fleet_dir_override=str(fleet),
+            state_path=state_path,
+            dry_run=False,
+            source="prologue",
+            full_pass_interval_seconds=300,
+        )
 
-    assert result.ok is True
-    assert result.started == 2  # both parked runners were started (stubbed)
-    assert save_calls == [True]
-    assert (fleet / "runner-allocation.json").exists()
-    assert log_payloads and log_payloads[-1]["dry_run"] is False
-    assert log_payloads[-1]["source"] == "prologue"
+        assert result.ok is True
+        assert result.started == 2  # both parked runners were started (stubbed)
+        assert save_calls == [True]
+        assert (fleet / "runner-allocation.json").exists()
+        assert log_payloads and log_payloads[-1]["dry_run"] is False
+        assert log_payloads[-1]["source"] == "prologue"
+    finally:
+        close_db(state_path)
 
 
 # --------------------------------------------------------------------------
