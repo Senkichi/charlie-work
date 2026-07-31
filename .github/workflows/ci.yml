@@ -48,37 +48,45 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Run tests
-        # -n 2 (pytest-xdist, fixed count -- deliberately not "auto"): matches
-        # the box-wide xdist cap already established in
-        # src/charlie_work/env_sanitize.py (PYTEST_XDIST_AUTO_NUM_WORKERS
-        # default "2", issue 646) after a 2026-07-26 incident where ~36
+        # -n 2 (pytest-xdist, fixed count -- deliberately not "auto"): this
+        # box runs 2 self-hosted runners, so 2 Tests jobs can already execute
+        # concurrently, and charlie-work's own worker-dispatch tree can add
+        # more pytest sessions on the same shared box independent of CI. That
+        # tree's default worker count for its own dispatched sessions is
+        # PYTEST_XDIST_AUTO_NUM_WORKERS=2 (src/charlie_work/env_sanitize.py),
+        # itself chosen after a 2026-07-26 incident (issue 646) where ~36
         # uncapped xdist workers stacked on this box's 8 physical cores took
-        # a 6.4min suite to ~145min. This box runs 2 self-hosted runners (so
-        # 2 Tests jobs can execute concurrently) and charlie-work's own
-        # worker-dispatch tree can add more pytest sessions on the same
-        # shared box independent of CI, each already capped at 2 workers by
-        # that same constant -- matching it here keeps this job consistent
-        # with the rest of the system's box-sharing discipline instead of
-        # being the one uncapped outlier. --dist=load (pytest-xdist's
-        # default, spelled out for clarity) rather than loadfile:
-        # tests/test_worktree.py alone is ~150 of ~3100 tests and the
-        # heaviest file by wall time (real git.exe subprocesses), so pinning
-        # it to a single worker would floor the achievable speedup.
+        # a 6.4min suite to ~145min. That constant only governs the
+        # dispatch tree's own "-n auto" resolution and has no enforcement
+        # reach into this workflow file -- but matching its number here
+        # keeps this job's box footprint consistent with the rest of the
+        # system's box-sharing discipline rather than picking an unrelated,
+        # uncoordinated worker count for the one job that also runs
+        # concurrently (x2 runners) on the same shared hardware.
+        # --dist=load (pytest-xdist's default, spelled out for clarity)
+        # rather than loadfile: tests/test_worktree.py alone is ~150 of
+        # ~3100 tests and the heaviest file by wall time (real git.exe
+        # subprocesses), so pinning it to a single worker would floor the
+        # achievable speedup.
         #
-        # Measured full-suite, full local run, ambient box load 35-70%
-        # (2026-07-31, this box, all runs identical pass/skip count --
-        # 3092 passed, 2 skipped):
+        # Measured full-suite, full local run, ambient box load 35-70% (other
+        # CI jobs and fleet worktree processes concurrently active -- not an
+        # idealized clean-room benchmark) (2026-07-31, this box, all runs
+        # identical pass/skip count -- 3092 passed, 2 skipped):
         #   serial:    1593.55s (26:33)
         #   -n 2:       458.86s ( 7:38)  3.47x
         #   -n 4:       457.45s ( 7:37)  3.48x  (measured for comparison,
         #                                        not used -- ties -n 2)
         #   -n 6:       369.76s ( 6:10)  4.31x  (measured for comparison,
-        #                                        not used -- exceeds the
-        #                                        established box-wide cap)
-        # -n 2 ties -n 4 head-to-head, indicating this suite is
-        # subprocess/IO-bound past 2 workers on this box rather than
-        # CPU-bound, so there is no measured speed cost to picking the safe,
-        # convention-matching worker count.
+        #                                        not used -- see below)
+        # -n 2 ties -n 4 and -n 6 is only moderately faster than both; given
+        # ambient load varied 35-70% CPU across these runs (uncontrolled,
+        # shared box), this spread is consistent with ambient-load noise
+        # rather than a clean worker-count scaling curve, so it is not being
+        # read as proof the suite is IO-bound past 2 workers. The choice of
+        # -n 2 rests on the box-sharing argument above, not on a claimed
+        # throughput advantage -- and the data at minimum rules out a large
+        # speed cost to the safer, convention-matching count.
         # -q dropped here (pyproject.toml addopts already sets it): stacking
         # an explicit -q on top of addopts' -q silently drops pytest's final
         # "N passed" summary line -- verified locally, exit code is
