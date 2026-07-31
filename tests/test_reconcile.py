@@ -2536,6 +2536,55 @@ def test_reconcile_deferred_when_graphql_rate_limit_below_threshold(
     assert events[0]["payload"]["remaining"] == 100
 
 
+def test_reconcile_defensive_graphql_budget_error_emits_event(tmp_path: Path) -> None:
+    """Issue #743: the defensive except GraphQLBudgetError path in reconcile()
+    must emit a reconcile_pass_deferred event and persist it to state.json.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeGitHub(
+        prs=[_pr(1, "OPEN", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.in_progress])],
+        rate_limit_sufficient=True,
+        rate_limit_remaining=100,
+        rate_limit_reset=1234567890,
+    )
+    call_count = 0
+
+    def toggling_check(threshold: int) -> tuple[bool, int, int | None]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return (True, 100, 1234567890)
+        return (False, 50, 1234567890)
+
+    gh.check_graphql_rate_limit = toggling_check
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.reconcile(fix=True)
+
+    assert result.ok is True
+    assert result.data["deferred_reason"] == "graphql_rate_limit"
+    assert result.data["graphql_remaining"] == 50
+    assert result.data["graphql_reset"] == 1234567890
+    # No list calls were made because the budget guard raised before the sweep.
+    assert not any(c[:2] == ["pr", "list"] for c in gh.run_calls)
+    assert not any(c[:2] == ["issue", "list"] for c in gh.run_calls)
+    # The defensive exception path must leave a durable event.
+    state = load_state(paths.state_file)
+    events = [e for e in state.get("events", []) if e["kind"] == "reconcile_pass_deferred"]
+    assert len(events) == 1
+    assert events[0]["payload"]["remaining"] == 50
+    assert events[0]["payload"]["fix"] is True
+    assert events[0]["payload"]["deferred_reason"] == "graphql_rate_limit"
+    # The SQLite audit log also has the event.
+    log_events = [
+        e for e in read_event_log(paths.state_file) if e["kind"] == "reconcile_pass_deferred"
+    ]
+    assert len(log_events) == 1
+    assert log_events[0]["payload"]["remaining"] == 50
+
+
 def test_reconcile_fix_deferred_when_supervisor_lock_held(tmp_path: Path) -> None:
     """Issue #398: mop-up --fix must be mutually exclusive with a supervised/fleet
     pass on the same repo. If the supervisor.lock is held, reconcile returns a skip.
