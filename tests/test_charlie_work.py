@@ -18183,8 +18183,8 @@ def test_merge_ready_failed_attempt_alarm_clamps_at_threshold_plus_one(
 
     results = [app.merge_ready(456, merge=False) for _ in range(6)]
 
-    for result in results[:2]:
-        assert result.data["consecutive_failed_merge_attempts"] < threshold
+    assert results[0].data["consecutive_failed_merge_attempts"] == 1
+    assert results[1].data["consecutive_failed_merge_attempts"] == 2
     assert results[2].data["consecutive_failed_merge_attempts"] == threshold
     for result in results[3:]:
         assert result.data["consecutive_failed_merge_attempts"] == threshold + 1
