@@ -15,6 +15,7 @@ from charlie_work.config import (
     RunnerAllocationConfig,
     RunnerScalingConfig,
 )
+from charlie_work.cross_family import LEGACY_VACUOUS_SUMMARY
 from charlie_work.fleet_dispatch import ApiWorkerFleetReport
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.quiesce import QuiesceReport
@@ -194,6 +195,79 @@ def test_cli_verdict_missing_summary_file_json_output(
     assert payload["ok"] is False
     assert "OS error" in payload["message"]
     assert not (repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json").exists()
+
+
+def test_cli_verdict_request_changes_derives_required_changes_from_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Issue #792 AC-6, third producer path: `charlie verdict` has no
+    --required-changes flag at all -- every request_changes/blocked verdict
+    recorded through this CLI command arrives at record_review with
+    required_changes=None, so real reviewer prose supplied via
+    --summary-file must be derived into required_changes rather than
+    persisted empty."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    summary = repo / "summary.md"
+    prose = "The retry wrapper swallows the exception type; push a fix before merging."
+    summary.write_text(prose, encoding="utf-8")
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "request_changes",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "review recorded" in captured.out
+    decision_path = repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["decision"] == "request_changes"
+    assert decision["required_changes"] == [prose]
+    assert decision["findings_channel"] == "derived"
+
+
+def test_cli_verdict_request_changes_persists_vacuous_marker_for_legacy_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Same manual-CLI producer path, the nothing-derivable outcome: a
+    --summary-file containing the historical content-free placeholder
+    records ok=True with required_changes: [] and findings_channel:
+    "vacuous" -- never a non-zero exit, matching record_review's
+    never-reject invariant (issue #792 AC-3)."""
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    summary = repo / "summary.md"
+    summary.write_text(LEGACY_VACUOUS_SUMMARY, encoding="utf-8")
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "request_changes",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+
+    assert rc == 0
+    decision_path = repo / ".var" / "charlie-work" / "prs" / "pr-1" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == []
+    assert decision["findings_channel"] == "vacuous"
 
 
 def test_cli_verdict_isolates_fleet_registry(

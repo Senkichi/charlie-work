@@ -6,20 +6,12 @@ on:
     branches:
       - main
 
-# Issue 801: with only 2 self-hosted runners, every rebase/review-fix push
-# left the previous, now-superseded run for the same ref queued or even
-# occupying a runner -- measured live: 9 queued runs, 4 testing dead SHAs,
-# one of them actively holding a runner. Cancelling superseded runs is safe
-# for required-check gating: summarize_checks() (checks.py) only ever reads
-# checks for the PR's current head SHA (gh pr checks / statusCheckRollup are
-# both scoped that way), and cancel-in-progress by construction only cancels
-# a PREVIOUS run for an older SHA on the same ref -- never the SHA that is
-# currently head. A superseded-run cancellation is therefore invisible to
-# summarize_checks entirely, not reported as CANCELLED against the current
-# head, so this cannot turn into a spurious "infra failure" read for a check
-# that never actually ran to completion at head. Push-to-main runs are
-# exempted from cancellation: a main run is a historical record that also
-# feeds deployment, not a superseded draft.
+# Cancel superseded in-progress runs for the same branch. charlie-work has
+# only 2 registered self-hosted runners; without this, a run left in-progress
+# by a since-superseded push keeps occupying one of them to test a SHA that
+# can no longer appear in any PR's check set (checks are computed against the
+# head SHA). Push-to-main runs are exempt from cancellation: a main run is a
+# historical record that also feeds deployment, not a superseded draft.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}

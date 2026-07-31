@@ -61,6 +61,7 @@ from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, link
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
+    PASSIVE_OPEN_STATUS,
     append_event,
     empty_state,
     is_throttled,
@@ -82,6 +83,7 @@ from charlie_work.workflow import (
     _reap_orphaned_review_checkouts,
     _render_required_changes_section,
     _required_changes_from_checks,
+    _summary_is_vacuous,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -8003,6 +8005,168 @@ def test_dispatch_reviews_probe_success_clears_reviewer_quota(monkeypatch, tmp_p
     # completed, so the queue is empty and dispatch returns early — but the
     # quota clearing happens before the queue check (fix 1.1).
     assert state.get("reviewer_quota", {}).get("throttled_until") is None
+    # The verdict-reap recovery path must stamp the same recovery marker a
+    # green flat probe would, so later dead-reviewer sweeps can suppress
+    # backoff from throttle signatures that predate the recovery (issue #662).
+    assert state.get("reviewer_quota", {}).get("last_probe_cleared_at") is not None
+
+
+def test_dispatch_reviews_recorded_verdict_suppresses_later_stalled_throttle(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #662: a recorded verdict from a dead reviewer clears reviewer_quota
+    and stamps ``last_probe_cleared_at``. A later stale throttled reviewer that
+    died before that marker must not re-poison ``reviewer_quota``.
+    """
+    from charlie_work.state import is_reviewer_quota_exhausted
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    future_throttle = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    past_probe = (datetime.now(UTC) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["reviewer_quota"] = {
+            "throttled_until": future_throttle,
+            "probe_after": past_probe,
+        }
+        state["prs"]["100"] = {
+            **state["prs"].get("100", {}),
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": (datetime.now(UTC) - timedelta(minutes=10))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "reviewer_pid": 0,
+            "reviewer_process_start_time": None,
+        }
+        save_state(app.paths.state_file, state)
+
+    # Issue #663 landed a layout-module refactor (on main, after this branch
+    # diverged) that changed ReviewDispatchConfig.reviews_dir's default to ""
+    # -- an empty-string sentinel meaning "derive from layout.reviews_dir_default"
+    # (see paths.resolved_layout). `tmp_path / app.config.review_dispatch.reviews_dir`
+    # now silently resolves to tmp_path itself, not the real reviews directory
+    # dispatch_reviews() reads from (self._layout.reviews_dir) -- use the
+    # resolved layout path, matching the sibling
+    # test_dispatch_reviews_probe_success_clears_reviewer_quota above.
+    reviews_dir = app._layout.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        'Review complete.\n```json\n{"decision": "approved", "summary": "LGTM"}\n```',
+        encoding="utf-8",
+    )
+    sidecar_path = reviews_dir / "issue-100.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 100,
+                "branch": "agent/issue-10-fix",
+                "worktree_path": str(tmp_path / "wt"),
+                "prompt_path": str(tmp_path / "prompt"),
+                "command": ["claude"],
+                "pid": 0,
+                "started_at": (datetime.now(UTC) - timedelta(minutes=10))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "log_path": str(log_path),
+                "adapter_kind": "claude-code",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr(
+        "charlie_work.workflow.launch_claude_worker",
+        lambda *args, **kwargs: _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        ),
+    )
+
+    app.dispatch_reviews()
+    state = load_state(app.paths.state_file)
+    assert not is_reviewer_quota_exhausted(state)
+    marker = state["reviewer_quota"]["last_probe_cleared_at"]
+    assert marker
+
+    # Now create a second stale throttled reviewer (PR 200) whose death
+    # predates the marker. The reap sweep should suppress backoff.
+    marker_dt = datetime.fromisoformat(marker.replace("Z", "+00:00"))
+    death_dt = marker_dt - timedelta(seconds=1)
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+
+    log_path_200 = reviews_dir / "issue-200-review.claude.log"
+    log_path_200.write_text(
+        "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path_200, (death_dt.timestamp(), death_dt.timestamp()))
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    (reviews_dir / "issue-200.claude.json").write_text(
+        json.dumps(
+            {
+                "issue_number": 200,
+                "branch": "agent/issue-20-fix",
+                "worktree_path": str(tmp_path / "wt200"),
+                "prompt_path": str(tmp_path / "prompt200"),
+                "command": ["claude", "-p"],
+                "pid": 999999999,
+                "started_at": old_started,
+                "log_path": str(log_path_200),
+                "error": None,
+                "process_start_time": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["200"] = {
+            "number": 200,
+            "issue_number": 20,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(app.paths.state_file, state)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, app.paths.state_file, app.config, repo_root)
+
+    state = load_state(app.paths.state_file)
+    assert not is_reviewer_quota_exhausted(state)
+    assert state["prs"]["200"].get("review_dispatch_status") is None
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("pr_number") == 200
+        and event.get("payload", {}).get("reason") == "provider_throttled"
+        and event.get("payload", {}).get("backoff_suppressed") is True
+        for event in state.get("events", [])
+    )
 
 
 def test_dispatch_reviews_turn_limit_posts_summary_comment(monkeypatch, tmp_path: Path) -> None:
@@ -8447,6 +8611,185 @@ def test_detect_and_handle_stalled_reviews_backs_off_on_provider_throttle_in_log
     assert any(
         event.get("kind") == "review_dispatch_stalled"
         and event.get("payload", {}).get("reason") == "provider_throttled"
+        for event in state.get("events", [])
+    )
+
+
+def test_detect_and_handle_stalled_reviews_suppresses_backoff_after_probe_recovery(
+    tmp_path: Path,
+) -> None:
+    """Issue #662: a dead reviewer whose log shows a throttle signature must
+    NOT re-poison reviewer_quota when a green flat-interval probe already
+    cleared the throttle AFTER the reviewer died. The throttle signature in a
+    dead session's log tail is frozen at death time; re-applying backoff from
+    it would anchor throttled_until/probe_after to "now" rather than the
+    original death time, delaying the next dispatch by up to one probe cycle
+    even though the quota window is open. The claim is still rolled back and
+    the sidecar reaped -- the reviewer is dead regardless, and with the quota
+    recovered the PR should be immediately re-dispatchable.
+    """
+    from datetime import timedelta
+
+    from charlie_work.state import load_state as _load_state
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n",
+        encoding="utf-8",
+    )
+    # Pin the log mtime to 10 minutes ago -- the reviewer died then, and a
+    # green probe cleared the quota 1 minute ago (after death).
+    death_dt = datetime.now(UTC) - timedelta(minutes=10)
+    cleared_dt = datetime.now(UTC) - timedelta(minutes=1)
+    os.utime(log_path, (death_dt.timestamp(), death_dt.timestamp()))
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": old_started,
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    cleared_iso = cleared_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        # Simulate a green probe that cleared the quota after the reviewer died.
+        state["reviewer_quota"] = {
+            "consecutive_probe_failures": 0,
+            "last_probe_cleared_at": cleared_iso,
+        }
+        save_state(state_file, state)
+
+    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    assert any(
+        entry.get("pr") == 100 and entry.get("reason") == "provider_throttled" for entry in stalled
+    )
+
+    state = _load_state(state_file)
+    pr_state = state["prs"]["100"]
+    # Rolled back, not failed -- immediately re-dispatchable (quota is open).
+    assert pr_state.get("review_dispatch_status") is None
+    assert pr_state.get("reviewer_pid") is None
+
+    quota = state.get("reviewer_quota", {})
+    # Backoff was suppressed: no throttled_until / probe_after re-poisoning.
+    assert not quota.get("throttled_until")
+    assert not quota.get("probe_after")
+    # The recovery marker must survive the sweep unchanged.
+    assert quota.get("last_probe_cleared_at") == cleared_iso
+
+    # The event must record the suppression for observability.
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("reason") == "provider_throttled"
+        and event.get("payload", {}).get("backoff_suppressed") is True
+        for event in state.get("events", [])
+    )
+    # The sidecar was reaped (one-shot, no re-entry next sweep).
+    assert not (reviews_dir / "issue-100.claude.json").exists()
+
+
+def test_detect_and_handle_stalled_reviews_applies_backoff_when_probe_predates_death(
+    tmp_path: Path,
+) -> None:
+    """Issue #662 control: when the green probe cleared BEFORE the reviewer
+    died, the throttle signature is fresh evidence the quota closed again and
+    backoff must still be applied. Only a probe recovery that post-dates the
+    death suppresses backoff.
+    """
+    from datetime import timedelta
+
+    from charlie_work.state import load_state as _load_state
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text(
+        "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n",
+        encoding="utf-8",
+    )
+    # The reviewer died 1 minute ago; the probe cleared 10 minutes ago (before
+    # death) -- the throttle signature is fresh, backoff must engage.
+    death_dt = datetime.now(UTC) - timedelta(minutes=1)
+    cleared_dt = datetime.now(UTC) - timedelta(minutes=10)
+    os.utime(log_path, (death_dt.timestamp(), death_dt.timestamp()))
+
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": old_started,
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    cleared_iso = cleared_dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        state["reviewer_quota"] = {
+            "consecutive_probe_failures": 0,
+            "last_probe_cleared_at": cleared_iso,
+        }
+        save_state(state_file, state)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    state = _load_state(state_file)
+    quota = state.get("reviewer_quota", {})
+    # Backoff applied: throttled_until / probe_after are set.
+    assert quota.get("throttled_until")
+    assert quota.get("probe_after")
+    assert any(
+        event.get("kind") == "review_dispatch_stalled"
+        and event.get("payload", {}).get("reason") == "provider_throttled"
+        and event.get("payload", {}).get("backoff_suppressed") is False
         for event in state.get("events", [])
     )
 
@@ -9474,6 +9817,209 @@ def test_unauthorized_merge_baseline_arming_writes_nothing_in_dry_run(tmp_path: 
     )
 
 
+def _ack_unauthorized_merge(paths, pr_number: int, reason: str = "triaged") -> None:
+    """Mark a post-arming unauthorized-merge finding as acknowledged in state.json.
+
+    Mirrors ``_arm_unauthorized_merge_tripwire`` for the ack half of the
+    tripwire: tests asserting on post-arming findings use this to declare the
+    steady state where a finding has already been triaged and must no longer
+    pin ``ok=False`` (issue #673).
+    """
+    from charlie_work.state import load_state, save_state
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    state = load_state(paths.state_file)
+    acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+    if not isinstance(acks, dict):
+        acks = {}
+    acks[str(pr_number)] = {
+        "acknowledged_at": "2026-07-27T00:00:00Z",
+        "reason": reason,
+    }
+    state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
+    save_state(paths.state_file, state)
+
+
+def test_unauthorized_merge_ack_suppresses_acknowledged_finding(tmp_path: Path) -> None:
+    """An acknowledged post-arming finding must stop polluting every pass (issue #673).
+
+    The tripwire keeps its bite until a finding is explicitly acknowledged; once
+    acked it is filtered the same way the pre-arming baseline filters history, so
+    ``ok=False`` / ``errors`` go back to meaning "there is something new to look
+    at" instead of "the mechanism cannot ever clear this".
+    """
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [
+        _merged_worker_pr(1408, 1404, "sha-1408"),
+        _merged_worker_pr(1392, 1268, "sha-1392"),
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-ack: both post-arming findings are flagged.
+    detected = app._detect_unauthorized_merges(fake_gh.prs)
+    assert sorted(d["pr"] for d in detected) == [1392, 1408]
+
+    # Acknowledge both (e.g. root cause fixed in #672, confirmed benign per #634).
+    _ack_unauthorized_merge(paths, 1408, "root cause fixed in #672")
+    _ack_unauthorized_merge(paths, 1392, "root cause fixed in #672")
+
+    # Post-ack: both are suppressed — the tripwire can go quiet.
+    assert app._detect_unauthorized_merges(fake_gh.prs) == [], (
+        "an acknowledged finding must not be re-reported on every pass"
+    )
+
+    # A NEW post-arming finding is still flagged — ack only suppresses what was
+    # explicitly acked, it does not auto-acknowledge anything else.
+    new_prs = [*fake_gh.prs, _merged_worker_pr(1500, 1501, "sha-1500")]
+    detected_after = app._detect_unauthorized_merges(new_prs)
+    assert [d["pr"] for d in detected_after] == [1500]
+
+
+def test_unauthorized_merge_ack_does_not_suppress_unacked(tmp_path: Path) -> None:
+    """The ack set suppresses only the acked PR, never a sibling finding (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
+    _ack_unauthorized_merge(paths, 1408, "fixed")
+
+    fake_gh = FakeGitHub()
+    prs = [
+        _merged_worker_pr(1408, 1404, "sha-1408"),
+        _merged_worker_pr(1392, 1268, "sha-1392"),
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    detected = app._detect_unauthorized_merges(prs)
+    assert [d["pr"] for d in detected] == [1392], (
+        "acking #1408 must not also suppress the unrelated #1392 finding"
+    )
+
+
+def test_ack_unauthorized_merge_records_ack_and_event(tmp_path: Path) -> None:
+    """``ack_unauthorized_merge`` persists the ack set and an audit event (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="senki")
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+    assert isinstance(acks, dict), "ack must persist an ack set to state.json"
+    entry = acks["1408"]
+    assert entry["reason"] == "root cause fixed in #672"
+    assert entry["acknowledged_at"]
+    assert entry["by"] == "senki"
+
+    # The ack must be auditable: an event carries who/why/when.
+    acked = [e for e in state["events"] if e["kind"] == "unauthorized_merge_acknowledged"]
+    assert len(acked) == 1
+    assert acked[0]["payload"]["pr"] == 1408
+    assert acked[0]["payload"]["reason"] == "root cause fixed in #672"
+    assert acked[0]["payload"]["by"] == "senki"
+
+
+def test_ack_unauthorized_merge_requires_reason(tmp_path: Path) -> None:
+    """An ack without a reason is rejected — a tripwire that can be silenced silently is no control (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.ack_unauthorized_merge(1408, "   ")
+    assert result.ok is False
+    assert "reason" in result.message.lower()
+    assert UNAUTHORIZED_MERGE_ACK_KEY not in load_state(paths.state_file), (
+        "a rejected ack must not have written anything to state"
+    )
+
+
+def test_ack_unauthorized_merge_updates_existing_ack(tmp_path: Path) -> None:
+    """Re-acking a PR updates the record rather than refusing or duplicating (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    app.ack_unauthorized_merge(1408, "initial triage", by="alice")
+    first = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]["1408"]
+
+    app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="bob")
+    second = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]["1408"]
+
+    assert len(load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]) == 1, (
+        "re-acking must not duplicate the entry"
+    )
+    assert second["reason"] == "root cause fixed in #672"
+    assert second["by"] == "bob"
+    assert second["acknowledged_at"] >= first["acknowledged_at"]
+
+
+def test_cli_tripwire_ack_writes_state(monkeypatch, tmp_path: Path) -> None:
+    """`charlie tripwire ack <pr> --reason ...` persists the ack through the CLI (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    monkeypatch.setattr(cli, "build_app", lambda args: app)
+
+    exit_code = cli.main(
+        ["tripwire", "ack", "1408", "--reason", "root cause fixed in #672", "--by", "senki"]
+    )
+    assert exit_code == 0
+
+    acks = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]
+    assert acks["1408"]["reason"] == "root cause fixed in #672"
+    assert acks["1408"]["by"] == "senki"
+
+
+def test_cli_tripwire_ack_requires_reason(monkeypatch, capsys, tmp_path: Path) -> None:
+    """`charlie tripwire ack` without --reason exits non-zero and writes nothing (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    monkeypatch.setattr(cli, "build_app", lambda args: app)
+
+    exit_code = cli.main(["tripwire", "ack", "1408"])
+    assert exit_code == 1
+    assert UNAUTHORIZED_MERGE_ACK_KEY not in load_state(paths.state_file)
+
+
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
         return subprocess.CompletedProcess(
@@ -10185,7 +10731,7 @@ def test_run_cross_family_sanitizes_environment(
 def test_run_cross_family_sanitizes_environment_with_repo_venv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When repo has .venv, VIRTUAL_ENV must be set to that path."""
+    """When repo has a real .venv, VIRTUAL_ENV must be set and UV_PROJECT_ENVIRONMENT dropped."""
     from charlie_work.env_sanitize import sanitize_env
 
     repo_root = tmp_path / "repo"
@@ -10201,7 +10747,7 @@ def test_run_cross_family_sanitizes_environment_with_repo_venv(
 
     assert env.get("VIRTUAL_ENV") == str(repo_venv), "VIRTUAL_ENV must be set to repo .venv"
     assert "UV_PROJECT_ENVIRONMENT" not in env, (
-        "UV_PROJECT_ENVIRONMENT must be dropped when repo has .venv"
+        "UV_PROJECT_ENVIRONMENT must be dropped; uv's default is the same repo .venv (issue #649)"
     )
 
 
@@ -10516,6 +11062,66 @@ def test_parse_cross_family_verdict_legacy_blocker_with_no_summary_is_malformed(
     assert "BLOCKER" in result.raw_body
 
 
+def test_parse_cross_family_verdict_bold_inline_verdict_marker() -> None:
+    """Regression: some cross-family models (e.g. glm-5.2) emit the verdict as
+    a bold-inline ``**Verdict:**`` marker within a paragraph, rather than a
+    bare ``Verdict:`` line or a ``## Verdict`` heading. The pre-fix
+    ``_VERDICT_RE`` matched neither the bare-colon nor the heading form, so
+    every such report (PRs #680, #690, #692, #699, #700 in production, all
+    with real BLOCKER/MAJOR findings and a readable verdict) fell through to
+    the "no extractable summary" branch and was misclassified as
+    ``MalformedCrossFamilyVerdict`` despite the verdict being right there."""
+    body = (
+        "**MAJOR**\nfile.py:10 real bug\n\n"
+        "**Verdict:** Approve with a required follow-up — MAJOR 1 is a real "
+        "correctness bug that must be fixed before this claim can be trusted."
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary=(
+            "Approve with a required follow-up — MAJOR 1 is a real "
+            "correctness bug that must be fixed before this claim can be trusted."
+        ),
+        required_changes=(),
+    )
+
+
+def test_parse_cross_family_verdict_json_block_after_language_tagged_code_fences() -> None:
+    """Regression for PR #802's real failure shape: a report that cites code
+    in ```python fences before its final ```json verdict fence. The pre-fix
+    ``_VERDICT_FENCE_RE`` (``` ```(?:json)?\\s*\\n `` ``) only recognized an
+    opening fence tagged bare or ``json`` -- a ```python fence's own opening
+    backtick never matched, so ``finditer`` instead paired that block's
+    *closing* bare ``` with the *next* fence's opening as a bogus "match",
+    permanently desynchronizing every fence pair after it and hiding the
+    genuinely well-formed trailing JSON verdict entirely (confirmed
+    byte-for-byte against PR #802's on-disk report)."""
+    body = (
+        "**MAJOR**\nfile.py:10 real bug\n\n"
+        "```python\n"
+        "total_running = sum(t.running for t in plan.targets)\n"
+        "```\n\n"
+        "some prose explaining the first citation\n\n"
+        "```python\n"
+        "planned_running = sum(t.target for t in plan.targets)\n"
+        "```\n\n"
+        "some prose explaining the second citation\n\n"
+        "```json\n"
+        '{"decision": "request_changes", "summary": "real bug in the spare-budget gate", '
+        '"required_changes": ["Fix the gate to use planned running, not actual running"]}\n'
+        "```\n"
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="real bug in the spare-budget gate",
+        required_changes=("Fix the gate to use planned running, not actual running",),
+    )
+
+
 def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
     """Issue #784 AC-6: the invalid state -- request_changes with neither
     itemized required_changes nor a real summary -- must be unrepresentable
@@ -10647,6 +11253,57 @@ def test_is_carry_forward_eligible_false_for_whitespace_padded_placeholder() -> 
         )
         is False
     )
+
+
+# --------------------------------------------------------------------------
+# Issue #792: _summary_is_vacuous is the single shared discriminator between
+# "nothing to derive" (record_review's write-time marker) and "not eligible
+# for carry-forward" (_is_carry_forward_eligible's read-time check above).
+# It must classify real, specific reviewer prose as non-vacuous even when
+# that prose is terse or lacks a file/line reference -- only a blank string
+# or the one known historical placeholder is vacuous.
+# --------------------------------------------------------------------------
+
+
+def test_summary_is_vacuous_true_for_blank_string() -> None:
+    assert _summary_is_vacuous("") is True
+
+
+def test_summary_is_vacuous_true_for_whitespace_only() -> None:
+    assert _summary_is_vacuous("   \n\t  ") is True
+
+
+def test_summary_is_vacuous_true_for_legacy_placeholder() -> None:
+    assert _summary_is_vacuous(LEGACY_VACUOUS_SUMMARY) is True
+
+
+def test_summary_is_vacuous_true_for_whitespace_padded_placeholder() -> None:
+    assert _summary_is_vacuous(f"  {LEGACY_VACUOUS_SUMMARY}  ") is True
+
+
+def test_summary_is_vacuous_false_for_substantive_architectural_prose() -> None:
+    """A real, specific finding with no file/line reference (pr-774's shape)
+    must not be misclassified as vacuous just because it lacks structure."""
+    prose = (
+        "The retry wrapper swallows the underlying exception type, so a "
+        "caller cannot distinguish a transient network failure from a "
+        "permanent 4xx and will retry requests that can never succeed."
+    )
+    assert _summary_is_vacuous(prose) is False
+
+
+def test_summary_is_vacuous_false_for_terse_but_real_ci_summary() -> None:
+    """The CI-failure producer's own summary shape (pr-529/683's pattern)
+    is short but names a specific, real cause -- not content-free."""
+    assert _summary_is_vacuous("CI failed on Lint; push a fix") is False
+
+
+def test_summary_is_vacuous_false_for_prefix_or_suffix_of_placeholder() -> None:
+    """Only an exact match on the known placeholder is vacuous -- a summary
+    that merely contains it as a substring (e.g. a reviewer quoting the old
+    bug) is real, distinguishing text and must not be swept in by a loose
+    substring check."""
+    assert _summary_is_vacuous(f"{LEGACY_VACUOUS_SUMMARY} but I also checked X") is False
 
 
 # --------------------------------------------------------------------------
@@ -11594,6 +12251,48 @@ def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_fai
     assert cleared["reviewer_quota"]["consecutive_probe_failures"] == 0
     # The devin adapter's root throttle must still be untouched.
     assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+
+
+def test_clear_quota_throttles_records_last_probe_cleared_at() -> None:
+    """Issue #662: ``clear_quota_throttles`` stamps ``last_probe_cleared_at``
+    on reviewer_quota so the dead-reviewer reap sweep can tell a recovery
+    happened. It is recorded even when reviewer_quota was never exhausted
+    (a green probe clearing a root-only throttle still proves the provider
+    recovered), and survives ``clear_reviewer_quota`` across episodes.
+    """
+    from charlie_work.state import (
+        clear_quota_throttles,
+        clear_reviewer_quota,
+        empty_state,
+        reviewer_quota_last_probe_cleared_at,
+        set_reviewer_quota_exhausted,
+        set_throttled_until,
+    )
+
+    # Reviewer-quota exhaustion present: marker recorded after clear.
+    state = set_reviewer_quota_exhausted(
+        empty_state(), throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
+    )
+    cleared = clear_quota_throttles(state)
+    assert reviewer_quota_last_probe_cleared_at(cleared) is not None
+    assert "throttled_until" not in cleared["reviewer_quota"]
+
+    # Root-only throttle (reviewer_quota never set): marker still recorded.
+    root_only = set_throttled_until(
+        empty_state(), "2026-08-01T00:00:00Z", reason="rate_limited", adapter_kind="claude-code"
+    )
+    cleared_root = clear_quota_throttles(root_only)
+    assert reviewer_quota_last_probe_cleared_at(cleared_root) is not None
+    assert "throttled_until" not in cleared_root["reviewer_quota"]
+
+    # The marker survives a subsequent clear_reviewer_quota (new episode).
+    re_exhausted = set_reviewer_quota_exhausted(
+        cleared_root, throttled_until="2026-09-01T00:00:00Z", probe_after="2026-09-01T00:00:00Z"
+    )
+    re_cleared = clear_reviewer_quota(re_exhausted)
+    assert reviewer_quota_last_probe_cleared_at(
+        re_cleared
+    ) == reviewer_quota_last_probe_cleared_at(cleared_root)
 
 
 def test_dispatch_reviews_quota_deferral_emits_one_shot_digest(
@@ -13382,9 +14081,13 @@ def test_review_ci_failure_without_annotations_degrades_without_fabricating(
 ) -> None:
     """Issue #771: a failing required check whose run carries zero GitHub
     annotations AND no link (e.g. a process-level crash with nothing GitHub
-    can point at) must not fabricate a file/line -- required_changes stays
-    empty and the pre-existing summary-only fallback
-    (_render_required_changes_section tier 2) renders instead."""
+    can point at) must not fabricate a file/line -- no bogus per-file bullet
+    is synthesized. Issue #792: record_review now derives a single
+    required_changes entry from the non-vacuous summary text (marking
+    findings_channel="derived"), and _render_required_changes_section renders
+    that marker with the same summary-only fallback shape (tier 2) as before
+    -- the rendered prompt is unchanged even though required_changes is no
+    longer empty."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithChecksAndAnnotations(
@@ -13405,7 +14108,8 @@ def test_review_ci_failure_without_annotations_degrades_without_fabricating(
     assert result.ok is True
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
-    assert decision["required_changes"] == []
+    assert decision["required_changes"] == ["CI failed on Tests passed; push a fix"]
+    assert decision["findings_channel"] == "derived"
     assert decision["summary"] == "CI failed on Tests passed; push a fix"
 
     rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
@@ -14164,6 +14868,241 @@ def test_find_repo_root_explicit_raises_when_not_git_repo(tmp_path: Path) -> Non
         assert "git work tree" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("expected RepoNotFoundError")
+
+
+def _init_git_repo(repo_root: Path) -> None:
+    """Create a real non-bare git repo with one commit on ``main``."""
+    repo_root.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+
+
+def test_find_repo_root_resolves_shared_root_from_linked_worktree(tmp_path: Path) -> None:
+    """Issue #648: with no --repo, find_repo_root() invoked from inside a
+    linked git worktree must resolve the *shared* (main) worktree root, not
+    the worktree's own toplevel — otherwise runtime state silently targets a
+    phantom, never-populated ``.var/charlie-work/`` directory."""
+    from charlie_work.paths import find_repo_root, runtime_paths
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    # Seed a real state dir under the main root so we can distinguish it.
+    main_state_dir = repo_root / ".var" / "charlie-work"
+    main_state_dir.mkdir(parents=True)
+    (main_state_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    branch = "agent/issue-648-linked"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(tmp_path / "wt"), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        resolved = find_repo_root(tmp_path / "wt")
+        # Must resolve to the main worktree root, not the linked worktree.
+        assert resolved == repo_root.resolve()
+        paths = runtime_paths(resolved, ".var/charlie-work")
+        assert paths.state_file.exists()
+        assert paths.state_file == (repo_root / ".var" / "charlie-work" / "state.json").resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(tmp_path / "wt")],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_explicit_main_worktree_returns_main_root(tmp_path: Path) -> None:
+    """An explicit --repo pointing at the main checkout returns the main root.
+    The shared-root resolution returns None in the main worktree (where
+    --git-dir == --git-common-dir), so --show-toplevel is used and is correct."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    resolved = find_repo_root(repo_root, explicit=True)
+    assert resolved == repo_root.resolve()
+
+
+def test_find_repo_root_explicit_linked_worktree_resolves_main_root(tmp_path: Path) -> None:
+    """Issue #648 review: an explicit --repo pointing at a linked worktree must
+    also resolve to the shared main root, not the linked worktree's own
+    toplevel.  The orchestrator's state is shared — there is no per-worktree
+    state directory — so --repo <linked-worktree> would silently target a
+    phantom state dir without this."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    branch = "agent/issue-648-explicit"
+    linked_wt = tmp_path / "wt-explicit"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(linked_wt), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        resolved = find_repo_root(linked_wt, explicit=True)
+        assert resolved == repo_root.resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_from_subdirectory_of_linked_worktree(tmp_path: Path) -> None:
+    """Issue #648 review: find_repo_root from a *subdirectory* of a linked
+    worktree must still resolve to the shared main root."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    linked_wt = tmp_path / "wt-subdir"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "agent/issue-648-subdir", str(linked_wt), "HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subdir = linked_wt / "src" / "deep"
+    subdir.mkdir(parents=True)
+    try:
+        resolved = find_repo_root(subdir)
+        assert resolved == repo_root.resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_find_repo_root_separate_git_dir_main_worktree(tmp_path: Path) -> None:
+    """Issue #648 review MAJOR 1: a --separate-git-dir repo's main worktree
+    must resolve to the *working tree* root (where the code lives), not the
+    external git dir's container.  The shared-root resolution detects the main
+    worktree (--git-dir == --git-common-dir) and returns None, so
+    --show-toplevel is used and returns the working tree root."""
+    from charlie_work.paths import find_repo_root
+
+    repo_root = tmp_path / "repo"
+    external_git = tmp_path / "external" / ".git"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    external_git.parent.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", f"--separate-git-dir={external_git}", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+    # The external dir's parent must NOT be returned as the repo root.
+    resolved = find_repo_root(repo_root)
+    assert resolved == repo_root.resolve()
+    assert resolved != external_git.parent.resolve()
+
+
+def test_runtime_paths_warns_on_phantom_state_dir(tmp_path: Path, caplog: Any) -> None:
+    """Issue #648: a state dir that exists with sibling artifacts but no
+    state.json is a phantom signal — runtime_paths must warn (non-blocking)
+    so the operator notices instead of seeing a silent 'all clear'."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    # Mimic the stray artifacts described in the issue.
+    (state_dir / "events.db").write_bytes(b"")
+    (state_dir / "state.json.lock").write_text("", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(state_dir.resolve()) in warnings[0].message
+    assert "state.json" in warnings[0].message
+
+
+def test_runtime_paths_silent_without_sibling_artifacts(tmp_path: Path, caplog: Any) -> None:
+    """Issue #648 review MINOR: a state dir that exists but has no state.json
+    AND no sibling artifacts (events.db, state.json.lock) must NOT warn — it
+    could be a pre-existing directory used for an unrelated purpose, not a
+    phantom left by a misresolved invocation."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    # No sibling artifacts — just an empty dir.
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
+
+
+def test_runtime_paths_no_warn_for_absolute_unrelated_state_dir(
+    tmp_path: Path, caplog: Any
+) -> None:
+    """Issue #648 review MINOR: an absolute state_dir pointing at a
+    pre-existing directory without sibling artifacts must not trigger the
+    phantom warning."""
+    from charlie_work.paths import runtime_paths
+
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "some-file.txt").write_text("data", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, str(unrelated))
+
+    assert not caplog.records
+
+
+def test_runtime_paths_silent_when_state_dir_absent(tmp_path: Path, caplog: Any) -> None:
+    """A genuine first run has not created the state dir yet at runtime_paths
+    call time — no phantom warning must fire."""
+    from charlie_work.paths import runtime_paths
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
+
+
+def test_runtime_paths_silent_when_state_json_exists(tmp_path: Path, caplog: Any) -> None:
+    """A populated state dir is the normal steady state — no warning."""
+    from charlie_work.paths import runtime_paths
+
+    state_dir = tmp_path / ".var" / "charlie-work"
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text("{}", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.paths"):
+        runtime_paths(tmp_path, ".var/charlie-work")
+
+    assert not caplog.records
 
 
 # --- adversarial-review fixes: regressions + coverage gaps ---------------------
@@ -17345,7 +18284,16 @@ def test_record_review_approved_allows_empty_summary(tmp_path: Path) -> None:
 
 
 def test_record_review_decision_payload_includes_required_changes(tmp_path: Path) -> None:
-    """Issue #11: decision payload always includes required_changes field."""
+    """Issue #11: decision payload always includes required_changes field.
+
+    Issue #792: a request_changes verdict with no required_changes no longer
+    persists an empty list when `summary` has real content -- record_review
+    now derives required_changes from summary at write time, so the
+    persisted list here is `["fix A"]`, not `[]`. See
+    test_record_review_derives_required_changes_from_summary and
+    test_record_review_persists_vacuous_marker_when_nothing_derivable for the
+    dedicated coverage of both derivation outcomes.
+    """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -17357,12 +18305,160 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "required_changes" in decision
     assert decision["required_changes"] == []
+    # approved is never subject to derivation: no marker at all (issue #792 AC-4).
+    assert "findings_channel" not in decision
 
     app.record_review(456, "request_changes", summary="fix A")
 
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "required_changes" in decision
+    assert decision["required_changes"] == ["fix A"]
+    assert decision["findings_channel"] == "derived"
+
+
+# --------------------------------------------------------------------------
+# Issue #792: required_changes has a near-0% fill rate because reviewers
+# reliably fill in `summary` and skip the structured list. record_review now
+# derives required_changes from summary at write time instead of leaving it
+# empty for a downstream renderer to paper over. These tests cover the 8
+# acceptance criteria from the issue directly against the record_review
+# entrypoint (not the decision-payload dict alone).
+# --------------------------------------------------------------------------
+
+
+def test_record_review_derives_required_changes_from_summary(tmp_path: Path) -> None:
+    """AC-1: request_changes + empty required_changes + extractable prose ->
+    persisted with required_changes populated from that prose, and
+    findings_channel marks it as derived (not an itemized reviewer list)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    prose = "The null check in parse() is missing, causing a crash on empty input."
+    result = app.record_review(456, "request_changes", summary=prose, required_changes=None)
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["required_changes"] == [prose]
+    assert decision["findings_channel"] == "derived"
+    assert decision["summary"] == prose
+
+
+def test_record_review_persists_vacuous_marker_when_nothing_derivable(
+    tmp_path: Path,
+) -> None:
+    """AC-2: request_changes + empty required_changes + a summary with no
+    extractable findings is still PERSISTED -- never rejected -- with
+    required_changes: [], findings_channel: "vacuous", and a distinct
+    required_changes_vacuous event alongside the general record_review
+    event. A blank/whitespace-only summary cannot reach this derivation at
+    all (issue #11's gate rejects it outright before any state mutation, so
+    that shape can never produce a persisted vacuous marker); the only
+    non-blank text this function is entitled to call vacuous is the one
+    known historical placeholder, so that is what exercises this path here.
+    See test_record_review_positive_control_legacy_vacuous_summary (AC-8)
+    for the same literal used to prove the discriminator fires on real
+    on-disk data, not just a fixture invented for this test.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
     assert decision["required_changes"] == []
+    assert decision["findings_channel"] == "vacuous"
+
+    state = load_state(paths.state_file)
+    kinds = [
+        event["kind"] for event in state["events"] if event["payload"].get("pr_number") == 456
+    ]
+    assert "required_changes_vacuous" in kinds
+    assert "record_review" in kinds
+
+
+def test_record_review_positive_control_legacy_vacuous_summary(tmp_path: Path) -> None:
+    """AC-8 positive control: the exact LEGACY_VACUOUS_SUMMARY literal --
+    real text that shipped on six on-disk pre-#795 cross-family verdicts --
+    fed through record_review must be classified vacuous, proving the
+    discriminator actually fires on real historical data rather than only
+    on a synthetic fixture invented for this test."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary=LEGACY_VACUOUS_SUMMARY,
+        required_changes=None,
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["findings_channel"] == "vacuous"
+    assert decision["required_changes"] == []
+
+
+def test_record_review_blocked_also_derives_required_changes(tmp_path: Path) -> None:
+    """The derivation is not request_changes-specific: `blocked` verdicts go
+    through the same rework-adjacent path (merge-conflict / janitor routes
+    can carry a `blocked` decision forward) and must not silently drop the
+    reviewer's stated reason either."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456, "blocked", summary="Security review flagged an unauthenticated endpoint."
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["findings_channel"] == "derived"
+    assert decision["required_changes"] == ["Security review flagged an unauthenticated endpoint."]
+
+
+def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
+    """AC-3 regression pin, referenced by name in record_review's derivation
+    comment. A reject-on-empty-required_changes gate here would recreate the
+    unbounded re-review loop this fix closes: a False CommandResult writes no
+    review-decision.json, the caller logs review_verdict_missed, the PR still
+    reads as pending next pass, and it gets re-dispatched to a fresh reviewer
+    forever. Assert both the vacuous case and the derivable case return
+    ok=True -- neither shape may ever produce ok=False on account of
+    required_changes."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    vacuous_result = app.record_review(
+        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+    )
+    assert vacuous_result.ok is True
+
+    fake_gh.pr_head_shas[456] = "sha-2"
+    derivable_result = app.record_review(
+        456, "request_changes", summary="Real finding here.", required_changes=None
+    )
+    assert derivable_result.ok is True
 
 
 def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> None:
@@ -21999,16 +23095,18 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
 
 
-@pytest.mark.parametrize("terminal_status", ["escalated", "blocked"])
-def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
-    tmp_path: Path, terminal_status: str
-) -> None:
-    """Issue #379 rework: a merge conflict whose linked issue is escalated/blocked
-    (human-terminal) must never be rerouted to rework_requested.
+def test_merge_ready_conflict_blocked_issue_not_rerouted(tmp_path: Path) -> None:
+    """Issue #379 rework: a merge conflict whose linked issue is blocked (a
+    human reviewer verdict, set by record_review's decision=="blocked") must
+    never be rerouted to rework_requested.
 
     transition() has no source-state validation, so rerouting would silently
-    strip the human_needed label and hand the issue back to automation behind
-    the human's back. The PR and issue must be left untouched.
+    strip that reviewer verdict and hand the issue back to automation behind
+    the human's back. The PR and issue must be left untouched. Unlike
+    "escalated" (see
+    test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework
+    below), "blocked" records no reason a re-entry mechanism could scope to,
+    so issue #776 deliberately leaves it a one-way door.
     """
     from charlie_work.config import AutoMergeConfig
 
@@ -22037,14 +23135,14 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
         },
     ]
     # Mark the linked issue as carrying the human_needed label, matching a
-    # real escalated/blocked issue, so a stripped label would be observable.
+    # real blocked issue, so a stripped label would be observable.
     fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
-        state["issues"]["123"]["status"] = terminal_status
+        state["issues"]["123"]["status"] = "blocked"
         save_state(paths.state_file, state)
 
     labels_removed_before = list(fake_gh.labels_removed)
@@ -22059,12 +23157,412 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
     assert result.data["merge_attempt_warning"] is None
 
     state = load_state(paths.state_file)
-    assert state["issues"]["123"]["status"] == terminal_status
+    assert state["issues"]["123"]["status"] == "blocked"
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
     # No label mutation must have been issued for the linked issue —
     # human_needed must stay in place.
     assert fake_gh.labels_removed == labels_removed_before
     assert fake_gh.labels_added == labels_added_before
+
+
+def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #776: an issue escalated for an UNRELATED reason (e.g. a dead
+    request-changes-fix worker exhausting the watchdog's redispatch cap --
+    the real mechanism that escalated corpus issues #592/#648/#606 via
+    _reap_restore_rework_requested) must not permanently wall off a PR that
+    separately develops a merge conflict.
+
+    This is the regression test for narrowing merge_ready()'s Guard 1
+    exclusion from ``("escalated", "blocked")`` down to ``"blocked"`` only --
+    it asserts the ROUTING CALL actually happened (a fresh dispatch, the
+    label edge, the attempts counter), not merely that the return value
+    looks different from the blocked case. It also asserts reason X's own
+    budget (``redispatch_at``, the watchdog counter that produced the
+    original escalation) survives untouched: re-entry must not reset X's
+    cap while remediating unrelated Y.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    unrelated_redispatch_at = ["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"]["123"],
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+            "redispatch_at": unrelated_redispatch_at,
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    # The routing call actually happened: a fresh dispatch, not a no-op.
+    # (merge_ready()'s top-level result.data doesn't expose the internal
+    # routed/escalated booleans -- verify via the state.json side effects
+    # the routing call actually produces instead.)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert conflict_events[0]["payload"]["issue_number"] == 123
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+    assert (123, config.labels.human_needed) in fake_gh.labels_removed
+    # Reason X's own budget must survive remediating unrelated Y: the
+    # watchdog redispatch timestamps that drove the ORIGINAL escalation are
+    # untouched, so a later re-escalation for the same reason X is not
+    # handed a falsely-fresh cap.
+    assert state["issues"]["123"]["redispatch_at"] == unrelated_redispatch_at
+
+
+def test_merge_ready_conflict_rework_dispatch_bounded_by_cap_across_repeated_evaluation(
+    tmp_path: Path,
+) -> None:
+    """Issue #777: merge_ready()'s conflict-rework trigger must never dispatch
+    more rework workers than config.review.max_conflict_rework_attempts, no
+    matter how many times merge_ready() re-evaluates the same conflicting PR
+    -- including across issue-status resets that mimic an external lane
+    (e.g. a dead-session reaper) putting the issue back into a re-dispatchable
+    state between passes.
+
+    Before this fix, merge_ready()'s dispatch trigger called
+    _request_merge_conflict_rework directly with no attempts_key bookkeeping
+    at all, so nothing bounded the number of real dispatches across such
+    cycles (real corpus: PR #679/issue #602, where the diagnostic-only
+    consecutive_failed_merge_attempts counter climbed past 11 while the
+    functional cap sat at 0 the entire time).
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig, ReviewConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    def _reset_issue_to_fresh() -> None:
+        with state_lock(paths.state_file):
+            state = load_state(paths.state_file)
+            state["issues"]["123"] = {**state["issues"]["123"], "status": "approved"}
+            save_state(paths.state_file, state)
+
+    dispatch_events_total = 0
+    escalated_seen_at: int | None = None
+    for pass_number in range(1, 5):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["merge_conflict"] is True
+        state = load_state(paths.state_file)
+        dispatch_events_total = sum(
+            1 for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+        )
+        if state["issues"]["123"]["status"] == "escalated":
+            escalated_seen_at = pass_number
+            assert (
+                state["issues"]["123"]["escalation_reason"]
+                == "conflict_rework_attempts_cap_exceeded"
+            )
+            # Once escalated for this lane's own exhausted cap, stop
+            # artificially re-arming: no real production path resets an
+            # escalated issue's status back to "approved" (only
+            # `charlie unescalate` does, and it also clears
+            # escalation_reason) -- the loop's reset is only a harness
+            # device to reach the cap boundary, not a realistic post-
+            # escalation event. Break here and verify stability below
+            # instead of feeding the wrapper a state no real caller would
+            # ever produce.
+            break
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        # Never more real dispatches than the cap, no matter how many passes.
+        assert dispatch_events_total <= config.review.max_conflict_rework_attempts
+        _reset_issue_to_fresh()
+
+    # The cap was actually reached and enforced, not merely never approached.
+    assert escalated_seen_at is not None
+    assert dispatch_events_total == config.review.max_conflict_rework_attempts
+    escalated_events_after_first = sum(
+        1 for e in state["events"] if e["kind"] == "janitor_rework_escalated"
+    )
+    assert escalated_events_after_first == 1
+
+    # Issue #776: once escalated for THIS lane's own exhausted cap, a FURTHER
+    # evaluation of the same still-conflicting PR must not dispatch yet
+    # another worker, must not burn the counter past what it already is, and
+    # must not re-fire a duplicate escalation event on every pass ("X blocks
+    # retry of X") -- it simply leaves the already-escalated pair alone.
+    for _ in range(3):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "conflict_rework_attempts_cap_exceeded"
+    expected_final_attempts = config.review.max_conflict_rework_attempts + 1
+    assert state["prs"]["456"]["conflict_rework_attempts"] == expected_final_attempts
+    final_dispatch_events = sum(
+        1 for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    )
+    assert final_dispatch_events == config.review.max_conflict_rework_attempts
+    final_escalated_events = sum(
+        1 for e in state["events"] if e["kind"] == "janitor_rework_escalated"
+    )
+    assert final_escalated_events == 1
+
+
+def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #777(d): the conflict-rework attempt must be counted (via
+    _route_janitor_gate_failure_to_rework's conflict_rework_attempts write,
+    which merge_ready's dispatch trigger now goes through) BEFORE a later,
+    deterministic worktree_unsafe failure at actual worker-launch time can
+    escalate the issue through dispatch_rework's separate failure_kind lane.
+
+    Real corpus: PR #679/issue #602, escalation_reason="worktree_unsafe".
+    dispatch_rework's deterministic-failure branch only ever writes to
+    state["issues"][...] -- it must never zero or otherwise touch the PR
+    record's conflict_rework_attempts counter.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import AutoMergeConfig, DevinConfig, WatchdogConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    dispatch_result = app.merge_ready(456, merge=False)
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree is unsafe to reuse",
+                failure_kind="worktree_unsafe",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+    # The attempt counted by the (now-unified) conflict-rework dispatch must
+    # survive this SEPARATE escalation lane untouched -- it lives on the PR
+    # record, and dispatch_rework's deterministic-failure branch only ever
+    # writes to the issue record.
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+
+def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
+    tmp_path: Path,
+) -> None:
+    """Issue #776 follow-up: the new same-reason guard in
+    _route_janitor_gate_failure_to_rework (which refuses to re-route once
+    escalation_reason == f"{attempts_key}_cap_exceeded" is already recorded)
+    must not become a NEW one-way door of its own. ``charlie unescalate`` is
+    the sanctioned re-arm: it clears ``escalation_reason`` on both the issue
+    and PR records (``_UNESCALATE_ISSUE_RESET_FIELDS`` /
+    ``_UNESCALATE_PR_RESET_FIELDS`` both list it) and zeros
+    ``conflict_rework_attempts`` on the PR record, so a PR that is STILL
+    conflicting after a human re-arms it gets a genuinely fresh attempts
+    budget rather than being silently re-refused by the guard or picking up
+    where the exhausted counter left off.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Directly construct the "this lane's own cap already exhausted,
+    # escalated" state that _route_janitor_gate_failure_to_rework's
+    # cap-exceeded branch produces (workflow.py ~11862-11878), merged over
+    # whatever record_review() already wrote -- mirrors the construction
+    # convention test_fix_unescalate.py uses rather than re-deriving the
+    # escalation via a repeated merge_ready() loop.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"]["456"],
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "conflict_rework_attempts": 3,
+        }
+        state["issues"]["123"] = {
+            **state["issues"]["123"],
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    # Sanity check: while escalated for THIS lane's own reason, the new guard
+    # refuses to re-route at all (the property test C already covers directly
+    # -- reconfirmed here as a precondition for what unescalate() is about to
+    # undo).
+    precheck = app.merge_ready(456, merge=False)
+    assert precheck.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 3
+
+    unescalate_result = app.unescalate(issue_number=123)
+    assert unescalate_result.ok is True
+    assert unescalate_result.data["changed"] is True
+
+    state = load_state(paths.state_file)
+    assert "escalation_reason" not in state["prs"]["456"]
+    assert "escalation_reason" not in state["issues"]["123"]
+    assert "conflict_rework_attempts" not in state["prs"]["456"]
+    assert state["prs"]["456"]["status"] == PASSIVE_OPEN_STATUS
+
+    # The conflict is still present (PR still CONFLICTING/DIRTY on GitHub) --
+    # a fresh merge_ready() pass must dispatch rework again with a genuinely
+    # fresh attempts counter, not pick up where the exhausted counter (3)
+    # left off and not be silently refused by the same-reason guard (which no
+    # longer matches now that escalation_reason has been cleared).
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    dispatch_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(dispatch_events) == 1
 
 
 def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
@@ -33988,6 +35486,37 @@ def test_parse_review_verdict_from_log_extracts_last_fenced_json(tmp_path: Path)
     assert verdict["required_changes"] == []
 
 
+def test_parse_review_verdict_from_log_extracts_json_after_language_tagged_fence(
+    tmp_path: Path,
+) -> None:
+    """Regression: ``_VERDICT_FENCE_RE`` previously only recognized an opening
+    fence tagged bare or ``json`` (``` ```(?:json)?\\s*\\n `` ``), so a
+    reviewer quoting evidence in a ```python fence before its final verdict
+    fence would desync the pairing entirely -- the ```python fence's own
+    opening backtick never matched, so its *closing* bare ``` got misread as
+    a new opening and swallowed everything up to the *next* fence's opening,
+    permanently misaligning the scan. This mirrors the exact structure that
+    hid a real, well-formed verdict in a production cross-family report
+    (PR #802); the same regex is duplicated here in ``workflow.py`` (kept
+    latent so far by per-event stream-json decoding, but a real defect)."""
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        "Citing the bug:\n```python\ndef broken():\n    return None\n```\n"
+        "That's a real problem.\n\n"
+        'Final verdict:\n```json\n{\n  "decision": "request_changes",\n'
+        '  "summary": "broken() returns None instead of raising",\n'
+        '  "required_changes": ["Raise instead of returning None"]\n}\n```\n',
+        encoding="utf-8",
+    )
+
+    verdict = _parse_review_verdict_from_log(log)
+
+    assert verdict is not None
+    assert verdict["decision"] == "request_changes"
+    assert verdict["summary"] == "broken() returns None instead of raising"
+    assert verdict["required_changes"] == ["Raise instead of returning None"]
+
+
 def test_parse_review_verdict_from_log_requires_valid_decision(tmp_path: Path) -> None:
     """Issue #507: only accepted decisions and non-empty summaries are valid."""
     log = tmp_path / "review.claude.log"
@@ -34442,6 +35971,50 @@ def test_cross_family_request_changes_verdict_persists_required_changes(
     assert decision["summary"] == "file.py:10 has a real bug that breaks X"
 
 
+def test_cross_family_legacy_path_verdict_with_empty_required_changes_gets_derived(
+    tmp_path: Path,
+) -> None:
+    """AC-6 (cross-family producer): the legacy Markdown-only parse path
+    (no JSON verdict block) never itemizes required_changes -- it only ever
+    extracts a summary -- so a request_changes verdict recorded from it
+    always arrives at record_review with required_changes=() and a real,
+    non-vacuous summary. This is the shape record_review's derivation
+    exists for. Contrast with test_handle_malformed_cross_family_verdict_*:
+    a JSON verdict block declaring request_changes with an empty
+    required_changes is diverted to MalformedCrossFamilyVerdict before ever
+    reaching record_review (issue #795) -- this test's report has no JSON
+    block at all, so that defense-in-depth layer does not apply here and
+    record_review's own derivation is what prevents the content-free
+    outcome."""
+    body = "**MAJOR**\nreal bug\n\nVerdict: MAJOR issues block merge"
+    report_text = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    parsed = parse_cross_family_verdict(report_text)
+    assert isinstance(parsed, CrossFamilyVerdict)
+    assert parsed.decision == "request_changes"
+    assert parsed.required_changes == ()
+    assert parsed.summary and not _summary_is_vacuous(parsed.summary)
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Mirrors workflow.py's _record_cross_family_verdicts call site exactly.
+    result = app.record_review(
+        456,
+        parsed.decision,
+        summary=parsed.summary,
+        required_changes=parsed.required_changes,
+    )
+    assert result.ok is True
+
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["required_changes"] == [parsed.summary]
+    assert decision["findings_channel"] == "derived"
+
+
 def test_rework_brief_contains_required_changes_from_verdict(tmp_path: Path) -> None:
     """Issue #632 defect 1: a request_changes verdict's required_changes must
     reach the rework brief. The brief reads review-decision.json itself (single
@@ -34731,6 +36304,90 @@ def test_render_required_changes_section_blocked_both_empty_renders_escape_hatch
     section = _render_required_changes_section(decision)
 
     assert "REVIEWER FINDINGS UNAVAILABLE" in section
+
+
+# --------------------------------------------------------------------------
+# Issue #792: verdicts recorded by the current record_review carry an
+# explicit findings_channel marker ("vacuous" or "derived"). These tests
+# cover the renderer's handling of that marker directly, independent of the
+# shape-based (required_changes/summary) tiers above, which exist only to
+# infer the same distinction for pre-#792 records with no marker at all.
+# --------------------------------------------------------------------------
+
+
+def test_render_required_changes_section_vacuous_marker_renders_escape_hatch() -> None:
+    """A findings_channel="vacuous" verdict always renders tier 3, even
+    though `summary` is technically non-blank (it may carry the historical
+    placeholder) -- rendering it as real content (tier 2) would silently
+    present content-free text as the reviewer's actual findings."""
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [],
+        "findings_channel": "vacuous",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+    assert LEGACY_VACUOUS_SUMMARY not in section
+
+
+def test_render_required_changes_section_vacuous_marker_fires_for_blocked_too() -> None:
+    """The vacuous marker's escape hatch is decision-agnostic -- it fires for
+    `blocked` exactly as it does for `request_changes`, unlike the "derived"
+    marker below which is request_changes-specific."""
+    decision = {
+        "decision": "blocked",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [],
+        "findings_channel": "vacuous",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+
+
+def test_render_required_changes_section_derived_marker_renders_summary_verbatim() -> None:
+    """A findings_channel="derived" request_changes verdict renders the
+    tier-2-shaped verbatim-summary section even though required_changes is
+    now populated (record_review copied summary into it) -- it must not
+    fall into tier 1's bullet-list rendering, which would wrap an entire
+    multi-sentence summary as a single bullet."""
+    prose = "The retry wrapper swallows the exception type; callers cannot distinguish causes."
+    decision = {
+        "decision": "request_changes",
+        "summary": prose,
+        "required_changes": [prose],
+        "findings_channel": "derived",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert prose in section
+    assert f"- {prose}" not in section
+    assert "did not record a structured findings list" in section
+
+
+def test_render_required_changes_section_derived_marker_suppressed_for_blocked() -> None:
+    """Unlike "vacuous", the "derived" marker's special-cased rendering only
+    applies to request_changes (see the docstring's blocked-suppression
+    rule) -- for `blocked` it falls through to the pre-existing shape-based
+    tiers, where a populated required_changes on a blocked verdict is
+    suppressed by design (blocked's "what must change before approval"
+    framing doesn't fit blocked's routes)."""
+    prose = "Security review flagged an unauthenticated endpoint."
+    decision = {
+        "decision": "blocked",
+        "summary": prose,
+        "required_changes": [prose],
+        "findings_channel": "derived",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert section == ""
 
 
 def test_defang_closing_keywords_strips_live_keyword_but_keeps_number_legible() -> None:

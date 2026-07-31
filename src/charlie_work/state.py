@@ -9,7 +9,8 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 STATE_VERSION = 1
 
@@ -122,10 +123,44 @@ PASSIVE_OPEN_STATUS = "reviewing"
 #     acceptance criterion, or a reviewer's explicit "blocked" verdict. Stays
 #     terminal; only a human running ``charlie unescalate`` may clear it.
 #
-# An escalation recorded with no ``reason_class`` at all (every escalation
-# that predates this field) is treated as "judgment" by the sweep -- fail
-# closed, never retroactively guessed.
+# A legacy escalation recorded with no ``reason_class`` at all may be
+# backfilled by ``workflow._maybe_deescalate_mechanical`` from the most
+# recent escalation-transition event in ``events.db``, but only when the
+# event kind unambiguously denotes a process failure. Ambiguous or
+# deliberately-preserved kinds stay fail-closed: ``reason_class`` remains
+# absent and the issue stays terminal.
 ESCALATION_REASON_CLASSES: frozenset[str] = frozenset({"mechanical", "judgment"})
+
+# Issue #797: legacy escalations may lack ``reason_class`` because the field
+# was added later. The backfill derives the class from the escalation event
+# kind. Only kinds that unambiguously indicate a process failure map to
+# ``"mechanical"``. Kinds in ``DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS``
+# are too ambiguous (or are intentionally preserved forensic records) and
+# must stay unclassified, so the backfill leaves the issue terminal.
+ESCALATION_REASON_CLASS_BY_EVENT_KIND: Mapping[str, str] = MappingProxyType(
+    {
+        # A rework worker's session dying, or a redispatch/no-op-rework cap
+        # being exceeded, is a pure process/infrastructure failure.
+        "session_failed_escalated": "mechanical",
+        # The review-dispatch attempt cap is an infrastructure-driven limit.
+        "review_dispatch_escalated": "mechanical",
+    }
+)
+DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
+    {
+        # Issue #662: a deliberately-preserved forensic record; the kind alone
+        # cannot distinguish a normal process failure from a record that must
+        # stay terminal.
+        "janitor_rework_escalated",
+        # Can carry either a human ``blocked`` verdict (judgment) or a
+        # request-changes/unparseable report (mechanical); the kind alone is
+        # ambiguous.
+        "rescue_review_escalated",
+        # Records review decisions including approved, request_changes, and
+        # blocked; the event kind alone does not identify an escalation.
+        "record_review",
+    }
+)
 
 
 def escalation_reason_class(reason_class: str) -> str:
@@ -745,7 +780,12 @@ def mark_reviewer_quota_alerted(data: dict[str, Any]) -> dict[str, Any]:
 def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     """Clear reviewer quota exhaustion state.
 
-    Returns a new state dict; does not mutate ``data``.
+    Returns a new state dict; does not mutate ``data``. The
+    ``last_probe_cleared_at`` recovery marker (written by
+    ``clear_quota_throttles`` and by the verdict-reap recovery path in
+    ``workflow.dispatch_reviews``) is deliberately preserved across clears so
+    the dead-reviewer reap sweep can compare it against a dead session's death
+    time across exhaustion episodes (issue #662).
     """
     quota = _reviewer_quota(data)
     if not quota:
@@ -757,6 +797,23 @@ def clear_reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
     # a stale value does not linger after the quota window is proven open.
     quota.pop("reset_at", None)
     return {**data, "reviewer_quota": quota}
+
+
+def reviewer_quota_last_probe_cleared_at(data: dict[str, Any]) -> str | None:
+    """Return the timestamp of the last green probe or verdict that cleared a
+    throttle.
+
+    Written by ``clear_quota_throttles`` whenever a green ambient-CLI probe
+    clears a claude-code-shaped throttle, and by the verdict-reap recovery
+    path in ``workflow.dispatch_reviews`` whenever a dead reviewer's verdict
+    proves the provider window is open. Consumed by the dead-reviewer reap
+    sweep (``_detect_and_handle_stalled_reviews``) to suppress re-poisoning
+    ``reviewer_quota`` from a throttle signature frozen in a dead session's
+    log tail when a recovery has already happened after that session died
+    (issue #662). None when no green probe/verdict has cleared the quota
+    since the last exhaustion episode (or ever).
+    """
+    return _reviewer_quota(data).get("last_probe_cleared_at")
 
 
 def defer_reviewer_probe_after(data: dict[str, Any], probe_after: str) -> dict[str, Any]:
@@ -1065,10 +1122,18 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
     check before running a probe at all -- see that function's docstring
     for what is and is not cleared here and why.
 
+    The ``last_probe_cleared_at`` recovery marker is only stamped when this
+    call actually cleared something (a claude-code-shaped root throttle or
+    reviewer-quota exhaustion), so a caller that bypasses the
+    ``is_quota_probe_actionable`` guard cannot seed a false recovery marker.
+    It is stored with microsecond precision so sub-second comparisons against
+    a dead session's log mtime are not flipped (issue #662).
+
     Returns a new state dict; does not mutate ``data``.
     """
     cleared = data
-    if _root_throttle_is_claude_code_shaped(data):
+    cleared_root = _root_throttle_is_claude_code_shaped(data)
+    if cleared_root:
         cleared = {
             **cleared,
             "throttled_until": None,
@@ -1076,10 +1141,22 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
             "throttle_adapter_kind": None,
         }
     cleared = clear_reviewer_quota(cleared)
-    reviewer_quota = cleared.get("reviewer_quota")
-    if reviewer_quota:
-        cleared = {
-            **cleared,
-            "reviewer_quota": {**reviewer_quota, "consecutive_probe_failures": 0},
+    reviewer_quota = cleared.get("reviewer_quota") or {}
+    # Stamp the recovery time so the dead-reviewer reap sweep can suppress
+    # backoff for sessions whose throttle signature predates this recovery
+    # (issue #662): a dead reviewer's log tail is frozen at death time and
+    # does not reflect a quota window that has since reopened, so re-applying
+    # backoff from it would re-poison reviewer_quota anchored to "now" rather
+    # than the original death time. Only populate the marker when we actually
+    # cleared a claude-code-shaped root throttle or reviewer_quota (the
+    # exhaustion checks treat a missing throttled_until/probe_after as "not
+    # exhausted", so an ever-present recovery marker is benign but only useful
+    # when a real recovery happened).
+    if is_reviewer_quota_exhausted(data) or cleared_root:
+        reviewer_quota = {
+            **reviewer_quota,
+            "consecutive_probe_failures": 0,
+            "last_probe_cleared_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         }
+        cleared = {**cleared, "reviewer_quota": reviewer_quota}
     return cleared
