@@ -190,6 +190,7 @@ def _classify_session_failure(
     throttle_error_markers: Sequence[str] | None = None,
     *,
     resume_margin_seconds: int = 0,
+    now: datetime | None = None,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
@@ -203,6 +204,13 @@ def _classify_session_failure(
     reported reset (or fixed quota cooldown) time. Provider reset estimates are
     floors, not guarantees, and dispatching at T+0 races the actual reset
     (issue #499).
+
+    ``now`` is the injectable clock (mirrors ``get_rate_limit_defer_until``
+    below and ``post_mortem.classify_and_record``): defaults to
+    ``datetime.now(UTC)`` when not supplied, so production behavior is
+    byte-identical. Tests that need an exact (not wall-clock-tolerance)
+    assertion on the returned ``throttled_until_iso`` should pass a frozen
+    value instead of racing real time (issue #822).
     """
     if not log_path.exists():
         return None, None
@@ -212,6 +220,8 @@ def _classify_session_failure(
     except OSError:
         return None, None
 
+    resolved_now = now if now is not None else datetime.now(UTC)
+
     # Check the last 2KB of the log (where error messages appear)
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
 
@@ -219,7 +229,7 @@ def _classify_session_failure(
     if _QUOTA_EXHAUSTED_PATTERN.search(tail):
         # Quota exhaustion uses a fixed 24-hour cooldown regardless of reset time
         cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
-        throttled_until = datetime.now(UTC) + cooldown
+        throttled_until = resolved_now + cooldown
         return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )
@@ -240,7 +250,7 @@ def _classify_session_failure(
             else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
             seconds=resume_margin_seconds,
         )
-        throttled_until = datetime.now(UTC) + cooldown
+        throttled_until = resolved_now + cooldown
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )
@@ -749,6 +759,7 @@ def update_session_record_with_failure_classification(
     fallback_kind: str | None = None,
     config: OrchestratorConfig | None = None,
     session_completed: bool = False,
+    now: datetime | None = None,
 ) -> tuple[str | None, str | None]:
     """Update a session record with failure classification after the session exits.
 
@@ -779,6 +790,9 @@ def update_session_record_with_failure_classification(
     ``config`` is optional for backward compatibility; when provided, its
     ``runtime.throttle_error_markers`` and ``runtime.throttle_resume_margin_s``
     are used instead of the defaults.
+
+    ``now`` is forwarded to ``_classify_session_failure`` (issue #822's
+    injectable clock); defaults to ``datetime.now(UTC)`` there when omitted.
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed. ``throttled_until_iso`` is only non-None
@@ -815,6 +829,7 @@ def update_session_record_with_failure_classification(
             Path(log_path_str),
             throttle_markers,
             resume_margin_seconds=resume_margin_seconds,
+            now=now,
         )
 
     resolved_kind = classified_kind or fallback_kind

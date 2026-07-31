@@ -523,6 +523,7 @@ def _classify_session_failure(
     *,
     resume_margin_seconds: int = 0,
     adapter_kind: str = "claude-code",
+    now: datetime | None = None,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
@@ -543,6 +544,11 @@ def _classify_session_failure(
     key does not masquerade as a generic throttle. On a ``provider_auth`` match,
     the cooldown reuses the existing quota-exhaustion constant (24h) — a dead
     key needs human intervention, not a 15-minute retry window.
+
+    ``now`` is the injectable clock (mirrors ``devin_shell._classify_session_
+    failure`` / ``get_rate_limit_defer_until``): defaults to
+    ``datetime.now(UTC)`` when not supplied, so production behavior is
+    byte-identical (issue #822).
     """
     if not log_path.exists():
         return None, None
@@ -551,6 +557,8 @@ def _classify_session_failure(
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None, None
+
+    resolved_now = now if now is not None else datetime.now(UTC)
 
     # Check the last 2KB of the log (where error messages appear)
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
@@ -561,7 +569,7 @@ def _classify_session_failure(
     # rather than the short rate-limit cooldown — the key will not self-heal.
     if adapter_kind == "api" and _PROVIDER_AUTH_PATTERN.search(tail):
         cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
-        throttled_until = datetime.now(UTC) + cooldown
+        throttled_until = resolved_now + cooldown
         return "provider_auth", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )
@@ -570,7 +578,7 @@ def _classify_session_failure(
     if _QUOTA_EXHAUSTED_PATTERN.search(tail):
         # Quota exhaustion uses a fixed 24-hour cooldown regardless of reset time
         cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
-        throttled_until = datetime.now(UTC) + cooldown
+        throttled_until = resolved_now + cooldown
         return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )
@@ -591,7 +599,7 @@ def _classify_session_failure(
             else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
             seconds=resume_margin_seconds,
         )
-        throttled_until = datetime.now(UTC) + cooldown
+        throttled_until = resolved_now + cooldown
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )
@@ -1533,6 +1541,7 @@ def update_worker_record_with_failure_classification(
     config: OrchestratorConfig | None = None,
     adapter_kind: str = "claude-code",
     session_completed: bool = False,
+    now: datetime | None = None,
 ) -> tuple[str | None, str | None]:
     """Update a worker record with failure classification after the session exits.
 
@@ -1578,6 +1587,9 @@ def update_worker_record_with_failure_classification(
     for ``"api"``) and enables provider-auth classification (issue #484).
     Defaults to ``"claude-code"`` for backward compatibility.
 
+    ``now`` is forwarded to ``_classify_session_failure`` (issue #822's
+    injectable clock); defaults to ``datetime.now(UTC)`` there when omitted.
+
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
     update runtime state if needed. ``throttled_until_iso`` is only non-None
     when log-tail classification actually matched a throttle/auth signature.
@@ -1614,6 +1626,7 @@ def update_worker_record_with_failure_classification(
             throttle_markers,
             resume_margin_seconds=resume_margin_seconds,
             adapter_kind=adapter_kind,
+            now=now,
         )
 
     resolved_kind = classified_kind or fallback_kind
