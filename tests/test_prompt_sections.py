@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import string
 from pathlib import Path
 
 from charlie_work.prompt_sections import section_variables
@@ -199,8 +200,11 @@ def test_legitimate_partial_placeholders_still_resolve() -> None:
         assert "$section_" not in prompt
 
 
-def test_rework_prompt_includes_merge_main_instruction() -> None:
-    """Verify that the rework prompt instructs workers to merge origin/main first."""
+def test_rework_prompt_includes_conditional_base_merge_instruction() -> None:
+    """F4 (docs/plans/rework-findings-channel.md, #6): the rework prompt still
+    instructs workers to merge the PR's base branch when it's actually needed,
+    but only as a demoted, self-conditional trigger -- not as the mandated
+    opening action of every rework."""
     from pathlib import Path
 
     rework_values = {
@@ -215,9 +219,10 @@ def test_rework_prompt_includes_merge_main_instruction() -> None:
     # The rework.md template is in the package prompts dir, not repo-local
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
     prompt = render_prompt("rework.md", rework_values, search_dirs=(prompts_dir,))
+    normalized = " ".join(prompt.split())
 
-    assert "merge the PR's base branch" in prompt
-    assert "incorporate any base changes" in prompt
+    assert "merge the PR's base branch" in normalized
+    assert "If your branch is behind its base or the PR shows a merge conflict" in normalized
 
 
 def test_rework_prompt_includes_push_then_verify_final_step() -> None:
@@ -280,8 +285,16 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
         # Verify the comparison instruction
         assert "headRefOid" in prompt
         assert "git rev-parse HEAD" in prompt
-        # CRITICAL: assert NO unresolved $ placeholders remain anywhere
-        assert "$" not in prompt, f"Unresolved placeholders found in rendered prompt:\n{prompt}"
+        # CRITICAL: assert NO unresolved $ placeholders remain anywhere. This is
+        # narrower than a bare `"$" not in prompt` check: worker_sections
+        # partials may legitimately contain a literal `$` that isn't a
+        # `string.Template` placeholder at all -- e.g. `mutation_check.md`'s
+        # shell snippet `git show $(git merge-base ...)` uses `$(` (command
+        # substitution), which `get_identifiers()` correctly ignores because it
+        # is not `$identifier`/`${identifier}` shaped.
+        assert not string.Template(prompt).get_identifiers(), (
+            f"Unresolved placeholders found in rendered prompt:\n{prompt}"
+        )
 
 
 def test_worker_prompt_includes_push_then_verify() -> None:
@@ -547,12 +560,17 @@ def test_review_template_summary_requires_strengths_and_severity_tags() -> None:
 
 
 def test_rework_template_severity_aware_required_behavior() -> None:
-    """Verify that rework.md tells the worker Minor findings are optional to address."""
+    """Verify that rework.md tells the worker Minor findings are optional to
+    address, and that this guidance is self-conditional (F4) rather than an
+    unconditional command to act on a possibly-empty findings set."""
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
     text = (prompts_dir / "rework.md").read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
 
-    assert "Address every Critical and Important finding directly" in text
-    assert "Minor findings are" in text and "optional" in text
+    assert "Critical and Important items are mandatory" in normalized
+    assert "a Minor item may be skipped only if you say so explicitly" in normalized
+    # The old unconditional imperative must not reappear.
+    assert "Address every Critical and Important finding directly" not in normalized
 
 
 def test_cross_family_review_contains_self_report_distrust_rule() -> None:

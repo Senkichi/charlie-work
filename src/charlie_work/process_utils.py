@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -35,7 +37,7 @@ def parse_proc_stat_starttime(stat_text: str) -> int | None:
     ensures we handle embedded ')' characters in comm (e.g., "(tmux: (0) server)").
     """
     # Split on the LAST ')' to handle comm containing embedded ')'
-    before_paren, sep, after_paren = stat_text.rpartition(")")
+    _, sep, after_paren = stat_text.rpartition(")")
     if not sep:
         # No ')' found - malformed stat line
         return None
@@ -130,9 +132,6 @@ def _enumerate_child_pids(pid: int) -> list[int]:
     if os.name == "nt":
         # Windows: use PowerShell CIM (primary) with wmic fallback
         try:
-            import subprocess
-            import shutil
-
             # Try PowerShell CIM first (modern Windows 11+)
             if shutil.which("powershell"):
                 result = subprocess.run(
@@ -334,6 +333,157 @@ def is_pid_alive(pid: int, expected_start_time: float | None = None) -> bool:
     return True
 
 
+def worker_terminal_status_path(
+    sessions_dir: Path, issue_number: int, sidecar_suffix: str
+) -> Path:
+    """Path to a worker's durable terminal-status record.
+
+    Named ``issue-<n>.<suffix>.terminal.json`` -- distinct from the adapter's
+    own sidecar (``issue-<n>.<suffix>.json``) so the terminal record is never
+    touched by sidecar reaping (``WorkerView.reap_sidecar``) and survives
+    independently of it (issue #773). ``sidecar_suffix`` mirrors the adapter's
+    own sidecar suffix (e.g. ``"claude"`` for ``adapter_kind="claude-code"``)
+    purely so both files sit side by side and are easy to correlate by eye;
+    readers should not need to know the suffix (see ``find_worker_terminal_status``).
+    """
+    return sessions_dir / f"issue-{issue_number}.{sidecar_suffix}.terminal.json"
+
+
+def write_worker_terminal_status(
+    path: Path,
+    *,
+    pid: int,
+    exit_code: int | None,
+    started_at: str,
+    ended_at: str,
+    duration_seconds: float,
+) -> None:
+    """Atomically persist a worker process's terminal status (issue #773).
+
+    Written by ``start_terminal_status_watcher`` once its ``Popen.poll()``
+    loop observes the process has exited. Uses the tmp-file + ``replace()``
+    pattern required by CLAUDE.md for every JSON state write so a reader (the
+    orphan detector's polling pass) never observes a partially-written file.
+    """
+    payload: dict[str, Any] = {
+        "pid": pid,
+        "exit_code": exit_code,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": duration_seconds,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def find_worker_terminal_status(sessions_dir: Path, issue_number: int) -> dict[str, Any] | None:
+    """Return the most recently written terminal-status record for ``issue_number``.
+
+    Globs ``issue-<n>.*.terminal.json`` rather than requiring a caller-known
+    adapter suffix, because this is consulted by the state.json-driven orphan
+    sweep (``workflow._detect_and_handle_orphaned_workers``), which is
+    explicitly the fallback path for when an issue's own sidecar (and thus
+    its adapter identity) may already be gone. Ties are broken by mtime so a
+    redispatch's fresh record wins over a stale one left by an earlier
+    attempt. Never raises: a missing directory, no matching file, an
+    unreadable file, or malformed JSON all resolve to ``None`` -- this is the
+    "no terminal record" case that callers must treat as today's legacy
+    behavior (issue #773 acceptance criterion: fully backward compatible
+    when no record exists).
+    """
+    if not sessions_dir.is_dir():
+        return None
+    candidates = list(sessions_dir.glob(f"issue-{issue_number}.*.terminal.json"))
+    if not candidates:
+        return None
+
+    def _mtime(candidate: Path) -> float:
+        try:
+            return candidate.stat().st_mtime
+        except OSError:
+            return -1.0
+
+    candidates.sort(key=_mtime, reverse=True)
+    for candidate in candidates:
+        try:
+            with candidate.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+# Sleep interval for the terminal-status watcher's poll() loop. Workers run
+# for minutes, so this granularity costs nothing; kept as a named constant
+# (rather than an inline literal) since it's the one knob that trades
+# poll-loop wakeups against exit-timestamp precision.
+_TERMINAL_STATUS_POLL_INTERVAL_SECONDS = 2.0
+
+
+def start_terminal_status_watcher(process: subprocess.Popen[Any], path: Path) -> threading.Thread:
+    """Spawn a daemon thread that records ``process``'s terminal status at exit.
+
+    This is the durable half of issue #773's fix: reading ``GetExitCodeProcess``
+    at orphan-sweep poll time is unreliable (the sweep runs every
+    ``full_pass_interval_seconds`` -- 300s by default -- by which point the
+    process is long reaped and the PID may already be recycled), so the exit
+    code must be captured once, at the moment the process actually exits, and
+    persisted where a later poll can find it.
+
+    Does NOT call ``Popen.wait()`` or ``Popen.communicate()`` -- on the caller
+    thread or any other. CLAUDE.md's "adapters must not block on worker
+    completion" invariant bans those two calls outright, not just a
+    caller-thread version of them (this project was previously bitten by
+    exactly this deadlock class). Instead this polls ``Popen.poll()`` in a
+    sleep loop, so the banned calls are structurally absent from every code
+    path here -- a later edit cannot reintroduce the deadlock class by moving
+    a `wait()`/`communicate()` call onto a different thread, because there is
+    no such call to move. Never raises: a failure inside the thread (a
+    poll() error, or a write failure) is swallowed, since this is best-effort
+    telemetry that must not crash the orchestrator or the worker's own I/O
+    threads (e.g. the tee_stream_json reader thread also draining
+    ``process.stdout`` concurrently in ``claude_code.launch_claude_worker``).
+    """
+    pid = process.pid
+    started_monotonic = time.monotonic()
+    started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    def _watch() -> None:
+        try:
+            while process.poll() is None:
+                time.sleep(_TERMINAL_STATUS_POLL_INTERVAL_SECONDS)
+            exit_code = process.returncode
+        except Exception:
+            exit_code = None
+        duration_seconds = time.monotonic() - started_monotonic
+        ended_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        try:
+            write_worker_terminal_status(
+                path,
+                pid=pid,
+                exit_code=exit_code,
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_seconds=duration_seconds,
+            )
+        except Exception:
+            # Best-effort telemetry: a write failure (disk full, permissions,
+            # or -- observed under test mocking -- a non-JSON-serializable
+            # field) must not raise inside a daemon thread the caller isn't
+            # watching. Narrower than OSError deliberately, matching the
+            # `_tee_output` thread's `except Exception` precedent elsewhere
+            # in this codebase (claude_code.py) for the same reason.
+            pass
+
+    thread = threading.Thread(target=_watch, daemon=True, name=f"terminal-status-watcher-{pid}")
+    thread.start()
+    return thread
+
+
 def kill_process_tree(pid: int, expected_start_time: float | None = None) -> list[int]:
     """Kill a process and all its children (process tree).
 
@@ -395,8 +545,6 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     try:
         if os.name == "nt":
             # Windows: use taskkill to terminate the process tree
-            import subprocess
-
             result = subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(pid)],
                 capture_output=True,
@@ -459,8 +607,6 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
         return orphans
 
     try:
-        import shutil
-
         if not shutil.which("powershell"):
             return orphans
 

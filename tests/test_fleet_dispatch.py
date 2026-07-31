@@ -8,7 +8,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from charlie_work import layout
 from charlie_work.config import (
+    ConfigError,
     OrchestratorConfig,
     RunnerAllocationConfig,
     RunnerScalingConfig,
@@ -21,6 +23,7 @@ from charlie_work.fleet_dispatch import (
     _emit_fleet_transition,
     _extract_attention_events,
     _is_fleet_pass_active,
+    _lane_failure_state_path,
     _run_fleet_allocation_prologue,
     _select_repos,
     compute_api_worker_fleet_report,
@@ -29,6 +32,7 @@ from charlie_work.fleet_dispatch import (
 )
 from charlie_work.notify import AttentionEntry
 from charlie_work.fleet_registry import count_fleet_runners
+from charlie_work.instrumentation import query_events
 from charlie_work.runner_allocation import (
     AllocationPlan,
     SlotAction,
@@ -708,6 +712,397 @@ def test_fleet_loop_unclassified_exception_isolated(
 
     # Verify overall result is False (one repo failed)
     assert result.ok is False
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_config_load_error_isolated(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """#6-G / G-AC4 (most important): a repo whose lane fails during startup —
+    i.e. inside ``load_layered_config`` itself, before ``OrchestratorApp`` is
+    ever constructed — must not prevent another repo's lane from running.
+
+    This is distinct from ``test_fleet_loop_unclassified_exception_isolated``
+    above, which raises inside ``app.loop()`` (config load succeeds for both
+    repos there). The real 2026-07-29 incident (``ConfigError: unknown
+    key(s) in config section 'cross_family': auto_verdict``) failed at
+    config-load time, before any per-repo app object existed — this test
+    pins isolation at that exact point. D-4 requires the per-repo ``except``
+    to keep catching this; this test would fail loudly (as a fleet-wide
+    exception) if a future change narrowed or removed it.
+
+    G-AC6: the injected failure happens inside ``load_layered_config``,
+    strictly before ``paths = runtime_paths(...)`` executes in the same try
+    block, so ``paths`` is genuinely unbound in repo1's except handler (not
+    merely untested) -- see the ``mock_runtime_paths.call_count`` assertion
+    below.
+    """
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    # repo1's config load raises during startup; repo2's succeeds. Only one
+    # OrchestratorApp is ever constructed (for repo2) because repo1 never
+    # reaches that line — mock_app_class.return_value (not side_effect list)
+    # pins that.
+    #
+    # Keyed by repo_root rather than a fixed-length call-order list: the
+    # fleet pass also calls load_layered_config a second time for repo1 from
+    # compute_api_worker_fleet_report (it re-loads any repo missing from
+    # preloaded_configs, which repo1 is, since its first load failed). A
+    # positional side_effect list of length 2 would exhaust after the two
+    # per-repo-loop calls and raise a spurious StopIteration on that third
+    # call. Retrying the same broken config deterministically re-raises the
+    # same ConfigError, matching real load_layered_config behavior.
+    repo1_root = tmp_path / "repo1"
+
+    def _load_layered_config_side_effect(
+        repo_root: Path, *args: Any, **kwargs: Any
+    ) -> OrchestratorConfig:
+        if Path(repo_root) == repo1_root:
+            raise ConfigError(
+                "unknown key(s) in config section 'cross_family': auto_verdict "
+                "(valid: enabled, model, command)"
+            )
+        return OrchestratorConfig()
+
+    mock_load_layered_config.side_effect = _load_layered_config_side_effect
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app2 = MagicMock()
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.return_value = mock_app2
+
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # repo1 failed at startup; repo2's lane actually ran. This is the
+    # isolation proof: only one OrchestratorApp was ever built, and its
+    # loop() was called exactly once, for the surviving repo.
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+    assert mock_app_class.call_count == 1
+    assert mock_app2.loop.call_count == 1
+
+    # G-AC6: repo1's ConfigError is raised inside load_layered_config,
+    # strictly before `paths = runtime_paths(...)` is reached in that same
+    # try block. runtime_paths is therefore called exactly once (for repo2
+    # only) -- proving `paths` is genuinely unbound in repo1's except
+    # handler, not just untested. The handler itself never references
+    # `paths` (it uses `repo_root`/`entry`, both bound before the try); if a
+    # future change added a `paths.state_file` reference there, this would
+    # raise UnboundLocalError *inside* the except block, which escapes the
+    # per-repo isolation boundary entirely (D-4) instead of being caught by
+    # it -- this assertion is what pins that it never happens.
+    assert mock_runtime_paths.call_count == 1
+
+    message = result.data["repos"]["owner/repo1"]["message"]
+    assert "fleet pass error" in message
+    assert "ConfigError" in message
+    assert "cross_family" in message
+
+    # G-AC2: the raw digest feed carries the failure even though app.loop()
+    # never ran for repo1 — _extract_attention_events() (which only runs
+    # after a successful loop()) never fires for repo1, so this event must
+    # come from the except block itself.
+    digest_events = result.data["digest"]["events"]
+    error_events = [e for e in digest_events if e.get("repo_key") == "owner/repo1"]
+    assert len(error_events) == 1
+    assert error_events[0]["type"] == "error"
+
+    # Confirm the reused "error" branch actually maps this to a real
+    # AttentionEntry (health=ERROR, already desktop-toast-eligible via
+    # _DESKTOP_SEVERITIES) rather than silently falling through.
+    attention_digest = _build_fleet_attention_digest(digest_events)
+    matching = [e for e in attention_digest.transitions if e.adapter_kind == "owner/repo1"]
+    assert len(matching) == 1
+    assert matching[0].health == "ERROR"
+    assert "cross_family" in (matching[0].last_log_line or "")
+
+    assert result.ok is False
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_lane_failure_reaches_real_emit_digest(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    mock_emit_digest: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """#6-G / G-AC2: the lane-failure entry must reach the real ``emit_digest``
+    sink, not just the raw ``digest["events"]`` list.
+
+    ``test_fleet_loop_config_load_error_isolated`` proves the raw event dict
+    is correct and that ``_build_fleet_attention_digest`` maps it to
+    ``health=ERROR`` -- but it calls ``_build_fleet_attention_digest`` itself
+    (out of band) and passes ``global_config=None`` to ``fleet_loop``, so the
+    real ``if notify_config is not None and notify_config.enabled`` /
+    ``if attention_digest.transitions`` gates that guard the actual
+    ``emit_digest(...)`` call at the end of ``fleet_loop`` are never entered.
+    That leaves open exactly the failure mode this AC exists to close: a gate
+    keyed on something only the loop()-succeeded path populates would still
+    pass the other test while leaving the desktop/file sink silent. This test
+    turns notify on for real and asserts ``emit_digest`` fires with an ERROR
+    entry for the failed repo, driving ``fleet_loop`` itself on the exact
+    pass where ``app.loop()`` never ran for repo1 -- rather than re-deriving
+    the mapping out of band.
+    """
+    from charlie_work.config import NotifyConfig
+
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    repo1_root = tmp_path / "repo1"
+
+    def _load_layered_config_side_effect(
+        repo_root: Path, *args: Any, **kwargs: Any
+    ) -> OrchestratorConfig:
+        if Path(repo_root) == repo1_root:
+            raise ConfigError(
+                "unknown key(s) in config section 'cross_family': auto_verdict "
+                "(valid: enabled, model, command)"
+            )
+        return OrchestratorConfig()
+
+    mock_load_layered_config.side_effect = _load_layered_config_side_effect
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app2 = MagicMock()
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.return_value = mock_app2
+
+    mock_gh = MagicMock()
+    mock_gh_class.return_value = mock_gh
+
+    # The real gate: notify_config comes from the *outer* global_config
+    # parameter (not from a per-repo loaded config), so this alone drives
+    # whether the digest-build-and-emit block at the end of fleet_loop runs.
+    global_config = OrchestratorConfig(
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        )
+    )
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=global_config,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+
+    # The discriminating assertion: the real sink actually fired, on the pass
+    # where repo1's app.loop() never ran (only repo2's did).
+    assert mock_emit_digest.called is True
+    emitted_digest = mock_emit_digest.call_args[0][1]
+    matching = [e for e in emitted_digest.transitions if e.adapter_kind == "owner/repo1"]
+    assert len(matching) == 1
+    assert matching[0].health == "ERROR"
+    assert "cross_family" in (matching[0].last_log_line or "")
+
+
+def test_lane_failure_state_path_prefers_registry_state_dir(tmp_path: Path) -> None:
+    """_lane_failure_state_path uses the registry's recorded state_dir when
+    present — the common case for a repo that previously registered
+    successfully and only later started failing (e.g. self-deploy version
+    skew, the actual 2026-07-29 shape)."""
+    repo_root = tmp_path / "repo"
+    recorded_state_dir = tmp_path / "custom-state"
+    entry = {"repo_root": str(repo_root), "state_dir": str(recorded_state_dir)}
+
+    result = _lane_failure_state_path(repo_root, entry)
+
+    assert result == layout.state_file_path(recorded_state_dir)
+
+
+def test_lane_failure_state_path_falls_back_to_default_without_registry_entry(
+    tmp_path: Path,
+) -> None:
+    """Without a recorded state_dir (a repo that has never registered
+    successfully), _lane_failure_state_path falls back to the conventional
+    default location so the failure is still recorded somewhere findable."""
+    repo_root = tmp_path / "repo"
+    entry: dict[str, Any] = {"repo_root": str(repo_root)}
+
+    result = _lane_failure_state_path(repo_root, entry)
+
+    assert result == layout.state_file_path(layout.default_state_root(repo_root))
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_real_unknown_config_key_reproduces_incident(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """#6-G / G-AC5: full reproduction of the 2026-07-29 incident.
+
+    An unknown key in one repo's real config file (``cross_family:
+    totally_unknown_key``, mirroring the actual ``cross_family: auto_verdict``
+    version-skew incident) drives the real, unmocked ``load_layered_config``
+    to raise ``ConfigError``. This proves: (a) an events.db row is recorded
+    for the failing repo (queryable via query_events(kind=
+    "fleet_pass_config_error")), (b) the fleet digest carries a matching
+    AttentionEntry, and (c) a second, healthy repo's lane still completes —
+    while a doctor check run against the failing repo's own state directory
+    surfaces the same event as a finding (see
+    test_check_recent_lane_failures_surfaces_past_event in test_doctor.py,
+    which covers the doctor half of this chain with the same event shape).
+
+    Only load_layered_config is left unmocked; runtime_paths/GitHub/
+    OrchestratorApp stay mocked exactly as in the other fleet_loop tests —
+    this isolates "does the real config parser really raise ConfigError for
+    an unknown key, and does fleet_loop's except really catch it" from the
+    rest of the per-repo machinery.
+    """
+    repo1 = tmp_path / "repo1"
+    repo1.mkdir()
+    (repo1 / "orchestrator.config.yaml").write_text(
+        "labels:\n"
+        "  ready: automated-ready\n"
+        "runtime:\n"
+        "  state_dir: .var/charlie-work\n"
+        "cross_family:\n"
+        "  totally_unknown_key: true\n",
+        encoding="utf-8",
+    )
+    repo1_state_dir = repo1 / ".var" / "charlie-work"
+    repo1_state_dir.mkdir(parents=True)
+
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo1),
+                "state_dir": str(repo1_state_dir),
+                # No config_path override: load_layered_config resolves the
+                # real file above via find_config_path(repo_root, None).
+            },
+            "owner/repo2": {
+                "repo_root": str(repo2),
+            },
+        }
+    }
+
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app2 = MagicMock()
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.return_value = mock_app2
+    mock_gh_class.return_value = MagicMock()
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # (c) repo2's lane proceeded despite repo1's real ConfigError.
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+    assert mock_app_class.call_count == 1
+    assert mock_app2.loop.call_count == 1
+
+    # G-AC6: same pre-`paths`-binding failure point as
+    # test_fleet_loop_config_load_error_isolated, this time via the real,
+    # unmocked load_layered_config raising the real ConfigError rather than
+    # a mock side_effect. runtime_paths is called exactly once (repo2 only).
+    assert mock_runtime_paths.call_count == 1
+
+    message = result.data["repos"]["owner/repo1"]["message"]
+    assert "ConfigError" in message
+    assert "cross_family" in message
+    assert "totally_unknown_key" in message
+
+    # (a) the failure is durably recorded to repo1's own events.db.
+    state_path = layout.state_file_path(repo1_state_dir)
+    recorded = query_events(state_path, kind="fleet_pass_config_error")
+    assert len(recorded) == 1
+    assert recorded[0]["level"] == "error"
+    assert recorded[0]["payload"]["repo_key"] == "owner/repo1"
+    assert "totally_unknown_key" in recorded[0]["payload"]["error"]
+
+    # (b) the fleet digest carries a matching entry.
+    attention_digest = _build_fleet_attention_digest(result.data["digest"]["events"])
+    matching = [e for e in attention_digest.transitions if e.adapter_kind == "owner/repo1"]
+    assert len(matching) == 1
+    assert matching[0].health == "ERROR"
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")

@@ -23,9 +23,15 @@ $issue_body
 
 $section_scope_contract
 
+$section_spec_letter
+
 $section_no_merge_contract
 
+$section_process_lifetime
+
 $section_api_shape_validation
+
+$section_caller_sweep
 
 $section_parallel_investigation
 
@@ -39,7 +45,11 @@ $section_config_parity
    data flow).
 3. Reproduce or precisely explain the defect/requirement.
 4. Implement the smallest correct change at the right abstraction layer.
+
+   $section_invariant_enumeration
 5. Add or update regression tests unless genuinely not applicable (justify if so).
+
+   $section_test_hygiene
 6. Run the tests impacted by your change from the worktree root: the test
    file(s) you added or modified, plus `grep tests/` for every
    module/function/symbol your production diff touched and run every
@@ -57,6 +67,10 @@ $section_config_parity
    uncommitted reflow is the #1 cause of green-locally / red-on-CI.
 10. Push: `git push -u origin $branch_name`.
 11. Open the PR (see requirements below).
+
+$section_mutation_check
+
+$section_pr_body_honesty
 
 ## PR requirements
 
