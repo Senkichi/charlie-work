@@ -7388,6 +7388,7 @@ class OrchestratorApp:
             # re-log identical failures every pass while escalated either.
             escalated_checks = self.gh.pr_checks(pr_number)
             escalated_diff = self.gh.pr_diff(pr_number)
+            escalated_verdict = None
             with state_lock(self.paths.state_file):
                 fresh_state = load_state(self.paths.state_file)
                 existing_pr_state = fresh_state["prs"].get(str(pr_number))
@@ -7419,6 +7420,60 @@ class OrchestratorApp:
                             },
                         )
                     save_state(self.paths.state_file, fresh_state)
+
+            # Issue #776: escalation must stay terminal for the reason that
+            # caused it, but must not become a one-way door that ALSO blocks
+            # an unrelated, independently-capped remediation -- e.g. a dead
+            # request-changes-fix worker exhausting the unrelated watchdog
+            # redispatch cap used to permanently wall off a PR that
+            # separately developed a merge conflict, with no path back short
+            # of a human running `charlie unescalate` (real corpus: issues
+            # #592/#648/#606). A merge-conflict or no-op-rework janitor
+            # failure is routed through the SAME attempts_key-capped wrapper
+            # the non-escalated janitor gate below uses
+            # (_route_janitor_gate_failure_to_rework); that wrapper's own
+            # rework_pending check does not treat "escalated" as in-flight,
+            # so it re-derives its own dispatch/escalate decision from
+            # conflict_rework_attempts/no_op_rework_attempts -- a cap that is
+            # untouched by (and therefore still fresh after) an escalation
+            # from a different lane, but already exhausted -- so still
+            # correctly refused -- if THIS lane is what escalated the issue
+            # previously. This never re-litigates the original verdict or
+            # reason for escalation: only these two deterministic,
+            # zero-token checks are attempted here; packet generation and the
+            # LLM reviewer remain skipped below.
+            if issue_number is not None and escalated_verdict is not None:
+                is_merge_conflict_block = str(
+                    pr.get("mergeable") or ""
+                ).upper() == "CONFLICTING" or (
+                    str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
+                )
+                is_no_op_rework_block = (
+                    escalated_verdict.is_no_op_rework
+                    and not escalated_verdict.failed_required_checks
+                )
+                if is_merge_conflict_block or is_no_op_rework_block:
+                    if is_merge_conflict_block:
+                        routed = self._route_janitor_gate_failure_to_rework(
+                            pr,
+                            issue_number,
+                            attempts_key="conflict_rework_attempts",
+                            max_attempts=self.config.review.max_conflict_rework_attempts,
+                            reason="merge_conflict",
+                            router=self._request_merge_conflict_rework,
+                        )
+                    else:
+                        routed = self._route_janitor_gate_failure_to_rework(
+                            pr,
+                            issue_number,
+                            attempts_key="no_op_rework_attempts",
+                            max_attempts=self.config.review.max_no_op_rework_attempts,
+                            reason="no_op_rework",
+                            router=self._request_no_op_rework_repair,
+                        )
+                    if routed is not None:
+                        return routed
+
             return CommandResult(
                 True,
                 reason,
@@ -10260,6 +10315,7 @@ class OrchestratorApp:
         sync_failed = False
         merge_conflict = False
         merge_conflict_routed = False
+        merge_conflict_escalated = False
         check_failure_routed = False
         cross_pr_revert_detected = False
         cross_pr_revert_routed = False
@@ -10399,14 +10455,30 @@ class OrchestratorApp:
                             "merge_attempt_warning": None,
                         },
                     )
-                # The linked issue is in a human-terminal state (escalated to a
-                # human decision, or blocked pending one). Never reroute those
-                # to rework_requested: transition() has no source-state
-                # validation, so doing so would silently strip human_needed
-                # and hand the issue back into the automated pipeline behind
-                # the human's back. Leave the issue and PR alone; a human
-                # must move it out of this state.
-                if issue_status in ("escalated", "blocked"):
+                # "blocked" is a human reviewer verdict (record_review's
+                # decision == "blocked"), not a cap escalation: transition()
+                # has no source-state validation, so rerouting it to
+                # rework_requested would silently strip that verdict and hand
+                # the issue back into the automated pipeline behind the
+                # human's back. Leave it alone; a human must move it out.
+                #
+                # "escalated" is deliberately NOT excluded here (issue #776):
+                # it used to be, which let an escalation for ANY reason --
+                # e.g. a dead request-changes-fix worker exhausting the
+                # unrelated watchdog redispatch cap -- permanently wall off a
+                # PR that separately develops a merge conflict, with no path
+                # back short of a human running `charlie unescalate` (real
+                # corpus: issues #592/#648/#606). The unified conflict-rework
+                # dispatch below (_route_janitor_gate_failure_to_rework)
+                # re-derives its own decision from conflict_rework_attempts,
+                # a cap left untouched by an escalation from a different lane
+                # -- but already exhausted, so still correctly refused, if
+                # THIS lane is what escalated the issue previously. Falling
+                # through is safe: it is the same merge_conflict=True /
+                # sync_failed=True path already taken today by a fresh,
+                # not-yet-escalated conflict before the failed-attempt-alarm
+                # threshold below is reached.
+                if issue_status == "blocked":
                     return CommandResult(
                         True,
                         f"PR #{pr_number} merge conflict on issue #{issue_number} "
@@ -10788,8 +10860,37 @@ class OrchestratorApp:
         # human-terminal state, and the stale `existing_pr_state` snapshot can
         # diverge from the counter the final persistence block will reload
         # (e.g. a carry-forward reset in this same pass). Dispatch outside the
-        # final state-lock because _request_merge_conflict_rework acquires its
-        # own lock.
+        # final state-lock because _route_janitor_gate_failure_to_rework
+        # acquires its own lock.
+        #
+        # Issues #776/#777: this used to call _request_merge_conflict_rework
+        # directly, bypassing conflict_rework_attempts entirely -- the only
+        # gate was this threshold check, so a PR could be re-dispatched to
+        # rework on every pass forever with no cap, and consecutive_failed_
+        # merge_attempts (a diagnostic-only alarm counter, see
+        # AutoMergeConfig.failed_attempt_alarm) was the only "cap" a human
+        # could point to. It is now routed through the SAME
+        # attempts_key-capped wrapper review()'s janitor gate uses, so there
+        # is exactly one place in the codebase that increments
+        # conflict_rework_attempts and decides dispatch vs. rescue vs.
+        # escalation for this lane -- and the attempt is counted (line
+        # `attempts = ... + 1` inside that wrapper) BEFORE any subsequent
+        # worker-launch failure (e.g. a deterministic worktree_unsafe at
+        # actual dispatch time, real corpus: PR #679/issue #602) can
+        # escalate, so a launch failure no longer bypasses the cap.
+        # "manifest_written"/"blocked" remain pre-checked here because they
+        # are merge_ready()-specific concerns the shared wrapper does not
+        # know about: manifest_written means an unrelated worker is being
+        # launched for this issue right now (preempting it would race that
+        # launch), and blocked is a human reviewer verdict that must never be
+        # silently routed around. "dispatched"/"dispatch_pending"/
+        # "rework_requested" and "escalated" are deliberately NOT
+        # pre-excluded any more: the wrapper's own rework_pending check
+        # already treats the first three as in-flight (returning None, a
+        # no-op here), and its own attempts_key cap -- untouched by an
+        # escalation from an unrelated lane, already exhausted if this lane
+        # is what escalated the issue -- is what correctly decides
+        # "escalated" (issue #776's fix; real corpus: issues #592/#648/#606).
         if (
             merge_conflict
             and approved
@@ -10801,23 +10902,24 @@ class OrchestratorApp:
             issue_state = state["issues"].get(str(issue_number), {})
             issue_status = issue_state.get("status")
             existing_for_route = state["prs"].get(str(pr_number), {})
-            if issue_status not in (
-                "dispatched",
-                "dispatch_pending",
-                "manifest_written",
-                "escalated",
-                "blocked",
-                "rework_requested",
-            ):
+            if issue_status not in ("manifest_written", "blocked"):
                 new_attempts_for_route = (
                     int(existing_for_route.get("consecutive_failed_merge_attempts", 0)) + 1
                 )
                 threshold = self.config.auto_merge.failed_attempt_alarm
                 if threshold > 0 and new_attempts_for_route >= threshold:
-                    merge_conflict_routed = True
-                    rework_label_error = self._request_merge_conflict_rework(
-                        pr, issue_number, decision
+                    routed = self._route_janitor_gate_failure_to_rework(
+                        pr,
+                        issue_number,
+                        attempts_key="conflict_rework_attempts",
+                        max_attempts=self.config.review.max_conflict_rework_attempts,
+                        reason="merge_conflict",
+                        router=self._request_merge_conflict_rework,
                     )
+                    if routed is not None:
+                        merge_conflict_routed = bool(routed.data.get("routed_to_rework"))
+                        merge_conflict_escalated = bool(routed.data.get("escalated"))
+                        rework_label_error = routed.data.get("label_error")
         # Check-failure rework dispatch (issue #674): an approved PR whose
         # required checks have genuinely failed (a completed FAILURE
         # conclusion, not merely pending/missing/infra_failed/unavailable)
@@ -10875,12 +10977,32 @@ class OrchestratorApp:
             ) or mergequeue_handoff_failed:
                 new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0)) + 1
                 threshold = self.config.auto_merge.failed_attempt_alarm
+                # Issue #777(b): this counter previously had no ceiling and
+                # grew unbounded across passes (real corpus: PR #679 reached
+                # 12 and climbing) because nothing ever reset it once a
+                # rework was dispatched and pending. It is diagnostic only --
+                # the FUNCTIONAL bound on repeated conflict-rework/no-op-
+                # rework dispatch is conflict_rework_attempts/
+                # no_op_rework_attempts, enforced by
+                # _route_janitor_gate_failure_to_rework above. Clamp at
+                # threshold + 1 (not at threshold): clamping AT threshold
+                # would make `merge_attempt_alarm` below re-fire every pass
+                # once clamped, turning a one-time alarm into a cost spiral;
+                # threshold + 1 keeps the alarm's "== threshold" one-shot
+                # semantics intact while still giving every trigger sharing
+                # this counter (check-failure, cross-PR-revert, mergequeue
+                # handoff) a stable ">= threshold" debounce reading forever
+                # after the first alarm fires, instead of an ever-growing one.
+                if threshold > 0:
+                    new_attempts = min(new_attempts, threshold + 1)
                 merge_attempt_alarm = threshold > 0 and new_attempts == threshold
                 if merge_attempt_alarm:
                     if merge_conflict:
                         pass_str = "pass" if new_attempts == 1 else "passes"
                         if issue_number is None:
                             conflict_detail = "no linked issue, cannot route to rework"
+                        elif merge_conflict_escalated:
+                            conflict_detail = "conflict-rework cap exhausted; escalated to a human"
                         elif merge_conflict_routed:
                             if rework_label_error:
                                 outcome = rework_label_error.get("outcome", rework_label_error)
@@ -12085,7 +12207,41 @@ class OrchestratorApp:
         # failure direction.
         snapshot = load_state_locked(self.paths.state_file)
         existing_pr_state = snapshot.get("prs", {}).get(str(pr_number), {})
-        issue_status = snapshot.get("issues", {}).get(str(issue_number), {}).get("status")
+        issue_state = snapshot.get("issues", {}).get(str(issue_number), {})
+        issue_status = issue_state.get("status")
+        # Issue #776: this wrapper is called on every pass for as long as the
+        # underlying janitor failure persists (review()'s escalated-issue
+        # early return re-attempts it every pass; merge_ready()'s conflict
+        # trigger no longer pre-excludes "escalated" either, by design, so
+        # unrelated remediation can proceed). Once THIS lane's own cap has
+        # already escalated the pair, re-running the block below on an
+        # unchanged verdict would re-burn attempts_key past the cap, re-fire
+        # janitor_rework_escalated, and re-call transition() every single
+        # pass forever. Match on the lane-specific escalation_reason (not
+        # just issue_status == "escalated") so an escalation from a
+        # DIFFERENT lane -- a different attempts_key, or the unrelated
+        # watchdog redispatch cap -- does NOT match here and remediation of
+        # that unrelated Y still proceeds below. Checking both records
+        # covers the PR-only-escalated edge case.
+        #
+        # Both this lane's cap-exceeded escalation AND its stall escalation
+        # (_check_janitor_rework_stall, issue #765/#774) must be recognized
+        # here. Without the stall reason, an issue escalated for a stalled
+        # rework (nobody working it -- the whole point of that escalation is
+        # to get a human to look) would fall through: its status is
+        # "escalated", not "rework_requested"/"dispatched"/"dispatch_pending",
+        # so `rework_pending` below is False and the function would proceed
+        # straight to the attempts-increment/dispatch logic and silently
+        # redispatch a fresh rework attempt on the very next pass --
+        # defeating the stall escalation the moment it fires.
+        current_escalation_reasons = frozenset(
+            {f"{attempts_key}_cap_exceeded", f"{attempts_key}_stall_exceeded"}
+        )
+        if (
+            issue_state.get("escalation_reason") in current_escalation_reasons
+            or existing_pr_state.get("escalation_reason") in current_escalation_reasons
+        ):
+            return None
         rework_pending = issue_status in ("rework_requested", "dispatched", "dispatch_pending")
         counted_head = existing_pr_state.get(last_head_key)
         if rework_pending:
@@ -12231,6 +12387,15 @@ class OrchestratorApp:
             )
 
         if max_attempts > 0 and attempts > max_attempts:
+            # Issue #776: record a structured, lane-specific escalation reason
+            # (distinct from the generic "redispatch_cap_exceeded" other
+            # escalation sites use for the unrelated worker-liveness
+            # redispatch cap) so a human -- and any future reason-scoped
+            # guard -- can tell THIS lane's cap is what's exhausted, as
+            # opposed to an unrelated lane having escalated the issue. This
+            # was the one escalation call site in the codebase that recorded
+            # no reason at all.
+            escalation_reason = f"{attempts_key}_cap_exceeded"
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 state["prs"][str(pr_number)] = {
@@ -12238,12 +12403,14 @@ class OrchestratorApp:
                     "number": pr_number,
                     "issue_number": issue_number,
                     "status": "escalated",
+                    "escalation_reason": escalation_reason,
                     attempts_key: attempts,
                 }
                 state["issues"][str(issue_number)] = {
                     **state["issues"].get(str(issue_number), {}),
                     "number": issue_number,
                     "status": "escalated",
+                    "escalation_reason": escalation_reason,
                     "merge_alert": "OK",
                     # Issue #783: janitor-gate rework attempt cap is a
                     # process limit, not a judgment call -- mechanical.
@@ -12256,6 +12423,7 @@ class OrchestratorApp:
                         "pr_number": pr_number,
                         "issue_number": issue_number,
                         "reason": reason,
+                        "escalation_reason": escalation_reason,
                         "attempts": attempts,
                     },
                 )
@@ -12456,6 +12624,15 @@ class OrchestratorApp:
         if elapsed_minutes < threshold_minutes:
             return None
 
+        # Issue #776 follow-up: record a lane-scoped escalation_reason here
+        # too (parallel to the cap-exceeded branch above), not just a status
+        # flip. Without it, _route_janitor_gate_failure_to_rework's same-lane
+        # guard has nothing to match on the next pass -- the issue's status
+        # is "escalated" (so rework_pending is False, skipping straight past
+        # the not-settled branch) and the wrapper would silently redispatch a
+        # fresh rework attempt (or re-escalate) immediately, undoing the stall
+        # escalation's entire purpose the moment it fires.
+        escalation_reason = f"{attempts_key}_stall_exceeded"
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             attempts_so_far = int(state["prs"].get(str(pr_number), {}).get(attempts_key, 0))
@@ -12464,6 +12641,7 @@ class OrchestratorApp:
                 "number": pr_number,
                 "issue_number": issue_number,
                 "status": "escalated",
+                "escalation_reason": escalation_reason,
                 stall_since_key: None,
                 stall_head_key: None,
             }
@@ -12471,6 +12649,7 @@ class OrchestratorApp:
                 **state["issues"].get(str(issue_number), {}),
                 "number": issue_number,
                 "status": "escalated",
+                "escalation_reason": escalation_reason,
                 "merge_alert": "OK",
                 # Issue #783: a stalled rework worker is a process failure,
                 # not a judgment call -- mechanical.
@@ -12483,6 +12662,7 @@ class OrchestratorApp:
                     "pr_number": pr_number,
                     "issue_number": issue_number,
                     "reason": reason,
+                    "escalation_reason": escalation_reason,
                     "attempts": attempts_so_far,
                     "stalled_minutes": round(elapsed_minutes, 1),
                     "stall_since": stall_since,
