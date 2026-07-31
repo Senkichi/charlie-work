@@ -59,6 +59,7 @@ from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, link
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
+    PASSIVE_OPEN_STATUS,
     append_event,
     empty_state,
     is_throttled,
@@ -21400,16 +21401,18 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
 
 
-@pytest.mark.parametrize("terminal_status", ["escalated", "blocked"])
-def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
-    tmp_path: Path, terminal_status: str
-) -> None:
-    """Issue #379 rework: a merge conflict whose linked issue is escalated/blocked
-    (human-terminal) must never be rerouted to rework_requested.
+def test_merge_ready_conflict_blocked_issue_not_rerouted(tmp_path: Path) -> None:
+    """Issue #379 rework: a merge conflict whose linked issue is blocked (a
+    human reviewer verdict, set by record_review's decision=="blocked") must
+    never be rerouted to rework_requested.
 
     transition() has no source-state validation, so rerouting would silently
-    strip the human_needed label and hand the issue back to automation behind
-    the human's back. The PR and issue must be left untouched.
+    strip that reviewer verdict and hand the issue back to automation behind
+    the human's back. The PR and issue must be left untouched. Unlike
+    "escalated" (see
+    test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework
+    below), "blocked" records no reason a re-entry mechanism could scope to,
+    so issue #776 deliberately leaves it a one-way door.
     """
     from charlie_work.config import AutoMergeConfig
 
@@ -21438,14 +21441,14 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
         },
     ]
     # Mark the linked issue as carrying the human_needed label, matching a
-    # real escalated/blocked issue, so a stripped label would be observable.
+    # real blocked issue, so a stripped label would be observable.
     fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
-        state["issues"]["123"]["status"] = terminal_status
+        state["issues"]["123"]["status"] = "blocked"
         save_state(paths.state_file, state)
 
     labels_removed_before = list(fake_gh.labels_removed)
@@ -21460,12 +21463,412 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
     assert result.data["merge_attempt_warning"] is None
 
     state = load_state(paths.state_file)
-    assert state["issues"]["123"]["status"] == terminal_status
+    assert state["issues"]["123"]["status"] == "blocked"
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
     # No label mutation must have been issued for the linked issue —
     # human_needed must stay in place.
     assert fake_gh.labels_removed == labels_removed_before
     assert fake_gh.labels_added == labels_added_before
+
+
+def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #776: an issue escalated for an UNRELATED reason (e.g. a dead
+    request-changes-fix worker exhausting the watchdog's redispatch cap --
+    the real mechanism that escalated corpus issues #592/#648/#606 via
+    _reap_restore_rework_requested) must not permanently wall off a PR that
+    separately develops a merge conflict.
+
+    This is the regression test for narrowing merge_ready()'s Guard 1
+    exclusion from ``("escalated", "blocked")`` down to ``"blocked"`` only --
+    it asserts the ROUTING CALL actually happened (a fresh dispatch, the
+    label edge, the attempts counter), not merely that the return value
+    looks different from the blocked case. It also asserts reason X's own
+    budget (``redispatch_at``, the watchdog counter that produced the
+    original escalation) survives untouched: re-entry must not reset X's
+    cap while remediating unrelated Y.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    unrelated_redispatch_at = ["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"]["123"],
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+            "redispatch_at": unrelated_redispatch_at,
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    # The routing call actually happened: a fresh dispatch, not a no-op.
+    # (merge_ready()'s top-level result.data doesn't expose the internal
+    # routed/escalated booleans -- verify via the state.json side effects
+    # the routing call actually produces instead.)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert conflict_events[0]["payload"]["issue_number"] == 123
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+    assert (123, config.labels.human_needed) in fake_gh.labels_removed
+    # Reason X's own budget must survive remediating unrelated Y: the
+    # watchdog redispatch timestamps that drove the ORIGINAL escalation are
+    # untouched, so a later re-escalation for the same reason X is not
+    # handed a falsely-fresh cap.
+    assert state["issues"]["123"]["redispatch_at"] == unrelated_redispatch_at
+
+
+def test_merge_ready_conflict_rework_dispatch_bounded_by_cap_across_repeated_evaluation(
+    tmp_path: Path,
+) -> None:
+    """Issue #777: merge_ready()'s conflict-rework trigger must never dispatch
+    more rework workers than config.review.max_conflict_rework_attempts, no
+    matter how many times merge_ready() re-evaluates the same conflicting PR
+    -- including across issue-status resets that mimic an external lane
+    (e.g. a dead-session reaper) putting the issue back into a re-dispatchable
+    state between passes.
+
+    Before this fix, merge_ready()'s dispatch trigger called
+    _request_merge_conflict_rework directly with no attempts_key bookkeeping
+    at all, so nothing bounded the number of real dispatches across such
+    cycles (real corpus: PR #679/issue #602, where the diagnostic-only
+    consecutive_failed_merge_attempts counter climbed past 11 while the
+    functional cap sat at 0 the entire time).
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig, ReviewConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    def _reset_issue_to_fresh() -> None:
+        with state_lock(paths.state_file):
+            state = load_state(paths.state_file)
+            state["issues"]["123"] = {**state["issues"]["123"], "status": "approved"}
+            save_state(paths.state_file, state)
+
+    dispatch_events_total = 0
+    escalated_seen_at: int | None = None
+    for pass_number in range(1, 5):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["merge_conflict"] is True
+        state = load_state(paths.state_file)
+        dispatch_events_total = sum(
+            1 for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+        )
+        if state["issues"]["123"]["status"] == "escalated":
+            escalated_seen_at = pass_number
+            assert (
+                state["issues"]["123"]["escalation_reason"]
+                == "conflict_rework_attempts_cap_exceeded"
+            )
+            # Once escalated for this lane's own exhausted cap, stop
+            # artificially re-arming: no real production path resets an
+            # escalated issue's status back to "approved" (only
+            # `charlie unescalate` does, and it also clears
+            # escalation_reason) -- the loop's reset is only a harness
+            # device to reach the cap boundary, not a realistic post-
+            # escalation event. Break here and verify stability below
+            # instead of feeding the wrapper a state no real caller would
+            # ever produce.
+            break
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        # Never more real dispatches than the cap, no matter how many passes.
+        assert dispatch_events_total <= config.review.max_conflict_rework_attempts
+        _reset_issue_to_fresh()
+
+    # The cap was actually reached and enforced, not merely never approached.
+    assert escalated_seen_at is not None
+    assert dispatch_events_total == config.review.max_conflict_rework_attempts
+    escalated_events_after_first = sum(
+        1 for e in state["events"] if e["kind"] == "janitor_rework_escalated"
+    )
+    assert escalated_events_after_first == 1
+
+    # Issue #776: once escalated for THIS lane's own exhausted cap, a FURTHER
+    # evaluation of the same still-conflicting PR must not dispatch yet
+    # another worker, must not burn the counter past what it already is, and
+    # must not re-fire a duplicate escalation event on every pass ("X blocks
+    # retry of X") -- it simply leaves the already-escalated pair alone.
+    for _ in range(3):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "conflict_rework_attempts_cap_exceeded"
+    expected_final_attempts = config.review.max_conflict_rework_attempts + 1
+    assert state["prs"]["456"]["conflict_rework_attempts"] == expected_final_attempts
+    final_dispatch_events = sum(
+        1 for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    )
+    assert final_dispatch_events == config.review.max_conflict_rework_attempts
+    final_escalated_events = sum(
+        1 for e in state["events"] if e["kind"] == "janitor_rework_escalated"
+    )
+    assert final_escalated_events == 1
+
+
+def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #777(d): the conflict-rework attempt must be counted (via
+    _route_janitor_gate_failure_to_rework's conflict_rework_attempts write,
+    which merge_ready's dispatch trigger now goes through) BEFORE a later,
+    deterministic worktree_unsafe failure at actual worker-launch time can
+    escalate the issue through dispatch_rework's separate failure_kind lane.
+
+    Real corpus: PR #679/issue #602, escalation_reason="worktree_unsafe".
+    dispatch_rework's deterministic-failure branch only ever writes to
+    state["issues"][...] -- it must never zero or otherwise touch the PR
+    record's conflict_rework_attempts counter.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import AutoMergeConfig, DevinConfig, WatchdogConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    dispatch_result = app.merge_ready(456, merge=False)
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree is unsafe to reuse",
+                failure_kind="worktree_unsafe",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+    # The attempt counted by the (now-unified) conflict-rework dispatch must
+    # survive this SEPARATE escalation lane untouched -- it lives on the PR
+    # record, and dispatch_rework's deterministic-failure branch only ever
+    # writes to the issue record.
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+
+def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
+    tmp_path: Path,
+) -> None:
+    """Issue #776 follow-up: the new same-reason guard in
+    _route_janitor_gate_failure_to_rework (which refuses to re-route once
+    escalation_reason == f"{attempts_key}_cap_exceeded" is already recorded)
+    must not become a NEW one-way door of its own. ``charlie unescalate`` is
+    the sanctioned re-arm: it clears ``escalation_reason`` on both the issue
+    and PR records (``_UNESCALATE_ISSUE_RESET_FIELDS`` /
+    ``_UNESCALATE_PR_RESET_FIELDS`` both list it) and zeros
+    ``conflict_rework_attempts`` on the PR record, so a PR that is STILL
+    conflicting after a human re-arms it gets a genuinely fresh attempts
+    budget rather than being silently re-refused by the guard or picking up
+    where the exhausted counter left off.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Directly construct the "this lane's own cap already exhausted,
+    # escalated" state that _route_janitor_gate_failure_to_rework's
+    # cap-exceeded branch produces (workflow.py ~11862-11878), merged over
+    # whatever record_review() already wrote -- mirrors the construction
+    # convention test_fix_unescalate.py uses rather than re-deriving the
+    # escalation via a repeated merge_ready() loop.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"]["456"],
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "conflict_rework_attempts": 3,
+        }
+        state["issues"]["123"] = {
+            **state["issues"]["123"],
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    # Sanity check: while escalated for THIS lane's own reason, the new guard
+    # refuses to re-route at all (the property test C already covers directly
+    # -- reconfirmed here as a precondition for what unescalate() is about to
+    # undo).
+    precheck = app.merge_ready(456, merge=False)
+    assert precheck.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 3
+
+    unescalate_result = app.unescalate(issue_number=123)
+    assert unescalate_result.ok is True
+    assert unescalate_result.data["changed"] is True
+
+    state = load_state(paths.state_file)
+    assert "escalation_reason" not in state["prs"]["456"]
+    assert "escalation_reason" not in state["issues"]["123"]
+    assert "conflict_rework_attempts" not in state["prs"]["456"]
+    assert state["prs"]["456"]["status"] == PASSIVE_OPEN_STATUS
+
+    # The conflict is still present (PR still CONFLICTING/DIRTY on GitHub) --
+    # a fresh merge_ready() pass must dispatch rework again with a genuinely
+    # fresh attempts counter, not pick up where the exhausted counter (3)
+    # left off and not be silently refused by the same-reason guard (which no
+    # longer matches now that escalation_reason has been cleared).
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    dispatch_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(dispatch_events) == 1
 
 
 def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
