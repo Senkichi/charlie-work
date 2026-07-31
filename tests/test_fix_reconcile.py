@@ -22,7 +22,7 @@ import pytest
 
 from charlie_work.config import OrchestratorConfig
 from charlie_work.reconcile import apply_fixes, detect_drift
-from charlie_work.state import empty_state
+from charlie_work.state import ORCHESTRATOR_OWNED_ISSUE_STATUSES, empty_state
 
 from test_reconcile import FakeGitHub, _issue, _pr
 
@@ -126,6 +126,110 @@ def test_closed_issue_with_invalid_status_gets_closed() -> None:
 
     assert new_state["issues"]["374"]["status"] == "closed"
     assert new_state["issues"]["374"]["title"] == "some cached title"
+
+
+def test_reopened_issue_with_closed_state_status_and_open_pr_is_rederived() -> None:
+    """Issue #789 / AC-1 / AC-5: a GitHub reopen must un-strand a state entry
+    that was correctly normalized to "closed" at the time but has since gone
+    stale. Reproduces the confirmed live instance (issue #649 / PR #693): the
+    issue carries its normal `pr_open` label (so the separate
+    issue_active_label_with_open_pr self-heal has nothing to fix) but
+    state.json's status is still the pre-reopen "closed" -- before this fix
+    that was self-validating and the entry was stranded forever.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(693, "OPEN", head_ref="agent/issue-649-x")],
+        issues=[_issue(649, [config.labels.pr_open], state="OPEN")],
+    )
+    state = empty_state()
+    state["issues"]["649"] = {"number": 649, "status": "closed"}
+
+    drift = [
+        item for item in detect_drift(gh, state, config) if item.kind == "issue_status_normalized"
+    ]
+    assert len(drift) == 1
+    assert drift[0].issue_number == 649
+    assert drift[0].new_status == "reviewing"  # PASSIVE_OPEN_STATUS
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state["issues"]["649"]["status"] == "reviewing"
+
+
+def test_both_closed_issue_is_unchanged_and_costs_no_extra_github_call() -> None:
+    """Issue #789 / AC-2 / AC-5: the common case -- state status "closed" and
+    the GitHub issue is genuinely still closed -- must be a no-op: no drift
+    item (so no spurious event/log noise every pass) and, since re-examining
+    "closed" entries now runs a GitHub-state lookup that used to be skipped
+    entirely, no *additional* `gh.run` call beyond the two upfront list
+    queries `detect_drift` always issues. `issues_by_number` is populated from
+    that same `--state all` issue-list snapshot, so the lookup is a dict
+    `.get()`, not a network call.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(900, [], state="CLOSED")])
+    state = empty_state()
+    state["issues"]["900"] = {"number": 900, "status": "closed"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.issue_number == 900] == []
+    # Exactly the two unconditional snapshot queries (`pr list`, `issue list`)
+    # -- no per-issue call was added for the closed entry.
+    assert len(gh.run_calls) == 2
+
+
+def test_closed_status_with_issue_absent_from_snapshot_emits_no_drift() -> None:
+    """Issue #789 follow-up: a state entry with status "closed" whose issue
+    number is absent from the GitHub issue-list snapshot entirely must NOT be
+    treated as evidence the issue is gone. Before the explicit `issue is
+    None` guard in the normalization loop, this fell through to
+    `target_status = None` and `apply_fixes` would strip the "closed" status
+    -- harmless today only by the accident that the repo's issue count sits
+    under `_LIST_LIMIT`, so `issues_by_number` never actually drops a real
+    closed issue. Once the repo passes that limit, every closed entry whose
+    issue fell off the `--state all` page would get its status silently
+    wiped on the very next reconcile pass, with no signal in the drift log
+    to explain it. This test pins the guard directly -- it must fail against
+    the unguarded version of the fix (verified via mutation check).
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])  # issue 950 absent from the snapshot entirely
+    state = empty_state()
+    state["issues"]["950"] = {"number": 950, "status": "closed"}
+
+    drift = [
+        item for item in detect_drift(gh, state, config) if item.kind == "issue_status_normalized"
+    ]
+    assert drift == []
+
+
+@pytest.mark.parametrize("owned_status", sorted(ORCHESTRATOR_OWNED_ISSUE_STATUSES))
+def test_orchestrator_owned_status_keeps_skip_behavior_on_closed_issue(
+    owned_status: str,
+) -> None:
+    """Issue #789 / AC-3: every orchestrator-owned status (VALID_ISSUE_STATUSES
+    minus the externally-derived "closed") must keep its exact pre-#789 skip
+    behavior in the status-normalization sweep -- reconcile must not start
+    overwriting escalated/dispatched/etc. Uses a GitHub issue that is CLOSED
+    with no tracked PR: the one shape that *would* trigger normalization for
+    a status outside the skip set, which is what makes this discriminating.
+    A fix that accidentally narrowed the skip set (e.g. a typo'd literal at
+    the call site instead of deriving from the frozenset) would surface here
+    as a spurious issue_status_normalized drift item.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(950, [], state="CLOSED")])
+    state = empty_state()
+    state["issues"]["950"] = {"number": 950, "status": owned_status}
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "issue_status_normalized" and item.issue_number == 950
+    ]
+    assert drift == [], f"status {owned_status!r} was incorrectly re-normalized"
 
 
 def test_pr_status_normalized_when_tracked_pr_missing_status() -> None:

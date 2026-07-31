@@ -47,6 +47,8 @@ from . import rescue as rescue_helpers
 from .subprocess_runner import no_console_window_kwargs
 from .cross_family import (
     CrossFamilyResult,
+    LEGACY_VACUOUS_SUMMARY,
+    MalformedCrossFamilyVerdict,
     extract_head_ref_oid,
     extract_report_body,
     parse_cross_family_verdict,
@@ -108,13 +110,16 @@ from .state import (
     _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     append_event,
+    arm_deescalation_pass,
     arm_quota_probe,
     arm_reconcile_pass,
     clear_quota_throttles,
     clear_reviewer_quota,
     defer_reviewer_probe_after,
     disarm_quota_probe,
+    escalation_reason_class,
     is_claim_stale,
+    is_deescalation_due,
     is_quota_probe_actionable,
     is_quota_probe_armed,
     is_quota_probe_due,
@@ -460,6 +465,52 @@ class CarryForwardCheck:
     @property
     def carry_forward(self) -> bool:
         return self.tier is not None
+
+
+def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
+    """Reject carry-forward for a content-free cross-family verdict (issue #784, AC-8).
+
+    ``review_queue`` reads recorded verdicts as plain dicts straight off
+    ``review-decision.json`` (never through the ``CrossFamilyVerdict``
+    constructor -- see ``_review_decision``), so this is a data-shape check,
+    not a dataclass reconstruction: it must never raise on the 8 pre-#784
+    on-disk records this predicate exists to catch, which is exactly the
+    deserialization hazard flagged during this fix's design.
+
+    A verdict is ineligible only when it is unmistakably a product of the
+    pre-#784 bug: ``decision == "request_changes"`` with no itemized
+    ``required_changes`` AND a summary that is either empty or exactly the
+    historical hardcoded placeholder (``LEGACY_VACUOUS_SUMMARY``). A primary
+    reviewer's ``request_changes`` verdict always has a non-empty, non-
+    placeholder summary (``record_review`` rejects an empty one outright),
+    so this predicate cannot mistake a legitimate primary-review decision --
+    one that simply chose prose over an itemized list -- for a vacuous one.
+    Everything else (``approved``, ``blocked``, populated
+    ``required_changes``, or a real summary) is eligible, unchanged from
+    before this fix.
+    """
+    if decision.get("decision") != "request_changes":
+        return True
+    if decision.get("required_changes"):
+        return True
+    summary = str(decision.get("summary") or "").strip()
+    return bool(summary) and summary != LEGACY_VACUOUS_SUMMARY
+
+
+# Statuses that mean an issue already has a rework routed (or an equivalent
+# gate) in flight, or is otherwise spoken for -- shared by every "should I
+# route this PR to rework_requested" check so they cannot drift apart.
+# Originally the cross-PR-revert gate in ``merge_ready`` (below); issue #784
+# AC-8 Case 2 reuses it verbatim for ``review_queue``'s stranded-verdict
+# check rather than inventing a second list.
+_REWORK_ALREADY_ROUTED_STATUSES = (
+    "escalated",
+    "blocked",
+    "dispatched",
+    "dispatch_pending",
+    "manifest_written",
+    "rework_requested",
+)
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -3682,6 +3733,9 @@ def _reap_restore_rework_requested(
             entry["escalation_reason"] = (
                 failure_kind if terminal_failure else "redispatch_cap_exceeded"
             )
+            # Issue #783: dead worker session / redispatch cap is a process
+            # failure, not a judgment call on the PR artifact -- mechanical.
+            entry["reason_class"] = escalation_reason_class("mechanical")
             # Preserve worker_pid/worker_process_start_time (issue #282): the
             # recovery probe still needs the fingerprint even after escalation.
             state["issues"][str(worker.issue_number)] = entry
@@ -4228,6 +4282,9 @@ def _route_dead_worker_to_pre_review_rework(
                 if terminal_failure
                 else "redispatch_cap_exceeded",
                 "pre_review_rework_reason": reason,
+                # Issue #783: merge conflict / rework-branch conflict / stale-CI
+                # redispatch cap are all process failures, not judgment calls.
+                "reason_class": escalation_reason_class("mechanical"),
             }
             state["issues"][str(issue_number)] = entry
             save_state(state_file, state)
@@ -4451,6 +4508,9 @@ def _classify_dead_sessions_and_update_throttle_state(
                     ) + [now.isoformat().replace("+00:00", "Z")]
                     entry["status"] = "escalated"
                     entry["escalation_reason"] = failure_kind
+                    # Issue #783: a deterministic launch failure kind is a
+                    # process failure, not a judgment call -- mechanical.
+                    entry["reason_class"] = escalation_reason_class("mechanical")
                     entry["redispatch_at"] = redispatch_at
                     entry.pop("worker_pid", None)
                     entry.pop("worker_process_start_time", None)
@@ -4750,6 +4810,9 @@ def _classify_dead_sessions_and_update_throttle_state(
                         entry["escalation_reason"] = (
                             failure_kind if terminal_failure else "redispatch_cap_exceeded"
                         )
+                        # Issue #783: dead worker session / redispatch cap is a
+                        # process failure, not a judgment call -- mechanical.
+                        entry["reason_class"] = escalation_reason_class("mechanical")
                         # Issue #282: preserve the liveness fingerprint for the
                         # recovery path. The PID is already verified dead by the
                         # time we reach this branch, but clearing it removes the
@@ -6576,6 +6639,13 @@ class OrchestratorApp:
                     **_issue_entry,
                     "number": issue_number,
                     "merged_pr_mention_flagged_at": utc_now(),
+                    # Issue #783: a merged PR that only mentions the issue in
+                    # free text is a hijack-safety judgment call, not a
+                    # process failure -- never auto-de-escalated. "status" is
+                    # deliberately untouched (see above), so this reason_class
+                    # is carried for completeness/consistency even though the
+                    # de-escalation sweep never visits this issue via status.
+                    "reason_class": escalation_reason_class("judgment"),
                 }
             if stamped_mention_issues:
                 state = append_event(
@@ -6946,6 +7016,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     entry.pop("escalation_reason", None)
+                    entry.pop("reason_class", None)
                 elif is_phantom_live_worker:
                     # Issue #523: a phantom live worker is being routed as dead;
                     # do not preserve a stale worker_pid that would keep the slot
@@ -6956,6 +7027,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     entry.pop("escalation_reason", None)
+                    entry.pop("reason_class", None)
                     entry.pop("worker_pid", None)
                     entry.pop("worker_process_start_time", None)
                 elif status == "escalated":
@@ -6965,6 +7037,10 @@ class OrchestratorApp:
                         if terminal_failure and failed_result is not None
                         else "dispatch_failed_cap_exceeded"
                     )
+                    # Issue #783: a deterministic launch failure kind or
+                    # dispatch-cap exceeded is a process failure, not a
+                    # judgment call -- mechanical.
+                    entry["reason_class"] = escalation_reason_class("mechanical")
                 else:
                     entry["dispatch_failed_at"] = all_attempts
                     entry.pop("escalation_reason", None)
@@ -7911,6 +7987,22 @@ class OrchestratorApp:
         - The recorded decision is a stale ``request_changes``/``blocked``/
           ``approved`` verdict whose patch-id genuinely differs from the live
           head and the packet head is still current.
+        - The recorded decision is a content-free ``request_changes`` verdict
+          (issue #784 AC-8, ``_is_carry_forward_eligible``) and the packet
+          head is current -- queued as ``"vacuous"`` regardless of whether
+          the head moved, since carry-forward and the head-unchanged
+          shortcut must never re-confirm a verdict with nothing for a
+          rework brief to act on.
+
+        A PR is NOT queued, but has a side-effecting repair applied instead,
+        when the recorded decision is an actionable (non-content-free),
+        non-escalated ``request_changes`` verdict at the live head whose
+        linked issue status does not show it was ever routed to rework
+        (issue #784 AC-8, Case 2, ``_reroute_stranded_request_changes``) --
+        this re-applies the SAME ``rework_requested`` transition
+        ``record_review`` already decided, so it is a repair of a dropped
+        transition, not a new decision, and is a no-op once the issue is at
+        ``rework_requested`` (or otherwise already spoken for).
 
         Returns:
             CommandResult with a sorted ``queue`` list keyed by repo.
@@ -7943,7 +8035,49 @@ class OrchestratorApp:
             reviewed_head_sha = decision.get("reviewed_head_sha")
 
             if decision_value in ("approved", "request_changes", "blocked"):
+                if not _is_carry_forward_eligible(decision):
+                    # Issue #784 AC-8: a content-free request_changes verdict
+                    # must never be silently re-confirmed. This check runs
+                    # BEFORE the head-unchanged shortcut below on purpose --
+                    # that shortcut is the dominant case (a label-strip
+                    # requeue never moves the head), and the whole point of
+                    # AC-8 is that "head unchanged" must stop meaning
+                    # "verdict re-affirmed" for exactly this content-free
+                    # shape. Queue it as "vacuous" (packet permitting) so
+                    # _record_cross_family_verdicts can force a *bounded*
+                    # number of regeneration attempts
+                    # (cross_family.max_parse_failures) rather than looping
+                    # or re-confirming forever.
+                    if packet_head_sha is None or packet_head_sha != live_head_sha:
+                        continue
+                    queue.append(
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "packet_head_sha": packet_head_sha,
+                            "decision": "vacuous",
+                            "reviewed_head_sha": reviewed_head_sha,
+                        }
+                    )
+                    continue
+
                 if reviewed_head_sha == live_head_sha:
+                    # Issue #784 AC-8 (Case 2): "reviewed at live head" only
+                    # means "nothing to do" if the recorded verdict was
+                    # actually actioned. A request_changes verdict that
+                    # record_review decided is within the rework-cycle
+                    # budget (``escalated`` falsy) must have routed its
+                    # issue to rework_requested in that same call; if the
+                    # issue status doesn't show that -- e.g. issue #789's
+                    # reconcile one-way "closed" gate clobbered it -- re-
+                    # drive the same target here rather than silently
+                    # re-confirming a verdict nobody ever acted on.
+                    if (
+                        not self.dry_run
+                        and decision_value == "request_changes"
+                        and not decision.get("escalated")
+                    ):
+                        self._reroute_stranded_request_changes(pr, issue_number, decision)
                     continue
 
                 check = self._check_carry_forward(pr_number, decision)
@@ -8193,10 +8327,18 @@ class OrchestratorApp:
         When ``cross_family.auto_verdict`` is enabled and
         ``review_dispatch`` is disabled (the cross-family pass is the sole
         automated review), this scans the review queue for PRs whose
-        ``review-decision.json`` is still ``pending`` but whose
-        ``cross-family-review.md`` report is valid and non-stale. It
-        parses the report into an approved/request_changes verdict and
-        records it via ``record_review()``, unblocking the merge lane.
+        ``review-decision.json`` is still ``pending`` -- or whose recorded
+        verdict was rejected as content-free and re-queued as ``"vacuous"``
+        (issue #784 AC-8) -- but whose ``cross-family-review.md`` report is
+        valid and non-stale. It parses the report into an approved/
+        request_changes verdict and records it via ``record_review()``,
+        unblocking the merge lane.
+
+        A report that fails to parse into a real verdict
+        (``MalformedCrossFamilyVerdict``) is never recorded -- issue #784
+        AC-3: it must not increment ``request_changes_count`` or dispatch
+        rework. See ``_handle_malformed_cross_family_verdict`` for how that
+        outcome is bounded so it cannot repeat forever.
 
         Returns a list of per-PR result dicts for logging/diagnostics.
         """
@@ -8208,7 +8350,7 @@ class OrchestratorApp:
         for candidate in candidates:
             pr_number = candidate["pr"]
             decision = candidate.get("decision")
-            if decision != "pending":
+            if decision not in ("pending", "vacuous"):
                 continue
             pr_dir = self.paths.prs / f"pr-{pr_number}"
             report_path = pr_dir / "cross-family-review.md"
@@ -8227,6 +8369,13 @@ class OrchestratorApp:
             parsed = parse_cross_family_verdict(report_text)
             if parsed is None:
                 continue
+            if isinstance(parsed, MalformedCrossFamilyVerdict):
+                results.append(
+                    self._handle_malformed_cross_family_verdict(
+                        pr_number, candidate.get("issue"), packet_head, parsed
+                    )
+                )
+                continue
             verdict_decision = parsed.decision
             record_result = self.record_review(
                 pr_number,
@@ -8244,6 +8393,93 @@ class OrchestratorApp:
                 }
             )
         return results
+
+    def _handle_malformed_cross_family_verdict(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        packet_head: str | None,
+        parsed: MalformedCrossFamilyVerdict,
+    ) -> dict[str, Any]:
+        """Bound the malformed-verdict cycle for one PR (issue #784 AC-8 bound).
+
+        Never calls ``record_review`` with the malformed outcome itself
+        (AC-3: no ``request_changes_count`` increment, no rework dispatch).
+        Tracks a *separate* durable counter,
+        ``cross_family_parse_failure_count``, so the "content-free verdict
+        -> AC-8 forces regeneration -> still content-free" cycle cannot
+        repeat forever: without a bound of its own, removing the
+        request_changes-cycle counter from this path (as AC-3 requires)
+        would leave nothing capping how many times a PR re-enters this
+        branch, one ``_record_cross_family_verdicts`` invocation per loop
+        pass.
+
+        Past ``cross_family.max_parse_failures`` observations, cross-family
+        review is abandoned for this PR: recorded as a caveated, non-
+        blocking ``approved`` (never ``agent:human-needed``, and never a
+        ``request_changes`` verdict that blocks indefinitely -- both of
+        which would recreate the original bug with better provenance). This
+        is deliberately asymmetric: a reviewer this pipeline cannot parse is
+        a failure of the pipeline, not evidence against the PR, so the PR
+        does not pay for it.
+        """
+        cap = self.config.cross_family.max_parse_failures
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            failure_count = int(pr_state.get("cross_family_parse_failure_count", 0)) + 1
+            abandon = failure_count > cap
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "cross_family_parse_failure_count": failure_count,
+            }
+            state = self._record_event(
+                state,
+                "cross_family_verdict_abandoned"
+                if abandon
+                else "cross_family_verdict_unparseable",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "reason": parsed.reason,
+                    "attempt": failure_count,
+                    "max_parse_failures": cap,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        if not abandon:
+            return {
+                "pr_number": pr_number,
+                "decision": "unparseable",
+                "ok": False,
+                "message": (
+                    f"cross-family verdict unparseable ({parsed.reason}), "
+                    f"attempt {failure_count}/{cap}"
+                ),
+            }
+        record_result = self.record_review(
+            pr_number,
+            "approved",
+            summary=(
+                "Cross-family review could not produce a parseable verdict "
+                f"after {failure_count} attempts ({parsed.reason}); treated "
+                "as non-blocking per its advisory-only design (issue #784). "
+                f"A human should inspect prs/pr-{pr_number}/cross-family-review.md "
+                "directly."
+            ),
+            reviewed_head=packet_head,
+            required_changes=(),
+        )
+        return {
+            "pr_number": pr_number,
+            "decision": "approved",
+            "ok": record_result.ok,
+            "message": (
+                f"cross-family review abandoned after {failure_count} parse "
+                f"failures: {record_result.message}"
+            ),
+        }
 
     @_guard_state_lock
     def dispatch_reviews(self, limit: int | None = None) -> CommandResult:
@@ -8526,6 +8762,10 @@ class OrchestratorApp:
                             "number": issue_num,
                             "status": "escalated",
                             "merge_alert": "OK",
+                            # Issue #783: review-dispatch attempt cap is a
+                            # process failure, not a judgment call --
+                            # mechanical.
+                            "reason_class": escalation_reason_class("mechanical"),
                         }
                     state = append_event(
                         state,
@@ -9179,6 +9419,18 @@ class OrchestratorApp:
             verdict_summary=verdict_summary,
         )
         label_error: dict[str, Any] | None = None
+        # Issue #783: an explicit "blocked" rescue verdict is the same kind of
+        # human product/security decision as record_review's "blocked" path
+        # -- judgment, never auto-cleared. "request_changes" and an
+        # unparseable/failed cross-family report both escalate only because
+        # the rescue tier structurally cannot loop again (one-shot, no
+        # further rework cycle) -- that is a process limit, not a judgment
+        # call, so it is mechanical and eligible for re-evaluation.
+        rescue_reason_class = escalation_reason_class(
+            "judgment"
+            if verdict is not None and verdict["decision"] == "blocked"
+            else "mechanical"
+        )
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             state["prs"][str(pr_number)] = {
@@ -9193,6 +9445,7 @@ class OrchestratorApp:
                     "number": issue_number,
                     "status": "escalated",
                     "merge_alert": "OK",
+                    "reason_class": rescue_reason_class,
                 }
             state = self._record_event(
                 state,
@@ -9475,6 +9728,13 @@ class OrchestratorApp:
                 # the PR is not stuck. If the head later advances and triggers a
                 # new review cycle, the counter starts fresh.
                 "review_dispatch_attempt_count": 0,
+                # Reset the cross-family parse-failure bound (issue #784
+                # AC-8): a real verdict was just recorded -- whether a
+                # genuine parse or this method's own "abandon" call from
+                # _handle_malformed_cross_family_verdict -- so a future
+                # review cycle (new head, new content) gets a fresh budget
+                # rather than inheriting an exhausted one.
+                "cross_family_parse_failure_count": 0,
                 # Reviewer session token/cost telemetry (best-effort): merge-update
                 # so a call without metrics (e.g. a manual `charlie verdict`)
                 # never clobbers metrics recorded by an earlier automated reap.
@@ -9504,6 +9764,10 @@ class OrchestratorApp:
                             "number": issue_number,
                             "status": "escalated",
                             "merge_alert": "OK",
+                            # Issue #783: rework-cycle cap reached is a
+                            # process limit, not a judgment call --
+                            # mechanical.
+                            "reason_class": escalation_reason_class("mechanical"),
                         }
                 elif decision == "approved":
                     state["issues"][str(issue_number)] = {
@@ -9521,6 +9785,10 @@ class OrchestratorApp:
                         "number": issue_number,
                         "status": "blocked",
                         "merge_alert": "OK",
+                        # Issue #783: an explicit "blocked" review decision is
+                        # a human product/security judgment call, never
+                        # auto-cleared.
+                        "reason_class": escalation_reason_class("judgment"),
                     }
                     # Clear worker PID when issue is blocked (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
@@ -9662,6 +9930,20 @@ class OrchestratorApp:
         "dispatch_failed_at",
         "redispatch_at",
         "escalation_reason",
+        # Issue #783: a human-authorized manual unescalate clears the reason
+        # class (the escalation itself is gone) and resets the auto
+        # de-escalation counter -- unlike the automated sweep, which never
+        # resets its own counter (that is the oscillation guard; see
+        # _maybe_deescalate_mechanical). The one-time cap-notification marker
+        # must reset alongside the counter it gates: without this, a human
+        # unescalate -> re-escalate -> re-hit-the-cap cycle would silently
+        # suppress the second `deescalation_cap_exhausted` event because the
+        # stale marker from the first cap-hit survived the reset, leaving
+        # the oscillation guard's terminal state undiagnosable the second
+        # time around.
+        "reason_class",
+        "auto_deescalation_count",
+        "deescalation_cap_notified_at",
         "label_error",
         "worker_pid",
         "worker_process_start_time",
@@ -10250,18 +10532,11 @@ class OrchestratorApp:
                         state = load_state_locked(self.paths.state_file)
                         issue_state = state["issues"].get(str(issue_number), {})
                         issue_status = issue_state.get("status")
-                        if issue_status not in (
-                            "escalated",
-                            "blocked",
-                            "dispatched",
-                            "dispatch_pending",
-                            "manifest_written",
-                        ):
-                            if issue_status != "rework_requested":
-                                cross_pr_revert_routed = True
-                                rework_label_error = self._request_cross_pr_revert_rework(
-                                    pr, issue_number, decision, cross_pr_revert_reason
-                                )
+                        if issue_status not in _REWORK_ALREADY_ROUTED_STATUSES:
+                            cross_pr_revert_routed = True
+                            rework_label_error = self._request_cross_pr_revert_rework(
+                                pr, issue_number, decision, cross_pr_revert_reason
+                            )
         checks = self.gh.pr_checks(pr_number)
         checks_unavailable = checks is None
 
@@ -11970,6 +12245,9 @@ class OrchestratorApp:
                     "number": issue_number,
                     "status": "escalated",
                     "merge_alert": "OK",
+                    # Issue #783: janitor-gate rework attempt cap is a
+                    # process limit, not a judgment call -- mechanical.
+                    "reason_class": escalation_reason_class("mechanical"),
                 }
                 state = self._record_event(
                     state,
@@ -12194,6 +12472,9 @@ class OrchestratorApp:
                 "number": issue_number,
                 "status": "escalated",
                 "merge_alert": "OK",
+                # Issue #783: a stalled rework worker is a process failure,
+                # not a judgment call -- mechanical.
+                "reason_class": escalation_reason_class("mechanical"),
             }
             state = self._record_event(
                 state,
@@ -12277,6 +12558,56 @@ class OrchestratorApp:
         )
         return self._route_to_rework(
             pr, issue_number, decision, summary, "cross_pr_revert_rework_requested"
+        )
+
+    def _reroute_stranded_request_changes(
+        self,
+        pr: dict[str, Any],
+        issue_number: int,
+        decision: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Re-drive an actionable, already-recorded ``request_changes`` verdict
+        to ``rework_requested`` when the linked issue's status never reflects it.
+
+        Issue #784 AC-8 (Case 2). ``record_review`` durably decides and
+        persists the rework-vs-escalate outcome (``decision["escalated"]``,
+        computed against ``max_rework_cycles`` and persisted to
+        ``request_changes_count`` BEFORE any GitHub label mutation --
+        ``record_review`` ~9355-9396) and applies the matching issue-status
+        transition in that same call. If that label transition silently
+        failed, or the issue status was later clobbered by an independent
+        bug (e.g. issue #789's reconcile one-way "closed" gate), the issue
+        is stranded: a real, actionable verdict sits on disk with nothing
+        routing it to a rework worker (``dispatch_rework`` only ever selects
+        issues already at ``status == "rework_requested"``).
+
+        This never re-decides escalation -- the caller only invokes it when
+        ``decision.get("escalated")`` is falsy, i.e. record_review already
+        decided this verdict is within the rework-cycle budget -- it only
+        re-applies that SAME target via the SAME generic entry point
+        (``_route_to_rework``) that every other "discovered late, needs
+        rework" lane in this file uses (cross-PR-revert, merge-conflict,
+        check-failure).
+
+        Idempotent: guarded by ``_REWORK_ALREADY_ROUTED_STATUSES`` -- the
+        exact status set ``merge_ready``'s cross-PR-revert gate uses -- so a
+        second pass over unchanged state (issue already ``rework_requested``,
+        or otherwise mid-flight/escalated/blocked) is a no-op. This is also
+        why the fix lives here rather than in ``reconcile.py``: routing to
+        rework can dispatch a worker, and reconcile's repair pass must never
+        synthesize ``rework_requested`` (reconcile.py's own invariant) --
+        only a dispatch-context caller may complete this transition.
+        """
+        state = load_state_locked(self.paths.state_file)
+        issue_status = state.get("issues", {}).get(str(issue_number), {}).get("status")
+        if issue_status in _REWORK_ALREADY_ROUTED_STATUSES:
+            return None
+        return self._route_to_rework(
+            pr,
+            issue_number,
+            decision,
+            decision.get("summary") or "",
+            "stranded_request_changes_rework_requested",
         )
 
     def _merge_train_head(self, prs: list[dict[str, Any]] | None = None) -> int | None:
@@ -13058,6 +13389,339 @@ class OrchestratorApp:
                 )
             save_state(state_file, state)
 
+    def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any] | None:
+        """Re-evaluate one ``mechanical`` escalation and clear it if safe.
+
+        Called only from ``_maybe_deescalate_mechanical`` for issues whose
+        snapshot already matched the selection query (``status in
+        ("escalated", "blocked")`` and ``reason_class == "mechanical"``).
+        Every check here is re-run against FRESH state/GitHub data -- the
+        snapshot may be stale by the time this runs (a concurrent
+        ``charlie unescalate``, a re-escalation with a new reason, or a
+        parallel loop lane already touched the entry).
+
+        Returns ``None`` when there is nothing to report: the entry no
+        longer qualifies, a worker is still live, no open PR is bound to the
+        issue, or the fresh mergeable/janitor check failed (stays
+        escalated -- this is the expected, common outcome). Returns
+        ``{"cap_exhausted": True, ...}`` the first time
+        ``auto_deescalation_count`` has already reached
+        ``config.deescalation.max_auto_deescalations``. Returns
+        ``{"cleared": True, ...}`` after a successful auto-de-escalation.
+
+        Issue #783 hazard (a) -- oscillation guard: ``auto_deescalation_count``
+        is incremented here on every clear and is NEVER reset by this
+        method -- only a human-invoked ``charlie unescalate`` resets it (see
+        ``_UNESCALATE_ISSUE_RESET_FIELDS``). Once the count reaches
+        ``max_auto_deescalations`` (default 2), this method permanently
+        stops clearing that issue and instead emits
+        ``deescalation_cap_exhausted`` exactly once (guarded by the
+        ``deescalation_cap_notified_at`` marker, also reset only by
+        ``unescalate()``). The issue stays on ``agent:human-needed`` --  this
+        is a diagnosable terminal state (the event names the exhausted
+        count), not a silent re-creation of the one-way door under a new
+        name: a human is still required to re-arm it, exactly once more
+        than before.
+
+        Issue #783 hazard (b) -- unbounded paid-session loop: this method
+        never resets the ORIGINAL per-mechanism attempt/cap counters (e.g.
+        ``redispatch_at``, ``request_changes_count``,
+        ``conflict_rework_attempts``, ``review_dispatch_attempt_count``) --
+        it only clears the escalation-specific fields (``status``,
+        ``escalation_reason``, ``reason_class``). If the same mechanical
+        condition recurs after a clear, the ORIGINAL cap re-trips (usually
+        within one dispatch/review/rework cycle, since that counter was
+        never zeroed), which re-escalates the issue through one of the
+        S1-S14 call sites and re-enters this same accounting. That
+        recurrence also consumes one more slot of
+        ``auto_deescalation_count``, so the two counters compound: the
+        mechanism-specific cap bounds how fast a single recurring failure
+        can re-escalate, and ``auto_deescalation_count``'s cap independently
+        bounds how many times this sweep will ever clear the SAME issue.
+        Neither counter is reset by this method, so neither loop can run
+        forever -- the sweep cannot re-dispatch a paid worker session more
+        than ``max_auto_deescalations`` times for one recurring failure
+        before falling permanently back to human review.
+
+        A pre-PR dispatch failure (e.g. ``dispatch_failed_cap_exceeded`` --
+        the launch never produced a PR at all) has no artifact AC3's
+        "mergeable AND janitor_ok" can be checked against, so it is left
+        untouched here (return ``None``) rather than guessed at; a human
+        still recovers it via ``charlie unescalate --issue``.
+        """
+        state = load_state_locked(self.paths.state_file)
+        issue_key = str(issue_number)
+        issue_entry = state.get("issues", {}).get(issue_key, {})
+        if not isinstance(issue_entry, dict):
+            return None
+        if issue_entry.get("status") not in ("escalated", "blocked"):
+            return None  # already resolved by something else since the snapshot
+        if issue_entry.get("reason_class") != "mechanical":
+            return None  # fail closed: judgment (or re-classified) since the snapshot
+
+        max_auto = self.config.deescalation.max_auto_deescalations
+        auto_count = int(issue_entry.get("auto_deescalation_count", 0) or 0)
+        if auto_count >= max_auto:
+            if issue_entry.get("deescalation_cap_notified_at"):
+                return None  # already reported once; do not re-notify every pass
+            with state_lock(self.paths.state_file):
+                fresh_state = load_state(self.paths.state_file)
+                fresh_entry = fresh_state["issues"].get(issue_key, {})
+                if not isinstance(fresh_entry, dict) or fresh_entry.get(
+                    "deescalation_cap_notified_at"
+                ):
+                    return None
+                fresh_state["issues"][issue_key] = {
+                    **fresh_entry,
+                    "number": issue_number,
+                    "deescalation_cap_notified_at": utc_now(),
+                }
+                fresh_state = self._record_event(
+                    fresh_state,
+                    "deescalation_cap_exhausted",
+                    {
+                        "issue_number": issue_number,
+                        "auto_deescalation_count": auto_count,
+                        "max_auto_deescalations": max_auto,
+                    },
+                )
+                save_state(self.paths.state_file, fresh_state)
+            return {"cap_exhausted": True, "issue_number": issue_number}
+
+        pr_number: int | None = None
+        for key, entry in state.get("prs", {}).items():
+            if (
+                isinstance(entry, dict)
+                and entry.get("issue_number") == issue_number
+                and entry.get("status") not in ("merged", "closed")
+                and key.isdigit()
+            ):
+                pr_number = int(key)
+                break
+        if pr_number is None:
+            return None
+
+        from .worker import issue_worker_liveness
+
+        liveness = issue_worker_liveness(
+            issue_number, issue_entry, self._layout.sessions_dir, self.config, datetime.now(UTC)
+        )
+        if liveness.live:
+            return None  # a live worker is using this issue; not stuck
+
+        pr = self.gh.pr_view(pr_number)
+        pr_state_str = str(pr.get("state") or "").upper()
+        # Mirror janitor._check_mergeable's own permissive definition of
+        # "mergeable" exactly: it fails a PR only on the literal
+        # "CONFLICTING" value and treats "UNKNOWN" (the common transient
+        # value in the minutes after any push, before GitHub finishes
+        # computing mergeability) or a missing field as passing. Requiring
+        # an exact "MERGEABLE" match here would be a *stricter*, competing
+        # definition of mergeable than the one the janitor gate itself uses
+        # -- and would make this sweep silently inert on exactly the
+        # freshly-pushed green PRs (#690/#699/#759) it exists to unblock.
+        mergeable = str(pr.get("mergeable") or "").upper()
+        checks = self.gh.pr_checks(pr_number)
+        diff = self.gh.pr_diff(pr_number)
+        pr_entry_for_janitor = state.get("prs", {}).get(str(pr_number))
+        janitor_verdict = run_janitor(
+            pr,
+            checks,
+            self.config,
+            pr_state=pr_entry_for_janitor if isinstance(pr_entry_for_janitor, dict) else None,
+            repo_root=self.repo_root,
+            pr_diff=diff,
+        )
+
+        with state_lock(self.paths.state_file):
+            fresh_state = load_state(self.paths.state_file)
+            fresh_pr_entry = fresh_state["prs"].get(str(pr_number))
+            if isinstance(fresh_pr_entry, dict):
+                # Visibility update mirrors review()'s escalated-PR early
+                # return (workflow.py): the cached janitor fields stay fresh
+                # even on a pass that does not end up clearing anything.
+                fresh_state["prs"][str(pr_number)] = {
+                    **fresh_pr_entry,
+                    "janitor_ok": janitor_verdict.ok,
+                    "janitor_failures": list(janitor_verdict.failures),
+                }
+            fresh_issue_entry = fresh_state["issues"].get(issue_key)
+            if not isinstance(fresh_issue_entry, dict) or (
+                fresh_issue_entry.get("status") not in ("escalated", "blocked")
+                or fresh_issue_entry.get("reason_class") != "mechanical"
+            ):
+                # Changed concurrently since the snapshot (human unescalate,
+                # re-escalation with a different reason_class, etc.) -- do
+                # not act on stale intent.
+                save_state(self.paths.state_file, fresh_state)
+                return None
+
+            if not (pr_state_str == "OPEN" and mergeable != "CONFLICTING" and janitor_verdict.ok):
+                save_state(self.paths.state_file, fresh_state)
+                return None
+
+            cleared_condition = fresh_issue_entry.get("escalation_reason")
+            cleared_auto_count = auto_count + 1
+            updated_issue_entry = {
+                **fresh_issue_entry,
+                "number": issue_number,
+                "status": PASSIVE_OPEN_STATUS,
+                "auto_deescalation_count": cleared_auto_count,
+            }
+            updated_issue_entry.pop("escalation_reason", None)
+            updated_issue_entry.pop("reason_class", None)
+            updated_issue_entry.pop("label_error", None)
+            fresh_state["issues"][issue_key] = updated_issue_entry
+            fresh_state = self._record_event(
+                fresh_state,
+                "deescalation_cleared",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason_class": "mechanical",
+                    "cleared_condition": cleared_condition,
+                    "pr_mergeable": mergeable,
+                    "janitor_ok": janitor_verdict.ok,
+                    "auto_deescalation_count": cleared_auto_count,
+                },
+            )
+            save_state(self.paths.state_file, fresh_state)
+
+        result = transition(self.gh, self.config.labels, issue_number, "unescalated_pr_open")
+        if result.outcome != TransitionOutcome.APPLIED:
+            with state_lock(self.paths.state_file):
+                fresh_state = load_state(self.paths.state_file)
+                entry = fresh_state["issues"].get(issue_key, {})
+                fresh_state["issues"][issue_key] = {
+                    **(entry if isinstance(entry, dict) else {}),
+                    "number": issue_number,
+                    "label_error": {
+                        "edge": "unescalated_pr_open",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    },
+                }
+                save_state(self.paths.state_file, fresh_state)
+
+        return {
+            "cleared": True,
+            "issue_number": issue_number,
+            "pr_number": pr_number,
+            "cleared_condition": cleared_condition,
+        }
+
+    def _maybe_deescalate_mechanical(self) -> None:
+        """Periodic sweep that re-evaluates ``mechanical`` escalations (issue #783).
+
+        Escalation to ``agent:human-needed`` was a one-way door: four
+        ``labels.py`` edges (``escalated``, ``blocked``, ``redispatch_escalated``,
+        ``merged_pr_mention_flagged``) add the label; nothing in the automated
+        loop ever removed it. All recovery went through the operator-invoked
+        ``charlie unescalate`` command -- including for PRs whose underlying
+        artifact was already fine (pushed, open, CI green, ``janitor_ok``) and
+        whose escalation was purely a process failure (e.g. a rework worker's
+        session dying -- ``session_failed_escalated``), not a human decision.
+
+        This method is the automated re-entry point for exactly that
+        process-failure class. It is scoped narrowly by construction:
+
+        - Only issues whose entry carries ``reason_class == "mechanical"`` --
+          written atomically alongside every ``status -> escalated/blocked``
+          transition at its call site (S1-S14 in the issue #783 implementation)
+          -- are ever considered. ``judgment`` escalations (an explicit
+          product/security decision, or a merged-PR mention needing human
+          confirmation) and any PRE-EXISTING escalation with no recorded
+          reason_class at all (every escalation before this change shipped)
+          fail closed: they are invisible to this selection query and stay
+          exactly as terminal as they were before this method existed.
+        - Clearing additionally requires a live, freshly-fetched PR that is
+          still OPEN, does not report ``mergeable == "CONFLICTING"`` (mirrors
+          ``janitor._check_mergeable``'s own permissive definition exactly --
+          a transient ``"UNKNOWN"`` value is not a conflict), and passes a
+          freshly-computed ``run_janitor().ok`` -- reason-clearing alone
+          (e.g. simply having a ``reason_class``) is never sufficient. See
+          ``_deescalate_mechanical_issue`` for the full per-issue algorithm
+          and this issue's two required hazard analyses (oscillation guard /
+          unbounded-loop guard), both enforced there via
+          ``auto_deescalation_count`` and by never resetting the original
+          per-mechanism attempt counters.
+
+        Two-phase lock pattern, mirroring ``_maybe_reconcile_drift``:
+          1. Under our own (short) lock: decide whether this sweep is due at
+             all, and take a snapshot of candidate issue numbers. If not
+             due, return without calling out to GitHub.
+          2. Outside any lock held by this method: process each candidate
+             (``_deescalate_mechanical_issue`` acquires its own locks as
+             needed, mirroring ``unescalate()``'s snapshot-then-reapply
+             pattern so a slow ``gh`` call never holds the file lock).
+          3. Under our own (short) lock again: persist the next-due
+             timestamp and emit exactly one summary event for this pass.
+
+        Wrapped in exception containment per-issue (one issue's failure must
+        not sink the whole pass) AND around the snapshot/scheduling itself
+        (mirroring ``_maybe_reconcile_drift``'s docstring: ``supervise.py``'s
+        daemon loop has no outer per-pass exception boundary of its own, so
+        an uncaught exception here would kill the daemon, not just this
+        pass).
+        """
+        if not self.config.deescalation.enabled:
+            return
+
+        state_file = self.paths.state_file
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if not is_deescalation_due(state):
+                return
+            candidates = sorted(
+                int(num)
+                for num, entry in state.get("issues", {}).items()
+                if isinstance(entry, dict)
+                and entry.get("status") in ("escalated", "blocked")
+                and entry.get("reason_class") == "mechanical"
+                and str(num).isdigit()
+            )
+
+        next_deescalation_at = (
+            (datetime.now(UTC) + timedelta(minutes=self.config.deescalation.interval_minutes))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        cleared: list[dict[str, Any]] = []
+        cap_exhausted: list[int] = []
+        errors: list[dict[str, Any]] = []
+        for issue_number in candidates:
+            try:
+                outcome = self._deescalate_mechanical_issue(issue_number)
+            except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
+                errors.append(
+                    {"issue_number": issue_number, "error": f"{type(exc).__name__}: {exc}"}
+                )
+                continue
+            if outcome is None:
+                continue
+            if outcome.get("cap_exhausted"):
+                cap_exhausted.append(issue_number)
+            elif outcome.get("cleared"):
+                cleared.append(outcome)
+
+        with state_lock(state_file):
+            state = load_state(state_file)
+            state = arm_deescalation_pass(state, next_deescalation_at)
+            state = self._record_event(
+                state,
+                "deescalation_pass_completed",
+                {
+                    "candidates": len(candidates),
+                    "cleared": cleared,
+                    "cap_exhausted": cap_exhausted,
+                    "errors": errors,
+                },
+            )
+            save_state(state_file, state)
+
     def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
         # Every pass must observe a fresh GitHub snapshot. The list cache
         # dedupes calls within one pass, but a long-running supervisor
@@ -13121,6 +13785,15 @@ class OrchestratorApp:
         # `needs-rework` on an issue state already marked `escalated`) are
         # visible to this same pass's dispatch decisions, not just the next.
         self._maybe_reconcile_drift()
+
+        # Issue #783: periodic re-evaluation of `mechanical` escalations --
+        # the only automated re-entry from `agent:human-needed` for pure
+        # process failures (a dead rework worker, a redispatch cap, a
+        # stalled janitor-gate rework, ...) whose underlying PR artifact has
+        # since become mergeable and janitor-clean. `judgment` escalations
+        # and any pre-existing escalation with no recorded reason_class are
+        # untouched by construction (see _maybe_deescalate_mechanical).
+        self._maybe_deescalate_mechanical()
 
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills
@@ -13782,6 +14455,9 @@ class OrchestratorApp:
                         "status": "escalated",
                         "redispatch_at": redispatch_at,
                         "escalation_reason": "redispatch_cap_exceeded",
+                        # Issue #783: no-op rework redispatch cap is a process
+                        # failure, not a judgment call -- mechanical.
+                        "reason_class": escalation_reason_class("mechanical"),
                         "dispatched_at": None,
                     }
                     state["issues"][str(issue_number)] = entry
@@ -14168,6 +14844,9 @@ class OrchestratorApp:
                         entry["status"] = "escalated"
                         entry["redispatch_at"] = redispatch_at
                         entry["escalation_reason"] = "redispatch_cap_exceeded"
+                        # Issue #783: rework dispatch redispatch cap is a
+                        # process failure, not a judgment call -- mechanical.
+                        entry["reason_class"] = escalation_reason_class("mechanical")
                         state["issues"][str(request.issue_number)] = entry
                         save_state(self.paths.state_file, state)
                         result = transition(
@@ -14239,6 +14918,9 @@ class OrchestratorApp:
                         entry["escalation_reason"] = (
                             failure_kind if terminal_failure else "redispatch_cap_exceeded"
                         )
+                        # Issue #783: dead worker session / redispatch cap is a
+                        # process failure, not a judgment call -- mechanical.
+                        entry["reason_class"] = escalation_reason_class("mechanical")
                         entry["dispatched_at"] = None
                         state["issues"][str(request.issue_number)] = entry
                         save_state(self.paths.state_file, state)
