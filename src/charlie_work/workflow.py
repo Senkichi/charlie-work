@@ -469,6 +469,34 @@ class CarryForwardCheck:
         return self.tier is not None
 
 
+def _summary_is_vacuous(summary: str) -> bool:
+    """True when ``summary`` carries no reviewer content.
+
+    Covers a blank/whitespace-only string, and the historical
+    ``LEGACY_VACUOUS_SUMMARY`` placeholder (issue #784) that pre-#784
+    cross-family code emitted for a verdict that was, in fact, content-free.
+    This is the single definition of "there is nothing here to act on",
+    shared by two different callers at two different times:
+
+    - ``_is_carry_forward_eligible`` (read-time): should an old, already-
+      recorded verdict be reused across a content-identical head?
+    - ``record_review`` (write-time, issue #792): is there anything to
+      derive from ``summary`` into ``required_changes`` when the caller
+      didn't supply a structured list?
+
+    Deliberately does *not* do anything smarter than an equality check
+    against one known, exported constant -- a referent/keyword classifier
+    over free-form reviewer prose was evaluated and rejected (issue #792)
+    because it misclassified genuine, specific findings (e.g. architectural
+    gaps with no file/line reference, or "CI failed on Lint; push a fix")
+    as content-free. The only text this function is entitled to call
+    vacuous is text our *own* code emitted as a known placeholder, not text
+    a reviewer wrote that merely looks terse or unstructured.
+    """
+    stripped = summary.strip()
+    return not stripped or stripped == LEGACY_VACUOUS_SUMMARY
+
+
 def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
     """Reject carry-forward for a content-free cross-family verdict (issue #784, AC-8).
 
@@ -481,13 +509,12 @@ def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
 
     A verdict is ineligible only when it is unmistakably a product of the
     pre-#784 bug: ``decision == "request_changes"`` with no itemized
-    ``required_changes`` AND a summary that is either empty or exactly the
-    historical hardcoded placeholder (``LEGACY_VACUOUS_SUMMARY``). A primary
-    reviewer's ``request_changes`` verdict always has a non-empty, non-
-    placeholder summary (``record_review`` rejects an empty one outright),
-    so this predicate cannot mistake a legitimate primary-review decision --
-    one that simply chose prose over an itemized list -- for a vacuous one.
-    Everything else (``approved``, ``blocked``, populated
+    ``required_changes`` AND a vacuous summary (see ``_summary_is_vacuous``).
+    A primary reviewer's ``request_changes`` verdict always has a non-empty,
+    non-placeholder summary (``record_review`` rejects an empty one
+    outright), so this predicate cannot mistake a legitimate primary-review
+    decision -- one that simply chose prose over an itemized list -- for a
+    vacuous one. Everything else (``approved``, ``blocked``, populated
     ``required_changes``, or a real summary) is eligible, unchanged from
     before this fix.
     """
@@ -495,8 +522,7 @@ def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
         return True
     if decision.get("required_changes"):
         return True
-    summary = str(decision.get("summary") or "").strip()
-    return bool(summary) and summary != LEGACY_VACUOUS_SUMMARY
+    return not _summary_is_vacuous(str(decision.get("summary") or ""))
 
 
 # Statuses that mean an issue already has a rework routed (or an equivalent
@@ -1508,7 +1534,16 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
     - ``summary`` as a non-empty string, for EVERY decision including
       ``approved`` (issue #597), and not an unfilled ``<...>`` template
       placeholder
-    - ``required_changes`` is optional; if present it must be a list of strings
+    - ``required_changes``, if present, must be a list of strings. This
+      function does not require it to be non-empty: an empty or absent
+      ``required_changes`` on a ``request_changes``/``blocked`` verdict is
+      repaired downstream, at ``record_review`` (issue #792), which derives
+      it from ``summary`` or marks it ``findings_channel: "vacuous"`` when
+      nothing is derivable -- never by rejecting the verdict here. Rejecting
+      an empty ``required_changes`` at this layer would recreate the
+      unbounded re-review loop that gate is designed to avoid: see
+      ``record_review``'s derivation block and
+      ``test_record_review_never_rejects_for_empty_required_changes``.
 
     ``approved`` used to be exempt from the non-empty-summary rule, on the
     reasoning that ``record_review`` only rejects empty summaries where a
@@ -3944,6 +3979,24 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     could read as "there is nothing to change" when a decision actively
     requires rework.
 
+    Issue #792: ``record_review`` now derives ``required_changes`` from
+    ``summary`` itself, at write time, and records which of two outcomes
+    happened via ``decision["findings_channel"]``: ``"derived"`` (the
+    summary was used as the findings, i.e. what used to be this function's
+    own tier-2 fallback) or ``"vacuous"`` (nothing was derivable -- neither
+    an itemized list nor a usable summary -- e.g. the historical
+    cross-family placeholder, ``cross_family.LEGACY_VACUOUS_SUMMARY``, which
+    is genuinely non-blank text but carries no reviewer content). Verdicts
+    carrying either marker are handled explicitly, before the shape-based
+    tiers below: ``"vacuous"`` always renders tier 3 (a non-blank-but-
+    content-free summary is strictly worse than an empty one -- rendering
+    it as tier 2 would silently present it as real findings), and
+    ``"derived"`` always renders tier 2 verbatim rather than falling into
+    tier 1's bullet list (a single derived item wrapped as a one-item bullet
+    would otherwise dump an entire multi-paragraph summary onto one line).
+    Verdicts with no marker at all -- every record written before this
+    fix -- fall through unchanged to the original shape-based tiers.
+
     Rendered for ``request_changes`` and, defensively, ``blocked`` verdicts
     (routing to rework via the decision-agnostic janitor gates -- merge
     conflict / no-op-rework repair -- can carry forward whatever verdict was
@@ -3992,6 +4045,39 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     )
     raw_summary = decision.get("summary")
     summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
+    findings_channel = decision.get("findings_channel")
+
+    # issue #792: a verdict recorded by the current record_review carries an
+    # explicit marker for exactly this distinction -- handle it before the
+    # shape-based tiers below, which exist only to infer the same thing for
+    # verdicts recorded before this marker existed.
+    if findings_channel == "vacuous":
+        lines = [
+            "## Required changes",
+            "",
+            "**REVIEWER FINDINGS UNAVAILABLE.** No structured findings list "
+            "and no summary were recorded for this verdict. This is NOT a "
+            "signal that there is nothing to change — it means the findings "
+            "did not make it into `review-decision.json`. Inspect the PR's "
+            "review comments and review threads on GitHub directly before "
+            "doing anything else.",
+            "",
+        ]
+        return "\n".join(lines)
+
+    if verdict == "request_changes" and findings_channel == "derived":
+        lines = [
+            "## Required changes",
+            "",
+            "The reviewer did not record a structured findings list for this "
+            "verdict. This is their summary, rendered verbatim so it is not "
+            "lost — treat it as the findings to address before this PR can "
+            "be approved:",
+            "",
+            defang_closing_keywords(summary_text),
+            "",
+        ]
+        return "\n".join(lines)
 
     if verdict == "request_changes" and changes:
         lines = [
@@ -9578,6 +9664,53 @@ class OrchestratorApp:
                 f"--summary or --summary-file is required for decision '{decision}'",
                 {},
             )
+
+        # Issue #792: required_changes has a near-0% fill rate because
+        # prompts/review.md historically documented it as optional, so
+        # reviewers reliably fill in `summary` and skip the structured list.
+        # `_render_required_changes_section` used to paper over this at
+        # *render* time, falling back to `summary` when the list was empty --
+        # but that runs long after the reviewer is gone and the verdict is
+        # frozen, so a bad or missing derivation there can never be
+        # corrected. Derive here instead, at the point of record, so
+        # whatever `required_changes` lands on disk is exactly what a
+        # worker's rework brief will show.
+        #
+        # This step never *rejects* a verdict for an empty required_changes
+        # -- see test_record_review_never_rejects_for_empty_required_changes.
+        # A reject path here is the tempting wrong fix and that test is what
+        # stops a future session from "tightening" it: a False return writes
+        # no review-decision.json, the caller logs review_verdict_missed and
+        # moves on, the next pass still sees the PR as pending, and it gets
+        # re-dispatched to a fresh reviewer -- an unbounded re-review loop
+        # with no cap and no escalation. Contrast with issue #597's reject
+        # gate on a contentless *approved* verdict in
+        # `_validate_review_verdict`: that gate is safe because rejecting an
+        # approval just means "not merged yet", not an infinite loop.
+        effective_required_changes = list(required_changes) if required_changes else []
+        findings_channel: str | None = None
+        if decision in {"request_changes", "blocked"} and not effective_required_changes:
+            if _summary_is_vacuous(summary_text):
+                # Nothing derivable. Persist the empty list anyway (never
+                # reject) with an explicit marker so
+                # `_render_required_changes_section` can tell "genuinely
+                # nothing was recorded" apart from "the reviewer wrote
+                # prose instead of a list" and render its loud tier-3
+                # warning instead of silently treating this the same as a
+                # real derivation.
+                findings_channel = "vacuous"
+            else:
+                # The F1 extractor: `_render_required_changes_section`'s own
+                # tier-2 fallback, lifted here unchanged (issue #792) so the
+                # producer -- not a consumer with no way to correct a bad
+                # call -- makes this decision. `findings_channel = "derived"`
+                # tells the renderer this single item is reviewer prose, not
+                # an itemized list, so it renders as prose (tier 2) rather
+                # than a one-item bullet list built from a multi-paragraph
+                # summary.
+                effective_required_changes = [summary_text.strip()]
+                findings_channel = "derived"
+
         pr = self.gh.pr_view(pr_number)
         issue_number = (
             linked_issue_number(
@@ -9697,7 +9830,7 @@ class OrchestratorApp:
             "issue_number": issue_number,
             "decision": decision,
             "summary": summary_text,
-            "required_changes": list(required_changes) if required_changes is not None else [],
+            "required_changes": effective_required_changes,
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_head_source": reviewed_head_source,
             "reviewed_patch_id": reviewed_patch_id,
@@ -9707,6 +9840,11 @@ class OrchestratorApp:
             "carried_forward_from": [],
             "reviewed_at": utc_now(),
         }
+        # Only present when the derivation above ran (issue #792): a verdict
+        # that already carried a populated required_changes, or an
+        # `approved` verdict, passes through with no new key at all.
+        if findings_channel is not None:
+            decision_payload["findings_channel"] = findings_channel
         decision_path = pr_dir / "review-decision.json"
         # Merge-update (never in-place assignment) and persist BEFORE any GitHub
         # label mutation: a label-write failure or crash must not desync the
@@ -9867,7 +10005,24 @@ class OrchestratorApp:
             }
             if session_metrics is not None:
                 event_payload["session_metrics"] = session_metrics
+            if findings_channel is not None:
+                event_payload["findings_channel"] = findings_channel
             state = self._record_event(state, "record_review", event_payload)
+            if findings_channel == "vacuous":
+                # Distinct from the general "record_review" event (issue
+                # #792): this is the signal that a request_changes/blocked
+                # verdict arrived with nothing to act on -- neither an
+                # itemized required_changes nor derivable prose -- so it can
+                # be queried/alerted on independently of every other verdict.
+                state = self._record_event(
+                    state,
+                    "required_changes_vacuous",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "decision": decision,
+                    },
+                )
             if rescue_dispatched:
                 state = self._record_event(
                     state,
