@@ -36,7 +36,7 @@ from .github import (
 )
 from .paths import RuntimePaths, resolved_layout
 from .prompts import resolve_template
-from .runner_slots import (
+from ci_fleet.charlie_work_adapter import (
     ALLOCATION_STATE_FILENAME,
     CLI_ALLOCATION_SOURCE,
     UNATTENDED_ALLOCATION_SOURCE,

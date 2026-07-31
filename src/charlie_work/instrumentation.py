@@ -804,3 +804,21 @@ def close_db(state_path: Path) -> None:
     if lock is not None:
         with _db_init_lock:
             _db_locks.pop(key, None)
+
+
+# --- ci_fleet seams ---------------------------------------------------------
+# ci_fleet must never import charlie_work -- that would make it un-importable
+# without charlie-work installed, which is the independence this extraction
+# exists to create. So the *provider* registers itself, at module scope, after
+# both functions above are defined.
+#
+# Both seams are required, and the reader is the one that looks redundant.
+# Capacity signalling (#799) is edge-triggered and the fleet pass is a fresh
+# process every cycle, so "have I already signalled?" can only be answered by
+# reading the store back. With no reader installed, query_events() returns
+# None, the pass correctly declines to guess, and runner_capacity_starved never
+# fires -- indistinguishable from a host that was never starved.
+from ci_fleet.observability import set_event_query, set_event_sink  # noqa: E402
+
+set_event_sink(log_event)
+set_event_query(query_events)

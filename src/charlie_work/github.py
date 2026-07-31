@@ -14,6 +14,14 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .config import RuntimeConfig
 
+# GitHubError was MOVED to ci_fleet, not copied, because it is *caught*.
+# Two structurally identical exception classes are unrelated types, so a
+# local re-declaration would silently stop every `except GitHubError` in
+# charlie_work from catching what ci_fleet raises. Re-exported here rather
+# than at the adapter because 16 modules already do
+# `from .github import GitHubError`.
+from ci_fleet.github import GitHubError  # noqa: F401
+
 from .checks import _run_id_from_link
 from .subprocess_runner import no_console_window_kwargs
 
@@ -113,10 +121,6 @@ _ADMIN_FLAG = "--admin"
 ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
     {*_STRATEGY_FLAGS.values(), _DELETE_BRANCH_FLAG, _ADMIN_FLAG}
 )
-
-
-class GitHubError(RuntimeError):
-    pass
 
 
 class GitHubNotFoundError(GitHubError):

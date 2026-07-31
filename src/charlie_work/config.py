@@ -11,6 +11,14 @@ import yaml
 
 from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
+# Re-exported in place, not re-declared. These two dataclasses are compared
+# and isinstance-checked across the seam, and two structurally identical
+# frozen dataclasses are never equal to each other.
+from ci_fleet.config import (  # noqa: F401
+    RunnerAllocationConfig,
+    RunnerScalingConfig,
+)
+
 from . import layout
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
@@ -1143,98 +1151,8 @@ class RunnersConfig:
     fleet_autoscale_prologue: bool = False
 
 
-@dataclass(frozen=True)
-class RunnerScalingConfig:
-    """Self-hosted GitHub Actions runner pool scaling configuration.
-
-    ``enabled`` defaults False so an absent config block is a no-op — mirrors
-    CrossFamilyConfig (config.py:236). This is the foundation for read-only
-    observability; scaling actions are deferred to future issues.
-    """
-
-    enabled: bool = False
-    # Root directory where runner instances are managed (e.g., "C:\\actions-runners")
-    managed_root: str = ""
-    # Directory name prefix for runner instances (e.g., "jc-" for "jc-1", "jc-2")
-    runner_dir_prefix: str = "jc-"
-    # Template for GitHub runner names (e.g., "jc-9800x3d-{n}" where {n} is the instance number)
-    runner_name_template: str = "jc-{n}"
-    # Path to the runner package zip file for installation
-    package_zip: str = ""
-    # Minimum number of runners to maintain in the pool
-    min_runners: int = 1
-    # Maximum number of runners allowed in the pool
-    max_runners: int = 10
-    # Estimated RAM required per job in GB (empirical: ~2)
-    ram_per_job_gb: float = 2.0
-    # Minimum free RAM required in GB before scaling up
-    min_free_ram_gb: float = 4.0
-    # Maximum host CPU percentage before scaling up
-    max_host_cpu_pct: float = 80.0
-    # Minutes of idle time before scaling down runners
-    idle_scale_down_minutes: int = 15
-    # Cooldown period between scaling actions in minutes
-    cooldown_minutes: int = 5
 
 
-@dataclass(frozen=True)
-class RunnerAllocationConfig:
-    """Host-wide elastic allocation of self-hosted runner slots across repos.
-
-    Distinct from :class:`RunnerScalingConfig`, which scales *one* repo's pool
-    vertically by provisioning and deregistering runners (epic #231). This
-    section redistributes a fixed host-wide budget of *running listeners*
-    across every repo that already has runners registered under
-    ``managed_root``. Registration is left untouched — a slot moves between
-    repos by stopping an idle listener in one directory and starting an
-    already-configured one in another, so reallocation costs no registration
-    token, no GitHub write, and no package extraction.
-
-    Because this governs one physical host, it belongs in the **global** fleet
-    layer (``%LOCALAPPDATA%\\charlie-work\\config.yaml``) rather than a
-    per-repo ``orchestrator.config.yaml`` — three repos must not hold three
-    different opinions about how many jobs one machine can run.
-
-    ``enabled`` defaults False so an absent config block is a no-op.
-
-    ``max_running_runners`` is the host's total concurrent-CI-job budget. 0
-    means "derive from host CPU count" (see
-    ``runner_allocation.derive_budget``); set it explicitly once the host's
-    real ceiling is known, since CI jobs share the machine with Devin workers
-    and reviewers that this number cannot see.
-
-    ``min_running_per_repo`` is load-bearing, not cosmetic. A repo whose every
-    registered runner is offline has its queued jobs sit unclaimed until a
-    listener comes back (and GitHub fails them after 24h). Keeping one
-    listener alive per repo means a queued job is always picked up
-    immediately, and makes queue depth observable without waiting for the next
-    allocation pass. Lower it below 1 only if you accept that latency.
-
-    ``demand_idle_samples`` is the asymmetric-hysteresis knob: promotion to a
-    hotter repo happens on the first pass that sees demand, but demotion of an
-    over-allocated repo waits for this many consecutive passes of slack — a
-    single global cooldown would instead block helping a newly hot repo just
-    because a slot was parked elsewhere. Reclamation is immediate regardless
-    when another repo has unmet demand, since an idle slot someone else is
-    waiting on is exactly what this feature exists to move.
-
-    ``max_runs_scanned`` caps the per-repo Actions-runs page used to derive
-    demand; truncation is reported in the plan's notes rather than silently
-    under-counting.
-    """
-
-    enabled: bool = False
-    # Root directory holding the runner instance directories. Falls back to
-    # runner_scaling.managed_root when empty so the path is configured once.
-    managed_root: str = ""
-    # Host-wide cap on simultaneously running listeners. 0 = derive from cores.
-    max_running_runners: int = 0
-    # Listeners kept alive per repo regardless of demand (see docstring).
-    min_running_per_repo: int = 1
-    # Consecutive slack passes required before parking an over-allocated slot.
-    demand_idle_samples: int = 3
-    # Upper bound on Actions runs inspected per repo when measuring demand.
-    max_runs_scanned: int = 60
 
 
 @dataclass(frozen=True)
