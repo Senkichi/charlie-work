@@ -114,7 +114,9 @@ from .state import (
     clear_quota_throttles,
     clear_reviewer_quota,
     defer_reviewer_probe_after,
+    DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     disarm_quota_probe,
+    ESCALATION_REASON_CLASS_BY_EVENT_KIND,
     escalation_reason_class,
     is_claim_stale,
     is_deescalation_due,
@@ -141,7 +143,7 @@ from .state import (
     utc_now,
     without_review_dispatch_claim,
 )
-from .instrumentation import correlation_context, log_event, record_loop_pass
+from .instrumentation import correlation_context, log_event, query_events, record_loop_pass
 from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
 from .process_utils import (
     find_worker_terminal_status,
@@ -13353,6 +13355,78 @@ class OrchestratorApp:
             "cleared_condition": cleared_condition,
         }
 
+    def _backfill_missing_reason_classes(self, state: dict[str, Any]) -> dict[str, Any]:
+        """One-way migration that gives legacy escalations a ``reason_class`` (issue #797).
+
+        Escalations created before the ``reason_class`` field shipped carry no
+        ``reason_class`` at all, so the de-escalation sweep cannot see them.
+        ``events.db`` retains the original escalation-transition event for most
+        of them; for each ``escalated``/``blocked`` issue that still lacks
+        ``reason_class``, this helper looks up the most recent such event and
+        derives the class from its kind.
+
+        The mapping is deliberately conservative: only kinds that unambiguously
+        indicate a process failure are mapped to ``"mechanical"``. Kinds in
+        ``DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS`` (e.g.
+        ``janitor_rework_escalated``, a deliberately-preserved forensic record)
+        are left untouched, so they stay terminal. No event, or an unknown
+        kind, also stays fail-closed.
+
+        Backfilling only writes ``reason_class``. It does not clear the
+        escalation, does not reset ``auto_deescalation_count`` or any
+        per-mechanism attempt counter, and emits exactly one
+        ``deescalation_reason_class_backfilled`` event per issue so the
+        migration is auditable. It is idempotent: once ``reason_class`` is
+        present the issue is skipped.
+        """
+        all_source_kinds: frozenset[str] = (
+            frozenset(ESCALATION_REASON_CLASS_BY_EVENT_KIND)
+            | DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS
+        )
+        for issue_key, issue in list(state.get("issues", {}).items()):
+            if not isinstance(issue, dict):
+                continue
+            if issue.get("status") not in ("escalated", "blocked"):
+                continue
+            if "reason_class" in issue:
+                continue
+            if not issue_key.isdigit():
+                continue
+            issue_number = int(issue_key)
+
+            events = query_events(
+                self.paths.state_file,
+                issue_number=issue_number,
+            )
+            escalation_events = [e for e in events if e["kind"] in all_source_kinds]
+            if not escalation_events:
+                continue
+            latest = escalation_events[-1]
+            reason_class = ESCALATION_REASON_CLASS_BY_EVENT_KIND.get(latest["kind"])
+            if reason_class is None:
+                continue
+
+            issue = {
+                **issue,
+                "number": issue_number,
+                "reason_class": reason_class,
+            }
+            state = {
+                **state,
+                "issues": {**state.get("issues", {}), issue_key: issue},
+            }
+            state = self._record_event(
+                state,
+                "deescalation_reason_class_backfilled",
+                {
+                    "issue_number": issue_number,
+                    "from_event_kind": latest["kind"],
+                    "from_event_ts": latest["ts"],
+                    "reason_class": reason_class,
+                },
+            )
+        return state
+
     def _maybe_deescalate_mechanical(self) -> None:
         """Periodic sweep that re-evaluates ``mechanical`` escalations (issue #783).
 
@@ -13368,15 +13442,16 @@ class OrchestratorApp:
         This method is the automated re-entry point for exactly that
         process-failure class. It is scoped narrowly by construction:
 
-        - Only issues whose entry carries ``reason_class == "mechanical"`` --
+        - Issues whose entry carries ``reason_class == "mechanical"`` --
           written atomically alongside every ``status -> escalated/blocked``
           transition at its call site (S1-S14 in the issue #783 implementation)
-          -- are ever considered. ``judgment`` escalations (an explicit
-          product/security decision, or a merged-PR mention needing human
-          confirmation) and any PRE-EXISTING escalation with no recorded
-          reason_class at all (every escalation before this change shipped)
-          fail closed: they are invisible to this selection query and stay
-          exactly as terminal as they were before this method existed.
+          -- are considered directly. ``judgment`` escalations stay terminal.
+          A PRE-EXISTING escalation with no recorded ``reason_class`` (every
+          escalation before issue #783 shipped) is first backfilled from its
+          most recent escalation-transition event in ``events.db`` (issue #797):
+          only kinds that unambiguously denote a process failure become
+          ``mechanical``; ambiguous or unknown kinds, and issues with no event,
+          stay fail-closed and invisible to the selection query.
         - Clearing additionally requires a live, freshly-fetched PR that is
           still OPEN, does not report ``mergeable == "CONFLICTING"`` (mirrors
           ``janitor._check_mergeable``'s own permissive definition exactly --
@@ -13415,6 +13490,8 @@ class OrchestratorApp:
             state = load_state(state_file)
             if not is_deescalation_due(state):
                 return
+            state = self._backfill_missing_reason_classes(state)
+            save_state(state_file, state)
             candidates = sorted(
                 int(num)
                 for num, entry in state.get("issues", {}).items()
