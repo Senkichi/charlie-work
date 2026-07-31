@@ -19,13 +19,16 @@ $required_changes_section
 
 ## Required behavior
 
-- First, merge the PR's base branch (e.g., `origin/main` unless the PR targets another base)
-  into your branch to incorporate any base changes that landed since the branch was created.
-  This catches skew even when auto-update is off.
+- Act on the review above — the orchestrator note and any findings — before
+  anything else; that is the reason this PR was sent back for rework. Where
+  the findings above carry severities, Critical and Important items are
+  mandatory; a Minor item may be skipped only if you say so explicitly in the
+  PR body.
 - Update the existing PR. Do not open a new PR unless the branch is unrecoverable.
-- Address every Critical and Important finding directly. Minor findings are
-  optional — if you skip one, say so explicitly rather than silently
-  dropping it.
+- If your branch is behind its base or the PR shows a merge conflict, merge
+  the PR's base branch (e.g., `origin/main` unless the PR targets another
+  base) into your branch and resolve any conflicts. This catches skew even
+  when auto-update is off.
 - Preserve the original issue scope.
 - Add or update tests for the review findings.
 - Before pushing, run `/preflight` (ruff + ruff-format + pre-commit) and COMMIT anything
