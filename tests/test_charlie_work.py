@@ -33038,6 +33038,7 @@ def test_supervisor_config_defaults() -> None:
     assert config.supervisor.full_pass_interval_seconds == 300
     assert config.supervisor.active_cooldown_seconds == 30
     assert config.supervisor.max_runtime_minutes == 0
+    assert config.supervisor.self_deploy_failure_alarm == 3
 
 
 def test_supervisor_config_parses_custom_values(tmp_path: Path) -> None:
@@ -33050,6 +33051,7 @@ supervisor:
   full_pass_interval_seconds: 120
   active_cooldown_seconds: 15
   max_runtime_minutes: 60
+  self_deploy_failure_alarm: 5
 """
     )
     config = load_config(config_file)
@@ -33057,6 +33059,7 @@ supervisor:
     assert config.supervisor.full_pass_interval_seconds == 120
     assert config.supervisor.active_cooldown_seconds == 15
     assert config.supervisor.max_runtime_minutes == 60
+    assert config.supervisor.self_deploy_failure_alarm == 5
 
 
 def test_supervisor_config_unknown_key_raises(tmp_path: Path) -> None:
@@ -33084,6 +33087,28 @@ def test_supervisor_config_wrong_type_raises(tmp_path: Path) -> None:
         """
 supervisor:
   poll_interval_seconds: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises(tmp_path: Path) -> None:
+    """Wrong type for self_deploy_failure_alarm raises ConfigError.
+
+    Issue #817 item 5 added this field alongside the existing supervisor int
+    fields; the supervisor section has its own manual int-type-validation
+    tuple in config.py (separate from the generic _build_section machinery),
+    which needed the new key added explicitly. Locks that in so a future
+    refactor of the tuple can't silently drop validation for this field.
+    """
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  self_deploy_failure_alarm: "not-an-int"
 """
     )
     with pytest.raises(ConfigError, match="must be an int"):

@@ -1234,12 +1234,16 @@ class SupervisorConfig:
     ``active_cooldown_seconds``: sleep after a pass that dispatched or merged
     something (default 30 s — stagger starts, respect rate limits).
     ``max_runtime_minutes``: hard wall-clock cap; 0 = unlimited (default).
+    ``self_deploy_failure_alarm``: consecutive ``self_deploy`` failures before
+    a ``self_deploy_alarm`` events.db entry fires (default 3, mirrors
+    ``AutoMergeConfig.failed_attempt_alarm``). 0 disables the alarm.
     """
 
     poll_interval_seconds: int = 20
     full_pass_interval_seconds: int = 300
     active_cooldown_seconds: int = 30
     max_runtime_minutes: int = 0
+    self_deploy_failure_alarm: int = 3
 
 
 @dataclass(frozen=True)
@@ -2348,6 +2352,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         "full_pass_interval_seconds",
         "active_cooldown_seconds",
         "max_runtime_minutes",
+        "self_deploy_failure_alarm",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):
