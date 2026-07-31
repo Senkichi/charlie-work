@@ -351,6 +351,28 @@ flags any whose merged head SHA is not covered by an `approved`
 pass's `errors` bucket. Treat one as a security event: identify which credential
 performed the merge before re-arming anything.
 
+The tripwire has two dedupe layers so a control that can never go quiet is not
+allowed to bury new signal in constant noise:
+
+1. **Pre-arming baseline** (`unauthorized_merge_baseline` in `state.json`,
+   issue #510): the first pass records which uncovered merges already predate
+   the control and reports nothing. Every later pass reports only merges absent
+   from that baseline.
+2. **Post-arming acknowledgment** (`unauthorized_merge_acknowledged` in
+   `state.json`, issue #673): a post-arming finding that has been triaged (root
+   cause fixed, issue filed, or confirmed benign per the #634 audit taxonomy)
+   is acknowledged once and then stops pinning `ok=False` on every subsequent
+   pass. Acknowledgment is never automatic — it requires an explicit action:
+
+   ```
+   charlie tripwire ack <pr> --reason "root cause fixed in #N" [--by <operator>]
+   ```
+
+   A non-empty `--reason` is mandatory. Re-acking the same PR updates the
+   record (new reason/by/timestamp) rather than duplicating. The ack and its
+   audit trail (who/why/when) are recorded as an
+   `unauthorized_merge_acknowledged` event in `state.json` and `events.db`.
+
 ## Fleet: cross-repo dispatch
 
 The fleet layer extends the single-repo orchestrator to operate across multiple
