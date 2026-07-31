@@ -131,6 +131,28 @@ class SlotChangeResult:
     message: str
 
 
+@dataclass(frozen=True)
+class CapacityStarvation:
+    """One repo whose live demand exceeds its registered capacity while the
+    host still has spare budget elsewhere (issue #799).
+
+    Registration is the hard ceiling on a repo's parallelism — this module can
+    only start already-configured listeners, never mint a new one (CLAUDE.md:
+    "runner slots move by start/park — never by re-registration"). So a repo
+    pinned at its own capacity cannot be helped by *this* module no matter how
+    starved it is; the condition only becomes actionable once something else
+    (``runners.py``) provisions another registration. ``spare_budget`` is what
+    makes the signal worth raising: budget sitting unused elsewhere is real
+    headroom a bigger registration could fill.
+    """
+
+    repo: str
+    demand: int
+    capacity: int
+    running: int
+    spare_budget: int
+
+
 def repo_slug_from_github_url(url: str) -> str | None:
     """Extract "owner/name" from a runner's registration URL.
 
@@ -578,6 +600,37 @@ def runner_capacity_starved_events(plan: AllocationPlan) -> list[dict[str, Any]]
                 }
             )
     return events
+
+
+def starved_repos(plan: AllocationPlan) -> tuple[CapacityStarvation, ...]:
+    """Repos where ``demand > capacity`` while the host-wide budget has slack.
+
+    This mirrors the "exceeds its N registered runner(s)" note ``plan_allocation``
+    already produces (see the ``notes`` loop above), but adds the spare-budget
+    check the note text lacks: signaling is only worth it when
+    ``budget - total running > 0``, since a fully-subscribed budget means no
+    unused host capacity would benefit from a bigger registration anyway — the
+    starved repo would just be trading its shortage for someone else's.
+
+    Derived entirely from ``plan.targets`` — the same computed target set
+    ``plan_allocation`` builds from live discovery — so a repo appearing (or
+    disappearing) under ``managed_root`` changes this function's output with
+    zero code change. Nothing here names a repo.
+    """
+    spare_budget = plan.budget - sum(t.running for t in plan.targets)
+    if spare_budget <= 0:
+        return ()
+    return tuple(
+        CapacityStarvation(
+            repo=t.repo,
+            demand=t.demand,
+            capacity=t.capacity,
+            running=t.running,
+            spare_budget=spare_budget,
+        )
+        for t in plan.targets
+        if t.demand > t.capacity
+    )
 
 
 def plan_summary(plan: AllocationPlan) -> dict[str, Any]:

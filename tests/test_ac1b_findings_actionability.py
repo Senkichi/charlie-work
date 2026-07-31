@@ -55,21 +55,31 @@ def ac1b() -> ModuleType:
 
 
 def test_derive_cross_family_collapse_sentinel_matches_real_parser(ac1b: ModuleType) -> None:
-    """The derived sentinel must be the exact legacy-fallback summary the
-    REAL parser produces for a BLOCKER-only report with no Verdict: marker
-    -- proving derivation actually exercises cross_family's live contract
-    rather than raising and falling back to UNKNOWN.
+    """Issue #784 rewrote the legacy fallback (this script's own
+    docstring's "F5"): the live parser can no longer construct a
+    content-free ``CrossFamilyVerdict`` for a BLOCKER-only report with no
+    ``Verdict:`` marker -- it now returns ``MalformedCrossFamilyVerdict``
+    instead (``CrossFamilyVerdict.__post_init__`` raises on that exact
+    shape). The prior version of this test asserted the parser returned the
+    vacuous placeholder as a real verdict -- that assertion encoded the
+    defect #784 fixes, so it is replaced rather than preserved: the sentinel
+    must still equal the historical constant (kept for classifying PRE-#784
+    on-disk records), but derivation must prove the *live* parser has
+    actually adopted the new contract rather than trusting the constant
+    blindly.
     """
     sentinel = ac1b.derive_cross_family_collapse_sentinel()
     assert sentinel == "Cross-family review found BLOCKER/MAJOR findings"
+    assert sentinel == cross_family.LEGACY_VACUOUS_SUMMARY
 
-    # Cross-check directly against the parser this is meant to track, so a
-    # future change to the legacy fallback string is caught by BOTH tests
-    # moving together, not just trusted to match by construction.
+    # Cross-check directly against the parser this is meant to track: the
+    # exact probe that used to produce a vacuous CrossFamilyVerdict now
+    # returns a MalformedCrossFamilyVerdict, proving #784's fix is live in
+    # the code under test, not just assumed.
     probe = "## Report\n\n**BLOCKER** unparseable body with no Verdict: marker\n"
     parsed = cross_family.parse_cross_family_verdict(probe)
-    assert isinstance(parsed, cross_family.CrossFamilyVerdict)
-    assert parsed.summary == sentinel
+    assert isinstance(parsed, cross_family.MalformedCrossFamilyVerdict)
+    assert parsed.reason == "blocker_or_major_with_no_extractable_summary"
 
 
 def test_classify_verdict_uses_derived_sentinel_for_cross_family_collapse(

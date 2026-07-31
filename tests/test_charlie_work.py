@@ -49,6 +49,8 @@ from charlie_work.cross_family import (
     _CAVEAT,
     CrossFamilyResult,
     CrossFamilyVerdict,
+    LEGACY_VACUOUS_SUMMARY,
+    MalformedCrossFamilyVerdict,
     extract_report_body,
     parse_cross_family_verdict,
     render_command,
@@ -59,6 +61,7 @@ from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, link
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
+    PASSIVE_OPEN_STATUS,
     append_event,
     empty_state,
     is_throttled,
@@ -75,6 +78,7 @@ from charlie_work.workflow import (
     _annotation_to_required_change,
     _append_sweep_events,
     _detect_and_handle_stalled_reviews,
+    _is_carry_forward_eligible,
     _parse_review_verdict_from_log,
     _reap_orphaned_review_checkouts,
     _render_required_changes_section,
@@ -5674,9 +5678,15 @@ def test_merge_ready_checks_unavailable_returns_false(tmp_path: Path) -> None:
 
 
 def _review_queue_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, dry_run: bool = True
 ) -> OrchestratorApp:
-    """Build an OrchestratorApp with FakeGitHub and a default state file."""
+    """Build an OrchestratorApp with FakeGitHub and a default state file.
+
+    ``dry_run`` defaults to ``True`` (unchanged from every existing caller of
+    this helper). Issue #784 AC-8 Case 2's stranded-verdict repair is
+    intentionally gated on ``not self.dry_run`` (it mutates state and GitHub
+    labels), so tests exercising that repair pass ``dry_run=False`` explicitly.
+    """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     (paths.root).mkdir(parents=True, exist_ok=True)
@@ -5687,7 +5697,7 @@ def _review_queue_app(
     fake_gh = FakeGitHub()
     if prs is not None:
         fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
 
 
 def _write_review_packet(
@@ -5805,12 +5815,19 @@ def test_review_queue_includes_missing_pending_and_stale_decisions(
     _write_review_packet(tmp_path, 100, "sha-100")
     # PR 200: current packet, pending decision
     _write_review_packet(tmp_path, 200, "sha-200", {"decision": "pending"})
-    # PR 300: current packet, request_changes from prior head -> stale
+    # PR 300: current packet, request_changes from prior head -> stale.
+    # Real (non-placeholder) summary so this exercises the stale/carry-
+    # forward path under test, not issue #784's content-free "vacuous"
+    # detection (a distinct concern covered by its own tests).
     _write_review_packet(
         tmp_path,
         300,
         "sha-300-new",
-        {"decision": "request_changes", "reviewed_head_sha": "sha-300-old"},
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-300-old",
+            "summary": "some prior finding that needs a rework brief",
+        },
     )
     # PR 400: current packet, approved on current head -> excluded
     _write_review_packet(
@@ -6011,6 +6028,12 @@ def test_review_queue_carries_forward_request_changes_on_identical_patch_id(
             "reviewed_head_sha": old_head,
             "reviewed_patch_id": patch_id,
             "carried_forward_from": [],
+            # Real (non-placeholder) summary: this test exercises identical-
+            # patch-id carry-forward (issue #411), not issue #784's
+            # content-free "vacuous" detection -- a content-free verdict
+            # would be ineligible for carry-forward entirely, which is
+            # covered by its own dedicated tests.
+            "summary": "some prior finding that needs a rework brief",
         },
     )
 
@@ -10419,11 +10442,18 @@ def test_parse_cross_family_verdict_json_approved_overridden_by_body_severity() 
     assert result.decision == "request_changes"
 
 
-def test_parse_cross_family_verdict_json_request_changes_empty_list_falls_back() -> None:
-    """Contract violation: request_changes with an empty/missing required_changes
-    list is not trusted on its own -- falls back to the legacy Markdown parse
-    (today's behavior) rather than recording a request_changes verdict with
-    nothing for a rework brief to act on."""
+def test_parse_cross_family_verdict_json_request_changes_empty_list_is_malformed() -> None:
+    """Issue #784 (AC-2): a JSON verdict block that declares request_changes
+    with an empty/missing required_changes list is a contract violation and
+    must NOT silently fall back to the legacy Markdown parse -- even though
+    the legacy parse would find a perfectly usable ``Verdict:`` line here.
+    Pre-#784, this test asserted exactly that fall-through as correct
+    behavior; that assertion encoded the defect itself (issue #784's root
+    cause: "a JSON verdict saying request_changes with empty
+    required_changes falls through to the weaker legacy path"), so it is
+    replaced rather than preserved. The contract is: once a reviewer elects
+    the structured JSON format, empty required_changes is untrusted on its
+    own, full stop -- regardless of what the Markdown body also says."""
     body = (
         "**MAJOR**\nfile.py:30 bug\n\nVerdict: MAJOR should block\n\n"
         '```json\n{"decision": "request_changes", "summary": "bad but no list", '
@@ -10431,12 +10461,8 @@ def test_parse_cross_family_verdict_json_request_changes_empty_list_falls_back()
     )
     wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     result = parse_cross_family_verdict(wrapped)
-    assert result is not None
-    assert result.decision == "request_changes"
-    assert result.required_changes == ()
-    # The legacy parse picks up the body's own Verdict: line, not the JSON
-    # block's (untrusted) summary.
-    assert result.summary == "MAJOR should block"
+    assert isinstance(result, MalformedCrossFamilyVerdict)
+    assert result.reason == "json_verdict_request_changes_missing_required_changes"
 
 
 def test_parse_cross_family_verdict_json_block_drives_decision_legacy_would_not_reach() -> None:
@@ -10475,6 +10501,580 @@ def test_parse_cross_family_verdict_legacy_report_unchanged_by_json_support() ->
         summary="BLOCKER — does not fix the issue",
         required_changes=(),
     )
+
+
+def test_parse_cross_family_verdict_legacy_blocker_with_no_summary_is_malformed() -> None:
+    """Issue #784 AC-1: a BLOCKER/MAJOR marker with no ``Verdict:`` line to
+    extract a summary from is genuinely content-free -- it must return
+    MalformedCrossFamilyVerdict, never a request_changes verdict asserting
+    blockers exist while naming none. No hardcoded placeholder summary is
+    substituted (the pre-#784 behavior this fix replaces)."""
+    body = "**BLOCKER**\ncritical bug, but no Verdict: line anywhere in this report"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert isinstance(result, MalformedCrossFamilyVerdict)
+    assert result.reason == "blocker_or_major_with_no_extractable_summary"
+    assert "BLOCKER" in result.raw_body
+
+
+def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
+    """Issue #784 AC-6: the invalid state -- request_changes with neither
+    itemized required_changes nor a real summary -- must be unrepresentable
+    at construction, not just avoided by callers that remember to check."""
+    with pytest.raises(ValueError, match="content-free"):
+        CrossFamilyVerdict(decision="request_changes", summary="", required_changes=())
+
+
+def test_cross_family_verdict_post_init_rejects_whitespace_only_summary() -> None:
+    """Whitespace-only is not a real summary either -- ``.strip()`` is
+    applied before the emptiness check, so padding cannot smuggle a
+    content-free verdict past the guard."""
+    with pytest.raises(ValueError, match="content-free"):
+        CrossFamilyVerdict(decision="request_changes", summary="   \n  ", required_changes=())
+
+
+def test_cross_family_verdict_post_init_allows_request_changes_with_only_summary() -> None:
+    """Narrower than "always require required_changes": the legacy Markdown
+    parse path never itemizes findings, so a request_changes verdict with a
+    real extracted summary and empty required_changes remains legitimate
+    and constructible -- this is exactly what the legacy-path tests above
+    rely on."""
+    verdict = CrossFamilyVerdict(
+        decision="request_changes", summary="a real extracted summary", required_changes=()
+    )
+    assert verdict.summary == "a real extracted summary"
+
+
+def test_cross_family_verdict_post_init_allows_request_changes_with_only_required_changes() -> (
+    None
+):
+    """A JSON-block verdict with itemized required_changes but an empty
+    summary is also legitimate -- required_changes alone is something a
+    rework brief can act on."""
+    verdict = CrossFamilyVerdict(
+        decision="request_changes", summary="", required_changes=("fix the null check",)
+    )
+    assert verdict.required_changes == ("fix the null check",)
+
+
+def test_cross_family_verdict_post_init_allows_approved_with_empty_summary() -> None:
+    """The guard is scoped to ``request_changes`` only -- an approved
+    verdict never needs anything for a rework brief to act on, so an empty
+    summary there is unaffected."""
+    verdict = CrossFamilyVerdict(decision="approved", summary="")
+    assert verdict.decision == "approved"
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8: _is_carry_forward_eligible -- the single-point-of-
+# enforcement predicate that rejects carry-forward for a content-free
+# recorded verdict. Operates on plain dicts (never reconstructs a
+# CrossFamilyVerdict), which is the load-bearing fact resolving the
+# deserialization hazard: it must never raise on any of the 8 pre-#784
+# on-disk broken records, however malformed their shape.
+# --------------------------------------------------------------------------
+
+
+def test_is_carry_forward_eligible_true_for_approved() -> None:
+    assert _is_carry_forward_eligible({"decision": "approved", "summary": ""}) is True
+
+
+def test_is_carry_forward_eligible_true_for_blocked() -> None:
+    assert _is_carry_forward_eligible({"decision": "blocked", "summary": "why"}) is True
+
+
+def test_is_carry_forward_eligible_true_for_request_changes_with_required_changes() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": ["fix x"], "summary": ""}
+        )
+        is True
+    )
+
+
+def test_is_carry_forward_eligible_true_for_request_changes_with_real_summary() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": [], "summary": "Real prose."}
+        )
+        is True
+    )
+
+
+def test_is_carry_forward_eligible_false_for_empty_summary_and_required_changes() -> None:
+    assert (
+        _is_carry_forward_eligible(
+            {"decision": "request_changes", "required_changes": [], "summary": ""}
+        )
+        is False
+    )
+
+
+def test_is_carry_forward_eligible_false_for_missing_keys() -> None:
+    """A pre-#784 broken on-disk record may not even carry a
+    ``required_changes`` or ``summary`` key at all -- must classify as
+    ineligible via ``.get()`` defaults, never raise (KeyError or otherwise),
+    on a plain dict this predicate was built specifically to tolerate."""
+    assert _is_carry_forward_eligible({"decision": "request_changes"}) is False
+
+
+def test_is_carry_forward_eligible_false_for_legacy_placeholder_summary() -> None:
+    """The historical hardcoded placeholder is content-free by definition
+    even though ``summary`` is technically non-empty -- one of the 8
+    pre-#784 on-disk records has exactly this shape."""
+    assert (
+        _is_carry_forward_eligible(
+            {
+                "decision": "request_changes",
+                "required_changes": [],
+                "summary": LEGACY_VACUOUS_SUMMARY,
+            }
+        )
+        is False
+    )
+
+
+def test_is_carry_forward_eligible_false_for_whitespace_padded_placeholder() -> None:
+    """``summary`` is ``.strip()``-normalized before the comparison, so
+    whitespace padding around the exact placeholder cannot smuggle it past
+    the guard as if it were a distinct, real summary."""
+    assert (
+        _is_carry_forward_eligible(
+            {
+                "decision": "request_changes",
+                "required_changes": [],
+                "summary": f"  {LEGACY_VACUOUS_SUMMARY}  ",
+            }
+        )
+        is False
+    )
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8: review_queue() must never silently re-confirm a
+# content-free recorded verdict via the head-unchanged shortcut -- it is
+# queued as "vacuous" instead, regardless of whether the head moved.
+# --------------------------------------------------------------------------
+
+
+def test_review_queue_flags_content_free_request_changes_as_vacuous(tmp_path: Path) -> None:
+    """The dominant real-world shape: reviewed_head_sha == live head (a
+    label-strip requeue never moves the head). Pre-#784, this would hit the
+    head-unchanged shortcut and be silently excluded from the queue
+    forever, permanently blocking the merge lane."""
+    prs = [
+        {
+            "number": 700,
+            "title": "Fix #70: vacuous verdict on current head",
+            "url": "https://example.test/pull/700",
+            "headRefName": "agent/issue-70-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-700",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #70",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        700,
+        "sha-700",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-700",
+            "required_changes": [],
+            "summary": "",
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": 700,
+            "issue": 70,
+            "packet_head_sha": "sha-700",
+            "decision": "vacuous",
+            "reviewed_head_sha": "sha-700",
+        },
+    ]
+
+
+def test_review_queue_treats_legacy_placeholder_summary_as_vacuous(tmp_path: Path) -> None:
+    prs = [
+        {
+            "number": 701,
+            "title": "Fix #71: legacy placeholder summary",
+            "url": "https://example.test/pull/701",
+            "headRefName": "agent/issue-71-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-701",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #71",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        701,
+        "sha-701",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-701",
+            "required_changes": [],
+            "summary": LEGACY_VACUOUS_SUMMARY,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.data["queue"][0]["decision"] == "vacuous"
+
+
+def test_review_queue_stale_packet_excludes_vacuous_verdict(tmp_path: Path) -> None:
+    """A vacuous verdict is only queued when the packet head is current --
+    matching every other review_queue category's contract: a stale packet
+    cannot be re-reviewed from, so it is excluded rather than queued."""
+    prs = [
+        {
+            "number": 702,
+            "title": "Fix #72: vacuous verdict, stale packet",
+            "url": "https://example.test/pull/702",
+            "headRefName": "agent/issue-72-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-702-new",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #72",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs)
+    _write_review_packet(
+        tmp_path,
+        702,
+        "sha-702-old",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-702-old",
+            "required_changes": [],
+            "summary": "",
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.data["queue"] == []
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8, Case 2: review_queue()'s head-unchanged shortcut must not
+# treat "reviewed at live head" as "nothing to do" when a real, actionable,
+# non-escalated request_changes verdict was never actually routed to
+# rework_requested -- e.g. issue #789's reconcile one-way "closed" gate
+# clobbering the issue status after record_review set it. This is a repair
+# of a dropped transition (re-applying the same target record_review already
+# decided via the same generic _route_to_rework entry point), never a new
+# decision, and must be idempotent.
+# --------------------------------------------------------------------------
+
+
+def test_review_queue_reroutes_stranded_request_changes_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """Motivating real-world case: PR #693 -> issue #649. A real, actionable
+    request_changes verdict (non-empty prose summary, within the rework-cycle
+    budget -- ``escalated: False``) is recorded at the live head, but the
+    linked issue's status was left at (or clobbered to) something other than
+    ``rework_requested`` -- so ``dispatch_rework``'s
+    ``status == "rework_requested"`` selection never picks the issue up and
+    the PR is stranded forever, even though nothing is actually wrong with
+    the verdict itself.
+
+    review_queue() must detect this at the head-unchanged shortcut and
+    re-drive the SAME rework_requested transition via the SAME generic
+    ``_route_to_rework`` entry point ``record_review`` itself uses -- never
+    adding the PR to the returned ``queue`` (that would wrongly trigger a
+    brand-new reviewer dispatch for a PR that already has a valid verdict).
+
+    A second ``review_queue()`` call over the now-repaired state must not
+    dispatch or mutate anything further (coordinator's explicit, non-
+    negotiable requirement for this fix).
+    """
+    prs = [
+        {
+            "number": 693,
+            "title": "Fix #649: some change",
+            "url": "https://example.test/pull/693",
+            "headRefName": "agent/issue-649-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-693",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #649",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    _write_review_packet(
+        tmp_path,
+        693,
+        "sha-693",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-693",
+            "required_changes": [],
+            "summary": (
+                "The refactor drops the timeout guard added in #611; restore "
+                "it before merging, otherwise a hung subprocess call blocks "
+                "the orchestrator loop indefinitely."
+            ),
+            "escalated": False,
+        },
+    )
+    # Simulate issue #789: the linked issue's status is something other than
+    # rework_requested even though record_review's own contract says a
+    # non-escalated request_changes verdict must have set it there.
+    state = load_state(app.paths.state_file)
+    state["issues"]["649"] = {"number": 649, "status": "closed"}
+    save_state(app.paths.state_file, state)
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    state_after = load_state(app.paths.state_file)
+    assert state_after["issues"]["649"]["status"] == "rework_requested"
+    assert state_after["prs"]["693"]["status"] == "rework_requested"
+    assert any(
+        e["kind"] == "stranded_request_changes_rework_requested" for e in state_after["events"]
+    )
+    prompt_path = app.paths.prs / "pr-693" / "rework-prompt.md"
+    assert prompt_path.exists()
+    assert (649, app.config.labels.needs_rework) in app.gh.labels_added
+
+    # Idempotency: a second pass over the now-repaired state must dispatch
+    # and mutate nothing further. "Without that test I will not merge this."
+    events_before_second_pass = len(state_after["events"])
+    labels_added_before_second_pass = list(app.gh.labels_added)
+
+    result_2 = app.review_queue()
+
+    assert result_2.ok is True
+    assert result_2.data["queue"] == []
+    state_final = load_state(app.paths.state_file)
+    assert state_final["issues"]["649"]["status"] == "rework_requested"
+    assert state_final["prs"]["693"]["status"] == "rework_requested"
+    assert len(state_final["events"]) == events_before_second_pass
+    assert app.gh.labels_added == labels_added_before_second_pass
+
+
+def test_review_queue_does_not_reroute_escalated_request_changes(tmp_path: Path) -> None:
+    """The Case 2 repair is scoped to the non-escalated lane only: when
+    ``record_review`` already decided a verdict exceeded the rework-cycle
+    budget (``escalated: True``), review_queue() must not independently
+    re-decide that or invent a second rework lane bypassing
+    ``max_rework_cycles`` -- it defers entirely to the existing
+    escalation/rescue path.
+    """
+    prs = [
+        {
+            "number": 694,
+            "title": "Fix #650: some other change",
+            "url": "https://example.test/pull/694",
+            "headRefName": "agent/issue-650-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-694",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #650",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    _write_review_packet(
+        tmp_path,
+        694,
+        "sha-694",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-694",
+            "required_changes": [],
+            "summary": "Real reviewer prose describing a real problem to fix.",
+            "escalated": True,
+        },
+    )
+    state = load_state(app.paths.state_file)
+    state["issues"]["650"] = {"number": 650, "status": "closed"}
+    save_state(app.paths.state_file, state)
+
+    result = app.review_queue()
+
+    assert result.data["queue"] == []
+    state_after = load_state(app.paths.state_file)
+    # Untouched -- Case 2 must not fire for an escalated verdict.
+    assert state_after["issues"]["650"]["status"] == "closed"
+    prompt_path = app.paths.prs / "pr-694" / "rework-prompt.md"
+    assert not prompt_path.exists()
+    assert app.gh.labels_added == []
+
+
+# --------------------------------------------------------------------------
+# Issue #784 AC-8 bound: _handle_malformed_cross_family_verdict /
+# _record_cross_family_verdicts. A malformed verdict never increments
+# request_changes_count or dispatches rework (AC-3); a SEPARATE bounded
+# counter (cross_family_parse_failure_count) caps how many times the
+# content-free-verdict -> forced-regeneration cycle can repeat for one PR,
+# so removing the request_changes-cycle counter from this path does not
+# create an unbounded loop. Past the cap, cross-family review is abandoned
+# via a caveated, non-blocking "approved" verdict -- never
+# agent:human-needed, never a blocking request_changes.
+# --------------------------------------------------------------------------
+
+
+def _cross_family_auto_verdict_app(
+    tmp_path: Path, *, max_parse_failures: int = 2, prs: list[dict[str, Any]] | None = None
+) -> OrchestratorApp:
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(auto_verdict=True, max_parse_failures=max_parse_failures)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    if prs is not None:
+        fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+
+def _malformed_cross_family_pr(number: int, head_sha: str) -> dict[str, Any]:
+    return {
+        "number": number,
+        "title": f"Fix #{number}: unparseable cross-family report",
+        "url": f"https://example.test/pull/{number}",
+        "headRefName": f"agent/issue-{number}-fix",
+        "baseRefName": "main",
+        "headRefOid": head_sha,
+        "mergeStateStatus": "CLEAN",
+        "body": f"Closes #{number}",
+        "labels": [],
+        "isCrossRepository": False,
+        "state": "OPEN",
+    }
+
+
+def test_handle_malformed_cross_family_verdict_below_cap_logs_without_recording(
+    tmp_path: Path,
+) -> None:
+    prs = [_malformed_cross_family_pr(800, "sha-800")]
+    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
+    _write_review_packet(tmp_path, 800, "sha-800", {"decision": "pending"})
+    pr_dir = app.paths.prs / "pr-800"
+    (pr_dir / "cross-family-review.md").write_text(
+        "# Cross-family adversarial review — `glm-5.2`\n\n"
+        "<!-- PR head SHA: sha-800 -->\n\n"
+        f"{_CAVEAT}\n\n---\n\n"
+        "**BLOCKER** something is wrong, no Verdict line here\n",
+        encoding="utf-8",
+    )
+
+    results = app._record_cross_family_verdicts()
+
+    assert results == [
+        {
+            "pr_number": 800,
+            "decision": "unparseable",
+            "ok": False,
+            "message": (
+                "cross-family verdict unparseable "
+                "(blocker_or_major_with_no_extractable_summary), attempt 1/2"
+            ),
+        }
+    ]
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["decision"] == "pending"
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["800"]["cross_family_parse_failure_count"] == 1
+    # AC-3: never touches the separate request_changes rework-cycle counter.
+    assert state["prs"]["800"].get("request_changes_count", 0) == 0
+
+
+def test_handle_malformed_cross_family_verdict_abandons_after_cap_exceeded(
+    tmp_path: Path,
+) -> None:
+    """The coordinator's required bound: past max_parse_failures, the cycle
+    terminates in a caveated, non-blocking approved verdict -- not
+    agent:human-needed, not an indefinitely-blocking request_changes."""
+    prs = [_malformed_cross_family_pr(801, "sha-801")]
+    app = _cross_family_auto_verdict_app(tmp_path, max_parse_failures=2, prs=prs)
+    _write_review_packet(tmp_path, 801, "sha-801", {"decision": "pending"})
+    pr_dir = app.paths.prs / "pr-801"
+    (pr_dir / "cross-family-review.md").write_text(
+        "# Cross-family adversarial review — `glm-5.2`\n\n"
+        "<!-- PR head SHA: sha-801 -->\n\n"
+        f"{_CAVEAT}\n\n---\n\n"
+        "**BLOCKER** something is wrong, no Verdict line here\n",
+        encoding="utf-8",
+    )
+
+    for expected_attempt in (1, 2):
+        results = app._record_cross_family_verdicts()
+        assert results[0]["decision"] == "unparseable"
+        assert results[0]["ok"] is False
+        decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+        assert decision["decision"] == "pending"
+        state = load_state(app.paths.state_file)
+        assert state["prs"]["801"]["cross_family_parse_failure_count"] == expected_attempt
+
+    results = app._record_cross_family_verdicts()
+
+    assert results[0]["decision"] == "approved"
+    assert results[0]["ok"] is True
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["decision"] == "approved"
+    assert decision["required_changes"] == []
+    assert "784" in decision["summary"]
+    assert "3 attempts" in decision["summary"]
+    state = load_state(app.paths.state_file)
+    # record_review resets the parse-failure budget on any real verdict.
+    assert state["prs"]["801"]["cross_family_parse_failure_count"] == 0
+    assert state["prs"]["801"].get("request_changes_count", 0) == 0
+
+
+def test_record_review_resets_cross_family_parse_failure_count(tmp_path: Path) -> None:
+    """Whenever ANY real verdict is subsequently recorded for a PR --
+    whether a genuine parse succeeds after prior failures, or this is
+    _handle_malformed_cross_family_verdict's own abandon-call -- the budget
+    resets, so a future review cycle (new head, new content) starts fresh
+    rather than inheriting an exhausted one."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {"number": 456, "cross_family_parse_failure_count": 5}
+        save_state(paths.state_file, state)
+
+    app.record_review(456, "approved", summary="all clear")
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["cross_family_parse_failure_count"] == 0
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
@@ -21400,16 +22000,18 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
 
 
-@pytest.mark.parametrize("terminal_status", ["escalated", "blocked"])
-def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
-    tmp_path: Path, terminal_status: str
-) -> None:
-    """Issue #379 rework: a merge conflict whose linked issue is escalated/blocked
-    (human-terminal) must never be rerouted to rework_requested.
+def test_merge_ready_conflict_blocked_issue_not_rerouted(tmp_path: Path) -> None:
+    """Issue #379 rework: a merge conflict whose linked issue is blocked (a
+    human reviewer verdict, set by record_review's decision=="blocked") must
+    never be rerouted to rework_requested.
 
     transition() has no source-state validation, so rerouting would silently
-    strip the human_needed label and hand the issue back to automation behind
-    the human's back. The PR and issue must be left untouched.
+    strip that reviewer verdict and hand the issue back to automation behind
+    the human's back. The PR and issue must be left untouched. Unlike
+    "escalated" (see
+    test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework
+    below), "blocked" records no reason a re-entry mechanism could scope to,
+    so issue #776 deliberately leaves it a one-way door.
     """
     from charlie_work.config import AutoMergeConfig
 
@@ -21438,14 +22040,14 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
         },
     ]
     # Mark the linked issue as carrying the human_needed label, matching a
-    # real escalated/blocked issue, so a stripped label would be observable.
+    # real blocked issue, so a stripped label would be observable.
     fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
-        state["issues"]["123"]["status"] = terminal_status
+        state["issues"]["123"]["status"] = "blocked"
         save_state(paths.state_file, state)
 
     labels_removed_before = list(fake_gh.labels_removed)
@@ -21460,12 +22062,412 @@ def test_merge_ready_conflict_human_terminal_issue_not_rerouted(
     assert result.data["merge_attempt_warning"] is None
 
     state = load_state(paths.state_file)
-    assert state["issues"]["123"]["status"] == terminal_status
+    assert state["issues"]["123"]["status"] == "blocked"
     assert not any(e["kind"] == "merge_conflict_rework_requested" for e in state["events"])
     # No label mutation must have been issued for the linked issue —
     # human_needed must stay in place.
     assert fake_gh.labels_removed == labels_removed_before
     assert fake_gh.labels_added == labels_added_before
+
+
+def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
+    tmp_path: Path,
+) -> None:
+    """Issue #776: an issue escalated for an UNRELATED reason (e.g. a dead
+    request-changes-fix worker exhausting the watchdog's redispatch cap --
+    the real mechanism that escalated corpus issues #592/#648/#606 via
+    _reap_restore_rework_requested) must not permanently wall off a PR that
+    separately develops a merge conflict.
+
+    This is the regression test for narrowing merge_ready()'s Guard 1
+    exclusion from ``("escalated", "blocked")`` down to ``"blocked"`` only --
+    it asserts the ROUTING CALL actually happened (a fresh dispatch, the
+    label edge, the attempts counter), not merely that the return value
+    looks different from the blocked case. It also asserts reason X's own
+    budget (``redispatch_at``, the watchdog counter that produced the
+    original escalation) survives untouched: re-entry must not reset X's
+    cap while remediating unrelated Y.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    unrelated_redispatch_at = ["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"]["123"],
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+            "redispatch_at": unrelated_redispatch_at,
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    # The routing call actually happened: a fresh dispatch, not a no-op.
+    # (merge_ready()'s top-level result.data doesn't expose the internal
+    # routed/escalated booleans -- verify via the state.json side effects
+    # the routing call actually produces instead.)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    conflict_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(conflict_events) == 1
+    assert conflict_events[0]["payload"]["issue_number"] == 123
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+    assert (123, config.labels.human_needed) in fake_gh.labels_removed
+    # Reason X's own budget must survive remediating unrelated Y: the
+    # watchdog redispatch timestamps that drove the ORIGINAL escalation are
+    # untouched, so a later re-escalation for the same reason X is not
+    # handed a falsely-fresh cap.
+    assert state["issues"]["123"]["redispatch_at"] == unrelated_redispatch_at
+
+
+def test_merge_ready_conflict_rework_dispatch_bounded_by_cap_across_repeated_evaluation(
+    tmp_path: Path,
+) -> None:
+    """Issue #777: merge_ready()'s conflict-rework trigger must never dispatch
+    more rework workers than config.review.max_conflict_rework_attempts, no
+    matter how many times merge_ready() re-evaluates the same conflicting PR
+    -- including across issue-status resets that mimic an external lane
+    (e.g. a dead-session reaper) putting the issue back into a re-dispatchable
+    state between passes.
+
+    Before this fix, merge_ready()'s dispatch trigger called
+    _request_merge_conflict_rework directly with no attempts_key bookkeeping
+    at all, so nothing bounded the number of real dispatches across such
+    cycles (real corpus: PR #679/issue #602, where the diagnostic-only
+    consecutive_failed_merge_attempts counter climbed past 11 while the
+    functional cap sat at 0 the entire time).
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig, ReviewConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    def _reset_issue_to_fresh() -> None:
+        with state_lock(paths.state_file):
+            state = load_state(paths.state_file)
+            state["issues"]["123"] = {**state["issues"]["123"], "status": "approved"}
+            save_state(paths.state_file, state)
+
+    dispatch_events_total = 0
+    escalated_seen_at: int | None = None
+    for pass_number in range(1, 5):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["merge_conflict"] is True
+        state = load_state(paths.state_file)
+        dispatch_events_total = sum(
+            1 for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+        )
+        if state["issues"]["123"]["status"] == "escalated":
+            escalated_seen_at = pass_number
+            assert (
+                state["issues"]["123"]["escalation_reason"]
+                == "conflict_rework_attempts_cap_exceeded"
+            )
+            # Once escalated for this lane's own exhausted cap, stop
+            # artificially re-arming: no real production path resets an
+            # escalated issue's status back to "approved" (only
+            # `charlie unescalate` does, and it also clears
+            # escalation_reason) -- the loop's reset is only a harness
+            # device to reach the cap boundary, not a realistic post-
+            # escalation event. Break here and verify stability below
+            # instead of feeding the wrapper a state no real caller would
+            # ever produce.
+            break
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        # Never more real dispatches than the cap, no matter how many passes.
+        assert dispatch_events_total <= config.review.max_conflict_rework_attempts
+        _reset_issue_to_fresh()
+
+    # The cap was actually reached and enforced, not merely never approached.
+    assert escalated_seen_at is not None
+    assert dispatch_events_total == config.review.max_conflict_rework_attempts
+    escalated_events_after_first = sum(
+        1 for e in state["events"] if e["kind"] == "janitor_rework_escalated"
+    )
+    assert escalated_events_after_first == 1
+
+    # Issue #776: once escalated for THIS lane's own exhausted cap, a FURTHER
+    # evaluation of the same still-conflicting PR must not dispatch yet
+    # another worker, must not burn the counter past what it already is, and
+    # must not re-fire a duplicate escalation event on every pass ("X blocks
+    # retry of X") -- it simply leaves the already-escalated pair alone.
+    for _ in range(3):
+        result = app.merge_ready(456, merge=False)
+        assert result.ok is True
+        assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "conflict_rework_attempts_cap_exceeded"
+    expected_final_attempts = config.review.max_conflict_rework_attempts + 1
+    assert state["prs"]["456"]["conflict_rework_attempts"] == expected_final_attempts
+    final_dispatch_events = sum(
+        1 for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    )
+    assert final_dispatch_events == config.review.max_conflict_rework_attempts
+    final_escalated_events = sum(
+        1 for e in state["events"] if e["kind"] == "janitor_rework_escalated"
+    )
+    assert final_escalated_events == 1
+
+
+def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #777(d): the conflict-rework attempt must be counted (via
+    _route_janitor_gate_failure_to_rework's conflict_rework_attempts write,
+    which merge_ready's dispatch trigger now goes through) BEFORE a later,
+    deterministic worktree_unsafe failure at actual worker-launch time can
+    escalate the issue through dispatch_rework's separate failure_kind lane.
+
+    Real corpus: PR #679/issue #602, escalation_reason="worktree_unsafe".
+    dispatch_rework's deterministic-failure branch only ever writes to
+    state["issues"][...] -- it must never zero or otherwise touch the PR
+    record's conflict_rework_attempts counter.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import AutoMergeConfig, DevinConfig, WatchdogConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    dispatch_result = app.merge_ready(456, merge=False)
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    prompt_path = paths.prs / "pr-456" / "rework-prompt.md"
+    assert prompt_path.exists()
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree is unsafe to reuse",
+                failure_kind="worktree_unsafe",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+    # The attempt counted by the (now-unified) conflict-rework dispatch must
+    # survive this SEPARATE escalation lane untouched -- it lives on the PR
+    # record, and dispatch_rework's deterministic-failure branch only ever
+    # writes to the issue record.
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+
+def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
+    tmp_path: Path,
+) -> None:
+    """Issue #776 follow-up: the new same-reason guard in
+    _route_janitor_gate_failure_to_rework (which refuses to re-route once
+    escalation_reason == f"{attempts_key}_cap_exceeded" is already recorded)
+    must not become a NEW one-way door of its own. ``charlie unescalate`` is
+    the sanctioned re-arm: it clears ``escalation_reason`` on both the issue
+    and PR records (``_UNESCALATE_ISSUE_RESET_FIELDS`` /
+    ``_UNESCALATE_PR_RESET_FIELDS`` both list it) and zeros
+    ``conflict_rework_attempts`` on the PR record, so a PR that is STILL
+    conflicting after a human re-arms it gets a genuinely fresh attempts
+    budget rather than being silently re-refused by the guard or picking up
+    where the exhausted counter left off.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Directly construct the "this lane's own cap already exhausted,
+    # escalated" state that _route_janitor_gate_failure_to_rework's
+    # cap-exceeded branch produces (workflow.py ~11862-11878), merged over
+    # whatever record_review() already wrote -- mirrors the construction
+    # convention test_fix_unescalate.py uses rather than re-deriving the
+    # escalation via a repeated merge_ready() loop.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"]["456"],
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+            "conflict_rework_attempts": 3,
+        }
+        state["issues"]["123"] = {
+            **state["issues"]["123"],
+            "status": "escalated",
+            "escalation_reason": "conflict_rework_attempts_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    # Sanity check: while escalated for THIS lane's own reason, the new guard
+    # refuses to re-route at all (the property test C already covers directly
+    # -- reconfirmed here as a precondition for what unescalate() is about to
+    # undo).
+    precheck = app.merge_ready(456, merge=False)
+    assert precheck.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 3
+
+    unescalate_result = app.unescalate(issue_number=123)
+    assert unescalate_result.ok is True
+    assert unescalate_result.data["changed"] is True
+
+    state = load_state(paths.state_file)
+    assert "escalation_reason" not in state["prs"]["456"]
+    assert "escalation_reason" not in state["issues"]["123"]
+    assert "conflict_rework_attempts" not in state["prs"]["456"]
+    assert state["prs"]["456"]["status"] == PASSIVE_OPEN_STATUS
+
+    # The conflict is still present (PR still CONFLICTING/DIRTY on GitHub) --
+    # a fresh merge_ready() pass must dispatch rework again with a genuinely
+    # fresh attempts counter, not pick up where the exhausted counter (3)
+    # left off and not be silently refused by the same-reason guard (which no
+    # longer matches now that escalation_reason has been cleared).
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+    dispatch_events = [
+        e for e in state["events"] if e["kind"] == "merge_conflict_rework_requested"
+    ]
+    assert len(dispatch_events) == 1
 
 
 def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
