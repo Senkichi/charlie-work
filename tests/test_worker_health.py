@@ -20,6 +20,7 @@ from charlie_work.worker import (
     WorkerHealth,
     WorkerView,
     classify_worker_health,
+    issue_worker_liveness,
     parse_cumulative_usage,
     real_activity_probe_for,
 )
@@ -1909,3 +1910,145 @@ def test_classify_worker_health_api_budget_no_events_healthy(tmp_path: Path) -> 
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
         assert health == WorkerHealth.HEALTHY
+
+
+# --- issue_worker_liveness: the two untested branches from PR #684 review ---
+#
+# The predicate's state-path inconclusive/wall-clock branch is exercised
+# end-to-end via test_fix_unescalate.py, but its two other decisive branches
+# had no direct coverage:
+#   * sidecar path: an alive sidecar worker that classify_worker_health
+#     classifies STALLED must yield live=False (the "closing the symmetric
+#     drift" behavior described in the PR body).
+#   * state path: a real (non-None) but past-stall_minutes activity timestamp
+#     must yield live=False with the "alive but wedged: no real activity for
+#     >Nm" reason, distinct from the inconclusive/wall-clock branch.
+
+
+def test_issue_worker_liveness_sidecar_stalled_yields_not_live(tmp_path: Path) -> None:
+    """PR #684 review: an alive sidecar worker classified STALLED by
+    ``classify_worker_health`` must yield ``live=False``. This is the
+    "closing the symmetric drift" branch -- before the predicate unified the
+    two authorities, the sidecar path deferred to the watchdog (which had
+    reaped the sidecar) while the state path asked only "is the PID alive?",
+    so the criteria drifted. Now both route through one predicate; an
+    alive-but-stalled sidecar session is wedged, not live.
+
+    The sidecar references the live test process (``is_pid_alive`` True with
+    no ``process_start_time`` fingerprint). Its log mtime is parked past
+    ``stall_minutes`` so Signal 3 fires, and the real-activity probe is
+    *conclusively stale* (the worktree-mtime source reports the session's
+    own ``started_at`` with threshold 0 -- the "conclusively stale rather
+    than inconclusive" path of ``_worktree_mtime_source``), so the STALLED
+    verdict is not deferred. sessions.db / per-PID Devin log sources are
+    kept inconclusive (missing db_path) so they cannot veto with a fresh
+    timestamp.
+    """
+    import os
+    import time
+
+    now = datetime.now(UTC)
+    stall_minutes = OrchestratorConfig().watchdog.stall_minutes
+    started_at = (now - timedelta(minutes=stall_minutes + 10)).isoformat()
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    worktree_dir = tmp_path / "worktree"
+    worktree_dir.mkdir()  # empty -> no post-start file mtimes -> conclusive-stale
+    log_file = sessions_dir / "issue-123.log"
+    log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+    old_mtime = (now - timedelta(minutes=stall_minutes + 10)).timestamp()
+    os.utime(log_file, (time.time(), old_mtime))
+
+    sidecar = sessions_dir / "issue-123.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": "",
+                "worktree_path": str(worktree_dir),
+                "prompt_path": "",
+                "command": [],
+                "pid": os.getpid(),
+                "started_at": started_at,
+                "log_path": str(log_file),
+                "process_start_time": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
+    )
+
+    verdict = issue_worker_liveness(123, {}, sessions_dir, config, now)
+
+    assert verdict.live is False
+    assert verdict.source == "sidecar"
+    assert verdict.pid == os.getpid()
+    # The "closing the symmetric drift" reason: alive but stalled.
+    assert "alive but stalled" in verdict.reason
+    assert f">{stall_minutes}m" in verdict.reason
+    # Conclusive-stale probe: a real last-activity timestamp is surfaced.
+    assert verdict.last_activity_at is not None
+    assert verdict.last_activity_source == "worktree_files_mtime"
+
+
+def test_issue_worker_liveness_state_conclusive_stale_yields_not_live(tmp_path: Path) -> None:
+    """PR #684 review: the state path's conclusive-stale branch -- a real
+    (non-None) but past-``stall_minutes`` activity timestamp -- must yield
+    ``live=False`` with the "alive but wedged: no real activity for >Nm"
+    reason. This is distinct from the already-tested inconclusive/wall-clock
+    branch (every source errored -> fall back to the wall-clock deadline):
+    here a real activity source produced a timestamp, it is just old, so the
+    conclusive-stale branch fires before the wall-clock backstop is reached.
+
+    The state path hardcodes ``worktree_path=""`` and ``log_path=None``, so
+    the only source that can produce a real timestamp is the per-PID Devin
+    log (Source 2). We materialize a ``devin_*_{pid}.log`` file under the
+    ``logs/`` sibling of the configured ``db_path`` with an mtime parked
+    past ``stall_minutes``; sessions.db is left missing so Source 1 errors
+    (timestamp=None) and cannot veto with a fresh signal. The test process
+    is the alive PID; no sidecar exists for the issue.
+    """
+    import os
+    import time
+
+    now = datetime.now(UTC)
+    stall_minutes = OrchestratorConfig().watchdog.stall_minutes
+    started_at = (now - timedelta(minutes=stall_minutes + 10)).isoformat()
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()  # no sidecar for issue 123 -> source 1 skipped
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    per_pid_log = logs_dir / f"devin_cli_{os.getpid()}.log"
+    per_pid_log.write_text("devin session log\n", encoding="utf-8")
+    old_mtime = (now - timedelta(minutes=stall_minutes + 10)).timestamp()
+    os.utime(per_pid_log, (time.time(), old_mtime))
+
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
+    )
+
+    issue_state = {
+        "number": 123,
+        "status": "dispatched",
+        "worker_pid": os.getpid(),
+        "dispatched_at": started_at,
+    }
+
+    verdict = issue_worker_liveness(123, issue_state, sessions_dir, config, now)
+
+    assert verdict.live is False
+    assert verdict.source == "state"
+    assert verdict.pid == os.getpid()
+    # The conclusive-stale reason, distinct from the wall-clock backstop.
+    assert "alive but wedged" in verdict.reason
+    assert f"no real activity for >{stall_minutes}m" in verdict.reason
+    assert "wall-clock" not in verdict.reason
+    # A real (non-None) activity timestamp is surfaced -- the hallmark of the
+    # conclusive-stale branch, not the inconclusive branch.
+    assert verdict.last_activity_at is not None
+    assert verdict.last_activity_source == "devin_per_pid_log"

@@ -131,6 +131,28 @@ class SlotChangeResult:
     message: str
 
 
+@dataclass(frozen=True)
+class CapacityStarvation:
+    """One repo whose live demand exceeds its registered capacity while the
+    host still has spare budget elsewhere (issue #799).
+
+    Registration is the hard ceiling on a repo's parallelism — this module can
+    only start already-configured listeners, never mint a new one (CLAUDE.md:
+    "runner slots move by start/park — never by re-registration"). So a repo
+    pinned at its own capacity cannot be helped by *this* module no matter how
+    starved it is; the condition only becomes actionable once something else
+    (``runners.py``) provisions another registration. ``spare_budget`` is what
+    makes the signal worth raising: budget sitting unused elsewhere is real
+    headroom a bigger registration could fill.
+    """
+
+    repo: str
+    demand: int
+    capacity: int
+    running: int
+    spare_budget: int
+
+
 def repo_slug_from_github_url(url: str) -> str | None:
     """Extract "owner/name" from a runner's registration URL.
 
@@ -311,6 +333,11 @@ def plan_allocation(
     actively queuing would defeat the point; waiting before parking a slot
     nobody wants avoids pointless churn.
 
+    A mature slack streak is also left in place when the host's budget is
+    undersubscribed and all pending starts still fit within it, because
+    parking a slot only to restart it a few passes later wastes CI latency
+    for host resources that are not the binding constraint (issue #628).
+
     Slots executing jobs are never selected for parking, so a plan can be
     smaller than the target arithmetic implies; that gap is reported in notes.
     """
@@ -366,6 +393,15 @@ def plan_allocation(
         targets.get(repo, 0) < min(demand_values[repo], capacities[repo]) for repo in by_repo
     )
 
+    total_running = sum(running_counts.values())
+    pending_starts = sum(max(0, targets.get(repo, 0) - running_counts[repo]) for repo in by_repo)
+    post_without_parks = total_running + pending_starts
+    # A purely-idle surplus should not be parked while the budget is
+    # undersubscribed (current running plus all planned starts still fit),
+    # because parking then only saves host resources while a restore costs
+    # real CI latency. See issue #628.
+    budget_undersubscribed = total_running < budget and post_without_parks <= budget
+
     changes: list[SlotChange] = []
     target_records: list[RepoTarget] = []
 
@@ -418,12 +454,31 @@ def plan_allocation(
         if target < len(running):
             surplus = len(running) - target
             streak = idle_streaks.get(repo, 0)
-            if not contended and streak < demand_idle_samples:
-                notes.append(
-                    f"{repo}: holding {surplus} surplus slot(s) — slack for {streak}/"
-                    f"{demand_idle_samples} pass(es) and no repo is waiting"
-                )
-                held_by_hysteresis += surplus
+            # Hold the surplus when either the streak is still inside the
+            # demotion grace period and no other repo is contended, or the
+            # budget is undersubscribed.  The budget guard does not need a
+            # ``not contended`` clause: a contended allocation has already
+            # spent the entire budget, so any surplus would push
+            # post_without_parks above it.
+            if budget_undersubscribed or (not contended and streak < demand_idle_samples):
+                if streak < demand_idle_samples:
+                    notes.append(
+                        f"{repo}: holding {surplus} surplus slot(s) — slack for {streak}/"
+                        f"{demand_idle_samples} pass(es) and no repo is waiting"
+                    )
+                    if not budget_undersubscribed:
+                        held_by_hysteresis += surplus
+                else:
+                    busy = sum(1 for i in running if i.busy)
+                    busy_surplus = max(0, busy - target)
+                    note = (
+                        f"{repo}: holding {surplus} surplus slot(s) — "
+                        f"budget undersubscribed ({post_without_parks}/{budget} running) "
+                        f"and no repo is waiting"
+                    )
+                    if busy_surplus:
+                        note += f"; {busy_surplus} executing jobs"
+                    notes.append(note)
                 continue
 
             reclaimable = sorted(
@@ -517,6 +572,37 @@ def next_idle_streaks(
         usable = min(measurement.demand, len(insts))
         streaks[repo] = previous.get(repo, 0) + 1 if usable < running else 0
     return streaks
+
+
+def starved_repos(plan: AllocationPlan) -> tuple[CapacityStarvation, ...]:
+    """Repos where ``demand > capacity`` while the host-wide budget has slack.
+
+    This mirrors the "exceeds its N registered runner(s)" note ``plan_allocation``
+    already produces (see the ``notes`` loop above), but adds the spare-budget
+    check the note text lacks: signaling is only worth it when
+    ``budget - total running > 0``, since a fully-subscribed budget means no
+    unused host capacity would benefit from a bigger registration anyway — the
+    starved repo would just be trading its shortage for someone else's.
+
+    Derived entirely from ``plan.targets`` — the same computed target set
+    ``plan_allocation`` builds from live discovery — so a repo appearing (or
+    disappearing) under ``managed_root`` changes this function's output with
+    zero code change. Nothing here names a repo.
+    """
+    spare_budget = plan.budget - sum(t.running for t in plan.targets)
+    if spare_budget <= 0:
+        return ()
+    return tuple(
+        CapacityStarvation(
+            repo=t.repo,
+            demand=t.demand,
+            capacity=t.capacity,
+            running=t.running,
+            spare_budget=spare_budget,
+        )
+        for t in plan.targets
+        if t.demand > t.capacity
+    )
 
 
 def plan_summary(plan: AllocationPlan) -> dict[str, Any]:

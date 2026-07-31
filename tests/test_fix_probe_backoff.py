@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
+from charlie_work.paths import resolved_layout
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import _set_reviewer_quota_exhausted_with_backoff
 
@@ -41,19 +42,19 @@ def test_probe_backoff_doubles_each_consecutive_failure() -> None:
     now = datetime(2026, 7, 24, 12, 0, 0, tzinfo=UTC)
     state: dict[str, Any] = {}
 
-    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+    state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 1
     assert _probe_after(state) - now == timedelta(minutes=15)
 
-    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+    state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 2
     assert _probe_after(state) - now == timedelta(minutes=30)
 
-    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+    state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 3
     assert _probe_after(state) - now == timedelta(minutes=60)
 
-    state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+    state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 4
     assert _probe_after(state) - now == timedelta(minutes=120)
 
@@ -70,7 +71,7 @@ def test_probe_backoff_caps_at_configured_max_interval() -> None:
 
     # 15 -> 30 -> 60 (capped to 40) -> 120 (capped to 40)
     for _ in range(4):
-        state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+        state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     assert _probe_after(state) - now == timedelta(minutes=40)
 
 
@@ -85,7 +86,7 @@ def test_probe_backoff_uncapped_when_max_interval_is_zero() -> None:
     state: dict[str, Any] = {}
 
     for _ in range(5):
-        state = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
+        state, _ = _set_reviewer_quota_exhausted_with_backoff(state, config, now)
     # 15 * 2^4 = 240, uncapped (0 disables the cap per the config docstring).
     assert _probe_after(state) - now == timedelta(minutes=240)
 
@@ -136,7 +137,7 @@ def test_probe_backoff_resets_on_successful_verdict_reap(monkeypatch, tmp_path) 
         }
         save_state(app.paths.state_file, state)
 
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = resolved_layout(app.config, tmp_path).reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     log_path = reviews_dir / "issue-100-review.claude.log"
     log_path.write_text(
