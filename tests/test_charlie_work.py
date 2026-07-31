@@ -72,11 +72,13 @@ from charlie_work.workflow import (
     CommandResult,
     ConcurrencyGovernorResult,
     OrchestratorApp,
+    _annotation_to_required_change,
     _append_sweep_events,
     _detect_and_handle_stalled_reviews,
     _parse_review_verdict_from_log,
     _reap_orphaned_review_checkouts,
     _render_required_changes_section,
+    _required_changes_from_checks,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -2531,6 +2533,46 @@ def test_pr_checks_returns_none_on_gh_command_failure(monkeypatch, tmp_path: Pat
     assert checks is None
 
 
+def test_check_run_annotations_returns_parsed_list_on_success(monkeypatch, tmp_path: Path) -> None:
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=json.dumps(
+                [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    result = github_module.GitHub(tmp_path).check_run_annotations(999)
+
+    assert result == [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+
+
+def test_check_run_annotations_returns_empty_list_on_api_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #771: the annotations accessor must return a value (empty list),
+    never raise, when the gh api call fails -- callers building required_changes
+    from it must never crash the review() codepath on a transient GitHub error."""
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr="HTTP 404: Not Found",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    result = github_module.GitHub(tmp_path).check_run_annotations(999)
+
+    assert result == []
+
+
 def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) -> None:
     """gh pr checks exits non-zero but with JSON list (failing checks) -> list."""
 
@@ -3091,6 +3133,11 @@ class FakeGitHub:
             {"name": "Pre-commit", "state": "SUCCESS"},
         ]
 
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        # Mirrors the real GitHub.check_run_annotations default: no
+        # annotations configured means an empty list, never a raise.
+        return []
+
     def pr_diff(self, number: int):
         # Return custom diff if set, otherwise default
         if number in self.diffs:
@@ -3391,6 +3438,22 @@ class FakeGitHubWithChecks(FakeGitHub):
             }
             for check in self.checks
         ]
+
+
+class FakeGitHubWithChecksAndAnnotations(FakeGitHubWithChecks):
+    """FakeGitHubWithChecks whose check_run_annotations returns a configurable
+    per-check-run-id mapping (issue #771 tests)."""
+
+    def __init__(
+        self,
+        checks: list[dict[str, Any]] | None = None,
+        annotations_by_check_run_id: dict[int, list[dict[str, Any]]] | None = None,
+    ) -> None:
+        super().__init__(checks=checks)
+        self.annotations_by_check_run_id = annotations_by_check_run_id or {}
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
+        return self.annotations_by_check_run_id.get(check_run_id, [])
 
 
 class FakeGitHubWithMissingRequired(FakeGitHubWithChecks):
@@ -12510,6 +12573,292 @@ def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> 
     # No interdiff is generated for a same-head review.
     assert not (decision_dir / "interdiff.patch").exists()
     assert "No interdiff is needed" in packet
+
+
+def test_annotation_to_required_change_full_annotation() -> None:
+    """Issue #771: a well-formed GitHub annotation renders check/path/line/message."""
+    entry = _annotation_to_required_change(
+        "Lint",
+        {
+            "path": "src/charlie_work/workflow.py",
+            "start_line": 42,
+            "message": "line too long (100 > 99)",
+        },
+    )
+    assert entry == "Lint: src/charlie_work/workflow.py:42 — line too long (100 > 99)"
+
+
+def test_annotation_to_required_change_no_message_returns_none() -> None:
+    """Never fabricate a placeholder when GitHub gives no explanatory message."""
+    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "start_line": 1}) is None
+    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "message": ""}) is None
+
+
+def test_annotation_to_required_change_missing_path_falls_back_to_message_only() -> None:
+    """No path/line data (e.g. a process-level crash) still surfaces the real
+    message rather than being dropped -- but with no fabricated location."""
+    entry = _annotation_to_required_change("Tests", {"message": "process exited with code 1"})
+    assert entry == "Tests: process exited with code 1"
+
+
+def test_annotation_to_required_change_path_without_line() -> None:
+    entry = _annotation_to_required_change(
+        "Lint", {"path": "src/foo.py", "message": "file-level issue"}
+    )
+    assert entry == "Lint: src/foo.py — file-level issue"
+
+
+def test_annotation_to_required_change_non_dict_returns_none() -> None:
+    assert _annotation_to_required_change("Lint", "not a dict") is None  # type: ignore[arg-type]
+
+
+def test_required_changes_from_checks_aggregates_annotations_for_failing_check() -> None:
+    checks = [
+        {"name": "Lint", "state": "FAILURE", "databaseId": 111},
+        {"name": "Tests", "state": "SUCCESS", "databaseId": 222},
+    ]
+    annotations_by_id = {
+        111: [
+            {"path": "src/foo.py", "start_line": 10, "message": "E501 line too long"},
+            {"path": "src/bar.py", "start_line": 20, "message": "F401 unused import"},
+        ],
+    }
+    required_changes = _required_changes_from_checks(
+        checks, ("Lint",), lambda check_run_id: annotations_by_id.get(check_run_id, [])
+    )
+    assert required_changes == [
+        "Lint: src/foo.py:10 — E501 line too long",
+        "Lint: src/bar.py:20 — F401 unused import",
+    ]
+
+
+def test_required_changes_from_checks_skips_passing_run_of_failed_name() -> None:
+    """A name with two runs (matrix legs) under worst-of semantics: only the
+    FAILURE run's annotations should be fetched, not the passing sibling's."""
+    fetched_ids: list[int] = []
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        fetched_ids.append(check_run_id)
+        return [{"path": "x.py", "start_line": 1, "message": "boom"}] if check_run_id == 2 else []
+
+    checks = [
+        {"name": "Tests", "state": "SUCCESS", "databaseId": 1},
+        {"name": "Tests", "state": "FAILURE", "databaseId": 2},
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Tests",), fetch)
+    assert fetched_ids == [2]
+    assert required_changes == ["Tests: x.py:1 — boom"]
+
+
+def test_required_changes_from_checks_no_databaseid_degrades_to_empty() -> None:
+    """No resolvable check-run id AND no link (e.g. a bare status check with
+    neither) -- degrade to [] without ever calling the annotations fetcher."""
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": None}]
+    called = False
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        nonlocal called
+        called = True
+        return []
+
+    assert _required_changes_from_checks(checks, ("Lint",), fetch) == []
+    assert called is False
+
+
+def test_required_changes_from_checks_no_databaseid_falls_back_to_link() -> None:
+    """No resolvable check-run id (e.g. an external status check) but a real
+    ``link`` from GitHub -- fall back to pointing at the link rather than
+    silently dropping the failure, and never call the annotations fetcher
+    (there is no check-run id to fetch with)."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": None,
+            "link": "https://example.com/status/lint",
+        }
+    ]
+    called = False
+
+    def fetch(check_run_id: int) -> list[dict[str, Any]]:
+        nonlocal called
+        called = True
+        return []
+
+    result = _required_changes_from_checks(checks, ("Lint",), fetch)
+    assert result == [
+        "Lint: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://example.com/status/lint",
+    ]
+    assert called is False
+
+
+def test_required_changes_from_checks_zero_annotations_degrades_to_empty() -> None:
+    """A resolvable check run with zero annotations and no link (common for a
+    process-level crash) degrades to [] -- never a fabricated file/line."""
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
+    assert _required_changes_from_checks(checks, ("Lint",), lambda _id: []) == []
+
+
+def test_required_changes_from_checks_zero_annotations_falls_back_to_link() -> None:
+    """A resolvable check run with zero annotations but a real ``link`` falls
+    back to the link -- more useful than silence, still not fabricated."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": 5,
+            "link": "https://github.com/o/r/actions/runs/1/jobs/5",
+        }
+    ]
+    result = _required_changes_from_checks(checks, ("Lint",), lambda _id: [])
+    assert result == [
+        "Lint: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://github.com/o/r/actions/runs/1/jobs/5",
+    ]
+
+
+def test_required_changes_from_checks_no_checks_available_degrades_to_empty() -> None:
+    assert _required_changes_from_checks(None, ("Lint",), lambda _id: []) == []
+
+
+def test_required_changes_from_checks_no_failed_names_degrades_to_empty() -> None:
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
+    assert _required_changes_from_checks(checks, (), lambda _id: [{"message": "x"}]) == []
+
+
+def test_review_ci_failure_with_annotations_populates_required_changes(tmp_path: Path) -> None:
+    """Issue #771: a required-check failure whose check run carries GitHub
+    annotations yields required_changes naming the real file/line, and the
+    rendered rework brief contains them -- not just the bare check-name
+    summary the route previously emitted."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={
+            9001: [
+                {
+                    "path": "src/charlie_work/workflow.py",
+                    "start_line": 7296,
+                    "message": "F821 undefined name 'checks'",
+                    "annotation_level": "failure",
+                },
+            ],
+        },
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == [
+        "Tests passed: src/charlie_work/workflow.py:7296 — F821 undefined name 'checks'",
+    ]
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "## Required changes" in prompt_text
+    assert "src/charlie_work/workflow.py:7296" in prompt_text
+    assert "F821 undefined name 'checks'" in prompt_text
+    # The failing check's own name reaches the brief via $dispatch_note (the
+    # rework_summary passed to _write_rework_prompt, kept as a separate
+    # template slot from $required_changes_section) regardless of which
+    # required_changes tier rendered -- a worker sees which check was red
+    # even when tier 1 (the enumerated list) is what fired.
+    assert "Tests passed" in prompt_text
+
+
+def test_review_ci_failure_without_annotations_degrades_without_fabricating(
+    tmp_path: Path,
+) -> None:
+    """Issue #771: a failing required check whose run carries zero GitHub
+    annotations AND no link (e.g. a process-level crash with nothing GitHub
+    can point at) must not fabricate a file/line -- required_changes stays
+    empty and the pre-existing summary-only fallback
+    (_render_required_changes_section tier 2) renders instead."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9002},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={},  # 9002 resolves to zero annotations
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == []
+    assert decision["summary"] == "CI failed on Tests passed; push a fix"
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    # Tier-2 fallback renders the real summary verbatim -- not a fabricated
+    # file/line, and still strictly more informative than an empty section.
+    assert "CI failed on Tests passed; push a fix" in prompt_text
+    assert "## Required changes" in prompt_text
+
+
+def test_review_ci_failure_without_annotations_but_with_link_uses_link_fallback(
+    tmp_path: Path,
+) -> None:
+    """Issue #771: a failing required check with zero GitHub annotations but a
+    real ``link`` (the common case: GitHub Actions always assigns a run URL,
+    but only some failure modes emit per-line annotations) falls back to
+    pointing the worker at the failing run instead of degrading all the way
+    to the bare check-name summary."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecksAndAnnotations(
+        checks=[
+            {
+                "name": "Tests passed",
+                "state": "FAILURE",
+                "databaseId": 9003,
+                "link": "https://github.com/o/r/actions/runs/1/jobs/9003",
+            },
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        annotations_by_check_run_id={},  # 9003 resolves to zero annotations
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["required_changes"] == [
+        "Tests passed: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://github.com/o/r/actions/runs/1/jobs/9003",
+    ]
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "## Required changes" in prompt_text
+    assert "https://github.com/o/r/actions/runs/1/jobs/9003" in prompt_text
 
 
 def test_janitor_required_check_failure_routes_to_rework(tmp_path: Path) -> None:
