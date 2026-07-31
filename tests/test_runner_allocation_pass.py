@@ -35,6 +35,8 @@ from charlie_work.runner_slots import (
 CW = "Senkichi/charlie-work"
 JC = "Senkichi/job-cannon"
 
+PASS_INTERVAL = 300  # seconds; arbitrary but consistent allocation pass cadence
+
 
 # --------------------------------------------------------------------------
 # Fakes
@@ -147,6 +149,7 @@ def test_disabled_config_returns_skipped_without_touching_github() -> None:
         gh,
         RunnerAllocationConfig(enabled=False),
         source="prologue",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
@@ -156,30 +159,52 @@ def test_disabled_config_returns_skipped_without_touching_github() -> None:
     assert gh.calls == []
 
 
-def test_unresolvable_managed_root_returns_error_without_raising() -> None:
+def test_unresolvable_managed_root_returns_error_without_raising(
+    tmp_path: Path,
+) -> None:
     """No managed root and no fallback is a config error, not a crash."""
+    fleet_dir = tmp_path / "fleet"
     result = run_allocation_pass(
         _FakeGitHub(),
         RunnerAllocationConfig(enabled=True),  # managed_root empty, no fallback
+        fleet_dir_override=str(fleet_dir),
         source="prologue",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is False
     assert result.error is not None
     assert "managed_root" in result.error
 
+    stamp = load_allocation_stamp(fleet_dir)
+    assert stamp is not None
+    assert stamp.source == "prologue"
+    assert stamp.full_pass_interval_seconds == PASS_INTERVAL
+    assert stamp.skip_reason is not None
+    assert "managed_root" in stamp.skip_reason
+
 
 def test_nonexistent_managed_root_returns_error(tmp_path: Path) -> None:
     """A typo'd path fails loudly instead of silently allocating nothing."""
+    fleet_dir = tmp_path / "fleet"
     result = run_allocation_pass(
         _FakeGitHub(),
         RunnerAllocationConfig(enabled=True, managed_root=str(tmp_path / "gone")),
+        fleet_dir_override=str(fleet_dir),
         source="prologue",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is False
     assert result.error is not None
     assert "does not exist" in result.error
+
+    stamp = load_allocation_stamp(fleet_dir)
+    assert stamp is not None
+    assert stamp.source == "prologue"
+    assert stamp.full_pass_interval_seconds == PASS_INTERVAL
+    assert stamp.skip_reason is not None
+    assert "does not exist" in stamp.skip_reason
 
 
 def test_zero_discovered_instances_returns_skipped(
@@ -195,13 +220,20 @@ def test_zero_discovered_instances_returns_skipped(
         RunnerAllocationConfig(enabled=True, managed_root=str(root)),
         fleet_dir_override=str(fleet_dir),
         source="prologue",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
     assert result.skipped is True
     assert any("no configured runners" in note for note in result.notes)
-    # No state file written when there is nothing to allocate.
-    assert not _allocation_state_path(fleet_dir).exists()
+    # A skip file is written so the doctor probe can tell this pass reached
+    # allocation and found nothing, rather than assuming the daemon was stuck.
+    stamp = load_allocation_stamp(fleet_dir)
+    assert stamp is not None
+    assert stamp.source == "prologue"
+    assert stamp.full_pass_interval_seconds == PASS_INTERVAL
+    assert stamp.skip_reason is not None
+    assert "no configured runners" in stamp.skip_reason
 
 
 # --------------------------------------------------------------------------
@@ -238,6 +270,7 @@ def test_dry_run_writes_no_state_file(tmp_path: Path, monkeypatch: pytest.Monkey
         fleet_dir_override=str(fleet_dir),
         dry_run=True,
         source="prologue",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
@@ -263,6 +296,7 @@ def test_real_run_with_converged_plan_writes_provenance(
         fleet_dir_override=str(fleet_dir),
         dry_run=False,
         source="prologue",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
@@ -308,6 +342,7 @@ def test_dry_run_with_planned_start_does_not_actuate(
         fleet_dir_override=str(fleet_dir),
         dry_run=True,
         source="cli",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
@@ -352,6 +387,7 @@ def test_real_run_with_planned_start_actuates_and_writes_state(
         fleet_dir_override=str(fleet_dir),
         dry_run=False,
         source="cli",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
@@ -375,7 +411,9 @@ def _mature_slack_setup(
     fleet_dir = tmp_path / "fleet"
     from charlie_work.runner_slots import save_idle_streaks
 
-    save_idle_streaks(fleet_dir, {CW: 3}, source="prologue")
+    save_idle_streaks(
+        fleet_dir, {CW: 3}, source="prologue", full_pass_interval_seconds=PASS_INTERVAL
+    )
     assert load_idle_streaks(fleet_dir) == {CW: 3}
 
     gh = _FakeGitHub()
@@ -412,6 +450,7 @@ def test_dry_run_with_planned_park_does_not_actuate(
         fleet_dir_override=str(fleet_dir),
         dry_run=True,
         source="cli",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
@@ -454,6 +493,7 @@ def test_real_run_with_planned_park_actuates_and_writes_state(
         fleet_dir_override=str(fleet_dir),
         dry_run=False,
         source="cli",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
@@ -512,6 +552,7 @@ def test_unreadable_runner_list_pins_the_repo(
         fleet_dir_override=str(fleet_dir),
         dry_run=False,
         source="prologue",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
@@ -550,7 +591,9 @@ def test_unreadable_runner_list_holds_idle_streak_not_advances_it(
     # Seed a prior streak so we can tell hold-from-advance apart.
     from charlie_work.runner_slots import save_idle_streaks
 
-    save_idle_streaks(fleet_dir, {CW: 2}, source="prologue")
+    save_idle_streaks(
+        fleet_dir, {CW: 2}, source="prologue", full_pass_interval_seconds=PASS_INTERVAL
+    )
     assert load_idle_streaks(fleet_dir) == {CW: 2}
 
     gh = _FakeGitHub(runners_error_repos={CW})
@@ -560,6 +603,7 @@ def test_unreadable_runner_list_holds_idle_streak_not_advances_it(
         fleet_dir_override=str(fleet_dir),
         dry_run=False,
         source="prologue",
+        full_pass_interval_seconds=PASS_INTERVAL,
     )
 
     assert result.ok is True
