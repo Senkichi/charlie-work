@@ -144,6 +144,12 @@ ESCALATION_REASON_CLASS_BY_EVENT_KIND: Mapping[str, str] = MappingProxyType(
         "session_failed_escalated": "mechanical",
         # The review-dispatch attempt cap is an infrastructure-driven limit.
         "review_dispatch_escalated": "mechanical",
+        # Issue #841: an infra-cancelled required check (self-hosted runner
+        # timeout-minutes kill) exhausting its auto-rerun attempt cap is a
+        # pure process/infrastructure limit, unambiguous like the other
+        # attempt-cap kinds above -- no code fix or human judgment call is
+        # involved, only a retry budget running out.
+        "infra_rerun_escalated": "mechanical",
     }
 )
 DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
@@ -159,6 +165,35 @@ DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
         # Records review decisions including approved, request_changes, and
         # blocked; the event kind alone does not identify an escalation.
         "record_review",
+        # Diagnostics-only: emitted either (a) while re-running the janitor
+        # for visibility on a PR/issue that is ALREADY escalated (this
+        # occurrence's ``escalated: True`` payload key documents the
+        # ambient status, it does not cause the transition -- see
+        # ``review()``'s "Escalation is terminal" branch), or (b) as the
+        # ordinary janitor-gate block, which sets status "janitor_blocked",
+        # never "escalated". The kind alone never identifies an escalation
+        # transition.
+        #
+        # Membership here is inert for `_backfill_missing_reason_classes`'s
+        # per-issue `query_events(issue_number=...)` lookup: neither payload
+        # above carries an `issue_number`/`issue`/`issue_numbers`/`issues`
+        # key, so `_extract_payload_refs` (instrumentation.py) always leaves
+        # the indexed `issue_number` column NULL for this kind, and SQL
+        # `issue_number = N` never matches NULL -- a `janitor_gate` row can
+        # never be selected as the "latest" event for any issue. Mapping it
+        # to `None` here is therefore unreachable in practice, not merely
+        # unmapped by omission.
+        #
+        # Discovery of this kind by
+        # ``_escalation_event_kinds_from_workflow()`` in
+        # ``test_deescalation.py`` is contingent on `review()` containing a
+        # call to `escalation_reason_class(...)` (currently true via the
+        # `infra_rerun_escalated` block). If a future refactor moves that
+        # call out of `review()`, this kind stops being discovered and this
+        # entry becomes dormant -- harmless, but worth knowing if this
+        # comment is ever found to be describing a kind the test no longer
+        # flags.
+        "janitor_gate",
     }
 )
 
