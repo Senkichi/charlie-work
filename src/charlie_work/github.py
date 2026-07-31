@@ -202,6 +202,30 @@ def _job_id_from_link(link: str | None) -> int | None:
     return int(match.group(1))
 
 
+def _check_bucket(state: str | None) -> str:
+    """Reproduce the `bucket` classification `gh pr checks` uses per state.
+
+    `gh pr view --json statusCheckRollup` has no `bucket` field, but `gh pr
+    checks` returns one. Every consumer reads `bucket` only as an `or`
+    alternative to `state`, so an unmapped bucket would not change
+    classification, but reproducing the field keeps the fallback shape aligned.
+
+    Source: pkg/cmd/pr/checks/aggregate.go in github.com/cli/cli (trunk):
+    SUCCESS -> pass; SKIPPED/NEUTRAL -> skipping; ERROR/FAILURE/TIMED_OUT/
+    ACTION_REQUIRED -> fail; CANCELLED -> cancel; all others -> pending.
+    """
+    state = (state or "").upper()
+    if state == "SUCCESS":
+        return "pass"
+    if state in {"SKIPPED", "NEUTRAL"}:
+        return "skipping"
+    if state in {"ERROR", "FAILURE", "TIMED_OUT", "ACTION_REQUIRED"}:
+        return "fail"
+    if state == "CANCELLED":
+        return "cancel"
+    return "pending"
+
+
 @dataclass(frozen=True)
 class GitHub:
     repo_root: Path
@@ -722,19 +746,25 @@ class GitHub:
             # list, while genuinely failing checks still produce a list of results.
             if isinstance(result.value, list):
                 checks = result.value
-            elif result.ok and result.value is None:
-                # Empty successful response (no checks reported) is legitimate.
-                return []
             else:
-                # Command-level failure (Unknown JSON field, GraphQL error, etc.)
-                return None
+                # When gh pr checks yields no parseable list, the failure is
+                # indistinguishable from the legitimate "no checks reported yet"
+                # case. Disambiguate with a different endpoint that can represent
+                # "no checks" as a successful empty response (issue #846).
+                fallback = self._pr_checks_fallback(number)
+                if fallback is None:
+                    # Genuine unavailability: preserve the existing None contract.
+                    return None
+                checks = fallback
         else:
             # Legacy pre-result-object fallback
             checks = result if isinstance(result, list) else []
         # gh pr checks --json has no databaseId/runId fields; derive both the
         # GitHub Actions job id and the workflow run id from "link" and inject
         # them so downstream consumers keep reading check.get("databaseId") and
-        # check.get("runId") unchanged.
+        # check.get("runId") unchanged. The statusCheckRollup fallback carries
+        # the same Actions job URL shape in "detailsUrl", so the same regex
+        # derivation applies there too.
         return [
             {
                 **check,
@@ -743,6 +773,65 @@ class GitHub:
             }
             for check in checks
         ]
+
+    def _pr_checks_fallback(self, number: int) -> list[dict[str, Any]] | None:
+        """Disambiguate a ``gh pr checks`` failure using ``statusCheckRollup``.
+
+        ``gh pr checks --json`` cannot represent "no checks reported yet" as a
+        successful empty response; it exits non-zero with empty stdout, exactly
+        like a genuine command failure. ``gh pr view --json statusCheckRollup``
+        returns a clean empty list with exit 0 for a PR with zero checks
+        (measured live against PR #700 in this repo), so it can disambiguate.
+
+        Returns:
+        - ``None`` if the fallback call fails or its rollup is unverifiable.
+        - ``[]`` if the rollup is empty.
+        - A list of dicts shaped like the normal ``gh pr checks --json`` output
+          for a non-empty rollup of GitHub Actions ``CheckRun`` entries.
+
+        Mapping (verified against live PRs and the gh CLI source):
+        - ``name`` <- ``name``
+        - ``link`` <- ``detailsUrl``
+        - ``state`` <- ``conclusion`` if ``status == "COMPLETED"`` and a
+          conclusion is present, otherwise ``status``.
+        - ``bucket`` is reconstructed from ``state`` because statusCheckRollup
+          has no equivalent field and ``gh pr checks`` consumers expect it.
+
+        Any rollup entry that is not a ``CheckRun`` (e.g. an external
+        ``StatusContext``) makes the whole call return ``None``: this repo has
+        no live sample of that shape and fabricating one would risk silently
+        inventing check state.
+        """
+        result = self.run(
+            ["pr", "view", str(number), "--json", "statusCheckRollup"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if not (
+            isinstance(result, GitHubRunResult) and result.ok and isinstance(result.value, dict)
+        ):
+            return None
+        rollup = result.value.get("statusCheckRollup")
+        if not isinstance(rollup, list):
+            return None
+        if not rollup:
+            return []
+        mapped: list[dict[str, Any]] = []
+        for entry in rollup:
+            if not isinstance(entry, dict) or entry.get("__typename") != "CheckRun":
+                return None
+            status = str(entry.get("status") or "")
+            conclusion = str(entry.get("conclusion") or "")
+            state = conclusion if status == "COMPLETED" and conclusion else status
+            mapped.append(
+                {
+                    "name": entry.get("name"),
+                    "state": state,
+                    "bucket": _check_bucket(state),
+                    "link": entry.get("detailsUrl"),
+                }
+            )
+        return mapped
 
     def actions_job(self, job_id: int) -> dict[str, Any] | None:
         """Fetch a single GitHub Actions job by ID.

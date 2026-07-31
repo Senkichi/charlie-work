@@ -9411,6 +9411,31 @@ def test_loop_checks_unavailable_review_lands_in_errors_bucket(tmp_path: Path) -
     assert "checks unavailable" in result.data["errors"][0]["error"].lower()
 
 
+def test_loop_zero_checks_pr_does_not_land_in_errors_bucket(tmp_path: Path) -> None:
+    """Issue #846: a PR with zero checks must not be counted as a loop error.
+
+    A PR whose ``pr_checks()`` returns ``[]`` (genuinely no checks yet, e.g. a
+    conflicted/CI-never-ran PR) is a normal review outcome. The orchestrator
+    should record a review verdict, not an infrastructure error.
+    """
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithZeroChecks(FakeGitHub):
+        def pr_checks(self, number: int):
+            return []
+
+    fake_gh = FakeGitHubWithZeroChecks()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.loop(merge=False)
+
+    assert result.data["errors"] == []
+    assert result.data["merges"] == []
+    assert len(result.data["reviews"]) == 1
+    assert result.data["reviews"][0]["pr"] == 456
+
+
 def _arm_unauthorized_merge_tripwire(paths, pre_existing: tuple[int, ...] = ()) -> None:
     """Declare the #502 tripwire already armed, so a test sees its steady state.
 

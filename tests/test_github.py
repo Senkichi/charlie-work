@@ -264,6 +264,173 @@ def test_pr_checks_injects_run_id(monkeypatch, tmp_path: Path) -> None:
     ]
 
 
+def test_pr_checks_zero_checks_returns_empty_list(monkeypatch, tmp_path: Path) -> None:
+    """Issue #846: a PR with no checks must return [], not None.
+
+    `gh pr checks` exits non-zero with "no checks reported" and no JSON when a
+    PR has no checks yet -- a shape indistinguishable from a genuine command
+    failure using result.ok/result.value alone. pr_checks must disambiguate via
+    the statusCheckRollup fallback and return [] here.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["pr", "checks"]:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="",
+                stderr="no checks reported on the 'agent/issue-627-fix' branch",
+            )
+        assert cmd[1:3] == ["pr", "view"], cmd
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps({"statusCheckRollup": []}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    checks = gh.pr_checks(700)
+
+    assert checks == []
+    assert len(calls) == 2
+
+
+def test_pr_checks_genuine_failure_returns_none(monkeypatch, tmp_path: Path) -> None:
+    """Issue #846: pr_checks must still return None when the fallback also fails."""
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[1:3] == ["pr", "checks"]:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="",
+                stderr='Unknown JSON field: "bucket"',
+            )
+        assert cmd[1:3] == ["pr", "view"], cmd
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=1,
+            stdout="",
+            stderr="GraphQL: Could not resolve to a PullRequest with the number of 700.",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    checks = gh.pr_checks(700)
+
+    assert checks is None
+
+
+def test_pr_checks_fallback_maps_existing_checks(monkeypatch, tmp_path: Path) -> None:
+    """Issue #846: a transient `gh pr checks` glitch falls back to statusCheckRollup.
+
+    If `gh pr checks` fails but the PR genuinely has checks, the
+    statusCheckRollup fallback maps them into the same shape pr_checks normally
+    returns, including the databaseId/runId injection.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["pr", "checks"]:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="",
+                stderr="unexpected end of JSON input",
+            )
+        assert cmd[1:3] == ["pr", "view"], cmd
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "statusCheckRollup": [
+                        {
+                            "__typename": "CheckRun",
+                            "name": "Tests",
+                            "status": "COMPLETED",
+                            "conclusion": "SUCCESS",
+                            "detailsUrl": "https://github.com/owner/repo/actions/runs/111/job/222",
+                        },
+                        {
+                            "__typename": "CheckRun",
+                            "name": "Lint",
+                            "status": "IN_PROGRESS",
+                            "conclusion": "",
+                            "detailsUrl": "https://github.com/owner/repo/actions/runs/111/job/333",
+                        },
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    checks = gh.pr_checks(679)
+
+    assert checks == [
+        {
+            "name": "Tests",
+            "state": "SUCCESS",
+            "bucket": "pass",
+            "link": "https://github.com/owner/repo/actions/runs/111/job/222",
+            "databaseId": 222,
+            "runId": 111,
+        },
+        {
+            "name": "Lint",
+            "state": "IN_PROGRESS",
+            "bucket": "pending",
+            "link": "https://github.com/owner/repo/actions/runs/111/job/333",
+            "databaseId": 333,
+            "runId": 111,
+        },
+    ]
+
+
+def test_pr_checks_fallback_declines_unknown_rollup_entry(monkeypatch, tmp_path: Path) -> None:
+    """Issue #846: an unverified statusCheckRollup shape must not be guessed at.
+
+    A `statusCheckRollup` entry that isn't a GitHub Actions `CheckRun` (e.g. an
+    external `StatusContext`) has no field mapping verified against this repo.
+    pr_checks declines and returns None rather than fabricate a lossy mapping.
+    """
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[1:3] == ["pr", "checks"]:
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=1,
+                stdout="",
+                stderr="no checks reported on the 'x' branch",
+            )
+        assert cmd[1:3] == ["pr", "view"], cmd
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps(
+                {"statusCheckRollup": [{"__typename": "StatusContext", "state": "SUCCESS"}]}
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    checks = gh.pr_checks(700)
+
+    assert checks is None
+
+
 _FIXTURES = Path(__file__).parent / "fixtures"
 
 
