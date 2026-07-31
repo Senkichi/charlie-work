@@ -15,6 +15,7 @@ failure is captured as a stub report and a not-ok result instead.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -69,6 +70,11 @@ _SEVERITY_RE = re.compile(
     re.MULTILINE,
 )
 
+# Fenced ```json ... ``` (or bare ``` ... ```) block, mirroring
+# ``workflow._VERDICT_FENCE_RE``. Not imported from ``workflow`` because
+# ``workflow`` imports this module, not the reverse.
+_VERDICT_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+
 
 def _looks_transient(*texts: str) -> bool:
     return bool(_TRANSIENT_RE.search("\n".join(texts)))
@@ -110,11 +116,16 @@ def report_body_is_valid(body: str) -> bool:
     """Return True if the captured model output looks like a real review.
 
     A real review must contain at least one strict severity marker
-    (**BLOCKER**, **MAJOR**, **MINOR**, or **NIT**) or a non-refusal
-    ``Verdict:`` line.  Blocked/refusal messages (e.g. "blocked from performing
-    the review", "all tool calls are being rejected", "please re-run") are
-    rejected even if they include a severity marker or verdict line, so they
-    cannot be cached as a success report.
+    (**BLOCKER**, **MAJOR**, **MINOR**, or **NIT**), a non-refusal
+    ``Verdict:`` line, or a shape-valid JSON verdict block (see
+    ``_find_json_verdict``) — the last case covers a reviewer that emitted
+    the new structured block but, contrary to instructions, dropped the
+    Markdown severity/verdict markers; without this fallback that report
+    would be discarded as UNAVAILABLE and its findings lost entirely.
+    Blocked/refusal messages (e.g. "blocked from performing the review",
+    "all tool calls are being rejected", "please re-run") are rejected even
+    if they include a severity marker or verdict line, so they cannot be
+    cached as a success report.
     """
     text = extract_report_body(body)
     if not text:
@@ -123,7 +134,9 @@ def report_body_is_valid(body: str) -> bool:
         return False
     if _SEVERITY_RE.search(text):
         return True
-    return bool(_VERDICT_RE.search(text))
+    if _VERDICT_RE.search(text):
+        return True
+    return _find_json_verdict(text) is not None
 
 
 @dataclass(frozen=True)
@@ -313,18 +326,100 @@ _BLOCKER_OR_MAJOR_RE = re.compile(
 )
 
 
-def parse_cross_family_verdict(report_text: str) -> tuple[str, str] | None:
-    """Parse a cross-family report into a ``(decision, summary)`` tuple.
+@dataclass(frozen=True)
+class CrossFamilyVerdict:
+    """A parsed cross-family verdict: decision, summary, and itemized findings.
 
-    Returns ``("approved", summary)`` when the report body contains no
-    BLOCKER or MAJOR severity markers, ``("request_changes", summary)``
-    when it does, or ``None`` when the report is absent, UNAVAILABLE, or
-    semantically invalid (so the caller skips the PR rather than recording
-    a wrong verdict).
+    ``required_changes`` is empty for verdicts recovered via the legacy
+    Markdown-only parse path (no historical report ever populated it, and
+    ``approved`` verdicts never need it); it carries the reviewer's itemized
+    findings when parsed from the JSON verdict block described in
+    ``prompts/cross_family_review.md``.
+    """
 
-    The summary is the verdict section text (the line(s) after the
-    ``Verdict:`` marker or ``## Verdict`` heading), truncated to a
-    reasonable length for a PR comment / state event payload.
+    decision: str
+    summary: str
+    required_changes: tuple[str, ...] = ()
+
+
+def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
+    """Return the last shape-valid JSON verdict block in ``body``, or None.
+
+    Scans fenced code blocks from the last one backwards — mirroring
+    ``workflow._extract_verdict_from_text`` — so a reviewer's actual final
+    answer wins over an earlier echo (e.g. of the example block in its own
+    prompt). A block is shape-valid when ``decision`` is ``"approved"`` or
+    ``"request_changes"`` (cross-family review never gates a merge on its
+    own, so unlike the primary reviewer it has no ``"blocked"`` decision)
+    and ``summary`` is a non-empty, non-placeholder string.
+    ``required_changes``, if present, must be a list of strings; a
+    malformed one rejects that block (an earlier fence, if any, is tried
+    next) rather than silently discarding the bad data.
+    """
+    for match in reversed(list(_VERDICT_FENCE_RE.finditer(body))):
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        decision = data.get("decision")
+        if decision not in ("approved", "request_changes"):
+            continue
+        summary = data.get("summary")
+        if not isinstance(summary, str):
+            continue
+        stripped_summary = summary.strip()
+        if not stripped_summary:
+            continue
+        # An unfilled template placeholder ("<one or two sentence...>") is
+        # prompt boilerplate that leaked into the verdict, never a real
+        # summary — mirrors workflow._validate_review_verdict's guard.
+        if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
+            continue
+        raw_changes = data.get("required_changes")
+        if raw_changes is None:
+            required_changes: tuple[str, ...] = ()
+        elif isinstance(raw_changes, list) and all(isinstance(item, str) for item in raw_changes):
+            required_changes = tuple(item.strip() for item in raw_changes if item.strip())
+        else:
+            continue
+        return CrossFamilyVerdict(
+            decision=decision, summary=stripped_summary, required_changes=required_changes
+        )
+    return None
+
+
+def parse_cross_family_verdict(report_text: str) -> CrossFamilyVerdict | None:
+    """Parse a cross-family report into a :class:`CrossFamilyVerdict`.
+
+    Prefers a JSON verdict block (see ``_find_json_verdict``) when the
+    report contains one, so ``required_changes`` carries the reviewer's
+    itemized findings into the recorded verdict. Falls back to the legacy
+    Markdown-only parse — unchanged from before this function accepted JSON
+    — for any report without one, so every historical report (and any
+    reviewer session that doesn't emit the new block) continues to produce
+    byte-identical ``decision``/``summary`` output.
+
+    Two fail-safes govern how the JSON block is trusted:
+
+    - A ``**BLOCKER**``/``**MAJOR**`` marker anywhere in the Markdown findings
+      always overrides a JSON block claiming ``"approved"`` — this verdict
+      auto-records and can unblock the merge lane, so a downgrade the model
+      contradicts in its own findings is never trusted silently.
+    - ``required_changes`` is mandatory (per the template) whenever
+      ``decision`` is ``"request_changes"``. A block that violates that
+      contract (empty or missing list) is not trusted on its own; parsing
+      falls through to the legacy path below instead, which reproduces
+      today's behavior exactly rather than recording a request_changes
+      verdict with nothing for a rework brief to act on.
+
+    Returns ``None`` when the report is absent, UNAVAILABLE, or semantically
+    invalid (so the caller skips the PR rather than recording a wrong
+    verdict).
     """
     if not report_text or not report_text.strip():
         return None
@@ -334,7 +429,24 @@ def parse_cross_family_verdict(report_text: str) -> tuple[str, str] | None:
     body = extract_report_body(report_text)
     if not report_body_is_valid(body):
         return None
-    # Extract the verdict section as the summary.
+
+    has_blocker_or_major = bool(_BLOCKER_OR_MAJOR_RE.search(body))
+
+    json_verdict = _find_json_verdict(body)
+    if json_verdict is not None:
+        decision = json_verdict.decision
+        if has_blocker_or_major and decision == "approved":
+            decision = "request_changes"
+        if decision != "request_changes" or json_verdict.required_changes:
+            return CrossFamilyVerdict(
+                decision=decision,
+                summary=json_verdict.summary,
+                required_changes=json_verdict.required_changes,
+            )
+
+    # Legacy path: no JSON verdict block, or one that failed the
+    # mandatory-required_changes contract above. Extract the verdict
+    # section as the summary — logic unchanged from the pre-JSON parser.
     summary = ""
     verdict_match = _VERDICT_RE.search(body)
     if verdict_match:
@@ -351,13 +463,20 @@ def parse_cross_family_verdict(report_text: str) -> tuple[str, str] | None:
                 break
             lines.append(stripped)
         summary = " ".join(lines)[:500]
-    if _BLOCKER_OR_MAJOR_RE.search(body):
-        return "request_changes", summary or "Cross-family review found BLOCKER/MAJOR findings"
-    return "approved", summary or "Cross-family review found no BLOCKER or MAJOR findings"
+    if has_blocker_or_major:
+        return CrossFamilyVerdict(
+            decision="request_changes",
+            summary=summary or "Cross-family review found BLOCKER/MAJOR findings",
+        )
+    return CrossFamilyVerdict(
+        decision="approved",
+        summary=summary or "Cross-family review found no BLOCKER or MAJOR findings",
+    )
 
 
 __all__ = [
     "CrossFamilyResult",
+    "CrossFamilyVerdict",
     "render_command",
     "run_cross_family_review",
     "extract_report_body",
