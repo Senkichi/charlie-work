@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
+from charlie_work.paths import resolved_layout
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import _set_reviewer_quota_exhausted_with_backoff
 
@@ -136,7 +137,7 @@ def test_probe_backoff_resets_on_successful_verdict_reap(monkeypatch, tmp_path) 
         }
         save_state(app.paths.state_file, state)
 
-    reviews_dir = tmp_path / app.config.review_dispatch.reviews_dir
+    reviews_dir = resolved_layout(app.config, tmp_path).reviews_dir
     reviews_dir.mkdir(parents=True, exist_ok=True)
     log_path = reviews_dir / "issue-100-review.claude.log"
     log_path.write_text(

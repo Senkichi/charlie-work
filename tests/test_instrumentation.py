@@ -286,6 +286,31 @@ def test_level_classification(tmp_path: Path) -> None:
     assert levels["loop_started"] == "info"
 
 
+def test_fleet_pass_config_error_classified_and_queryable_by_level(tmp_path: Path) -> None:
+    """#6-G: a lane-startup failure is classified as an error and reachable
+    through query_events(level="error") without any new query infrastructure
+    (the plan's explicit constraint for the events.db side of the fix)."""
+    state_path = tmp_path / "state.json"
+    log_event(
+        state_path,
+        "fleet_pass_config_error",
+        {
+            "repo_key": "owner/repo",
+            "error": "ConfigError: unknown key(s) in config section 'cross_family': auto_verdict",
+        },
+        repo="owner/repo",
+    )
+
+    events = read_event_log(state_path)
+    assert events[0]["level"] == "error"
+
+    by_level = query_events(state_path, level="error")
+    assert len(by_level) == 1
+    assert by_level[0]["kind"] == "fleet_pass_config_error"
+    assert by_level[0]["payload"]["repo_key"] == "owner/repo"
+    assert by_level[0]["repo"] == "owner/repo"
+
+
 def test_query_events_by_kind(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     log_event(state_path, "dispatch", {"issue": 1})
