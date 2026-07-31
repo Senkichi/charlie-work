@@ -60,6 +60,24 @@ PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # object, and on the REST path it is already present in the payload as
 # head.sha, so adding it costs neither an extra request nor a graph walk.
 MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+# Fields needed by `charlie closing-keyword-check` (issue #790): the gate only
+# scans PR body/title text for closing keywords and resolves the PR's own
+# declared-target binding via linked_issue_number(), which reads headRefName
+# and is_cross_repository. It touches no CI/review/label state at all, so it
+# must not go through the general-purpose PR_VIEW_FIELDS -- that list's
+# `statusCheckRollup` forces gh's GraphQL query to walk the PR's check-run
+# connection, which the default Actions GITHUB_TOKEN cannot read by default.
+# This surfaced twice on the same branch, each a step deeper into the same
+# query: run 30607061237 ("repository.pullRequest" itself inaccessible,
+# fixed by granting `pull-requests: read`), then run 30609781476
+# ("...statusCheckRollup.nodes.0.commit.statusCheckRollup" inaccessible one
+# level further in, before `checks: read` had been granted at all). Rather
+# than keep granting one nested-connection scope at a time and re-running to
+# find the next one, the fix is at the query layer: the gate never needed
+# statusCheckRollup in the first place, so a narrow field list sidesteps the
+# whole class of integration-context permission gaps instead of chasing them
+# field by field.
+CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,isCrossRepository"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
@@ -662,14 +680,24 @@ class GitHub:
                 matched.append(pr)
         return _MergedPRSearchResult(matched, ok=True)
 
-    def pr_view(self, number: int) -> dict[str, Any]:
+    def pr_view(self, number: int, *, fields: str = PR_VIEW_FIELDS) -> dict[str, Any]:
+        """Fetch a PR via ``gh pr view --json <fields>``.
+
+        ``fields`` defaults to the general-purpose ``PR_VIEW_FIELDS`` (CI/review/
+        label state included). Callers that only need a narrow slice -- e.g.
+        the closing-keyword-check gate, which never touches CI status and
+        must not risk `statusCheckRollup`'s token-scope failure (see
+        `CLOSING_KEYWORD_PR_FIELDS`) -- should pass their own narrower field
+        list rather than filtering the wide result after the fact, so the gh
+        invocation itself never requests a field it doesn't need.
+        """
         result = self.run(
             [
                 "pr",
                 "view",
                 str(number),
                 "--json",
-                PR_VIEW_FIELDS,
+                fields,
             ],
             json_output=True,
         )

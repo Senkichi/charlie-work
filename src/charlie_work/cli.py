@@ -16,7 +16,13 @@ from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import compute_api_worker_fleet_report, fleet_loop, run_fleet_supervise
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
-from .github import GitHub, GitHubError, defang_closing_keywords, linked_issue_number
+from .github import (
+    CLOSING_KEYWORD_PR_FIELDS,
+    GitHub,
+    GitHubError,
+    defang_closing_keywords,
+    linked_issue_number,
+)
 from . import layout
 from .logging_setup import configure_logging
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -430,25 +436,30 @@ def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
 def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult:
     """CI gate (issue #790): fail on any unnegated closing keyword pointing off-target.
 
-    Fetches the PR's body/labels/branch (`GitHub.pr_view`) and every commit's
-    raw message (`GitHub.pr_commits` — the REST endpoint, not `gh pr view
-    --json commits`, whose GraphQL fields truncate/corrupt long commit
-    messages; see `GitHub.pr_commits`'s docstring). The PR's own declared
-    target issue is resolved the same way charlie-work's own label-transition
-    binding resolves it (`linked_issue_number`: same-repo branch-prefix
-    first, then an unnegated closing keyword in the PR's own title/body) —
-    that single number is the only exemption `find_unexpected_closing_references`
-    allows. Everything else it finds is a reference GitHub's native
-    auto-close-on-merge will act on regardless of what this codebase intends,
-    because that GitHub feature scans PR body + every commit message with no
-    negation awareness (issue #790; PR #788's own commit text is the
-    regression fixture proving this).
+    Fetches the PR's title/body/branch (`GitHub.pr_view`, deliberately scoped
+    to `CLOSING_KEYWORD_PR_FIELDS` rather than the general-purpose
+    `PR_VIEW_FIELDS` — this gate never touches CI/review/label state, and
+    `PR_VIEW_FIELDS`'s `statusCheckRollup` triggers a nested GraphQL
+    connection the default Actions `GITHUB_TOKEN` cannot read without
+    additional scope grants; see `CLOSING_KEYWORD_PR_FIELDS`'s docstring for
+    the two live failures this caused) and every commit's raw message
+    (`GitHub.pr_commits` — the REST endpoint, not `gh pr view --json commits`, whose GraphQL fields
+    truncate/corrupt long commit messages; see `GitHub.pr_commits`'s
+    docstring). The PR's own declared target issue is resolved the same way
+    charlie-work's own label-transition binding resolves it
+    (`linked_issue_number`: same-repo branch-prefix first, then an unnegated
+    closing keyword in the PR's own title/body) — that single number is the
+    only exemption `find_unexpected_closing_references` allows. Everything
+    else it finds is a reference GitHub's native auto-close-on-merge will act
+    on regardless of what this codebase intends, because that GitHub feature
+    scans PR body + every commit message with no negation awareness (issue
+    #790; PR #788's own commit text is the regression fixture proving this).
     """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
 
-    pr = gh.pr_view(args.pr)
+    pr = gh.pr_view(args.pr, fields=CLOSING_KEYWORD_PR_FIELDS)
     if not pr:
         return CommandResult(False, f"closing-keyword-check: could not fetch PR #{args.pr}", {})
 

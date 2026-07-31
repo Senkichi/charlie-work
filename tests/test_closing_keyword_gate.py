@@ -30,7 +30,12 @@ from charlie_work.closing_keyword_gate import (
     find_unexpected_closing_references,
 )
 from charlie_work.config import OrchestratorConfig
-from charlie_work.github import GitHub, GitHubRunResult, iter_unnegated_closing_keyword_matches
+from charlie_work.github import (
+    CLOSING_KEYWORD_PR_FIELDS,
+    GitHub,
+    GitHubRunResult,
+    iter_unnegated_closing_keyword_matches,
+)
 from charlie_work.github import linked_issue_number
 
 # --- find_unexpected_closing_references: core scanning behavior ---
@@ -249,7 +254,7 @@ class _FakeGitHubForCLI:
     def __init__(self, *args, **kwargs) -> None:
         pass
 
-    def pr_view(self, number: int):
+    def pr_view(self, number: int, *, fields: str | None = None):
         return {
             "number": number,
             "body": "Fixes #999999",
@@ -308,3 +313,73 @@ def test_cli_closing_keyword_check_reports_fetch_failure(monkeypatch, tmp_path) 
 
     assert result.ok is False
     assert "commits" in result.message
+
+
+# --- Regression: CI failure on run 30609781476 (statusCheckRollup) ---
+#
+# `_FakeGitHubForCLI` above stubs `GitHub.pr_view` entirely and returns every
+# field the gate could ever want regardless of what was actually requested --
+# it would pass even if `run_closing_keyword_check_command` asked `gh` for
+# every PR_VIEW_FIELDS entry, including `statusCheckRollup`. That is exactly
+# what shipped and broke CI: the real `GitHub.pr_view()` requested
+# `statusCheckRollup`, which GraphQL: Resource not accessible by integration
+# under the default Actions GITHUB_TOKEN (observed live, run 30609781476,
+# before `checks: read` had been granted at all). Rather than grant that
+# scope and re-run to see whether it's sufficient for this nested
+# connection, the fix removes the need for the field entirely. The tests
+# below exercise the REAL `GitHub.pr_view()` -> `GitHub.run()` call path
+# (only the lowest-level subprocess wrapper is mocked) so a regression back
+# to the wide query fails loudly here instead of only in CI.
+
+
+def test_closing_keyword_pr_fields_excludes_statuscheckrollup() -> None:
+    # Guards the query contract directly: whatever CLOSING_KEYWORD_PR_FIELDS
+    # is defined as, it must never grow to include the field that triggered
+    # the token-scope failure -- widening it back is the exact regression
+    # this issue is about.
+    requested = set(CLOSING_KEYWORD_PR_FIELDS.split(","))
+    assert "statusCheckRollup" not in requested
+    assert requested == {"title", "body", "headRefName", "isCrossRepository"}
+
+
+def test_cli_closing_keyword_check_queries_narrow_pr_view_fields_end_to_end(
+    monkeypatch, tmp_path
+) -> None:
+    def fake_run(self, args, *, json_output=False, allow_failure=False):
+        if args[:2] == ["pr", "view"]:
+            fields = set(args[args.index("--json") + 1].split(","))
+            # This is the load-bearing assertion: a fake that unconditionally
+            # returns every field (like _FakeGitHubForCLI above) can't catch
+            # a regression to the wide PR_VIEW_FIELDS query -- this one
+            # inspects the actual `gh pr view --json <fields>` argv the CLI
+            # builds, the same argv `gh` itself would reject the
+            # statusCheckRollup portion of under a restricted Actions token.
+            assert fields == {"title", "body", "headRefName", "isCrossRepository"}, (
+                "closing-keyword-check must query CLOSING_KEYWORD_PR_FIELDS only -- "
+                f"got {sorted(fields)}, which would re-trigger the statusCheckRollup "
+                "GraphQL failure from run 30609781476"
+            )
+            return {
+                "title": "",
+                "body": "Fixes #999999",
+                "headRefName": "agent/issue-999999-do-thing",
+                "isCrossRepository": False,
+            }
+        if args[:1] == ["api"]:
+            return [{"commit": {"message": "fix: unrelated cleanup\n\nFixes #999997 as well"}}]
+        raise AssertionError(f"unexpected gh invocation in this test: {args}")
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    # Deliberately NOT monkeypatching cli_module.GitHub here -- the real
+    # GitHub class must be constructed so its real pr_view()/pr_commits()
+    # methods build the argv under test, with only the subprocess-level
+    # run() mocked out.
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(999992))
+
+    assert result.ok is False
+    assert result.data["findings"] == [
+        {"issue_number": 999997, "source": "commit #1", "matched_text": "Fixes #999997"}
+    ]
