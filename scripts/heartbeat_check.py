@@ -253,12 +253,20 @@ def get_dispatch_cap(config_path: Path) -> int | None:
 # --------------------------------------------------------------------------
 
 
-def check_dispatch_throttle(report: Report, repo: RepoInfo) -> None:
+def check_dispatch_throttle(
+    report: Report, repo: RepoInfo, *, now: datetime | None = None
+) -> None:
     """Report the provider throttle cooldown (state.json's throttled_until).
 
     Being throttled is normal self-protection (OK-level), but the line must
     always print so a zero-dispatch beat is instantly explainable. Only an
     unusually long cooldown (beyond DISPATCH_THROTTLE_MAX_MINUTES) is an anomaly.
+
+    ``now`` is the injectable clock (issue #828): defaults to
+    ``datetime.now(timezone.utc)`` when not supplied, so production behavior
+    is byte-identical. Callers running multiple checks in one pass (see
+    ``main``) should sample ``now`` once and pass the same value to every
+    check instead of letting each check independently race the wall clock.
     """
     check = f"dispatch-throttle {repo.slug}"
     state_json = repo.state_dir / "state.json"
@@ -273,12 +281,12 @@ def check_dispatch_throttle(report: Report, repo: RepoInfo) -> None:
 
     throttled_until_raw = data.get("throttled_until") if isinstance(data, dict) else None
     until = parse_iso(throttled_until_raw)
-    now = datetime.now(timezone.utc)
-    if until is None or until <= now:
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
+    if until is None or until <= resolved_now:
         report.ok(check, "none")
         return
 
-    remaining_min = round((until - now).total_seconds() / 60)
+    remaining_min = round((until - resolved_now).total_seconds() / 60)
     facts = f"throttled until {throttled_until_raw} ({remaining_min} min remaining)"
     if remaining_min > DISPATCH_THROTTLE_MAX_MINUTES:
         report.anom(
@@ -296,7 +304,10 @@ def check_dispatch_coverage(
     skip_delta: bool,
     blocked_numbers: set[int] | None,
     blocked_err: str,
+    *,
+    now: datetime | None = None,
 ) -> None:
+    """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
     check = f"dispatch-coverage {repo.slug}"
     args = [
         "issue",
@@ -360,12 +371,12 @@ def check_dispatch_coverage(
                 )
         new_repo_state["dispatchable_issues"] = sorted(cur_dispatchable)
 
-    now = datetime.now(timezone.utc)
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
     stale_queued = []
     for number, updated in queued:
         if updated is None:
             continue
-        age_min = (now - updated).total_seconds() / 60
+        age_min = (resolved_now - updated).total_seconds() / 60
         if age_min > QUEUED_STALE_MINUTES:
             stale_queued.append((number, round(age_min)))
     if stale_queued:
@@ -388,7 +399,7 @@ def check_dispatch_coverage(
     else:
         report.ok(check, facts)
 
-    check_dispatch_throttle(report, repo)
+    check_dispatch_throttle(report, repo, now=resolved_now)
     check_in_progress_staleness(
         report, repo, in_progress, prev_repo_state, new_repo_state, skip_delta
     )
@@ -539,7 +550,8 @@ def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
     return newest
 
 
-def check_review_liveness(report: Report, repo: RepoInfo) -> None:
+def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | None = None) -> None:
+    """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
     check = f"review-liveness {repo.slug}"
     prs_dir = repo.state_dir / "prs"
     if not prs_dir.exists():
@@ -569,7 +581,7 @@ def check_review_liveness(report: Report, repo: RepoInfo) -> None:
     if not isinstance(prs_state, dict):
         prs_state = {}
 
-    now = datetime.now(timezone.utc)
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
     open_claims = 0
     stale: list[str] = []
     claims: list[tuple[int, int, str]] = []
@@ -604,7 +616,7 @@ def check_review_liveness(report: Report, repo: RepoInfo) -> None:
             # primary clock (issue #517).
             claim_time = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
 
-        age_min = (now - claim_time).total_seconds() / 60
+        age_min = (resolved_now - claim_time).total_seconds() / 60
         age_rounded = round(age_min)
 
         pid_alive = _reviewer_pid_alive(pr_state)
@@ -668,7 +680,8 @@ def check_dispatch_failures(report: Report, repo: RepoInfo, baseline: datetime) 
         report.ok(check, facts)
 
 
-def check_log_freshness(report: Report, repo: RepoInfo) -> None:
+def check_log_freshness(report: Report, repo: RepoInfo, *, now: datetime | None = None) -> None:
+    """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
     check = f"log-freshness {repo.slug}"
     candidates = list(repo.state_dir.glob("*.log"))
     state_json = repo.state_dir / "state.json"
@@ -682,9 +695,9 @@ def check_log_freshness(report: Report, repo: RepoInfo) -> None:
         return
 
     freshest = max(candidates, key=lambda p: p.stat().st_mtime)
-    now = datetime.now(timezone.utc)
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
     mtime = datetime.fromtimestamp(freshest.stat().st_mtime, tz=timezone.utc)
-    age_min = (now - mtime).total_seconds() / 60
+    age_min = (resolved_now - mtime).total_seconds() / 60
 
     facts = f"freshest={freshest.name} age={round(age_min)}m"
     if age_min > LOG_FRESHNESS_STALE_MINUTES:
@@ -877,6 +890,10 @@ def main() -> int:
 
     prev_state = load_state()
     prev_last_beat_at = parse_iso(prev_state.get("last_beat_at"))
+    # Sampled once for this entire beat (issue #828) and threaded into every
+    # sub-check below instead of each one independently racing the wall
+    # clock -- keeps all checks in one run reporting against a single
+    # consistent instant, and makes the run's own last_beat_at exact.
     now = datetime.now(timezone.utc)
     baseline = prev_last_beat_at or (now - timedelta(minutes=LOG_FRESHNESS_STALE_MINUTES))
     skip_delta = prev_last_beat_at is not None and (now - prev_last_beat_at) < timedelta(
@@ -904,10 +921,11 @@ def main() -> int:
             skip_delta,
             blocked_by_repo.get(repo.slug),
             blocked_err,
+            now=now,
         )
-        check_review_liveness(report, repo)
+        check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
-        check_log_freshness(report, repo)
+        check_log_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
         new_state["repos"][repo.slug] = new_repo_state
 
