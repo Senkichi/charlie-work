@@ -3624,6 +3624,14 @@ def test_push_branch_publishes_and_verifies(tmp_path: Path) -> None:
     remove_worktree(repo, info.path, branch="agent/issue-4")
 
 
+def test_push_branch_rejects_invalid_ref_name(tmp_path: Path) -> None:
+    """Invalid ref names are rejected before any git argv is built (issue #659)."""
+    ok, error = push_branch(tmp_path, "--exec=foo")
+    assert not ok
+    assert error is not None
+    assert "not a valid git ref name" in error
+
+
 def test_recovery_aborts_when_worker_pid_alive(tmp_path: Path) -> None:
     """Issue #282: recovery must not remove a worktree if the recorded worker PID is still alive."""
     repo_root = tmp_path / "repo"

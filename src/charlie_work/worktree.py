@@ -2667,6 +2667,11 @@ def push_branch(
     Returns ``(ok, error)``. Pushes can fail silently on some transports, so the
     remote branch tip is explicitly checked and compared to the local branch tip.
     """
+    try:
+        branch = require_valid_ref_name(branch, context="push_branch branch")
+    except ValueError as exc:
+        return False, str(exc)
+
     cwd = worktree_path if worktree_path else repo_root
     push_result = run_captured(
         ["git", "push", "origin", branch],
