@@ -219,43 +219,50 @@ CATEGORY_ORDER = (CROSS_FAMILY_COLLAPSE, SYNTHETIC_CI_FAILURE, REAL_REVIEWER_PRO
 
 
 def derive_cross_family_collapse_sentinel() -> str:
-    """Derive the generic-collapse fallback string via the REAL parser.
+    """Return the legacy generic-collapse fallback string, for classifying
+    PRE-issue-#784 on-disk verdicts.
 
-    ``cross_family.parse_cross_family_verdict`` (src/charlie_work/
-    cross_family.py:396-474) returns a ``CrossFamilyVerdict`` dataclass (or
-    ``None``) -- NOT a ``(decision, summary)`` tuple. Its legacy fallback
-    path (cross_family.py:466-470) returns the literal constant "Cross-family
-    review found BLOCKER/MAJOR findings" as ``.summary`` whenever a
-    BLOCKER/MAJOR severity marker is present but ``_VERDICT_RE`` fails to
-    find a ``Verdict:`` marker to extract a real summary from. Deriving it
-    here by calling the real function with a crafted probe -- rather than
-    hardcoding a second copy of the literal -- means this classifier cannot
-    silently drift from the parser it is measuring.
+    This function used to derive the sentinel by calling the real parser
+    with a crafted BLOCKER-only/no-``Verdict:``-marker probe (its
+    docstring's own "F5", per ``docs/plans/rework-findings-channel.md``).
+    Issue #784 IS that rewrite: ``cross_family.parse_cross_family_verdict``'s
+    legacy fallback can no longer construct a content-free
+    ``CrossFamilyVerdict`` for that exact shape at all --
+    ``CrossFamilyVerdict.__post_init__`` now raises on it, and the parser
+    catches that and returns a ``MalformedCrossFamilyVerdict`` instead.
+    Deriving the historical literal by probing the live parser is therefore
+    no longer possible; that capability is precisely what #784 removed, by
+    design (unrepresentable content-free verdicts is the whole point of the
+    fix).
 
-    Raises RuntimeError (loudly, not silently) if the parser's return shape
-    or behavior no longer matches what this probe expects. F5 (plan section
-    6) rewrites this exact function; if F5 changes the contract, this probe
-    must be re-validated by a human, not silently misclassify every
-    cross-family verdict as "real reviewer prose".
+    The literal itself survives as ``cross_family.LEGACY_VACUOUS_SUMMARY``,
+    exported specifically so this script and
+    ``workflow._is_carry_forward_eligible`` share one source of truth for
+    recognizing the 8 pre-#784 broken records rather than each hardcoding a
+    second copy. This function still probes the live parser with the same
+    input as before -- not to derive the string, but to prove #784's fix is
+    actually live in the code under test (not just merged elsewhere) before
+    trusting the historical constant for classification.
+
+    Raises RuntimeError (loudly, not silently) if the live parser's
+    behavior for this probe is neither the expected post-#784 shape
+    (``MalformedCrossFamilyVerdict``) nor recognizable at all -- so a future
+    behavior change is caught, not silently misclassified as "real reviewer
+    prose".
     """
     probe = "## Report\n\n**BLOCKER** unparseable body with no Verdict: marker\n"
     result = cross_family.parse_cross_family_verdict(probe)
-    if not isinstance(result, cross_family.CrossFamilyVerdict):
+    if not isinstance(result, cross_family.MalformedCrossFamilyVerdict):
         raise RuntimeError(
             "cross_family.parse_cross_family_verdict returned an unexpected "
             f"shape ({result!r}) for the generic-collapse sentinel probe. "
-            "The parser's contract has likely changed (see F5 in docs/plans/"
-            "rework-findings-channel.md) -- update this probe, do not ignore "
-            "this error."
+            "Expected MalformedCrossFamilyVerdict (issue #784's fix): a "
+            "BLOCKER/MAJOR marker with no extractable summary must no "
+            "longer construct a content-free CrossFamilyVerdict. Update "
+            "this probe or investigate a regression -- do not ignore this "
+            "error."
         )
-    if result.decision != "request_changes" or "BLOCKER" not in result.summary.upper():
-        raise RuntimeError(
-            f"cross_family.parse_cross_family_verdict returned {result!r} "
-            "for a synthetic BLOCKER-only probe with no Verdict: marker -- "
-            "this does not look like the known generic-collapse fallback. "
-            "Refusing to use it as a classification sentinel."
-        )
-    return result.summary
+    return cross_family.LEGACY_VACUOUS_SUMMARY
 
 
 #: Mirrors the f-string template at src/charlie_work/workflow.py:7231:
