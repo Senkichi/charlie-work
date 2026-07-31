@@ -289,18 +289,30 @@ def test_stalled_sweep_falls_back_when_no_clock_reset(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    # frozen_now (issue #828) is injected so the fallback-window assertion
+    # below is exact instead of racing wall-clock time under CI runner
+    # contention -- no downstream real-clock-dependent step follows in this
+    # test, so no future offset is needed (contrast
+    # test_loop_classifies_dead_sessions_and_sets_throttle_state in
+    # test_charlie_work.py, which offsets +1h because a later dispatch()
+    # call reads real wall clock).
+    frozen_now = datetime.now(UTC)
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root, now=frozen_now)
 
     state = load_state(state_file)
     qe_events = [e for e in state.get("events", []) if e.get("kind") == "review_quota_exhausted"]
     assert len(qe_events) == 1
     payload = qe_events[0]["payload"]
     assert payload["reset_at"] is None
-    # Fixed window fallback: throttled_until is ~now + quota_reset_hours, not a parsed reset.
+    # Fixed window fallback: no clock-time reset was parsed, so
+    # _set_reviewer_quota_exhausted_with_backoff falls back to
+    # frozen_now + quota_reset_hours exactly (see workflow.py) -- exact
+    # equality, no wall-clock tolerance window.
     throttled = _iso_to_dt(payload["throttled_until"])
-    now = datetime.now(UTC)
-    assert throttled > now
-    assert throttled <= now + timedelta(hours=config.review_dispatch.quota_reset_hours + 1)
+    expected = (frozen_now + timedelta(hours=config.review_dispatch.quota_reset_hours)).replace(
+        microsecond=0
+    )
+    assert throttled == expected
 
 
 # ---------------------------------------------------------------------------

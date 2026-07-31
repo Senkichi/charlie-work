@@ -139,6 +139,7 @@ def compute_api_worker_fleet_report(
     *,
     fleet_dir_override: str | None = None,
     preloaded_configs: dict[str, OrchestratorConfig] | None = None,
+    now: datetime.datetime | None = None,
 ) -> ApiWorkerFleetReport | None:
     """Compute the fleet-wide api-worker report line (issue #483).
 
@@ -162,6 +163,12 @@ def compute_api_worker_fleet_report(
     a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
     filesystem mutation. All errors surface as report values (zeroed spend,
     zero live), never raised.
+
+    ``now`` is the injectable clock used to derive the ledger's ``today`` key
+    (issue #828): defaults to ``datetime.now(UTC)`` when not supplied, so
+    production behavior is byte-identical. Without it, the day-granularity
+    lookup below can miss a UTC-midnight boundary crossed between a caller
+    writing the ledger and this function reading it.
     """
     from datetime import UTC, datetime
 
@@ -219,7 +226,8 @@ def compute_api_worker_fleet_report(
         try:
             ledger_file = ledger_path(Path(state_dir_str))
             ledger = load_ledger(ledger_file)
-            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            resolved_now = now if now is not None else datetime.now(UTC)
+            today = resolved_now.strftime("%Y-%m-%d")
             status = budget_status(ledger, rep_config.api_worker.budget, today)
             today_usd = status.spent_today_usd
             lifetime_usd = status.lifetime_spent_usd

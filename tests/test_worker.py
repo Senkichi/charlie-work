@@ -1703,7 +1703,13 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
         )
     )
 
-    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    # Issue #828: freeze the clock and inject it so the assertion below is an
+    # exact equality, not a wall-clock-tolerance window that a CI stall (the
+    # same failure class as PRs #700/#690) can blow through.
+    frozen_now = datetime.now(UTC)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, now=frozen_now
+    )
 
     assert result == []
     assert killed == []
@@ -1714,17 +1720,10 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
     assert sidecar["rate_limit_defer_until"] is not None
     defer_until = datetime.fromisoformat(sidecar["rate_limit_defer_until"].replace("Z", "+00:00"))
     margin_seconds = config.runtime.throttle_resume_margin_s
-    expected_min = (
-        datetime.now(UTC)
-        + timedelta(minutes=10 + 2, seconds=margin_seconds)
-        - timedelta(minutes=1)
+    expected = (frozen_now + timedelta(minutes=10 + 2, seconds=margin_seconds)).replace(
+        microsecond=0
     )
-    expected_max = (
-        datetime.now(UTC)
-        + timedelta(minutes=10 + 2, seconds=margin_seconds)
-        + timedelta(minutes=1)
-    )
-    assert expected_min <= defer_until <= expected_max
+    assert defer_until == expected
 
     state = json.loads(state_file.read_text(encoding="utf-8"))
     events = [e for e in state.get("events", []) if e.get("kind") == "session_rate_limit_deferred"]
@@ -1790,7 +1789,12 @@ def test_deferred_worker_past_deadline_is_killed(
         "Error: Reached overall message rate limit. Please try again later. "
         "Your limit will reset in 10 minutes.\n"
     )
-    past_defer = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    # Issue #828: freeze the clock and inject it into the call below so the
+    # deadline comparison is deterministic rather than depending on two
+    # independently-sampled wall-clock reads (setup here vs. the sweep's own
+    # internal sample) staying within 5 minutes of each other under CI load.
+    frozen_now = datetime.now(UTC)
+    past_defer = (frozen_now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
     sessions_dir, state_file, _ = _make_stalled_devin_session(
         tmp_path, issue_number, log_text, rate_limit_defer_until=past_defer
     )
@@ -1810,7 +1814,9 @@ def test_deferred_worker_past_deadline_is_killed(
         )
     )
 
-    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, now=frozen_now
+    )
 
     assert result == [{"issue": issue_number, "pid": 99999}]
     assert killed == [99999]

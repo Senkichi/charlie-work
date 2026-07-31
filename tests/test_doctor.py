@@ -1102,7 +1102,17 @@ def test_doctor_api_worker_corrupt_ledger(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_doctor_api_worker_headroom_math(tmp_path: Path, monkeypatch) -> None:
-    """Enabled with a ledger showing spend → headroom check reports correct math."""
+    """Enabled with a ledger showing spend -> headroom check reports correct math.
+
+    Regression for issue #828 (originally #822's class): production derives
+    its own `today = now.strftime("%Y-%m-%d")` ledger key independently of
+    this test's fixture write. If the wall clock crosses UTC midnight between
+    the write and `run_doctor`'s read, the lookup misses and the report shows
+    $0.00 instead of the expected spend -- a real (if rare) production defect,
+    not just a test flake. `now` is frozen and passed to both the fixture and
+    `run_doctor` so the ledger key always matches regardless of any stall or
+    midnight boundary in between.
+    """
     monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-value")
     budget = ApiBudgetConfig(
         max_usd_per_session=0.0,
@@ -1120,7 +1130,8 @@ def test_doctor_api_worker_headroom_math(tmp_path: Path, monkeypatch) -> None:
     # Write a ledger with today's spend and lifetime spend.
     from datetime import UTC, datetime
 
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    frozen_now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    today = frozen_now.strftime("%Y-%m-%d")
     ledger_data = {
         "days": {
             today: {
@@ -1137,7 +1148,7 @@ def test_doctor_api_worker_headroom_math(tmp_path: Path, monkeypatch) -> None:
     ledger_file.write_text(json.dumps(ledger_data), encoding="utf-8")
     gh = FakeDoctorGitHub(labels=config.labels.all)
 
-    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh, now=frozen_now)
 
     by_name = {check.name: check for check in checks}
     headroom = by_name["api_worker budget headroom"]
@@ -1153,7 +1164,13 @@ def test_doctor_api_worker_headroom_math(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_doctor_api_worker_headroom_exhausted(tmp_path: Path, monkeypatch) -> None:
-    """Enabled with spend at caps → headroom check fails (exhausted)."""
+    """Enabled with spend at caps -> headroom check fails (exhausted).
+
+    Regression for issue #828 (originally #822's class): same UTC-midnight
+    ledger-key race as ``test_doctor_api_worker_headroom_math`` above -- see
+    that test's docstring. ``now`` is frozen and passed to both the fixture
+    and ``run_doctor``.
+    """
     monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-value")
     budget = ApiBudgetConfig(
         max_usd_per_session=0.0,
@@ -1170,9 +1187,10 @@ def test_doctor_api_worker_headroom_exhausted(tmp_path: Path, monkeypatch) -> No
 
     from datetime import UTC, datetime
 
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
-    # Daily: 4.50 spent + 1.0 reserve = 5.50 > 5.0 → daily exhausted
-    # Lifetime: 15.00 >= 15.0 → lifetime exhausted
+    frozen_now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    today = frozen_now.strftime("%Y-%m-%d")
+    # Daily: 4.50 spent + 1.0 reserve = 5.50 > 5.0 -> daily exhausted
+    # Lifetime: 15.00 >= 15.0 -> lifetime exhausted
     ledger_data = {
         "days": {
             today: {
@@ -1189,7 +1207,7 @@ def test_doctor_api_worker_headroom_exhausted(tmp_path: Path, monkeypatch) -> No
     ledger_file.write_text(json.dumps(ledger_data), encoding="utf-8")
     gh = FakeDoctorGitHub(labels=config.labels.all)
 
-    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh, now=frozen_now)
 
     by_name = {check.name: check for check in checks}
     headroom = by_name["api_worker budget headroom"]
@@ -1249,7 +1267,9 @@ def _doctor_allocation_config(*, enabled: bool = True, budget: int = 8) -> Any:
     )
 
 
-def _collect_allocation_checks(config: Any, fleet_dir: Path) -> list[tuple[str, bool, str]]:
+def _collect_allocation_checks(
+    config: Any, fleet_dir: Path, *, now: Any = None
+) -> list[tuple[str, bool, str]]:
     from charlie_work.doctor import _check_runner_allocation
 
     collected: list[tuple[str, bool, str]] = []
@@ -1257,7 +1277,7 @@ def _collect_allocation_checks(config: Any, fleet_dir: Path) -> list[tuple[str, 
     def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
         collected.append((name, ok, detail))
 
-    _check_runner_allocation(add, config, fleet_dir_override=str(fleet_dir))
+    _check_runner_allocation(add, config, fleet_dir_override=str(fleet_dir), now=now)
     return collected
 
 
@@ -1334,13 +1354,22 @@ def _write_allocation_stamp(
     source: Any,
     full_pass_interval_seconds: int | None = None,
     skip_reason: str | None = None,
+    now: Any = None,
 ) -> None:
-    """Write a state file aged ``age_seconds`` (negative = future-dated)."""
+    """Write a state file aged ``age_seconds`` (negative = future-dated).
+
+    ``now`` is the reference instant the age is computed against; defaults to
+    the real wall clock. Pass a frozen value (issue #828) when the caller
+    also passes the same value to ``_collect_allocation_checks`` so a tight
+    downstream assertion cannot race an unbounded CI stall between the write
+    here and the probe's own clock read.
+    """
     import datetime
 
     from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
 
-    when = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=age_seconds)
+    reference = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    when = reference - datetime.timedelta(seconds=age_seconds)
     payload: dict[str, Any] = {"version": 1, "updated_at": when.isoformat(), "repos": {}}
     if source is not None:
         payload["source"] = source
@@ -1390,9 +1419,23 @@ def test_allocation_probe_names_an_unrecognised_writer(tmp_path: Path) -> None:
 
 
 def test_allocation_probe_clamps_a_future_dated_stamp(tmp_path: Path) -> None:
-    """Clock skew must not print a negative age, and must not read as stale."""
-    _write_allocation_stamp(tmp_path, age_seconds=-600, source="prologue")
-    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
+    """Clock skew must not print a negative age, and must not read as stale.
+
+    Regression for issue #828 (originally #822's class): the stamp is
+    future-dated by 600s, and the clamp (doctor.py's non-negative `max(0, ...)`
+    -- preserved, not removed) only reads as exactly "0s ago" while the
+    probe's own `now` sample has not yet caught up to the future-dated
+    `updated_at`. Two independently-sampled `now()`s would flip this the
+    moment a stall pushes the probe's read past 600s after the fixture write
+    -- the same order of magnitude as an observed CI stall. `now` is frozen
+    and passed to both the fixture write and the probe so the comparison is
+    exact regardless of any stall in between.
+    """
+    import datetime
+
+    frozen_now = datetime.datetime(2026, 7, 29, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    _write_allocation_stamp(tmp_path, age_seconds=-600, source="prologue", now=frozen_now)
+    checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path, now=frozen_now)
     _, ok, detail = checks[0]
     assert ok is True
     assert "-" not in detail

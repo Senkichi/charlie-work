@@ -527,6 +527,33 @@ def _is_carry_forward_eligible(decision: dict[str, Any]) -> bool:
     return not _summary_is_vacuous(str(decision.get("summary") or ""))
 
 
+def _escalation_flags(
+    pr_state: dict[str, Any], issue_state: dict[str, Any] | None
+) -> tuple[bool, bool]:
+    """Return ``(pr_escalated, issue_escalated)`` -- the shared escalation check.
+
+    A PR or its linked issue is "escalated" when its state entry's ``status``
+    is exactly ``"escalated"`` (a human has been asked to intervene via
+    ``agent:human-needed``). ``issue_state`` may be ``None`` when the PR has
+    no resolvable linked issue (cross-repo/fork PRs, or branches outside the
+    configured prefix) -- in that case only ``pr_escalated`` can be True.
+
+    This is the single predicate shared by ``review()`` (issue #384: gates
+    ALL packet generation and label transitions at entry, unconditionally,
+    once escalated) and ``merge_ready()`` (issue #833: gates only the
+    specific mutation sites that had NO escalation awareness at all).
+    ``merge_ready()`` deliberately does NOT call this at function entry --
+    several of its remediation lanes must keep running while escalated for
+    an unrelated reason (issue #776; real corpus: issues #592/#648/#606), so
+    a blanket entry gate would silently re-break that fix. See the
+    "escalation policy is per-route" comment inside ``merge_ready()`` for the
+    full breakdown of which lanes exclude "escalated" and which don't.
+    """
+    pr_escalated = pr_state.get("status") == "escalated"
+    issue_escalated = issue_state is not None and issue_state.get("status") == "escalated"
+    return pr_escalated, issue_escalated
+
+
 # Statuses that mean an issue already has a rework routed (or an equivalent
 # gate) in flight, or is otherwise spoken for -- shared by every "should I
 # route this PR to rework_requested" check so they cannot drift apart.
@@ -910,13 +937,18 @@ def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> 
 
 
 def _detect_stalled_sessions(
-    sessions_dir: Path, config: OrchestratorConfig
+    sessions_dir: Path, config: OrchestratorConfig, *, now: datetime | None = None
 ) -> list[dict[str, Any]]:
     """Detect stalled sessions (live PID but dead agent) without handling them.
 
     A session is stalled when its PID is alive but its log file's mtime is
     older than the configured threshold, or the log contains a terminal error
     marker. This is a read-only detection function for status/roll-call.
+
+    ``now`` (issue #828) is the injectable clock, following the convention
+    established by PR #827 / ``get_rate_limit_defer_until``: defaults to
+    ``datetime.now(UTC)`` when omitted, so production behavior is
+    byte-identical.
 
     Returns a list of {issue, pid, health, terminal_tool, terminal_reason}
     dicts for stalled sessions. ``health`` distinguishes STALLED from DEAD
@@ -933,7 +965,8 @@ def _detect_stalled_sessions(
         return []
 
     stalled_entries: list[dict[str, Any]] = []
-    now = datetime.now(UTC)
+    if now is None:
+        now = datetime.now(UTC)
 
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
@@ -984,7 +1017,11 @@ def _kill_orphan_pid(pid: int) -> None:
 
 
 def _detect_and_handle_stalled_sessions(
-    sessions_dir: Path, state_file: Path, config: OrchestratorConfig
+    sessions_dir: Path,
+    state_file: Path,
+    config: OrchestratorConfig,
+    *,
+    now: datetime | None = None,
 ) -> list[dict[str, int]]:
     """Detect stalled sessions (live PID but dead agent) and handle them.
 
@@ -1005,6 +1042,14 @@ def _detect_and_handle_stalled_sessions(
     persisted to state.json (same as the dead-session lane) so the next
     dispatch pass defers instead of relaunching into the same window. A
     session_stalled event is logged with the resolved failure_kind.
+
+    ``now`` (issue #828) is the injectable clock for this sweep, following
+    the convention established by PR #827. It is sampled once here and
+    threaded down to ``real_activity_probe_for``, ``classify_worker_health``,
+    ``get_rate_limit_defer_until``, and ``classify_and_record`` so a single
+    pass never straddles two different clock samples. Defaults to
+    ``datetime.now(UTC)`` when omitted, so production behavior is
+    byte-identical.
 
     Returns a list of {issue, pid} dicts for stalled sessions (for exclusion from
     dispatch in the same pass).
@@ -1028,7 +1073,8 @@ def _detect_and_handle_stalled_sessions(
         return []
 
     stalled_entries: list[dict[str, int]] = []
-    now = datetime.now(UTC)
+    if now is None:
+        now = datetime.now(UTC)
 
     def _parse_defer_until(value: str | None) -> datetime | None:
         if not value:
@@ -2362,6 +2408,8 @@ def _detect_and_handle_stalled_reviews(
     state_file: Path,
     config: OrchestratorConfig,
     repo_root: Path,
+    *,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Detect reviewer processes that died without a verdict and free their claims.
 
@@ -2388,7 +2436,17 @@ def _detect_and_handle_stalled_reviews(
     PRs whose log has no parseable verdict fall through to the failed-claim
     retry/backoff path. This function is intentionally simpler than
     ``_detect_and_handle_stalled_sessions``: it performs claim/slot cleanup.
+
+    ``now`` (issue #828) is the injectable clock for this sweep: it seeds
+    ``resolved_now`` below, which both internal ``datetime.now(UTC)`` samples
+    in the throttled-reviewer branch (the parsed-reset-time lookup and the
+    quota-exhaustion backoff) resolve from, instead of each independently
+    racing the wall clock. Defaults to ``datetime.now(UTC)`` when omitted, so
+    production behavior is byte-identical; tests can freeze it and assert
+    exact equality on the resulting ``throttled_until`` instead of a
+    wall-clock-tolerance proximity check.
     """
+    resolved_now = now if now is not None else datetime.now(UTC)
     stalled: list[dict[str, Any]] = []
     sweep_events: list[tuple[str, dict[str, Any]]] = []
     state = load_state_locked(state_file)
@@ -2481,7 +2539,7 @@ def _detect_and_handle_stalled_reviews(
             # already-applied backoff, matching the one-increment-per-wave
             # guard below.
             if throttled and not throttle_backoff_applied:
-                reset_at = parse_reset_clock_time(tail, datetime.now(UTC))
+                reset_at = parse_reset_clock_time(tail, resolved_now)
 
         if throttled:
             # A green flat-interval probe may have already cleared
@@ -2512,7 +2570,7 @@ def _detect_and_handle_stalled_reviews(
                 throttled_until = None
             else:
                 if not throttle_backoff_applied:
-                    now_dt = datetime.now(UTC)
+                    now_dt = resolved_now
                     state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
                         state, config, now_dt, reset_at=reset_at
                     )
@@ -7524,11 +7582,12 @@ class OrchestratorApp:
         # falling through to the janitor gate and losing their escalated marker.
         state = load_state_locked(self.paths.state_file)
         pr_state = state.get("prs", {}).get(str(pr_number), {})
-        pr_escalated = pr_state.get("status") == "escalated"
-        issue_escalated = False
-        if issue_number is not None:
-            issue_state = state.get("issues", {}).get(str(issue_number), {})
-            issue_escalated = issue_state.get("status") == "escalated"
+        issue_state = (
+            state.get("issues", {}).get(str(issue_number), {})
+            if issue_number is not None
+            else None
+        )
+        pr_escalated, issue_escalated = _escalation_flags(pr_state, issue_state)
         if pr_escalated or issue_escalated:
             reason = (
                 f"issue #{issue_number} is escalated; review skipped"
@@ -10839,44 +10898,78 @@ class OrchestratorApp:
             if head_moved and not carried_forward:
                 message = "PR head moved since approval — re-review required"
                 label_error: dict[str, Any] | None = None
-                if issue_number is not None:
-                    result = transition(
-                        self.gh, self.config.labels, issue_number, "review_started"
-                    )
-                    if result.outcome != TransitionOutcome.APPLIED:
-                        label_error = {
-                            "edge": "review_started",
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        }
-                with state_lock(self.paths.state_file):
-                    state = load_state(self.paths.state_file)
-                    state["prs"][str(pr_number)] = {
-                        **state["prs"].get(str(pr_number), {}),
-                        "number": pr_number,
-                        "issue_number": issue_number,
-                        "status": "reviewing",
-                        "head_moved": True,
-                        "reviewed_head_sha": reviewed_head_sha,
-                        "live_head_sha": live_head_sha,
-                        "consecutive_failed_merge_attempts": 0,
-                        "consecutive_stale_base_deferrals": 0,
-                    }
+                # Escalation gate (issue #833). merge_ready()'s escalation
+                # handling is per-route by design, not a single top-of-function
+                # gate: the readiness-no-CI-stall (below), check-failure, and
+                # cross-PR-revert lanes already exclude "escalated"; the
+                # merge-conflict-rework lane deliberately does NOT (issue #776
+                # -- an unrelated-cause escalation must not permanently wall
+                # off a PR from its own capped remediation; real corpus:
+                # issues #592/#648/#606). This head_moved branch had NO
+                # escalation awareness at all: it unconditionally re-applied
+                # the "review_started" label transition and rewrote status to
+                # "reviewing" on every ~30 min loop pass, even for a PR
+                # already flagged agent:human-needed -- a livelock, not a
+                # remediation, because nothing was waiting on the re-review it
+                # kept re-requesting (real corpus: issue #602 / PR #679).
+                # Mirrors review()'s entry gate (which uses the same
+                # ``_escalation_flags`` predicate) but scoped to just these two
+                # mutations, not the whole function, so the merge-conflict-
+                # rework lane a few lines below keeps working.
+                #
+                # State is re-read here rather than reusing a flag computed at
+                # function entry: ``_check_carry_forward``/
+                # ``_update_approval_head`` above, and the merge-conflict-
+                # rework dispatch further below, can each write a new status
+                # for this PR/issue mid-call, so only a read taken at this
+                # exact point is trustworthy.
+                escalation_state = load_state_locked(self.paths.state_file)
+                pr_escalated, issue_escalated = _escalation_flags(
+                    escalation_state.get("prs", {}).get(str(pr_number), {}),
+                    escalation_state.get("issues", {}).get(str(issue_number), {})
+                    if issue_number is not None
+                    else None,
+                )
+                escalated = pr_escalated or issue_escalated
+                if not escalated:
                     if issue_number is not None:
-                        _issue_key = str(issue_number)
-                        _issue_entry = state["issues"].get(_issue_key, {})
-                        state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
-                    state = self._record_event(
-                        state,
-                        "head_moved",
-                        {
-                            "pr_number": pr_number,
+                        result = transition(
+                            self.gh, self.config.labels, issue_number, "review_started"
+                        )
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            label_error = {
+                                "edge": "review_started",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)] = {
+                            **state["prs"].get(str(pr_number), {}),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "status": "reviewing",
+                            "head_moved": True,
                             "reviewed_head_sha": reviewed_head_sha,
                             "live_head_sha": live_head_sha,
-                        },
-                    )
-                    save_state(self.paths.state_file, state)
+                            "consecutive_failed_merge_attempts": 0,
+                            "consecutive_stale_base_deferrals": 0,
+                        }
+                        if issue_number is not None:
+                            _issue_key = str(issue_number)
+                            _issue_entry = state["issues"].get(_issue_key, {})
+                            state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+                        state = self._record_event(
+                            state,
+                            "head_moved",
+                            {
+                                "pr_number": pr_number,
+                                "reviewed_head_sha": reviewed_head_sha,
+                                "live_head_sha": live_head_sha,
+                            },
+                        )
+                        save_state(self.paths.state_file, state)
                 return CommandResult(
                     False,
                     message,
@@ -10890,6 +10983,7 @@ class OrchestratorApp:
                         "live_head_sha": live_head_sha,
                         "review_decision": decision,
                         "label_error": label_error,
+                        "escalated": escalated,
                     },
                 )
             # Genuine merge conflict: gh pr update-branch cannot resolve this.
@@ -13821,12 +13915,18 @@ class OrchestratorApp:
         merge: bool | None = None,
         now: datetime | None = None,
     ) -> CommandResult:
-        # ``now`` (issue #822) is the injectable clock for the dead-session
-        # throttle classification lane -- see
-        # ``_classify_dead_sessions_and_update_throttle_state``. Defaults to
-        # ``datetime.now(UTC)`` there when omitted, so production behavior is
-        # byte-identical; tests can freeze it to assert exact equality on
-        # ``throttled_until`` instead of a wall-clock-tolerance proximity check.
+        # ``now`` (issue #822, extended #828) is this pass's injectable clock.
+        # ``_loop_body`` forwards it, unresolved, to every cadence-gated lane
+        # that samples wall-clock time: dead-session throttle classification
+        # (``_classify_dead_sessions_and_update_throttle_state``), the
+        # stalled-session reaper (``_detect_and_handle_stalled_sessions``),
+        # and the quota-probe/worktree-reclaim/drift-reconcile schedulers
+        # (``_maybe_probe_quota_recovery``, ``_maybe_reclaim_worktrees``,
+        # ``_maybe_reconcile_drift``). Each callee independently defaults to
+        # ``datetime.now(UTC)`` when it receives None, so production behavior
+        # is byte-identical when this argument is omitted (as all current
+        # production callers do); tests can freeze one ``now`` and assert
+        # exact equality instead of a wall-clock-tolerance proximity check.
         return self._loop_impl(limit, merge=merge, now=now)
 
     def _loop_impl(
@@ -13874,7 +13974,7 @@ class OrchestratorApp:
             )
             return result
 
-    def _maybe_probe_quota_recovery(self) -> None:
+    def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
         """Flat-interval Haiku probe for early quota/rate-limit throttle recovery.
 
         Runs every loop pass but is a near-no-op unless a throttle that a
@@ -13904,10 +14004,20 @@ class OrchestratorApp:
           2. Outside the lock: run the actual probe subprocess.
           3. Under the lock again: re-read state (it may have changed while
              unlocked) and apply the outcome.
+
+        ``now`` (issue #828) is the injectable clock for this whole method:
+        both internal ``datetime.now(UTC)`` samples below (the first-arm
+        branch and the red-probe reschedule branch) resolve from the same
+        seeded instant instead of each independently racing the wall clock.
+        Defaults to ``datetime.now(UTC)`` when omitted, so production
+        behavior is byte-identical; tests can freeze it and assert exact
+        equality on the scheduled ``next_probe_at`` instead of a
+        wall-clock-tolerance proximity check.
         """
         if not self.config.quota_probe.enabled:
             return
 
+        resolved_now = now if now is not None else datetime.now(UTC)
         state_file = self.paths.state_file
         with state_lock(state_file):
             state = load_state(state_file)
@@ -13918,10 +14028,7 @@ class OrchestratorApp:
                 return
             if not is_quota_probe_armed(state):
                 next_probe_at = (
-                    (
-                        datetime.now(UTC)
-                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
-                    )
+                    (resolved_now + timedelta(minutes=self.config.quota_probe.interval_minutes))
                     .replace(microsecond=0)
                     .isoformat()
                     .replace("+00:00", "Z")
@@ -13947,10 +14054,7 @@ class OrchestratorApp:
                 state = self._record_event(state, "quota_probe_succeeded", {})
             else:
                 next_probe_at = (
-                    (
-                        datetime.now(UTC)
-                        + timedelta(minutes=self.config.quota_probe.interval_minutes)
-                    )
+                    (resolved_now + timedelta(minutes=self.config.quota_probe.interval_minutes))
                     .replace(microsecond=0)
                     .isoformat()
                     .replace("+00:00", "Z")
@@ -13966,7 +14070,7 @@ class OrchestratorApp:
                 state = self._record_event(state, "quota_probe_failed", {})
             save_state(state_file, state)
 
-    def _maybe_reclaim_worktrees(self) -> dict[str, Any] | None:
+    def _maybe_reclaim_worktrees(self, *, now: datetime | None = None) -> dict[str, Any] | None:
         """Cadence-gated merged-PR worktree reclamation on the fleet pass.
 
         Runs ``clean_worktrees`` -- the same junction-safe, merge-gated,
@@ -14001,9 +14105,18 @@ class OrchestratorApp:
         Returns a small summary dict when the sweep ran (for the loop result's
         ``data``), or ``None`` when reclamation is disabled or not due this
         pass.
+
+        ``now`` (issue #828) is the injectable clock used to compute
+        ``next_run_at`` below, BEFORE the ``clean_worktrees`` call's live
+        ``gh pr view`` fan-out. Defaults to ``datetime.now(UTC)`` when
+        omitted, so production behavior is byte-identical; tests can freeze
+        it and assert exact equality on the scheduled ``next_run_at`` instead
+        of a wall-clock-tolerance proximity check that would otherwise race
+        the fan-out's own duration.
         """
         if not self.config.worktree_reclamation.enabled:
             return None
+        resolved_now = now if now is not None else datetime.now(UTC)
         state_file = self.paths.state_file
         with state_lock(state_file):
             state = load_state(state_file)
@@ -14015,7 +14128,7 @@ class OrchestratorApp:
             # how long the sweep itself takes.
             next_run_at = (
                 (
-                    datetime.now(UTC)
+                    resolved_now
                     + timedelta(minutes=self.config.worktree_reclamation.interval_minutes)
                 )
                 .replace(microsecond=0)
@@ -14060,7 +14173,7 @@ class OrchestratorApp:
             save_state(state_file, state)
         return summary
 
-    def _maybe_reconcile_drift(self) -> None:
+    def _maybe_reconcile_drift(self, *, now: datetime | None = None) -> None:
         """Periodic in-loop repair of GitHub label / state.json divergence.
 
         merge-lane-recovery plan §6-B / D-8. ``OrchestratorApp.reconcile()``
@@ -14143,10 +14256,20 @@ class OrchestratorApp:
         path. A failed pass re-arms the timer like any other outcome, so a
         persistent failure degrades to one logged error per interval instead
         of a hot loop.
+
+        ``now`` (issue #828) is the injectable clock used to compute
+        ``next_reconcile_at`` below, BEFORE ``self._reconcile_locked(...)``
+        acquires ``state_lock`` and does its own (potentially slow) drift
+        detection/repair. Defaults to ``datetime.now(UTC)`` when omitted, so
+        production behavior is byte-identical; tests can freeze it and
+        assert exact equality on the scheduled ``next_reconcile_at`` instead
+        of a wall-clock-tolerance proximity check that would otherwise race
+        the reconcile call's own duration.
         """
         if not self.config.reconcile_pass.enabled:
             return
 
+        resolved_now = now if now is not None else datetime.now(UTC)
         state_file = self.paths.state_file
         with state_lock(state_file):
             state = load_state(state_file)
@@ -14154,7 +14277,7 @@ class OrchestratorApp:
                 return
 
         next_reconcile_at = (
-            (datetime.now(UTC) + timedelta(minutes=self.config.reconcile_pass.interval_minutes))
+            (resolved_now + timedelta(minutes=self.config.reconcile_pass.interval_minutes))
             .replace(microsecond=0)
             .isoformat()
             .replace("+00:00", "Z")
@@ -14647,8 +14770,11 @@ class OrchestratorApp:
         # dispatch lane advanced the counter up to 3x per pass, collapsing the
         # max_inconclusive_probe_deferrals "N passes of grace" into a single pass
         # (issue #343 Finding 2).
+        # now=now (issue #828): forward this pass's clock so the reaper's
+        # rate-limit-defer classification shares one sample with the other
+        # cadence-gated lanes below instead of re-sampling independently.
         loop_stalled_entries = _detect_and_handle_stalled_sessions(
-            sessions_dir, self.paths.state_file, self.config
+            sessions_dir, self.paths.state_file, self.config, now=now
         )
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
@@ -14679,7 +14805,10 @@ class OrchestratorApp:
 
         # Flat-interval Haiku probe for early quota/rate-limit recovery (see
         # docstring): only does real work when a throttle indicator is active.
-        self._maybe_probe_quota_recovery()
+        # `now` (issue #828) is this pass's single injected clock, forwarded
+        # so the probe's own cadence-scheduling samples stay consistent with
+        # the rest of this pass instead of independently racing wall clock.
+        self._maybe_probe_quota_recovery(now=now)
 
         # Periodic in-loop reconcile (merge-lane-recovery §6-B): repairs
         # GitHub label / state.json divergence on a fixed cadence instead of
@@ -14687,7 +14816,7 @@ class OrchestratorApp:
         # the dispatch calls below so labels it repairs (e.g. a stale
         # `needs-rework` on an issue state already marked `escalated`) are
         # visible to this same pass's dispatch decisions, not just the next.
-        self._maybe_reconcile_drift()
+        self._maybe_reconcile_drift(now=now)
 
         # Issue #783: periodic re-evaluation of `mechanical` escalations --
         # the only automated re-entry from `agent:human-needed` for pure
@@ -15084,8 +15213,10 @@ class OrchestratorApp:
         # contends with the dispatch/review/merge lanes for state_lock or
         # GitHub quota during the critical window. Gated by
         # worktree_reclamation.interval_minutes, so it fires at most once per
-        # interval regardless of poll frequency or backlog size.
-        reclamation = self._maybe_reclaim_worktrees()
+        # interval regardless of poll frequency or backlog size. `now`
+        # (issue #828) is this pass's single injected clock -- see
+        # `_loop_body`'s other cadence-gated calls above.
+        reclamation = self._maybe_reclaim_worktrees(now=now)
         if reclamation is not None:
             data["worktrees_reclaimed"] = reclamation
         return CommandResult(
