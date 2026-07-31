@@ -33251,6 +33251,112 @@ def test_rework_brief_omits_required_changes_for_approved_verdict(tmp_path: Path
     assert "rename foo to bar" not in brief
 
 
+def _normalize_ws(text: str) -> str:
+    """Collapse whitespace (including the template's hard line-wraps) so
+    substring assertions don't depend on exact word-wrap columns."""
+    return " ".join(text.split())
+
+
+def test_rework_brief_orders_findings_before_demoted_base_merge_bullet(
+    tmp_path: Path,
+) -> None:
+    """F4 (docs/plans/rework-findings-channel.md, #6): the base-merge bullet
+    used to be the unconditional, first bullet of `## Required behavior`. When
+    a verdict rendered zero findings, that made "merge the base branch" the
+    only concrete instruction in the brief -- workers complied, the head
+    advanced by a merge commit only, and the janitor correctly flagged the
+    result a no-op. The findings-action bullet must now open the section, and
+    the base-merge bullet must be demoted (present, but neither first nor
+    unconditional)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "round-1 summary",
+                "required_changes": ["fix the off-by-one", "add a regression test"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+    }
+    app._write_rework_prompt(pr, 123, "")
+
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    # The findings render well above `## Required behavior` at all.
+    assert brief.index("fix the off-by-one") < brief.index("## Required behavior")
+
+    behavior = brief.split("## Required behavior", 1)[1].split("\n## ", 1)[0]
+    bullets = [_normalize_ws(b) for b in behavior.split("\n- ") if b.strip()]
+    findings_bullet_idx = next(i for i, b in enumerate(bullets) if "the review above" in b)
+    merge_bullet_idx = next(i for i, b in enumerate(bullets) if "merge the PR's base branch" in b)
+
+    # The findings-action bullet opens the section; the base-merge bullet
+    # comes strictly later -- reordered, not just co-present.
+    assert findings_bullet_idx == 0
+    assert findings_bullet_idx < merge_bullet_idx
+
+    norm_behavior = _normalize_ws(behavior)
+    # Demoted to a self-conditional trigger, not the mandated opening action.
+    assert "If your branch is behind its base or the PR shows a merge conflict" in norm_behavior
+    assert "First, merge the PR's base branch" not in norm_behavior
+
+
+def test_rework_brief_omits_unconditional_address_findings_sentence_without_findings(
+    tmp_path: Path,
+) -> None:
+    """F4: the brief used to assert 'Address every Critical and Important
+    finding directly' unconditionally, instructing the worker to act on an
+    empty set whenever the verdict rendered zero findings. That sentence must
+    never render, in favor of self-conditional wording that references "the
+    findings above" without asserting they exist. Uses an approved verdict
+    (not request_changes with an empty required_changes list) so this keeps
+    exercising the empty-findings path even after F1's summary fallback lands
+    for request_changes verdicts."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "summary": "lgtm"}),
+        encoding="utf-8",
+    )
+    pr = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+    }
+    operational_note = (
+        "The PR branch has a merge conflict. Merge the base branch and resolve. "
+        "The code changes are already approved; do not re-litigate the review."
+    )
+    app._write_rework_prompt(pr, 123, operational_note)
+
+    brief = (pr_dir / "rework-prompt.md").read_text(encoding="utf-8")
+    norm_brief = _normalize_ws(brief)
+    assert "## Required changes" not in brief
+    assert "Address every Critical and Important finding directly" not in norm_brief
+    # The demoted base-merge bullet is still present for the route that
+    # genuinely needs it (the merge-conflict rework path) -- demoted, not
+    # deleted.
+    assert "If your branch is behind its base or the PR shows a merge conflict" in norm_brief
+
+
 def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
     monkeypatch, tmp_path: Path
 ) -> None:
