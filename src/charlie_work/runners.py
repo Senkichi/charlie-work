@@ -142,7 +142,9 @@ def save_pool_sample(state_dir: Path, sample: PoolSample) -> None:
         )
 
 
-def load_pool_samples(state_dir: Path, max_age_minutes: int = 60) -> list[PoolSample]:
+def load_pool_samples(
+    state_dir: Path, max_age_minutes: int = 60, *, now: datetime | None = None
+) -> list[PoolSample]:
     """Load pool samples from the persistent samples file.
 
     Filters out samples older than max_age_minutes to prevent unbounded growth.
@@ -150,6 +152,11 @@ def load_pool_samples(state_dir: Path, max_age_minutes: int = 60) -> list[PoolSa
     Args:
         state_dir: The state directory (e.g., .var/charlie-work)
         max_age_minutes: Maximum age of samples to return (default 60 minutes)
+        now: Injectable clock (issue #828, mirrors #822's ``now`` seam): defaults
+            to ``datetime.now(UTC)`` when not supplied, so production behavior
+            is byte-identical. Tests that build sample timestamps relative to a
+            frozen instant should pass the same instant here so the cutoff
+            filter cannot race the sample construction.
 
     Returns:
         List of pool samples, sorted by timestamp (oldest first)
@@ -159,7 +166,8 @@ def load_pool_samples(state_dir: Path, max_age_minutes: int = 60) -> list[PoolSa
         return []
 
     samples: list[PoolSample] = []
-    cutoff = datetime.now(UTC) - timedelta(minutes=max_age_minutes)
+    resolved_now = now if now is not None else datetime.now(UTC)
+    cutoff = resolved_now - timedelta(minutes=max_age_minutes)
 
     with samples_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -188,7 +196,11 @@ def load_pool_samples(state_dir: Path, max_age_minutes: int = 60) -> list[PoolSa
 
 
 def cleanup_pool_samples(
-    state_dir: Path, max_age_minutes: int = 60, max_samples: int = 1000
+    state_dir: Path,
+    max_age_minutes: int = 60,
+    max_samples: int = 1000,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Remove old samples from the persistent samples file.
 
@@ -200,6 +212,8 @@ def cleanup_pool_samples(
         state_dir: The state directory (e.g., .var/charlie-work)
         max_age_minutes: Maximum age of samples to keep (default 60 minutes)
         max_samples: Maximum number of samples before triggering cleanup (default 1000)
+        now: Injectable clock (issue #828); forwarded to ``load_pool_samples``,
+            which defaults to ``datetime.now(UTC)`` when omitted.
     """
     samples_path = state_dir / "runner-pool-samples.jsonl"
     if not samples_path.exists():
@@ -213,7 +227,7 @@ def cleanup_pool_samples(
     except OSError:
         return  # File read error, skip cleanup
 
-    recent_samples = load_pool_samples(state_dir, max_age_minutes)
+    recent_samples = load_pool_samples(state_dir, max_age_minutes, now=now)
 
     # Atomic rewrite
     tmp_path = samples_path.with_suffix(samples_path.suffix + ".tmp")
@@ -232,7 +246,9 @@ def cleanup_pool_samples(
     tmp_path.replace(samples_path)
 
 
-def is_pool_idle_for_minutes(state_dir: Path, idle_minutes: int) -> bool:
+def is_pool_idle_for_minutes(
+    state_dir: Path, idle_minutes: int, *, now: datetime | None = None
+) -> bool:
     """Check if the pool has been idle for a continuous period.
 
     A pool is considered idle if:
@@ -243,12 +259,16 @@ def is_pool_idle_for_minutes(state_dir: Path, idle_minutes: int) -> bool:
     Args:
         state_dir: The state directory (e.g., .var/charlie-work)
         idle_minutes: Required continuous idle duration in minutes
+        now: Injectable clock (issue #828); forwarded to ``load_pool_samples``,
+            which defaults to ``datetime.now(UTC)`` when omitted. The duration
+            check below reads only stored sample timestamps, not a fresh clock
+            sample, so ``now`` only needs to reach the cutoff filter.
 
     Returns:
         True if the pool has been idle for the required duration, False otherwise
     """
     samples = load_pool_samples(
-        state_dir, max_age_minutes=idle_minutes + 5
+        state_dir, max_age_minutes=idle_minutes + 5, now=now
     )  # Load slightly more than needed
 
     if not samples:
@@ -682,7 +702,7 @@ def get_last_scale_event_time(state_dir: Path) -> datetime | None:
     return None
 
 
-def record_scale_event(state_dir: Path, event_type: str) -> None:
+def record_scale_event(state_dir: Path, event_type: str, *, now: datetime | None = None) -> None:
     """Record a scale event (up or down) for cooldown tracking.
 
     Uses atomic temp-file + replace pattern.
@@ -690,12 +710,18 @@ def record_scale_event(state_dir: Path, event_type: str) -> None:
     Args:
         state_dir: The state directory (e.g., .var/charlie-work)
         event_type: The type of scale event ("up" or "down")
+        now: Injectable clock (issue #828, mirrors #822's ``now`` seam):
+            defaults to ``datetime.now(UTC)`` when not supplied, so production
+            behavior is byte-identical. Tests that need the exact timestamp
+            written here to line up with a later ``is_in_cooldown`` clock
+            sample should pass the same frozen instant to both.
     """
     scale_event_path = state_dir / "runner-scale-event.json"
     scale_event_path.parent.mkdir(parents=True, exist_ok=True)
 
+    resolved_now = now if now is not None else datetime.now(UTC)
     data = {
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": resolved_now.isoformat(),
         "event_type": event_type,
     }
 
@@ -821,12 +847,18 @@ def decide_autoscale(
     )
 
 
-def is_in_cooldown(state_dir: Path, cooldown_minutes: int) -> bool:
+def is_in_cooldown(state_dir: Path, cooldown_minutes: int, *, now: datetime | None = None) -> bool:
     """Check if we are in the cooldown period after a scale event.
 
     Args:
         state_dir: The state directory (e.g., .var/charlie-work)
         cooldown_minutes: Cooldown period in minutes
+        now: Injectable clock (issue #828, mirrors #822's ``now`` seam):
+            defaults to ``datetime.now(UTC)`` when not supplied, so production
+            behavior is byte-identical. There is no deliberate buffer between
+            ``record_scale_event``'s write and this read, so tests that freeze
+            both to the same instant get an exact ``elapsed == 0`` regardless
+            of how long the process stalls in between.
 
     Returns:
         True if in cooldown, False otherwise
@@ -835,7 +867,8 @@ def is_in_cooldown(state_dir: Path, cooldown_minutes: int) -> bool:
     if last_event is None:
         return False
 
-    elapsed = (datetime.now(UTC) - last_event).total_seconds() / 60
+    resolved_now = now if now is not None else datetime.now(UTC)
+    elapsed = (resolved_now - last_event).total_seconds() / 60
     return elapsed < cooldown_minutes
 
 
@@ -847,6 +880,7 @@ def scale_down_idle_runners(
     state_dir: Path,
     *,
     dry_run: bool = False,
+    now: datetime | None = None,
 ) -> tuple[int, list[str]]:
     """Scale down idle runners by gracefully removing them.
 
@@ -864,16 +898,21 @@ def scale_down_idle_runners(
         config: Runner scaling configuration
         state_dir: The state directory (e.g., .var/charlie-work)
         dry_run: If True, print what would be done without executing
+        now: Injectable clock (issue #828, mirrors #822's ``now`` seam):
+            defaults to ``datetime.now(UTC)`` when not supplied, so production
+            behavior is byte-identical. Forwarded to both the cooldown check
+            and the idle-duration check (and to the scale-event write below)
+            so a single frozen instant drives this entire pass.
 
     Returns:
         Tuple of (number_of_runners_removed, list_of_error_messages)
     """
     # Check cooldown
-    if is_in_cooldown(state_dir, config.cooldown_minutes):
+    if is_in_cooldown(state_dir, config.cooldown_minutes, now=now):
         return 0, ["In cooldown period"]
 
     # Check idle duration
-    if not is_pool_idle_for_minutes(state_dir, config.idle_scale_down_minutes):
+    if not is_pool_idle_for_minutes(state_dir, config.idle_scale_down_minutes, now=now):
         return 0, ["Pool not idle for required duration"]
 
     # Discover managed runners
@@ -912,7 +951,7 @@ def scale_down_idle_runners(
     # decide_autoscale *before* it branches up-vs-down, so one preview would
     # suppress real scaling in BOTH directions for cooldown_minutes (issue #609).
     if removed_count > 0 and not dry_run:
-        record_scale_event(state_dir, "down")
+        record_scale_event(state_dir, "down", now=now)
 
     return removed_count, errors
 
