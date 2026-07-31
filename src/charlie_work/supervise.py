@@ -250,10 +250,22 @@ class SelfDeployResult:
     """Result of a self-deploy attempt.
 
     ``pulled`` is True when ``git pull`` reported success (including the
-    already-up-to-date case).  ``changed`` is True when HEAD moved.  ``synced``
-    is True when ``uv sync`` ran and succeeded.  ``ok`` is False whenever any
-    step reported an error; callers must treat this as non-fatal and continue
-    the pass.
+    already-up-to-date case).  ``changed`` is True when HEAD moved *or* a
+    pending-sync marker exists (i.e. some dependency change is still
+    outstanding, even if this pass's own pull was a no-op) -- callers that
+    need to know whether *this pass* moved HEAD must use ``head_changed``
+    instead, not ``changed``.  ``synced`` is True when ``uv sync`` ran and
+    succeeded.  ``ok`` is False whenever any step reported an error; callers
+    must treat this as non-fatal and continue the pass.
+
+    ``head_changed`` is True only when ``git pull`` actually advanced HEAD on
+    *this* attempt (``before_sha != after_sha``).  This is the correct signal
+    for "the running process now has stale code loaded and must exit for a
+    watchdog restart" -- ``from_sha``/``to_sha`` are not, because on a
+    deferred-sync pass they report the marker's original range even when
+    HEAD did not move on this attempt, which previously caused a restart loop
+    (the supervisor kept exiting and relaunching without ever reaching zero
+    live workers to complete the deferred sync).
 
     ``venv_repaired`` is True when the orchestrator venv's editable ``.pth``
     was detected pointing outside ``repo_root/src`` and was atomically rewritten
@@ -264,6 +276,7 @@ class SelfDeployResult:
     pulled: bool
     changed: bool
     synced: bool
+    head_changed: bool = False
     from_sha: str | None = None
     to_sha: str | None = None
     message: str = ""
@@ -797,6 +810,7 @@ def _self_deploy_attempt(
                 pulled=True,
                 changed=False,
                 synced=False,
+                head_changed=False,
                 from_sha=before_sha,
                 to_sha=after_sha,
                 venv_repaired=venv_repaired,
@@ -816,6 +830,7 @@ def _self_deploy_attempt(
                     pulled=True,
                     changed=changed,
                     synced=False,
+                    head_changed=head_changed,
                     from_sha=before_sha,
                     to_sha=after_sha,
                     venv_repaired=venv_repaired,
@@ -830,6 +845,7 @@ def _self_deploy_attempt(
                 pulled=True,
                 changed=changed,
                 synced=False,
+                head_changed=head_changed,
                 from_sha=before_sha,
                 to_sha=after_sha,
                 venv_repaired=venv_repaired,
@@ -854,6 +870,7 @@ def _self_deploy_attempt(
                 pulled=True,
                 changed=changed,
                 synced=False,
+                head_changed=head_changed,
                 from_sha=from_sha,
                 to_sha=to_sha,
                 venv_repaired=venv_repaired,
@@ -871,6 +888,7 @@ def _self_deploy_attempt(
                 pulled=True,
                 changed=changed,
                 synced=False,
+                head_changed=head_changed,
                 from_sha=from_sha,
                 to_sha=to_sha,
                 venv_repaired=venv_repaired,
@@ -883,6 +901,7 @@ def _self_deploy_attempt(
             pulled=True,
             changed=changed,
             synced=True,
+            head_changed=head_changed,
             from_sha=from_sha,
             to_sha=to_sha,
             venv_repaired=venv_repaired,

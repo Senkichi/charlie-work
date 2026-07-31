@@ -987,6 +987,7 @@ def test_self_deploy_code_only_change_does_not_sync(
         pulled=True,
         changed=True,
         synced=False,
+        head_changed=True,
         from_sha="abc123",
         to_sha="def456",
         message="code-only update: def456",
@@ -1059,6 +1060,7 @@ def test_self_deploy_already_up_to_date(tmp_path: Path, no_fleet_live_sessions: 
         pulled=True,
         changed=False,
         synced=False,
+        head_changed=False,
         from_sha="abc123",
         to_sha="abc123",
         message="already up to date",
@@ -1114,6 +1116,7 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
         pulled=True,
         changed=True,
         synced=False,
+        head_changed=True,
         from_sha="abc123",
         to_sha="def456",
         message="sync deferred: 2 runners active",
@@ -1151,6 +1154,7 @@ def test_self_deploy_proceeds_when_zero_fleet_runners(
     assert result.pulled is True
     assert result.changed is True
     assert result.synced is True
+    assert result.head_changed is True
     assert result.from_sha == "abc123"
     assert result.to_sha == "def456"
     assert "updated and synced" in result.message
@@ -1219,7 +1223,18 @@ def test_self_deploy_retries_sync_after_deferral(
 def test_self_deploy_loud_warning_on_repeated_deferral(
     tmp_path: Path, monkeypatch: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """When a pending-sync marker survives repeated passes, a warning is printed."""
+    """When a pending-sync marker survives repeated passes, a warning is printed.
+
+    Also the outage regression guard: HEAD did not move on *this* attempt
+    (before == after == "def456") even though a marker from an earlier
+    deferral is still present and live workers are still active. Callers
+    must see ``head_changed is False`` here -- gating a watchdog restart on
+    ``from_sha != to_sha`` instead (the marker's original range, from
+    "abc123" to "def456") previously caused the supervisor to exit and
+    relaunch every single pass without ever reaching zero live workers to
+    complete the deferred sync (the total-fleet-outage bug this test guards
+    against).
+    """
     monkeypatch.setattr(
         "charlie_work.fleet_registry.count_fleet_live_sessions",
         lambda _fleet_dir_override: (3, []),
@@ -1243,7 +1258,9 @@ def test_self_deploy_loud_warning_on_repeated_deferral(
 
     result = self_deploy(tmp_path, run_command=runner)
     assert result.synced is False
+    assert result.head_changed is False
     assert "3 runners active" in result.message
+    assert marker_path.exists()
 
     out = capsys.readouterr().out
     assert "WARNING: pending dependency sync still deferred" in out

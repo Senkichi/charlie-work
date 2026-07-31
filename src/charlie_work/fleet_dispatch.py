@@ -1864,7 +1864,7 @@ def run_fleet_supervise(
             # message below; folding the check into a bool() loses it.
             from_sha = deploy.from_sha
             to_sha = deploy.to_sha
-            if deploy.ok and deploy.pulled and from_sha and to_sha and from_sha != to_sha:
+            if deploy.ok and deploy.pulled and from_sha and to_sha and deploy.head_changed:
                 print(
                     f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
                     f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
