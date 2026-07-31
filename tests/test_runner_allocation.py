@@ -1537,6 +1537,27 @@ def test_save_allocation_skip_write_is_atomic(tmp_path: Path) -> None:
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_save_allocation_skip_preserves_the_tie_break_offset(tmp_path: Path) -> None:
+    """A skip must not reset the floor-shortfall rotation (issues #601 + #606).
+
+    save_idle_streaks and save_allocation_skip share one writer; without an
+    explicit read-back the skip would write the default 0 and re-starve the
+    repo the rotation had just moved past.
+    """
+    from charlie_work.runner_slots import load_tie_break_offset, save_allocation_skip
+
+    save_idle_streaks(
+        tmp_path, {CW: 1}, source="prologue", full_pass_interval_seconds=300, tie_break_offset=3
+    )
+    save_allocation_skip(
+        tmp_path,
+        source="prologue",
+        full_pass_interval_seconds=300,
+        skip_reason="no runners",
+    )
+    assert load_tie_break_offset(tmp_path) == 3
+
+
 # --------------------------------------------------------------------------
 # run_allocation_pass — end-to-end tie_break_offset threading (issue #601)
 # --------------------------------------------------------------------------
