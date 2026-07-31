@@ -109,7 +109,7 @@ The block must have this exact shape, with `decision` replaced by exactly one of
 }
 ```
 
-The `summary` must be non-empty for every decision, including `approved` — an approval with no stated reason is indistinguishable from a reviewer that never ran. `required_changes` is optional; when provided it must be a list of strings and will be persisted in the verdict file. Use `request_changes` when rework is required, and `blocked` when human input is needed.
+The `summary` must be non-empty for every decision, including `approved` — an approval with no stated reason is indistinguishable from a reviewer that never ran. `required_changes` must be a list of strings when provided, and it is REQUIRED and non-empty whenever `decision` is `request_changes` or `blocked` — the rework worker's brief is built from this list, not from `summary`, so a `request_changes`/`blocked` verdict with an empty or missing `required_changes` sends the worker a brief with nothing to act on. It stays optional (and may be empty) for `approved`. Use `request_changes` when rework is required, and `blocked` when human input is needed.
 
 Your summary must include:
 

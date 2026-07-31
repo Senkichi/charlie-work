@@ -11,6 +11,8 @@ import yaml
 
 from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
+from . import layout
+
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
 # Root-relative path the Claude Code adapter writes to in each worktree.
@@ -232,6 +234,33 @@ class ReviewConfig:
     # but never consumed by anything (pr-lifecycle.md "janitor_blocked zero
     # readers" finding).
     max_no_op_rework_attempts: int = 2
+    # Issue #765: orthogonal stall bound for _route_janitor_gate_failure_to_
+    # rework's passive wait. max_conflict_rework_attempts/max_no_op_rework_
+    # attempts only advance on a SETTLED head change (merge_conflict) or a
+    # fresh non-pending detection (no_op_rework) -- both require the issue to
+    # leave `rework_requested` at least once. A PR whose head simply stops
+    # moving while queued (nobody dispatched a worker, or the worker's rework
+    # brief was empty -- see issue #765's "relationship to the empty-findings
+    # defect") never produces that signal, so it can sit in the passive
+    # janitor_blocked wait forever: PR #696 spun 55 `rework_already_pushed`
+    # events over 24h+ with its attempt count already AT the cap and the
+    # rescue tier never even attempted, because the cap/rescue check below is
+    # only reachable via progress. This bound fires independently of attempts
+    # count: once the head has been observed unchanged for this long while
+    # the issue is `rework_requested` (queued, nobody actively working),
+    # escalate regardless of how many attempts have been burned. Only a HEAD
+    # CHANGE resets the clock -- a live `dispatched` session pushing a real
+    # commit resets it, but idle dispatched time (and a same-head status
+    # flip, e.g. reconcile's issue_active_label_with_open_pr self-heal
+    # normalizing the label away from rework_requested and back) still
+    # counts toward the bound; see the call site. 240 minutes (4h)
+    # matches WatchdogConfig.redispatch_window_minutes, this codebase's
+    # existing convention for "how long a stuck fleet item may sit before
+    # it's treated as abnormal" -- long enough to absorb normal dispatch
+    # queueing latency under fleet load, short enough to bound the failure
+    # mode to hours instead of the unbounded, indefinite spin this issue was
+    # filed over.
+    rework_stall_minutes: int = 240
 
 
 @dataclass(frozen=True)
@@ -270,6 +299,76 @@ class QuotaProbeConfig:
 
 
 @dataclass(frozen=True)
+class ReconcilePassConfig:
+    """Periodic in-loop reconcile: merge-lane-recovery plan §6-B.
+
+    Wires ``OrchestratorApp.reconcile(fix=True)`` -- previously reachable
+    only via the operator-invoked ``charlie mop-up --fix`` CLI command --
+    into the fleet loop on a fixed cadence, so a state/label divergence
+    (e.g. an escalation whose ``human_needed`` label write silently failed,
+    per the plan's PRIMARY defect) is repaired automatically instead of only
+    when an operator remembers to run mop-up. Repair direction is always
+    state-wins: reconcile only ever converges GitHub labels to match
+    ``state.json``; it never rewrites ``status`` (D-2), so this is safe to
+    run unattended on every repo, every cycle.
+    """
+
+    # Default True: the fleet has never run its own repair (baseline: zero
+    # reconcile events ever recorded across the whole event history), and
+    # the repair direction is provably safe (see class docstring). A knob
+    # defaulted off would leave that divergence class unrepaired until an
+    # operator remembered to flip it -- exactly the failure mode this
+    # workstream exists to close. The knob exists for rollback, not opt-in.
+    enabled: bool = True
+    # detect_drift() issues two full-repo GitHub list queries (all PRs, all
+    # issues) plus a GraphQL rate-limit check every time it runs -- heavier
+    # than quota_probe's single cheap Haiku subprocess call, so a longer flat
+    # cadence than quota_probe's 15 minutes is appropriate here. 30 minutes
+    # still comfortably beats "only ever runs when an operator remembers to
+    # run mop-up".
+    interval_minutes: int = 30
+
+
+@dataclass(frozen=True)
+class DeescalationConfig:
+    """Periodic sweep that re-evaluates ``mechanical`` escalations (issue #783).
+
+    Escalating to ``agent:human-needed`` on a process failure (dead worker,
+    redispatch/rework-cycle cap, stalled worker) when the PR artifact itself
+    is fine is a category error -- it was a one-way door with no automated
+    re-entry. This sweep re-checks ONLY escalations recorded with
+    ``reason_class == "mechanical"`` (see ``state.escalation_reason_class``);
+    ``"judgment"`` escalations and any escalation with no recorded reason
+    class are never auto-cleared (fail closed).
+
+    ``max_auto_deescalations`` bounds the auto de-escalate/redispatch/
+    re-escalate cycle per issue (the ``auto_deescalation_count`` field on the
+    issue's state entry, never reset by this sweep -- only a human running
+    ``charlie unescalate`` resets it). This is deliberately independent from
+    every per-mechanism attempt cap (``max_rework_cycles``,
+    ``max_auto_redispatch``, ...): this sweep never resets those counters, so
+    a condition that keeps re-failing keeps re-tripping its own cap
+    immediately; this counter instead bounds how many times the SWEEP itself
+    may clear the human_needed door for the same issue before also leaving it
+    terminal, so the outer escalate/de-escalate cycle cannot spin forever
+    even if the underlying condition oscillates.
+    """
+
+    enabled: bool = True
+    # Cheaper per-item than reconcile (one gh pr_view + pr_checks + pr_diff
+    # per escalated-mechanical issue, no full-repo list queries), but there is
+    # no urgency to re-evaluate faster than an operator would notice a fixed
+    # escalation sitting idle -- 30 minutes matches reconcile_pass's cadence.
+    interval_minutes: int = 30
+    # Bounds the auto de-escalate -> redispatch -> re-escalate cycle per
+    # issue. Once reached, the sweep stops clearing this issue's escalation
+    # even if reason_class is still "mechanical" and the PR looks healthy;
+    # a distinct one-time event (deescalation_cap_exhausted) makes the
+    # terminal state diagnosable rather than a silently renamed one-way door.
+    max_auto_deescalations: int = 2
+
+
+@dataclass(frozen=True)
 class ReviewDispatchConfig:
     # Issue #370: concurrent reviewer launcher for queued PRs. This is a
     # deterministic loop stage, not a provider governor; reviewers use
@@ -277,8 +376,10 @@ class ReviewDispatchConfig:
     enabled: bool = False
     # Per-PR review sidecar + log directory. MUST be distinct from
     # devin.sessions_dir so worker concurrency accounting is not poisoned by
-    # reviewer processes.
-    reviews_dir: str = ".var/charlie-work/dispatches/reviews"
+    # reviewer processes. Empty string means "derive from runtime.state_dir"
+    # (layout.reviews_dir_default) rather than a fixed literal -- see
+    # paths.resolved_layout, the single place that resolves this sentinel.
+    reviews_dir: str = ""
     # Local-only process bound. 0 means unlimited; raise this only if local
     # CPU/disk from concurrent reviewer worktrees becomes a visible bottleneck.
     # Default is 2 so a host that enables review_dispatch without overriding
@@ -482,7 +583,7 @@ class AutoMergeConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    state_dir: str = ".var/charlie-work"
+    state_dir: str = layout.DEFAULT_STATE_DIR
     # Repo-local template dir searched before the package defaults. Relative
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None
@@ -561,12 +662,18 @@ class DevinConfig:
     # "claude-code" launches Claude Code workers in isolated git worktrees
     # (claude_code.py, configured under the claude_code section).
     adapter: str = "manual"
-    session_manifest: str = ".var/charlie-work/dispatches/session-manifest.json"
-    session_results: str = ".var/charlie-work/dispatches/session-results.json"
+    # Empty string means "derive from runtime.state_dir" (layout.py's
+    # session_manifest_default/session_results_default) rather than a fixed
+    # literal -- see paths.resolved_layout, the single place that resolves
+    # this sentinel.
+    session_manifest: str = ""
+    session_results: str = ""
     dispatch_command: str | tuple[str, ...] = ""
     command_timeout_seconds: int = 300
-    # devin-shell adapter: sidecar JSON + per-session logs live here.
-    sessions_dir: str = ".var/charlie-work/dispatches/sessions"
+    # devin-shell adapter: sidecar JSON + per-session logs live here. Empty
+    # string means "derive from runtime.state_dir" (layout.sessions_dir_default)
+    # -- see paths.resolved_layout.
+    sessions_dir: str = ""
     # devin-shell launch command; empty means devin_shell.DEFAULT_COMMAND_TEMPLATE.
     # Placeholders: {prompt_path} {issue_number} {branch} {model_args}.
     shell_command: tuple[str, ...] = ()
@@ -786,6 +893,14 @@ class CrossFamilyConfig:
         "{prompt_path}",
     )
     timeout_seconds: int = 300
+    auto_verdict: bool = False
+    # Issue #784: bounds the "content-free verdict -> forced regeneration ->
+    # still content-free" cycle. Counts distinct parse-failure attempts (one
+    # per genuinely new report/head, never per loop-pass re-read of a cached
+    # one) per PR. Once exceeded, the PR is released from the cross-family
+    # gate (recorded as a caveated "approved") instead of looping forever or
+    # escalating to a human — see workflow._record_cross_family_verdicts.
+    max_parse_failures: int = 2
 
 
 @dataclass(frozen=True)
@@ -891,6 +1006,33 @@ class WatchdogConfig:
 
 
 @dataclass(frozen=True)
+class WorktreeReclamationConfig:
+    """Cadence-gated reclamation of merged-PR worker worktrees from the fleet
+    pass (issue #636).
+
+    ``clean_worktrees`` is the junction-safe, merge-gated, liveness-gated sweep
+    that ``charlie worktree-clean`` runs on demand. Before this config drove a
+    fleet-pass call site, reclamation never fired on the fleet's own cadence --
+    worktrees for merged PRs accumulated indefinitely (77 of 81 dead on the
+    host this was measured on; ``git worktree list`` became unusable as an
+    operator instrument and ``du`` on the worktrees dir timed out).
+
+    ``enabled`` defaults True so the fleet reclaims by default; set False to
+    revert to operator-only ``charlie worktree-clean``. ``interval_minutes``
+    gates the sweep so the per-candidate ``gh pr view`` cost is proportional to
+    elapsed time, not to backlog size or loop frequency -- the sweep makes one
+    live REST call per candidate worktree, so running it every pass against an
+    80+ backlog would be a per-pass quota spike. The sweep itself is
+    idempotent, merge-gated, liveness-gated, and fails closed on an erroring
+    ``gh`` (see ``worktree.clean_worktrees``), which are the properties required
+    to run it unattended.
+    """
+
+    enabled: bool = True
+    interval_minutes: int = 60
+
+
+@dataclass(frozen=True)
 class TestAdequacyConfig:
     """Config for the opt-in test-adequacy gate (janitor.check_test_adequacy).
 
@@ -961,7 +1103,10 @@ class NotifyConfig:
     sink: str = "file"  # "webhook" | "desktop" | "shell" | "file"
     webhook_url: str = ""
     shell_command: tuple[str, ...] = ()
-    file_path: str = ".var/charlie-work/notify/digest.jsonl"
+    # Empty string means "derive from runtime.state_dir"
+    # (layout.notify_digest_default) rather than a fixed literal -- see
+    # paths.resolved_layout, the single place that resolves this sentinel.
+    file_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -1180,6 +1325,8 @@ class OrchestratorConfig:
     review: ReviewConfig = field(default_factory=ReviewConfig)
     review_dispatch: ReviewDispatchConfig = field(default_factory=ReviewDispatchConfig)
     quota_probe: QuotaProbeConfig = field(default_factory=QuotaProbeConfig)
+    reconcile_pass: ReconcilePassConfig = field(default_factory=ReconcilePassConfig)
+    deescalation: DeescalationConfig = field(default_factory=DeescalationConfig)
     auto_merge: AutoMergeConfig = field(default_factory=AutoMergeConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     devin: DevinConfig = field(default_factory=DevinConfig)
@@ -1188,6 +1335,9 @@ class OrchestratorConfig:
     cross_family: CrossFamilyConfig = field(default_factory=CrossFamilyConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+    worktree_reclamation: WorktreeReclamationConfig = field(
+        default_factory=WorktreeReclamationConfig
+    )
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
@@ -1467,6 +1617,26 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if qp_prompt is not None and not qp_prompt.strip():
         raise ConfigError("config section 'quota_probe' key 'prompt' must not be empty")
     quota_probe = _build_section(QuotaProbeConfig, "quota_probe", quota_probe_data)
+    reconcile_pass_data = _section(data, "reconcile_pass")
+    rp_enabled = reconcile_pass_data.get("enabled")
+    if rp_enabled is not None and not isinstance(rp_enabled, bool):
+        raise ConfigError(
+            f"config section 'reconcile_pass' key 'enabled' must be a bool, "
+            f"got {type(rp_enabled).__name__}"
+        )
+    rp_interval = reconcile_pass_data.get("interval_minutes")
+    if rp_interval is not None and (
+        isinstance(rp_interval, bool) or not isinstance(rp_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'reconcile_pass' key 'interval_minutes' must be an int, "
+            f"got {type(rp_interval).__name__}"
+        )
+    if rp_interval is not None and rp_interval < 1:
+        raise ConfigError(
+            f"config section 'reconcile_pass' key 'interval_minutes' must be >= 1, got {rp_interval}"
+        )
+    reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -1967,6 +2137,29 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
             str(item) for item in worktree_mtime_exclude_dirs
         )
     watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
+    worktree_reclamation_data = _section(data, "worktree_reclamation")
+    wr_enabled = worktree_reclamation_data.get("enabled")
+    if wr_enabled is not None and not isinstance(wr_enabled, bool):
+        raise ConfigError(
+            "config section 'worktree_reclamation' key 'enabled' must be a bool, "
+            f"got {type(wr_enabled).__name__}"
+        )
+    wr_interval = worktree_reclamation_data.get("interval_minutes")
+    if wr_interval is not None and (
+        isinstance(wr_interval, bool) or not isinstance(wr_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'worktree_reclamation' key 'interval_minutes' must be an int, "
+            f"got {type(wr_interval).__name__}"
+        )
+    if wr_interval is not None and wr_interval < 1:
+        raise ConfigError(
+            "config section 'worktree_reclamation' key 'interval_minutes' must be >= 1, "
+            f"got {wr_interval}"
+        )
+    worktree_reclamation = _build_section(
+        WorktreeReclamationConfig, "worktree_reclamation", worktree_reclamation_data
+    )
     test_adequacy_data = _section(data, "test_adequacy")
 
     # Six tuple-of-str fields: reject non-list, coerce elements to str.
@@ -2235,6 +2428,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         review=review,
         review_dispatch=review_dispatch,
         quota_probe=quota_probe,
+        reconcile_pass=reconcile_pass,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,
@@ -2243,6 +2437,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         cross_family=cross_family,
         rescue=rescue,
         watchdog=watchdog,
+        worktree_reclamation=worktree_reclamation,
         test_adequacy=test_adequacy,
         fleet=fleet,
         notify=notify,

@@ -12,7 +12,7 @@ from .config import (
     find_config_path,
     load_config,
 )
-from .fleet_paths import fleet_dir
+from . import layout
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ def load_layered_config(
     repo_config_path = find_config_path(repo_root, explicit)
 
     # Load global config if present
-    global_config_path = fleet_dir(override=fleet_dir_override) / "config.yaml"
+    global_config_path = layout.global_config_path(override=fleet_dir_override)
     global_exists = global_config_path.exists()
     if require_global and not global_exists:
         # The silent-{} branch below is the whole of issue #623: every

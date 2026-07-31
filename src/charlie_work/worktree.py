@@ -21,12 +21,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import OrchestratorConfig, WRITER_MARKER_FILENAME
-from .github import GitHub, GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
+from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .janitor import _calculate_patch_id
+from . import layout
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
@@ -257,7 +258,17 @@ def _slugify(value: str, *, max_length: int = 80) -> str:
 
 
 def _default_worktrees_dir(repo_root: Path) -> Path:
-    return repo_root / ".var" / "charlie-work" / "worktrees"
+    """Return the package-default worktrees root, ignoring any config override.
+
+    Equals the historical (pre-layout-module) path only when ``state_dir`` is
+    left at its default AND ``claude_code.worktrees_dir`` is unset. This is
+    the final fallback for direct library callers with no config in hand
+    (e.g. some unit tests); the production paths -- dispatch and ``charlie
+    worktree-clean`` -- always resolve through
+    ``paths.resolved_layout(config, repo_root).worktrees`` instead, which
+    honours both overrides.
+    """
+    return layout.worktrees_dir(layout.default_state_root(repo_root))
 
 
 def worktree_path_for_branch(
@@ -2403,10 +2414,6 @@ def remove_worktree(
     return worktree_removed and branch_deleted
 
 
-def _default_reviews_dir(repo_root: Path) -> Path:
-    return repo_root / ".var" / "charlie-work" / "dispatches" / "reviews"
-
-
 def _commit_exists_locally(repo_root: Path, sha: str) -> bool:
     """True if ``sha`` resolves to a commit object already present locally."""
     result = run_captured(
@@ -2422,7 +2429,7 @@ def create_review_checkout(
     pr_number: int,
     head_sha: str,
     *,
-    reviews_dir: Path | None = None,
+    reviews_dir: Path,
 ) -> WorktreeInfo:
     """Create an isolated, detached-HEAD checkout of a PR's head SHA for a
     reviewer session.
@@ -2455,7 +2462,7 @@ def create_review_checkout(
             f"create_review_checkout requires a non-empty head_sha for PR #{pr_number}"
         )
 
-    target_dir = reviews_dir or _default_reviews_dir(repo_root)
+    target_dir = reviews_dir
     target_dir.mkdir(parents=True, exist_ok=True)
     checkout_path = target_dir / f"pr-{pr_number}"
 
@@ -2503,9 +2510,7 @@ def create_review_checkout(
     return WorktreeInfo(path=checkout_path, branch=head_sha, venv_junction=None)
 
 
-def remove_review_checkout(
-    repo_root: Path, pr_number: int, *, reviews_dir: Path | None = None
-) -> bool:
+def remove_review_checkout(repo_root: Path, pr_number: int, *, reviews_dir: Path) -> bool:
     """Idempotent teardown of a PR's isolated review checkout.
 
     Returns True if the checkout was removed or was already absent; never
@@ -2513,8 +2518,7 @@ def remove_review_checkout(
     or during a stale-claim/completed-verdict sweep that isn't sure whether a
     checkout exists for a given PR).
     """
-    target_dir = reviews_dir or _default_reviews_dir(repo_root)
-    checkout_path = target_dir / f"pr-{pr_number}"
+    checkout_path = reviews_dir / f"pr-{pr_number}"
 
     existing_worktrees = list_worktrees(repo_root)
     is_registered = any(Path(wt["worktree"]) == checkout_path for wt in existing_worktrees)
@@ -2541,6 +2545,22 @@ def inspect_worktree_state(
     This is the single enforcement point for worktree inspection; it is used by
     both the workflow dead-session lane and reconcile.py drift detection.
     """
+    # Issue #660: api workers set worktree_path="" (they do not use dedicated
+    # worktrees). Path("") normalizes to Path("."), which would pass the
+    # is_dir() check below and probe the *caller's* cwd with real git
+    # merge-base/rev-list calls. If that cwd has local commits ahead of its
+    # resolved default branch (a normal state for a live checkout), the
+    # inspection returns COMPLETED, which forces the dead-session
+    # classification lanes (workflow.py / reconcile.py) to "unpublished_work"
+    # and skips the log-tail based provider-auth/quota/crash classification
+    # entirely. Short-circuit an empty/unset path to UNKNOWN so those lanes
+    # fall through to log-tail analysis instead.
+    if worktree_path == Path(""):
+        return WorktreeInspection(
+            WorktreeState.UNKNOWN,
+            error="worktree_path is empty (api workers have no dedicated worktree)",
+        )
+
     if not worktree_path.is_dir():
         return WorktreeInspection(
             WorktreeState.UNKNOWN,
@@ -2981,12 +3001,29 @@ class WorktreeCleanResult:
     data: dict[str, Any]
 
 
+@runtime_checkable
+class WorktreeCleanGH(Protocol):
+    """Slice of :class:`GitHub` that ``clean_worktrees`` depends on.
+
+    The cleanup lane only reads PR merge state via a single ``gh pr view``
+    call, so it needs just ``run`` -- the rest of ``GitHub`` (list caches,
+    mutating ops, retry config) is irrelevant here. Narrowing the parameter
+    type to this protocol lets test doubles satisfy the contract structurally
+    without subclassing the frozen ``GitHub`` dataclass, and documents exactly
+    which GitHub surface the cleanup lane relies on (issue #641).
+    """
+
+    def run(
+        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> Any: ...
+
+
 def clean_worktrees(
     repo_root: Path,
     worktrees_dir: Path,
     state: dict[str, Any],
     config: OrchestratorConfig,
-    gh: GitHub,
+    gh: WorktreeCleanGH,
     *,
     dry_run: bool = False,
 ) -> WorktreeCleanResult:
