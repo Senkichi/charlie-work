@@ -7691,6 +7691,89 @@ class OrchestratorApp:
                         "closed_unmerged_converged": True,
                     },
                 )
+
+            # Auto-ready otherwise-mergeable draft PRs (issue #818): a draft
+            # is an externally-imposed state like any other the fleet
+            # reconciles (base movement, flaky checks, ...). When draft is
+            # the ONLY janitor failure -- every other gate already passed --
+            # call `gh pr ready` and defer the actual review to the next
+            # poll, mirroring the flake-rerun debounce below: trigger a
+            # cheap, idempotent, self-correcting actuator rather than
+            # mutating this frozen verdict and continuing same-pass. Errors
+            # come back as values (GitHubRunResult.ok/.error), never
+            # exceptions, so a failed `gh pr ready` must NOT be treated as
+            # success -- the PR stays janitor_blocked and is not routed
+            # toward merge.
+            if verdict.is_draft_only_block:
+                ready_result = self.gh.pr_ready(pr_number)
+                if ready_result.ok:
+                    log_event(
+                        self.paths.state_file,
+                        "draft_pr_ready_triggered",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "head_sha": pr.get("headRefOid"),
+                        },
+                        repo=self.repo_root.name,
+                    )
+                    return CommandResult(
+                        False,
+                        f"PR #{pr_number} was a draft; marked ready for review "
+                        "(deferring to next pass)",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "draft_readied": True,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
+                # `gh pr ready` failed: park as janitor_blocked (same as the
+                # pre-fix behavior) plus a dedicated error field so repeated
+                # identical failures dedupe instead of re-firing the event
+                # every pass -- the underlying `verdict.failures` is constant
+                # ("PR is a draft") regardless of the actuator's outcome, so
+                # the existing failures_changed dedup below would never fire
+                # on its own for this class of park.
+                draft_ready_error = (
+                    ready_result.error or f"gh pr ready exited {ready_result.returncode}"
+                )
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    existing_pr_state = state["prs"].get(str(pr_number), {})
+                    error_changed = existing_pr_state.get("draft_ready_error") != draft_ready_error
+                    state["prs"][str(pr_number)] = {
+                        **existing_pr_state,
+                        "number": pr_number,
+                        "issue_number": issue_number,
+                        "status": "janitor_blocked",
+                        "janitor_ok": False,
+                        "janitor_failures": list(verdict.failures),
+                        "draft_ready_error": draft_ready_error,
+                    }
+                    if error_changed:
+                        state = append_event(
+                            state,
+                            "draft_pr_ready_failed",
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "error": draft_ready_error,
+                            },
+                            state_path=self.paths.state_file,
+                        )
+                    save_state(self.paths.state_file, state)
+                return CommandResult(
+                    False,
+                    f"PR #{pr_number} is a draft and `gh pr ready` failed: {draft_ready_error}",
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "draft_ready_failed": True,
+                        "checks_unavailable": checks is None,
+                    },
+                )
+
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework
@@ -7860,9 +7943,17 @@ class OrchestratorApp:
                     "check_rerun_attempts": verdict.check_rerun_attempts,
                 }
                 if failures_changed:
+                    # Issue #818: a draft co-occurring with another real
+                    # failure (e.g. draft + empty body) is not auto-readied
+                    # -- `is_draft_only_block` is False -- but the park is
+                    # still worth distinguishing from routine janitor_gate
+                    # bookkeeping so it's greppable via
+                    # query_events(kind="draft_pr_blocked") rather than a
+                    # manual `gh pr list` sweep.
+                    event_kind = "draft_pr_blocked" if verdict.is_draft else "janitor_gate"
                     state = self._record_event(
                         state,
-                        "janitor_gate",
+                        event_kind,
                         {"pr_number": pr_number, "failures": list(verdict.failures)},
                     )
                 save_state(self.paths.state_file, state)

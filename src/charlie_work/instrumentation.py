@@ -165,6 +165,15 @@ _WARNING_KINDS = frozenset(
         # actionable backoff kinds above. The paired "runner_capacity_recovered"
         # event stays at the default "info" level.
         "runner_capacity_starved",
+        # Issue #818: a draft PR is a park that would otherwise be invisible
+        # without a manual `gh pr list` sweep -- warning, so both the failed
+        # un-draft attempt and a mixed draft+other-failure block are reachable
+        # via query_events(level="warning") distinct from routine
+        # janitor_gate bookkeeping (which stays "info"). The paired
+        # "draft_pr_ready_triggered" success event stays at the default
+        # "info" level, matching "flake_rerun_triggered".
+        "draft_pr_ready_failed",
+        "draft_pr_blocked",
     }
 )
 

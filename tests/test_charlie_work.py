@@ -58,6 +58,7 @@ from charlie_work.cross_family import (
     run_cross_family_review,
 )
 from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
+from charlie_work.instrumentation import query_events
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
@@ -3033,6 +3034,9 @@ class FakeGitHub:
         self.delete_branch_ok = True
         self.update_branch_ok = True
         self.pr_update_branch_calls: list[int] = []
+        self.pr_ready_calls: list[int] = []
+        self.pr_ready_ok = True
+        self.pr_ready_error: str | None = None
         self.pr_head_shas: dict[int, str] = {}
         self.diffs: dict[int, str] = {}
         self.closed_issues: list[int] = []
@@ -3212,6 +3216,23 @@ class FakeGitHub:
     def delete_branch(self, branch: str) -> bool:
         self.deleted_branches.append(branch)
         return self.delete_branch_ok
+
+    def pr_ready(self, number: int) -> github_module.GitHubRunResult:
+        self.pr_ready_calls.append(number)
+        if self.pr_ready_ok:
+            for pr in self.prs:
+                if pr["number"] == number:
+                    # Simulate GitHub's real effect: the PR is no longer a
+                    # draft, so the next janitor pass sees isDraft=False.
+                    pr["isDraft"] = False
+                    break
+            return github_module.GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        error = self.pr_ready_error or "gh: pull request #%d is not ready for review" % number
+        return github_module.GitHubRunResult(
+            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
+        )
 
     def pr_update_branch(self, pr_number: int) -> bool:
         self.pr_update_branch_calls.append(pr_number)
@@ -10543,11 +10564,16 @@ def test_review_skips_cross_family_for_draft_pr(tmp_path: Path, monkeypatch) -> 
 
     result = app.review(456)
 
-    # The janitor gate now blocks drafts before any review spend — even
-    # earlier than the old cross-family draft skip this test pinned.
+    # Issue #818: the default fixture PR is otherwise fully janitor-green
+    # (linked issue, tests mentioned, CLEAN merge state), so draft is the
+    # ONLY failure -- the janitor gate now auto-readies it via `gh pr ready`
+    # instead of parking it, deferring the actual review to the next poll
+    # pass (the pass that never comes in this test, since _boom would raise
+    # if cross-family review ran). The pre-fix pin (janitor_ok False,
+    # "draft" in janitor_failures) no longer holds for a pure-draft block.
     assert result.ok is False
-    assert result.data["janitor_ok"] is False
-    assert any("draft" in failure.lower() for failure in result.data["janitor_failures"])
+    assert result.data["draft_readied"] is True
+    assert app.gh.pr_ready_calls == [456]
 
 
 def test_spec_review_runs_and_writes_report(tmp_path: Path, monkeypatch) -> None:
@@ -13510,16 +13536,102 @@ def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    fake_gh.prs[0] = {**fake_gh.prs[0], "isDraft": True}
+    # Issue #818: draft is no longer alone here -- pair it with an empty body
+    # (a second, unrelated janitor failure) so this stays a genuine
+    # janitor_blocked park rather than the new pure-draft auto-ready path.
+    # Empty body (not mergeable=CONFLICTING) deliberately avoids also
+    # tripping the separate merge-conflict rework-routing special case.
+    fake_gh.prs[0] = {**fake_gh.prs[0], "isDraft": True, "body": ""}
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.review(456)
 
     assert result.ok is False
+    assert fake_gh.pr_ready_calls == []  # not "otherwise ready" -- never attempted
     packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
     assert not packet.exists()  # zero packet spend on a blocked PR
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["status"] == "janitor_blocked"
+
+
+def test_janitor_draft_only_block_auto_readies_pr(tmp_path: Path) -> None:
+    """Issue #818: a draft PR that is otherwise mergeable is not a terminal
+    park. When draft is the ONLY janitor failure, review() calls `gh pr
+    ready` and defers the actual review to the next poll pass instead of
+    writing status="janitor_blocked" -- pinning the actuation itself, not
+    merely that the (pre-fix) failure string was appended.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0] = {**fake_gh.prs[0], "isDraft": True}
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False  # deferred to the next pass, not approved this pass
+    assert result.data["draft_readied"] is True
+    assert fake_gh.pr_ready_calls == [456]
+    # GitHub's real effect: the PR is no longer a draft on the next fetch.
+    assert fake_gh.pr_view(456)["isDraft"] is False
+    # No packet spend -- the review itself is deferred, not performed now.
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    assert not packet.exists()
+    # Distinguishable event kind (issue #818 AC4): greppable via
+    # query_events(kind=...) rather than a manual `gh pr list` sweep.
+    recorded = query_events(paths.state_file, kind="draft_pr_ready_triggered")
+    assert len(recorded) == 1
+    assert recorded[0]["payload"]["pr_number"] == 456
+
+
+def test_janitor_draft_only_block_gh_pr_ready_failure_stays_blocked(tmp_path: Path) -> None:
+    """Issue #818 AC3: when `gh pr ready` itself fails, the PR must NOT be
+    treated as ready -- the fleet must not proceed to merge on the
+    assumption un-draft succeeded. Errors from external processes come back
+    as values (GitHubRunResult.ok/.error), never exceptions.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0] = {**fake_gh.prs[0], "isDraft": True}
+    fake_gh.pr_ready_ok = False
+    fake_gh.pr_ready_error = "gh: insufficient permissions to mark PR ready"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data.get("draft_readied") is not True
+    assert fake_gh.pr_ready_calls == [456]
+    # GitHub-side state is unchanged: still a draft.
+    assert fake_gh.pr_view(456)["isDraft"] is True
+    # Parked exactly like the pre-fix behavior -- not silently advanced.
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert state["prs"]["456"]["janitor_ok"] is False
+    assert any("draft" in f.lower() for f in state["prs"]["456"]["janitor_failures"])
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    assert not packet.exists()  # never routed toward review/merge
+    # Distinguishable, deduped event (issue #818 AC4).
+    recorded = query_events(paths.state_file, kind="draft_pr_ready_failed")
+    assert len(recorded) == 1
+    assert recorded[0]["level"] == "warning"
+    assert recorded[0]["payload"]["pr_number"] == 456
+    assert "insufficient permissions" in recorded[0]["payload"]["error"]
+
+    # A second pass with the same gh error does not re-fire the event
+    # (cost-spirals.md dedup discipline: verdict.failures is byte-identical
+    # every pass regardless of the actuator's outcome, so dedup is keyed on
+    # the actuator's own error message, not on verdict.failures).
+    app.review(456)
+    # `gh pr ready` is attempted again -- it's the event that's deduped, not
+    # the actuator call itself. Without this, a control-flow change that
+    # skips the whole branch on pass 2 (e.g. an early return keyed off the
+    # state just written) would still satisfy the event-count assertion
+    # below, making it silently vacuous.
+    assert fake_gh.pr_ready_calls == [456, 456]
+    recorded_again = query_events(paths.state_file, kind="draft_pr_ready_failed")
+    assert len(recorded_again) == 1
 
 
 def test_janitor_warnings_surface_in_review_packet(tmp_path: Path) -> None:

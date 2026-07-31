@@ -100,6 +100,11 @@ def test_draft_pr_fails() -> None:
 
     assert verdict.ok is False
     assert any("draft" in f.lower() for f in verdict.failures)
+    # Issue #818: draft is the ONLY failure here (checks/mergeable/issue-link/
+    # body all pass), so this is the "otherwise ready" case workflow.review()
+    # uses to decide whether auto-readying the PR via `gh pr ready` is safe.
+    assert verdict.is_draft is True
+    assert verdict.is_draft_only_block is True
 
 
 def test_non_open_state_fails() -> None:
@@ -186,6 +191,11 @@ def test_required_check_failure_with_other_blocker_is_not_check_failure_block() 
     assert verdict.ok is False
     assert verdict.failed_required_checks == ("Tests passed",)
     assert verdict.is_check_failure_block is False
+    # Issue #818: draft co-occurring with a real failing required check must
+    # NOT be treated as "otherwise ready" -- a draft PR with a genuine
+    # failure is not silently auto-readied.
+    assert verdict.is_draft is True
+    assert verdict.is_draft_only_block is False
 
 
 def test_required_check_infra_failed_is_not_check_failure_block() -> None:

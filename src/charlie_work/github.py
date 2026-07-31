@@ -1085,6 +1085,26 @@ class GitHub:
         except GitHubError:
             return False
 
+    def pr_ready(self, number: int) -> GitHubRunResult:
+        """Mark a draft PR as ready for review via ``gh pr ready`` (issue #818).
+
+        Returns a structured result so callers can distinguish success from
+        failure without inferring from output shape -- errors from external
+        processes come back as values here, never exceptions. Dry-run mode
+        returns a synthetic ok=True result (the operation would succeed if not
+        for dry-run); this mirrors ``_run_bool``'s explicit guard because
+        ``.run()`` itself returns a bare string under dry-run, not a
+        ``GitHubRunResult``.
+        """
+        args = ["pr", "ready", str(number)]
+        if self.dry_run and _is_mutating(args):
+            return GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        result = self.run(args, allow_failure=True)
+        assert isinstance(result, GitHubRunResult)
+        return result
+
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
         """Check which of the given issue numbers are currently open.
 
