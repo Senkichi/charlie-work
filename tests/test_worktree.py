@@ -3551,6 +3551,31 @@ def test_inspect_worktree_state_unknown_missing_path(tmp_path: Path) -> None:
     assert inspection.error is not None
 
 
+def test_inspect_worktree_state_empty_path_returns_unknown(tmp_path: Path) -> None:
+    """Issue #660: an empty worktree_path (api workers set worktree_path="")
+    must short-circuit to UNKNOWN instead of probing the caller's cwd.
+
+    Path("") normalizes to Path("."), which is a real directory (the cwd).
+    Without the guard, inspect_worktree_state would run real git merge-base /
+    rev-list against whatever checkout the caller happens to be in, and could
+    return COMPLETED if that checkout has local commits ahead of its base --
+    silently misclassifying every dead api-worker session as "unpublished_work".
+    """
+    # Run from inside tmp_path (a real directory) to prove the guard fires
+    # before any filesystem/git probe of cwd, regardless of cwd state.
+    import os
+
+    old_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        inspection = inspect_worktree_state(Path(""))
+    finally:
+        os.chdir(old_cwd)
+    assert inspection.state == WorktreeState.UNKNOWN
+    assert inspection.error is not None
+    assert "empty" in inspection.error
+
+
 def test_push_branch_publishes_and_verifies(tmp_path: Path) -> None:
     """push_branch pushes a local branch to origin and verifies the remote tip."""
     remote, repo = _init_repo_with_remote(tmp_path)
