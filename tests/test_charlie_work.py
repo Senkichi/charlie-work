@@ -24353,23 +24353,33 @@ def test_maybe_reconcile_drift_noop_when_disabled(tmp_path: Path) -> None:
 
 
 def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -> None:
-    """B-AC1/B-AC2: enabled + due calls reconcile(fix=True) exactly once, arms
-    the next-due schedule ~interval_minutes out, and records a single
-    reconcile_pass_completed summary event carrying drift counts."""
+    """B-AC1/B-AC2: enabled + due calls _reconcile_locked(fix=True) exactly
+    once, arms the next-due schedule ~interval_minutes out, and records a
+    single reconcile_pass_completed summary event carrying drift counts.
+
+    Patches ``_reconcile_locked``, not ``reconcile`` (merge-lane-recovery
+    D-8a): ``_maybe_reconcile_drift`` calls ``_reconcile_locked`` directly
+    because loop()'s caller already holds supervisor.lock for the whole
+    pass, and re-entering ``reconcile()`` would re-acquire that same
+    non-reentrant lock and always no-op. Patching ``reconcile`` here would
+    silently never be invoked and this test would falsely pass with 0 calls
+    recorded as a bug, not a confirmation -- see
+    test_maybe_reconcile_drift_runs_while_supervisor_lock_held for the test
+    that actually exercises that lock-contention distinction end to end."""
     from datetime import UTC, datetime
 
     app = _reconcile_pass_app(tmp_path, interval_minutes=30)
-    original_reconcile = app.reconcile
+    original_reconcile_locked = app._reconcile_locked
     calls: list[tuple[bool, bool]] = []
 
-    def _counting_reconcile(
+    def _counting_reconcile_locked(
         *, fix: bool = False, skip_dead_session_sweep: bool = False
     ) -> CommandResult:
         calls.append((fix, skip_dead_session_sweep))
-        return original_reconcile(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
+        return original_reconcile_locked(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(app, "reconcile", _counting_reconcile)
+    monkeypatch.setattr(app, "_reconcile_locked", _counting_reconcile_locked)
     try:
         app._maybe_reconcile_drift()
     finally:
@@ -24544,6 +24554,63 @@ def test_loop_corrects_escalated_label_divergence_via_reconcile_pass(tmp_path: P
     # to match labels -- only `charlie unescalate` re-enters the machine.
     final_state = load_state(app.paths.state_file)
     assert final_state["issues"]["40"]["status"] == "escalated"
+
+
+def test_maybe_reconcile_drift_runs_while_supervisor_lock_held(tmp_path: Path) -> None:
+    """merge-lane-recovery D-8a: every production caller of loop() -- the
+    cli.py bash-rats handler, fleet_dispatch.py, and supervise.py's
+    `while True` -- already holds supervisor.lock for the whole call, so
+    _maybe_reconcile_drift must make progress under that exact condition.
+
+    The buggy predecessor called `self.reconcile(fix=True, ...)`, which
+    re-acquires supervisor.lock as its first action. Byte-range locks taken
+    via msvcrt.locking(LK_NBLCK) are per-handle and non-reentrant even
+    within one process (file_lock.py keeps no reentrancy bookkeeping), so
+    that reacquisition always failed and reconcile silently no-opped on
+    every one of the fleet's loop passes (0 reconcile events across 9,848
+    recorded events). The fix calls `self._reconcile_locked(...)` directly,
+    bypassing the lock acquisition entirely, since the precondition (lock
+    already held by loop()'s caller) is guaranteed by this method's callers.
+
+    A test that does not hold supervisor.lock during the call cannot
+    distinguish the two implementations -- both acquire/no-op fine when
+    unlocked, which is exactly how this shipped undetected.
+    """
+    from charlie_work import layout
+    from charlie_work.file_lock import try_acquire_byte_range_lock
+
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+
+    supervisor_lock = try_acquire_byte_range_lock(layout.supervisor_lock_path(app.paths.root))
+    assert supervisor_lock is not None, "test setup failed to acquire the supervisor lock"
+    try:
+        app._maybe_reconcile_drift()
+    finally:
+        supervisor_lock.release()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1, (
+        "reconcile_pass_completed must be recorded even while supervisor.lock "
+        f"is held by the loop() caller; events were: {events}"
+    )
+
+    # The assertion that actually discriminates the bug: the buggy code path
+    # (self.reconcile(fix=True, ...) re-acquiring the same non-reentrant
+    # lock) always produced this event with this exact reason instead.
+    lock_held_skips = [
+        e
+        for e in events
+        if e.get("kind") == "reconcile_pass_skipped"
+        and e.get("payload", {}).get("reason") == "supervisor_lock_held"
+    ]
+    assert lock_held_skips == [], (
+        "reconcile must not report supervisor_lock_held when the lock is "
+        "already held by this same in-process loop() call -- that reason is "
+        "reserved for a genuinely concurrent mop-up --fix"
+    )
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:

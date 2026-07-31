@@ -30,6 +30,7 @@ from typing import Any
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .github import (
     GitHub,
+    GitHubError,
     GraphQLBudgetError,
     _LIST_LIMIT,
     RECONCILE_ISSUE_FIELDS,
@@ -121,8 +122,46 @@ def _issue_state(issue: dict[str, Any] | None) -> str:
     return str(issue.get("state") or "OPEN").upper()
 
 
+def _fetch_snapshot(gh: GitHub, args: list[str], *, what: str) -> list[dict[str, Any]]:
+    """Run a ``gh ... list --json`` query, refusing to degrade a failed read to ``[]``.
+
+    ``GitHub.run`` does not raise on every failure mode. On the *success* path
+    -- ``returncode == 0``, ``allow_failure=False``, ``json_output=True`` -- an
+    empty stdout returns ``None`` (``github.py``'s ``if not output: return
+    None``). Coercing that ``None`` to ``[]``, as both fetchers used to, makes
+    "I could not read GitHub" indistinguishable from "GitHub has zero ``what``".
+
+    That distinction is load-bearing. ``detect_drift`` answers "GitHub has zero
+    PRs" by flagging every tracked PR ``state_pr_missing_on_github``, and the
+    fix handler drops each one out of ``state["prs"]`` -- erasing ``decision``
+    and ``reviewed_head_sha`` fleet-wide, so approved PRs read as un-approved.
+
+    It cannot be recovered downstream: ``detect_drift`` receives bit-identical
+    inputs (``prs=[]`` plus a non-empty ``state["prs"]``) from a genuinely
+    empty GitHub and from a failed fetch, which is exactly why a "suspiciously
+    empty" heuristic there is unsound in both directions. The non-list value is
+    only visible *here*, so this is the one layer that can preserve it -- after
+    which ``[]`` unambiguously means "GitHub has zero ``what``" and the
+    downstream sweep is correct by construction rather than by heuristic.
+
+    Raises ``GitHubError`` so existing caller handling applies: the periodic
+    in-loop pass records ``reconcile_pass_failed`` and leaves state untouched,
+    and the ``reconcile``/``mop-up`` CLI paths surface it through their
+    ``except GitHubError`` handlers instead of mutating state on a bad read.
+    """
+    result = gh.run(args, json_output=True)
+    if not isinstance(result, list):
+        raise GitHubError(
+            f"reconcile: `gh {args[0]} list` returned {type(result).__name__}, not a list; "
+            f"refusing to treat an unreadable {what} snapshot as an empty one "
+            "(that reading would drop every tracked item from state.json)"
+        )
+    return result
+
+
 def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
-    result = gh.run(
+    return _fetch_snapshot(
+        gh,
         [
             "pr",
             "list",
@@ -133,13 +172,13 @@ def _fetch_prs(gh: GitHub) -> list[dict[str, Any]]:
             "--json",
             RECONCILE_PR_FIELDS,
         ],
-        json_output=True,
+        what="PR",
     )
-    return result if isinstance(result, list) else []
 
 
 def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
-    result = gh.run(
+    return _fetch_snapshot(
+        gh,
         [
             "issue",
             "list",
@@ -150,9 +189,8 @@ def _fetch_issues(gh: GitHub) -> list[dict[str, Any]]:
             "--json",
             RECONCILE_ISSUE_FIELDS,
         ],
-        json_output=True,
+        what="issue",
     )
-    return result if isinstance(result, list) else []
 
 
 # Aviator (job-cannon/charlie-work's merge-queue bot) owns these strings; they

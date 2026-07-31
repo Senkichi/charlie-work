@@ -10544,13 +10544,14 @@ class OrchestratorApp:
         supervisor lock or the state lock is held, the call returns a skipped
         value result rather than blocking or writing unlocked.
 
-        ``skip_dead_session_sweep`` is passed straight through to
-        ``detect_drift`` (see its docstring for the full rationale): the
-        periodic in-loop caller (``_maybe_reconcile_drift``) sets this True
-        because the loop's own stall/dead lanes already swept sessions this
-        exact pass with grace-period semantics reconcile.py's sweep lacks.
-        ``mop-up --fix`` and every other caller default to False, preserving
-        today's full manual-reconcile behavior.
+        This is the public entry point: acquire ``supervisor.lock`` (only
+        when ``fix``, matching today's behavior), then delegate everything
+        else to ``_reconcile_locked``, which requires the lock already be
+        held. Do not inline the body back here — the periodic in-loop caller
+        (``_maybe_reconcile_drift``) already holds ``supervisor.lock`` via
+        its own caller (``loop()``) and must call ``_reconcile_locked``
+        directly; re-entering this method would always fail to reacquire the
+        same non-reentrant lock and silently no-op (merge-lane-recovery D-8a).
         """
         supervisor_lock = None
         if fix:
@@ -10563,6 +10564,32 @@ class OrchestratorApp:
                     "reconcile deferred: supervisor lock held",
                     {"skipped": True, "reason": "supervisor_lock_held"},
                 )
+        try:
+            return self._reconcile_locked(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
+        finally:
+            if supervisor_lock is not None:
+                supervisor_lock.release()
+
+    def _reconcile_locked(
+        self, *, fix: bool = False, skip_dead_session_sweep: bool = False
+    ) -> CommandResult:
+        """Run drift detection (and optional repair) against GitHub/state.
+
+        Precondition: the caller MUST already hold ``supervisor.lock`` — this
+        method never acquires it itself. ``reconcile()`` is the only method
+        that acquires the lock (and only when ``fix``); it delegates here
+        immediately afterward. The periodic in-loop caller
+        (``_maybe_reconcile_drift``) calls this directly, bypassing
+        ``reconcile()``'s lock-acquisition entirely, because ``loop()``'s own
+        caller already holds ``supervisor.lock`` for the whole pass —
+        acquiring it a second time on the same non-reentrant byte-range lock
+        would always fail and silently no-op (merge-lane-recovery D-8a).
+
+        Extracted verbatim from ``reconcile()``'s former body — logic here is
+        unchanged from before the split, including the GraphQL rate-limit
+        deferral, so ``charlie mop-up --fix`` (which still goes through
+        ``reconcile()``) is byte-for-byte unchanged in behaviour.
+        """
         try:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -10662,9 +10689,6 @@ class OrchestratorApp:
             )
         except StateLockBusy:
             return _state_lock_busy_result("reconcile deferred: state lock held")
-        finally:
-            if supervisor_lock is not None:
-                supervisor_lock.release()
 
     @staticmethod
     def _cross_family_section(report_path: str | Path) -> str:
@@ -12096,7 +12120,7 @@ class OrchestratorApp:
         only when an operator remembers to intervene.
 
         This method is wiring only -- it does not reimplement drift
-        detection or repair. ``self.reconcile(fix=True)`` owns that (and
+        detection or repair. ``self._reconcile_locked(fix=True)`` owns that (and
         already threads ``state_path`` so ``apply_fixes`` emits one
         ``"reconcile"`` event per repaired drift item for free -- see
         ``reconcile.py``). It also owns the safety invariant this
@@ -12118,24 +12142,52 @@ class OrchestratorApp:
         ``repo_root`` in ``detect_drift``) are unaffected -- they have no
         counterpart in the loop's own lanes and keep running.
 
+        Calls ``_reconcile_locked`` directly, NOT ``reconcile()`` -- this is
+        the whole point of the D-8a split and reverting it silently disables
+        this entire method. ``reconcile()`` acquires ``supervisor.lock``
+        before doing anything else, and every production caller of ``loop()``
+        already holds that exact lock for the full duration of the call:
+        ``cli.py``'s ``bash-rats`` handler, ``fleet_dispatch.py``, and
+        ``supervise.py`` (which holds it across *every* pass of its
+        ``while True``). Byte-range locks taken via ``msvcrt.locking`` with
+        ``LK_NBLCK`` are per-handle and non-reentrant *even within a single
+        process* -- ``file_lock.py`` keeps no reentrancy bookkeeping -- so a
+        second acquisition from inside the same process fails exactly like a
+        foreign process's would. Going through ``reconcile()`` here therefore
+        always took the ``supervisor_lock_held`` early return and never ran.
+
         Two-phase lock pattern, mirroring ``_maybe_probe_quota_recovery``:
-        ``self.reconcile(fix=True)`` acquires ``state_lock`` itself
-        internally to run drift detection/repair, and ``state_lock`` wraps a
-        non-reentrant advisory file lock (a plain per-path
-        ``threading.Lock``, not an ``RLock``) -- calling it while this
-        method already held the same lock would deadlock. So:
+        ``_reconcile_locked`` acquires ``state_lock`` itself internally to
+        run drift detection/repair, and ``state_lock`` wraps a non-reentrant
+        advisory file lock (a plain per-path ``threading.Lock``, not an
+        ``RLock``) -- calling it while this method already held the same lock
+        would deadlock. So:
           1. Under our own (short) lock: decide whether reconcile is due at
              all. If not, return without calling out.
           2. Outside any lock held by this method: call
-             ``self.reconcile(fix=True)``. This may itself defer (the
-             existing GraphQL rate-limit check) or skip (supervisor lock
-             held by a concurrent manual ``mop-up --fix``) rather than
-             running -- both are preserved, not bypassed.
+             ``self._reconcile_locked(fix=True)``. This may still defer (the
+             existing GraphQL rate-limit check) -- that path is preserved.
+             It can no longer report ``supervisor_lock_held``, because it
+             never attempts that acquisition; the lock is already held by
+             ``loop()``'s caller, which is the precondition this method
+             relies on rather than something it works around.
           3. Under our own (short) lock again: persist the next-due
              timestamp and emit exactly one summary event for this pass,
-             shaped by the outcome (completed / deferred / skipped) so a
-             deferred or skipped pass is distinguishable from a silent
+             shaped by the outcome (completed / deferred / failed) so a
+             deferred or failed pass is distinguishable from a silent
              no-op rather than failing silently (D-8, B-AC3).
+
+        The call is wrapped in exception containment, and that containment is
+        load-bearing rather than defensive habit: ``supervise.py``'s
+        ``except Exception`` sits *outside* its ``while True``, so a single
+        uncaught exception from here terminates the whole daemon rather than
+        one pass. ``_fetch_prs``/``_fetch_issues`` reach GitHub via
+        ``gh.run(..., json_output=True)`` with ``allow_failure=False``, which
+        *raises* ``GitHubError``/``GitHubNotFoundError`` once retries are
+        exhausted -- so without this, a GitHub outage is a live daemon-kill
+        path. A failed pass re-arms the timer like any other outcome, so a
+        persistent failure degrades to one logged error per interval instead
+        of a hot loop.
         """
         if not self.config.reconcile_pass.enabled:
             return
@@ -12146,14 +12198,29 @@ class OrchestratorApp:
             if not is_reconcile_due(state):
                 return
 
-        result = self.reconcile(fix=True, skip_dead_session_sweep=True)
-
         next_reconcile_at = (
             (datetime.now(UTC) + timedelta(minutes=self.config.reconcile_pass.interval_minutes))
             .replace(microsecond=0)
             .isoformat()
             .replace("+00:00", "Z")
         )
+
+        # D-8a: _reconcile_locked, never reconcile(). See this method's
+        # docstring -- reconcile() would re-acquire the supervisor lock that
+        # loop()'s caller already holds and silently no-op every pass.
+        try:
+            result = self._reconcile_locked(fix=True, skip_dead_session_sweep=True)
+        except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = arm_reconcile_pass(state, next_reconcile_at)
+                state = self._record_event(
+                    state,
+                    "reconcile_pass_failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+                save_state(state_file, state)
+            return
 
         with state_lock(state_file):
             state = load_state(state_file)
