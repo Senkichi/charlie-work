@@ -8,8 +8,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import layout
+from .config import DEFAULT_CONFIG_FILENAME
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
-from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
+from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError
 from .paths import RuntimePaths
 from .state import save_state, state_lock
@@ -107,10 +109,10 @@ def touch_repo(
     except GitHubError as exc:
         logger.debug(f"Skipping fleet registration: gh repo view failed: {exc}")
         # Return the current registry unchanged (or empty if missing)
-        fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+        fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
         return _load_registry(fleet_json_path)
 
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
 
     # Issue #624: a virtualized fleet dir forks a private copy on this write,
     # so registering a repo would land where the fleet supervisor never reads.
@@ -133,7 +135,7 @@ def touch_repo(
         updated_entry = {
             "repo_root": str(repo_root),
             "name_with_owner": name_with_owner,
-            "config_path": str(repo_root / "orchestrator.config.yaml"),
+            "config_path": str(repo_root / DEFAULT_CONFIG_FILENAME),
             "state_dir": str(paths.root),
             "first_seen": entry.get("first_seen", now) if entry else now,
             "last_seen": now,
@@ -163,7 +165,7 @@ def count_fleet_live_sessions(
         list of name_with_owner keys whose repo_root no longer exists or is not
         a git worktree.
     """
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
     repos = data.get("repos", {})
 
@@ -203,7 +205,12 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        sessions_dir = state_dir / "dispatches" / "sessions"
+        # NOTE: reconstructs the *default* layout and ignores a per-repo
+        # ``devin.sessions_dir`` override (deferred behavioral fix). A repo that
+        # overrides ``sessions_dir`` is silently skipped from this fleet-wide
+        # concurrency count, which fails open toward over-dispatch rather than
+        # under-dispatch.
+        sessions_dir = layout.sessions_dir_default(state_dir)
         if not sessions_dir.exists():
             # No sessions dir means no live sessions for this repo
             continue
@@ -228,8 +235,7 @@ def try_acquire_fleet_lock(fleet_dir_override: str | None) -> FleetLock | None:
     shared fleet-wide cap.
     """
     try:
-        lock_dir = fleet_dir(override=fleet_dir_override)
-        lock_path = lock_dir / "fleet.lock"
+        lock_path = layout.fleet_lock_path(override=fleet_dir_override)
 
         thread_lock = _fleet_thread_lock_for(lock_path)
         if not thread_lock.acquire(blocking=False):
@@ -260,7 +266,7 @@ def count_fleet_runners(
         skipped_repos is a list of name_with_owner keys whose repo_root no longer
         exists or is not a git worktree.
     """
-    fleet_json_path = fleet_dir(override=fleet_dir_override) / "fleet.json"
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
     repos = data.get("repos", {})
 

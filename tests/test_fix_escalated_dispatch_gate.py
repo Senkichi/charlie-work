@@ -218,7 +218,7 @@ def test_reap_review_verdicts_emits_event_when_record_review_refuses_escalated(
     review_verdict_missed event -- not silently dropped."""
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     verdict_log = (
         "Final verdict:\n```json\n{\n"
@@ -275,7 +275,7 @@ def test_reap_review_verdicts_launch_failure_is_not_reported_as_turn_limit(
 
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(
@@ -325,7 +325,7 @@ def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path:
 
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     max_turns = app.config.review_dispatch.review_max_turns
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
@@ -362,7 +362,7 @@ def test_reap_review_verdicts_death_after_partial_work_is_its_own_bucket(
 
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     _make_dead_review_sidecar(reviews_dir, 100, "Truncated log with no verdict block")
@@ -441,7 +441,7 @@ def test_reap_review_verdicts_session_limit_notice_is_launch_failure(
 
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
     _write_review_packet(tmp_path, 100, "sha-100")
-    reviews_dir = app._resolve(app.config.review_dispatch.reviews_dir)
+    reviews_dir = app._layout.reviews_dir
 
     old_dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     # Reviewer launches force tee_stream_json=True, so log_path and events_path

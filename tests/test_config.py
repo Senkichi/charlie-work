@@ -174,11 +174,18 @@ def test_load_config_injected_paths_normalizes_backslashes(tmp_path: Path) -> No
 
 
 def test_load_config_review_dispatch_defaults() -> None:
-    """ReviewDispatchConfig defaults are safe (disabled, separate dir, bounded)."""
+    """ReviewDispatchConfig defaults are safe (disabled, sentinel dir, bounded).
+
+    ``reviews_dir`` defaults to ``""`` -- the sentinel meaning "derive from
+    ``runtime.state_dir``" via ``paths.resolved_layout`` -- rather than a
+    hardcoded literal. See
+    test_paths.py::test_resolved_layout_default_config_matches_historical_literals
+    for proof the resolved value still matches the historical path.
+    """
     config_file = Path("nonexistent.yaml")
     config = load_config(config_file)
     assert config.review_dispatch.enabled is False
-    assert config.review_dispatch.reviews_dir == ".var/charlie-work/dispatches/reviews"
+    assert config.review_dispatch.reviews_dir == ""
     assert config.review_dispatch.max_local_review_processes == 2
 
 

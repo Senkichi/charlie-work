@@ -22,13 +22,20 @@ from charlie_work.workflow import _build_attention_digest
 
 
 def test_notify_config_defaults_disabled():
-    """NotifyConfig() has enabled=False by default."""
+    """NotifyConfig() has enabled=False by default.
+
+    ``file_path`` defaults to ``""`` -- the sentinel meaning "derive from
+    ``runtime.state_dir``" via ``paths.resolved_layout`` -- rather than a
+    hardcoded literal. See
+    test_paths.py::test_resolved_layout_default_config_matches_historical_literals
+    for proof the resolved value still matches the historical path.
+    """
     config = NotifyConfig()
     assert config.enabled is False
     assert config.sink == "file"
     assert config.webhook_url == ""
     assert config.shell_command == ()
-    assert config.file_path == ".var/charlie-work/notify/digest.jsonl"
+    assert config.file_path == ""
 
 
 def test_notify_config_unknown_key_raises_config_error(tmp_path):
