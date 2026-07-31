@@ -11062,6 +11062,66 @@ def test_parse_cross_family_verdict_legacy_blocker_with_no_summary_is_malformed(
     assert "BLOCKER" in result.raw_body
 
 
+def test_parse_cross_family_verdict_bold_inline_verdict_marker() -> None:
+    """Regression: some cross-family models (e.g. glm-5.2) emit the verdict as
+    a bold-inline ``**Verdict:**`` marker within a paragraph, rather than a
+    bare ``Verdict:`` line or a ``## Verdict`` heading. The pre-fix
+    ``_VERDICT_RE`` matched neither the bare-colon nor the heading form, so
+    every such report (PRs #680, #690, #692, #699, #700 in production, all
+    with real BLOCKER/MAJOR findings and a readable verdict) fell through to
+    the "no extractable summary" branch and was misclassified as
+    ``MalformedCrossFamilyVerdict`` despite the verdict being right there."""
+    body = (
+        "**MAJOR**\nfile.py:10 real bug\n\n"
+        "**Verdict:** Approve with a required follow-up — MAJOR 1 is a real "
+        "correctness bug that must be fixed before this claim can be trusted."
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary=(
+            "Approve with a required follow-up — MAJOR 1 is a real "
+            "correctness bug that must be fixed before this claim can be trusted."
+        ),
+        required_changes=(),
+    )
+
+
+def test_parse_cross_family_verdict_json_block_after_language_tagged_code_fences() -> None:
+    """Regression for PR #802's real failure shape: a report that cites code
+    in ```python fences before its final ```json verdict fence. The pre-fix
+    ``_VERDICT_FENCE_RE`` (``` ```(?:json)?\\s*\\n `` ``) only recognized an
+    opening fence tagged bare or ``json`` -- a ```python fence's own opening
+    backtick never matched, so ``finditer`` instead paired that block's
+    *closing* bare ``` with the *next* fence's opening as a bogus "match",
+    permanently desynchronizing every fence pair after it and hiding the
+    genuinely well-formed trailing JSON verdict entirely (confirmed
+    byte-for-byte against PR #802's on-disk report)."""
+    body = (
+        "**MAJOR**\nfile.py:10 real bug\n\n"
+        "```python\n"
+        "total_running = sum(t.running for t in plan.targets)\n"
+        "```\n\n"
+        "some prose explaining the first citation\n\n"
+        "```python\n"
+        "planned_running = sum(t.target for t in plan.targets)\n"
+        "```\n\n"
+        "some prose explaining the second citation\n\n"
+        "```json\n"
+        '{"decision": "request_changes", "summary": "real bug in the spare-budget gate", '
+        '"required_changes": ["Fix the gate to use planned running, not actual running"]}\n'
+        "```\n"
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="real bug in the spare-budget gate",
+        required_changes=("Fix the gate to use planned running, not actual running",),
+    )
+
+
 def test_cross_family_verdict_post_init_rejects_content_free_request_changes() -> None:
     """Issue #784 AC-6: the invalid state -- request_changes with neither
     itemized required_changes nor a real summary -- must be unrepresentable
@@ -35189,6 +35249,37 @@ def test_parse_review_verdict_from_log_extracts_last_fenced_json(tmp_path: Path)
     assert verdict["decision"] == "approved"
     assert verdict["summary"] == "lgtm"
     assert verdict["required_changes"] == []
+
+
+def test_parse_review_verdict_from_log_extracts_json_after_language_tagged_fence(
+    tmp_path: Path,
+) -> None:
+    """Regression: ``_VERDICT_FENCE_RE`` previously only recognized an opening
+    fence tagged bare or ``json`` (``` ```(?:json)?\\s*\\n `` ``), so a
+    reviewer quoting evidence in a ```python fence before its final verdict
+    fence would desync the pairing entirely -- the ```python fence's own
+    opening backtick never matched, so its *closing* bare ``` got misread as
+    a new opening and swallowed everything up to the *next* fence's opening,
+    permanently misaligning the scan. This mirrors the exact structure that
+    hid a real, well-formed verdict in a production cross-family report
+    (PR #802); the same regex is duplicated here in ``workflow.py`` (kept
+    latent so far by per-event stream-json decoding, but a real defect)."""
+    log = tmp_path / "review.claude.log"
+    log.write_text(
+        "Citing the bug:\n```python\ndef broken():\n    return None\n```\n"
+        "That's a real problem.\n\n"
+        'Final verdict:\n```json\n{\n  "decision": "request_changes",\n'
+        '  "summary": "broken() returns None instead of raising",\n'
+        '  "required_changes": ["Raise instead of returning None"]\n}\n```\n',
+        encoding="utf-8",
+    )
+
+    verdict = _parse_review_verdict_from_log(log)
+
+    assert verdict is not None
+    assert verdict["decision"] == "request_changes"
+    assert verdict["summary"] == "broken() returns None instead of raising"
+    assert verdict["required_changes"] == ["Raise instead of returning None"]
 
 
 def test_parse_review_verdict_from_log_requires_valid_decision(tmp_path: Path) -> None:
