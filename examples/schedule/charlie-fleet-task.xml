@@ -2,21 +2,44 @@
 <!--
   charlie-work fleet scheduler — Windows Task Scheduler XML template.
   Import this task with: schtasks /create /xml charlie-fleet-task.xml /tn "charlie-work fleet"
-  
-  Detection latency equals invocation cadence: a stalled session found on pass N
-  is invisible until pass N+1 runs. There is no daemon — this design does not add one.
-  Choose your interval based on how quickly you need to detect stalled/runaway/dead workers.
-  
+
+  Daemon + watchdog split. `charlie fleet supervise` is a long-running daemon
+  that polls each registered repo's sidecar/verdict mtimes every ~20 s and runs
+  a full fleet_loop pass only when something actionable changed or
+  full_pass_interval_seconds (300 s) expires. This scheduled task's 5-minute
+  trigger is a WATCHDOG, not the work itself: MultipleInstancesPolicy=IgnoreNew
+  keeps the trigger from double-launching while the daemon is alive, and a tick
+  only starts a new daemon process if the previous one has crashed. Choose your
+  interval based on how quickly you need the watchdog to notice a crashed
+  daemon and restart it — it no longer controls detection latency, which is
+  bounded by the daemon's own poll_interval_seconds.
+
+  This template launches the daemon through the windowless launcher chain
+  tracked in scripts/:
+    wscript.exe //B //NoLogo scripts/fleet-pass-hidden.vbs -> scripts/fleet-pass.ps1
+  The .vbs host is a GUI-subsystem executable (never gets a console), so the
+  daemon and its child processes (uv/python/gh/git) never flash a visible
+  terminal window. Do NOT replace this with a direct `powershell.exe` or
+  `cmd.exe` invocation: a console-subsystem exe gets its console window BEFORE
+  it can honor -WindowStyle Hidden, so every tick would flash a terminal.
+
   PLACEHOLDERS TO ADJUST:
-  - Replace C:\path\to\your\repo with your actual repository path
-  - Adjust the <Interval> in <Triggers> to set the recurrence interval (PT5M = 5 minutes)
-  - For single-repo (non-fleet) usage, replace "charlie fleet bash-rats" with "charlie bash-rats"
+  - Replace C:\path\to\your\repo with your actual repository path (in BOTH the
+    <Arguments> below AND the $root line in scripts/fleet-pass.ps1, which the
+    .vbs launcher derives from its own location and invokes).
+  - Adjust the <Interval> in <Triggers> to set the watchdog recurrence (PT5M = 5
+    minutes). This is the crash-detection cadence, not the work cadence.
+  - S-1-5-18 runs the task as LOCAL SYSTEM. For an interactive-user install
+    replace it with your user SID and use LogonType=InteractiveToken (see
+    scripts/charlie-fleet-pass-task.xml for this host's real registration).
+  - For single-repo (non-fleet) usage, replace "charlie fleet supervise" with
+    "charlie supervise" in scripts/fleet-pass.ps1.
 -->
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Date>2026-07-07T00:00:00.000000</Date>
     <Author>System Operator</Author>
-    <Description>Run charlie-work fleet supervisor periodically to detect stalled/runaway/dead workers</Description>
+    <Description>Run the charlie-work fleet supervisor (long-running `charlie fleet supervise` daemon). The 5-minute trigger is a watchdog: MultipleInstancesPolicy=IgnoreNew prevents double-launch while the daemon is alive; if it crashes, the next tick restarts it.</Description>
   </RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
@@ -25,7 +48,7 @@
       <ScheduleByDay>
         <DaysInterval>1</DaysInterval>
       </ScheduleByDay>
-      <!-- Adjust PT5M to your desired interval (PT5M = 5 minutes, PT15M = 15 minutes, PT1H = 1 hour) -->
+      <!-- Adjust PT5M to your desired watchdog interval (PT5M = 5 minutes, PT15M = 15 minutes, PT1H = 1 hour) -->
       <Repetition>
         <Interval>PT5M</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
@@ -57,25 +80,22 @@
     <DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>
     <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
     <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <!-- PT0S = no limit: the daemon runs indefinitely and is restarted by the
+         watchdog trigger only if it crashes. A finite limit would kill the
+         daemon on schedule and rely on the next tick to relaunch it. -->
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <!-- Replace C:\path\to\your\repo with your actual repository path -->
-      <!-- For single-repo usage, replace "charlie fleet bash-rats" with "charlie bash-rats" -->
-      <Command>cmd.exe</Command>
-      <Arguments>/c "cd /d C:\path\to\your\repo &amp;&amp; charlie fleet bash-rats"</Arguments>
-      <!-- Log persistence no longer depends on this redirect (issue #646
-           follow-up): every invocation calls configure_logging(), which
-           writes day-stamped INFO logs to
-           %LOCALAPPDATA%\charlie-work\logs\charlie-work-YYYYMMDD.log
-           (or $XDG_STATE_HOME/charlie-work/logs on POSIX) regardless of how
-           this task is launched or whether stdout/stderr is captured.
-           Uncommenting the line below is still fine as belt-and-braces,
-           e.g. to also capture this command's own stdout/stderr framing,
-           but it is not required to answer "what was running and when". -->
-      <!-- <Arguments>/c "cd /d C:\path\to\your\repo &amp;&amp; charlie fleet bash-rats &gt;&gt; C:\path\to\charlie-work.log 2&gt;&amp;1"</Arguments> -->
+      <!-- Launch through the windowless VBS launcher chain (scripts/fleet-pass-hidden.vbs
+           -> scripts/fleet-pass.ps1) to avoid the console-window flash that a direct
+           powershell.exe/cmd.exe invocation causes every tick.
+           Replace C:\path\to\your\repo with your actual repository path, and edit the
+           $root line in scripts/fleet-pass.ps1 to match. The .ps1 invokes
+           `charlie fleet supervise` with max-runtime 0 (0 = unlimited). -->
+      <Command>C:\Windows\System32\wscript.exe</Command>
+      <Arguments>//B //NoLogo "C:\path\to\your\repo\scripts\fleet-pass-hidden.vbs"</Arguments>
     </Exec>
   </Actions>
 </Task>
