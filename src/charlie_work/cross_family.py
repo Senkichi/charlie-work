@@ -74,10 +74,24 @@ _SEVERITY_RE = re.compile(
     re.MULTILINE,
 )
 
-# Fenced ```json ... ``` (or bare ``` ... ```) block, mirroring
-# ``workflow._VERDICT_FENCE_RE``. Not imported from ``workflow`` because
-# ``workflow`` imports this module, not the reverse.
-_VERDICT_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+# Fenced ```json ... ``` (or bare ``` ... ``` or ```<any-language-tag> ... ```)
+# block, mirroring ``workflow._VERDICT_FENCE_RE``. Not imported from
+# ``workflow`` because ``workflow`` imports this module, not the reverse.
+#
+# The language-tag group MUST accept any tag, not just ``json``: a prior
+# ``(?:json)?`` version only recognized an opening fence tagged bare or
+# ``json``, so a report with e.g. ``` ```python ``` citation blocks before its
+# final ```json verdict block desynchronized entirely -- the regex failed to
+# match the ```python fence's own OPENING backtick (its "python" tag isn't
+# "json" and isn't followed by whitespace-then-newline), so ``finditer``
+# skipped past it and instead matched the ```python block's *closing* bare
+# ``` as a spurious new opening, pairing it with the *next* fence's opening
+# as its "closing" -- silently merging two unrelated fenced blocks into one
+# corrupted match and permanently misaligning every fence pair after it in
+# the document (confirmed byte-for-byte against PR #802's real report, whose
+# genuinely well-formed trailing ```json verdict was never found because of
+# this).
+_VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 
 
 def _looks_transient(*texts: str) -> bool:

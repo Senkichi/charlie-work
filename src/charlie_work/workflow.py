@@ -1485,7 +1485,18 @@ def _is_review_dispatchable(
     return True
 
 
-_VERDICT_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+# Language-tag group accepts any tag (not just ``json``), mirroring the fix in
+# ``cross_family._VERDICT_FENCE_RE``: a fence opened with an unrecognized tag
+# (e.g. ```python) previously failed to match as an opening delimiter at all,
+# causing its own closing ``` to be misread as a spurious new opening and
+# desynchronizing every fence pair after it. In practice this path is
+# protected here because each stream-json event's text is checked in
+# isolation (see ``_extract_verdict_from_stream_json``) and the reviewer's
+# final verdict fence normally lands in its own turn, separate from any
+# earlier code-citation turns -- but the defect is real and latent, so it is
+# fixed here too rather than left to fire the day a reviewer's final message
+# happens to combine both.
+_VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 
 # Absolute path ending in .md, as reviewers reference their summary files in
 # final output (e.g. "Full review written to `C:\...\review.md`"). Colons,
