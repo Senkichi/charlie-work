@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -91,6 +92,45 @@ def _make_repo(hb: ModuleType, tmp_path: Path) -> Any:
         state_dir=tmp_path / "state",
         config_path=tmp_path / "orchestrator.config.yaml",
     )
+
+
+def _write_events_db(state_dir: Path, rows: list[tuple[str, str]] | None = None) -> Path:
+    """Create an events.db next to state.json with the production `events` schema.
+
+    `rows` is a list of (ts, kind) pairs inserted as minimal event rows.
+    Mirrors `charlie_work.instrumentation`'s `events` table by hand rather
+    than importing the package, since heartbeat_check.py deliberately
+    avoids that import (see `fleet_dir`'s docstring) and this check must be
+    tested the same way.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = state_dir / "events.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              TEXT    NOT NULL,
+                kind            TEXT    NOT NULL,
+                payload         TEXT    NOT NULL,
+                repo            TEXT,
+                correlation_id  TEXT,
+                pr_number       INTEGER,
+                issue_number    INTEGER,
+                level           TEXT DEFAULT 'info'
+            )
+            """
+        )
+        for ts, kind in rows or []:
+            conn.execute(
+                "INSERT INTO events (ts, kind, payload) VALUES (?, ?, '{}')",
+                (ts, kind),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
 
 
 def _write_state(state_dir: Path, pr_number: int, pr_state: dict[str, Any]) -> None:
@@ -673,3 +713,102 @@ def test_check_runners_anomaly_on_windows_with_bad_result(
     hb.check_runners(report)
     assert report.anomaly
     assert "last run result 1" in report.lines[0]
+
+
+def test_check_loop_pass_freshness_anomaly_when_stale_but_log_fresh(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Regression for the #851/#854 fleet outage.
+
+    A defect made the supervisor exit immediately every ~5min for a
+    "watchdog restart" while doing ZERO repo passes, for 32+ minutes.
+    During the real incident `check_log_freshness` passed the entire time --
+    state.json kept getting touched every beat even though no real loop
+    pass ran -- so log freshness was structurally blind to this outage
+    class. This test reproduces exactly that shape (fresh state.json, stale
+    `loop_started` row) and pins that `check_loop_pass_freshness` is the
+    check that catches it.
+    """
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    (repo.state_dir / "state.json").write_text("{}", encoding="utf-8")
+    _write_events_db(repo.state_dir, [(_iso(45), "loop_started")])
+
+    log_report = hb.Report()
+    hb.check_log_freshness(log_report, repo)
+    assert not log_report.anomaly, "log freshness must read healthy, matching the real outage"
+
+    report = hb.Report()
+    hb.check_loop_pass_freshness(report, repo)
+    assert report.anomaly
+    assert "loop_started" in report.lines[0]
+
+
+def test_check_loop_pass_freshness_ok_when_recent(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(5), "loop_started")])
+    report = hb.Report()
+    hb.check_loop_pass_freshness(report, repo)
+    assert not report.anomaly
+    assert "newest_loop_started=" in report.lines[0]
+
+
+def test_check_loop_pass_freshness_ok_when_db_missing(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    report = hb.Report()
+    hb.check_loop_pass_freshness(report, repo)
+    assert not report.anomaly
+    assert "no events.db" in report.lines[0]
+
+
+def test_check_loop_pass_freshness_ok_when_table_missing(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    db_path = repo.state_dir / "events.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("CREATE TABLE unrelated (id INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    report = hb.Report()
+    hb.check_loop_pass_freshness(report, repo)
+    assert not report.anomaly
+    assert "no events table" in report.lines[0]
+
+
+def test_check_loop_pass_freshness_ok_when_zero_loop_started_rows(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    # events table exists and has rows, but none of kind loop_started --
+    # must be distinguishable from both "no table" and "stale".
+    _write_events_db(repo.state_dir, [(_iso(1), "dispatch")])
+    report = hb.Report()
+    hb.check_loop_pass_freshness(report, repo)
+    assert not report.anomaly
+    assert "no loop_started rows" in report.lines[0]
+
+
+def test_check_loop_pass_freshness_recent_iso_row_not_misjudged_stale(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Positive control for the ISO-vs-SQLite string-comparison trap.
+
+    `ts` values are `...THH:MM:SSZ`. SQLite's `datetime('now','-30
+    minutes')` returns a space-separated, non-`Z` string like
+    `2026-07-31 22:25:04`. A predicate such as
+    `WHERE ts < datetime('now','-30 minutes')` string-compares these, and
+    `'T'` (0x54) sorting after `' '` (0x20) makes the comparison
+    unreliable in either direction. This row is genuinely 2 minutes old and
+    must read as fresh; if the SQL-based comparison is ever reintroduced in
+    place of the Python-side `parse_iso` + timedelta comparison, this test
+    must go red.
+    """
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(2), "loop_started")])
+    report = hb.Report()
+    hb.check_loop_pass_freshness(report, repo)
+    assert not report.anomaly, report.lines

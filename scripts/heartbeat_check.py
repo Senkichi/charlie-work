@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ MERGED_PR_LOOKBACK_LIMIT = 5
 QUEUED_STALE_MINUTES = 20
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
+LOOP_PASS_STALE_MINUTES = 30
 MERGEQUEUE_STALL_BEATS = 2
 GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
@@ -708,6 +710,97 @@ def check_log_freshness(report: Report, repo: RepoInfo, *, now: datetime | None 
         report.ok(check, facts)
 
 
+def check_loop_pass_freshness(
+    report: Report,
+    repo: RepoInfo,
+    *,
+    now: datetime | None = None,
+    stale_minutes: int = LOOP_PASS_STALE_MINUTES,
+) -> None:
+    """Detect a fleet loop that has stopped taking real repo passes.
+
+    Issues #851/#854: a defect made the supervisor exit immediately every
+    ~5min for a "watchdog restart" while doing ZERO repo passes, for 32+
+    minutes. It was invisible to every other check: the process exited 0,
+    the scheduled task reported success, and the state dir kept getting
+    touched (``self_deploy_succeeded`` fires every beat), so
+    ``check_log_freshness`` saw a fresh file the entire time and never
+    tripped. The only ground truth is the ABSENCE of ``loop_started`` rows
+    in ``events.db`` -- that event is only written from inside the real
+    loop body (``workflow.py``'s ``_loop_impl``), which a watchdog-restart
+    short-circuit never reaches.
+
+    ``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``.
+
+    Missing DB, missing table, and zero ``loop_started`` rows are each
+    reported OK with a distinct message -- a fresh install/state dir with no
+    history yet is not the same failure as a fleet that stopped mid-flight.
+
+    CRITICAL: the freshness comparison is done in Python on parsed
+    ``datetime`` objects, never in SQL. ``ts`` values are ISO strings like
+    ``2026-07-31T22:25:04Z`` (``T``/``Z``); SQLite's
+    ``datetime('now','-30 minutes')`` returns a space-separated,
+    non-``Z`` string like ``2026-07-31 22:25:04``. A predicate such as
+    ``WHERE ts < datetime('now','-30 minutes')`` compares them as strings,
+    where ``'T'`` (0x54) sorts after ``' '`` (0x20) -- this silently
+    misclassifies rows in both directions instead of raising, so the bug
+    doesn't fail loudly, it just returns the wrong answer.
+    """
+    check = f"loop-pass-freshness {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.ok(check, "no events.db (fresh install or pre-instrumentation state dir)")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.ok(check, "events.db has no events table yet")
+                return
+            newest_ts = conn.execute(
+                "SELECT MAX(ts) FROM events WHERE kind = 'loop_started'"
+            ).fetchone()[0]
+        except sqlite3.Error as exc:
+            report.anom(check, f"events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    if newest_ts is None:
+        report.ok(check, "no loop_started rows recorded yet")
+        return
+
+    newest_dt = parse_iso(newest_ts)
+    if newest_dt is None:
+        report.anom(check, f"newest loop_started ts unparseable: {newest_ts!r}")
+        return
+
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
+    age_min = (resolved_now - newest_dt).total_seconds() / 60
+    facts = f"newest_loop_started={newest_ts} age={round(age_min)}m"
+
+    if age_min > stale_minutes:
+        marker_path = repo.state_dir / "pending-sync.json"
+        report.anom(
+            check,
+            f"no fleet loop pass in {round(age_min)}m (newest loop_started {newest_ts}), "
+            f"threshold={stale_minutes}m. The supervisor may be exiting for watchdog "
+            f"restarts without doing work - check {marker_path} for a stale marker. "
+            f"({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
 def check_merge_flow(
     report: Report,
     repo: RepoInfo,
@@ -926,6 +1019,7 @@ def main() -> int:
         check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
+        check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
         new_state["repos"][repo.slug] = new_repo_state
 
