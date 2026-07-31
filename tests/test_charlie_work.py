@@ -9817,6 +9817,209 @@ def test_unauthorized_merge_baseline_arming_writes_nothing_in_dry_run(tmp_path: 
     )
 
 
+def _ack_unauthorized_merge(paths, pr_number: int, reason: str = "triaged") -> None:
+    """Mark a post-arming unauthorized-merge finding as acknowledged in state.json.
+
+    Mirrors ``_arm_unauthorized_merge_tripwire`` for the ack half of the
+    tripwire: tests asserting on post-arming findings use this to declare the
+    steady state where a finding has already been triaged and must no longer
+    pin ``ok=False`` (issue #673).
+    """
+    from charlie_work.state import load_state, save_state
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    state = load_state(paths.state_file)
+    acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+    if not isinstance(acks, dict):
+        acks = {}
+    acks[str(pr_number)] = {
+        "acknowledged_at": "2026-07-27T00:00:00Z",
+        "reason": reason,
+    }
+    state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
+    save_state(paths.state_file, state)
+
+
+def test_unauthorized_merge_ack_suppresses_acknowledged_finding(tmp_path: Path) -> None:
+    """An acknowledged post-arming finding must stop polluting every pass (issue #673).
+
+    The tripwire keeps its bite until a finding is explicitly acknowledged; once
+    acked it is filtered the same way the pre-arming baseline filters history, so
+    ``ok=False`` / ``errors`` go back to meaning "there is something new to look
+    at" instead of "the mechanism cannot ever clear this".
+    """
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [
+        _merged_worker_pr(1408, 1404, "sha-1408"),
+        _merged_worker_pr(1392, 1268, "sha-1392"),
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-ack: both post-arming findings are flagged.
+    detected = app._detect_unauthorized_merges(fake_gh.prs)
+    assert sorted(d["pr"] for d in detected) == [1392, 1408]
+
+    # Acknowledge both (e.g. root cause fixed in #672, confirmed benign per #634).
+    _ack_unauthorized_merge(paths, 1408, "root cause fixed in #672")
+    _ack_unauthorized_merge(paths, 1392, "root cause fixed in #672")
+
+    # Post-ack: both are suppressed — the tripwire can go quiet.
+    assert app._detect_unauthorized_merges(fake_gh.prs) == [], (
+        "an acknowledged finding must not be re-reported on every pass"
+    )
+
+    # A NEW post-arming finding is still flagged — ack only suppresses what was
+    # explicitly acked, it does not auto-acknowledge anything else.
+    new_prs = [*fake_gh.prs, _merged_worker_pr(1500, 1501, "sha-1500")]
+    detected_after = app._detect_unauthorized_merges(new_prs)
+    assert [d["pr"] for d in detected_after] == [1500]
+
+
+def test_unauthorized_merge_ack_does_not_suppress_unacked(tmp_path: Path) -> None:
+    """The ack set suppresses only the acked PR, never a sibling finding (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    _arm_unauthorized_merge_tripwire(paths)
+    _ack_unauthorized_merge(paths, 1408, "fixed")
+
+    fake_gh = FakeGitHub()
+    prs = [
+        _merged_worker_pr(1408, 1404, "sha-1408"),
+        _merged_worker_pr(1392, 1268, "sha-1392"),
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    detected = app._detect_unauthorized_merges(prs)
+    assert [d["pr"] for d in detected] == [1392], (
+        "acking #1408 must not also suppress the unrelated #1392 finding"
+    )
+
+
+def test_ack_unauthorized_merge_records_ack_and_event(tmp_path: Path) -> None:
+    """``ack_unauthorized_merge`` persists the ack set and an audit event (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="senki")
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+    assert isinstance(acks, dict), "ack must persist an ack set to state.json"
+    entry = acks["1408"]
+    assert entry["reason"] == "root cause fixed in #672"
+    assert entry["acknowledged_at"]
+    assert entry["by"] == "senki"
+
+    # The ack must be auditable: an event carries who/why/when.
+    acked = [e for e in state["events"] if e["kind"] == "unauthorized_merge_acknowledged"]
+    assert len(acked) == 1
+    assert acked[0]["payload"]["pr"] == 1408
+    assert acked[0]["payload"]["reason"] == "root cause fixed in #672"
+    assert acked[0]["payload"]["by"] == "senki"
+
+
+def test_ack_unauthorized_merge_requires_reason(tmp_path: Path) -> None:
+    """An ack without a reason is rejected — a tripwire that can be silenced silently is no control (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.ack_unauthorized_merge(1408, "   ")
+    assert result.ok is False
+    assert "reason" in result.message.lower()
+    assert UNAUTHORIZED_MERGE_ACK_KEY not in load_state(paths.state_file), (
+        "a rejected ack must not have written anything to state"
+    )
+
+
+def test_ack_unauthorized_merge_updates_existing_ack(tmp_path: Path) -> None:
+    """Re-acking a PR updates the record rather than refusing or duplicating (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    app.ack_unauthorized_merge(1408, "initial triage", by="alice")
+    first = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]["1408"]
+
+    app.ack_unauthorized_merge(1408, "root cause fixed in #672", by="bob")
+    second = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]["1408"]
+
+    assert len(load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]) == 1, (
+        "re-acking must not duplicate the entry"
+    )
+    assert second["reason"] == "root cause fixed in #672"
+    assert second["by"] == "bob"
+    assert second["acknowledged_at"] >= first["acknowledged_at"]
+
+
+def test_cli_tripwire_ack_writes_state(monkeypatch, tmp_path: Path) -> None:
+    """`charlie tripwire ack <pr> --reason ...` persists the ack through the CLI (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    monkeypatch.setattr(cli, "build_app", lambda args: app)
+
+    exit_code = cli.main(
+        ["tripwire", "ack", "1408", "--reason", "root cause fixed in #672", "--by", "senki"]
+    )
+    assert exit_code == 0
+
+    acks = load_state(paths.state_file)[UNAUTHORIZED_MERGE_ACK_KEY]
+    assert acks["1408"]["reason"] == "root cause fixed in #672"
+    assert acks["1408"]["by"] == "senki"
+
+
+def test_cli_tripwire_ack_requires_reason(monkeypatch, capsys, tmp_path: Path) -> None:
+    """`charlie tripwire ack` without --reason exits non-zero and writes nothing (issue #673)."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.ensure()
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+    monkeypatch.setattr(cli, "build_app", lambda args: app)
+
+    exit_code = cli.main(["tripwire", "ack", "1408"])
+    assert exit_code == 1
+    assert UNAUTHORIZED_MERGE_ACK_KEY not in load_state(paths.state_file)
+
+
 def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
     def fake_run(*args, **kwargs):
         return subprocess.CompletedProcess(
