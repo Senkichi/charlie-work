@@ -48,6 +48,7 @@ from charlie_work.config import (
 from charlie_work.cross_family import (
     _CAVEAT,
     CrossFamilyResult,
+    CrossFamilyVerdict,
     extract_report_body,
     parse_cross_family_verdict,
     render_command,
@@ -10248,9 +10249,9 @@ def test_parse_cross_family_verdict_approved_no_blockers() -> None:
     wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     result = parse_cross_family_verdict(wrapped)
     assert result is not None
-    decision, summary = result
-    assert decision == "approved"
-    assert "No BLOCKERs" in summary
+    assert result.decision == "approved"
+    assert "No BLOCKERs" in result.summary
+    assert result.required_changes == ()
 
 
 def test_parse_cross_family_verdict_request_changes_with_blocker() -> None:
@@ -10259,9 +10260,9 @@ def test_parse_cross_family_verdict_request_changes_with_blocker() -> None:
     wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     result = parse_cross_family_verdict(wrapped)
     assert result is not None
-    decision, summary = result
-    assert decision == "request_changes"
-    assert "BLOCKER" in summary
+    assert result.decision == "request_changes"
+    assert "BLOCKER" in result.summary
+    assert result.required_changes == ()
 
 
 def test_parse_cross_family_verdict_request_changes_with_major() -> None:
@@ -10270,8 +10271,7 @@ def test_parse_cross_family_verdict_request_changes_with_major() -> None:
     wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     result = parse_cross_family_verdict(wrapped)
     assert result is not None
-    decision, _summary = result
-    assert decision == "request_changes"
+    assert result.decision == "request_changes"
 
 
 def test_parse_cross_family_verdict_heading_style_major() -> None:
@@ -10280,8 +10280,7 @@ def test_parse_cross_family_verdict_heading_style_major() -> None:
     wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     result = parse_cross_family_verdict(wrapped)
     assert result is not None
-    decision, _summary = result
-    assert decision == "request_changes"
+    assert result.decision == "request_changes"
 
 
 def test_parse_cross_family_verdict_unavailable_returns_none() -> None:
@@ -10301,6 +10300,118 @@ def test_parse_cross_family_verdict_invalid_body_returns_none() -> None:
     body = "some random text with no severity or verdict"
     wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
     assert parse_cross_family_verdict(wrapped) is None
+
+
+def test_parse_cross_family_verdict_json_block_populates_required_changes() -> None:
+    """The defect this covers: a new-format report's JSON verdict block carries
+    itemized findings into ``required_changes`` instead of leaving it empty."""
+    body = (
+        "**MAJOR**\nfile.py:10 does the wrong thing\n\n"
+        "Verdict: MAJOR issue blocks merge\n\n"
+        "```json\n"
+        '{"decision": "request_changes", '
+        '"summary": "file.py:10 has a real bug that breaks X", '
+        '"required_changes": ["Fix the off-by-one in file.py:10", '
+        '"Add a regression test for the empty-list case"]}\n'
+        "```\n"
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="file.py:10 has a real bug that breaks X",
+        required_changes=(
+            "Fix the off-by-one in file.py:10",
+            "Add a regression test for the empty-list case",
+        ),
+    )
+
+
+def test_parse_cross_family_verdict_json_approved_no_markdown_severity() -> None:
+    """A JSON-only body (no ``**SEVERITY**``/``Verdict:`` markers) still parses --
+    exercises report_body_is_valid's JSON-block fallback."""
+    body = (
+        '```json\n{"decision": "approved", "summary": "clean PR, only a style nit", '
+        '"required_changes": []}\n```\n'
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    assert report_body_is_valid(body) is True
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(decision="approved", summary="clean PR, only a style nit")
+
+
+def test_parse_cross_family_verdict_json_approved_overridden_by_body_severity() -> None:
+    """Fail-safe: a **MAJOR** marker in the Markdown findings always overrides a
+    JSON block that claims "approved" -- this verdict auto-records and can
+    unblock the merge lane, so a self-contradicting downgrade is never trusted."""
+    body = (
+        "**MAJOR**\nfile.py:20 real bug\n\nVerdict: MAJOR should block\n\n"
+        '```json\n{"decision": "approved", "summary": "looks fine overall", '
+        '"required_changes": []}\n```\n'
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result.decision == "request_changes"
+
+
+def test_parse_cross_family_verdict_json_request_changes_empty_list_falls_back() -> None:
+    """Contract violation: request_changes with an empty/missing required_changes
+    list is not trusted on its own -- falls back to the legacy Markdown parse
+    (today's behavior) rather than recording a request_changes verdict with
+    nothing for a rework brief to act on."""
+    body = (
+        "**MAJOR**\nfile.py:30 bug\n\nVerdict: MAJOR should block\n\n"
+        '```json\n{"decision": "request_changes", "summary": "bad but no list", '
+        '"required_changes": []}\n```\n'
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result is not None
+    assert result.decision == "request_changes"
+    assert result.required_changes == ()
+    # The legacy parse picks up the body's own Verdict: line, not the JSON
+    # block's (untrusted) summary.
+    assert result.summary == "MAJOR should block"
+
+
+def test_parse_cross_family_verdict_json_block_drives_decision_legacy_would_not_reach() -> None:
+    """The JSON block is the decision authority, not a passenger on a legacy
+    verdict that happens to agree: a body with only a **MINOR** marker and no
+    ``Verdict:`` line -- which the legacy parser alone would call "approved"
+    (no BLOCKER/MAJOR marker present) -- must come back as request_changes
+    when the JSON block says so with a populated required_changes list. This
+    would fail if the JSON check were ever reordered below the legacy path."""
+    body = (
+        "**MINOR**\nfile.py:5 minor style issue, not a real bug\n\n"
+        "```json\n"
+        '{"decision": "request_changes", '
+        '"summary": "actually needs a behavioral fix despite the minor framing", '
+        '"required_changes": ["Handle the None case in file.py:5"]}\n'
+        "```\n"
+    )
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="actually needs a behavioral fix despite the minor framing",
+        required_changes=("Handle the None case in file.py:5",),
+    )
+
+
+def test_parse_cross_family_verdict_legacy_report_unchanged_by_json_support() -> None:
+    """Backward-compatibility regression guard: a historical report with no
+    JSON verdict block at all parses to the exact same decision/summary the
+    pre-JSON-support parser produced, with an empty required_changes."""
+    body = "**BLOCKER**\ncritical bug\n\nVerdict: BLOCKER — does not fix the issue"
+    wrapped = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    result = parse_cross_family_verdict(wrapped)
+    assert result == CrossFamilyVerdict(
+        decision="request_changes",
+        summary="BLOCKER — does not fix the issue",
+        required_changes=(),
+    )
 
 
 # --- P0 fixes: state safety, label honesty, rework cap, loop isolation --------
@@ -33055,6 +33166,54 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+def test_cross_family_request_changes_verdict_persists_required_changes(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a cross-family report's parsed request_changes verdict,
+    recorded the same way ``_record_cross_family_verdicts`` does (workflow.py),
+    ends up with a populated ``required_changes`` in review-decision.json --
+    the exact defect this fix closes (8 of 20 request_changes verdicts had it
+    silently empty)."""
+    body = (
+        "**MAJOR**\nfile.py:10 does the wrong thing\n\n"
+        "Verdict: MAJOR issue blocks merge\n\n"
+        "```json\n"
+        '{"decision": "request_changes", '
+        '"summary": "file.py:10 has a real bug that breaks X", '
+        '"required_changes": ["Fix the off-by-one in file.py:10", '
+        '"Add a regression test for the empty-list case"]}\n'
+        "```\n"
+    )
+    report_text = f"# Cross-family adversarial review — `glm-5.2`\n\n{_CAVEAT}\n\n---\n\n{body}\n"
+    parsed = parse_cross_family_verdict(report_text)
+    assert parsed is not None
+    assert parsed.decision == "request_changes"
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Mirrors workflow.py's _record_cross_family_verdicts call site exactly.
+    # PR 456 is FakeGitHub's seeded default PR.
+    result = app.record_review(
+        456,
+        parsed.decision,
+        summary=parsed.summary,
+        required_changes=parsed.required_changes,
+    )
+    assert result.ok
+
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["required_changes"] == [
+        "Fix the off-by-one in file.py:10",
+        "Add a regression test for the empty-list case",
+    ]
+    assert decision["summary"] == "file.py:10 has a real bug that breaks X"
 
 
 def test_rework_brief_contains_required_changes_from_verdict(tmp_path: Path) -> None:

@@ -8018,12 +8018,13 @@ class OrchestratorApp:
             parsed = parse_cross_family_verdict(report_text)
             if parsed is None:
                 continue
-            verdict_decision, summary = parsed
+            verdict_decision = parsed.decision
             record_result = self.record_review(
                 pr_number,
                 verdict_decision,
-                summary=summary,
+                summary=parsed.summary,
                 reviewed_head=packet_head,
+                required_changes=parsed.required_changes,
             )
             results.append(
                 {
