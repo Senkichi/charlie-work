@@ -6,6 +6,7 @@ import random
 import re
 import subprocess
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -791,6 +792,32 @@ class GitHub:
         check_runs = value.get("check_runs")
         return check_runs if isinstance(check_runs, list) else None
 
+    def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
+        """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.
+
+        Each item's ``commit.message`` is the exact, untruncated raw commit
+        message text (subject + blank line + body), matching ``git show
+        --format=%B``. Deliberately NOT ``gh pr view --json commits``: that
+        GraphQL field set truncates ``messageHeadline`` at a fixed length
+        (~70 chars observed) and splits the remainder into ``messageBody``
+        without preserving the original text — verified on PR #788's own
+        commit, where the GraphQL fields split the subject line mid-word
+        ("defang o" / "utbound reviewer prose...") and would silently corrupt
+        the very "keyword #N" text `closing_keyword_gate` (issue #790) needs
+        to scan intact. ``per_page=100`` covers every PR this codebase
+        produces (worker branches are single- or few-commit); a PR with more
+        commits than that is outside this project's workflow. Returns
+        ``None`` on failure — errors are returned as values, never raised.
+        """
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/pulls/{number}/commits?per_page=100"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, list) else None
+        return result if isinstance(result, list) else None
+
     def compare(self, base: str, head: str) -> dict[str, Any] | None:
         """Compare two commits and return the comparison metadata.
 
@@ -1141,6 +1168,30 @@ def _has_preceding_negation(text: str, match_start: int) -> bool:
     return bool(_NEGATION_RE.search(text, window_start, match_start))
 
 
+def iter_unnegated_closing_keyword_matches(text: str) -> Iterator[re.Match[str]]:
+    """Yield every `_CLOSING_KEYWORD_REF` match in ``text`` not preceded by negation.
+
+    This is the shared core scanning primitive (finditer over every
+    keyword+``#N`` occurrence, filtered by the negation lookback) behind both
+    consumers that need it:
+
+    - `_first_unnegated_closing_keyword_match` (below) takes only the first —
+      `linked_issue_number`'s label-transition binding only ever needs one
+      match to bind an issue.
+    - `closing_keyword_gate.find_unexpected_closing_references` (issue #790)
+      needs *every* match across a whole PR body plus every commit message,
+      because GitHub's native auto-close-on-merge scans all of those
+      surfaces for every closing-keyword reference, not just the first.
+
+    Both consume this one generator rather than each hand-rolling their own
+    `finditer` + negation-lookback scan, so the two callers cannot drift
+    apart on what counts as a live closing reference.
+    """
+    for match in _CLOSING_KEYWORD_REF.finditer(text):
+        if not _has_preceding_negation(text, match.start()):
+            yield match
+
+
 def _first_unnegated_closing_keyword_match(text: str) -> re.Match[str] | None:
     """Return the first `_CLOSING_KEYWORD_REF` match not preceded by negation.
 
@@ -1148,10 +1199,7 @@ def _first_unnegated_closing_keyword_match(text: str) -> re.Match[str] | None:
     genuine match in the same field (e.g. "...but this PR also fixes #700") —
     scanning continues past it instead of giving up on the whole field.
     """
-    for match in _CLOSING_KEYWORD_REF.finditer(text):
-        if not _has_preceding_negation(text, match.start()):
-            return match
-    return None
+    return next(iter_unnegated_closing_keyword_matches(text), None)
 
 
 def defang_closing_keywords(text: str) -> str:

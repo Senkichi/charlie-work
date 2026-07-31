@@ -1,0 +1,308 @@
+"""Tests for the closing-keyword CI gate (issue #790).
+
+Covers the pure scanning function (`find_unexpected_closing_references`),
+the refactored shared negation-aware scanning primitive it shares with
+`linked_issue_number` (`iter_unnegated_closing_keyword_matches`), the new
+`GitHub.pr_commits` REST wrapper, and the CLI command that wires them
+together for `charlie closing-keyword-check --pr N`.
+
+The centerpiece is `test_pr788_actual_commit_message_is_detected_as_a_violation`:
+a pinned regression fixture using PR #788's own real, merged commit message
+text (reconstructed via ``git show 24d3aceae758da81641a898d05314c62a92e2608
+--format=%B -s``) as a failing positive control. PR #788 fixed the
+negation-aware matcher for charlie-work's own label-transition binding, but
+its own commit message contained an unnegated "Fixes #649" inside a quoted
+illustrative example and GitHub's native auto-close-on-merge acted on it,
+closing issue #649 on merge even though the PR body itself
+(`closingIssuesReferences`) was clean. That incident is exactly what issue
+#790 exists to prevent.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import pytest
+
+from charlie_work import cli as cli_module
+from charlie_work.closing_keyword_gate import (
+    UnexpectedClosingReference,
+    find_unexpected_closing_references,
+)
+from charlie_work.config import OrchestratorConfig
+from charlie_work.github import GitHub, GitHubRunResult, iter_unnegated_closing_keyword_matches
+from charlie_work.github import linked_issue_number
+
+# --- find_unexpected_closing_references: core scanning behavior ---
+
+
+def test_clean_when_only_the_intended_issue_is_referenced() -> None:
+    findings = find_unexpected_closing_references(
+        pr_body="Fixes #700",
+        commit_messages=["fix: do the thing\n\nFixes #700"],
+        intended_issue_number=700,
+    )
+    assert findings == []
+
+
+def test_flags_body_reference_to_an_issue_other_than_the_intended_one() -> None:
+    findings = find_unexpected_closing_references(
+        pr_body="Fixes #700\n\nAlso closes #123 as a drive-by.",
+        commit_messages=[],
+        intended_issue_number=700,
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.issue_number == 123
+    assert finding.source == "pr body"
+    assert finding.matched_text.lower() == "closes #123"
+
+
+def test_flags_commit_message_reference_to_an_issue_other_than_the_intended_one() -> None:
+    findings = find_unexpected_closing_references(
+        pr_body="Fixes #700",
+        commit_messages=["fix: unrelated cleanup\n\nFixes #900 as well"],
+        intended_issue_number=700,
+    )
+    assert len(findings) == 1
+    assert findings[0].issue_number == 900
+    assert findings[0].source == "commit #1"
+
+
+def test_multiple_commits_are_each_scanned_and_indexed_from_one() -> None:
+    findings = find_unexpected_closing_references(
+        pr_body="Fixes #700",
+        commit_messages=["wip", "fix: closes #701 by mistake", "fixup"],
+        intended_issue_number=700,
+    )
+    assert len(findings) == 1
+    assert findings[0].source == "commit #2"
+    assert findings[0].issue_number == 701
+
+
+def test_negated_reference_is_not_flagged() -> None:
+    # "does not fix #649" must not be treated as a live closing reference --
+    # same negation guard linked_issue_number already applies (issue #781).
+    findings = find_unexpected_closing_references(
+        pr_body="",
+        commit_messages=["chore: note that this does not fix #649"],
+        intended_issue_number=None,
+    )
+    assert findings == []
+
+
+def test_intended_none_flags_every_unnegated_reference() -> None:
+    # A cross-repository/fork PR (or a same-repo PR with no resolvable
+    # branch/keyword binding at all) has no trusted target to exempt
+    # anything against -- mirrors linked_issue_number's fail-closed posture
+    # for unknown provenance: nothing is exempt when nothing is intended.
+    findings = find_unexpected_closing_references(
+        pr_body="Fixes #1",
+        commit_messages=["Resolves #2"],
+        intended_issue_number=None,
+    )
+    assert {finding.issue_number for finding in findings} == {1, 2}
+
+
+def test_unexpected_closing_reference_is_a_frozen_dataclass() -> None:
+    # CLAUDE.md invariant: config/value objects are frozen dataclasses.
+    finding = UnexpectedClosingReference(issue_number=1, source="pr body", matched_text="fix #1")
+    with pytest.raises(AttributeError):
+        finding.issue_number = 2  # type: ignore[misc]
+
+
+def test_shares_scanning_primitive_with_linked_issue_number() -> None:
+    # The gate must not diverge from linked_issue_number's own negation
+    # guard -- both are backed by the same iter_unnegated_closing_keyword_matches
+    # generator in github.py (refactored out of _first_unnegated_closing_keyword_match
+    # specifically so these two consumers cannot drift onto separate regexes).
+    # Padding matches the existing repo regression test's construction
+    # (test_linked_issue_number_negation_does_not_shadow_later_genuine_match):
+    # without it, the second match's 32-char negation lookback window reaches
+    # back across the sentence boundary and treats it as negated too.
+    padded_body = "does not fix #649. " + ("x" * 50) + " Fixes #700"
+
+    matches = list(iter_unnegated_closing_keyword_matches(padded_body))
+    assert [int(match.group(1)) for match in matches] == [700]
+
+    assert (
+        linked_issue_number(
+            {"body": padded_body}, is_cross_repository=False, branch_prefix="agent/issue"
+        )
+        == 700
+    )
+
+    findings = find_unexpected_closing_references(
+        pr_body=padded_body, commit_messages=[], intended_issue_number=None
+    )
+    assert [finding.issue_number for finding in findings] == [700]
+
+
+# --- Pinned regression: PR #788's actual merged commit message ---
+
+# Reconstructed verbatim via:
+#   git show 24d3aceae758da81641a898d05314c62a92e2608 --format=%B -s
+# DO NOT edit this string to "clean it up" -- its exact wording (the quoted
+# "Fixes #649" mid-sentence, with no negation word in its 32-char lookback
+# window) is the whole point of the fixture.
+_PR_788_COMMIT_MESSAGE = """fix(github): guard closing-keyword binding against negation, defang outbound reviewer prose (#788)
+
+_CLOSING_KEYWORD_REF matched a closing keyword even inside a negated phrase
+("does not fix #649" bound to issue 649 the same as "Fixes #649"). Two
+independent failure modes exist: GitHub's own auto-close (not controllable
+from this codebase) and charlie-work's own linked_issue_number label-transition
+binding (fixable by guarding the match).
+
+Inbound: linked_issue_number now rejects a closing-keyword match preceded by
+a negation word/contraction (not/never/without/cannot/n't) within a 32-char
+lookback window, scanning forward past a negated match instead of giving up
+on the field so a later genuine match still binds. Biased toward the safe
+direction: a missed binding leaves current label state; a false binding
+silently marks live work done.
+
+Outbound: a new defang_closing_keywords() rewrites "<keyword> #N" to
+"<keyword> issue N" (number stays legible, binding syntax removed) wherever
+reviewer-authored prose is embedded in a rework brief a worker reads and
+copies into its own PR body/commit -- text this codebase cannot re-check with
+linked_issue_number's guard once it leaves. Applied in
+_render_required_changes_section (both the structured-findings and
+summary-fallback tiers) and in _write_rework_prompt's dispatch_note slot --
+a second, independent template interpolation point in prompts/rework.md that
+carries the same reviewer summary text and was found leaking the raw keyword
+through an integration test before this commit.
+
+Addresses issue 781
+"""
+
+
+def test_pr788_actual_commit_message_is_detected_as_a_violation() -> None:
+    # PR #788's declared target was issue #781 ("Addresses issue 781" is not
+    # a closing keyword, so it doesn't bind via linked_issue_number either --
+    # its branch fix/false-close-hardening carries no issue number, so 781
+    # is the value an operator/CLI would supply or that a future stricter
+    # convention would resolve; the point under test is orthogonal to how
+    # 781 was determined). GitHub's native auto-close does not care about an
+    # "Addresses" trailer -- it acts on any unnegated closing keyword,
+    # anywhere, including inside this quoted illustrative example -- and
+    # closed issue #649 on merge.
+    findings = find_unexpected_closing_references(
+        pr_body="",
+        commit_messages=[_PR_788_COMMIT_MESSAGE],
+        intended_issue_number=781,
+    )
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.issue_number == 649
+    assert finding.source == "commit #1"
+    assert finding.matched_text.lower() == "fixes #649"
+
+
+def test_pr788_commit_message_also_flagged_when_target_is_unresolved() -> None:
+    # Same fixture, no declared target at all (intended_issue_number=None) --
+    # still exactly one finding, issue #649. Proves the detection does not
+    # depend on knowing the "right" answer in advance.
+    findings = find_unexpected_closing_references(
+        pr_body="",
+        commit_messages=[_PR_788_COMMIT_MESSAGE],
+        intended_issue_number=None,
+    )
+    assert [finding.issue_number for finding in findings] == [649]
+
+
+# --- GitHub.pr_commits: REST wrapper (not gh pr view --json commits) ---
+
+
+def test_pr_commits_extracts_raw_message_from_rest_shape(monkeypatch, tmp_path) -> None:
+    def fake_run(self, args, *, json_output=False, allow_failure=False):
+        assert args[0] == "api"
+        assert "pulls/42/commits" in args[1]
+        return [
+            {"sha": "abc123", "commit": {"message": "fix: thing\n\nFixes #700"}},
+            {"sha": "def456", "commit": {"message": "wip"}},
+        ]
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+    gh = GitHub(tmp_path)
+
+    commits = gh.pr_commits(42)
+
+    assert commits is not None
+    assert [c["commit"]["message"] for c in commits] == ["fix: thing\n\nFixes #700", "wip"]
+
+
+def test_pr_commits_returns_none_on_failure(monkeypatch, tmp_path) -> None:
+    def fake_run(self, args, *, json_output=False, allow_failure=False):
+        return GitHubRunResult(ok=False, returncode=1, stdout="", stderr="boom", error="boom")
+
+    monkeypatch.setattr(GitHub, "run", fake_run)
+    gh = GitHub(tmp_path)
+
+    assert gh.pr_commits(42) is None
+
+
+# --- CLI wiring: charlie closing-keyword-check --pr N ---
+
+
+class _FakeGitHubForCLI:
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def pr_view(self, number: int):
+        return {
+            "number": number,
+            "body": "Fixes #700",
+            "headRefName": "agent/issue-700-do-thing",
+            "isCrossRepository": False,
+        }
+
+    def pr_commits(self, number: int):
+        return [{"commit": {"message": "fix: unrelated cleanup\n\nFixes #900 as well"}}]
+
+
+def _cli_args(pr: int) -> argparse.Namespace:
+    return argparse.Namespace(repo=None, config=None, fleet_dir=None, dry_run=False, pr=pr)
+
+
+def test_cli_closing_keyword_check_fails_on_unexpected_reference(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "GitHub", _FakeGitHubForCLI)
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(42))
+
+    assert result.ok is False
+    assert result.data["intended_issue_number"] == 700
+    assert result.data["findings"] == [
+        {"issue_number": 900, "source": "commit #1", "matched_text": "Fixes #900"}
+    ]
+    assert "900" in result.message
+
+
+def test_cli_closing_keyword_check_passes_when_clean(monkeypatch, tmp_path) -> None:
+    class FakeGitHubClean(_FakeGitHubForCLI):
+        def pr_commits(self, number: int):
+            return [{"commit": {"message": "fix: unrelated cleanup\n\nFixes #700 as well"}}]
+
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "GitHub", FakeGitHubClean)
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(42))
+
+    assert result.ok is True
+    assert result.data["findings"] == []
+
+
+def test_cli_closing_keyword_check_reports_fetch_failure(monkeypatch, tmp_path) -> None:
+    class FakeGitHubNoCommits(_FakeGitHubForCLI):
+        def pr_commits(self, number: int):
+            return None
+
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "GitHub", FakeGitHubNoCommits)
+
+    result = cli_module.run_closing_keyword_check_command(_cli_args(42))
+
+    assert result.ok is False
+    assert "commits" in result.message

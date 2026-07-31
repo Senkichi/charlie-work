@@ -62,3 +62,40 @@ jobs:
         run: uv run ruff check --no-cache .
       - name: Ruff format
         run: uv run ruff format --check --no-cache .
+
+  ClosingKeywords:
+    name: Closing Keywords
+    runs-on: self-hosted
+    # PR-only (issue #790): scans the PR body and every commit message for a
+    # closing keyword (close(s/d)/fix(es/ed)/resolve(s/d)) bound to an issue
+    # number other than this PR's own declared target -- the surface GitHub's
+    # native auto-close-on-merge scans, which has no negation awareness at
+    # all. Not yet added to orchestrator.config.yaml auto_merge.required_checks,
+    # .aviator/config.yml, or GitHub branch-protection required_status_checks:
+    # promoting it to a hard-required gate immediately would strand every PR
+    # branch cut before this workflow file landed (their own checked-out
+    # ci.yml has no such job to ever report a status). See the PR body for
+    # the promotion follow-up.
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: false
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+      - name: Scan PR body and commits for closing keywords
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uv run charlie closing-keyword-check --pr ${{ github.event.pull_request.number }}
+      - name: Closing-keyword gate (issue #790)
+        # PR-only: push-to-main has no PR number, and GitHub's native
+        # auto-close scan only ever runs against a PR's body + commits.
+        # Added as a Lint step (not a new job) so it rides the existing
+        # required "Lint" status check without a branch-protection edit --
+        # that's an admin mutation outside a worker PR's blast radius.
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uv run charlie closing-keyword-check --pr ${{ github.event.pull_request.number }}
