@@ -808,6 +808,41 @@ class GitHub:
             return result.value if result.ok and isinstance(result.value, dict) else None
         return result if isinstance(result, dict) else None
 
+    def branch_protection(self, base: str) -> dict[str, Any] | None:
+        """Return branch protection settings for ``base``, or None on failure.
+
+        Wraps ``gh api repos/{owner}/{repo}/branches/{base}/protection``.
+        Returns ``None`` on any failure -- 404 (no protection configured),
+        rate limit, transient network error, gh not installed. Errors are
+        returned as values, never raised.
+
+        Cached per orchestrator pass in ``_list_cache`` (issue #812): callers
+        use this to derive base-freshness policy (``required_status_checks.
+        strict``) instead of a hardcoded config constant, and need exactly
+        one API call per base ref per pass, not one per PR. A failed read is
+        cached as ``None`` too, so a 404/rate-limit does not turn into a
+        per-PR retry storm within the same pass.
+
+        Safety note for callers: ``None`` means "could not be read", not "no
+        freshness required". Any caller gating a safety check on this value
+        must fail closed on ``None``.
+        """
+        cache_key = ("branch_protection", base)
+        if cache_key in self._list_cache:
+            return self._list_cache[cache_key]
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/branches/{base}/protection"],
+            json_output=True,
+            allow_failure=True,
+        )
+        value: dict[str, Any] | None = None
+        if isinstance(result, GitHubRunResult):
+            value = result.value if result.ok and isinstance(result.value, dict) else None
+        elif isinstance(result, dict):
+            value = result
+        self._list_cache[cache_key] = value
+        return value
+
     def compare_diff(self, base: str, head: str) -> str | None:
         """Return the plain unified-diff text between two commits (three-dot compare).
 
