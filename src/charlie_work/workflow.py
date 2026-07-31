@@ -4517,6 +4517,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     config: OrchestratorConfig,
     *,
     persist_inconclusive_probe_counter: bool = True,
+    now: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """Check for dead sessions, classify their failures, and update throttle state.
 
@@ -4557,6 +4558,15 @@ def _classify_dead_sessions_and_update_throttle_state(
     lane -- or how many passes ago -- last wrote it, so suppressing the
     write here never affects the DEAD-vs-deferred decision made below,
     only which lane's write ends up on disk for a given pass.
+
+    ``now`` (issue #822) is the injectable clock for this entire pass: it
+    seeds ``now_for_health`` (worker-health/probe timing) and is forwarded
+    to every throttle classification call below, so a single instant is used
+    consistently for the whole pass instead of each call independently
+    racing the wall clock. Defaults to ``datetime.now(UTC)`` when omitted,
+    so production behavior is byte-identical; tests can freeze it and assert
+    exact equality on the resulting ``throttled_until`` instead of a
+    wall-clock-tolerance proximity check.
     """
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
@@ -4571,7 +4581,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     )
     from .worktree import WorktreeState
 
-    now_for_health = datetime.now(UTC)
+    now_for_health = now if now is not None else datetime.now(UTC)
 
     # Fetch open PRs for the "no open PR" guard
     prs = gh.pr_list()
@@ -4604,6 +4614,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                     w.issue_number,
                     fallback_kind=failure_kind,
                     config=config,
+                    now=now_for_health,
                 )
             elif w.adapter_kind == "claude-code":
                 failure_kind, throttled_until = update_worker_record_with_failure_classification(
@@ -4611,6 +4622,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                     w.issue_number,
                     fallback_kind=failure_kind,
                     config=config,
+                    now=now_for_health,
                 )
             elif w.adapter_kind == "api":
                 failure_kind, throttled_until = update_worker_record_with_failure_classification(
@@ -4619,6 +4631,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                     fallback_kind=failure_kind,
                     config=config,
                     adapter_kind="api",
+                    now=now_for_health,
                 )
             if failure_kind and throttled_until:
                 # A throttle-caused launch failure must persist its window just
@@ -4788,6 +4801,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind="unpublished_work",
                             config=config,
                             session_completed=True,
+                            now=now_for_health,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -4798,6 +4812,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind="unpublished_work",
                             config=config,
                             session_completed=True,
+                            now=now_for_health,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -4809,6 +4824,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             config=config,
                             adapter_kind="api",
                             session_completed=True,
+                            now=now_for_health,
                         )
                     )
                 else:
@@ -4826,6 +4842,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind=fallback_kind,
                             config=config,
+                            now=now_for_health,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -4835,6 +4852,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             w.issue_number,
                             fallback_kind=fallback_kind,
                             config=config,
+                            now=now_for_health,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -4845,6 +4863,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             fallback_kind=fallback_kind,
                             config=config,
                             adapter_kind="api",
+                            now=now_for_health,
                         )
                     )
                 else:
@@ -13541,10 +13560,24 @@ class OrchestratorApp:
         return True
 
     @_guard_state_lock
-    def loop(self, limit: int | None = None, *, merge: bool | None = None) -> CommandResult:
-        return self._loop_impl(limit, merge=merge)
+    def loop(
+        self,
+        limit: int | None = None,
+        *,
+        merge: bool | None = None,
+        now: datetime | None = None,
+    ) -> CommandResult:
+        # ``now`` (issue #822) is the injectable clock for the dead-session
+        # throttle classification lane -- see
+        # ``_classify_dead_sessions_and_update_throttle_state``. Defaults to
+        # ``datetime.now(UTC)`` there when omitted, so production behavior is
+        # byte-identical; tests can freeze it to assert exact equality on
+        # ``throttled_until`` instead of a wall-clock-tolerance proximity check.
+        return self._loop_impl(limit, merge=merge, now=now)
 
-    def _loop_impl(self, limit: int | None, *, merge: bool | None) -> CommandResult:
+    def _loop_impl(
+        self, limit: int | None, *, merge: bool | None, now: datetime | None = None
+    ) -> CommandResult:
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
         # evaluation + labels) but skips the actual `gh pr merge` — for
         # operators sequencing same-surface PR cascades by hand, where the
@@ -13560,7 +13593,7 @@ class OrchestratorApp:
                 correlation_id=cid,
             )
             record_loop_pass(self.paths.state_file, cid, start_ts)
-            result = self._loop_body(limit, merge=merge)
+            result = self._loop_body(limit, merge=merge, now=now)
             elapsed = time.monotonic() - loop_start
             log_event(
                 self.paths.state_file,
@@ -14335,7 +14368,9 @@ class OrchestratorApp:
             )
             save_state(state_file, state)
 
-    def _loop_body(self, limit: int | None, *, merge: bool | None) -> CommandResult:
+    def _loop_body(
+        self, limit: int | None, *, merge: bool | None, now: datetime | None = None
+    ) -> CommandResult:
         # Every pass must observe a fresh GitHub snapshot. The list cache
         # dedupes calls within one pass, but a long-running supervisor
         # (charlie fleet supervise) reuses this app -- and therefore one
@@ -14385,6 +14420,7 @@ class OrchestratorApp:
             self.gh,
             self.config,
             persist_inconclusive_probe_counter=False,
+            now=now,
         )
 
         # Flat-interval Haiku probe for early quota/rate-limit recovery (see

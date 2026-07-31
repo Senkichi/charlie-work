@@ -19174,22 +19174,34 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
 
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
-    # Run a loop pass with limit=0 (no actual dispatch, just the classification logic)
-    # We don't assert result.ok because dispatch may fail with no issues to process
-    # The key is that the classification logic runs regardless
-    app.loop(limit=0)
+    # Run a loop pass with limit=0 (no actual dispatch, just the classification logic).
+    # `now` is frozen and injected (issue #822's clock seam -- see
+    # workflow._classify_dead_sessions_and_update_throttle_state) so the throttle
+    # timestamp assertion below is exact instead of racing wall-clock time under
+    # CI runner contention. We don't assert result.ok because dispatch may fail
+    # with no issues to process -- the key is that the classification logic runs
+    # regardless.
+    # frozen_now is offset 1 hour into the future (rather than the real instant)
+    # so the throttle window below stays open for the dispatch-deferral check
+    # further down regardless of how long the process stalls between here and
+    # there -- the offset is arbitrary and only needs to exceed any plausible
+    # CI stall; it does not affect the exact-equality assertion since both sides
+    # derive from this same captured value.
+    frozen_now = datetime.now(UTC) + timedelta(hours=1)
+    app.loop(limit=0, now=frozen_now)
 
     # Verify throttled_until was set in state by the loop's classification pass
     state = load_state(paths.state_file)
     assert state.get("throttled_until") is not None
 
-    # Verify the cooldown reflects the parsed 10 minutes plus the resume margin
+    # Verify the cooldown reflects the parsed 10 minutes plus the resume margin,
+    # computed from the same frozen `now` the loop pass was given -- exact
+    # equality, no wall-clock tolerance window.
     throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(
-        minutes=10, seconds=config.runtime.throttle_resume_margin_s
-    )
-    # Allow 2 second tolerance for test execution time
-    assert abs((throttle_time - expected_time).total_seconds()) < 2
+    expected_time = (
+        frozen_now + timedelta(minutes=10, seconds=config.runtime.throttle_resume_margin_s)
+    ).replace(microsecond=0)
+    assert throttle_time == expected_time
 
     # Verify that a subsequent dispatch() defers launches while throttled
     # Add a dispatchable issue
