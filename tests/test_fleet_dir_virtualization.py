@@ -153,7 +153,9 @@ def test_save_idle_streaks_warns_when_fleet_dir_is_virtualized(
     _patch_resolve_to_diverge(monkeypatch, fleet, redirected)
 
     with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_paths"):
-        save_idle_streaks(fleet, {"owner/repo": 1}, source="prologue")
+        save_idle_streaks(
+            fleet, {"owner/repo": 1}, source="prologue", full_pass_interval_seconds=300
+        )
 
     assert any("runner-allocation.json" in record.message for record in caplog.records)
     # The write still lands (the warning never blocks it).
@@ -167,7 +169,9 @@ def test_save_idle_streaks_is_silent_when_not_virtualized(tmp_path: Path, caplog
     fleet.mkdir(parents=True, exist_ok=True)
 
     with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_paths"):
-        save_idle_streaks(fleet, {"owner/repo": 1}, source="prologue")
+        save_idle_streaks(
+            fleet, {"owner/repo": 1}, source="prologue", full_pass_interval_seconds=300
+        )
 
     assert not any("Fleet dir virtualization" in record.message for record in caplog.records)
 
