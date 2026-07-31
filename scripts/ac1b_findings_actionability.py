@@ -47,7 +47,9 @@ automatically, not hand-typed), the DATA is wherever ``--repo`` points.
 from __future__ import annotations
 
 import argparse
+import builtins
 import copy
+import io
 import json
 import re
 import subprocess
@@ -108,11 +110,33 @@ _FILE_PATH_RE = re.compile(
 )
 
 #: A code symbol: a backtick-quoted identifier, or an `identifier(`
-#: call/def-shaped token.
+#: call/def-shaped token. The bare-call alternative is filtered post-match
+#: (see ``_is_builtin_call``) to exclude Python builtins -- `print(`, `int(`,
+#: `str(`, etc. constantly appear in ordinary prose and verification-command
+#: snippets (e.g. `python -c "...; print(x)"`) without a reviewer naming any
+#: project symbol a worker could act on. Backtick-quoted names are never
+#: builtin-shaped (the pattern excludes `(`) so they are unaffected either way.
 _CODE_SYMBOL_RE = re.compile(
     r"`[A-Za-z_][A-Za-z0-9_.]*`"
     r"|\b[A-Za-z_][A-Za-z0-9_]*\("
 )
+
+#: Every public Python builtin name (functions, types, exception classes,
+#: constants) -- derived from the ``builtins`` module itself, not hand-typed,
+#: so `open(`, `set(`, `len(`, etc. are excluded on the same footing as
+#: `print(`/`int(`/`str(` without per-name upkeep as builtins are added.
+_BUILTIN_NAMES = frozenset(name for name in dir(builtins) if not name.startswith("_"))
+
+
+def _is_builtin_call(match_text: str) -> bool:
+    """True if *match_text* is a bare call to a Python builtin, e.g. ``"print("``.
+
+    Only applies to the un-quoted ``identifier(`` shape (no surrounding
+    backticks are part of this match to begin with -- see ``_CODE_SYMBOL_RE``)
+    so a genuine backtick-quoted reference is never affected by this check.
+    """
+    return match_text.endswith("(") and match_text[:-1] in _BUILTIN_NAMES
+
 
 #: A line-number reference: `:123`, `line 123`, `L123`. Known false-positive
 #: risk (timestamps, ratios) is accepted per the task's explicit definition;
@@ -131,11 +155,20 @@ _REFERENT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 def find_concrete_referents(text: str) -> list[tuple[str, str]]:
-    """Return every ``(kind, matched substring)`` concrete referent in *text*."""
+    """Return every ``(kind, matched substring)`` concrete referent in *text*.
+
+    A ``code_symbol`` match is dropped when it is a bare call to a Python
+    builtin (see ``_is_builtin_call``) -- e.g. the `print(` in a verification
+    snippet's `python -c "import charlie_work; print(charlie_work.__file__)"`
+    is not a reviewer naming a symbol to change, it is the language itself.
+    """
     found: list[tuple[str, str]] = []
     for kind, pattern in _REFERENT_PATTERNS:
         for m in pattern.finditer(text):
-            found.append((kind, m.group(0)))
+            match_text = m.group(0)
+            if kind == "code_symbol" and _is_builtin_call(match_text):
+                continue
+            found.append((kind, match_text))
     return found
 
 
@@ -189,13 +222,15 @@ def derive_cross_family_collapse_sentinel() -> str:
     """Derive the generic-collapse fallback string via the REAL parser.
 
     ``cross_family.parse_cross_family_verdict`` (src/charlie_work/
-    cross_family.py:316-356) returns the literal constant "Cross-family
-    review found BLOCKER/MAJOR findings" as its ``summary`` whenever its
-    ``_VERDICT_RE`` fails to find a ``Verdict:`` marker while a
-    BLOCKER/MAJOR severity marker is present. Deriving it here by calling
-    the real function with a crafted probe -- rather than hardcoding a
-    second copy of the literal -- means this classifier cannot silently
-    drift from the parser it is measuring.
+    cross_family.py:396-474) returns a ``CrossFamilyVerdict`` dataclass (or
+    ``None``) -- NOT a ``(decision, summary)`` tuple. Its legacy fallback
+    path (cross_family.py:466-470) returns the literal constant "Cross-family
+    review found BLOCKER/MAJOR findings" as ``.summary`` whenever a
+    BLOCKER/MAJOR severity marker is present but ``_VERDICT_RE`` fails to
+    find a ``Verdict:`` marker to extract a real summary from. Deriving it
+    here by calling the real function with a crafted probe -- rather than
+    hardcoding a second copy of the literal -- means this classifier cannot
+    silently drift from the parser it is measuring.
 
     Raises RuntimeError (loudly, not silently) if the parser's return shape
     or behavior no longer matches what this probe expects. F5 (plan section
@@ -205,7 +240,7 @@ def derive_cross_family_collapse_sentinel() -> str:
     """
     probe = "## Report\n\n**BLOCKER** unparseable body with no Verdict: marker\n"
     result = cross_family.parse_cross_family_verdict(probe)
-    if not (isinstance(result, tuple) and len(result) == 2):
+    if not isinstance(result, cross_family.CrossFamilyVerdict):
         raise RuntimeError(
             "cross_family.parse_cross_family_verdict returned an unexpected "
             f"shape ({result!r}) for the generic-collapse sentinel probe. "
@@ -213,15 +248,14 @@ def derive_cross_family_collapse_sentinel() -> str:
             "rework-findings-channel.md) -- update this probe, do not ignore "
             "this error."
         )
-    decision, summary = result
-    if decision != "request_changes" or "BLOCKER" not in summary.upper():
+    if result.decision != "request_changes" or "BLOCKER" not in result.summary.upper():
         raise RuntimeError(
             f"cross_family.parse_cross_family_verdict returned {result!r} "
             "for a synthetic BLOCKER-only probe with no Verdict: marker -- "
             "this does not look like the known generic-collapse fallback. "
             "Refusing to use it as a classification sentinel."
         )
-    return summary
+    return result.summary
 
 
 #: Mirrors the f-string template at src/charlie_work/workflow.py:7231:
@@ -413,7 +447,14 @@ def resolve_code_sha() -> str | None:
 
 
 def main() -> int:
-    if hasattr(sys.stdout, "reconfigure"):
+    # `sys.stdout` is statically typed as `TextIO` (no `.reconfigure`); the
+    # concrete runtime class that actually declares it is `io.TextIOWrapper`.
+    # `isinstance` narrows to that concrete class so this is provably safe
+    # under static analysis, not just at runtime -- and it still safely
+    # no-ops when stdout has been replaced by something else (e.g. pytest's
+    # capture writer, which is not a TextIOWrapper), matching the previous
+    # `hasattr` guard's behavior exactly without the type-checker complaint.
+    if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -463,13 +504,21 @@ def main() -> int:
 
     mutation_ok = run_mutation_checks(verdicts[0].decision)
 
+    # `sentinel` (Optional[str]) is the single source of truth for whether
+    # derivation succeeded -- there is deliberately no separate boolean
+    # flag alongside it. Two independently-assigned variables that must
+    # stay in sync (a `str | None` plus a `bool` asserting whether it is
+    # `None`) is exactly the kind of state a type checker cannot verify is
+    # consistent, and a maintenance hazard if a future edit updates one
+    # without the other. Testing `sentinel is not None` directly lets
+    # static analysis (and readers) prove the classification call below is
+    # never reached with `None`, not just trust that it happens to line up.
     try:
-        sentinel = derive_cross_family_collapse_sentinel()
-        sentinel_ok = True
+        sentinel: str | None = derive_cross_family_collapse_sentinel()
     except RuntimeError as exc:
         print(f"ERROR deriving cross-family sentinel: {exc}", file=sys.stderr)
         sentinel = None
-        sentinel_ok = False
+    sentinel_ok = sentinel is not None
 
     print("=== Sentinel derivation ===")
     print(f"  cross-family generic-collapse sentinel: {sentinel!r}")
@@ -483,7 +532,7 @@ def main() -> int:
         summary = v.decision.get("summary") or ""
         category = (
             classify_verdict(summary, sentinel)
-            if sentinel_ok
+            if sentinel is not None
             else "UNKNOWN_provenance_unavailable"
         )
         cat_stats = stats[category]
