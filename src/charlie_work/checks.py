@@ -421,7 +421,7 @@ def classify_infra_failures(
                 infra_run_ids.add(run_id)
 
         if not infra_run_ids:
-            # No parseable Actions run id (e.g. external status check) — cannot
+            # No parseable Actions run id (e.g. external status check) -- cannot
             # auto-rerun, so treat as definitive immediately.
             definitive_failed.append(name)
             continue
