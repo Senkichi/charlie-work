@@ -277,6 +277,64 @@ def test_review_queue_skips_template_stale_stale_decision_packet(tmp_path: Path)
     assert not any(entry["pr"] == 456 for entry in queue)
 
 
+def test_review_queue_skips_template_stale_vacuous_decision_packet(tmp_path: Path) -> None:
+    """Issue #784 AC-8's "vacuous" branch (a content-free request_changes
+    verdict at the live head) must respect template staleness the same way
+    the "stale" and "pending"/"missing"/"invalid" branches do.
+
+    dispatch_reviews()'s normal (non-cross-family) dispatch path does not
+    filter its candidates by decision value -- _is_review_dispatchable
+    ignores the candidate payload -- so an un-gated "vacuous" queue entry
+    could still reach a fresh reviewer as a packet rendered from the old
+    template: the exact defect this issue fixed for its sibling branches.
+    """
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+
+    _plant_packet(
+        tmp_path,
+        456,
+        head_sha="sha-same",
+        template_sha="stale-digest",
+        decision={
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-same",
+            "required_changes": [],
+            "summary": "",
+        },
+    )
+
+    result = app.review_queue()
+    queue = result.data.get("queue", [])
+    assert not any(entry["pr"] == 456 for entry in queue)
+
+
+def test_review_queue_includes_vacuous_packet_when_template_matches(tmp_path: Path) -> None:
+    """The template check must not over-prune the vacuous path either: a
+    content-free verdict with a current-template packet is still queued as
+    "vacuous" so _record_cross_family_verdicts can act on it."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(
+        tmp_path,
+        456,
+        head_sha="sha-same",
+        template_sha=current_sha,
+        decision={
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-same",
+            "required_changes": [],
+            "summary": "",
+        },
+    )
+
+    result = app.review_queue()
+    queue = result.data.get("queue", [])
+    assert any(entry["pr"] == 456 and entry["decision"] == "vacuous" for entry in queue)
+
+
 def test_review_queue_includes_pending_packet_when_template_matches(tmp_path: Path) -> None:
     """The template check must not over-prune: a current packet is still queued."""
     pr = _pr456("sha-same")

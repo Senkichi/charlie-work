@@ -8058,6 +8058,19 @@ class OrchestratorApp:
                     # or re-confirming forever.
                     if packet_head_sha is None or packet_head_sha != live_head_sha:
                         continue
+                    # Issue #592: a template edit makes a same-head packet
+                    # stale for this path too. dispatch_reviews() does not
+                    # filter its normal (non-cross-family) dispatch by
+                    # decision value -- _is_review_dispatchable ignores the
+                    # candidate payload entirely -- so an un-gated "vacuous"
+                    # entry here could still reach a fresh reviewer as a
+                    # packet rendered from the old template: the exact
+                    # failure this issue fixed for the "stale" and
+                    # "pending"/"missing"/"invalid" branches below. loop()
+                    # regenerates the packet from the current template
+                    # first; the next pass re-queues it once fresh.
+                    if not self._packet_template_current(pr_number):
+                        continue
                     queue.append(
                         {
                             "pr": pr_number,
