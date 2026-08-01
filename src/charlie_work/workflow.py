@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -786,6 +787,12 @@ def parse_issue_numbers(only_issues: str) -> list[int]:
 # must not consume the same budget as fresh candidates; capping them at one per
 # pass prevents one stuck recovery candidate from starving the queue (issue #506).
 _MAX_RECOVERY_RETRY_PER_PASS = 1
+
+# Bound on concurrent `gh` subprocesses spawned by _prefetch_blocker_data() to
+# warm the dependency cache across every ready issue. I/O-bound fan-out width,
+# not a CPU budget; kept modest to stay clear of GitHub's secondary rate
+# limits. See issue #870.
+_MAX_PREFETCH_WORKERS = 8
 
 
 def _is_recovery_candidate(
@@ -5775,6 +5782,12 @@ class OrchestratorApp:
         available_issues = [
             issue for issue in issues if self._is_dispatchable(issue, operator_claimed)
         ]
+
+        # Warm the blocker/dependency cache for every ready issue concurrently
+        # before the serial per-issue lookups below run. See
+        # _prefetch_blocker_data's docstring and issue #870: this is what
+        # turns O(N) serial `gh` calls into one parallel batch.
+        self._prefetch_blocker_data(issues)
 
         # Check for blocked issues (dependency gate)
         truly_available, blocked_issues, _open_blockers_by_issue = self._filter_blocked_issues(
@@ -16599,6 +16612,71 @@ class OrchestratorApp:
             state_path=self.paths.state_file,
         )
         return "dispatch_failed", None, state
+
+    def _prefetch_blocker_data(self, issues: list[dict[str, Any]]) -> None:
+        """Warm the GitHub client's per-pass cache for blocker lookups.
+
+        ``status()`` runs ``_get_open_blockers`` once per ready issue via both
+        ``_filter_blocked_issues`` and ``_summarize_issue`` -- and until issue
+        #870, each call issued a live, uncached `gh api .../dependencies/
+        blocked_by` request plus one live `gh issue view` per declared
+        blocker, entirely serially. Measured on the live fleet registry: 62
+        ready issues drove 169s of a 184s `fleet status --json` run through
+        this exact path, including confirmed duplicate fetches (issues #887/
+        #888 each fetched twice; their shared blocker #886 fetched 4 times).
+
+        This method does the equivalent fetching *once* per unique resource,
+        concurrently, before any of the unmodified per-issue code below runs:
+
+          1. Fetch each ready issue's GitHub-native dependencies in parallel
+             (one `gh api` call per unique issue number -- no duplicates,
+             since ``issues`` already contains each ready issue exactly once).
+          2. Union those dependencies with each issue's body-declared
+             blockers (pure Python, no I/O) into one deduplicated set of
+             blocker issue numbers.
+          3. Resolve open/closed state for that whole set in a single
+             ``are_issues_open`` call, which itself fans out cache misses
+             concurrently (see github.py).
+
+        Both fetch layers cache into ``self.gh._list_cache``, so every
+        subsequent call to ``_get_open_blockers`` -- unchanged, still called
+        once per issue from two separate call sites -- resolves entirely
+        from the warm cache with no further network calls. Structuring it
+        this way (fetch each unique resource exactly once, then let the
+        existing serial consumers read a warm cache) avoids relying on a
+        cache race between concurrent callers to naturally dedupe: nothing
+        here fetches the same issue number from two threads at once.
+
+        Must be called once per ``status()`` invocation, before the first
+        call to ``_get_open_blockers`` (directly or via
+        ``_filter_blocked_issues`` / ``_summarize_issue``). Harmless to skip
+        (callers just fall back to the prior, slower, uncached behavior) but
+        never harmful to call twice -- the second call is a no-op cache hit.
+        """
+        issue_numbers = [int(issue["number"]) for issue in issues]
+        if not issue_numbers:
+            return
+
+        max_workers = min(_MAX_PREFETCH_WORKERS, len(issue_numbers))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            deps_by_number = dict(
+                zip(
+                    issue_numbers,
+                    pool.map(
+                        lambda number: get_github_issue_dependencies(self.gh, number),
+                        issue_numbers,
+                    ),
+                )
+            )
+
+        all_blockers: set[int] = set()
+        for issue in issues:
+            issue_number = int(issue["number"])
+            all_blockers.update(parse_blockers(issue.get("body", "")))
+            all_blockers.update(deps_by_number.get(issue_number, []))
+
+        if all_blockers:
+            self.gh.are_issues_open(sorted(all_blockers))
 
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
         """Check if an issue has any open blocker issues.
