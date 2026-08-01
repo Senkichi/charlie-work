@@ -4,11 +4,12 @@ import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from charlie_work.config import OrchestratorConfig
+from charlie_work.github import GitHubLike
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     empty_state,
@@ -143,6 +144,8 @@ def test_check_worktree_marker_owned_session_allowed(
 
 
 class _MinimalGitHub:
+    dry_run = False
+
     def __init__(self) -> None:
         pass
 
@@ -164,7 +167,7 @@ def test_claim_records_operator_claim_in_state(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.ensure()
-    app = OrchestratorApp(tmp_path, paths, config, _MinimalGitHub())
+    app = OrchestratorApp(tmp_path, paths, config, cast(GitHubLike, _MinimalGitHub()))
 
     result = app.claim(999)
     assert result.ok is True
@@ -180,7 +183,7 @@ def test_claim_release_removes_operator_claim(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.ensure()
-    app = OrchestratorApp(tmp_path, paths, config, _MinimalGitHub())
+    app = OrchestratorApp(tmp_path, paths, config, cast(GitHubLike, _MinimalGitHub()))
 
     app.claim(999)
     result = app.claim(999, release=True)
@@ -196,7 +199,7 @@ def test_claim_writes_worktree_marker_when_worktree_exists(tmp_path: Path) -> No
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.ensure()
-    app = OrchestratorApp(tmp_path, paths, config, _MinimalGitHub())
+    app = OrchestratorApp(tmp_path, paths, config, cast(GitHubLike, _MinimalGitHub()))
 
     branch_name = f"{config.dispatch.branch_prefix}-999-Issue-999"
     worktree_path = worktree_path_for_branch(tmp_path, branch_name)
@@ -262,7 +265,7 @@ def test_claim_release_does_not_remove_worker_marker(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.ensure()
-    app = OrchestratorApp(tmp_path, paths, config, _MinimalGitHub())
+    app = OrchestratorApp(tmp_path, paths, config, cast(GitHubLike, _MinimalGitHub()))
 
     branch_name = f"{config.dispatch.branch_prefix}-999-Issue-999"
     worktree_path = worktree_path_for_branch(tmp_path, branch_name)
