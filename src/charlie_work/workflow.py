@@ -59,6 +59,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    GitHubLike,
     GitHubNotFoundError,
     GitHubRunResult,
     GraphQLBudgetError,
@@ -2975,7 +2976,7 @@ def _reap_completed_review_checkouts(
 
 
 def _reap_orphaned_review_checkouts(
-    gh: GitHub,
+    gh: GitHubLike,
     repo_root: Path,
     reviews_dir: Path,
     state_file: Path,
@@ -3163,7 +3164,7 @@ def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
     config: OrchestratorConfig,
-    gh: GitHub,
+    gh: GitHubLike,
     *,
     review_callback: Callable[[int], Any] | None = None,
 ) -> None:
@@ -3821,7 +3822,7 @@ def _rework_pr_for_worker(
 
 def _reap_restore_rework_requested(
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     open_prs_by_issue: dict[int, list[dict[str, Any]]],
     worker: WorkerView,
@@ -4443,7 +4444,7 @@ def _is_readiness_no_ci_stall(
 
 def _route_dead_worker_to_pre_review_rework(
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     pr: dict[str, Any],
     issue_number: int,
@@ -4594,7 +4595,7 @@ def _route_dead_worker_to_pre_review_rework(
 def _classify_dead_sessions_and_update_throttle_state(
     sessions_dir: Path,
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     *,
     persist_inconclusive_probe_counter: bool = True,
@@ -5178,7 +5179,7 @@ def _classify_dead_sessions_and_update_throttle_state(
 
 def _attempt_salvage(
     *,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     repo_root: Path,
     worktree_path: Path,
@@ -5430,7 +5431,7 @@ class OrchestratorApp:
         repo_root: Path,
         paths: RuntimePaths,
         config: OrchestratorConfig,
-        gh: GitHub,
+        gh: GitHubLike,
         *,
         dry_run: bool = False,
         fleet_dir_override: str | None = None,
@@ -8443,6 +8444,14 @@ class OrchestratorApp:
                 prior_reviewed_head_sha is None or prior_reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
+        # Issue #868: review_dispatch.enabled gates whether landing this PR in
+        # "reviewing" is safe. Disabled means dispatch_reviews()'s launch+reap
+        # machinery never services this state (its own internal gate skips
+        # it too), so stamping "reviewing"/agent:reviewing here would strand
+        # the PR under a label nothing runs to clear. The packet itself is
+        # still written either way — only the state/label transition is
+        # gated, so a human can still read the prompt manually.
+        dispatch_disabled = not self.config.review_dispatch.enabled
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Merge-update, never replace: wholesale assignment here used to erase
@@ -8455,7 +8464,7 @@ class OrchestratorApp:
                 "issue_number": issue_number,
                 "prompt_path": str(prompt_path),
                 "decision_path": str(decision_path),
-                "status": "reviewing",
+                **({} if dispatch_disabled else {"status": "reviewing"}),
                 "janitor_ok": True,
                 "janitor_failures": [],
                 "janitor_warnings": list(merged_warnings),
@@ -8530,7 +8539,7 @@ class OrchestratorApp:
                 ):
                     should_skip_transition = True
 
-            if not should_skip_transition:
+            if not should_skip_transition and not dispatch_disabled:
                 result = transition(self.gh, self.config.labels, issue_number, "review_started")
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -9172,18 +9181,6 @@ class OrchestratorApp:
         byte-identical; tests can freeze it and assert exact equality instead
         of a wall-clock-tolerance proximity check.
         """
-        if not self.config.review_dispatch.enabled:
-            return CommandResult(
-                True,
-                "review dispatch disabled",
-                {
-                    "selected_count": 0,
-                    "attempted_count": 0,
-                    "failed_count": 0,
-                    "launched_count": 0,
-                },
-            )
-
         resolved_now = now if now is not None else datetime.now(UTC)
         reviews_dir = self._layout.reviews_dir
 
@@ -9193,6 +9190,16 @@ class OrchestratorApp:
         # returns early and leaves dead reviewer claims stuck — blocking
         # re-dispatch after the quota resets. In dry-run mode we skip
         # these sweeps to stay read-only.
+        #
+        # Issue #868: these sweeps must ALSO run ahead of the
+        # ``review_dispatch.enabled`` gate below, for the same reason —
+        # disabling dispatch must not disable the cleanup a *previously*
+        # dispatched (or previously stamped-reviewing) claim still needs. A
+        # dead reviewer's claim that goes stale while the flag happens to be
+        # off must still be freed, or it stays stuck even after the flag is
+        # re-enabled (the reap is what makes it re-dispatchable). Before this
+        # fix these sweeps sat below the ``enabled`` early return and were
+        # unreachable whenever dispatch was disabled.
         verdict_result = {"recorded": [], "missed": []}
         if not self.dry_run:
             verdict_result = self._reap_review_verdicts(reviews_dir)
@@ -9207,14 +9214,39 @@ class OrchestratorApp:
             _reap_orphaned_review_checkouts(
                 self.gh, self.repo_root, reviews_dir, self.paths.state_file, self.config
             )
+        recorded_verdicts = verdict_result.get("recorded", [])
+        missed_verdicts = verdict_result.get("missed", [])
+
+        if not self.config.review_dispatch.enabled:
+            # Issue #868 part 3: this is a real no-op for LAUNCHING new
+            # reviewers, but the reaper sweeps above may still have done real
+            # work (freeing a stale claim). Carry that through explicitly
+            # instead of returning a bare ``ok=True`` that reads identically
+            # to "nothing happened at all" — and mark ``disabled`` so a
+            # caller doesn't have to string-match the message to tell this
+            # apart from a real dispatch pass.
+            return CommandResult(
+                True,
+                "review dispatch disabled",
+                {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "disabled": True,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
+                },
+            )
 
         # Clear the reviewer quota if any verdicts were recorded from dead
         # reviewers. This is the only proof the quota window is actually open:
         # a process that merely *started* can still die seconds later from an
         # asynchronous session-limit kill. Run before the quota gate so a
         # successful reap clears the throttle and lets the pass proceed.
-        recorded_verdicts = verdict_result.get("recorded", [])
-        missed_verdicts = verdict_result.get("missed", [])
+        # (recorded_verdicts/missed_verdicts are computed above, ahead of the
+        # disabled-gate return, so issue #868's disabled payload can report
+        # them too.)
         if not self.dry_run and recorded_verdicts:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -11124,8 +11156,19 @@ class OrchestratorApp:
                     else None,
                 )
                 escalated = pr_escalated or issue_escalated
+                # Issue #868: a second, independent call site that stamps
+                # "reviewing"/agent:reviewing — separate from review()'s own
+                # packet-generation path, which gates the same way. Disabled
+                # dispatch means nothing services "reviewing" here either, so
+                # the state/label stamp is gated on the same flag. The
+                # head_moved bookkeeping below (state field + event) stays
+                # unconditional: it's read only by this function's own next
+                # pass (via _check_carry_forward/reviewed_head_sha
+                # comparisons), never jointly with status=="reviewing", so
+                # gating just the reviewing stamp doesn't orphan it.
+                dispatch_disabled = not self.config.review_dispatch.enabled
                 if not escalated:
-                    if issue_number is not None:
+                    if issue_number is not None and not dispatch_disabled:
                         result = transition(
                             self.gh, self.config.labels, issue_number, "review_started"
                         )
@@ -11142,7 +11185,7 @@ class OrchestratorApp:
                             **state["prs"].get(str(pr_number), {}),
                             "number": pr_number,
                             "issue_number": issue_number,
-                            "status": "reviewing",
+                            **({} if dispatch_disabled else {"status": "reviewing"}),
                             "head_moved": True,
                             "reviewed_head_sha": reviewed_head_sha,
                             "live_head_sha": live_head_sha,
@@ -11781,7 +11824,15 @@ class OrchestratorApp:
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
-            new_attempts = 0
+            # Issue #861: default to PRESERVING the prior count, not resetting
+            # to 0. A pending-only pass (checks still in flight) falls through
+            # both branches below and previously clobbered an accumulated
+            # count with 0 every time, defeating the threshold debounce.
+            # Indeterminate passes must leave the counter untouched; only a
+            # genuine-success pass (the `elif can_merge:` below) or an
+            # explicit merge (handled earlier, before this block re-reads
+            # `existing`) may zero it.
+            new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0))
             new_stale_base_deferrals = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
@@ -11793,10 +11844,13 @@ class OrchestratorApp:
                 # Issue #777(b): this counter previously had no ceiling and
                 # grew unbounded across passes (real corpus: PR #679 reached
                 # 12 and climbing) because nothing ever reset it once a
-                # rework was dispatched and pending. It is diagnostic only --
-                # the FUNCTIONAL bound on repeated conflict-rework/no-op-
-                # rework dispatch is conflict_rework_attempts/
-                # no_op_rework_attempts, enforced by
+                # rework was dispatched and pending. It is not purely
+                # diagnostic -- the merge-conflict rework-dispatch block
+                # above and the check-failure rework-dispatch block above
+                # both read this same counter as a `>= threshold` debounce
+                # gating *first*-dispatch timing -- but it does not bound
+                # *repeat* dispatch; that functional bound is
+                # conflict_rework_attempts/no_op_rework_attempts, enforced by
                 # _route_janitor_gate_failure_to_rework above. Clamp at
                 # threshold + 1 (not at threshold): clamping AT threshold
                 # would make `merge_attempt_alarm` below re-fire every pass
@@ -11909,6 +11963,17 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
+            elif can_merge:
+                # Genuine success: checks are ready (or an explicit merge/
+                # mergequeue-handoff already reset the persisted value above,
+                # which this re-read of `existing` picked up) and this is not
+                # a mergequeue-handoff failure (guaranteed by the `if` above:
+                # mergequeue_handoff_failed can only be True when can_merge is
+                # True, so if it were True this branch would not be reached).
+                # A confirmed-mergeable pass is real positive information, so
+                # it is safe -- and correct -- to zero the streak here, unlike
+                # the pending-only case above which conveys no information.
+                new_attempts = 0
             if (
                 approved
                 and can_merge

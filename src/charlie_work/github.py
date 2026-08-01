@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from .config import RuntimeConfig
@@ -173,7 +173,7 @@ class GitHubRunResult:
     error: str | None = None
 
 
-class _MergedPRSearchResult(list):
+class MergedPRSearchResult(list):
     """List-like result from ``merged_prs_for_issue`` with an ``ok`` flag.
 
     Behaves like a normal list so existing list-consuming callers keep working,
@@ -184,6 +184,9 @@ class _MergedPRSearchResult(list):
     def __init__(self, items: list[Any], ok: bool = True) -> None:
         super().__init__(items)
         self.ok = ok
+
+
+_MergedPRSearchResult = MergedPRSearchResult
 
 
 # Matches the job-id segment of a GitHub Actions check link, e.g.
@@ -632,7 +635,7 @@ class GitHub:
         self,
         issue_number: int,
         branch_prefix: str,
-    ) -> _MergedPRSearchResult:
+    ) -> MergedPRSearchResult:
         """Return merged PRs that hijack-safely bind to ``issue_number``.
 
         Uses ``gh pr list --state merged --search`` so PRs merged long ago
@@ -670,7 +673,7 @@ class GitHub:
                     issue_number,
                     result.error,
                 )
-                return _MergedPRSearchResult([], ok=False)
+                return MergedPRSearchResult([], ok=False)
             items = result.value if isinstance(result.value, list) else []
         else:
             items = result if isinstance(result, list) else []
@@ -686,7 +689,7 @@ class GitHub:
             )
             if bound == issue_number:
                 matched.append(pr)
-        return _MergedPRSearchResult(matched, ok=True)
+        return MergedPRSearchResult(matched, ok=True)
 
     def pr_view(self, number: int, *, fields: str = PR_VIEW_FIELDS) -> dict[str, Any]:
         """Fetch a PR via ``gh pr view --json <fields>``.
@@ -1330,6 +1333,97 @@ class GitHub:
         return name_with_owner
 
 
+@runtime_checkable
+class GitHubLike(Protocol):
+    """Structural interface for the GitHub surface the orchestrator calls.
+
+    Production functions accept ``gh: GitHubLike`` instead of the concrete
+    ``GitHub`` class so test doubles can satisfy the contract structurally
+    without subclassing the frozen dataclass (issue #593).
+    """
+
+    dry_run: bool = False
+
+    def run(
+        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> Any: ...
+
+    def check_graphql_rate_limit(self, threshold: int = ...) -> tuple[bool, int, int | None]: ...
+
+    def invalidate_list_cache(self) -> None: ...
+
+    def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]: ...
+
+    def issue_view(self, number: int) -> dict[str, Any]: ...
+
+    def pr_list(self) -> list[dict[str, Any]]: ...
+
+    def merged_pr_list(self) -> list[dict[str, Any]]: ...
+
+    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str) -> MergedPRSearchResult:
+        """Return merged PRs binding to ``issue_number``.
+
+        The returned object is list-like and carries an ``ok`` flag. Callers
+        must check ``ok`` before treating an empty result as "no merged PRs";
+        ``ok=False`` means the search itself failed (rate limit, etc.).
+        """
+        ...
+
+    def pr_view(self, number: int, *, fields: str = ...) -> dict[str, Any]: ...
+
+    def pr_diff(self, number: int) -> str: ...
+
+    def pr_checks(self, number: int) -> list[dict[str, Any]] | None: ...
+
+    def actions_job(self, job_id: int) -> dict[str, Any] | None: ...
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]: ...
+
+    def commit(self, sha: str) -> dict[str, Any] | None: ...
+
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None: ...
+
+    def pr_commits(self, number: int) -> list[dict[str, Any]] | None: ...
+
+    def compare(self, base: str, head: str) -> dict[str, Any] | None: ...
+
+    def branch_protection(self, base: str) -> dict[str, Any] | None: ...
+
+    def compare_diff(self, base: str, head: str) -> str | None: ...
+
+    def add_issue_label(self, number: int, label: str) -> bool: ...
+
+    def remove_issue_label(self, number: int, label: str) -> bool: ...
+
+    def add_pr_label(self, number: int, label: str) -> bool: ...
+
+    def remove_pr_label(self, number: int, label: str) -> bool: ...
+
+    def close_issue(self, number: int) -> bool: ...
+
+    def pr_comment(self, number: int, body_file: Path) -> None: ...
+
+    def label_list(self) -> list[dict[str, Any]]: ...
+
+    def label_create(self, label: str, color: str, description: str) -> None: ...
+
+    def merge_pr(
+        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
+    ) -> str: ...
+
+    def delete_branch(self, branch: str) -> bool: ...
+
+    def pr_update_branch(self, pr_number: int) -> bool: ...
+
+    def pr_ready(self, number: int) -> GitHubRunResult: ...
+
+    def are_issues_open(self, issue_numbers: list[int]) -> set[int]: ...
+
+    def name_with_owner(self) -> str: ...
+
+    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None: ...
+
+
 def label_names(item: dict[str, Any]) -> set[str]:
     labels = item.get("labels") or []
     names: set[str] = set()
@@ -1849,7 +1943,7 @@ def detect_prose_only_dependencies(text: str) -> bool:
     return False
 
 
-def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
+def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int]:
     """Fetch GitHub's native issue dependencies (blocked_by relationships).
 
     Uses the GitHub API to check for issue dependencies. Tolerates 404/410 errors
@@ -1943,7 +2037,7 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
 
 
 def cancel_superseded_runs(
-    gh: GitHub,
+    gh: GitHubLike,
     default_branch: str,
     workflow_name: str,
 ) -> dict[str, Any]:
