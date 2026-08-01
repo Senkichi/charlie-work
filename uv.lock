@@ -55,7 +55,6 @@ provides-extras = ["dev"]
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=8" },
-    { name = "pytest-cov", specifier = ">=5" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 
