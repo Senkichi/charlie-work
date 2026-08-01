@@ -11769,7 +11769,15 @@ class OrchestratorApp:
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
-            new_attempts = 0
+            # Issue #861: default to PRESERVING the prior count, not resetting
+            # to 0. A pending-only pass (checks still in flight) falls through
+            # both branches below and previously clobbered an accumulated
+            # count with 0 every time, defeating the threshold debounce.
+            # Indeterminate passes must leave the counter untouched; only a
+            # genuine-success pass (the `elif can_merge:` below) or an
+            # explicit merge (handled earlier, before this block re-reads
+            # `existing`) may zero it.
+            new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0))
             new_stale_base_deferrals = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
@@ -11781,10 +11789,13 @@ class OrchestratorApp:
                 # Issue #777(b): this counter previously had no ceiling and
                 # grew unbounded across passes (real corpus: PR #679 reached
                 # 12 and climbing) because nothing ever reset it once a
-                # rework was dispatched and pending. It is diagnostic only --
-                # the FUNCTIONAL bound on repeated conflict-rework/no-op-
-                # rework dispatch is conflict_rework_attempts/
-                # no_op_rework_attempts, enforced by
+                # rework was dispatched and pending. It is not purely
+                # diagnostic -- the merge-conflict rework-dispatch block
+                # above and the check-failure rework-dispatch block above
+                # both read this same counter as a `>= threshold` debounce
+                # gating *first*-dispatch timing -- but it does not bound
+                # *repeat* dispatch; that functional bound is
+                # conflict_rework_attempts/no_op_rework_attempts, enforced by
                 # _route_janitor_gate_failure_to_rework above. Clamp at
                 # threshold + 1 (not at threshold): clamping AT threshold
                 # would make `merge_attempt_alarm` below re-fire every pass
@@ -11897,6 +11908,17 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
+            elif can_merge:
+                # Genuine success: checks are ready (or an explicit merge/
+                # mergequeue-handoff already reset the persisted value above,
+                # which this re-read of `existing` picked up) and this is not
+                # a mergequeue-handoff failure (guaranteed by the `if` above:
+                # mergequeue_handoff_failed can only be True when can_merge is
+                # True, so if it were True this branch would not be reached).
+                # A confirmed-mergeable pass is real positive information, so
+                # it is safe -- and correct -- to zero the streak here, unlike
+                # the pending-only case above which conveys no information.
+                new_attempts = 0
             if (
                 approved
                 and can_merge
