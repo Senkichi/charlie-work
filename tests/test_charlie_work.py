@@ -23541,14 +23541,26 @@ def test_merge_ready_protection_strict_true_defers_even_when_config_disables_gat
     assert stale_events[0]["payload"]["pr_number"] == 789
 
 
-def test_merge_ready_protection_strict_false_allows_stale_base_without_update_call(
+def test_merge_ready_protection_strict_false_still_syncs_stale_base_before_merge(
     tmp_path: Path,
 ) -> None:
-    """Issue #812: protection strict:false disables the gate even though
-    require_current_base defaults to True in config -- the config constant is
-    a fallback for unreadable protection, not the authority. Also pins that the
-    pr_update_branch write is skipped entirely (the CI-churn half of the fix),
-    not merely that the deferral gate is skipped.
+    """Issue #875: protection ``strict: false`` must NOT disable the merge gate.
+
+    This test previously pinned the opposite (issue #812): with ``strict:
+    false``, PR 789 merged on a stale base and ``pr_update_branch`` was never
+    called. That is the defect. This repo runs ``strict: false`` deliberately
+    (two self-hosted runners cannot sustain strict mode), so the gate derived
+    "currency not required" and disabled itself -- an approved PR whose base had
+    advanced merged without its merged tree ever being tested, which is how
+    ``main`` went red.
+
+    The corrected policy is ``require_current_base OR protection.strict``:
+    protection may raise the requirement, never lower it below what the operator
+    configured. So PR 789 is now brought current *first* and merges on the
+    rebased tree.
+
+    The write firing here is also what makes the gate safe: gating merges while
+    leaving the write suppressed would deadlock a stale PR forever.
     """
     config = OrchestratorConfig(
         auto_merge=AutoMergeConfig(
@@ -23574,18 +23586,182 @@ def test_merge_ready_protection_strict_false_allows_stale_base_without_update_ca
 
     result_456 = app.merge_ready(456, merge=True)
     assert result_456.data["merged"] is True
-
-    result_789 = app.merge_ready(789, merge=True)
-    assert result_789.data["can_merge"] is True
-    assert result_789.data["merged"] is True
-    assert result_789.data.get("stale_base") is not True
-    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
-    # The write half of the churn (pr_update_branch) never fires when
-    # freshness isn't required -- not just the deferral-gate read half.
+    # 456's base is still current when it merges, so nothing to sync.
     assert fake_gh.pr_update_branch_calls == []
 
+    result_789 = app.merge_ready(789, merge=True)
+    # 456's merge advanced the base tip, leaving 789 organically stale. The gate
+    # is now live despite strict:false, so 789 is synced before it merges --
+    # pre-#875 this list stayed empty and 789 merged stale.
+    assert fake_gh.pr_update_branch_calls == [789]
+    assert result_789.data["merged"] is True
+    assert fake_gh.merged == [(456, "squash"), (789, "squash")]
+
+
+def test_merge_ready_strict_false_defers_when_sync_cannot_make_base_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #875, the refusal half: when the just-in-time sync cannot make the
+    PR current, the merge must be refused rather than proceeding on a stale
+    base. Distinct from the test above, which proves the happy path (sync
+    succeeds -> merge on the rebased tree); this proves the gate actually
+    blocks, so a green sync is not the only reason merges stop being stale.
+
+    ``pr_update_branch`` returning False is a *different* failure mode than
+    the one this test needs: it makes ``merge_ready`` set ``sync_failed``
+    (workflow.py's ``else: sync_failed = True`` branch right after the
+    ``self.gh.pr_update_branch(pr_number)`` call), which short-circuits the
+    base-currency check entirely (guarded by ``not sync_failed``) and routes
+    through the generic "approved but unmergeable" bookkeeping instead --
+    bumping ``consecutive_failed_merge_attempts`` with no ``stale_base``/
+    ``reason`` in the result and no ``merge_deferred_stale_base`` event. That
+    is real, correct behavior for an outright write failure, but it is not
+    the stale-base refusal path this test is meant to exercise.
+
+    The failure mode that actually reaches ``_merge_deferred_stale_base_result``
+    is a sync that *reports* success without moving the branch: mirroring the
+    sibling test above, ``pr_update_branch`` is monkeypatched to return True
+    (so ``sync_failed`` stays False) while never performing the fake's normal
+    side effect of advancing ``headRefOid``. ``_verify_synced_head`` then sees
+    the head SHA unchanged, treats it as "already up-to-date; nothing to do",
+    and the subsequent base-currency check finds the (still organically
+    stale) merge-base is not the current tip -- so the gate defers rather
+    than merging. This models a real GitHub race: the update-branch call is
+    accepted but the branch does not actually advance before the next read
+    (e.g. lost a race with another writer, or a conflict GitHub resolves as a
+    no-op).
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs=True,  # broadcast
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = _stale_base_prs()
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": False}}
+
+    for pr_number, head_sha in [(456, "sha-abc123"), (789, "sha-def456")]:
+        decision_dir = paths.prs / f"pr-{pr_number}"
+        decision_dir.mkdir(parents=True, exist_ok=True)
+        (decision_dir / "review-decision.json").write_text(
+            json.dumps({"decision": "approved", "reviewed_head_sha": head_sha}, indent=2),
+            encoding="utf-8",
+        )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app.merge_ready(456, merge=True).data["merged"] is True
+
+    # The sync reports success but never actually advances 789's head (see
+    # the docstring above): this is what makes the JIT sync fail to bring the
+    # PR current without tripping the unrelated sync_failed short-circuit.
+    # Record calls directly (the monkeypatch replaces the whole method, so
+    # FakeGitHub's own pr_update_branch_calls bookkeeping never runs) so the
+    # test proves the sync was actually ATTEMPTED and merely didn't help --
+    # not just that the PR was already stale before any sync was tried.
+    update_calls: list[int] = []
+
+    def _sync_reports_success_without_moving_head(pr_number: int) -> bool:
+        update_calls.append(pr_number)
+        return True
+
+    monkeypatch.setattr(fake_gh, "pr_update_branch", _sync_reports_success_without_moving_head)
+
+    result_789 = app.merge_ready(789, merge=True)
+    assert update_calls == [789]
+    assert result_789.data["can_merge"] is False
+    assert result_789.data["merged"] is False
+    assert result_789.data.get("stale_base") is True
+    assert fake_gh.merged == [(456, "squash")]
+
+    # _merge_deferred_stale_base_result's CommandResult.data does not carry a
+    # "reason" key (only "stale_base": True) -- the reason is recorded on the
+    # merge_deferred_stale_base event payload instead, so verify it there.
     state = json.loads(paths.state_file.read_text())
-    assert not any(e["kind"] == "merge_deferred_stale_base" for e in state["events"])
+    stale_events = [e for e in state["events"] if e["kind"] == "merge_deferred_stale_base"]
+    assert len(stale_events) == 1
+    assert stale_events[0]["payload"]["pr_number"] == 789
+    assert stale_events[0]["payload"]["reason"] == "base_stale"
+
+
+def test_is_base_currency_gated_protection_raises_never_lowers_config(tmp_path: Path) -> None:
+    """Issue #875 truth table. The merge gate is ``require_current_base OR
+    protection.strict`` -- protection can only ever raise the requirement.
+
+    The asymmetry versus ``_is_base_freshness_required`` (which protection
+    fully overrides) is deliberate: that one governs the broadcast sweep, whose
+    write costs N CI cycles across every open PR, where this one costs a single
+    cycle for the PR actually merging. Cheap enough to always pay; the broadcast
+    is not, which is what issue #812 correctly established.
+    """
+    from charlie_work.config import AutoMergeConfig
+
+    strict_true = {"required_status_checks": {"strict": True}}
+    strict_false = {"required_status_checks": {"strict": False}}
+
+    # (require_current_base, protection payload or None, expected gate)
+    cases: list[tuple[bool, dict[str, Any] | None, bool]] = [
+        # THE #875 FIX: config asks for the gate, protection must not veto it.
+        (True, strict_false, True),
+        # #812's direction still holds: protection alone can turn the gate on.
+        (False, strict_true, True),
+        # Both agree.
+        (True, strict_true, True),
+        (False, strict_false, False),
+        # Unreadable protection falls back to config, in both directions.
+        (True, None, True),
+        (False, None, False),
+    ]
+
+    for require_current_base, payload, expected in cases:
+        config = OrchestratorConfig(
+            auto_merge=AutoMergeConfig(
+                require_current_base=require_current_base,
+                # strategy must stay on: require_current_base=True + "off" is
+                # blocked by __post_init__ as an inescapable deferral loop.
+                update_open_prs=True,
+            )
+        )
+        paths = runtime_paths(tmp_path, config.runtime.state_dir)
+        fake_gh = FakeGitHub()
+        if payload is not None:
+            fake_gh.branch_protection_overrides["main"] = payload
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+        assert app._is_base_currency_gated("main") is expected, (
+            f"require_current_base={require_current_base} payload={payload!r}"
+        )
+
+
+def test_is_base_currency_gated_skips_protection_read_when_config_requires(
+    tmp_path: Path,
+) -> None:
+    """``require_current_base=True`` short-circuits before the protection read.
+
+    Not merely an optimization: it means the merge gate cannot be disabled by a
+    protection API outage, rate limit, or a repo whose protection is readable
+    but shaped unexpectedly. The strongest form of failing closed is not
+    depending on the remote read at all.
+
+    Deliberately asserts on a recorded call rather than raising from
+    ``branch_protection``: ``_is_base_freshness_required`` catches broad
+    ``Exception``, so a raise would be swallowed and converted into the same
+    ``True`` this test expects -- the assertion would hold whether or not the
+    short-circuit existed, making it blind to the very regression it exists to
+    catch.
+    """
+    config = OrchestratorConfig()  # require_current_base defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # strict:false would DISABLE the gate if the protection read were consulted,
+    # so this payload makes the read's influence observable in the return value
+    # as well as in the call log.
+    fake_gh.branch_protection_overrides["main"] = {"required_status_checks": {"strict": False}}
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app._is_base_currency_gated("main") is True
+    assert fake_gh.branch_protection_calls == []
 
 
 def test_is_base_freshness_required_fails_closed_when_protection_raises(tmp_path: Path) -> None:
