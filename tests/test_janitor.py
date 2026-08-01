@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from pathlib import Path
@@ -3153,7 +3154,7 @@ def test_no_op_rework_warns_on_flag_like_base_ref() -> None:
     assert any("_check_no_op_rework base_ref (merge-only)" in w for w in verdict.warnings)
 
 
-def test_no_op_rework_accepts_valid_sha_and_ref_values() -> None:
+def test_no_op_rework_accepts_valid_sha_and_ref_values(tmp_path: Path) -> None:
     """Valid SHA and ref-name values pass validation and reach the normal path."""
     pr = _green_pr(headRefOid="def456", headRefName="agent/issue-1-fix", baseRefName="main")
     pr_state = {
@@ -3161,9 +3162,9 @@ def test_no_op_rework_accepts_valid_sha_and_ref_values() -> None:
         "reviewed_head_sha": "abc123",
     }
 
-    # Heads differ and no real git repo at cwd — the merge-only check will
+    # Heads differ and no real git repo at tmp_path — the merge-only check will
     # fail gracefully (subprocess error → warning), but validation must pass.
-    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=tmp_path)
 
     assert isinstance(verdict, JanitorVerdict)
     assert not verdict.is_no_op_rework
@@ -3347,3 +3348,23 @@ def test_detect_cross_pr_revert_skips_invalid_base_ref(
 
     result = detect_cross_pr_revert(pr, repo_root)
     assert result is None
+
+
+def test_detect_cross_pr_revert_warns_on_invalid_ref(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ref validation failure must be logged, not silently treated as no revert."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    pr = _green_pr(headRefName="--upload-pack=evil")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.janitor"):
+        result = detect_cross_pr_revert(pr, repo_root)
+
+    assert result is None
+    assert any(
+        "detect_cross_pr_revert" in record.message and "not a valid git ref name" in record.message
+        for record in caplog.records
+    )

@@ -8,10 +8,9 @@ future refactor that drops an incidental protection (e.g. the ``^`` prefix on
 ``reviewed_head_sha`` in ``janitor._check_no_op_rework``) cannot silently turn
 an attacker-influenced value into a parsed flag.
 
-The checks are format-only (defense-in-depth, see issue #659). Git's own
-ref/SHA naming rules already reject flag-like strings today — a ref or SHA
-cannot start with ``-`` — so none of the validated sites are exploitable now.
-These validators exist so that stays true after future refactors.
+The SHA check is a pure format guard. The ref-name check mirrors the rules
+enforced by ``git check-ref-format --allow-onelevel`` without shelling out,
+so it can be used safely before any git argv is built (issue #659).
 
 Git ref-name rules reference: ``git check-ref-format --help``.
 """
@@ -24,13 +23,16 @@ import re
 # Hex-only means a flag prefix (``-``) is structurally impossible.
 _SHA_RE = re.compile(r"\A[0-9a-fA-F]{4,64}\Z")
 
-# Git ref-name: conservative allowlist covering all real branch names while
-# rejecting every rev-syntax metacharacter. First char must be alphanumeric
-# (rejects leading ``-`` for flag-injection prevention, and leading ``.``/``/``
-# per git check-ref-format rules). Subsequent chars: alphanumerics plus
-# ``. _ / - +``. Metacharacters ``~ ^ : ? * [ \`` and whitespace/control chars
-# are excluded by the allowlist; ``..`` and ``@{`` are checked separately.
-_REF_NAME_RE = re.compile(r"\A[0-9A-Za-z][0-9A-Za-z._+/-]*\Z")
+# Forbidden characters in a git ref name: the set documented by
+# ``git check-ref-format`` as rev-syntax / glob metacharacters.
+_REF_FORBIDDEN_CHARS = frozenset("~^:?*[\\")
+
+# ASCII whitespace that git rejects in ref names.
+_REF_WHITESPACE = frozenset(" \t\n\r\f\v")
+
+
+def _has_control_char(value: str) -> bool:
+    return any(ord(c) < 32 or ord(c) == 127 for c in value)
 
 
 def require_valid_sha(value: str, *, context: str) -> str:
@@ -51,23 +53,37 @@ def require_valid_sha(value: str, *, context: str) -> str:
 def require_valid_ref_name(value: str, *, context: str) -> str:
     """Return ``value`` if it is a valid git ref name, else raise ``ValueError``.
 
-    Rejects anything starting with ``-`` (flag injection) or containing
-    rev-syntax metacharacters, ``..``, ``@{``, or trailing ``/``/``.``.
-    Conservative allowlist: alphanumerics plus ``. _ / - +``. See issue #659.
+    Enforces the same structural rules as ``git check-ref-format
+    --allow-onelevel``: no leading ``.``/``-``/``/``, no ``..`` or ``@{``,
+    no rev-syntax metacharacters, no control/whitespace, no empty path
+    components, no ``.``-prefixed path components, no ``.lock``-suffixed path
+    components, and no trailing ``.`` or ``/``. This tracks git's actual
+    ref-name rules instead of a hand-maintained allowlist (issue #659).
     """
     if not isinstance(value, str) or not value:
         raise ValueError(f"{context}: ref name is empty or not a string")
-    if not _REF_NAME_RE.match(value):
-        raise ValueError(
-            f"{context}: {value!r} is not a valid git ref name "
-            f"(must start alphanumeric; only alphanumerics, '.', '_', '/', '-', '+' allowed)"
-        )
+    if value == "@":
+        # "@" alone is the HEAD reflog shorthand, not a valid ref name.
+        raise ValueError(f"{context}: {value!r} is not a valid git ref name")
+    if value.startswith((".", "-", "/")):
+        raise ValueError(f"{context}: {value!r} is not a valid git ref name")
+    if value.endswith((".", "/")):
+        raise ValueError(f"{context}: {value!r} ends with '/' or '.' (not a valid git ref name)")
     if ".." in value:
         raise ValueError(f"{context}: {value!r} contains '..' (not a valid git ref name)")
-    if value.endswith("/") or value.endswith("."):
-        raise ValueError(f"{context}: {value!r} ends with '/' or '.' (not a valid git ref name)")
     if "@{" in value:
         raise ValueError(f"{context}: {value!r} contains '@{{' (not a valid git ref name)")
+    if _has_control_char(value):
+        raise ValueError(f"{context}: {value!r} is not a valid git ref name")
+    if any(c in _REF_FORBIDDEN_CHARS or c in _REF_WHITESPACE for c in value):
+        raise ValueError(f"{context}: {value!r} is not a valid git ref name")
+    for part in value.split("/"):
+        if not part:
+            raise ValueError(f"{context}: {value!r} is not a valid git ref name")
+        if part.startswith("."):
+            raise ValueError(f"{context}: {value!r} is not a valid git ref name")
+        if part.endswith(".lock"):
+            raise ValueError(f"{context}: {value!r} is not a valid git ref name")
     return value
 
 

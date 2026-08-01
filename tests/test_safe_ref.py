@@ -91,6 +91,18 @@ class TestRequireValidRefName:
     def test_accepts_head(self) -> None:
         assert require_valid_ref_name("HEAD", context="test") == "HEAD"
 
+    def test_accepts_at_in_branch(self) -> None:
+        """Git-legal ref names containing '@' (outside '@{') must not be rejected."""
+        assert require_valid_ref_name("agent/issue@team", context="test") == "agent/issue@team"
+
+    def test_accepts_leading_plus(self) -> None:
+        """Git-legal ref names may start with '+'."""
+        assert require_valid_ref_name("+feature", context="test") == "+feature"
+
+    def test_accepts_unicode_branch(self) -> None:
+        """Git-legal ref names may contain non-ASCII characters."""
+        assert require_valid_ref_name("héllo", context="test") == "héllo"
+
     def test_rejects_leading_dash(self) -> None:
         """Leading ``-`` is flag injection — the primary defense."""
         with pytest.raises(ValueError, match="not a valid git ref name"):
@@ -117,12 +129,32 @@ class TestRequireValidRefName:
             require_valid_ref_name("foo@{bar", context="test")
 
     def test_rejects_trailing_slash(self) -> None:
-        with pytest.raises(ValueError, match="ends with"):
+        with pytest.raises(ValueError, match="not a valid git ref name"):
             require_valid_ref_name("foo/", context="test")
 
     def test_rejects_trailing_dot(self) -> None:
-        with pytest.raises(ValueError, match="ends with"):
+        with pytest.raises(ValueError, match="not a valid git ref name"):
             require_valid_ref_name("foo.", context="test")
+
+    def test_rejects_dot_lock_suffix(self) -> None:
+        """A path component ending with '.lock' is not a valid git ref name."""
+        with pytest.raises(ValueError, match="not a valid git ref name"):
+            require_valid_ref_name("release.lock", context="test")
+
+    def test_rejects_double_slash(self) -> None:
+        """Empty path components (consecutive '/') are not valid."""
+        with pytest.raises(ValueError, match="not a valid git ref name"):
+            require_valid_ref_name("agent//issue", context="test")
+
+    def test_rejects_dot_component(self) -> None:
+        """A path component that is '.' or '..' is not valid."""
+        with pytest.raises(ValueError, match="not a valid git ref name"):
+            require_valid_ref_name("agent/./issue", context="test")
+
+    def test_rejects_leading_dot_in_component(self) -> None:
+        """A path component beginning with '.' is not valid."""
+        with pytest.raises(ValueError, match="not a valid git ref name"):
+            require_valid_ref_name("agent/.hidden", context="test")
 
     def test_rejects_rev_syntax_caret(self) -> None:
         with pytest.raises(ValueError, match="not a valid git ref name"):

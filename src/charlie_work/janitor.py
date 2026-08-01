@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import builtins
 import fnmatch
+import logging
 import re
 import subprocess
 from collections.abc import Iterator
@@ -43,6 +44,8 @@ if TYPE_CHECKING:
 
 # Builtin names that should not be treated as external constants in assertions.
 _BUILTIN_NAMES = frozenset(name for name in dir(builtins) if not name.startswith("_"))
+
+logger = logging.getLogger(__name__)
 
 
 # Case-insensitive word-boundary regex for tests/rationale markers.
@@ -998,7 +1001,13 @@ def detect_cross_pr_revert(
                             f"would silently undo base commit {base_sha[:12]}; add an explicit "
                             f"'{allow_marker}: <reason>' line to the PR body to proceed"
                         )
-    except (OSError, ValueError):
+    except ValueError as exc:
+        # Ref validation failed (issue #659). The function returns None for a
+        # false negative, so a diagnostic is required to distinguish this from
+        # "no revert detected".
+        logger.warning("detect_cross_pr_revert ref validation failed: %s", exc)
+        return None
+    except OSError:
         return None
 
     return None
