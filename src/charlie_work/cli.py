@@ -13,7 +13,13 @@ from . import CLI_NAME
 from .closing_keyword_gate import find_unexpected_closing_references
 from .config import ConfigError, find_config_path
 from .doctor import DoctorCheck, run_doctor
-from .fleet_dispatch import compute_api_worker_fleet_report, fleet_loop, run_fleet_supervise
+from .fleet_dispatch import (
+    compute_api_worker_fleet_report,
+    fleet_loop,
+    run_fleet_supervise,
+    run_fleet_supervise_loop,
+)
+from .supervise_loop import DEFAULT_MAX_RELAUNCHES, EXIT_RESTART_REQUESTED
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import (
@@ -264,6 +270,34 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_supervise_merge_group.add_argument("--merge", action="store_true", dest="merge")
     fleet_supervise_merge_group.add_argument("--no-merge", action="store_false", dest="merge")
     fleet_supervise.set_defaults(merge=None)
+
+    fleet_supervise_loop = fleet_sub.add_parser(
+        "supervise-loop",
+        help=(
+            "Run `fleet supervise`, relaunching immediately when it exits to pick up "
+            "new code, bounded by --max-relaunches (#862)."
+        ),
+    )
+    fleet_supervise_loop.add_argument(
+        "--max-relaunches",
+        type=int,
+        default=DEFAULT_MAX_RELAUNCHES,
+        dest="max_relaunches",
+        help=(
+            "Maximum immediate relaunches before exiting and letting the scheduled "
+            f"task's next tick take over (default {DEFAULT_MAX_RELAUNCHES})."
+        ),
+    )
+    fleet_supervise_loop.add_argument(
+        "supervise_args",
+        nargs="*",
+        help=(
+            "Arguments forwarded verbatim to `fleet supervise`, e.g. "
+            "`supervise-loop -- --max-runtime 0`. Passthrough rather than "
+            "re-declared here so a new supervise flag needs no change in this "
+            "wrapper."
+        ),
+    )
 
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
@@ -1536,6 +1570,11 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_fleet_bash_rats(args)
             elif args.fleet_command == "supervise":
                 result = run_fleet_supervise_command(args)
+            elif args.fleet_command == "supervise-loop":
+                result = run_fleet_supervise_loop(
+                    supervise_args=tuple(args.supervise_args),
+                    max_relaunches=args.max_relaunches,
+                )
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         elif args.command == "runners":
@@ -1674,5 +1713,13 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"    {error}")
     else:
         print_result(result, json_output=args.json_output)
+
+    # #862: a supervisor exit that asked to be replaced must be distinguishable
+    # from a deliberate stop, so the wrapper relaunches on the former and not
+    # the latter. Read out of result.data rather than switched on the command
+    # name: main() is generic across every command, and a name list here would
+    # need editing for each new long-lived command wanting the same signal.
+    if result.ok and isinstance(result.data, dict) and result.data.get("restart_requested"):
+        return EXIT_RESTART_REQUESTED
 
     return 0 if result.ok else 1

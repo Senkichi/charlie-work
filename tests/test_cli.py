@@ -433,6 +433,72 @@ def test_cli_fleet_supervise_command_runs_and_returns_ok(
     assert captured["kwargs"]["max_runtime_override"] == 120
 
 
+def test_cli_maps_restart_requested_to_a_distinct_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#862 AC1: a restart-requesting exit is distinguishable from a clean one.
+
+    Both are ``ok=True``, which is exactly why the fleet used to sit
+    unsupervised for a full watchdog interval after every self-deploy without
+    anything in Task Scheduler looking wrong.
+    """
+
+    def _fake_run_fleet_supervise(**_kwargs: Any) -> CommandResult:
+        return CommandResult(
+            True,
+            "fleet supervisor complete",
+            {"exit_reason": "self_deploy", "restart_requested": True},
+        )
+
+    monkeypatch.setattr(cli, "run_fleet_supervise", _fake_run_fleet_supervise)
+
+    assert cli.main(["fleet", "supervise"]) == cli.EXIT_RESTART_REQUESTED
+
+
+def test_cli_maps_a_deliberate_stop_to_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4's control: same command, same ok=True, opposite exit code.
+
+    Paired with the test above so the distinct code is attributable to
+    ``restart_requested`` rather than to the command being run at all.
+    """
+
+    def _fake_run_fleet_supervise(**_kwargs: Any) -> CommandResult:
+        return CommandResult(
+            True,
+            "fleet supervisor complete",
+            {"exit_reason": "max_runtime", "restart_requested": False},
+        )
+
+    monkeypatch.setattr(cli, "run_fleet_supervise", _fake_run_fleet_supervise)
+
+    assert cli.main(["fleet", "supervise"]) == 0
+
+
+def test_cli_fleet_supervise_loop_forwards_args_after_the_separator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wrapper passes supervise's flags through verbatim.
+
+    Guards the passthrough contract the launcher depends on: `supervise-loop`
+    deliberately does not re-declare supervise's flags, so a regression that
+    swallowed them would start the supervisor with default settings instead of
+    the launcher's `--max-runtime 0`.
+    """
+    captured: dict[str, Any] = {}
+
+    def _fake_run_fleet_supervise_loop(**kwargs: Any) -> CommandResult:
+        captured["kwargs"] = kwargs
+        return CommandResult(True, "supervise-loop done", {})
+
+    monkeypatch.setattr(cli, "run_fleet_supervise_loop", _fake_run_fleet_supervise_loop)
+
+    rc = cli.main(["fleet", "supervise-loop", "--max-relaunches", "2", "--", "--max-runtime", "0"])
+
+    assert rc == 0
+    assert captured["kwargs"]["max_relaunches"] == 2
+    assert captured["kwargs"]["supervise_args"] == ("--max-runtime", "0")
+
+
 def test_run_fleet_bash_rats_self_deploys_before_pass(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

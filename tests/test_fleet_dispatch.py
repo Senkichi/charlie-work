@@ -30,6 +30,7 @@ from charlie_work.fleet_dispatch import (
     compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
+    run_fleet_supervise_loop,
 )
 from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.instrumentation import query_events
@@ -42,6 +43,7 @@ from charlie_work.runner_allocation import (
 from charlie_work.runner_allocation_pass import AllocationPassResult
 from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME, load_allocation_stamp
 from charlie_work.supervise import SelfDeployResult
+from charlie_work.supervise_loop import EXIT_RESTART_REQUESTED
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
 
@@ -1545,6 +1547,44 @@ def test_run_fleet_supervise_loops_until_max_passes(
     assert result.data["passes"] == 3
     assert mock_fleet_loop.call_count == 3
     assert fc.sleep_calls == [5.0, 5.0, 5.0]
+    # #862 AC4: exhausting the pass budget is a deliberate stop. It shares
+    # ok=True with the restart-requesting exits, so the launcher distinguishes
+    # them on this field alone -- a regression here would relaunch forever.
+    assert result.data["exit_reason"] == "max_passes"
+    assert result.data["restart_requested"] is False
+
+
+def test_run_fleet_supervise_loop_reports_ok_on_a_clean_child_exit() -> None:
+    """The wrapper is transparent when the supervisor stops deliberately."""
+    result = run_fleet_supervise_loop(spawn=lambda _n: 0, max_relaunches=3)
+
+    assert result.ok is True
+    assert result.data["launches"] == 1
+    assert result.data["cap_reached"] is False
+
+
+def test_run_fleet_supervise_loop_reports_not_ok_when_the_cap_is_hit() -> None:
+    """A non-converging self-deploy must not read green (#862).
+
+    The whole complaint in #862 was that this failure mode exited 0, so nothing
+    in Task Scheduler looked wrong. Task Scheduler re-fires on schedule
+    regardless of LastTaskResult, so surfacing it costs no restart.
+    """
+    result = run_fleet_supervise_loop(spawn=lambda _n: EXIT_RESTART_REQUESTED, max_relaunches=2)
+
+    assert result.ok is False
+    assert result.data["cap_reached"] is True
+    assert result.data["launches"] == 3
+    assert result.data["relaunches"] == 2
+
+
+def test_run_fleet_supervise_loop_propagates_a_child_failure() -> None:
+    """An aborted supervisor stays non-ok rather than being masked by the wrapper."""
+    result = run_fleet_supervise_loop(spawn=lambda _n: 1, max_relaunches=3)
+
+    assert result.ok is False
+    assert result.data["last_exit_code"] == 1
+    assert result.data["cap_reached"] is False
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -2028,6 +2068,11 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     assert deploy_mock.call_count == 1
     # fleet_loop must never run this pass's (now-stale) code path.
     assert mock_fleet_loop.call_count == 0
+    # #862: the exit must say *why*, so the launcher can relaunch immediately
+    # instead of leaving the fleet unsupervised for a full watchdog interval.
+    # ok=True alone is what made this indistinguishable from a clean timeout.
+    assert result.data["exit_reason"] == "self_deploy"
+    assert result.data["restart_requested"] is True
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")

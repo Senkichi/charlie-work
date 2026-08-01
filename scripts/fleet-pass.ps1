@@ -89,6 +89,21 @@ $env:PYTHONIOENCODING = 'utf-8'
 # `python -m charlie_work` (src/charlie_work/__main__.py, same `cli:main`) means
 # the locked image is python.exe, which `uv sync` never replaces, leaving
 # charlie.exe free to be rewritten.
-$cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" python -m charlie_work fleet supervise --max-runtime 0 >> `"$log`" 2>&1"
+# Entered through `fleet supervise-loop`, which runs `fleet supervise` as a child
+# and relaunches it immediately when it exits to pick up new code (issue #862).
+#
+# Before this, the only thing that relaunched a self-deployed supervisor was this
+# script's own 5-minute scheduled trigger, so every self-deploy left the fleet
+# with no supervisor for up to a full interval -- silently, because the exit code
+# was 0 either way.
+#
+# The relaunch decision stays inside Python: `supervise-loop` compares the child's
+# exit code against its own EXIT_RESTART_REQUESTED constant, so this script never
+# hardcodes that number. The bound (--max-relaunches) matters as much as the
+# relaunch: on hitting it the wrapper EXITS, handing restart authority back to the
+# 5-minute trigger below rather than pinning a stale wrapper process forever.
+#
+# Everything after `--` is forwarded to `fleet supervise` verbatim.
+$cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" python -m charlie_work fleet supervise-loop -- --max-runtime 0 >> `"$log`" 2>&1"
 & cmd /c $cmdLine
-"--- fleet supervise exit=$LASTEXITCODE $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
+"--- fleet supervise-loop exit=$LASTEXITCODE $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
