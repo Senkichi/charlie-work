@@ -74,6 +74,7 @@ from .github import (
     parse_blockers,
 )
 from .issue_comments import render_issue_comments
+from .markdown_fence import fenced_block
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
@@ -4371,7 +4372,16 @@ def _write_rework_prompt(
             "pr_title": pr.get("title", ""),
             "pr_url": pr.get("url", ""),
             "issue_number": issue_number or "UNKNOWN",
+            # The raw note stays available to templates; no shipped one
+            # references it since #883.
             "dispatch_note": defang_closing_keywords(dispatch_note),
+            # Pre-fenced, not bare, for the same reason as ``issue_body_block``
+            # (#883): reviewer prose quotes pytest output and shell commands,
+            # so it carries its own fences -- measured at 16 of 289 summaries
+            # on disk, with pr-182's brief a rendered example of the break.
+            # The width depends on the note's own backtick runs, so it cannot
+            # be written in the template.
+            "dispatch_note_block": fenced_block(defang_closing_keywords(dispatch_note), "md"),
             "required_changes_section": required_changes_section,
             "branch_name": pr.get("headRefName", ""),
         },
@@ -17011,7 +17021,15 @@ class OrchestratorApp:
                 "issue_number": issue_number,
                 "issue_title": issue.get("title", ""),
                 "issue_url": issue.get("url", ""),
+                # The raw body stays available to templates; no shipped one
+                # references it since #883, but rendering it bare is a
+                # legitimate thing for a template to want.
                 "issue_body": issue.get("body", ""),
+                # Pre-fenced, not bare: the fence width depends on the body's
+                # own backtick runs, so it cannot be written in the template
+                # (#883). ``or ""`` guards a null body, which would otherwise
+                # reach the regex as None.
+                "issue_body_block": fenced_block(str(issue.get("body") or ""), "md"),
                 "issue_comments": self._render_issue_comments(issue),
                 "branch_name": self._branch_name(issue),
                 "worker_model_tier": self.config.dispatch.worker_model_tier,

@@ -59,6 +59,7 @@ from charlie_work.cross_family import (
 )
 from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
 from charlie_work.instrumentation import query_events
+from charlie_work.markdown_fence import fenced_block
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
 from charlie_work.state import (
@@ -576,6 +577,7 @@ def test_worker_prompt_renders_issue_values() -> None:
             "issue_title": "Fix search",
             "issue_url": "https://example.test/issues/123",
             "issue_body": "Body text",
+            "issue_body_block": fenced_block("Body text", "md"),
             "branch_name": "agent/issue-123-fix-search",
             "worker_model_tier": "capable",
             "issue_comments": "",
@@ -595,6 +597,7 @@ def test_claude_code_worker_prompt_renders_issue_values() -> None:
             "issue_title": "Fix search",
             "issue_url": "https://example.test/issues/123",
             "issue_body": "Body text",
+            "issue_body_block": fenced_block("Body text", "md"),
             "branch_name": "agent/issue-123-fix-search",
             "worker_model_tier": "capable",
             "issue_comments": "",
@@ -634,6 +637,7 @@ def test_missing_repo_local_template_falls_back_to_package(tmp_path: Path) -> No
             "pr_url": "u",
             "issue_number": 1,
             "dispatch_note": "s",
+            "dispatch_note_block": fenced_block("s", "md"),
             "required_changes_section": "",
             "branch_name": "agent/issue-1-t",
         },

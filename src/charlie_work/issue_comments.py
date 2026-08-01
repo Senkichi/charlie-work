@@ -28,11 +28,12 @@ heading in the comment becomes indistinguishable from a heading the
 orchestrator wrote. Measured on this repo: 61 of 100 open issue *bodies*
 contain a fence, so this is the common case, not an edge case. It is also the
 injection that ``prompts.render_prompt``'s single-substitution design prevents
-at the templating layer, reintroduced at the formatting layer. ``_fence_for``
-picks a delimiter longer than any backtick run in the content, per CommonMark.
-(The pre-existing fixed fence around ``$issue_body`` has the same defect and is
-tracked separately -- fixing it changes the rendered prompt for those 61
-issues, which is a different blast radius than this change.)
+at the templating layer, reintroduced at the formatting layer.
+``markdown_fence.fenced_block`` picks a delimiter longer than any backtick run
+in the content, per CommonMark. (The identical defect in the fixed fence around
+``$issue_body`` was tracked separately as #883 and fixed there, since it changed
+the rendered prompt for those 61 issues -- a different blast radius than this
+change, which is a no-op for an issue with no usable comments.)
 
 **Why the block is empty rather than absent.** ``render_issue_comments``
 returns ``""`` when nothing survives filtering, and the template attaches the
@@ -44,9 +45,10 @@ overwhelmingly common case and makes any prompt diff attributable.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
+
+from .markdown_fence import fenced_block
 
 __all__ = [
     "DEFAULT_INCLUDED_ASSOCIATIONS",
@@ -58,19 +60,6 @@ __all__ = [
 # NONE for apps/bots (aviator-app) and for drive-by commenters; both are
 # excluded by omission rather than by naming them.
 DEFAULT_INCLUDED_ASSOCIATIONS: tuple[str, ...] = ("OWNER", "MEMBER", "COLLABORATOR")
-
-_BACKTICK_RUN_RE = re.compile(r"`+")
-
-
-def _fence_for(text: str) -> str:
-    """Return a fence longer than the longest backtick run in ``text``.
-
-    CommonMark closes a fenced block on the first line whose fence is at least
-    as long as the opener, so a fence of ``longest + 1`` cannot be terminated
-    from inside the content.
-    """
-    longest = max((len(run) for run in _BACKTICK_RUN_RE.findall(text)), default=0)
-    return "`" * max(3, longest + 1)
 
 
 def _normalized(values: Iterable[str]) -> frozenset[str]:
@@ -210,7 +199,6 @@ def render_issue_comments(
         body = str(comment.get("body") or "").strip()
         if sanitize is not None:
             body = sanitize(body)
-        fence = _fence_for(body)
-        lines += ["", heading, "", f"{fence}md", body, fence]
+        lines += ["", heading, "", fenced_block(body, "md")]
 
     return "\n".join(lines)

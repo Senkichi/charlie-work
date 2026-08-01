@@ -18,7 +18,8 @@ import pytest
 
 from charlie_work.config import DispatchConfig, OrchestratorConfig, RuntimeConfig
 from charlie_work.github import defang_closing_keywords
-from charlie_work.issue_comments import _fence_for, render_issue_comments
+from charlie_work.issue_comments import render_issue_comments
+from charlie_work.markdown_fence import fence_for
 from charlie_work.paths import runtime_paths
 from charlie_work.prompts import TEMPLATE_DIR
 from charlie_work.workflow import OrchestratorApp
@@ -242,10 +243,10 @@ def test_nested_code_fence_cannot_break_out_of_the_comment_block() -> None:
 
 
 def test_fence_width_grows_with_the_longest_backtick_run() -> None:
-    assert _fence_for("no backticks") == "```"
-    assert _fence_for("inline `code`") == "```"
-    assert _fence_for("a ``` fence") == "````"
-    assert _fence_for("a ````` long fence") == "``````"
+    assert fence_for("no backticks") == "```"
+    assert fence_for("inline `code`") == "```"
+    assert fence_for("a ``` fence") == "````"
+    assert fence_for("a ````` long fence") == "``````"
 
 
 def test_comment_config_sequences_are_coerced_to_tuples() -> None:
