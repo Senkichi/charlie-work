@@ -1563,19 +1563,39 @@ def test_run_fleet_supervise_loop_reports_ok_on_a_clean_child_exit() -> None:
     assert result.data["cap_reached"] is False
 
 
-def test_run_fleet_supervise_loop_reports_not_ok_when_the_cap_is_hit() -> None:
-    """A non-converging self-deploy must not read green (#862).
+def test_run_fleet_supervise_loop_reports_ok_when_the_cap_is_hit() -> None:
+    """Hitting the cap is a clean handoff, not a failure.
 
-    The whole complaint in #862 was that this failure mode exited 0, so nothing
-    in Task Scheduler looked wrong. Task Scheduler re-fires on schedule
-    regardless of LastTaskResult, so surfacing it costs no restart.
+    Stopping at the bound is the wrapper doing its job: it returns restart
+    authority to the 5-minute trigger instead of spinning. Reporting it as
+    ok=False would exit 1, which `except Exception` in `run_fleet_supervise`
+    already uses -- collapsing "self-deploy is not converging" and "supervisor
+    crashed" into one indistinguishable code. That is #862's own defect shape
+    one layer up, so the cap is signalled by the event and log instead.
     """
     result = run_fleet_supervise_loop(spawn=lambda _n: EXIT_RESTART_REQUESTED, max_relaunches=2)
 
-    assert result.ok is False
+    assert result.ok is True
     assert result.data["cap_reached"] is True
     assert result.data["launches"] == 3
     assert result.data["relaunches"] == 2
+    # Never exit 3 upward: the wrapper is the thing that consumed the restart
+    # request, so re-signalling it would ask the launcher to relaunch too.
+    assert "restart_requested" not in result.data
+
+
+def test_run_fleet_supervise_loop_distinguishes_a_cap_from_an_abort() -> None:
+    """The paired control for the test above -- ok=True must not mask a crash.
+
+    Both conditions stop the wrapper, and the whole argument for ok=True on cap
+    is that a crash keeps exit 1 to itself. If that ever stopped being true the
+    cap's ok=True would be hiding real failures rather than disambiguating them.
+    """
+    capped = run_fleet_supervise_loop(spawn=lambda _n: EXIT_RESTART_REQUESTED, max_relaunches=1)
+    aborted = run_fleet_supervise_loop(spawn=lambda _n: 1, max_relaunches=1)
+
+    assert (capped.ok, capped.data["cap_reached"]) == (True, True)
+    assert (aborted.ok, aborted.data["cap_reached"]) == (False, False)
 
 
 def test_run_fleet_supervise_loop_propagates_a_child_failure() -> None:

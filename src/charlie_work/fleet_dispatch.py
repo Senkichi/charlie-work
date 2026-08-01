@@ -47,6 +47,7 @@ from .state import state_lock, utc_now
 from .subprocess_runner import no_console_window_kwargs
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
+    EXIT_RESTART_REQUESTED,
     SuperviseLoopResult,
     run_supervise_relaunch_loop,
 )
@@ -2133,12 +2134,19 @@ def run_fleet_supervise_loop(
         on_cap_reached=_record_supervise_loop_cap_event,
     )
 
-    # ok=False on cap so the scheduled task records a non-zero LastTaskResult.
-    # #862's core complaint was that self-deploy restarts were *silent* because
-    # every exit read 0; a cap means self-deploy is not converging and should be
-    # visible in Task Scheduler without reading the log. Task Scheduler keeps
-    # firing on schedule regardless of result, so this costs no restart.
-    ok = not result.cap_reached and result.last_exit_code == 0
+    # A cap is a *clean handoff*, not a failure: the wrapper deliberately gives
+    # restart authority back to the 5-minute trigger rather than spinning. So the
+    # last exit being EXIT_RESTART_REQUESTED is ok, exactly like a plain 0.
+    #
+    # Reporting the cap as ok=False (exit 1) was the first draft, and it is wrong
+    # for the same reason #862 itself is: it makes two different conditions
+    # indistinguishable. `except Exception` in `run_fleet_supervise` also exits 1,
+    # so an operator seeing LastTaskResult=1 could not tell "supervisor crashed"
+    # from "self-deploy is not converging" — the ambiguity just moves up a layer
+    # instead of being removed. The cap's signal is the distinct log line and the
+    # `supervise_relaunch_cap_reached` event, both of which say exactly which
+    # condition occurred; the exit code does not need to carry it too.
+    ok = result.last_exit_code in (0, EXIT_RESTART_REQUESTED)
     return CommandResult(
         ok,
         f"supervise-loop: {result.launches} launch(es), {result.relaunches} relaunch(es), "
