@@ -45,6 +45,62 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false
+      # ci_fleet is consumed as an editable path dependency at ../ci_runners
+      # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
+      # exist BEFORE uv sync runs -- without it, sync exits 2 with
+      # "Distribution not found" and both required checks wedge every PR.
+      #
+      # Idempotent by necessity: $GITHUB_WORKSPACE/.. is outside the directory
+      # actions/checkout manages, so it is neither created for us nor cleaned
+      # between runs. A plain clone would succeed once per runner and fail on
+      # every run after that. actions/checkout cannot do this itself -- it
+      # refuses a path: outside the workspace, and the location is fixed by the
+      # relative path recorded in uv.lock.
+      #
+      # Tracks ci_runners' main rather than a pinned SHA. That is deliberate
+      # while the extraction is in flight: the lock records the editable path,
+      # not a revision, so a pin here would be a second source of truth that
+      # silently disagrees with it. Revisit when ci_fleet is published as a
+      # versioned dependency.
+      - name: Check out ci_runners as a sibling
+        shell: powershell
+        env:
+          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
+          # Credential passed per-command, never written to disk. `git -c`
+          # applies to the single invocation and is not copied into the new
+          # repo's config, unlike embedding a token in the remote URL -- which
+          # would persist in .git/config on the runner between runs.
+          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $auth = "AUTHORIZATION: basic $b64"
+          # Actions masks the *literal* secret string; the base64 of it is a
+          # different string and is NOT masked automatically. Basic-auth base64
+          # is encoding, not encryption -- anything that echoed $b64 or $auth
+          # would print a trivially reversible credential in the clear. Register
+          # it so the masker covers this form too.
+          Write-Host "::add-mask::$b64"
+          if (Test-Path (Join-Path $dest '.git')) {
+            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
+            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
+            git -C $dest reset --hard FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
+          } elseif (Test-Path $dest) {
+            # Something is there that is not a git checkout. Fail rather than
+            # remove it: this step has no business deleting an unexplained
+            # directory on the host, and on Windows a junction would be
+            # followed by a recursive delete (R-15).
+            throw "$dest exists but is not a git checkout -- refusing to touch it"
+          } else {
+            git -c http.extraheader="$auth" clone --depth 1 --branch main `
+              https://github.com/Senkichi/ci_runners.git $dest
+            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
+          }
+          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
+            throw "ci_runners checkout at $dest has no pyproject.toml"
+          }
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Run tests
@@ -139,6 +195,62 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false
+      # ci_fleet is consumed as an editable path dependency at ../ci_runners
+      # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
+      # exist BEFORE uv sync runs -- without it, sync exits 2 with
+      # "Distribution not found" and both required checks wedge every PR.
+      #
+      # Idempotent by necessity: $GITHUB_WORKSPACE/.. is outside the directory
+      # actions/checkout manages, so it is neither created for us nor cleaned
+      # between runs. A plain clone would succeed once per runner and fail on
+      # every run after that. actions/checkout cannot do this itself -- it
+      # refuses a path: outside the workspace, and the location is fixed by the
+      # relative path recorded in uv.lock.
+      #
+      # Tracks ci_runners' main rather than a pinned SHA. That is deliberate
+      # while the extraction is in flight: the lock records the editable path,
+      # not a revision, so a pin here would be a second source of truth that
+      # silently disagrees with it. Revisit when ci_fleet is published as a
+      # versioned dependency.
+      - name: Check out ci_runners as a sibling
+        shell: powershell
+        env:
+          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
+          # Credential passed per-command, never written to disk. `git -c`
+          # applies to the single invocation and is not copied into the new
+          # repo's config, unlike embedding a token in the remote URL -- which
+          # would persist in .git/config on the runner between runs.
+          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $auth = "AUTHORIZATION: basic $b64"
+          # Actions masks the *literal* secret string; the base64 of it is a
+          # different string and is NOT masked automatically. Basic-auth base64
+          # is encoding, not encryption -- anything that echoed $b64 or $auth
+          # would print a trivially reversible credential in the clear. Register
+          # it so the masker covers this form too.
+          Write-Host "::add-mask::$b64"
+          if (Test-Path (Join-Path $dest '.git')) {
+            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
+            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
+            git -C $dest reset --hard FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
+          } elseif (Test-Path $dest) {
+            # Something is there that is not a git checkout. Fail rather than
+            # remove it: this step has no business deleting an unexplained
+            # directory on the host, and on Windows a junction would be
+            # followed by a recursive delete (R-15).
+            throw "$dest exists but is not a git checkout -- refusing to touch it"
+          } else {
+            git -c http.extraheader="$auth" clone --depth 1 --branch main `
+              https://github.com/Senkichi/ci_runners.git $dest
+            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
+          }
+          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
+            throw "ci_runners checkout at $dest has no pyproject.toml"
+          }
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Ruff check

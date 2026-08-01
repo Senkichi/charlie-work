@@ -5891,7 +5891,7 @@ class OrchestratorApp:
         # Observe runner pool if feature is enabled
         runners_data = None
         if self.config.runner_scaling.enabled:
-            from .runners import format_runner_pool_state, observe_runner_pool
+            from ci_fleet.charlie_work_adapter import format_runner_pool_state, observe_runner_pool
 
             try:
                 # No state_dir here, so nothing is written either way today --

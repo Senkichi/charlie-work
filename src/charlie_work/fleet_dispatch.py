@@ -29,18 +29,19 @@ from .supervise import (
     take_snapshot,
     try_acquire_supervisor_lock,
 )
-from .runner_allocation_pass import run_allocation_pass
-from .runner_slots import save_allocation_skip, UNATTENDED_ALLOCATION_SOURCE
-from .runners import (
-    decide_autoscale,
+from ci_fleet.charlie_work_adapter import (
     FleetTotals,
+    ScaleAction,
+    UNATTENDED_ALLOCATION_SOURCE,
+    decide_autoscale,
     is_in_cooldown,
     is_pool_idle_for_minutes,
     observe_runner_pool,
     provision_runner,
     record_scale_event,
+    run_allocation_pass,
+    save_allocation_skip,
     scale_down_idle_runners,
-    ScaleAction,
 )
 from .state import state_lock, utc_now
 from .subprocess_runner import no_console_window_kwargs
