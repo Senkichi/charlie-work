@@ -3029,8 +3029,9 @@ def _required_checks_config(**kwargs) -> OrchestratorConfig:
 
 
 class FakeGitHub:
-    def __init__(self, repo_root: Any = None) -> None:
+    def __init__(self, repo_root: Any = None, dry_run: bool = False) -> None:
         self.repo_root = repo_root
+        self.dry_run = dry_run
         self.issues = [
             {
                 "number": 123,
@@ -3178,6 +3179,15 @@ class FakeGitHub:
     def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
         self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
         return self.pr_create_return
+
+    def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
+        # No fixture data configured means an empty list, matching the real
+        # GitHub.pr_commits's "no failure, nothing found" shape rather than
+        # raising. Not exercised by any GitHubLike-typed call site as of the
+        # PR that added this method (only the concrete GitHub-typed
+        # closing-keyword-check CLI path calls it), but kept here so
+        # FakeGitHub stays a complete stand-in for the GitHubLike protocol.
+        return []
 
     def pr_checks(self, number: int):
         return [
@@ -3491,6 +3501,18 @@ class FakeGitHub:
         return [{"name": name} for name, _color, _desc in self.labels_created]
 
     def pr_comment(self, number: int, body_file: Path) -> None:
+        pass
+
+    def remove_pr_label(self, number: int, label: str) -> bool:
+        return True
+
+    def actions_job(self, job_id: int) -> dict[str, Any] | None:
+        return None
+
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
+        return None
+
+    def validate_field_lists(self) -> None:
         pass
 
 
