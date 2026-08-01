@@ -345,6 +345,30 @@ def test_query_events_by_level(tmp_path: Path) -> None:
     assert all(e["level"] == "error" for e in errors)
 
 
+def test_session_exited_is_warning_while_session_stalled_stays_error(tmp_path: Path) -> None:
+    """Issue #873: the two worker-reap outcomes must not share a level.
+
+    ``session_stalled`` (WorkerHealth.STALLED — a live process that stopped
+    making progress) is a genuine fault and stays error-level.
+    ``session_exited`` (WorkerHealth.DEAD — the process is already gone) is
+    also the normal terminal state of every worker that finished and exited,
+    so it must not land in the error stream that #864/#866 consume.
+
+    Warning, not info, is deliberate: liveness alone does not distinguish a
+    clean exit from a crash, so the reap stays surfaced — it just stops being
+    reported as a fault.
+    """
+    state_path = tmp_path / "state.json"
+    log_event(state_path, "session_stalled", {"worker_health": "STALLED"})
+    log_event(state_path, "session_exited", {"worker_health": "DEAD"})
+
+    errors = query_events(state_path, level="error")
+    assert [e["kind"] for e in errors] == ["session_stalled"]
+
+    warnings = query_events(state_path, level="warning")
+    assert [e["kind"] for e in warnings] == ["session_exited"]
+
+
 def test_query_events_by_correlation_id(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     with correlation_context("abc123"):
