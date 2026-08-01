@@ -94,6 +94,27 @@ from charlie_work.devin_shell import SessionRecord
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
 
+def future_timestamp(*, days: int = 3650) -> str:
+    """An ISO-8601 ``Z`` timestamp guaranteed to be in the future.
+
+    Several state predicates decide behaviour by comparing a stored timestamp
+    against ``datetime.now(UTC)`` -- ``is_reviewer_quota_exhausted`` (true only
+    while ``throttled_until`` is future), ``is_reviewer_probe_ready``,
+    ``is_throttled``. A test that hardcodes an absolute date to satisfy one of
+    those preconditions is a time bomb: it passes until wall-clock time crosses
+    the literal, then fails permanently, on every branch at once.
+
+    That is not a theoretical concern -- a hardcoded ``2026-08-01T00:00:00Z``
+    did exactly this, turning every open PR and main itself red at that instant
+    and blocking the merge lane. Use this helper for any timestamp whose
+    *futureness* is load-bearing.
+
+    Timestamps that are merely round-tripped or compared for equality do not
+    need this; an absolute literal is clearer there, and stable.
+    """
+    return (datetime.now(UTC) + timedelta(days=days)).isoformat().replace("+00:00", "Z")
+
+
 @pytest.fixture(autouse=True)
 def _stub_real_activity_probe_for_stalled_tests(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
@@ -3008,8 +3029,9 @@ def _required_checks_config(**kwargs) -> OrchestratorConfig:
 
 
 class FakeGitHub:
-    def __init__(self, repo_root: Any = None) -> None:
+    def __init__(self, repo_root: Any = None, dry_run: bool = False) -> None:
         self.repo_root = repo_root
+        self.dry_run = dry_run
         self.issues = [
             {
                 "number": 123,
@@ -3157,6 +3179,15 @@ class FakeGitHub:
     def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
         self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
         return self.pr_create_return
+
+    def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
+        # No fixture data configured means an empty list, matching the real
+        # GitHub.pr_commits's "no failure, nothing found" shape rather than
+        # raising. Not exercised by any GitHubLike-typed call site as of the
+        # PR that added this method (only the concrete GitHub-typed
+        # closing-keyword-check CLI path calls it), but kept here so
+        # FakeGitHub stays a complete stand-in for the GitHubLike protocol.
+        return []
 
     def pr_checks(self, number: int):
         return [
@@ -3470,6 +3501,18 @@ class FakeGitHub:
         return [{"name": name} for name, _color, _desc in self.labels_created]
 
     def pr_comment(self, number: int, body_file: Path) -> None:
+        pass
+
+    def remove_pr_label(self, number: int, label: str) -> bool:
+        return True
+
+    def actions_job(self, job_id: int) -> dict[str, Any] | None:
+        return None
+
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
+        return None
+
+    def validate_field_lists(self) -> None:
         pass
 
 
@@ -12557,25 +12600,40 @@ def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_fai
         set_throttled_until,
     )
 
-    state = set_reviewer_quota_exhausted(
-        empty_state(), throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
-    )
+    # The reviewer-quota throttle MUST be derived from now, never hardcoded.
+    # ``clear_quota_throttles`` only resets ``consecutive_probe_failures`` when
+    # ``is_reviewer_quota_exhausted(data) or cleared_root`` holds, and
+    # ``is_reviewer_quota_exhausted`` is true only while ``throttled_until`` is
+    # still in the future (``datetime.now(UTC) < throttle_time``). This test
+    # deliberately uses a *devin* root throttle below so ``cleared_root`` is
+    # False, which makes the exhaustion check the sole path to the reset --
+    # so the instant a hardcoded date goes stale, the assertion below flips
+    # from testing the reset to testing nothing, and fails.
+    #
+    # This is not hypothetical: this test pinned "2026-08-01T00:00:00Z" and
+    # began failing on every PR and on main at exactly that instant, blocking
+    # the merge lane until the date was made relative.
+    future = future_timestamp(days=3650)
+    # Opaque by contrast: the root throttle is only ever round-tripped and
+    # compared for equality, never against the clock, so an absolute literal is
+    # safe here and keeps the "untouched" assertion easy to read.
+    root_throttle = "2026-08-01T00:00:00Z"
+
+    state = set_reviewer_quota_exhausted(empty_state(), throttled_until=future, probe_after=future)
     state = {
         **state,
         "reviewer_quota": {**state["reviewer_quota"], "consecutive_probe_failures": 3},
     }
     # Also carry a devin-adapter root throttle, to confirm reviewer_quota
     # clears independently of what the root-throttle branch decides.
-    state = set_throttled_until(
-        state, "2026-08-01T00:00:00Z", reason="rate_limited", adapter_kind="devin"
-    )
+    state = set_throttled_until(state, root_throttle, reason="rate_limited", adapter_kind="devin")
 
     cleared = clear_quota_throttles(state)
 
     assert "throttled_until" not in cleared["reviewer_quota"]
     assert cleared["reviewer_quota"]["consecutive_probe_failures"] == 0
     # The devin adapter's root throttle must still be untouched.
-    assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+    assert cleared["throttled_until"] == root_throttle
 
 
 def test_clear_quota_throttles_records_last_probe_cleared_at() -> None:
@@ -34780,6 +34838,7 @@ def test_supervisor_config_defaults() -> None:
     assert config.supervisor.active_cooldown_seconds == 30
     assert config.supervisor.max_runtime_minutes == 0
     assert config.supervisor.self_deploy_failure_alarm == 3
+    assert config.supervisor.zero_pass_alarm == 3
 
 
 def test_supervisor_config_parses_custom_values(tmp_path: Path) -> None:
@@ -34793,6 +34852,7 @@ supervisor:
   active_cooldown_seconds: 15
   max_runtime_minutes: 60
   self_deploy_failure_alarm: 5
+  zero_pass_alarm: 7
 """
     )
     config = load_config(config_file)
@@ -34801,6 +34861,7 @@ supervisor:
     assert config.supervisor.active_cooldown_seconds == 15
     assert config.supervisor.max_runtime_minutes == 60
     assert config.supervisor.self_deploy_failure_alarm == 5
+    assert config.supervisor.zero_pass_alarm == 7
 
 
 def test_supervisor_config_unknown_key_raises(tmp_path: Path) -> None:
@@ -34850,6 +34911,30 @@ def test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises(tmp_path:
         """
 supervisor:
   self_deploy_failure_alarm: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_supervisor_config_zero_pass_alarm_wrong_type_raises(tmp_path: Path) -> None:
+    """Wrong type for zero_pass_alarm raises ConfigError.
+
+    Issue #855 added this field alongside the existing supervisor int
+    fields; the supervisor section has its own manual int-type-validation
+    tuple in config.py (separate from the generic _build_section machinery),
+    which needed the new key added explicitly -- mirrors
+    test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
+    Locks that in so a future refactor of the tuple can't silently drop
+    validation for this field.
+    """
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  zero_pass_alarm: "not-an-int"
 """
     )
     with pytest.raises(ConfigError, match="must be an int"):

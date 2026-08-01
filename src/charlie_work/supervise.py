@@ -270,6 +270,19 @@ class SelfDeployResult:
     ``venv_repaired`` is True when the orchestrator venv's editable ``.pth``
     was detected pointing outside ``repo_root/src`` and was atomically rewritten
     to the correct path.
+
+    ``deferred`` is True only on the one return path where a pending dependency
+    sync was actually postponed because a fleet worker was live (issue #858).
+    It is *not* derivable from ``ok and not synced``: both the "already up to
+    date" and "code-only update" paths are also ``ok=True, synced=False`` but
+    have nothing pending to sync at all, so treating that predicate as
+    "deferred" made a genuine, resolved pull success indistinguishable from an
+    unresolved deferral -- and made the failure-streak counter refuse to reset
+    after real recovery (caught by
+    ``test_self_deploy_failure_streak_fires_alarm_once_at_threshold``). Same
+    lesson as ``head_changed`` one field up: callers that need to know about
+    a specific event on *this* attempt need a field describing that event,
+    not an inference from the shape of other fields.
     """
 
     ok: bool
@@ -283,6 +296,7 @@ class SelfDeployResult:
     error: str | None = None
     venv_repaired: bool = False
     previewed: bool = False
+    deferred: bool = False
 
     @property
     def alertable(self) -> bool:
@@ -640,16 +654,39 @@ def _record_self_deploy_failure_streak(
 ) -> None:
     """Track consecutive self_deploy failures and escalate at ``threshold`` (item 5).
 
-    Mirrors ``workflow._merge_deferred_stale_base_result``'s alarm pattern: a
-    persisted counter increments on every failure and resets to 0 on success,
-    and a distinct ``self_deploy_alarm`` event fires exactly once -- the pass
-    the counter *reaches* ``threshold``, not on every subsequent pass past it
-    -- so a long-running outage produces one escalation, not one per pass
-    (the digest's own dedup already handles "don't repeat every pass" for the
-    plain ERROR entry; this is a second, coarser signal for "this has now
-    gone on long enough to be a distinct incident"). ``threshold <= 0``
-    disables the alarm entirely, matching ``failed_attempt_alarm``'s "0
-    disables" convention.
+    Three outcomes, not two (issue #858): ``result.deferred`` is a genuine
+    deferral -- a dependency sync was actually pending but postponed because a
+    fleet worker was live -- and carries no information about whether that
+    sync would have succeeded, so it leaves the streak untouched. Any other
+    ``ok`` result (including "already up to date" and "code-only update",
+    both ``ok=True, synced=False`` but with nothing pending to sync at all) is
+    a genuine success and resets the streak to 0. ``not ok`` is a genuine
+    failure and increments it.
+
+    Deliberately *not* keyed on ``ok and not synced``: that predicate cannot
+    tell a real deferral apart from a resolved pull with nothing to sync, so
+    it also refuses to reset the streak after genuine recovery from a run of
+    pull failures -- see ``SelfDeployResult.deferred``'s docstring and
+    ``test_self_deploy_failure_streak_fires_alarm_once_at_threshold``, which
+    caught exactly that regression.
+
+    Before this fix, any ``ok`` result -- including a deferral, which is
+    reported as ``ok=True, synced=False`` precisely because declining to
+    mutate the shared venv while a worker is live is the *correct* choice,
+    not a failure -- reset the counter to 0. That let a permanently failing
+    sync interleaved with occasional deferrals (``fail, fail, defer, fail,
+    fail, defer, ...``) hold the streak at or below ``threshold - 1``
+    forever, silencing the exact alarm this counter exists to raise.
+
+    Mirrors ``workflow._merge_deferred_stale_base_result``'s alarm pattern
+    otherwise: a distinct ``self_deploy_alarm`` event fires exactly once --
+    the pass the counter *reaches* ``threshold``, not on every subsequent
+    pass past it -- so a long-running outage produces one escalation, not
+    one per pass (the digest's own dedup already handles "don't repeat every
+    pass" for the plain ERROR entry; this is a second, coarser signal for
+    "this has now gone on long enough to be a distinct incident").
+    ``threshold <= 0`` disables the alarm entirely, matching
+    ``failed_attempt_alarm``'s "0 disables" convention.
     """
     counter_path = _self_deploy_failure_counter_path(repo_root)
     # Ensure the parent directory exists before state_lock tries to create the
@@ -660,6 +697,11 @@ def _record_self_deploy_failure_streak(
     counter_path.parent.mkdir(parents=True, exist_ok=True)
     with state_lock(counter_path):
         count = _read_failure_streak(counter_path)
+        if result.deferred:
+            # A pending sync was genuinely postponed: no new information about
+            # whether it would have succeeded. Leave the streak exactly as it
+            # is -- do not reset, do not increment.
+            return
         if result.ok:
             if count:
                 _write_failure_streak(counter_path, 0)
@@ -674,6 +716,95 @@ def _record_self_deploy_failure_streak(
                     "consecutive_failures": count,
                     "threshold": threshold,
                     "error": result.error,
+                },
+            )
+
+
+#: Default consecutive-zero-repo-pass-cycle count at which the fleet
+#: supervisor fires a ``supervisor_zero_pass_alarm`` events.db entry (issue
+#: #855, the general shape behind #851). Mirrors
+#: ``DEFAULT_SELF_DEPLOY_FAILURE_ALARM``'s default and "0 disables" convention.
+DEFAULT_ZERO_PASS_ALARM = 3
+
+
+def _zero_pass_streak_counter_path(repo_root: Path) -> Path:
+    """Return the consecutive-zero-repo-pass-cycle counter sidecar path for ``repo_root``."""
+    return layout.zero_pass_streak_state_path(layout.default_state_root(repo_root))
+
+
+def _read_zero_pass_streak(path: Path) -> int:
+    """Read the persisted consecutive-zero-repo-pass-cycle count, defaulting to 0 on any error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    count = data.get("consecutive_zero_pass_cycles", 0)
+    return count if isinstance(count, int) else 0
+
+
+def _write_zero_pass_streak(path: Path, count: int) -> None:
+    """Persist the consecutive-zero-repo-pass-cycle count atomically (temp-file + replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"consecutive_zero_pass_cycles": count}, indent=2) + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+
+
+def record_zero_pass_streak(
+    repo_root: Path,
+    *,
+    repo_passes: int,
+    repos_configured: bool,
+    threshold: int = DEFAULT_ZERO_PASS_ALARM,
+) -> None:
+    """Track consecutive zero-repo-pass fleet-supervisor cycles; escalate at ``threshold``.
+
+    Mirrors :func:`_record_self_deploy_failure_streak` (issue #855, the
+    general shape behind #851): a persisted counter increments on every
+    cycle that completed with ``repo_passes == 0`` and resets to 0 on any
+    cycle with ``repo_passes > 0``. A distinct ``supervisor_zero_pass_alarm``
+    event fires exactly once -- the cycle the counter *reaches* ``threshold``,
+    not on every subsequent cycle past it -- so a long-running outage (the
+    #851 shape: every watchdog restart exits before ``fleet_loop`` ever runs,
+    exit code 0 every time) produces one escalation, not one per cycle.
+    ``threshold <= 0`` disables the alarm entirely, matching
+    ``self_deploy_failure_alarm``'s "0 disables" convention.
+
+    ``repos_configured`` must be computed by the caller from the fleet
+    registry, independent of whether this cycle actually reached
+    ``fleet_loop`` -- the #851 exit shape this alarm targets breaks out of
+    the supervisor loop before ``fleet_loop`` is ever called, so
+    ``repo_passes`` alone cannot distinguish "no repos configured" from "repos
+    configured but the loop never got to them". When ``repos_configured`` is
+    False, this function is a complete no-op: it must not move the counter in
+    either direction, so a fleet with zero configured repos never fires this
+    alarm regardless of how long it runs (acceptance criterion 4).
+    """
+    if not repos_configured:
+        return
+    counter_path = _zero_pass_streak_counter_path(repo_root)
+    # Ensure the parent directory exists before state_lock tries to create the
+    # sibling .lock file (advisory_file_lock touches it directly) -- mirrors
+    # _record_self_deploy_failure_streak. Without this, a cold state dir (no
+    # prior events.db/state.json write yet this process) raises here, which
+    # would propagate out of run_fleet_supervise's post-loop bookkeeping.
+    counter_path.parent.mkdir(parents=True, exist_ok=True)
+    with state_lock(counter_path):
+        count = _read_zero_pass_streak(counter_path)
+        if repo_passes > 0:
+            if count:
+                _write_zero_pass_streak(counter_path, 0)
+            return
+        count += 1
+        _write_zero_pass_streak(counter_path, count)
+        if threshold > 0 and count == threshold:
+            log_event(
+                _self_deploy_state_path(repo_root),
+                "supervisor_zero_pass_alarm",
+                {
+                    "consecutive_zero_pass_cycles": count,
+                    "threshold": threshold,
                 },
             )
 
@@ -875,6 +1006,7 @@ def _self_deploy_attempt(
                 to_sha=to_sha,
                 venv_repaired=venv_repaired,
                 message=f"sync deferred: {live_count} {runner_word} active",
+                deferred=True,
             )
 
         # Persist marker before attempting sync so a crash between the pull and
