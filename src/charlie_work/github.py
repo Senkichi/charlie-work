@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from .config import RuntimeConfig
@@ -165,7 +165,7 @@ class GitHubRunResult:
     error: str | None = None
 
 
-class _MergedPRSearchResult(list):
+class MergedPRSearchResult(list):
     """List-like result from ``merged_prs_for_issue`` with an ``ok`` flag.
 
     Behaves like a normal list so existing list-consuming callers keep working,
@@ -176,6 +176,9 @@ class _MergedPRSearchResult(list):
     def __init__(self, items: list[Any], ok: bool = True) -> None:
         super().__init__(items)
         self.ok = ok
+
+
+_MergedPRSearchResult = MergedPRSearchResult
 
 
 # Matches the job-id segment of a GitHub Actions check link, e.g.
@@ -624,7 +627,7 @@ class GitHub:
         self,
         issue_number: int,
         branch_prefix: str,
-    ) -> _MergedPRSearchResult:
+    ) -> MergedPRSearchResult:
         """Return merged PRs that hijack-safely bind to ``issue_number``.
 
         Uses ``gh pr list --state merged --search`` so PRs merged long ago
@@ -662,7 +665,7 @@ class GitHub:
                     issue_number,
                     result.error,
                 )
-                return _MergedPRSearchResult([], ok=False)
+                return MergedPRSearchResult([], ok=False)
             items = result.value if isinstance(result.value, list) else []
         else:
             items = result if isinstance(result, list) else []
@@ -678,7 +681,7 @@ class GitHub:
             )
             if bound == issue_number:
                 matched.append(pr)
-        return _MergedPRSearchResult(matched, ok=True)
+        return MergedPRSearchResult(matched, ok=True)
 
     def pr_view(self, number: int, *, fields: str = PR_VIEW_FIELDS) -> dict[str, Any]:
         """Fetch a PR via ``gh pr view --json <fields>``.
@@ -1292,6 +1295,7 @@ class GitHub:
         return name_with_owner
 
 
+@runtime_checkable
 class GitHubLike(Protocol):
     """Structural interface for the GitHub surface the orchestrator calls.
 
@@ -1318,9 +1322,14 @@ class GitHubLike(Protocol):
 
     def merged_pr_list(self) -> list[dict[str, Any]]: ...
 
-    def merged_prs_for_issue(
-        self, issue_number: int, branch_prefix: str
-    ) -> list[dict[str, Any]]: ...
+    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str) -> MergedPRSearchResult:
+        """Return merged PRs binding to ``issue_number``.
+
+        The returned object is list-like and carries an ``ok`` flag. Callers
+        must check ``ok`` before treating an empty result as "no merged PRs";
+        ``ok=False`` means the search itself failed (rate limit, etc.).
+        """
+        ...
 
     def pr_view(self, number: int, *, fields: str = ...) -> dict[str, Any]: ...
 
