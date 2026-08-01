@@ -7,9 +7,15 @@ stdlib-only; see the notes below before "fixing" one.
 
 ## Files
 
-- **`fleet-pass.ps1`** — launches `charlie fleet supervise` (the long-running
-  daemon), re-invoked every 5 minutes by the `charlie-fleet-pass` scheduled
-  task as a crash-restart watchdog. Repo root is derived from the script's
+- **`fleet-pass.ps1`** — launches `python -m charlie_work fleet supervise-loop`,
+  which runs the long-running `fleet supervise` daemon as a child and relaunches
+  it immediately when it exits to pick up newly self-deployed code (#862),
+  bounded by `--max-relaunches`. Re-invoked every 5 minutes by the
+  `charlie-fleet-pass` scheduled task as a crash-restart watchdog; hitting the
+  relaunch bound makes the wrapper *exit*, which is what hands restart authority
+  back to that 5-minute trigger. Entry is via `python -m`, never the `charlie`
+  console script — see #854 and the inline comment. Repo root is derived from the
+  script's
   own location (`$PSScriptRoot`); the log directory
   (`.var\charlie-work\logs`) is a literal that mirrors the default
   `runtime.state_dir` (`config.RuntimeConfig`) and must be updated by hand if
