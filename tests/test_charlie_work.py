@@ -7588,11 +7588,16 @@ def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
 
 
 def _dispatch_reviews_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, enabled: bool = True
 ) -> OrchestratorApp:
-    """Build an OrchestratorApp with review_dispatch enabled and an empty state file."""
+    """Build an OrchestratorApp with review_dispatch enabled (by default) and an empty state file.
+
+    Issue #868: ``enabled`` is overridable so tests can exercise
+    ``dispatch_reviews()``'s disabled-gate path with the same PR/state seeding
+    helpers used by the enabled-path tests.
+    """
     config = OrchestratorConfig(
-        review_dispatch=ReviewDispatchConfig(enabled=True),
+        review_dispatch=ReviewDispatchConfig(enabled=enabled),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     (paths.root).mkdir(parents=True, exist_ok=True)
@@ -8076,6 +8081,125 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
     state = load_state(app.paths.state_file)
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
     assert state["prs"]["100"]["reviewer_pid"] == 12345
+
+
+def test_dispatch_reviews_reaps_stalled_claim_when_disabled(monkeypatch, tmp_path: Path) -> None:
+    """Issue #868: the reaper sweeps must run even when review_dispatch is off.
+
+    Before this fix, the four reaper sweeps sat BELOW the ``enabled`` early
+    return inside ``dispatch_reviews()`` and were unreachable whenever
+    dispatch was disabled -- a dead reviewer's claim (and any other stale
+    claim) was never freed while the flag was off, so it stayed stuck even
+    after the flag was re-enabled (the reap is what makes it re-dispatchable).
+    This seeds the exact same dead-reviewer claim as
+    ``test_dispatch_reviews_redispatches_stalled_reviews`` above, but with
+    dispatch disabled: the claim must still be reaped to
+    ``review_dispatch_failed`` even though nothing gets (re)launched, and the
+    disabled no-op result must carry an explicit ``disabled`` marker (issue
+    #868 part 3) instead of being a bare ``ok=True`` indistinguishable from
+    real progress.
+    """
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, enabled=False)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # Seed a stale reviewer sidecar + state claim, identical to the
+    # redispatch test above.
+    reviews_dir = app._layout.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 99999,
+        "started_at": old_started,
+        "log_path": str(tmp_path / "log.log"),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(app.paths.state_file, state)
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    def fake_is_worker_alive(record: ClaudeWorkerRecord, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", fake_is_worker_alive)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data.get("disabled") is True
+    assert result.data["launched_count"] == 0
+    assert launched == []  # dispatch stays off -- no relaunch, only the reap
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_failed"
+
+
+def test_review_queue_lists_pending_pr_regardless_of_dispatch_enabled(tmp_path: Path) -> None:
+    """Issue #868 AC4 (pin, not a new behavior): review_queue() must not
+    filter on review_dispatch.enabled, so a PR awaiting review is queued the
+    moment the flag flips back on -- nothing about candidate selection
+    itself depends on the flag; only dispatch_reviews()'s own launch gate
+    does.
+    """
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, enabled=False)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert [c["pr"] for c in result.data["queue"]] == [100]
 
 
 def test_dispatch_reviews_defers_when_reviewer_quota_exhausted(tmp_path: Path) -> None:
@@ -11999,7 +12123,7 @@ def test_review_preserves_recorded_decision_in_state(tmp_path: Path) -> None:
     from charlie_work.state import load_state as _load
     from charlie_work.state import save_state as _save
 
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
     state = _load(paths.state_file)
@@ -13221,7 +13345,7 @@ def test_review_label_transition_failure_persists_packet(tmp_path: Path) -> None
     leave the review packet persisted in state and report structured label_error."""
     from charlie_work.labels import TransitionOutcome
 
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
     reviewing_label = config.labels.reviewing
 
     class LabelFailReviewGitHub(FakeGitHub):
@@ -16930,7 +17054,7 @@ def test_merge_ready_head_moved_transition_failure_recorded(tmp_path: Path) -> N
     """Issue #135: PARTIAL_FAILURE during merge_ready head-moved transition must be recorded."""
     from charlie_work.labels import TransitionOutcome
 
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
 
     class LabelFailGitHub(FakeGitHub):
         def add_issue_label(self, number: int, label: str) -> bool:
@@ -17059,7 +17183,9 @@ def test_merge_ready_changed_patch_id_resets_to_pending(tmp_path: Path) -> None:
     """Issue #375: if the cumulative diff changes, the approval is voided."""
     from charlie_work.janitor import _calculate_patch_id
 
-    config = _required_checks_config()
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -19325,6 +19451,47 @@ def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> No
     assert result == {100, 300, 400}, f"Expected {{100, 300, 400}}, got {result}"
 
 
+def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #870: are_issues_open() was a fully serial, uncached, one
+    `gh issue view` per number loop. Every distinct blocker issue number must
+    now cost exactly one `gh issue view` call per status()/orchestrator pass,
+    no matter how many separate callers ask about it or how much the
+    requested number lists overlap -- mirroring the existing per-pass cache
+    contract already proven for branch_protection()
+    (test_branch_protection_caches_per_pass).
+    """
+    calls: list[int] = []
+
+    def fake_run(command, **kwargs):
+        # command: ["gh", "issue", "view", "<number>", "--json", ...]
+        number = int(command[3])
+        calls.append(number)
+        payload = json.dumps({"number": number, "state": "OPEN" if number != 200 else "CLOSED"})
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    # Two overlapping requests, as _filter_blocked_issues and _summarize_issue
+    # would each independently make for two issues sharing a blocker.
+    first = gh.are_issues_open([100, 200])
+    second = gh.are_issues_open([100, 200, 300])
+
+    assert first == {100}
+    assert second == {100, 300}
+    # 100 and 200 must not be re-fetched by the second, overlapping call;
+    # only the genuinely new number (300) costs a live call.
+    assert sorted(calls) == [100, 200, 300]
+
+    # invalidate_list_cache() (called once per orchestrator pass) must force
+    # a fresh read on the next call -- never leaking across passes.
+    gh.invalidate_list_cache()
+    gh.are_issues_open([100])
+    assert calls.count(100) == 2
+
+
 # --- Issue #18: idempotence of ship-it and loop --------------------------------
 
 
@@ -20072,7 +20239,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
 
 
 def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
-    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    config = OrchestratorConfig(
+        auto_merge=_approved_automerge(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -20092,6 +20261,40 @@ def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> N
     assert (123, "agent:reviewing") in fake_gh.labels_added
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "reviewing"
     assert fake_gh.merged_merge_flags == []
+
+
+def test_merge_ready_head_moved_does_not_stamp_reviewing_when_dispatch_disabled(
+    tmp_path: Path,
+) -> None:
+    """Issue #868: merge_ready()'s head-moved re-review branch is a second,
+    independent call site that stamps ``reviewing``/``agent:reviewing`` --
+    separate from review()'s own packet-generation path. It must be gated
+    the same way: byte-identical scenario to
+    test_merge_ready_refuses_when_head_moved_after_approval above, minus the
+    enabled flag. The head_moved bookkeeping (state field + event) must
+    still happen -- only the reviewing state/label stamp is gated, since
+    nothing else keys off head_moved together with status=="reviewing".
+    """
+    config = OrchestratorConfig(auto_merge=_approved_automerge())  # review_dispatch defaults False
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is False
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert result.data["head_moved"] is True
+    assert fake_gh.merged == []
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] != "reviewing"
+    assert state["prs"]["456"]["head_moved"] is True
 
 
 def test_merge_ready_escalated_head_moved_makes_no_label_or_status_mutations(
@@ -20303,7 +20506,9 @@ def test_merge_ready_legacy_approved_decision_without_head_sha_is_refused(
 
 
 def test_loop_re_reviews_when_head_moved_after_approval(tmp_path: Path) -> None:
-    config = _required_checks_config()
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -27812,7 +28017,9 @@ def test_dispatch_rework_routes_to_review_instead_of_relaunch_when_head_moved(
     content-change case and route the issue to the review lane instead of
     launching a redundant worker (acceptance criterion 1).
     """
-    config = _dispatch_rework_config()
+    config = dataclasses.replace(
+        _dispatch_rework_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -28204,7 +28411,7 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
 
 def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path: Path) -> None:
     """Review_started transition should fire when head has advanced after request_changes."""
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -28441,7 +28648,7 @@ def test_review_refreshes_janitor_diagnostics_while_issue_escalated(tmp_path: Pa
 
 def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:
     """Review_started transition should fire when there's no prior verdict."""
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -28470,6 +28677,48 @@ def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:
     assert result.ok is True
     assert (123, "agent:pr-open") in fake_gh.labels_added
     assert (123, "agent:reviewing") in fake_gh.labels_added
+
+
+def test_review_started_does_not_fire_when_review_dispatch_disabled(tmp_path: Path) -> None:
+    """Issue #868: review() must not stamp reviewing/agent:reviewing when
+    review_dispatch is disabled.
+
+    Nothing services the "reviewing" state when dispatch is off --
+    dispatch_reviews()'s launch+reap machinery is gated off by the same
+    flag -- so stamping it here just strands the PR under a label its own
+    reaper never runs to clear. Byte-identical scenario to
+    test_review_started_fires_when_no_recorded_verdict above, minus the
+    enabled flag.
+    """
+    config = OrchestratorConfig()  # review_dispatch.enabled defaults to False
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps(
+            {
+                "number": 456,
+                "title": "PR for issue 123",
+                "url": "https://example.test/pr/456",
+                "headRefOid": "sha-abc123",
+                "isCrossRepository": False,
+                "headRefName": "agent/issue-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"].get("status") != "reviewing"
+    # The packet itself is still generated -- only the state/label stamp is gated.
+    assert state["prs"]["456"]["prompt_path"] == result.data["prompt_path"]
 
 
 def test_dispatch_defers_when_provider_throttled(tmp_path: Path) -> None:
@@ -30447,6 +30696,52 @@ def test_github_dependencies_successful_parse(tmp_path: Path) -> None:
     assert result == [100, 200]
 
 
+def test_get_github_issue_dependencies_caches_successful_result_per_pass(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #870: get_github_issue_dependencies() made one live `gh api`
+    call per invocation, with zero caching -- called once per ready issue
+    from _get_open_blockers, and _get_open_blockers itself is called once per
+    issue from *two* separate places (_filter_blocked_issues and
+    _summarize_issue), so every ready issue's dependencies were fetched
+    twice per status() call. A successful resolution for a given issue
+    number must now cost exactly one live call per pass.
+
+    Uses the real GitHub (not FakeGitHub, whose `run()` has its own
+    dependencies_response stand-in and doesn't exercise the production
+    _list_cache path) with subprocess.run mocked.
+    """
+    from charlie_work.github import get_github_issue_dependencies
+
+    calls: list[str] = []
+
+    def fake_run(command, **kwargs):
+        # command: ["gh", "api", "repos/{owner}/{repo}/issues/<N>/dependencies/blocked_by"]
+        calls.append(command[2])
+        payload = json.dumps([{"number": 200}])
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    first = get_github_issue_dependencies(gh, 100)
+    second = get_github_issue_dependencies(gh, 100)
+
+    assert first == [200]
+    assert second == [200]
+    assert len(calls) == 1  # second call is a pure cache hit, no live fetch
+
+    # A different issue number is a distinct cache key -- costs a fresh read.
+    get_github_issue_dependencies(gh, 101)
+    assert len(calls) == 2
+
+    # invalidate_list_cache() (called once per orchestrator pass) must force
+    # a fresh read on the next call for the same issue number.
+    gh.invalidate_list_cache()
+    get_github_issue_dependencies(gh, 100)
+    assert len(calls) == 3
+
+
 def test_cancel_superseded_runs_no_workflow_name(tmp_path: Path) -> None:
     """Test that cancel_superseded_runs returns error when workflow_name is empty."""
     from charlie_work.github import cancel_superseded_runs
@@ -30833,6 +31128,166 @@ def test_status_includes_blocked_section(tmp_path: Path) -> None:
 
     # available_issue_count should exclude blocked issues
     assert result.data["available_issue_count"] == 0
+
+
+def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #870: `fleet status --json` measured at 90s-184s wall clock,
+    almost entirely (169s of 184s in the diagnosed baseline) spent in serial,
+    uncached `gh` subprocess calls made by _get_open_blockers -- once per
+    ready issue from _filter_blocked_issues, and AGAIN once per ready issue
+    from _summarize_issue. Two ready issues sharing a declared blocker (the
+    diagnosed case: issues #887/#888 both blocked by #886) meant the shared
+    blocker's `gh issue view` was fetched 4 times, and each issue's own
+    dependencies-API call was fetched twice.
+
+    This uses a real GitHub (not the hand-rolled FakeGitHub used elsewhere in
+    this file, which has its own non-caching are_issues_open/dependencies
+    stand-ins and would not exercise the production caching path at all) with
+    subprocess.run mocked, so every `gh` invocation status() actually makes is
+    visible and countable.
+
+    Two ready issues (887, 888) both declare the same open blocker (886) via
+    GitHub-native dependencies. Before the fix: 2 dependency-API calls x2
+    (once per _filter_blocked_issues, once per _summarize_issue) = 4, plus
+    886's issue-view fetched once per calling issue x2 duplicate passes = 4.
+    After the fix: each unique resource is fetched exactly once per status()
+    call, regardless of how many internal consumers ask for it.
+    """
+    calls: list[list[str]] = []
+    # Thread name recorded alongside each dependencies-API call, so the test
+    # can assert the fan-out actually ran concurrently -- not just that the
+    # call count was deduped. A regression that replaced the ThreadPoolExecutor
+    # in _prefetch_blocker_data with a plain serial loop would still pass every
+    # call-count assertion below; this is what catches that specifically.
+    #
+    # A 2-party barrier forces both dependency-API calls to be in flight at
+    # once: with the mocked (near-instant) gh call, ThreadPoolExecutor's lazy
+    # thread creation would otherwise let the first task finish and its
+    # thread go idle before the second task is even submitted, so both would
+    # land on the same reused thread despite running through a real
+    # ThreadPoolExecutor -- a false negative, not evidence of a serial loop.
+    # Blocking each call on the barrier until both have arrived guarantees a
+    # second thread must be spawned to service the second call. Bounded with
+    # a timeout so a future regression (e.g. back to one call) fails fast
+    # with BrokenBarrierError instead of hanging the test.
+    dependency_call_threads: list[str] = []
+    dependency_call_barrier = threading.Barrier(2, timeout=5)
+
+    def make_issue(number: int) -> dict[str, Any]:
+        return {
+            "number": number,
+            "title": f"Issue {number}",
+            "url": f"https://example.test/issues/{number}",
+            "body": "",
+            "labels": [{"name": "automated-ready"}],
+            "author": {"login": "tester"},
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "state": "OPEN",
+        }
+
+    ready_issues = [make_issue(887), make_issue(888)]
+    # Both 887 and 888 declare 886 as a GitHub-native dependency.
+    dependencies_by_issue = {887: [886], 888: [886]}
+
+    def fake_run(command, **kwargs):
+        args = command[1:]  # drop leading "gh"
+        if args and args[-2:] == ["--json", "nonexistent"]:
+            # OrchestratorApp.__init__'s validate_field_lists() startup probe
+            # (github.py: GitHub.validate_field_lists) -- not part of the
+            # behavior under test, so satisfy it generically by unioning
+            # every field-list constant it checks, rather than hand-picking
+            # (and inevitably under-covering) a subset here.
+            all_field_list_constants = [
+                "ISSUE_LIST_FIELDS",
+                "ISSUE_VIEW_FIELDS",
+                "PR_LIST_FIELDS",
+                "MERGED_PR_LIST_FIELDS",
+                "PR_VIEW_FIELDS",
+                "PR_CHECKS_FIELDS",
+                "LABEL_LIST_FIELDS",
+                "RECONCILE_PR_FIELDS",
+                "RECONCILE_ISSUE_FIELDS",
+                "RUN_LIST_FIELDS",
+            ]
+            available_fields = sorted(
+                {
+                    field
+                    for name in all_field_list_constants
+                    for field in getattr(github_module, name).split(",")
+                }
+            )
+            stderr = (
+                'Unknown JSON field: "nonexistent"\nAvailable fields:\n  '
+                + "\n  ".join(available_fields)
+                + "\n"
+            )
+            return subprocess.CompletedProcess(
+                args=command, returncode=1, stdout="", stderr=stderr
+            )
+
+        calls.append(command)
+        if args[:2] == ["issue", "list"]:
+            payload = json.dumps(ready_issues)
+        elif args[:2] == ["pr", "list"]:
+            payload = json.dumps([])
+        elif args[:2] == ["issue", "view"]:
+            number = int(args[2])
+            payload = json.dumps({"number": number, "state": "OPEN"})
+        elif args[0] == "api" and "dependencies/blocked_by" in args[1]:
+            dependency_call_threads.append(threading.current_thread().name)
+            dependency_call_barrier.wait()
+            number = int(args[1].split("/issues/")[1].split("/")[0])
+            deps = dependencies_by_issue.get(number, [])
+            payload = json.dumps([{"number": d} for d in deps])
+        else:
+            raise AssertionError(f"Unexpected gh command in status(): {command}")
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = github_module.GitHub(repo_root=tmp_path)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.status()
+
+    assert result.ok is True
+    # Both issues correctly identified as blocked by the still-open #886 --
+    # the fix must not change the *answer*, only how many times it's fetched.
+    assert result.data["available_issue_count"] == 0
+    blocked_by_issue = {b["issue"]: b["blockers"] for b in result.data["blocked"]}
+    assert blocked_by_issue == {887: [886], 888: [886]}
+    summaries = {s["number"]: s["dependencies"] for s in result.data["issues"]}
+    assert summaries[887] == {"declared": [886], "open": [886]}
+    assert summaries[888] == {"declared": [886], "open": [886]}
+
+    dependency_calls = [c for c in calls if c[1] == "api" and "dependencies/blocked_by" in c[2]]
+    issue_view_calls = [c for c in calls if c[1:3] == ["issue", "view"]]
+
+    # One dependencies-API call per ready issue (887, 888) -- not one per
+    # (issue, consumer) pair. Before the fix this was 4 (2 issues x 2
+    # consumers: _filter_blocked_issues and _summarize_issue).
+    assert len(dependency_calls) == 2
+    assert {int(c[2].split("/issues/")[1].split("/")[0]) for c in dependency_calls} == {887, 888}
+
+    # Exactly one issue-view call for the shared blocker #886 -- not one per
+    # (blocker, calling issue) pair. Before the fix this was 4 (886 looked up
+    # once per calling issue x 2 duplicate passes).
+    assert len(issue_view_calls) == 1
+    assert issue_view_calls[0][3] == "886"
+
+    # The dedup assertions above would still pass if _prefetch_blocker_data's
+    # ThreadPoolExecutor were replaced by a plain serial loop -- call *counts*
+    # don't distinguish parallel from sequential. The 74% wall-clock reduction
+    # (184.39s -> 47.9s, issue #870) came from the fan-out, not just the
+    # caching, so assert the two dependency-API calls actually ran on
+    # different threads.
+    assert len(dependency_call_threads) == 2
+    assert len(set(dependency_call_threads)) == 2
 
 
 def test_status_includes_stalled_section(tmp_path: Path) -> None:

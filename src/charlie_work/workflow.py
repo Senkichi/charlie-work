@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -786,6 +787,12 @@ def parse_issue_numbers(only_issues: str) -> list[int]:
 # must not consume the same budget as fresh candidates; capping them at one per
 # pass prevents one stuck recovery candidate from starving the queue (issue #506).
 _MAX_RECOVERY_RETRY_PER_PASS = 1
+
+# Bound on concurrent `gh` subprocesses spawned by _prefetch_blocker_data() to
+# warm the dependency cache across every ready issue. I/O-bound fan-out width,
+# not a CPU budget; kept modest to stay clear of GitHub's secondary rate
+# limits. See issue #870.
+_MAX_PREFETCH_WORKERS = 8
 
 
 def _is_recovery_candidate(
@@ -5776,6 +5783,12 @@ class OrchestratorApp:
             issue for issue in issues if self._is_dispatchable(issue, operator_claimed)
         ]
 
+        # Warm the blocker/dependency cache for every ready issue concurrently
+        # before the serial per-issue lookups below run. See
+        # _prefetch_blocker_data's docstring and issue #870: this is what
+        # turns O(N) serial `gh` calls into one parallel batch.
+        self._prefetch_blocker_data(issues)
+
         # Check for blocked issues (dependency gate)
         truly_available, blocked_issues, _open_blockers_by_issue = self._filter_blocked_issues(
             available_issues
@@ -8431,6 +8444,14 @@ class OrchestratorApp:
                 prior_reviewed_head_sha is None or prior_reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
+        # Issue #868: review_dispatch.enabled gates whether landing this PR in
+        # "reviewing" is safe. Disabled means dispatch_reviews()'s launch+reap
+        # machinery never services this state (its own internal gate skips
+        # it too), so stamping "reviewing"/agent:reviewing here would strand
+        # the PR under a label nothing runs to clear. The packet itself is
+        # still written either way — only the state/label transition is
+        # gated, so a human can still read the prompt manually.
+        dispatch_disabled = not self.config.review_dispatch.enabled
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Merge-update, never replace: wholesale assignment here used to erase
@@ -8443,7 +8464,7 @@ class OrchestratorApp:
                 "issue_number": issue_number,
                 "prompt_path": str(prompt_path),
                 "decision_path": str(decision_path),
-                "status": "reviewing",
+                **({} if dispatch_disabled else {"status": "reviewing"}),
                 "janitor_ok": True,
                 "janitor_failures": [],
                 "janitor_warnings": list(merged_warnings),
@@ -8518,7 +8539,7 @@ class OrchestratorApp:
                 ):
                     should_skip_transition = True
 
-            if not should_skip_transition:
+            if not should_skip_transition and not dispatch_disabled:
                 result = transition(self.gh, self.config.labels, issue_number, "review_started")
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -9160,18 +9181,6 @@ class OrchestratorApp:
         byte-identical; tests can freeze it and assert exact equality instead
         of a wall-clock-tolerance proximity check.
         """
-        if not self.config.review_dispatch.enabled:
-            return CommandResult(
-                True,
-                "review dispatch disabled",
-                {
-                    "selected_count": 0,
-                    "attempted_count": 0,
-                    "failed_count": 0,
-                    "launched_count": 0,
-                },
-            )
-
         resolved_now = now if now is not None else datetime.now(UTC)
         reviews_dir = self._layout.reviews_dir
 
@@ -9181,6 +9190,16 @@ class OrchestratorApp:
         # returns early and leaves dead reviewer claims stuck — blocking
         # re-dispatch after the quota resets. In dry-run mode we skip
         # these sweeps to stay read-only.
+        #
+        # Issue #868: these sweeps must ALSO run ahead of the
+        # ``review_dispatch.enabled`` gate below, for the same reason —
+        # disabling dispatch must not disable the cleanup a *previously*
+        # dispatched (or previously stamped-reviewing) claim still needs. A
+        # dead reviewer's claim that goes stale while the flag happens to be
+        # off must still be freed, or it stays stuck even after the flag is
+        # re-enabled (the reap is what makes it re-dispatchable). Before this
+        # fix these sweeps sat below the ``enabled`` early return and were
+        # unreachable whenever dispatch was disabled.
         verdict_result = {"recorded": [], "missed": []}
         if not self.dry_run:
             verdict_result = self._reap_review_verdicts(reviews_dir)
@@ -9195,14 +9214,39 @@ class OrchestratorApp:
             _reap_orphaned_review_checkouts(
                 self.gh, self.repo_root, reviews_dir, self.paths.state_file, self.config
             )
+        recorded_verdicts = verdict_result.get("recorded", [])
+        missed_verdicts = verdict_result.get("missed", [])
+
+        if not self.config.review_dispatch.enabled:
+            # Issue #868 part 3: this is a real no-op for LAUNCHING new
+            # reviewers, but the reaper sweeps above may still have done real
+            # work (freeing a stale claim). Carry that through explicitly
+            # instead of returning a bare ``ok=True`` that reads identically
+            # to "nothing happened at all" — and mark ``disabled`` so a
+            # caller doesn't have to string-match the message to tell this
+            # apart from a real dispatch pass.
+            return CommandResult(
+                True,
+                "review dispatch disabled",
+                {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "disabled": True,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
+                },
+            )
 
         # Clear the reviewer quota if any verdicts were recorded from dead
         # reviewers. This is the only proof the quota window is actually open:
         # a process that merely *started* can still die seconds later from an
         # asynchronous session-limit kill. Run before the quota gate so a
         # successful reap clears the throttle and lets the pass proceed.
-        recorded_verdicts = verdict_result.get("recorded", [])
-        missed_verdicts = verdict_result.get("missed", [])
+        # (recorded_verdicts/missed_verdicts are computed above, ahead of the
+        # disabled-gate return, so issue #868's disabled payload can report
+        # them too.)
         if not self.dry_run and recorded_verdicts:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -11112,8 +11156,19 @@ class OrchestratorApp:
                     else None,
                 )
                 escalated = pr_escalated or issue_escalated
+                # Issue #868: a second, independent call site that stamps
+                # "reviewing"/agent:reviewing — separate from review()'s own
+                # packet-generation path, which gates the same way. Disabled
+                # dispatch means nothing services "reviewing" here either, so
+                # the state/label stamp is gated on the same flag. The
+                # head_moved bookkeeping below (state field + event) stays
+                # unconditional: it's read only by this function's own next
+                # pass (via _check_carry_forward/reviewed_head_sha
+                # comparisons), never jointly with status=="reviewing", so
+                # gating just the reviewing stamp doesn't orphan it.
+                dispatch_disabled = not self.config.review_dispatch.enabled
                 if not escalated:
-                    if issue_number is not None:
+                    if issue_number is not None and not dispatch_disabled:
                         result = transition(
                             self.gh, self.config.labels, issue_number, "review_started"
                         )
@@ -11130,7 +11185,7 @@ class OrchestratorApp:
                             **state["prs"].get(str(pr_number), {}),
                             "number": pr_number,
                             "issue_number": issue_number,
-                            "status": "reviewing",
+                            **({} if dispatch_disabled else {"status": "reviewing"}),
                             "head_moved": True,
                             "reviewed_head_sha": reviewed_head_sha,
                             "live_head_sha": live_head_sha,
@@ -16621,6 +16676,71 @@ class OrchestratorApp:
             state_path=self.paths.state_file,
         )
         return "dispatch_failed", None, state
+
+    def _prefetch_blocker_data(self, issues: list[dict[str, Any]]) -> None:
+        """Warm the GitHub client's per-pass cache for blocker lookups.
+
+        ``status()`` runs ``_get_open_blockers`` once per ready issue via both
+        ``_filter_blocked_issues`` and ``_summarize_issue`` -- and until issue
+        #870, each call issued a live, uncached `gh api .../dependencies/
+        blocked_by` request plus one live `gh issue view` per declared
+        blocker, entirely serially. Measured on the live fleet registry: 62
+        ready issues drove 169s of a 184s `fleet status --json` run through
+        this exact path, including confirmed duplicate fetches (issues #887/
+        #888 each fetched twice; their shared blocker #886 fetched 4 times).
+
+        This method does the equivalent fetching *once* per unique resource,
+        concurrently, before any of the unmodified per-issue code below runs:
+
+          1. Fetch each ready issue's GitHub-native dependencies in parallel
+             (one `gh api` call per unique issue number -- no duplicates,
+             since ``issues`` already contains each ready issue exactly once).
+          2. Union those dependencies with each issue's body-declared
+             blockers (pure Python, no I/O) into one deduplicated set of
+             blocker issue numbers.
+          3. Resolve open/closed state for that whole set in a single
+             ``are_issues_open`` call, which itself fans out cache misses
+             concurrently (see github.py).
+
+        Both fetch layers cache into ``self.gh._list_cache``, so every
+        subsequent call to ``_get_open_blockers`` -- unchanged, still called
+        once per issue from two separate call sites -- resolves entirely
+        from the warm cache with no further network calls. Structuring it
+        this way (fetch each unique resource exactly once, then let the
+        existing serial consumers read a warm cache) avoids relying on a
+        cache race between concurrent callers to naturally dedupe: nothing
+        here fetches the same issue number from two threads at once.
+
+        Must be called once per ``status()`` invocation, before the first
+        call to ``_get_open_blockers`` (directly or via
+        ``_filter_blocked_issues`` / ``_summarize_issue``). Harmless to skip
+        (callers just fall back to the prior, slower, uncached behavior) but
+        never harmful to call twice -- the second call is a no-op cache hit.
+        """
+        issue_numbers = [int(issue["number"]) for issue in issues]
+        if not issue_numbers:
+            return
+
+        max_workers = min(_MAX_PREFETCH_WORKERS, len(issue_numbers))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            deps_by_number = dict(
+                zip(
+                    issue_numbers,
+                    pool.map(
+                        lambda number: get_github_issue_dependencies(self.gh, number),
+                        issue_numbers,
+                    ),
+                )
+            )
+
+        all_blockers: set[int] = set()
+        for issue in issues:
+            issue_number = int(issue["number"])
+            all_blockers.update(parse_blockers(issue.get("body", "")))
+            all_blockers.update(deps_by_number.get(issue_number, []))
+
+        if all_blockers:
+            self.gh.are_issues_open(sorted(all_blockers))
 
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
         """Check if an issue has any open blocker issues.
