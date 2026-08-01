@@ -251,6 +251,35 @@ jobs:
           if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
             throw "ci_runners checkout at $dest has no pyproject.toml"
           }
+      - name: Lock currency gate (issue 889)
+        # `uv sync --frozen` below consumes uv.lock as-is and deliberately
+        # SKIPS the "is this lock still current with pyproject.toml?"
+        # assertion. That skip is the hole this closes.
+        #
+        # uv.lock carries a [package.metadata.requires-dev] snapshot of
+        # ../ci_runners' dev dependency-group, because ci-fleet is an
+        # editable path dependency. A change to that group in the sibling
+        # repo silently staleness the lock committed here. The drift is
+        # metadata-only -- no [[package]] entry moves, the resolved
+        # dependency set is unchanged, the build cannot break -- which is
+        # precisely why nothing caught it until the regenerated line nearly
+        # rode into an unrelated PR as an unexplained diff hunk.
+        #
+        # Deliberately a step of the existing "Lint" job, and deliberately
+        # NOT a `--frozen` -> `--locked` swap on the step below:
+        #   * A new job name would need matching edits to required_checks in
+        #     BOTH .aviator/config.yml and the deployed
+        #     orchestrator.config.yaml. Same reasoning as the
+        #     closing-keyword gate: a step changes no check names, so no
+        #     downstream consumer has to learn about it.
+        #   * Kept separate from `uv sync` so "lock is stale" and "install
+        #     failed" cannot collapse into one exit code -- exactly the
+        #     ambiguity #888 and #891 were spent pulling back apart.
+        #
+        # When this fires it fires uniformly: every open PR goes red at once
+        # and identically, which reads as a clock/merge-class signal rather
+        # than a branch defect. The fix is one command -- `uv lock`, commit.
+        run: uv lock --check
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Ruff check
