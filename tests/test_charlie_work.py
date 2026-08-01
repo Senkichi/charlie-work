@@ -38673,6 +38673,268 @@ def test_dispatch_rework_regenerates_stale_brief_after_decision_edit(
     assert "The previous cycle was a no-op." not in regenerated
 
 
+def test_dispatch_rework_regenerates_brief_after_renderer_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #800: the brief goes stale along a second axis the mtime gate
+    cannot see.
+
+    ``_is_verdict_newer_than_brief`` compares timestamps, so it only detects
+    *decision content* drift. The #800 case is the other axis: the decision is
+    byte-identical and older than the brief, but the **renderer** changed
+    underneath it (commit ``35c072d`` added tier-2/tier-3 fallbacks to
+    ``_render_required_changes_section``; #883 changed ``rework.md`` itself).
+    Every brief already on disk then keeps rendering through the old code
+    forever, because nothing ever makes the verdict look newer.
+
+    Monkeypatching the renderer reproduces that exactly: same decision, same
+    mtimes, different output. The brief must pick the change up at dispatch.
+    """
+    from charlie_work import workflow as workflow_module
+    from charlie_work.workflow import _is_verdict_newer_than_brief
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    decision_path = pr_dir / "review-decision.json"
+    decision_path.write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "needs work",
+                "required_changes": ["handle the empty-list case"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Write the brief through the real writer, so it carries a dispatch-note
+    # sidecar exactly as production briefs do. Seed it from the *same* PR dict
+    # dispatch_rework will re-render with, so the renderer swap below is the
+    # only thing that differs — otherwise a PR-metadata mismatch would
+    # regenerate the brief and the test would pass without proving anything.
+    pr = gh.prs[0]
+    brief_path = app._write_rework_prompt(pr, 123, "the operational note")
+    original = brief_path.read_text(encoding="utf-8")
+    assert "handle the empty-list case" in original
+
+    # The decision is *older* than the brief, so the #632 mtime gate is
+    # definitively off — this test cannot pass through that path.
+    now = time.time()
+    os.utime(decision_path, (now, now))
+    os.utime(brief_path, (now + 10, now + 10))
+    assert not _is_verdict_newer_than_brief(decision_path, brief_path)
+
+    # Now the renderer changes, with the decision untouched.
+    monkeypatch.setattr(
+        workflow_module,
+        "_render_required_changes_section",
+        lambda decision: "## Required changes\n\nRENDERED-BY-NEW-CODE\n",
+    )
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True, result.message
+    assert result.data["selected_count"] == 1
+    regenerated = brief_path.read_text(encoding="utf-8")
+    assert "RENDERED-BY-NEW-CODE" in regenerated
+    # The note survives the regeneration: it is replayed from the sidecar,
+    # which is what makes re-rendering input-preserving rather than lossy.
+    assert "the operational note" in regenerated
+    # A silent rewrite would be unauditable, and the two staleness axes are
+    # worth telling apart in the log: this one is renderer drift, not the
+    # #632 newer-verdict case.
+    events = query_events(paths.state_file, kind="rework_brief_regenerated")
+    assert len(events) == 1, events
+    assert events[0]["payload"]["reason"] == "renderer_drift"
+    assert events[0]["payload"]["pr_number"] == 456
+
+
+def test_dispatch_rework_leaves_brief_untouched_when_nothing_changed(
+    tmp_path: Path,
+) -> None:
+    """Complement to the #800 regeneration test: re-rendering is unconditional,
+    but *writing* is not.
+
+    Without this the fix would rewrite every brief on every dispatch pass,
+    churning mtimes that ``_is_verdict_newer_than_brief`` reads. Content is
+    compared before writing, so a brief that is already current keeps its
+    bytes and its mtime.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "needs work",
+                "required_changes": ["handle the empty-list case"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pr = gh.prs[0]
+    brief_path = app._write_rework_prompt(pr, 123, "the operational note")
+    before = brief_path.read_text(encoding="utf-8")
+    before_mtime = brief_path.stat().st_mtime_ns
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True, result.message
+    assert brief_path.read_text(encoding="utf-8") == before
+    assert brief_path.stat().st_mtime_ns == before_mtime
+
+
+def test_dispatch_rework_does_not_regenerate_when_sidecar_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-rendering is only safe because the dispatch note can be replayed from
+    the sidecar. An unreadable sidecar must be treated exactly like an absent
+    one — fall back to the mtime gate — because regenerating with an empty note
+    would silently drop the note the brief is carrying.
+
+    Its positive control is ``..._regenerates_brief_after_renderer_change``:
+    identical setup and identical mtime ordering, differing only in that the
+    sidecar is readable there. That one regenerates and this one must not, so
+    "no regeneration" here is attributable to the sidecar rather than to the
+    PR never being selected for dispatch at all.
+    """
+    from charlie_work import workflow as workflow_module
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": "agent:needs-rework"}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    decision_path = pr_dir / "review-decision.json"
+    decision_path.write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "needs work",
+                "required_changes": ["handle the empty-list case"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pr = gh.prs[0]
+    brief_path = app._write_rework_prompt(pr, 123, "the operational note")
+    # Corrupt the sidecar: not valid UTF-8, so reading it raises.
+    (pr_dir / "rework-dispatch-note.txt").write_bytes(b"\xff\xfe not utf-8 \xff")
+    before = brief_path.read_text(encoding="utf-8")
+
+    now = time.time()
+    os.utime(decision_path, (now, now))
+    os.utime(brief_path, (now + 10, now + 10))
+
+    monkeypatch.setattr(
+        workflow_module,
+        "_render_required_changes_section",
+        lambda decision: "## Required changes\n\nRENDERED-BY-NEW-CODE\n",
+    )
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True, result.message
+    # The renderer changed, but without a replayable note the brief is left
+    # alone rather than rewritten without its note.
+    assert brief_path.read_text(encoding="utf-8") == before
+    assert "the operational note" in before
+
+
 def test_rework_brief_omits_required_changes_for_approved_verdict(tmp_path: Path) -> None:
     """Issue #632 edge case: an approved verdict may carry a non-empty
     required_changes list (the field is optional for every decision). The

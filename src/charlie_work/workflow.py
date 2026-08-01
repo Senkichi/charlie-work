@@ -4325,6 +4325,52 @@ def _is_verdict_newer_than_brief(decision_path: Path, brief_path: Path) -> bool:
     return decision_path.stat().st_mtime_ns > brief_path.stat().st_mtime_ns
 
 
+def _render_rework_prompt(
+    state_file: Path,
+    pr: dict[str, Any],
+    issue_number: int | None,
+    dispatch_note: str,
+    config: OrchestratorConfig,
+    *,
+    repo_root: Path | None = None,
+) -> str:
+    """Render the rework brief text for a PR, without writing anything.
+
+    Split out of ``_write_rework_prompt`` for issue #800 so ``dispatch_rework``
+    can compare the brief a *current* renderer would produce against the bytes
+    already on disk. Rendering is a pure function of the verdict file, the
+    dispatch note, and the template set, so re-rendering an unchanged brief
+    reproduces it exactly — which is what lets the caller detect renderer drift
+    without rewriting (and re-timestamping) every brief it inspects.
+    """
+    pr_number = int(pr["number"])
+    pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
+    decision = _read_review_decision(pr_dir / "review-decision.json")
+    required_changes_section = _render_required_changes_section(decision)
+    return render_prompt(
+        config.dispatch.rework_template,
+        {
+            "pr_number": pr_number,
+            "pr_title": pr.get("title", ""),
+            "pr_url": pr.get("url", ""),
+            "issue_number": issue_number or "UNKNOWN",
+            # The raw note stays available to templates; no shipped one
+            # references it since #883.
+            "dispatch_note": defang_closing_keywords(dispatch_note),
+            # Pre-fenced, not bare, for the same reason as ``issue_body_block``
+            # (#883): reviewer prose quotes pytest output and shell commands,
+            # so it carries its own fences -- measured at 16 of 289 summaries
+            # on disk, with pr-182's brief a rendered example of the break.
+            # The width depends on the note's own backtick runs, so it cannot
+            # be written in the template.
+            "dispatch_note_block": fenced_block(defang_closing_keywords(dispatch_note), "md"),
+            "required_changes_section": required_changes_section,
+            "branch_name": pr.get("headRefName", ""),
+        },
+        search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
+    )
+
+
 def _write_rework_prompt(
     state_file: Path,
     pr: dict[str, Any],
@@ -4363,29 +4409,13 @@ def _write_rework_prompt(
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
     pr_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = pr_dir / "rework-prompt.md"
-    decision = _read_review_decision(pr_dir / "review-decision.json")
-    required_changes_section = _render_required_changes_section(decision)
-    prompt = render_prompt(
-        config.dispatch.rework_template,
-        {
-            "pr_number": pr_number,
-            "pr_title": pr.get("title", ""),
-            "pr_url": pr.get("url", ""),
-            "issue_number": issue_number or "UNKNOWN",
-            # The raw note stays available to templates; no shipped one
-            # references it since #883.
-            "dispatch_note": defang_closing_keywords(dispatch_note),
-            # Pre-fenced, not bare, for the same reason as ``issue_body_block``
-            # (#883): reviewer prose quotes pytest output and shell commands,
-            # so it carries its own fences -- measured at 16 of 289 summaries
-            # on disk, with pr-182's brief a rendered example of the break.
-            # The width depends on the note's own backtick runs, so it cannot
-            # be written in the template.
-            "dispatch_note_block": fenced_block(defang_closing_keywords(dispatch_note), "md"),
-            "required_changes_section": required_changes_section,
-            "branch_name": pr.get("headRefName", ""),
-        },
-        search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
+    prompt = _render_rework_prompt(
+        state_file,
+        pr,
+        issue_number,
+        dispatch_note,
+        config,
+        repo_root=repo_root,
     )
     prompt_path.write_text(prompt, encoding="utf-8")
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
@@ -16065,20 +16095,100 @@ class OrchestratorApp:
                     f"missing rework prompt: {rework_prompt_path}"
                 )
                 continue
-            # Issue #632: the brief on disk is authoritative and can drift
-            # arbitrarily far from a corrected verdict (an operator
-            # hand-editing review-decision.json is the #510 case). Regenerate
-            # it from the verdict + the preserved dispatch-note sidecar when
-            # the verdict is newer than the brief, so a stale brief cannot
-            # outlive a corrected verdict. The note sidecar is written by
-            # _write_rework_prompt; if it is absent (a brief predating the
-            # fix) the brief is regenerated with an empty note — the findings
-            # are the critical part and must not stay hidden.
+            # The brief on disk is authoritative and dispatch_rework reads it
+            # verbatim, so it must be checked for staleness before dispatch.
+            # It can go stale along two independent axes:
+            #
+            #   1. The verdict content changed under it — an operator
+            #      hand-editing review-decision.json is the #510 case, and
+            #      issue #632 added the mtime comparison that catches it.
+            #   2. The *renderer* changed under an untouched verdict — issue
+            #      #800. No timestamp moves, so axis 1's check cannot see it.
+            #
+            # Axis 2 subsumes axis 1 wherever the dispatch note can be
+            # replayed from its sidecar, so the sidecar decides which check
+            # runs; see the two branches below.
             decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
-            if _is_verdict_newer_than_brief(decision_path, rework_prompt_path):
-                note_path = self.paths.prs / f"pr-{pr_number}" / "rework-dispatch-note.txt"
-                dispatch_note = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
-                self._write_rework_prompt(pr, issue_number, dispatch_note)
+            note_path = self.paths.prs / f"pr-{pr_number}" / "rework-dispatch-note.txt"
+            # The sidecar is what makes re-rendering non-lossy, so an
+            # unreadable one is treated exactly like an absent one: fall back
+            # to the mtime gate rather than regenerate with an empty note.
+            try:
+                dispatch_note = (
+                    note_path.read_text(encoding="utf-8") if note_path.exists() else None
+                )
+            except (OSError, UnicodeDecodeError):
+                dispatch_note = None
+            # A missing verdict is the other way re-rendering could lose
+            # information: _render_required_changes_section would fall to its
+            # Tier 3 "REVIEWER FINDINGS UNAVAILABLE" placeholder and overwrite
+            # a brief that still has real findings in it. Without the verdict
+            # there is no way to produce a *better* brief, only a worse one,
+            # so leave it alone — same failure direction as the sidecar guard.
+            if dispatch_note is not None and decision_path.exists():
+                # Issue #800: the mtime comparison above only sees one of the
+                # two ways a brief goes stale. It catches *verdict content*
+                # drift, but a brief also goes stale when the **renderer**
+                # changes underneath an untouched verdict — 35c072d adding
+                # tier-2/3 fallbacks to _render_required_changes_section, or
+                # #883 rewriting rework.md's fences. Nothing about that makes
+                # the verdict newer, so every brief already on disk kept
+                # rendering through the old code indefinitely.
+                #
+                # A template/renderer digest (the #592 approach) would not fix
+                # this: #800's own trigger was a change to Python, not to a
+                # template. So re-render unconditionally and diff instead —
+                # that is axis-agnostic by construction and cannot miss a
+                # staleness source nobody has enumerated yet.
+                #
+                # Writing stays conditional on the content actually differing.
+                # An unconditional write would churn the brief mtime that
+                # _is_verdict_newer_than_brief reads, on every pass.
+                #
+                # Reading the brief is new failure surface on a path that
+                # previously never opened it, and this loop body has no
+                # per-issue exception handling — an unreadable brief would
+                # abort the whole pass for every *other* issue too. Treat it
+                # as "differs": the note is in hand, so regenerating is both
+                # safe and the right repair for an unreadable file.
+                try:
+                    current_brief: str | None = rework_prompt_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    current_brief = None
+                expected_brief = _render_rework_prompt(
+                    self.paths.state_file,
+                    pr,
+                    issue_number,
+                    dispatch_note,
+                    self.config,
+                    repo_root=self.repo_root,
+                )
+                if expected_brief != current_brief:
+                    verdict_newer = _is_verdict_newer_than_brief(decision_path, rework_prompt_path)
+                    self._write_rework_prompt(pr, issue_number, dispatch_note)
+                    log_event(
+                        self.paths.state_file,
+                        "rework_brief_regenerated",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            # Which axis moved: a newer verdict is the #632
+                            # case the mtime gate already covered; anything
+                            # else is renderer/template drift (#800), which
+                            # was previously undetectable.
+                            "reason": "verdict_newer" if verdict_newer else "renderer_drift",
+                        },
+                        repo=self.repo_root.name,
+                    )
+            elif _is_verdict_newer_than_brief(decision_path, rework_prompt_path):
+                # No usable sidecar: a brief predating #632, whose dispatch note
+                # exists only inside the rendered markdown. Re-rendering it
+                # would silently drop that note, so the unconditional path
+                # above is gated on the inputs being reproducible. Fall back
+                # to the mtime gate, which regenerates with an empty note
+                # only when a newer verdict makes the findings worth more
+                # than the lost prose.
+                self._write_rework_prompt(pr, issue_number, "")
             # Rescue tier (issue #555): rescue-marked PRs bypass per-issue
             # adapter routing — they always launch via the claude-code adapter
             # pinned to rescue.worker_model, regardless of the primary
