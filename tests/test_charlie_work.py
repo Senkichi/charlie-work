@@ -7588,11 +7588,16 @@ def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
 
 
 def _dispatch_reviews_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None
+    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, enabled: bool = True
 ) -> OrchestratorApp:
-    """Build an OrchestratorApp with review_dispatch enabled and an empty state file."""
+    """Build an OrchestratorApp with review_dispatch enabled (by default) and an empty state file.
+
+    Issue #868: ``enabled`` is overridable so tests can exercise
+    ``dispatch_reviews()``'s disabled-gate path with the same PR/state seeding
+    helpers used by the enabled-path tests.
+    """
     config = OrchestratorConfig(
-        review_dispatch=ReviewDispatchConfig(enabled=True),
+        review_dispatch=ReviewDispatchConfig(enabled=enabled),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     (paths.root).mkdir(parents=True, exist_ok=True)
@@ -8076,6 +8081,125 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
     state = load_state(app.paths.state_file)
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
     assert state["prs"]["100"]["reviewer_pid"] == 12345
+
+
+def test_dispatch_reviews_reaps_stalled_claim_when_disabled(monkeypatch, tmp_path: Path) -> None:
+    """Issue #868: the reaper sweeps must run even when review_dispatch is off.
+
+    Before this fix, the four reaper sweeps sat BELOW the ``enabled`` early
+    return inside ``dispatch_reviews()`` and were unreachable whenever
+    dispatch was disabled -- a dead reviewer's claim (and any other stale
+    claim) was never freed while the flag was off, so it stayed stuck even
+    after the flag was re-enabled (the reap is what makes it re-dispatchable).
+    This seeds the exact same dead-reviewer claim as
+    ``test_dispatch_reviews_redispatches_stalled_reviews`` above, but with
+    dispatch disabled: the claim must still be reaped to
+    ``review_dispatch_failed`` even though nothing gets (re)launched, and the
+    disabled no-op result must carry an explicit ``disabled`` marker (issue
+    #868 part 3) instead of being a bare ``ok=True`` indistinguishable from
+    real progress.
+    """
+    from datetime import timedelta
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, enabled=False)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    # Seed a stale reviewer sidecar + state claim, identical to the
+    # redispatch test above.
+    reviews_dir = app._layout.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    old_started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    sidecar = {
+        "issue_number": 100,
+        "branch": "agent/issue-10-fix",
+        "worktree_path": str(tmp_path / "worktrees" / "issue-100"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 99999,
+        "started_at": old_started,
+        "log_path": str(tmp_path / "log.log"),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": old_started,
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(app.paths.state_file, state)
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    def fake_is_worker_alive(record: ClaudeWorkerRecord, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", fake_is_worker_alive)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data.get("disabled") is True
+    assert result.data["launched_count"] == 0
+    assert launched == []  # dispatch stays off -- no relaunch, only the reap
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_failed"
+
+
+def test_review_queue_lists_pending_pr_regardless_of_dispatch_enabled(tmp_path: Path) -> None:
+    """Issue #868 AC4 (pin, not a new behavior): review_queue() must not
+    filter on review_dispatch.enabled, so a PR awaiting review is queued the
+    moment the flag flips back on -- nothing about candidate selection
+    itself depends on the flag; only dispatch_reviews()'s own launch gate
+    does.
+    """
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, enabled=False)
+    _write_review_packet(tmp_path, 100, "sha-100")
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert [c["pr"] for c in result.data["queue"]] == [100]
 
 
 def test_dispatch_reviews_defers_when_reviewer_quota_exhausted(tmp_path: Path) -> None:
@@ -11999,7 +12123,7 @@ def test_review_preserves_recorded_decision_in_state(tmp_path: Path) -> None:
     from charlie_work.state import load_state as _load
     from charlie_work.state import save_state as _save
 
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
     state = _load(paths.state_file)
@@ -13221,7 +13345,7 @@ def test_review_label_transition_failure_persists_packet(tmp_path: Path) -> None
     leave the review packet persisted in state and report structured label_error."""
     from charlie_work.labels import TransitionOutcome
 
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
     reviewing_label = config.labels.reviewing
 
     class LabelFailReviewGitHub(FakeGitHub):
@@ -16930,7 +17054,7 @@ def test_merge_ready_head_moved_transition_failure_recorded(tmp_path: Path) -> N
     """Issue #135: PARTIAL_FAILURE during merge_ready head-moved transition must be recorded."""
     from charlie_work.labels import TransitionOutcome
 
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
 
     class LabelFailGitHub(FakeGitHub):
         def add_issue_label(self, number: int, label: str) -> bool:
@@ -17059,7 +17183,9 @@ def test_merge_ready_changed_patch_id_resets_to_pending(tmp_path: Path) -> None:
     """Issue #375: if the cumulative diff changes, the approval is voided."""
     from charlie_work.janitor import _calculate_patch_id
 
-    config = _required_checks_config()
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -20072,7 +20198,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
 
 
 def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
-    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    config = OrchestratorConfig(
+        auto_merge=_approved_automerge(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -20092,6 +20220,40 @@ def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> N
     assert (123, "agent:reviewing") in fake_gh.labels_added
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "reviewing"
     assert fake_gh.merged_merge_flags == []
+
+
+def test_merge_ready_head_moved_does_not_stamp_reviewing_when_dispatch_disabled(
+    tmp_path: Path,
+) -> None:
+    """Issue #868: merge_ready()'s head-moved re-review branch is a second,
+    independent call site that stamps ``reviewing``/``agent:reviewing`` --
+    separate from review()'s own packet-generation path. It must be gated
+    the same way: byte-identical scenario to
+    test_merge_ready_refuses_when_head_moved_after_approval above, minus the
+    enabled flag. The head_moved bookkeeping (state field + event) must
+    still happen -- only the reviewing state/label stamp is gated, since
+    nothing else keys off head_moved together with status=="reviewing".
+    """
+    config = OrchestratorConfig(auto_merge=_approved_automerge())  # review_dispatch defaults False
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is False
+    assert result.data["merged"] is False
+    assert result.data["can_merge"] is False
+    assert result.data["head_moved"] is True
+    assert fake_gh.merged == []
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] != "reviewing"
+    assert state["prs"]["456"]["head_moved"] is True
 
 
 def test_merge_ready_escalated_head_moved_makes_no_label_or_status_mutations(
@@ -20303,7 +20465,9 @@ def test_merge_ready_legacy_approved_decision_without_head_sha_is_refused(
 
 
 def test_loop_re_reviews_when_head_moved_after_approval(tmp_path: Path) -> None:
-    config = _required_checks_config()
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -27636,7 +27800,9 @@ def test_dispatch_rework_routes_to_review_instead_of_relaunch_when_head_moved(
     content-change case and route the issue to the review lane instead of
     launching a redundant worker (acceptance criterion 1).
     """
-    config = _dispatch_rework_config()
+    config = dataclasses.replace(
+        _dispatch_rework_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -28028,7 +28194,7 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
 
 def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path: Path) -> None:
     """Review_started transition should fire when head has advanced after request_changes."""
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -28265,7 +28431,7 @@ def test_review_refreshes_janitor_diagnostics_while_issue_escalated(tmp_path: Pa
 
 def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:
     """Review_started transition should fire when there's no prior verdict."""
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -28294,6 +28460,48 @@ def test_review_started_fires_when_no_recorded_verdict(tmp_path: Path) -> None:
     assert result.ok is True
     assert (123, "agent:pr-open") in fake_gh.labels_added
     assert (123, "agent:reviewing") in fake_gh.labels_added
+
+
+def test_review_started_does_not_fire_when_review_dispatch_disabled(tmp_path: Path) -> None:
+    """Issue #868: review() must not stamp reviewing/agent:reviewing when
+    review_dispatch is disabled.
+
+    Nothing services the "reviewing" state when dispatch is off --
+    dispatch_reviews()'s launch+reap machinery is gated off by the same
+    flag -- so stamping it here just strands the PR under a label its own
+    reaper never runs to clear. Byte-identical scenario to
+    test_review_started_fires_when_no_recorded_verdict above, minus the
+    enabled flag.
+    """
+    config = OrchestratorConfig()  # review_dispatch.enabled defaults to False
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "pr.json").write_text(
+        json.dumps(
+            {
+                "number": 456,
+                "title": "PR for issue 123",
+                "url": "https://example.test/pr/456",
+                "headRefOid": "sha-abc123",
+                "isCrossRepository": False,
+                "headRefName": "agent/issue-123",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert (123, "agent:reviewing") not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"].get("status") != "reviewing"
+    # The packet itself is still generated -- only the state/label stamp is gated.
+    assert state["prs"]["456"]["prompt_path"] == result.data["prompt_path"]
 
 
 def test_dispatch_defers_when_provider_throttled(tmp_path: Path) -> None:
