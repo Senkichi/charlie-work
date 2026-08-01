@@ -3,7 +3,10 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import subprocess
+import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -41,6 +44,13 @@ from ci_fleet.charlie_work_adapter import (
     scale_down_idle_runners,
 )
 from .state import state_lock, utc_now
+from .subprocess_runner import no_console_window_kwargs
+from .supervise_loop import (
+    DEFAULT_MAX_RELAUNCHES,
+    EXIT_RESTART_REQUESTED,
+    SuperviseLoopResult,
+    run_supervise_relaunch_loop,
+)
 from .workflow import CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -1675,6 +1685,19 @@ def _fleet_has_configured_repos(
     return bool(_select_repos(registry, repos))
 
 
+# Exit reasons that mean "the code on disk changed underneath this process", so
+# the supervisor must be replaced *now* rather than after a watchdog interval
+# (#862). Every other reason is a deliberate stop and must not relaunch.
+#
+# This is a reason vocabulary rather than a `restart_requested` boolean set at
+# the two restarting break sites, because the failure directions differ. A new
+# break site that forgets to set a boolean reads as "normal exit" and silently
+# reintroduces #862's downtime hole; one that forgets to set a reason reports
+# "unknown", which is visible in the exit event and the launcher log. #855's
+# zero-pass alarm also cannot currently tell these cases apart.
+RESTART_EXIT_REASONS = frozenset({"self_deploy", "head_drift"})
+
+
 def run_fleet_supervise(
     *,
     fleet_dir_override: str | None = None,
@@ -1772,6 +1795,8 @@ def run_fleet_supervise(
     total_attention_events = 0
     total_failed_repos = 0
     start_time = clock()
+    # Set at every route out of the loop below; see RESTART_EXIT_REASONS.
+    exit_reason: str | None = None
     full_pass_interval = cfg.full_pass_interval_seconds
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
@@ -1791,8 +1816,10 @@ def run_fleet_supervise(
             if cfg.max_runtime_minutes is not None and cfg.max_runtime_minutes > 0:
                 elapsed_minutes = (now - start_time) / 60.0
                 if elapsed_minutes >= cfg.max_runtime_minutes:
+                    exit_reason = "max_runtime"
                     break
             if max_passes is not None and pass_number >= max_passes:
+                exit_reason = "max_passes"
                 break
 
             new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
@@ -1889,6 +1916,7 @@ def run_fleet_supervise(
                     f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
                     flush=True,
                 )
+                exit_reason = "self_deploy"
                 break
 
             # Independent drift check: even when self_deploy reports "already
@@ -1908,6 +1936,7 @@ def run_fleet_supervise(
                     f"watchdog restart to pick up new code",
                     flush=True,
                 )
+                exit_reason = "head_drift"
                 break
 
             pass_result = fleet_loop(
@@ -1983,13 +2012,19 @@ def run_fleet_supervise(
             threshold=cfg.zero_pass_alarm,
         )
     except KeyboardInterrupt:
-        pass
+        # An operator stop must never relaunch. Named rather than left unset so
+        # the exit event distinguishes it from a break site that forgot a reason.
+        exit_reason = "interrupted"
     except Exception as exc:
         elapsed_s = clock() - start_time
         return CommandResult(
             False,
             f"fleet supervisor aborted on pass {pass_number}: {exc}",
             {
+                # ok=False already prevents relaunch; carried for symmetry so
+                # every exit route reports a reason in the same field.
+                "exit_reason": "aborted",
+                "restart_requested": False,
                 "passes": pass_number,
                 "total_repo_passes": total_repo_passes,
                 "total_attention_events": total_attention_events,
@@ -2006,12 +2041,121 @@ def run_fleet_supervise(
         True,
         f"fleet supervisor complete: {pass_number} pass(es) in {elapsed_str}, "
         f"{total_repo_passes} repo pass(es), {total_attention_events} attention "
-        f"event(s), {total_failed_repos} failed repo(s)",
+        f"event(s), {total_failed_repos} failed repo(s) "
+        f"[exit_reason={exit_reason or 'unknown'}]",
         {
             "passes": pass_number,
             "total_repo_passes": total_repo_passes,
             "total_attention_events": total_attention_events,
             "total_failed_repos": total_failed_repos,
             "elapsed_seconds": elapsed_s,
+            "exit_reason": exit_reason or "unknown",
+            "restart_requested": exit_reason in RESTART_EXIT_REASONS,
+        },
+    )
+
+
+def _record_supervise_loop_cap_event(result: SuperviseLoopResult) -> None:
+    """Best-effort fleet-level record that the relaunch bound refused a restart.
+
+    Same never-escape discipline as ``_record_lane_failure_event``: the whole
+    point of the cap is to exit cleanly so the scheduled task's tick regains
+    restart authority, and a failure to *record* that must not turn the clean
+    exit into a crash.
+    """
+    try:
+        state_path = layout.state_file_path(layout.default_state_root(orchestrator_root()))
+        log_event(
+            state_path,
+            "supervise_relaunch_cap_reached",
+            {
+                "launches": result.launches,
+                "relaunches": result.relaunches,
+                "last_exit_code": result.last_exit_code,
+            },
+        )
+    except Exception:
+        logger.exception("Failed to record supervise relaunch cap event")
+
+
+def _spawn_supervise_child(supervise_args: Sequence[str]) -> int:
+    """Run one ``fleet supervise`` child to completion; return its exit code.
+
+    ``Popen`` + ``wait`` with *inherited* stdio, deliberately not
+    ``subprocess_runner.run_captured``: the child runs for hours and
+    ``capture_output=True`` would buffer its entire log in memory. Inheriting
+    also leaves the launcher's own ``>> $log`` redirection as the single place
+    output lands, unchanged from before this wrapper existed.
+
+    This is a wrapper waiting on its own child, so it is outside the adapter
+    "never block on worker completion" invariant — blocking here is the point.
+
+    ``sys.executable`` keeps the child in the venv the wrapper was started in;
+    ``-m charlie_work`` rather than the console script because of #854 (the
+    running ``charlie.exe`` is the file ``uv sync`` must delete on self-deploy).
+
+    ``no_console_window_kwargs`` and *not* ``hidden_console_kwargs``, even though
+    this is a long-lived worker-shaped spawn: ``CREATE_NEW_CONSOLE`` gives the
+    child that console's std handles instead of the ones it inherits, which
+    would silently redirect the supervisor's entire log away from the launcher's
+    ``>> $log`` and into a hidden console nobody can read. ``CREATE_NO_WINDOW``
+    suppresses the window while leaving inherited handles intact.
+    """
+    command = [sys.executable, "-m", "charlie_work", "fleet", "supervise", *supervise_args]
+    process = subprocess.Popen(
+        command,
+        cwd=str(orchestrator_root()),
+        **no_console_window_kwargs(),
+    )
+    return process.wait()
+
+
+def run_fleet_supervise_loop(
+    *,
+    supervise_args: Sequence[str] = (),
+    max_relaunches: int = DEFAULT_MAX_RELAUNCHES,
+    spawn: Callable[[int], int] | None = None,
+) -> CommandResult:
+    """Run ``fleet supervise``, relaunching immediately on a restart request.
+
+    ``supervise_args`` is forwarded to the child verbatim rather than being
+    re-declared flag by flag here: a per-flag list would silently stop
+    forwarding any option added to ``fleet supervise`` later.
+    """
+    args = tuple(supervise_args)
+
+    def _default_spawn(_launch_number: int) -> int:
+        return _spawn_supervise_child(args)
+
+    result = run_supervise_relaunch_loop(
+        spawn if spawn is not None else _default_spawn,
+        max_relaunches=max_relaunches,
+        log=lambda message: print(message, flush=True),
+        on_cap_reached=_record_supervise_loop_cap_event,
+    )
+
+    # A cap is a *clean handoff*, not a failure: the wrapper deliberately gives
+    # restart authority back to the 5-minute trigger rather than spinning. So the
+    # last exit being EXIT_RESTART_REQUESTED is ok, exactly like a plain 0.
+    #
+    # Reporting the cap as ok=False (exit 1) was the first draft, and it is wrong
+    # for the same reason #862 itself is: it makes two different conditions
+    # indistinguishable. `except Exception` in `run_fleet_supervise` also exits 1,
+    # so an operator seeing LastTaskResult=1 could not tell "supervisor crashed"
+    # from "self-deploy is not converging" — the ambiguity just moves up a layer
+    # instead of being removed. The cap's signal is the distinct log line and the
+    # `supervise_relaunch_cap_reached` event, both of which say exactly which
+    # condition occurred; the exit code does not need to carry it too.
+    ok = result.last_exit_code in (0, EXIT_RESTART_REQUESTED)
+    return CommandResult(
+        ok,
+        f"supervise-loop: {result.launches} launch(es), {result.relaunches} relaunch(es), "
+        f"last exit {result.last_exit_code}"
+        + (" (relaunch cap reached)" if result.cap_reached else ""),
+        {
+            "launches": result.launches,
+            "relaunches": result.relaunches,
+            "last_exit_code": result.last_exit_code,
+            "cap_reached": result.cap_reached,
         },
     )
