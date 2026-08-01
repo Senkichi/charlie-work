@@ -31,19 +31,19 @@ from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
 from .supervise import orchestrator_root, self_deploy
-from .runner_allocation import plan_summary
-from .runner_allocation_pass import run_allocation_pass
-from .runner_slots import CLI_ALLOCATION_SOURCE
-from .runners import (
+from ci_fleet.charlie_work_adapter import (
+    CLI_ALLOCATION_SOURCE,
+    FleetTotals,
+    ScaleAction,
     decide_autoscale,
     ensure_runners_started,
     format_runner_pool_state,
-    FleetTotals,
     is_in_cooldown,
     is_pool_idle_for_minutes,
     observe_runner_pool,
+    plan_summary,
+    run_allocation_pass,
     scale_down_idle_runners,
-    ScaleAction,
 )
 from .worktree import clean_worktrees
 from .workflow import CommandResult, OrchestratorApp
@@ -1241,7 +1241,7 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
 
     # Execute the decision
     if decision.action == ScaleAction.UP:
-        from .runners import provision_runner
+        from ci_fleet.charlie_work_adapter import provision_runner
 
         result = provision_runner(
             gh,
@@ -1251,7 +1251,7 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
         )
         if result.ok:
             # Record scale event
-            from .runners import record_scale_event
+            from ci_fleet.charlie_work_adapter import record_scale_event
 
             record_scale_event(paths.root, "up")
             return CommandResult(
