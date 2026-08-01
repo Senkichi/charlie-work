@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -40,6 +41,31 @@ MERGED_PR_LOOKBACK_LIMIT = 5
 QUEUED_STALE_MINUTES = 20
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
+# Measured production cadence (charlie-work `loop_started` gaps, last 39
+# intervals, 2026-07-31): min=5.5m median=10.4m p90=20.2m max=53.9m.
+# `loop_started` is logged per repo (workflow.py's `_loop_impl`, into that
+# repo's own events.db), and the supervisor processes repos sequentially in
+# one pass, so a single repo's gap is gated by how long its SIBLING repos
+# take, not by supervisor health -- job-cannon's reconcile alone walks
+# ~690 issues / ~877 PRs and can push charlie-work's gap past 50 minutes on
+# a perfectly healthy fleet.
+#
+# Set to 90: comfortably above the observed healthy maximum (53.9m) so a
+# slow-but-alive fleet cannot false-alarm (at 30m this fired on 1 of 39
+# healthy intervals, ~3-4 false alarms/day). This deliberately means it
+# will NOT catch a sub-90-minute stall -- the outage that motivated this
+# check (issues #851/#854) was only ~45 minutes, shorter than charlie-work's
+# own legitimate worst-case gap, so no per-repo threshold can separate a
+# real stall of that length from a healthy-but-slow pass. This check is a
+# coarse backstop for prolonged, total fleet death (fresh log, zero passes,
+# for well over an hour) -- not a detector for the #851/#854 class. That
+# class is caught by PR #865 (issue #855), which escalates consecutive
+# zero-repo-pass supervisor cycles: edge-triggered on the actual failure
+# mode, needs no cadence-based threshold, and can't be confused with a
+# merely slow loop. Do not lower this value to "catch" that outage faster --
+# it will just reintroduce the false-alarm noise measured above; extend
+# PR #865's check instead.
+LOOP_PASS_STALE_MINUTES = 90
 MERGEQUEUE_STALL_BEATS = 2
 GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
@@ -708,6 +734,189 @@ def check_log_freshness(report: Report, repo: RepoInfo, *, now: datetime | None 
         report.ok(check, facts)
 
 
+def check_loop_pass_freshness(
+    report: Report,
+    repo: RepoInfo,
+    *,
+    now: datetime | None = None,
+    stale_minutes: int = LOOP_PASS_STALE_MINUTES,
+) -> None:
+    """Coarse backstop for prolonged, total fleet death -- NOT a detector
+    for the #851/#854 outage class specifically (see ``LOOP_PASS_STALE_MINUTES``
+    for the measured cadence data and why: that outage was shorter than this
+    repo's own legitimate worst-case gap between loop passes, so no per-repo
+    threshold can separate the two; PR #865 / issue #855 catches that class
+    instead, by watching for consecutive zero-repo-pass cycles rather than
+    elapsed time).
+
+    What this still catches: the process exited 0, the scheduled task
+    reported success, and the state dir kept getting touched
+    (``self_deploy_succeeded`` fires every beat), so ``check_log_freshness``
+    reads healthy indefinitely even though the loop body itself
+    (``workflow.py``'s ``_loop_impl``, which is the only place that logs
+    ``loop_started``) has not run in any of this repo's passes for well
+    over an hour. The only ground truth for "is the loop actually running"
+    is the ABSENCE of ``loop_started`` rows in ``events.db``.
+
+    ``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``.
+
+    Missing DB, missing table, and zero ``loop_started`` rows are each
+    reported OK with a distinct message -- a fresh install/state dir with no
+    history yet is not the same failure as a fleet that stopped mid-flight.
+
+    CRITICAL: the freshness comparison is done in Python on parsed
+    ``datetime`` objects, never in SQL. ``ts`` values are ISO strings like
+    ``2026-07-31T22:25:04Z`` (``T``/``Z``); SQLite's
+    ``datetime('now','-90 minutes')`` returns a space-separated,
+    non-``Z`` string like ``2026-07-31 22:25:04``. A predicate such as
+    ``WHERE ts < datetime('now','-90 minutes')`` compares them as strings,
+    where ``'T'`` (0x54) sorts after ``' '`` (0x20) -- this silently
+    misclassifies rows in both directions instead of raising, so the bug
+    doesn't fail loudly, it just returns the wrong answer.
+    """
+    check = f"loop-pass-freshness {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.ok(check, "no events.db (fresh install or pre-instrumentation state dir)")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.ok(check, "events.db has no events table yet")
+                return
+            newest_ts = conn.execute(
+                "SELECT MAX(ts) FROM events WHERE kind = 'loop_started'"
+            ).fetchone()[0]
+        except sqlite3.Error as exc:
+            report.anom(check, f"events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    if newest_ts is None:
+        report.ok(check, "no loop_started rows recorded yet")
+        return
+
+    newest_dt = parse_iso(newest_ts)
+    if newest_dt is None:
+        report.anom(check, f"newest loop_started ts unparseable: {newest_ts!r}")
+        return
+
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
+    age_min = (resolved_now - newest_dt).total_seconds() / 60
+    facts = f"newest_loop_started={newest_ts} age={round(age_min)}m"
+
+    if age_min > stale_minutes:
+        marker_path = repo.state_dir / "pending-sync.json"
+        report.anom(
+            check,
+            f"no loop pass in {repo.slug} for {round(age_min)}m "
+            f"(newest loop_started {newest_ts}), threshold={stale_minutes}m -- "
+            f"at or beyond the observed healthy worst case, so the supervisor "
+            f"may be dead or wedged. Cause is open-ended at this duration; "
+            f"{marker_path} is one thing worth checking, not the only one. "
+            f"({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
+def check_error_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface error-level events that fire but have no consumer (issue #866).
+
+    `self_deploy_alarm` and every other member of `instrumentation._ERROR_KINDS`
+    (e.g. PR #865's `supervisor_zero_pass_alarm`) are emitted, classified
+    error-level, documented, and unit-tested -- but before this check,
+    nothing in the codebase ever read them. A human had to manually open
+    `events.db` and know which `kind` string to search for. This check
+    closes that detection-to-delivery gap; `check_loop_pass_freshness` above
+    is a separate, coarser backstop (defense in depth), not a substitute --
+    that one answers "did the loop run recently," this one answers "did
+    anything already flag itself as an error."
+
+    Coverage is DERIVED, never a hardcoded `kind` list: `level` is computed
+    once and persisted per-row at write time by
+    `instrumentation._classify_level` (checked against `_ERROR_KINDS`/
+    `_WARNING_KINDS` there), so filtering on the persisted `level = 'error'`
+    column here picks up every current and future error kind without this
+    script importing `charlie_work` or restating its kind list. This is more
+    correct than importing `_ERROR_KINDS` directly would be, too:
+    `_ERROR_KINDS` reflects the currently-installed code, while a row's
+    `level` reflects what the classifier actually assigned when that row was
+    written -- the two can disagree across a deploy boundary, and the
+    persisted column is ground truth for "what actually happened."
+
+    Unlike `check_loop_pass_freshness` (missing db/table = OK, "no history
+    yet" -- a fresh install is not a failure), a missing or unreadable
+    events.db HERE is an ANOMALY: this check's entire job is "did any alarm
+    fire," and a registered repo this check cannot read is a repo it cannot
+    vouch for, not one it can call clean.
+
+    Only rows with `ts` strictly after `baseline` (the previous heartbeat
+    beat -- same mechanism as `check_dispatch_failures`) are reported, so an
+    already-seen alarm is not re-flagged forever. On a cold start (no prior
+    `heartbeat-state.json`), `main()` falls `baseline` back to
+    `now - LOG_FRESHNESS_STALE_MINUTES`, so alarms older than that fallback
+    window are silently out of scope on the very first run -- a deliberate,
+    bounded blind spot, not an oversight.
+
+    CRITICAL: timestamps are compared in Python, never in SQL -- the same
+    ISO-`T`/`Z`-vs-SQLite-space-format trap documented on
+    `check_loop_pass_freshness`. All `level='error'` rows are pulled
+    unfiltered by time and each `ts` is parsed with `parse_iso` and compared
+    against the `baseline` `datetime` in Python.
+    """
+    check = f"error-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check for alarms: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check for alarms: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check for alarms: events.db has no events table")
+                return
+            rows = conn.execute("SELECT ts, kind FROM events WHERE level = 'error'").fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check for alarms: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_alarms: list[str] = []
+    for ts, kind in rows:
+        ts_dt = parse_iso(ts)
+        # An unparseable ts fails toward visibility (reported), not silence.
+        if ts_dt is None or ts_dt > baseline:
+            new_alarms.append(f"{kind}@{ts}")
+
+    facts = f"error_rows={len(rows)} new_since_last_beat={len(new_alarms)}"
+    if new_alarms:
+        report.anom(check, f"new error-level event(s) since last beat: {new_alarms} ({facts})")
+    else:
+        report.ok(check, facts)
+
+
 def check_merge_flow(
     report: Report,
     repo: RepoInfo,
@@ -925,7 +1134,9 @@ def main() -> int:
         )
         check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
+        check_error_events(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
+        check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
         new_state["repos"][repo.slug] = new_repo_state
 

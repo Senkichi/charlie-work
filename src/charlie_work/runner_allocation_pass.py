@@ -50,7 +50,7 @@ from pathlib import Path
 
 from .config import RunnerAllocationConfig
 from .fleet_paths import fleet_dir
-from .github import GitHub
+from .github import GitHubLike
 from .instrumentation import log_event, query_events
 from .runner_allocation import (
     AllocationPlan,
@@ -225,7 +225,7 @@ def _emit_capacity_events(state_path: Path, plan: AllocationPlan) -> None:
 
 
 def run_allocation_pass(
-    gh: GitHub,
+    gh: GitHubLike,
     allocation: RunnerAllocationConfig,
     *,
     managed_root_fallback: str = "",
