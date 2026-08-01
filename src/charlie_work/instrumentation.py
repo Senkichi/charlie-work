@@ -152,6 +152,14 @@ _ERROR_KINDS = frozenset(
         # zero events.db rows).
         "self_deploy_failed",
         "self_deploy_alarm",
+        # Issue #855 (the general shape behind #851): a fleet-supervisor
+        # cycle completed with zero repo passes, despite at least one repo
+        # being configured, N times in a row -- exit code 0 every cycle, so
+        # this is the only signal that distinguishes the outage from a
+        # healthy fleet. Classified as an error for the same reason as
+        # self_deploy_alarm above: reachable via query_events(level="error")
+        # without any new query infrastructure.
+        "supervisor_zero_pass_alarm",
     }
 )
 _WARNING_KINDS = frozenset(
