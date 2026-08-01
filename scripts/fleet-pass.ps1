@@ -26,7 +26,11 @@ $logDir = Join-Path $root '.var\charlie-work\logs'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 $log = Join-Path $logDir 'fleet-pass.log'
 
-"--- fleet supervise start $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
+# Must name the same command as the exit marker below. These two lines bracket one
+# run in the log, and #862 changed the command under the exit marker only, leaving a
+# pass that started as "supervise" and ended as "supervise-loop" -- which reads like
+# two interleaved runs precisely when someone is untangling a restart.
+"--- fleet supervise-loop start $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
 
 # Native supervisor call. Three settings are REQUIRED for this to run at all under
 # Windows PowerShell 5.1 (observed 2026-07-17 — old launcher wrote the marker then
