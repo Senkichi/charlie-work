@@ -1051,6 +1051,15 @@ def _detect_and_handle_stalled_sessions(
     dispatch pass defers instead of relaunching into the same window. A
     session_stalled event is logged with the resolved failure_kind.
 
+    Issue #873: the reap event's *kind* now follows the worker's health.
+    ``WorkerHealth.STALLED`` (a live process that stopped progressing) keeps
+    the error-level ``session_stalled``; ``WorkerHealth.DEAD`` (the process is
+    already gone — equally the normal end of a worker that finished and
+    exited) emits the warning-level ``session_exited``. The handling is
+    deliberately still shared; only the classification splits. Both payloads
+    carry ``worker_health`` so the distinction is recorded rather than
+    inferred from an empty ``killed_pids``.
+
     ``now`` (issue #828) is the injectable clock for this sweep, following
     the convention established by PR #827. It is sampled once here and
     threaded down to ``real_activity_probe_for``, ``classify_worker_health``,
@@ -1335,15 +1344,41 @@ def _detect_and_handle_stalled_sessions(
                 }
             )
 
+            # Issue #873: STALLED and DEAD share this handling path, and that
+            # sharing is deliberate — the cleanup (reap the tree, free the
+            # slot) is identical for both. What they must NOT share is a
+            # *classification*. STALLED is a live process that stopped making
+            # progress: a genuine fault. DEAD means the process is already
+            # gone, which is equally the normal terminal state of every worker
+            # that finished its work and exited. Emitting one error-level kind
+            # for both filed successful completions as faults in the
+            # error-level stream that #864/#866 added the first consumer for
+            # (scripts/heartbeat_check.check_error_events).
+            #
+            # The reporting lane (``_detect_stalled_sessions``) already kept
+            # ``health.name`` in its entry; only this handling lane discarded
+            # the distinction at the point of emission. Both the event kind and
+            # the new ``worker_health`` payload field now carry it, so the
+            # split is recorded rather than inferred from ``killed_pids``.
+            #
+            # ``session_exited`` is deliberately not named
+            # ``session_completed``: process liveness proves the worker is
+            # gone, not that it succeeded. For the same reason it is a warning
+            # rather than info — this change does not establish the
+            # clean-exit-vs-crash split, and info would encode a claim the
+            # evidence does not support.
+            event_kind = "session_stalled" if health is WorkerHealth.STALLED else "session_exited"
+
             with state_lock(state_file):
                 state = load_state(state_file)
                 state = append_event(
                     state,
-                    "session_stalled",
+                    event_kind,
                     {
                         "issue_number": w.issue_number,
                         "pid": w.pid,
                         "process_start_time": w.process_start_time,
+                        "worker_health": health.name,
                         "log_mtime": str(datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)),
                         "last_log_line": last_log_line,
                         "killed_pids": killed_pids,

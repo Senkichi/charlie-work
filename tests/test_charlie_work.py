@@ -31922,11 +31922,28 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     margin = timedelta(seconds=config.runtime.throttle_resume_margin_s)
     assert before + timedelta(minutes=6) <= throttle_time <= after + timedelta(minutes=8) + margin
 
-    # session_stalled event must carry the resolved failure_kind
+    # The reap event must carry the resolved failure_kind.
+    #
+    # Issue #873: this fixture's log tail opens with a terminal error marker
+    # ("Agent error: Permission denied"), so classify_worker_health returns
+    # DEAD at its unconditional terminal-marker signal — not STALLED. (The
+    # patch on charlie_work.worker.is_session_alive above is inert here:
+    # classify_worker_health checks view.is_alive(), not that module-level
+    # helper.) The reap event is therefore "session_exited", not
+    # "session_stalled". This test always exercised the DEAD path; before
+    # #873 both healths emitted the same kind, so nothing could tell.
+    #
+    # Note what this proves about session_exited: it means "the process is
+    # gone", NOT "the worker succeeded". Here it is a worker that died on a
+    # provider rate limit. The genuine-failure signal is not lost — the
+    # dead-session lane still emits error-level session_failed_escalated /
+    # session_failed_relabeled carrying this same failure_kind.
     events = state.get("events", [])
-    stalled_events = [e for e in events if e.get("kind") == "session_stalled"]
-    assert len(stalled_events) == 1
-    assert stalled_events[0]["payload"]["failure_kind"] == "rate_limited"
+    exited_events = [e for e in events if e.get("kind") == "session_exited"]
+    assert len(exited_events) == 1
+    assert exited_events[0]["payload"]["failure_kind"] == "rate_limited"
+    assert exited_events[0]["payload"]["worker_health"] == "DEAD"
+    assert [e for e in events if e.get("kind") == "session_stalled"] == []
 
 
 def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path: Path) -> None:
@@ -31976,6 +31993,12 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     events = state.get("events", [])
     stalled_events = [e for e in events if e.get("kind") == "session_stalled"]
     assert stalled_events[0]["payload"]["failure_kind"] == "quota_exhausted"
+    # Issue #873: unlike the rate-limit sibling above, this fixture's log tail
+    # carries no terminal error marker, so the worker is classified STALLED
+    # (live-but-quiet) and keeps the error-level "session_stalled" kind. Pinned
+    # explicitly so the two sibling tests document both sides of the split.
+    assert stalled_events[0]["payload"]["worker_health"] == "STALLED"
+    assert [e for e in events if e.get("kind") == "session_exited"] == []
 
 
 def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: Path) -> None:
@@ -32018,6 +32041,12 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
     events = state.get("events", [])
     stalled_events = [e for e in events if e.get("kind") == "session_stalled"]
     assert stalled_events[0]["payload"]["failure_kind"] == "stalled"
+    # Issue #873: quiet log, no terminal marker -> STALLED, so this keeps the
+    # error-level kind. Note failure_kind "stalled" here is the *fallback* used
+    # when no throttle signature matched; it is not evidence of a hang, which
+    # is exactly why worker_health (not failure_kind) is the field that
+    # distinguishes a live-but-stuck worker from a vanished one.
+    assert stalled_events[0]["payload"]["worker_health"] == "STALLED"
 
 
 def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -> None:
@@ -32328,9 +32357,17 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
     state = load_state(paths.state_file)
     events = state.get("events", [])
 
-    # Find the session_stalled event
-    stalled_events = [e for e in events if e.get("type") == "session_stalled"]
-    assert len(stalled_events) == 0  # No event emitted
+    # No reap event of either kind may be emitted while the watchdog is off.
+    #
+    # This filter previously read e.get("type"), but events are keyed on
+    # "kind" — so it matched nothing regardless of what was emitted and the
+    # assertion below was true by construction. Found while splitting the
+    # reap kinds for #873; fixed here rather than left as a silent no-op.
+    # Both kinds are checked because #873 split the single "session_stalled"
+    # into session_stalled (STALLED) + session_exited (DEAD), and a
+    # disabled watchdog must emit neither.
+    reap_events = [e for e in events if e.get("kind") in {"session_stalled", "session_exited"}]
+    assert reap_events == []
 
 
 # Fleet registry and global config tests
