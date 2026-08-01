@@ -3624,6 +3624,14 @@ def test_push_branch_publishes_and_verifies(tmp_path: Path) -> None:
     remove_worktree(repo, info.path, branch="agent/issue-4")
 
 
+def test_push_branch_rejects_invalid_ref_name(tmp_path: Path) -> None:
+    """Invalid ref names are rejected before any git argv is built (issue #659)."""
+    ok, error = push_branch(tmp_path, "--exec=foo")
+    assert not ok
+    assert error is not None
+    assert "not a valid git ref name" in error
+
+
 def test_recovery_aborts_when_worker_pid_alive(tmp_path: Path) -> None:
     """Issue #282: recovery must not remove a worktree if the recorded worker PID is still alive."""
     repo_root = tmp_path / "repo"
@@ -5522,3 +5530,60 @@ def test_clean_worktrees_skips_orphan_sweep_when_worktree_list_fails(
     assert not result.data["orphans"]["failed"]
     assert any(e["type"] == "worktree_list_failed" for e in result.data["attention_events"])
     assert result.ok is False
+
+
+# --- issue #659: git argv validation (defense-in-depth) -----------------------
+
+
+def test_create_worktree_rejects_flag_like_branch(tmp_path: Path) -> None:
+    """A flag-like branch name must raise before reaching any git argv."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_worktree branch"):
+        create_worktree(repo_root, "--exec=foo", base_ref="HEAD")
+
+
+def test_create_worktree_rejects_rev_syntax_branch(tmp_path: Path) -> None:
+    """A branch name with rev-syntax metacharacters must raise."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_worktree branch"):
+        create_worktree(repo_root, "foo~bar", base_ref="HEAD")
+
+
+def test_create_worktree_rejects_flag_like_base_ref(tmp_path: Path) -> None:
+    """A flag-like base_ref must raise before reaching any git argv."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_worktree base_ref"):
+        create_worktree(repo_root, "agent/issue-1-fix", base_ref="--upload-pack=evil")
+
+
+def test_create_worktree_accepts_empty_base_ref(tmp_path: Path) -> None:
+    """Empty base_ref (auto-resolve sentinel) must pass validation."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    info = create_worktree(repo_root, "agent/issue-659-valid", base_ref="")
+    assert info.path.exists()
+
+
+def test_create_review_checkout_rejects_flag_like_head_sha(tmp_path: Path) -> None:
+    """A flag-like head_sha must raise before reaching ``git fetch``/``worktree add``."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_review_checkout head_sha"):
+        create_review_checkout(repo_root, 1, "--exec=foo", reviews_dir=tmp_path / "reviews")
+
+
+def test_create_review_checkout_rejects_non_hex_head_sha(tmp_path: Path) -> None:
+    """A non-hex head_sha must raise (format check, not just flags)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with pytest.raises(ValueError, match="create_review_checkout head_sha"):
+        create_review_checkout(repo_root, 1, "not-a-sha!", reviews_dir=tmp_path / "reviews")

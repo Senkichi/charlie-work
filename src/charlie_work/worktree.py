@@ -32,6 +32,7 @@ from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
 from .process_utils import is_pid_alive
 from .safe_path import contains
+from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
 from .subprocess_runner import RunResult, run_captured
 from . import state as _state
 
@@ -1736,6 +1737,13 @@ def create_worktree(
     active ``operator_claimed_at`` for ``issue_number``. Pass ``None`` to skip
     the guard (e.g. unit tests that focus on worktree git mechanics).
     """
+    # Validate branch/base_ref before they reach any git argv (issue #659).
+    # branch originates from GitHub-derived branch names; base_ref may be a
+    # ref name, a SHA, or "" (auto-resolve sentinel).
+    branch = require_valid_ref_name(branch, context="create_worktree branch")
+    if base_ref != "":
+        require_valid_rev(base_ref, context="create_worktree base_ref")
+
     # Resolve base_ref: empty string means auto-resolve to origin/<default>
     resolved_base_ref = base_ref
     if base_ref == "":
@@ -2461,6 +2469,11 @@ def create_review_checkout(
         raise ValueError(
             f"create_review_checkout requires a non-empty head_sha for PR #{pr_number}"
         )
+    # Validate head_sha format before it reaches git argv (issue #659).
+    # head_sha is passed as a plain positional to ``git fetch origin`` and
+    # ``git worktree add --detach``, so a flag-like value would be parsed as
+    # an option without this guard.
+    head_sha = require_valid_sha(head_sha, context="create_review_checkout head_sha")
 
     target_dir = reviews_dir
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -2654,6 +2667,11 @@ def push_branch(
     Returns ``(ok, error)``. Pushes can fail silently on some transports, so the
     remote branch tip is explicitly checked and compared to the local branch tip.
     """
+    try:
+        branch = require_valid_ref_name(branch, context="push_branch branch")
+    except ValueError as exc:
+        return False, str(exc)
+
     cwd = worktree_path if worktree_path else repo_root
     push_result = run_captured(
         ["git", "push", "origin", branch],
