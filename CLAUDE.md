@@ -79,6 +79,15 @@ listeners run. Operator scripts and post-reboot procedures must delegate to it
 rather than starting every runner directly — a second controller silently undoes
 parking and burns a full `demand_idle_samples` hysteresis window reconverging.
 
+### `EXIT_RESTART_REQUESTED` is a cross-version wire contract — never change it
+`supervise_loop.EXIT_RESTART_REQUESTED` (3) is how the `fleet supervise-loop`
+wrapper learns that its `fleet supervise` child wants to be replaced. The wrapper
+holds the value in memory from *its* commit; the child loads it fresh from disk.
+A self-deploy is exactly when those differ. Changing the number makes a stale
+wrapper misread a restart request as a normal exit and skip the relaunch — the
+#862 outage, reintroduced on the very deploy that changed it. Treat it like a
+label string: read from the constant, never re-declare, and never renumber.
+
 ### Adapters must not block on worker completion
 `devin_shell.launch_devin_session` and `claude_code.launch_claude_worker` both use
 `subprocess.Popen` and return immediately — they never call `process.wait()` or

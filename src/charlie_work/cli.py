@@ -1719,7 +1719,13 @@ def main(argv: list[str] | None = None) -> int:
     # the latter. Read out of result.data rather than switched on the command
     # name: main() is generic across every command, and a name list here would
     # need editing for each new long-lived command wanting the same signal.
-    if result.ok and isinstance(result.data, dict) and result.data.get("restart_requested"):
+    # Deliberately NOT gated on result.ok. "Should I be replaced?" is orthogonal
+    # to "did I succeed?": a supervisor that self-deployed and then hit an error
+    # still has new code on disk and still needs relaunching -- relaunching is
+    # the recovery, not a reward for a clean run. Gating this on ok meant a
+    # preserved restart signal on a failed result was inert, so the wrapper sat
+    # out the interval exactly as in #862.
+    if isinstance(result.data, dict) and result.data.get("restart_requested"):
         return EXIT_RESTART_REQUESTED
 
     return 0 if result.ok else 1

@@ -474,6 +474,50 @@ def test_cli_maps_a_deliberate_stop_to_zero(monkeypatch: pytest.MonkeyPatch) -> 
     assert cli.main(["fleet", "supervise"]) == 0
 
 
+def test_cli_maps_restart_requested_even_on_a_failed_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ "Replace me" is orthogonal to "I succeeded".
+
+    A supervisor that self-deployed and then hit an error still has new code on
+    disk and still needs replacing -- relaunching is the recovery, not a reward
+    for a clean run. This was gated on ``result.ok``, which made the preserved
+    restart reason on an aborted run inert: exit 1, no relaunch, fleet
+    unsupervised for the interval. That is #862 reached through the error path
+    instead of the happy path.
+    """
+
+    def _fake_run_fleet_supervise(**_kwargs: Any) -> CommandResult:
+        return CommandResult(
+            False,
+            "fleet supervisor aborted on pass 1: state file locked",
+            {"exit_reason": "self_deploy", "restart_requested": True},
+        )
+
+    monkeypatch.setattr(cli, "run_fleet_supervise", _fake_run_fleet_supervise)
+
+    assert cli.main(["fleet", "supervise"]) == cli.EXIT_RESTART_REQUESTED
+
+
+def test_cli_maps_a_plain_failure_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control for the test above: ok=False without a restart reason stays 1.
+
+    Ungating the restart code from ``ok`` must not turn every failure into a
+    relaunch request -- only the ones that actually asked to be replaced.
+    """
+
+    def _fake_run_fleet_supervise(**_kwargs: Any) -> CommandResult:
+        return CommandResult(
+            False,
+            "fleet supervisor aborted on pass 1: boom",
+            {"exit_reason": "aborted", "restart_requested": False},
+        )
+
+    monkeypatch.setattr(cli, "run_fleet_supervise", _fake_run_fleet_supervise)
+
+    assert cli.main(["fleet", "supervise"]) == 1
+
+
 def test_cli_fleet_supervise_loop_forwards_args_after_the_separator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

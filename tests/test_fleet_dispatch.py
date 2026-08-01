@@ -1573,7 +1573,12 @@ def test_run_fleet_supervise_loop_reports_ok_when_the_cap_is_hit() -> None:
     crashed" into one indistinguishable code. That is #862's own defect shape
     one layer up, so the cap is signalled by the event and log instead.
     """
-    result = run_fleet_supervise_loop(spawn=lambda _n: EXIT_RESTART_REQUESTED, max_relaunches=2)
+    recorded: list[object] = []
+    result = run_fleet_supervise_loop(
+        spawn=lambda _n: EXIT_RESTART_REQUESTED,
+        max_relaunches=2,
+        on_cap_reached=recorded.append,
+    )
 
     assert result.ok is True
     assert result.data["cap_reached"] is True
@@ -1582,6 +1587,8 @@ def test_run_fleet_supervise_loop_reports_ok_when_the_cap_is_hit() -> None:
     # Never exit 3 upward: the wrapper is the thing that consumed the restart
     # request, so re-signalling it would ask the launcher to relaunch too.
     assert "restart_requested" not in result.data
+    # ok=True is only defensible because the cap still announces itself.
+    assert len(recorded) == 1
 
 
 def test_run_fleet_supervise_loop_distinguishes_a_cap_from_an_abort() -> None:
@@ -1591,16 +1598,42 @@ def test_run_fleet_supervise_loop_distinguishes_a_cap_from_an_abort() -> None:
     is that a crash keeps exit 1 to itself. If that ever stopped being true the
     cap's ok=True would be hiding real failures rather than disambiguating them.
     """
-    capped = run_fleet_supervise_loop(spawn=lambda _n: EXIT_RESTART_REQUESTED, max_relaunches=1)
-    aborted = run_fleet_supervise_loop(spawn=lambda _n: 1, max_relaunches=1)
+    capped_events: list[object] = []
+    aborted_events: list[object] = []
+    capped = run_fleet_supervise_loop(
+        spawn=lambda _n: EXIT_RESTART_REQUESTED,
+        max_relaunches=1,
+        on_cap_reached=capped_events.append,
+    )
+    aborted = run_fleet_supervise_loop(
+        spawn=lambda _n: 1, max_relaunches=1, on_cap_reached=aborted_events.append
+    )
 
     assert (capped.ok, capped.data["cap_reached"]) == (True, True)
     assert (aborted.ok, aborted.data["cap_reached"]) == (False, False)
+    assert (len(capped_events), len(aborted_events)) == (1, 0)
+
+
+def test_run_fleet_supervise_loop_does_not_touch_the_real_state_file() -> None:
+    """The cap callback must be injectable, not resolved from the live repo.
+
+    Its default writes through ``orchestrator_root()`` to the real ``events.db``
+    and ``state.json`` -- the ones the running supervisor owns. A cap test using
+    defaults therefore injects fake events into production and contends for the
+    live state lock. Asserting the parameter exists is what keeps the next cap
+    test from quietly reaching production again.
+    """
+    import inspect
+
+    signature = inspect.signature(run_fleet_supervise_loop)
+    assert "on_cap_reached" in signature.parameters
 
 
 def test_run_fleet_supervise_loop_propagates_a_child_failure() -> None:
     """An aborted supervisor stays non-ok rather than being masked by the wrapper."""
-    result = run_fleet_supervise_loop(spawn=lambda _n: 1, max_relaunches=3)
+    result = run_fleet_supervise_loop(
+        spawn=lambda _n: 1, max_relaunches=3, on_cap_reached=lambda _r: None
+    )
 
     assert result.ok is False
     assert result.data["last_exit_code"] == 1
@@ -1770,6 +1803,11 @@ def test_run_fleet_supervise_respects_max_runtime(
     assert result.data["passes"] == 1
     assert mock_fleet_loop.call_count == 1
     assert fc.sleep_calls == [7.0]
+    # A runtime budget expiring is a deliberate stop, not a request to be
+    # replaced -- it shares ok=True with the restarting exits, so this field is
+    # the only thing keeping the wrapper from relaunching forever.
+    assert result.data["exit_reason"] == "max_runtime"
+    assert result.data["restart_requested"] is False
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -2098,6 +2136,136 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A failure in post-loop bookkeeping must not suppress the restart signal.
+
+    ``record_zero_pass_streak`` runs after the loop and does real file I/O
+    (mkdir, state_lock, log_event); its own docstring says it can raise. It used
+    to sit bare inside the outer ``try``, whose handler rewrote ``exit_reason``
+    to ``aborted`` and ``restart_requested`` to False unconditionally. So a
+    self-deploy that pulled new code, followed by a counter write failing on a
+    locked state file, produced an exit the wrapper read as "do not relaunch" --
+    the #862 outage, reachable through a secondary failure that has nothing to
+    do with whether new code is on disk.
+
+    The important assertion is ``restart_requested``, not ``ok``: the run really
+    did fail, so ok=False is correct. What must survive is the instruction to
+    replace this process.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=True,
+            head_changed=True,
+            from_sha="abc123",
+            to_sha="def456",
+            message="updated and synced: def456",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("state file locked by another process")
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.record_zero_pass_streak", _boom)
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.data["exit_reason"] == "self_deploy"
+    assert result.data["restart_requested"] is True
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_an_operator_interrupt_never_asks_to_be_relaunched(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Ctrl-C means stop, and a wrapper that relaunched would defeat that.
+
+    ``interrupted`` is a named reason rather than an unset default precisely so
+    this intent is stated and testable. Nothing verified it when the vocabulary
+    was introduced, which left the one exit an operator triggers by hand relying
+    on ``None`` happening to fall outside ``RESTART_EXIT_REASONS``.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.side_effect = KeyboardInterrupt()
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.data["exit_reason"] == "interrupted"
+    assert result.data["restart_requested"] is False
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_a_mid_loop_crash_reports_aborted_and_does_not_relaunch(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A crash with no restarting reason already set stays non-restarting.
+
+    The control for
+    ``test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart``:
+    that test proves an already-set reason survives the handler, and this one
+    proves the handler did not simply start relaunching on every exception.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.side_effect = RuntimeError("boom")
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is False
+    assert result.data["exit_reason"] == "aborted"
+    assert result.data["restart_requested"] is False
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
 def test_run_fleet_supervise_does_not_restart_when_already_up_to_date(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
@@ -2253,6 +2421,12 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     assert deploy_mock.call_count == 1
     # fleet_loop must never run with stale code.
     assert mock_fleet_loop.call_count == 0
+    # head_drift is the OTHER half of the restart contract (RESTART_EXIT_REASONS
+    # holds exactly self_deploy and head_drift). Only self_deploy was asserted
+    # when the field was introduced, so an edit dropping the reason here would
+    # have left drift silently non-restarting with every test still green.
+    assert result.data["exit_reason"] == "head_drift"
+    assert result.data["restart_requested"] is True
 
 
 @patch("charlie_work.fleet_dispatch.emit_digest")
