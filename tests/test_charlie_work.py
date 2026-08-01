@@ -94,6 +94,27 @@ from charlie_work.devin_shell import SessionRecord
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
 
+def future_timestamp(*, days: int = 3650) -> str:
+    """An ISO-8601 ``Z`` timestamp guaranteed to be in the future.
+
+    Several state predicates decide behaviour by comparing a stored timestamp
+    against ``datetime.now(UTC)`` -- ``is_reviewer_quota_exhausted`` (true only
+    while ``throttled_until`` is future), ``is_reviewer_probe_ready``,
+    ``is_throttled``. A test that hardcodes an absolute date to satisfy one of
+    those preconditions is a time bomb: it passes until wall-clock time crosses
+    the literal, then fails permanently, on every branch at once.
+
+    That is not a theoretical concern -- a hardcoded ``2026-08-01T00:00:00Z``
+    did exactly this, turning every open PR and main itself red at that instant
+    and blocking the merge lane. Use this helper for any timestamp whose
+    *futureness* is load-bearing.
+
+    Timestamps that are merely round-tripped or compared for equality do not
+    need this; an absolute literal is clearer there, and stable.
+    """
+    return (datetime.now(UTC) + timedelta(days=days)).isoformat().replace("+00:00", "Z")
+
+
 @pytest.fixture(autouse=True)
 def _stub_real_activity_probe_for_stalled_tests(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
@@ -12455,25 +12476,40 @@ def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_fai
         set_throttled_until,
     )
 
-    state = set_reviewer_quota_exhausted(
-        empty_state(), throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
-    )
+    # The reviewer-quota throttle MUST be derived from now, never hardcoded.
+    # ``clear_quota_throttles`` only resets ``consecutive_probe_failures`` when
+    # ``is_reviewer_quota_exhausted(data) or cleared_root`` holds, and
+    # ``is_reviewer_quota_exhausted`` is true only while ``throttled_until`` is
+    # still in the future (``datetime.now(UTC) < throttle_time``). This test
+    # deliberately uses a *devin* root throttle below so ``cleared_root`` is
+    # False, which makes the exhaustion check the sole path to the reset --
+    # so the instant a hardcoded date goes stale, the assertion below flips
+    # from testing the reset to testing nothing, and fails.
+    #
+    # This is not hypothetical: this test pinned "2026-08-01T00:00:00Z" and
+    # began failing on every PR and on main at exactly that instant, blocking
+    # the merge lane until the date was made relative.
+    future = future_timestamp(days=3650)
+    # Opaque by contrast: the root throttle is only ever round-tripped and
+    # compared for equality, never against the clock, so an absolute literal is
+    # safe here and keeps the "untouched" assertion easy to read.
+    root_throttle = "2026-08-01T00:00:00Z"
+
+    state = set_reviewer_quota_exhausted(empty_state(), throttled_until=future, probe_after=future)
     state = {
         **state,
         "reviewer_quota": {**state["reviewer_quota"], "consecutive_probe_failures": 3},
     }
     # Also carry a devin-adapter root throttle, to confirm reviewer_quota
     # clears independently of what the root-throttle branch decides.
-    state = set_throttled_until(
-        state, "2026-08-01T00:00:00Z", reason="rate_limited", adapter_kind="devin"
-    )
+    state = set_throttled_until(state, root_throttle, reason="rate_limited", adapter_kind="devin")
 
     cleared = clear_quota_throttles(state)
 
     assert "throttled_until" not in cleared["reviewer_quota"]
     assert cleared["reviewer_quota"]["consecutive_probe_failures"] == 0
     # The devin adapter's root throttle must still be untouched.
-    assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+    assert cleared["throttled_until"] == root_throttle
 
 
 def test_clear_quota_throttles_records_last_probe_cleared_at() -> None:
