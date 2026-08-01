@@ -19070,6 +19070,47 @@ def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> No
     assert result == {100, 300, 400}, f"Expected {{100, 300, 400}}, got {result}"
 
 
+def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #870: are_issues_open() was a fully serial, uncached, one
+    `gh issue view` per number loop. Every distinct blocker issue number must
+    now cost exactly one `gh issue view` call per status()/orchestrator pass,
+    no matter how many separate callers ask about it or how much the
+    requested number lists overlap -- mirroring the existing per-pass cache
+    contract already proven for branch_protection()
+    (test_branch_protection_caches_per_pass).
+    """
+    calls: list[int] = []
+
+    def fake_run(command, **kwargs):
+        # command: ["gh", "issue", "view", "<number>", "--json", ...]
+        number = int(command[3])
+        calls.append(number)
+        payload = json.dumps({"number": number, "state": "OPEN" if number != 200 else "CLOSED"})
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    # Two overlapping requests, as _filter_blocked_issues and _summarize_issue
+    # would each independently make for two issues sharing a blocker.
+    first = gh.are_issues_open([100, 200])
+    second = gh.are_issues_open([100, 200, 300])
+
+    assert first == {100}
+    assert second == {100, 300}
+    # 100 and 200 must not be re-fetched by the second, overlapping call;
+    # only the genuinely new number (300) costs a live call.
+    assert sorted(calls) == [100, 200, 300]
+
+    # invalidate_list_cache() (called once per orchestrator pass) must force
+    # a fresh read on the next call -- never leaking across passes.
+    gh.invalidate_list_cache()
+    gh.are_issues_open([100])
+    assert calls.count(100) == 2
+
+
 # --- Issue #18: idempotence of ship-it and loop --------------------------------
 
 
@@ -30016,6 +30057,52 @@ def test_github_dependencies_successful_parse(tmp_path: Path) -> None:
     assert result == [100, 200]
 
 
+def test_get_github_issue_dependencies_caches_successful_result_per_pass(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #870: get_github_issue_dependencies() made one live `gh api`
+    call per invocation, with zero caching -- called once per ready issue
+    from _get_open_blockers, and _get_open_blockers itself is called once per
+    issue from *two* separate places (_filter_blocked_issues and
+    _summarize_issue), so every ready issue's dependencies were fetched
+    twice per status() call. A successful resolution for a given issue
+    number must now cost exactly one live call per pass.
+
+    Uses the real GitHub (not FakeGitHub, whose `run()` has its own
+    dependencies_response stand-in and doesn't exercise the production
+    _list_cache path) with subprocess.run mocked.
+    """
+    from charlie_work.github import get_github_issue_dependencies
+
+    calls: list[str] = []
+
+    def fake_run(command, **kwargs):
+        # command: ["gh", "api", "repos/{owner}/{repo}/issues/<N>/dependencies/blocked_by"]
+        calls.append(command[2])
+        payload = json.dumps([{"number": 200}])
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    first = get_github_issue_dependencies(gh, 100)
+    second = get_github_issue_dependencies(gh, 100)
+
+    assert first == [200]
+    assert second == [200]
+    assert len(calls) == 1  # second call is a pure cache hit, no live fetch
+
+    # A different issue number is a distinct cache key -- costs a fresh read.
+    get_github_issue_dependencies(gh, 101)
+    assert len(calls) == 2
+
+    # invalidate_list_cache() (called once per orchestrator pass) must force
+    # a fresh read on the next call for the same issue number.
+    gh.invalidate_list_cache()
+    get_github_issue_dependencies(gh, 100)
+    assert len(calls) == 3
+
+
 def test_cancel_superseded_runs_no_workflow_name(tmp_path: Path) -> None:
     """Test that cancel_superseded_runs returns error when workflow_name is empty."""
     from charlie_work.github import cancel_superseded_runs
@@ -30402,6 +30489,166 @@ def test_status_includes_blocked_section(tmp_path: Path) -> None:
 
     # available_issue_count should exclude blocked issues
     assert result.data["available_issue_count"] == 0
+
+
+def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #870: `fleet status --json` measured at 90s-184s wall clock,
+    almost entirely (169s of 184s in the diagnosed baseline) spent in serial,
+    uncached `gh` subprocess calls made by _get_open_blockers -- once per
+    ready issue from _filter_blocked_issues, and AGAIN once per ready issue
+    from _summarize_issue. Two ready issues sharing a declared blocker (the
+    diagnosed case: issues #887/#888 both blocked by #886) meant the shared
+    blocker's `gh issue view` was fetched 4 times, and each issue's own
+    dependencies-API call was fetched twice.
+
+    This uses a real GitHub (not the hand-rolled FakeGitHub used elsewhere in
+    this file, which has its own non-caching are_issues_open/dependencies
+    stand-ins and would not exercise the production caching path at all) with
+    subprocess.run mocked, so every `gh` invocation status() actually makes is
+    visible and countable.
+
+    Two ready issues (887, 888) both declare the same open blocker (886) via
+    GitHub-native dependencies. Before the fix: 2 dependency-API calls x2
+    (once per _filter_blocked_issues, once per _summarize_issue) = 4, plus
+    886's issue-view fetched once per calling issue x2 duplicate passes = 4.
+    After the fix: each unique resource is fetched exactly once per status()
+    call, regardless of how many internal consumers ask for it.
+    """
+    calls: list[list[str]] = []
+    # Thread name recorded alongside each dependencies-API call, so the test
+    # can assert the fan-out actually ran concurrently -- not just that the
+    # call count was deduped. A regression that replaced the ThreadPoolExecutor
+    # in _prefetch_blocker_data with a plain serial loop would still pass every
+    # call-count assertion below; this is what catches that specifically.
+    #
+    # A 2-party barrier forces both dependency-API calls to be in flight at
+    # once: with the mocked (near-instant) gh call, ThreadPoolExecutor's lazy
+    # thread creation would otherwise let the first task finish and its
+    # thread go idle before the second task is even submitted, so both would
+    # land on the same reused thread despite running through a real
+    # ThreadPoolExecutor -- a false negative, not evidence of a serial loop.
+    # Blocking each call on the barrier until both have arrived guarantees a
+    # second thread must be spawned to service the second call. Bounded with
+    # a timeout so a future regression (e.g. back to one call) fails fast
+    # with BrokenBarrierError instead of hanging the test.
+    dependency_call_threads: list[str] = []
+    dependency_call_barrier = threading.Barrier(2, timeout=5)
+
+    def make_issue(number: int) -> dict[str, Any]:
+        return {
+            "number": number,
+            "title": f"Issue {number}",
+            "url": f"https://example.test/issues/{number}",
+            "body": "",
+            "labels": [{"name": "automated-ready"}],
+            "author": {"login": "tester"},
+            "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "state": "OPEN",
+        }
+
+    ready_issues = [make_issue(887), make_issue(888)]
+    # Both 887 and 888 declare 886 as a GitHub-native dependency.
+    dependencies_by_issue = {887: [886], 888: [886]}
+
+    def fake_run(command, **kwargs):
+        args = command[1:]  # drop leading "gh"
+        if args and args[-2:] == ["--json", "nonexistent"]:
+            # OrchestratorApp.__init__'s validate_field_lists() startup probe
+            # (github.py: GitHub.validate_field_lists) -- not part of the
+            # behavior under test, so satisfy it generically by unioning
+            # every field-list constant it checks, rather than hand-picking
+            # (and inevitably under-covering) a subset here.
+            all_field_list_constants = [
+                "ISSUE_LIST_FIELDS",
+                "ISSUE_VIEW_FIELDS",
+                "PR_LIST_FIELDS",
+                "MERGED_PR_LIST_FIELDS",
+                "PR_VIEW_FIELDS",
+                "PR_CHECKS_FIELDS",
+                "LABEL_LIST_FIELDS",
+                "RECONCILE_PR_FIELDS",
+                "RECONCILE_ISSUE_FIELDS",
+                "RUN_LIST_FIELDS",
+            ]
+            available_fields = sorted(
+                {
+                    field
+                    for name in all_field_list_constants
+                    for field in getattr(github_module, name).split(",")
+                }
+            )
+            stderr = (
+                'Unknown JSON field: "nonexistent"\nAvailable fields:\n  '
+                + "\n  ".join(available_fields)
+                + "\n"
+            )
+            return subprocess.CompletedProcess(
+                args=command, returncode=1, stdout="", stderr=stderr
+            )
+
+        calls.append(command)
+        if args[:2] == ["issue", "list"]:
+            payload = json.dumps(ready_issues)
+        elif args[:2] == ["pr", "list"]:
+            payload = json.dumps([])
+        elif args[:2] == ["issue", "view"]:
+            number = int(args[2])
+            payload = json.dumps({"number": number, "state": "OPEN"})
+        elif args[0] == "api" and "dependencies/blocked_by" in args[1]:
+            dependency_call_threads.append(threading.current_thread().name)
+            dependency_call_barrier.wait()
+            number = int(args[1].split("/issues/")[1].split("/")[0])
+            deps = dependencies_by_issue.get(number, [])
+            payload = json.dumps([{"number": d} for d in deps])
+        else:
+            raise AssertionError(f"Unexpected gh command in status(): {command}")
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = github_module.GitHub(repo_root=tmp_path)
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+
+    result = app.status()
+
+    assert result.ok is True
+    # Both issues correctly identified as blocked by the still-open #886 --
+    # the fix must not change the *answer*, only how many times it's fetched.
+    assert result.data["available_issue_count"] == 0
+    blocked_by_issue = {b["issue"]: b["blockers"] for b in result.data["blocked"]}
+    assert blocked_by_issue == {887: [886], 888: [886]}
+    summaries = {s["number"]: s["dependencies"] for s in result.data["issues"]}
+    assert summaries[887] == {"declared": [886], "open": [886]}
+    assert summaries[888] == {"declared": [886], "open": [886]}
+
+    dependency_calls = [c for c in calls if c[1] == "api" and "dependencies/blocked_by" in c[2]]
+    issue_view_calls = [c for c in calls if c[1:3] == ["issue", "view"]]
+
+    # One dependencies-API call per ready issue (887, 888) -- not one per
+    # (issue, consumer) pair. Before the fix this was 4 (2 issues x 2
+    # consumers: _filter_blocked_issues and _summarize_issue).
+    assert len(dependency_calls) == 2
+    assert {int(c[2].split("/issues/")[1].split("/")[0]) for c in dependency_calls} == {887, 888}
+
+    # Exactly one issue-view call for the shared blocker #886 -- not one per
+    # (blocker, calling issue) pair. Before the fix this was 4 (886 looked up
+    # once per calling issue x 2 duplicate passes).
+    assert len(issue_view_calls) == 1
+    assert issue_view_calls[0][3] == "886"
+
+    # The dedup assertions above would still pass if _prefetch_blocker_data's
+    # ThreadPoolExecutor were replaced by a plain serial loop -- call *counts*
+    # don't distinguish parallel from sequential. The 74% wall-clock reduction
+    # (184.39s -> 47.9s, issue #870) came from the fan-out, not just the
+    # caching, so assert the two dependency-API calls actually ran on
+    # different threads.
+    assert len(dependency_call_threads) == 2
+    assert len(set(dependency_call_threads)) == 2
 
 
 def test_status_includes_stalled_section(tmp_path: Path) -> None:
