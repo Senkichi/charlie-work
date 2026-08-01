@@ -16,9 +16,7 @@ $branch_name
 
 ## Issue body
 
-```md
-$issue_body
-```
+$issue_body_block$issue_comments
 
 $section_scope_contract
 

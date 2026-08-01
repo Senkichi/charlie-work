@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -58,6 +59,7 @@ from .cross_family import (
 from .github import (
     GitHub,
     GitHubError,
+    GitHubLike,
     GitHubNotFoundError,
     GitHubRunResult,
     GraphQLBudgetError,
@@ -71,6 +73,8 @@ from .github import (
     linked_issue_number,
     parse_blockers,
 )
+from .issue_comments import render_issue_comments
+from .markdown_fence import fenced_block
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
@@ -786,6 +790,12 @@ def parse_issue_numbers(only_issues: str) -> list[int]:
 # pass prevents one stuck recovery candidate from starving the queue (issue #506).
 _MAX_RECOVERY_RETRY_PER_PASS = 1
 
+# Bound on concurrent `gh` subprocesses spawned by _prefetch_blocker_data() to
+# warm the dependency cache across every ready issue. I/O-bound fan-out width,
+# not a CPU budget; kept modest to stay clear of GitHub's secondary rate
+# limits. See issue #870.
+_MAX_PREFETCH_WORKERS = 8
+
 
 def _is_recovery_candidate(
     issue: dict[str, Any],
@@ -1042,6 +1052,15 @@ def _detect_and_handle_stalled_sessions(
     persisted to state.json (same as the dead-session lane) so the next
     dispatch pass defers instead of relaunching into the same window. A
     session_stalled event is logged with the resolved failure_kind.
+
+    Issue #873: the reap event's *kind* now follows the worker's health.
+    ``WorkerHealth.STALLED`` (a live process that stopped progressing) keeps
+    the error-level ``session_stalled``; ``WorkerHealth.DEAD`` (the process is
+    already gone — equally the normal end of a worker that finished and
+    exited) emits the warning-level ``session_exited``. The handling is
+    deliberately still shared; only the classification splits. Both payloads
+    carry ``worker_health`` so the distinction is recorded rather than
+    inferred from an empty ``killed_pids``.
 
     ``now`` (issue #828) is the injectable clock for this sweep, following
     the convention established by PR #827. It is sampled once here and
@@ -1327,15 +1346,41 @@ def _detect_and_handle_stalled_sessions(
                 }
             )
 
+            # Issue #873: STALLED and DEAD share this handling path, and that
+            # sharing is deliberate — the cleanup (reap the tree, free the
+            # slot) is identical for both. What they must NOT share is a
+            # *classification*. STALLED is a live process that stopped making
+            # progress: a genuine fault. DEAD means the process is already
+            # gone, which is equally the normal terminal state of every worker
+            # that finished its work and exited. Emitting one error-level kind
+            # for both filed successful completions as faults in the
+            # error-level stream that #864/#866 added the first consumer for
+            # (scripts/heartbeat_check.check_error_events).
+            #
+            # The reporting lane (``_detect_stalled_sessions``) already kept
+            # ``health.name`` in its entry; only this handling lane discarded
+            # the distinction at the point of emission. Both the event kind and
+            # the new ``worker_health`` payload field now carry it, so the
+            # split is recorded rather than inferred from ``killed_pids``.
+            #
+            # ``session_exited`` is deliberately not named
+            # ``session_completed``: process liveness proves the worker is
+            # gone, not that it succeeded. For the same reason it is a warning
+            # rather than info — this change does not establish the
+            # clean-exit-vs-crash split, and info would encode a claim the
+            # evidence does not support.
+            event_kind = "session_stalled" if health is WorkerHealth.STALLED else "session_exited"
+
             with state_lock(state_file):
                 state = load_state(state_file)
                 state = append_event(
                     state,
-                    "session_stalled",
+                    event_kind,
                     {
                         "issue_number": w.issue_number,
                         "pid": w.pid,
                         "process_start_time": w.process_start_time,
+                        "worker_health": health.name,
                         "log_mtime": str(datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)),
                         "last_log_line": last_log_line,
                         "killed_pids": killed_pids,
@@ -2968,7 +3013,7 @@ def _reap_completed_review_checkouts(
 
 
 def _reap_orphaned_review_checkouts(
-    gh: GitHub,
+    gh: GitHubLike,
     repo_root: Path,
     reviews_dir: Path,
     state_file: Path,
@@ -3156,7 +3201,7 @@ def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
     config: OrchestratorConfig,
-    gh: GitHub,
+    gh: GitHubLike,
     *,
     review_callback: Callable[[int], Any] | None = None,
 ) -> None:
@@ -3814,7 +3859,7 @@ def _rework_pr_for_worker(
 
 def _reap_restore_rework_requested(
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     open_prs_by_issue: dict[int, list[dict[str, Any]]],
     worker: WorkerView,
@@ -4280,6 +4325,52 @@ def _is_verdict_newer_than_brief(decision_path: Path, brief_path: Path) -> bool:
     return decision_path.stat().st_mtime_ns > brief_path.stat().st_mtime_ns
 
 
+def _render_rework_prompt(
+    state_file: Path,
+    pr: dict[str, Any],
+    issue_number: int | None,
+    dispatch_note: str,
+    config: OrchestratorConfig,
+    *,
+    repo_root: Path | None = None,
+) -> str:
+    """Render the rework brief text for a PR, without writing anything.
+
+    Split out of ``_write_rework_prompt`` for issue #800 so ``dispatch_rework``
+    can compare the brief a *current* renderer would produce against the bytes
+    already on disk. Rendering is a pure function of the verdict file, the
+    dispatch note, and the template set, so re-rendering an unchanged brief
+    reproduces it exactly — which is what lets the caller detect renderer drift
+    without rewriting (and re-timestamping) every brief it inspects.
+    """
+    pr_number = int(pr["number"])
+    pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
+    decision = _read_review_decision(pr_dir / "review-decision.json")
+    required_changes_section = _render_required_changes_section(decision)
+    return render_prompt(
+        config.dispatch.rework_template,
+        {
+            "pr_number": pr_number,
+            "pr_title": pr.get("title", ""),
+            "pr_url": pr.get("url", ""),
+            "issue_number": issue_number or "UNKNOWN",
+            # The raw note stays available to templates; no shipped one
+            # references it since #883.
+            "dispatch_note": defang_closing_keywords(dispatch_note),
+            # Pre-fenced, not bare, for the same reason as ``issue_body_block``
+            # (#883): reviewer prose quotes pytest output and shell commands,
+            # so it carries its own fences -- measured at 16 of 289 summaries
+            # on disk, with pr-182's brief a rendered example of the break.
+            # The width depends on the note's own backtick runs, so it cannot
+            # be written in the template.
+            "dispatch_note_block": fenced_block(defang_closing_keywords(dispatch_note), "md"),
+            "required_changes_section": required_changes_section,
+            "branch_name": pr.get("headRefName", ""),
+        },
+        search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
+    )
+
+
 def _write_rework_prompt(
     state_file: Path,
     pr: dict[str, Any],
@@ -4318,20 +4409,13 @@ def _write_rework_prompt(
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
     pr_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = pr_dir / "rework-prompt.md"
-    decision = _read_review_decision(pr_dir / "review-decision.json")
-    required_changes_section = _render_required_changes_section(decision)
-    prompt = render_prompt(
-        config.dispatch.rework_template,
-        {
-            "pr_number": pr_number,
-            "pr_title": pr.get("title", ""),
-            "pr_url": pr.get("url", ""),
-            "issue_number": issue_number or "UNKNOWN",
-            "dispatch_note": defang_closing_keywords(dispatch_note),
-            "required_changes_section": required_changes_section,
-            "branch_name": pr.get("headRefName", ""),
-        },
-        search_dirs=_rework_prompt_search_dirs(config, repo_root=repo_root),
+    prompt = _render_rework_prompt(
+        state_file,
+        pr,
+        issue_number,
+        dispatch_note,
+        config,
+        repo_root=repo_root,
     )
     prompt_path.write_text(prompt, encoding="utf-8")
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
@@ -4436,7 +4520,7 @@ def _is_readiness_no_ci_stall(
 
 def _route_dead_worker_to_pre_review_rework(
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     pr: dict[str, Any],
     issue_number: int,
@@ -4587,7 +4671,7 @@ def _route_dead_worker_to_pre_review_rework(
 def _classify_dead_sessions_and_update_throttle_state(
     sessions_dir: Path,
     state_file: Path,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     *,
     persist_inconclusive_probe_counter: bool = True,
@@ -5171,7 +5255,7 @@ def _classify_dead_sessions_and_update_throttle_state(
 
 def _attempt_salvage(
     *,
-    gh: GitHub,
+    gh: GitHubLike,
     config: OrchestratorConfig,
     repo_root: Path,
     worktree_path: Path,
@@ -5423,7 +5507,7 @@ class OrchestratorApp:
         repo_root: Path,
         paths: RuntimePaths,
         config: OrchestratorConfig,
-        gh: GitHub,
+        gh: GitHubLike,
         *,
         dry_run: bool = False,
         fleet_dir_override: str | None = None,
@@ -5774,6 +5858,12 @@ class OrchestratorApp:
         available_issues = [
             issue for issue in issues if self._is_dispatchable(issue, operator_claimed)
         ]
+
+        # Warm the blocker/dependency cache for every ready issue concurrently
+        # before the serial per-issue lookups below run. See
+        # _prefetch_blocker_data's docstring and issue #870: this is what
+        # turns O(N) serial `gh` calls into one parallel batch.
+        self._prefetch_blocker_data(issues)
 
         # Check for blocked issues (dependency gate)
         truly_available, blocked_issues, _open_blockers_by_issue = self._filter_blocked_issues(
@@ -8430,6 +8520,14 @@ class OrchestratorApp:
                 prior_reviewed_head_sha is None or prior_reviewed_head_sha != pr.get("headRefOid")
             ):
                 self._write_json(decision_path, decision_template)
+        # Issue #868: review_dispatch.enabled gates whether landing this PR in
+        # "reviewing" is safe. Disabled means dispatch_reviews()'s launch+reap
+        # machinery never services this state (its own internal gate skips
+        # it too), so stamping "reviewing"/agent:reviewing here would strand
+        # the PR under a label nothing runs to clear. The packet itself is
+        # still written either way — only the state/label transition is
+        # gated, so a human can still read the prompt manually.
+        dispatch_disabled = not self.config.review_dispatch.enabled
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Merge-update, never replace: wholesale assignment here used to erase
@@ -8442,7 +8540,7 @@ class OrchestratorApp:
                 "issue_number": issue_number,
                 "prompt_path": str(prompt_path),
                 "decision_path": str(decision_path),
-                "status": "reviewing",
+                **({} if dispatch_disabled else {"status": "reviewing"}),
                 "janitor_ok": True,
                 "janitor_failures": [],
                 "janitor_warnings": list(merged_warnings),
@@ -8517,7 +8615,7 @@ class OrchestratorApp:
                 ):
                     should_skip_transition = True
 
-            if not should_skip_transition:
+            if not should_skip_transition and not dispatch_disabled:
                 result = transition(self.gh, self.config.labels, issue_number, "review_started")
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -9159,18 +9257,6 @@ class OrchestratorApp:
         byte-identical; tests can freeze it and assert exact equality instead
         of a wall-clock-tolerance proximity check.
         """
-        if not self.config.review_dispatch.enabled:
-            return CommandResult(
-                True,
-                "review dispatch disabled",
-                {
-                    "selected_count": 0,
-                    "attempted_count": 0,
-                    "failed_count": 0,
-                    "launched_count": 0,
-                },
-            )
-
         resolved_now = now if now is not None else datetime.now(UTC)
         reviews_dir = self._layout.reviews_dir
 
@@ -9180,6 +9266,16 @@ class OrchestratorApp:
         # returns early and leaves dead reviewer claims stuck — blocking
         # re-dispatch after the quota resets. In dry-run mode we skip
         # these sweeps to stay read-only.
+        #
+        # Issue #868: these sweeps must ALSO run ahead of the
+        # ``review_dispatch.enabled`` gate below, for the same reason —
+        # disabling dispatch must not disable the cleanup a *previously*
+        # dispatched (or previously stamped-reviewing) claim still needs. A
+        # dead reviewer's claim that goes stale while the flag happens to be
+        # off must still be freed, or it stays stuck even after the flag is
+        # re-enabled (the reap is what makes it re-dispatchable). Before this
+        # fix these sweeps sat below the ``enabled`` early return and were
+        # unreachable whenever dispatch was disabled.
         verdict_result = {"recorded": [], "missed": []}
         if not self.dry_run:
             verdict_result = self._reap_review_verdicts(reviews_dir)
@@ -9194,14 +9290,39 @@ class OrchestratorApp:
             _reap_orphaned_review_checkouts(
                 self.gh, self.repo_root, reviews_dir, self.paths.state_file, self.config
             )
+        recorded_verdicts = verdict_result.get("recorded", [])
+        missed_verdicts = verdict_result.get("missed", [])
+
+        if not self.config.review_dispatch.enabled:
+            # Issue #868 part 3: this is a real no-op for LAUNCHING new
+            # reviewers, but the reaper sweeps above may still have done real
+            # work (freeing a stale claim). Carry that through explicitly
+            # instead of returning a bare ``ok=True`` that reads identically
+            # to "nothing happened at all" — and mark ``disabled`` so a
+            # caller doesn't have to string-match the message to tell this
+            # apart from a real dispatch pass.
+            return CommandResult(
+                True,
+                "review dispatch disabled",
+                {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "disabled": True,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
+                },
+            )
 
         # Clear the reviewer quota if any verdicts were recorded from dead
         # reviewers. This is the only proof the quota window is actually open:
         # a process that merely *started* can still die seconds later from an
         # asynchronous session-limit kill. Run before the quota gate so a
         # successful reap clears the throttle and lets the pass proceed.
-        recorded_verdicts = verdict_result.get("recorded", [])
-        missed_verdicts = verdict_result.get("missed", [])
+        # (recorded_verdicts/missed_verdicts are computed above, ahead of the
+        # disabled-gate return, so issue #868's disabled payload can report
+        # them too.)
         if not self.dry_run and recorded_verdicts:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -11111,8 +11232,19 @@ class OrchestratorApp:
                     else None,
                 )
                 escalated = pr_escalated or issue_escalated
+                # Issue #868: a second, independent call site that stamps
+                # "reviewing"/agent:reviewing — separate from review()'s own
+                # packet-generation path, which gates the same way. Disabled
+                # dispatch means nothing services "reviewing" here either, so
+                # the state/label stamp is gated on the same flag. The
+                # head_moved bookkeeping below (state field + event) stays
+                # unconditional: it's read only by this function's own next
+                # pass (via _check_carry_forward/reviewed_head_sha
+                # comparisons), never jointly with status=="reviewing", so
+                # gating just the reviewing stamp doesn't orphan it.
+                dispatch_disabled = not self.config.review_dispatch.enabled
                 if not escalated:
-                    if issue_number is not None:
+                    if issue_number is not None and not dispatch_disabled:
                         result = transition(
                             self.gh, self.config.labels, issue_number, "review_started"
                         )
@@ -11129,7 +11261,7 @@ class OrchestratorApp:
                             **state["prs"].get(str(pr_number), {}),
                             "number": pr_number,
                             "issue_number": issue_number,
-                            "status": "reviewing",
+                            **({} if dispatch_disabled else {"status": "reviewing"}),
                             "head_moved": True,
                             "reviewed_head_sha": reviewed_head_sha,
                             "live_head_sha": live_head_sha,
@@ -11276,26 +11408,36 @@ class OrchestratorApp:
             # and the merge-base gate. mergeStateStatus can lag and report CLEAN
             # while the branch is actually stale, so it is no longer authoritative.
             #
-            # Whether base freshness is required AT ALL is itself derived from
-            # GitHub branch protection (issue #812), not trusted from the
-            # `require_current_base` config constant: a repo whose protection sets
-            # `strict: false` does not require branches to be current with main, so
-            # both the pr_update_branch write below and the deferral gate are
-            # skipped entirely. See _is_base_freshness_required for the
-            # fail-closed contract on read failure. `update_branch_strategy ==
-            # "off"` additionally forces this off regardless of what protection
-            # says: with no sync mechanism at all, requiring currency would be an
-            # inescapable deadlock -- the same hazard __post_init__ already blocks
-            # for the config-only case (require_current_base=True + strategy=off).
+            # Whether base currency gates THIS merge is `require_current_base OR
+            # protection.strict` -- protection may raise the requirement, never
+            # lower it below what the operator configured (issue #875). Issue
+            # #812 made this purely protection-derived, which meant a repo
+            # running `strict: false` (as this one does, deliberately: two
+            # self-hosted runners cannot sustain strict mode) disabled its own
+            # merge gate and merged stale-base PRs whose merged tree was never
+            # tested. The broadcast sweep still uses the protection-only
+            # `_is_base_freshness_required` -- that write costs N CI cycles
+            # across every open PR, where this one costs a single cycle for the
+            # PR actually merging. See _is_base_currency_gated.
+            #
+            # This single flag intentionally drives BOTH the pr_update_branch
+            # write below and the deferral gate further down. Decoupling them --
+            # gating merges while leaving the write suppressed -- would deadlock:
+            # a stale PR would defer forever with nothing to make it current.
+            # `update_branch_strategy == "off"` forces the whole thing off
+            # regardless: with no sync mechanism at all, requiring currency would
+            # be that same inescapable deadlock -- the hazard __post_init__
+            # already blocks for the config-only case (require_current_base=True
+            # + strategy=off).
             base_current: bool | None = None
-            base_freshness_required = False
+            base_currency_gated = False
             if not sync_failed and update_branch_strategy != "off":
-                base_freshness_required = self._is_base_freshness_required(
+                base_currency_gated = self._is_base_currency_gated(
                     pr.get("baseRefName") or self.config.runners.default_branch
                 )
             if (
                 not sync_failed
-                and base_freshness_required
+                and base_currency_gated
                 and update_branch_strategy in {"front_of_train", "broadcast"}
             ):
                 base_current = self._is_base_current(pr)
@@ -11334,7 +11476,7 @@ class OrchestratorApp:
             # merge-base freshness gate: mergeStateStatus can lag, so verify
             # ancestry with the GitHub compare API before merging. Skipped
             # entirely when base freshness is not required (issue #812).
-            if not sync_failed and base_freshness_required:
+            if not sync_failed and base_currency_gated:
                 if base_current is None and update_branch_strategy not in {
                     "front_of_train",
                     "broadcast",
@@ -11768,7 +11910,15 @@ class OrchestratorApp:
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             existing = state["prs"].get(str(pr_number), {})
-            new_attempts = 0
+            # Issue #861: default to PRESERVING the prior count, not resetting
+            # to 0. A pending-only pass (checks still in flight) falls through
+            # both branches below and previously clobbered an accumulated
+            # count with 0 every time, defeating the threshold debounce.
+            # Indeterminate passes must leave the counter untouched; only a
+            # genuine-success pass (the `elif can_merge:` below) or an
+            # explicit merge (handled earlier, before this block re-reads
+            # `existing`) may zero it.
+            new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0))
             new_stale_base_deferrals = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
@@ -11780,10 +11930,13 @@ class OrchestratorApp:
                 # Issue #777(b): this counter previously had no ceiling and
                 # grew unbounded across passes (real corpus: PR #679 reached
                 # 12 and climbing) because nothing ever reset it once a
-                # rework was dispatched and pending. It is diagnostic only --
-                # the FUNCTIONAL bound on repeated conflict-rework/no-op-
-                # rework dispatch is conflict_rework_attempts/
-                # no_op_rework_attempts, enforced by
+                # rework was dispatched and pending. It is not purely
+                # diagnostic -- the merge-conflict rework-dispatch block
+                # above and the check-failure rework-dispatch block above
+                # both read this same counter as a `>= threshold` debounce
+                # gating *first*-dispatch timing -- but it does not bound
+                # *repeat* dispatch; that functional bound is
+                # conflict_rework_attempts/no_op_rework_attempts, enforced by
                 # _route_janitor_gate_failure_to_rework above. Clamp at
                 # threshold + 1 (not at threshold): clamping AT threshold
                 # would make `merge_attempt_alarm` below re-fire every pass
@@ -11896,6 +12049,17 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
+            elif can_merge:
+                # Genuine success: checks are ready (or an explicit merge/
+                # mergequeue-handoff already reset the persisted value above,
+                # which this re-read of `existing` picked up) and this is not
+                # a mergequeue-handoff failure (guaranteed by the `if` above:
+                # mergequeue_handoff_failed can only be True when can_merge is
+                # True, so if it were True this branch would not be reached).
+                # A confirmed-mergeable pass is real positive information, so
+                # it is safe -- and correct -- to zero the streak here, unlike
+                # the pending-only case above which conveys no information.
+                new_attempts = 0
             if (
                 approved
                 and can_merge
@@ -13979,6 +14143,60 @@ class OrchestratorApp:
             return None
         return bool(base_sha == merge_base_sha)
 
+    def _is_base_currency_gated(self, base_ref: str) -> bool:
+        """Return whether ``merge_ready`` must refuse to merge a stale-base PR.
+
+        This is the *merge gate* policy. It differs deliberately from
+        ``_is_base_freshness_required`` (the *broadcast sweep* policy) and the
+        difference is the entire point of issue #875.
+
+        Issue #812 made base-freshness policy protection-derived, so that a
+        repo with ``required_status_checks.strict: false`` would not burn CI
+        re-running every open PR against a base GitHub does not require it to
+        be current with. That reasoning is correct for the broadcast sweep,
+        which writes to *N* open PRs per merge.
+
+        Applying it to the merge gate too was the defect. This repo runs
+        ``strict: false`` (a deliberate capacity decision -- two self-hosted
+        runners cannot sustain strict mode), so the gate derived "currency not
+        required" and disabled *itself*. ``_is_base_current`` was still correct
+        and still failed closed; it was simply never reached. An approved PR
+        whose base had advanced merged without its merged tree ever being
+        tested, which is how ``main`` went red (both parents green, merge
+        untested -- the same class as #853 x #865).
+
+        So protection may *raise* the requirement, never *lower* it below what
+        the operator asked for:
+
+            gated = require_current_base OR protection_strict
+
+        - ``strict: true`` + ``require_current_base=False`` -> gated (unchanged
+          from #812: protection-derived enforcement still works for operators
+          who opted out in config).
+        - ``strict: false`` + ``require_current_base=True`` -> gated. **This is
+          the #875 fix.** Previously ungated.
+        - protection unreadable -> falls through to
+          ``_is_base_freshness_required``'s fail-closed contract, which returns
+          ``require_current_base``.
+
+        Cost: one ``pr_update_branch`` + one CI cycle for the single PR that is
+        actually merging, not N cycles across every open PR -- the broadcast
+        sweep keeps calling ``_is_base_freshness_required`` and keeps #812's
+        saving. The real cost is serialization: each merge staleness-invalidates
+        the next PR in the lane, which must then rebase and wait for CI before
+        it can land. That is the intended trade -- a slower lane against a lane
+        that merges untested trees.
+
+        Scope limit: this gate cannot retract a PR already handed to Aviator
+        MergeQueue (``already_in_mergequeue`` suppresses the write, and the
+        deferral does not remove the label), and it cannot stop a human
+        pressing merge in the GitHub UI. It prevents the *initial* handoff of a
+        stale PR, which is the path the orchestrator controls.
+        """
+        if self.config.auto_merge.require_current_base:
+            return True
+        return self._is_base_freshness_required(base_ref)
+
     def _is_base_freshness_required(self, base_ref: str) -> bool:
         """Return whether base currency is actually required for ``base_ref``.
 
@@ -15877,20 +16095,100 @@ class OrchestratorApp:
                     f"missing rework prompt: {rework_prompt_path}"
                 )
                 continue
-            # Issue #632: the brief on disk is authoritative and can drift
-            # arbitrarily far from a corrected verdict (an operator
-            # hand-editing review-decision.json is the #510 case). Regenerate
-            # it from the verdict + the preserved dispatch-note sidecar when
-            # the verdict is newer than the brief, so a stale brief cannot
-            # outlive a corrected verdict. The note sidecar is written by
-            # _write_rework_prompt; if it is absent (a brief predating the
-            # fix) the brief is regenerated with an empty note — the findings
-            # are the critical part and must not stay hidden.
+            # The brief on disk is authoritative and dispatch_rework reads it
+            # verbatim, so it must be checked for staleness before dispatch.
+            # It can go stale along two independent axes:
+            #
+            #   1. The verdict content changed under it — an operator
+            #      hand-editing review-decision.json is the #510 case, and
+            #      issue #632 added the mtime comparison that catches it.
+            #   2. The *renderer* changed under an untouched verdict — issue
+            #      #800. No timestamp moves, so axis 1's check cannot see it.
+            #
+            # Axis 2 subsumes axis 1 wherever the dispatch note can be
+            # replayed from its sidecar, so the sidecar decides which check
+            # runs; see the two branches below.
             decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
-            if _is_verdict_newer_than_brief(decision_path, rework_prompt_path):
-                note_path = self.paths.prs / f"pr-{pr_number}" / "rework-dispatch-note.txt"
-                dispatch_note = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
-                self._write_rework_prompt(pr, issue_number, dispatch_note)
+            note_path = self.paths.prs / f"pr-{pr_number}" / "rework-dispatch-note.txt"
+            # The sidecar is what makes re-rendering non-lossy, so an
+            # unreadable one is treated exactly like an absent one: fall back
+            # to the mtime gate rather than regenerate with an empty note.
+            try:
+                dispatch_note = (
+                    note_path.read_text(encoding="utf-8") if note_path.exists() else None
+                )
+            except (OSError, UnicodeDecodeError):
+                dispatch_note = None
+            # A missing verdict is the other way re-rendering could lose
+            # information: _render_required_changes_section would fall to its
+            # Tier 3 "REVIEWER FINDINGS UNAVAILABLE" placeholder and overwrite
+            # a brief that still has real findings in it. Without the verdict
+            # there is no way to produce a *better* brief, only a worse one,
+            # so leave it alone — same failure direction as the sidecar guard.
+            if dispatch_note is not None and decision_path.exists():
+                # Issue #800: the mtime comparison above only sees one of the
+                # two ways a brief goes stale. It catches *verdict content*
+                # drift, but a brief also goes stale when the **renderer**
+                # changes underneath an untouched verdict — 35c072d adding
+                # tier-2/3 fallbacks to _render_required_changes_section, or
+                # #883 rewriting rework.md's fences. Nothing about that makes
+                # the verdict newer, so every brief already on disk kept
+                # rendering through the old code indefinitely.
+                #
+                # A template/renderer digest (the #592 approach) would not fix
+                # this: #800's own trigger was a change to Python, not to a
+                # template. So re-render unconditionally and diff instead —
+                # that is axis-agnostic by construction and cannot miss a
+                # staleness source nobody has enumerated yet.
+                #
+                # Writing stays conditional on the content actually differing.
+                # An unconditional write would churn the brief mtime that
+                # _is_verdict_newer_than_brief reads, on every pass.
+                #
+                # Reading the brief is new failure surface on a path that
+                # previously never opened it, and this loop body has no
+                # per-issue exception handling — an unreadable brief would
+                # abort the whole pass for every *other* issue too. Treat it
+                # as "differs": the note is in hand, so regenerating is both
+                # safe and the right repair for an unreadable file.
+                try:
+                    current_brief: str | None = rework_prompt_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    current_brief = None
+                expected_brief = _render_rework_prompt(
+                    self.paths.state_file,
+                    pr,
+                    issue_number,
+                    dispatch_note,
+                    self.config,
+                    repo_root=self.repo_root,
+                )
+                if expected_brief != current_brief:
+                    verdict_newer = _is_verdict_newer_than_brief(decision_path, rework_prompt_path)
+                    self._write_rework_prompt(pr, issue_number, dispatch_note)
+                    log_event(
+                        self.paths.state_file,
+                        "rework_brief_regenerated",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            # Which axis moved: a newer verdict is the #632
+                            # case the mtime gate already covered; anything
+                            # else is renderer/template drift (#800), which
+                            # was previously undetectable.
+                            "reason": "verdict_newer" if verdict_newer else "renderer_drift",
+                        },
+                        repo=self.repo_root.name,
+                    )
+            elif _is_verdict_newer_than_brief(decision_path, rework_prompt_path):
+                # No usable sidecar: a brief predating #632, whose dispatch note
+                # exists only inside the rendered markdown. Re-rendering it
+                # would silently drop that note, so the unconditional path
+                # above is gated on the inputs being reproducible. Fall back
+                # to the mtime gate, which regenerates with an empty note
+                # only when a newer verdict makes the findings worth more
+                # than the lost prose.
+                self._write_rework_prompt(pr, issue_number, "")
             # Rescue tier (issue #555): rescue-marked PRs bypass per-issue
             # adapter routing — they always launch via the claude-code adapter
             # pinned to rescue.worker_model, regardless of the primary
@@ -16535,6 +16833,71 @@ class OrchestratorApp:
         )
         return "dispatch_failed", None, state
 
+    def _prefetch_blocker_data(self, issues: list[dict[str, Any]]) -> None:
+        """Warm the GitHub client's per-pass cache for blocker lookups.
+
+        ``status()`` runs ``_get_open_blockers`` once per ready issue via both
+        ``_filter_blocked_issues`` and ``_summarize_issue`` -- and until issue
+        #870, each call issued a live, uncached `gh api .../dependencies/
+        blocked_by` request plus one live `gh issue view` per declared
+        blocker, entirely serially. Measured on the live fleet registry: 62
+        ready issues drove 169s of a 184s `fleet status --json` run through
+        this exact path, including confirmed duplicate fetches (issues #887/
+        #888 each fetched twice; their shared blocker #886 fetched 4 times).
+
+        This method does the equivalent fetching *once* per unique resource,
+        concurrently, before any of the unmodified per-issue code below runs:
+
+          1. Fetch each ready issue's GitHub-native dependencies in parallel
+             (one `gh api` call per unique issue number -- no duplicates,
+             since ``issues`` already contains each ready issue exactly once).
+          2. Union those dependencies with each issue's body-declared
+             blockers (pure Python, no I/O) into one deduplicated set of
+             blocker issue numbers.
+          3. Resolve open/closed state for that whole set in a single
+             ``are_issues_open`` call, which itself fans out cache misses
+             concurrently (see github.py).
+
+        Both fetch layers cache into ``self.gh._list_cache``, so every
+        subsequent call to ``_get_open_blockers`` -- unchanged, still called
+        once per issue from two separate call sites -- resolves entirely
+        from the warm cache with no further network calls. Structuring it
+        this way (fetch each unique resource exactly once, then let the
+        existing serial consumers read a warm cache) avoids relying on a
+        cache race between concurrent callers to naturally dedupe: nothing
+        here fetches the same issue number from two threads at once.
+
+        Must be called once per ``status()`` invocation, before the first
+        call to ``_get_open_blockers`` (directly or via
+        ``_filter_blocked_issues`` / ``_summarize_issue``). Harmless to skip
+        (callers just fall back to the prior, slower, uncached behavior) but
+        never harmful to call twice -- the second call is a no-op cache hit.
+        """
+        issue_numbers = [int(issue["number"]) for issue in issues]
+        if not issue_numbers:
+            return
+
+        max_workers = min(_MAX_PREFETCH_WORKERS, len(issue_numbers))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            deps_by_number = dict(
+                zip(
+                    issue_numbers,
+                    pool.map(
+                        lambda number: get_github_issue_dependencies(self.gh, number),
+                        issue_numbers,
+                    ),
+                )
+            )
+
+        all_blockers: set[int] = set()
+        for issue in issues:
+            issue_number = int(issue["number"])
+            all_blockers.update(parse_blockers(issue.get("body", "")))
+            all_blockers.update(deps_by_number.get(issue_number, []))
+
+        if all_blockers:
+            self.gh.are_issues_open(sorted(all_blockers))
+
     def _get_open_blockers(self, issue: dict[str, Any]) -> tuple[list[int], list[int]]:
         """Check if an issue has any open blocker issues.
 
@@ -16734,6 +17097,29 @@ class OrchestratorApp:
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
 
+    def _render_issue_comments(self, issue: dict[str, Any]) -> str:
+        """Render the ``$issue_comments`` slot for a worker prompt (issue #872).
+
+        The comments are already in hand: every ``_write_worker_prompt`` call
+        site sources its issue from ``gh.issue_view``, and ``ISSUE_VIEW_FIELDS``
+        has always requested ``comments``. This adds no API call -- the data was
+        being fetched and discarded.
+
+        Bodies are defanged here rather than in ``issue_comments`` itself so
+        that module stays free of the GitHub layer; the defang is what stops a
+        comment's "closes #123" from auto-closing an unrelated issue when a
+        worker copies the text into its PR body.
+        """
+        dispatch = self.config.dispatch
+        return render_issue_comments(
+            issue.get("comments"),
+            included_associations=dispatch.worker_prompt_comment_associations,
+            excluded_authors=dispatch.worker_prompt_excluded_comment_authors,
+            max_comments=dispatch.worker_prompt_max_comments,
+            max_chars=dispatch.worker_prompt_max_comment_chars,
+            sanitize=defang_closing_keywords,
+        )
+
     def _write_worker_prompt(self, issue: dict[str, Any], *, template: str | None = None) -> Path:
         issue_number = int(issue["number"])
         issue_dir = self.paths.issues / f"issue-{issue_number}"
@@ -16745,7 +17131,16 @@ class OrchestratorApp:
                 "issue_number": issue_number,
                 "issue_title": issue.get("title", ""),
                 "issue_url": issue.get("url", ""),
+                # The raw body stays available to templates; no shipped one
+                # references it since #883, but rendering it bare is a
+                # legitimate thing for a template to want.
                 "issue_body": issue.get("body", ""),
+                # Pre-fenced, not bare: the fence width depends on the body's
+                # own backtick runs, so it cannot be written in the template
+                # (#883). ``or ""`` guards a null body, which would otherwise
+                # reach the regex as None.
+                "issue_body_block": fenced_block(str(issue.get("body") or ""), "md"),
+                "issue_comments": self._render_issue_comments(issue),
                 "branch_name": self._branch_name(issue),
                 "worker_model_tier": self.config.dispatch.worker_model_tier,
             },

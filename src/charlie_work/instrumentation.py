@@ -170,6 +170,17 @@ _WARNING_KINDS = frozenset(
         "dispatch_merged_pr_mention_flagged",
         "review_dispatch_lifecycle_reaped",
         "session_rate_limit_deferred",
+        # Issue #873: the watchdog reaped a worker whose process was already
+        # gone (WorkerHealth.DEAD). Split out of "session_stalled", which stays
+        # an error and now means only the live-but-hung case. A vanished
+        # process is also the normal terminal state of every worker that
+        # finished and exited, so error level reported successful completions
+        # as faults once #864/#866 gave error-level events their first
+        # consumer. Warning rather than info because liveness alone does not
+        # distinguish a clean exit from a crash -- the reap is still worth
+        # surfacing, it is just not evidence of a fault. The paired
+        # "session_stalled" (error) fires for WorkerHealth.STALLED instead.
+        "session_exited",
         # Issue #612: a quota-dead reviewer session is a handled backoff
         # (the fleet defers and probes), not a crash — warning, like the
         # analogous session_rate_limit_deferred. Distinct from the per-PR

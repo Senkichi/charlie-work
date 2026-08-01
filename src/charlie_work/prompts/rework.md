@@ -11,9 +11,7 @@ Your PR requires changes before it can be approved.
 
 ## Orchestrator review
 
-```md
-$dispatch_note
-```
+$dispatch_note_block
 
 $required_changes_section
 
