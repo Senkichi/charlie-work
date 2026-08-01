@@ -479,6 +479,12 @@ class AutoMergeConfig:
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
     failed_attempt_alarm: int = 3
+    # Maximum `gh run rerun` attempts per workflow run id for a required check
+    # that is infra-failed (CANCELLED/INFRA_FAILURE/TIMED_OUT -- see
+    # checks.classify_infra_failures, issue #841). Once every infra-failing
+    # run id for a check has been retried this many times on the current
+    # head, the PR escalates to a human instead of retrying forever.
+    infra_rerun_attempt_cap: int = 2
     # Maximum minutes after the PR's last update (updatedAt) to wait for any
     # required check run to appear before routing an approved PR to readiness
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
@@ -1245,6 +1251,12 @@ class SupervisorConfig:
     ``self_deploy_failure_alarm``: consecutive ``self_deploy`` failures before
     a ``self_deploy_alarm`` events.db entry fires (default 3, mirrors
     ``AutoMergeConfig.failed_attempt_alarm``). 0 disables the alarm.
+    ``zero_pass_alarm``: consecutive fleet-supervisor cycles that complete
+    with zero repo passes, despite at least one repo being configured,
+    before a ``supervisor_zero_pass_alarm`` events.db entry fires (default 3,
+    mirrors ``self_deploy_failure_alarm``). 0 disables the alarm. A cycle
+    with zero repos configured never counts toward this streak in either
+    direction -- that is a configuration state, not an incident (issue #855).
     """
 
     poll_interval_seconds: int = 20
@@ -1252,6 +1264,7 @@ class SupervisorConfig:
     active_cooldown_seconds: int = 30
     max_runtime_minutes: int = 0
     self_deploy_failure_alarm: int = 3
+    zero_pass_alarm: int = 3
 
 
 @dataclass(frozen=True)
@@ -2361,6 +2374,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         "active_cooldown_seconds",
         "max_runtime_minutes",
         "self_deploy_failure_alarm",
+        "zero_pass_alarm",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):

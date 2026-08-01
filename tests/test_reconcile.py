@@ -255,6 +255,37 @@ def test_detect_drift_finds_state_pr_missing_on_github() -> None:
     assert matches[0].issue_number == 5
 
 
+def test_detect_drift_pr_snapshot_truncated_still_skips_state_pr_missing_on_github(
+    caplog,
+) -> None:
+    """Issue #857 acceptance criterion 2: state_pr_missing_on_github stays fully gated.
+
+    Unlike the issue-side sweeps (state_active_status_issue_closed,
+    issue_status_normalized), this sweep's per-item fix is NOT safe to run
+    against a partial snapshot: a false positive here reaches
+    ``new_prs.pop(...)`` in ``apply_fixes`` and erases ``decision`` /
+    ``reviewed_head_sha`` for an approved PR fleet-wide. Issue #857 deliberately
+    leaves this gate untouched -- pin that it still skips outright when the PR
+    snapshot is truncated, so a future refactor of the issue-side gate doesn't
+    accidentally also lift this one.
+    """
+    caplog.set_level(logging.WARNING)
+    config = OrchestratorConfig()
+    # Exactly _LIST_LIMIT PRs, none numbered 999: the PR snapshot is provably
+    # truncated AND PR #999 (tracked in state, "missing" on GitHub) fell off it.
+    prs = [_pr(i, "OPEN") for i in range(1, reconcile_list_limit + 1)]
+    gh = FakeGitHub(prs=prs, issues=[])
+    state = empty_state()
+    state["prs"]["999"] = {"issue_number": 5, "status": "reviewing"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "state_pr_missing_on_github"] == []
+    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
+    assert len(truncated) == 1
+    assert "incomplete" in caplog.text.lower()
+
+
 def test_detect_drift_finds_issue_active_label_no_open_pr(tmp_path: Path) -> None:
     """Issue #417: this fix path must also add the ready label back, not just
     remove the stale active one -- otherwise a --fix run leaves the issue with
@@ -689,13 +720,33 @@ def test_reconcile_and_github_share_list_limit_constant() -> None:
     assert reconcile_list_limit == github_list_limit
 
 
-def test_detect_drift_snapshot_truncated_skips_closed_issue_finalization(
+def test_detect_drift_snapshot_truncated_still_finalizes_in_window_closed_issue(
     caplog,
 ) -> None:
-    """Issue #259 review: a snapshot that hits the page limit is incomplete.
+    """Issue #857: an in-window closed issue is finalized while an out-of-window
+    entry in the SAME pass is still skipped silently.
 
-    The finalization sweep must be skipped to avoid acting on a provably
-    incomplete snapshot, and a warning drift item must be emitted.
+    This test used to assert ZERO finalization whenever the issue snapshot hit
+    the page limit at all. That assertion was wrong: it conflated "the snapshot
+    as a whole is incomplete" with "this specific item is unanswerable". The
+    closed issue built below IS present in the truncated snapshot -- GitHub gave
+    a definite CLOSED answer for it -- so skipping its finalization discarded a
+    known-good signal for no reason. The per-item lookup
+    (`issues_by_number.get(...)` -> ``None`` -> ``continue``) already fails safe
+    on issues that truly fell off the page; the outer total-skip gate added
+    nothing beyond that and is removed by issue #857.
+
+    Both entries share one ``detect_drift()`` call (issue #857 acceptance
+    criterion 4's exact wording: "assert the in-window issue IS finalized while
+    genuinely out-of-window entries are still skipped"). A version of this test
+    with only the out-of-window entry would pass unchanged under the OLD, fully
+    gated code too -- a lone out-of-window entry produces zero drift either
+    way -- so it alone would not prove per-item discrimination replaced the
+    outer gate. Combining both in one pass is what actually pins that.
+
+    A warning drift item (``snapshot_truncated``) is still emitted so operators
+    know the snapshot is incomplete, but it must not claim the sweeps were
+    skipped outright now that they partially ran (acceptance criterion 5).
     """
     caplog.set_level(logging.WARNING)
     config = OrchestratorConfig()
@@ -709,14 +760,70 @@ def test_detect_drift_snapshot_truncated_skips_closed_issue_finalization(
         "number": closed_issue_number,
         "status": "dispatched",
     }
+    # A second entry whose number never appears in the snapshot above: GitHub's
+    # answer for it is genuinely unknown (not "closed"), so it must be skipped
+    # silently rather than flagged (acceptance criterion 3).
+    out_of_window_issue_number = reconcile_list_limit + 1000
+    state["issues"][str(out_of_window_issue_number)] = {
+        "number": out_of_window_issue_number,
+        "status": "dispatched",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    closed_items = [item for item in drift if item.kind == "state_active_status_issue_closed"]
+    assert len(closed_items) == 1
+    assert closed_items[0].issue_number == closed_issue_number
+    assert [item for item in drift if item.kind == "issue_status_normalized"] == []
+    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
+    assert len(truncated) == 1
+    assert truncated[0].issue_number is None
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warning_records) == 1
+    message = warning_records[0].getMessage()
+    # Positive check (acceptance criterion 5): the message must name both
+    # sweeps and describe partial coverage, not just "truncated".
+    assert "state_active_status_issue_closed" in message
+    assert "issue_status_normalized" in message
+    assert "ran against" in message
+    # It must not claim the sweeps were skipped outright now that they
+    # partially run. Scoped to this one record (not all of caplog.text) so an
+    # unrelated future warning containing "skip" can't false-fail this test.
+    assert "skipping" not in message.lower()
+
+
+def test_detect_drift_snapshot_truncated_skips_out_of_window_issue() -> None:
+    """Issue #857 acceptance criterion 3: an out-of-window entry is skipped silently.
+
+    An issue tracked in state.json with an active status, but whose number does
+    NOT appear anywhere in the (truncated, exactly-_LIST_LIMIT) snapshot, is
+    genuinely unanswerable -- GitHub may have closed it, or it may still be
+    open; the snapshot simply doesn't say. It must be skipped, not flagged, and
+    the skip must not itself produce a drift item (the single snapshot_truncated
+    warning already covers that). This is a standalone companion to the combined
+    in-window/out-of-window test above: it isolates the out-of-window case on
+    its own so a future change to the in-window path can't accidentally also
+    break this one without a dedicated assertion catching it.
+    """
+    config = OrchestratorConfig()
+    # Exactly _LIST_LIMIT issues, none numbered `out_of_window_issue_number`:
+    # the snapshot is provably truncated AND this issue fell off the page.
+    out_of_window_issue_number = reconcile_list_limit + 1000
+    issues = [_issue(i, [config.labels.ready]) for i in range(1, reconcile_list_limit + 1)]
+    gh = FakeGitHub(prs=[], issues=issues)
+    state = empty_state()
+    state["issues"][str(out_of_window_issue_number)] = {
+        "number": out_of_window_issue_number,
+        "status": "dispatched",
+    }
 
     drift = detect_drift(gh, state, config)
 
     assert [item for item in drift if item.kind == "state_active_status_issue_closed"] == []
+    assert [item for item in drift if item.kind == "issue_status_normalized"] == []
     truncated = [item for item in drift if item.kind == "snapshot_truncated"]
     assert len(truncated) == 1
-    assert truncated[0].issue_number is None
-    assert "truncated" in caplog.text.lower()
 
 
 def test_detect_drift_snapshot_not_truncated_finalizes_closed_issues() -> None:

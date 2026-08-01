@@ -250,10 +250,22 @@ class SelfDeployResult:
     """Result of a self-deploy attempt.
 
     ``pulled`` is True when ``git pull`` reported success (including the
-    already-up-to-date case).  ``changed`` is True when HEAD moved.  ``synced``
-    is True when ``uv sync`` ran and succeeded.  ``ok`` is False whenever any
-    step reported an error; callers must treat this as non-fatal and continue
-    the pass.
+    already-up-to-date case).  ``changed`` is True when HEAD moved *or* a
+    pending-sync marker exists (i.e. some dependency change is still
+    outstanding, even if this pass's own pull was a no-op) -- callers that
+    need to know whether *this pass* moved HEAD must use ``head_changed``
+    instead, not ``changed``.  ``synced`` is True when ``uv sync`` ran and
+    succeeded.  ``ok`` is False whenever any step reported an error; callers
+    must treat this as non-fatal and continue the pass.
+
+    ``head_changed`` is True only when ``git pull`` actually advanced HEAD on
+    *this* attempt (``before_sha != after_sha``).  This is the correct signal
+    for "the running process now has stale code loaded and must exit for a
+    watchdog restart" -- ``from_sha``/``to_sha`` are not, because on a
+    deferred-sync pass they report the marker's original range even when
+    HEAD did not move on this attempt, which previously caused a restart loop
+    (the supervisor kept exiting and relaunching without ever reaching zero
+    live workers to complete the deferred sync).
 
     ``venv_repaired`` is True when the orchestrator venv's editable ``.pth``
     was detected pointing outside ``repo_root/src`` and was atomically rewritten
@@ -264,6 +276,7 @@ class SelfDeployResult:
     pulled: bool
     changed: bool
     synced: bool
+    head_changed: bool = False
     from_sha: str | None = None
     to_sha: str | None = None
     message: str = ""
@@ -665,6 +678,95 @@ def _record_self_deploy_failure_streak(
             )
 
 
+#: Default consecutive-zero-repo-pass-cycle count at which the fleet
+#: supervisor fires a ``supervisor_zero_pass_alarm`` events.db entry (issue
+#: #855, the general shape behind #851). Mirrors
+#: ``DEFAULT_SELF_DEPLOY_FAILURE_ALARM``'s default and "0 disables" convention.
+DEFAULT_ZERO_PASS_ALARM = 3
+
+
+def _zero_pass_streak_counter_path(repo_root: Path) -> Path:
+    """Return the consecutive-zero-repo-pass-cycle counter sidecar path for ``repo_root``."""
+    return layout.zero_pass_streak_state_path(layout.default_state_root(repo_root))
+
+
+def _read_zero_pass_streak(path: Path) -> int:
+    """Read the persisted consecutive-zero-repo-pass-cycle count, defaulting to 0 on any error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    count = data.get("consecutive_zero_pass_cycles", 0)
+    return count if isinstance(count, int) else 0
+
+
+def _write_zero_pass_streak(path: Path, count: int) -> None:
+    """Persist the consecutive-zero-repo-pass-cycle count atomically (temp-file + replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"consecutive_zero_pass_cycles": count}, indent=2) + "\n"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(path)
+
+
+def record_zero_pass_streak(
+    repo_root: Path,
+    *,
+    repo_passes: int,
+    repos_configured: bool,
+    threshold: int = DEFAULT_ZERO_PASS_ALARM,
+) -> None:
+    """Track consecutive zero-repo-pass fleet-supervisor cycles; escalate at ``threshold``.
+
+    Mirrors :func:`_record_self_deploy_failure_streak` (issue #855, the
+    general shape behind #851): a persisted counter increments on every
+    cycle that completed with ``repo_passes == 0`` and resets to 0 on any
+    cycle with ``repo_passes > 0``. A distinct ``supervisor_zero_pass_alarm``
+    event fires exactly once -- the cycle the counter *reaches* ``threshold``,
+    not on every subsequent cycle past it -- so a long-running outage (the
+    #851 shape: every watchdog restart exits before ``fleet_loop`` ever runs,
+    exit code 0 every time) produces one escalation, not one per cycle.
+    ``threshold <= 0`` disables the alarm entirely, matching
+    ``self_deploy_failure_alarm``'s "0 disables" convention.
+
+    ``repos_configured`` must be computed by the caller from the fleet
+    registry, independent of whether this cycle actually reached
+    ``fleet_loop`` -- the #851 exit shape this alarm targets breaks out of
+    the supervisor loop before ``fleet_loop`` is ever called, so
+    ``repo_passes`` alone cannot distinguish "no repos configured" from "repos
+    configured but the loop never got to them". When ``repos_configured`` is
+    False, this function is a complete no-op: it must not move the counter in
+    either direction, so a fleet with zero configured repos never fires this
+    alarm regardless of how long it runs (acceptance criterion 4).
+    """
+    if not repos_configured:
+        return
+    counter_path = _zero_pass_streak_counter_path(repo_root)
+    # Ensure the parent directory exists before state_lock tries to create the
+    # sibling .lock file (advisory_file_lock touches it directly) -- mirrors
+    # _record_self_deploy_failure_streak. Without this, a cold state dir (no
+    # prior events.db/state.json write yet this process) raises here, which
+    # would propagate out of run_fleet_supervise's post-loop bookkeeping.
+    counter_path.parent.mkdir(parents=True, exist_ok=True)
+    with state_lock(counter_path):
+        count = _read_zero_pass_streak(counter_path)
+        if repo_passes > 0:
+            if count:
+                _write_zero_pass_streak(counter_path, 0)
+            return
+        count += 1
+        _write_zero_pass_streak(counter_path, count)
+        if threshold > 0 and count == threshold:
+            log_event(
+                _self_deploy_state_path(repo_root),
+                "supervisor_zero_pass_alarm",
+                {
+                    "consecutive_zero_pass_cycles": count,
+                    "threshold": threshold,
+                },
+            )
+
+
 def self_deploy(
     repo_root: Path,
     *,
@@ -797,6 +899,7 @@ def _self_deploy_attempt(
                 pulled=True,
                 changed=False,
                 synced=False,
+                head_changed=False,
                 from_sha=before_sha,
                 to_sha=after_sha,
                 venv_repaired=venv_repaired,
@@ -816,6 +919,7 @@ def _self_deploy_attempt(
                     pulled=True,
                     changed=changed,
                     synced=False,
+                    head_changed=head_changed,
                     from_sha=before_sha,
                     to_sha=after_sha,
                     venv_repaired=venv_repaired,
@@ -830,6 +934,7 @@ def _self_deploy_attempt(
                 pulled=True,
                 changed=changed,
                 synced=False,
+                head_changed=head_changed,
                 from_sha=before_sha,
                 to_sha=after_sha,
                 venv_repaired=venv_repaired,
@@ -854,6 +959,7 @@ def _self_deploy_attempt(
                 pulled=True,
                 changed=changed,
                 synced=False,
+                head_changed=head_changed,
                 from_sha=from_sha,
                 to_sha=to_sha,
                 venv_repaired=venv_repaired,
@@ -871,6 +977,7 @@ def _self_deploy_attempt(
                 pulled=True,
                 changed=changed,
                 synced=False,
+                head_changed=head_changed,
                 from_sha=from_sha,
                 to_sha=to_sha,
                 venv_repaired=venv_repaired,
@@ -883,6 +990,7 @@ def _self_deploy_attempt(
             pulled=True,
             changed=changed,
             synced=True,
+            head_changed=head_changed,
             from_sha=from_sha,
             to_sha=to_sha,
             venv_repaired=venv_repaired,
