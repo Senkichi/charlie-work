@@ -578,6 +578,7 @@ def test_worker_prompt_renders_issue_values() -> None:
             "issue_body": "Body text",
             "branch_name": "agent/issue-123-fix-search",
             "worker_model_tier": "capable",
+            "issue_comments": "",
         },
     )
 
@@ -596,6 +597,7 @@ def test_claude_code_worker_prompt_renders_issue_values() -> None:
             "issue_body": "Body text",
             "branch_name": "agent/issue-123-fix-search",
             "worker_model_tier": "capable",
+            "issue_comments": "",
         },
     )
 

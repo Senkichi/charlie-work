@@ -87,9 +87,7 @@ def _render_via_pre_change_template(tmp_path: Path, issue: dict, template: str) 
         f"{template} no longer references $issue_comments -- this test is comparing "
         f"the template against itself and can no longer detect a regression"
     )
-    (prompts_dir / template).write_text(
-        shipped.replace("$issue_comments", ""), encoding="utf-8"
-    )
+    (prompts_dir / template).write_text(shipped.replace("$issue_comments", ""), encoding="utf-8")
     config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(prompts_dir)))
     return (
         _app(tmp_path / "pre", config)
@@ -104,8 +102,8 @@ def test_issue_without_comments_renders_byte_identical_prompt(
 ) -> None:
     issue = _issue()
 
-    after = _app(tmp_path)._write_worker_prompt(issue, template=template).read_text(
-        encoding="utf-8"
+    after = (
+        _app(tmp_path)._write_worker_prompt(issue, template=template).read_text(encoding="utf-8")
     )
     before = _render_via_pre_change_template(tmp_path, issue, template)
 
@@ -119,8 +117,8 @@ def test_issue_whose_comments_are_all_filtered_renders_byte_identical_prompt(
     """Distinct path from "no comments": the list is non-empty but nothing survives."""
     issue = _issue(comments=[_comment(login="aviator-app", association="NONE")])
 
-    after = _app(tmp_path)._write_worker_prompt(issue, template=template).read_text(
-        encoding="utf-8"
+    after = (
+        _app(tmp_path)._write_worker_prompt(issue, template=template).read_text(encoding="utf-8")
     )
     before = _render_via_pre_change_template(tmp_path, issue, template)
 
@@ -275,3 +273,18 @@ def test_malformed_comments_are_skipped_not_crashed_on() -> None:
 
     assert "the good one" in rendered
     assert "@unknown" in rendered, "a comment with no author is kept but marked unknown"
+
+
+def test_placeholders_inside_a_comment_are_not_expanded(tmp_path: Path) -> None:
+    """Comments are a second attacker-controlled value reaching the prompt.
+
+    ``render_prompt`` resolves partials first and then substitutes once, so a
+    ``$section_*`` token inside a comment must survive as literal text rather
+    than being expanded in a second pass -- the issue #8 guarantee, extended to
+    the channel this change opens.
+    """
+    issue = _issue(comments=[_comment(body="Try $section_scope_contract and $issue_number")])
+
+    rendered = _app(tmp_path)._write_worker_prompt(issue).read_text(encoding="utf-8")
+
+    assert "Try $section_scope_contract and $issue_number" in rendered

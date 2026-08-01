@@ -14,6 +14,7 @@ ISSUE_VALUES = {
     "issue_body": "Body text",
     "branch_name": "agent/issue-123-fix-search",
     "worker_model_tier": "capable",
+    "issue_comments": "",
     "pr_number": 456,
     "pr_title": "fix: search is broken",
     "pr_url": "https://example.test/pull/456",
@@ -170,6 +171,7 @@ def test_attacker_controlled_placeholders_not_expanded() -> None:
         "issue_body": "This contains $section_scope_contract and $issue_number",
         "branch_name": "agent/issue-8-test",
         "worker_model_tier": "capable",
+        "issue_comments": "",
     }
 
     for template_name in ("worker.md", "worker_claude_code.md"):
