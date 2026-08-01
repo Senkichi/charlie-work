@@ -12,6 +12,7 @@ import yaml
 from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
 from . import layout
+from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
@@ -200,6 +201,25 @@ class DispatchConfig:
     # explicitly. Paths are normalized to forward slashes so Windows-style
     # backslash separators in config still match git-reported paths.
     injected_paths: tuple[str, ...] = ()
+    # Issue comments rendered into the worker prompt (issue #872). A worker that
+    # only sees ``issue.body`` cannot see the comment that corrected it.
+    #
+    # The include filter is an allow-list on GitHub's ``authorAssociation``, not
+    # a deny-list of bot logins: a new bot then needs no code change to be
+    # excluded, and the comment payload carries no ``is_bot`` field to key off.
+    # ``viewerDidAuthor`` looks like the natural self-filter and is the wrong
+    # one -- the orchestrator authenticates as the operator's own account, so it
+    # is true for exactly the human corrections this feature exists to deliver.
+    worker_prompt_comment_associations: tuple[str, ...] = DEFAULT_COMMENT_ASSOCIATIONS
+    # Logins whose comments are dropped regardless of association. Empty by
+    # default; the escape hatch for a bot that comments as a COLLABORATOR, or
+    # for the orchestrator's own future issue-side chatter.
+    worker_prompt_excluded_comment_authors: tuple[str, ...] = ()
+    # Prompt budget. Newest comments win when either bound binds, and the
+    # rendered block says how many were dropped rather than truncating silently.
+    # 0 disables the respective bound.
+    worker_prompt_max_comments: int = 20
+    worker_prompt_max_comment_chars: int = 12000
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -211,6 +231,19 @@ class DispatchConfig:
         if WRITER_MARKER_FILENAME not in base:
             base.append(WRITER_MARKER_FILENAME)
         object.__setattr__(self, "injected_paths", _normalize_injected_paths(base))
+        # Coerce the comment-filter sequences here rather than only in
+        # ``load_config``: this is the one path every construction goes through,
+        # so a direct ``DispatchConfig(...)`` in a test or a caller cannot smuggle
+        # in a list and silently make a frozen instance unhashable. A bare string
+        # is wrapped rather than iterated -- ``tuple("OWNER")`` would otherwise
+        # yield five single-character "associations" that match nothing.
+        for field_name in (
+            "worker_prompt_comment_associations",
+            "worker_prompt_excluded_comment_authors",
+        ):
+            value = getattr(self, field_name)
+            normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
+            object.__setattr__(self, field_name, normalized)
 
 
 @dataclass(frozen=True)
@@ -1475,6 +1508,42 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         dispatch_data["injected_paths"] = _normalize_injected_paths(
             tuple(str(item) for item in injected_paths)
         )
+    # Worker-prompt comment controls (issue #872). ``DispatchConfig.__post_init__``
+    # does the list->tuple coercion for every construction path; these checks exist
+    # so a *config file* mistake fails loudly at load with the offending key named,
+    # rather than silently degrading the prompt for every dispatched issue.
+    for _seq_key in (
+        "worker_prompt_comment_associations",
+        "worker_prompt_excluded_comment_authors",
+    ):
+        _seq_value = dispatch_data.get(_seq_key)
+        if _seq_value is not None:
+            if not isinstance(_seq_value, list):
+                raise ConfigError(
+                    f"config section 'dispatch' key '{_seq_key}' must be a list of "
+                    f"strings, got {type(_seq_value).__name__}"
+                )
+            for item in _seq_value:
+                if not isinstance(item, str):
+                    raise ConfigError(
+                        f"config section 'dispatch' key '{_seq_key}' must be a list of "
+                        f"strings, got element of type {type(item).__name__}"
+                    )
+            dispatch_data[_seq_key] = tuple(str(item) for item in _seq_value)
+    for _int_key in ("worker_prompt_max_comments", "worker_prompt_max_comment_chars"):
+        _int_value = dispatch_data.get(_int_key)
+        if _int_value is not None:
+            # bool is an int subclass; rejecting it explicitly (as the api_worker
+            # section does) keeps `true` in YAML from silently meaning "1 comment".
+            if isinstance(_int_value, bool) or not isinstance(_int_value, int):
+                raise ConfigError(
+                    f"config section 'dispatch' key '{_int_key}' must be an int, "
+                    f"got {type(_int_value).__name__}"
+                )
+            if _int_value < 0:
+                raise ConfigError(
+                    f"config section 'dispatch' key '{_int_key}' must be >= 0, got {_int_value}"
+                )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     review_dispatch_data = _section(data, "review_dispatch")

@@ -73,6 +73,7 @@ from .github import (
     linked_issue_number,
     parse_blockers,
 )
+from .issue_comments import render_issue_comments
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
@@ -16976,6 +16977,29 @@ class OrchestratorApp:
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
 
+    def _render_issue_comments(self, issue: dict[str, Any]) -> str:
+        """Render the ``$issue_comments`` slot for a worker prompt (issue #872).
+
+        The comments are already in hand: every ``_write_worker_prompt`` call
+        site sources its issue from ``gh.issue_view``, and ``ISSUE_VIEW_FIELDS``
+        has always requested ``comments``. This adds no API call -- the data was
+        being fetched and discarded.
+
+        Bodies are defanged here rather than in ``issue_comments`` itself so
+        that module stays free of the GitHub layer; the defang is what stops a
+        comment's "closes #123" from auto-closing an unrelated issue when a
+        worker copies the text into its PR body.
+        """
+        dispatch = self.config.dispatch
+        return render_issue_comments(
+            issue.get("comments"),
+            included_associations=dispatch.worker_prompt_comment_associations,
+            excluded_authors=dispatch.worker_prompt_excluded_comment_authors,
+            max_comments=dispatch.worker_prompt_max_comments,
+            max_chars=dispatch.worker_prompt_max_comment_chars,
+            sanitize=defang_closing_keywords,
+        )
+
     def _write_worker_prompt(self, issue: dict[str, Any], *, template: str | None = None) -> Path:
         issue_number = int(issue["number"])
         issue_dir = self.paths.issues / f"issue-{issue_number}"
@@ -16988,6 +17012,7 @@ class OrchestratorApp:
                 "issue_title": issue.get("title", ""),
                 "issue_url": issue.get("url", ""),
                 "issue_body": issue.get("body", ""),
+                "issue_comments": self._render_issue_comments(issue),
                 "branch_name": self._branch_name(issue),
                 "worker_model_tier": self.config.dispatch.worker_model_tier,
             },
