@@ -11332,26 +11332,36 @@ class OrchestratorApp:
             # and the merge-base gate. mergeStateStatus can lag and report CLEAN
             # while the branch is actually stale, so it is no longer authoritative.
             #
-            # Whether base freshness is required AT ALL is itself derived from
-            # GitHub branch protection (issue #812), not trusted from the
-            # `require_current_base` config constant: a repo whose protection sets
-            # `strict: false` does not require branches to be current with main, so
-            # both the pr_update_branch write below and the deferral gate are
-            # skipped entirely. See _is_base_freshness_required for the
-            # fail-closed contract on read failure. `update_branch_strategy ==
-            # "off"` additionally forces this off regardless of what protection
-            # says: with no sync mechanism at all, requiring currency would be an
-            # inescapable deadlock -- the same hazard __post_init__ already blocks
-            # for the config-only case (require_current_base=True + strategy=off).
+            # Whether base currency gates THIS merge is `require_current_base OR
+            # protection.strict` -- protection may raise the requirement, never
+            # lower it below what the operator configured (issue #875). Issue
+            # #812 made this purely protection-derived, which meant a repo
+            # running `strict: false` (as this one does, deliberately: two
+            # self-hosted runners cannot sustain strict mode) disabled its own
+            # merge gate and merged stale-base PRs whose merged tree was never
+            # tested. The broadcast sweep still uses the protection-only
+            # `_is_base_freshness_required` -- that write costs N CI cycles
+            # across every open PR, where this one costs a single cycle for the
+            # PR actually merging. See _is_base_currency_gated.
+            #
+            # This single flag intentionally drives BOTH the pr_update_branch
+            # write below and the deferral gate further down. Decoupling them --
+            # gating merges while leaving the write suppressed -- would deadlock:
+            # a stale PR would defer forever with nothing to make it current.
+            # `update_branch_strategy == "off"` forces the whole thing off
+            # regardless: with no sync mechanism at all, requiring currency would
+            # be that same inescapable deadlock -- the hazard __post_init__
+            # already blocks for the config-only case (require_current_base=True
+            # + strategy=off).
             base_current: bool | None = None
-            base_freshness_required = False
+            base_currency_gated = False
             if not sync_failed and update_branch_strategy != "off":
-                base_freshness_required = self._is_base_freshness_required(
+                base_currency_gated = self._is_base_currency_gated(
                     pr.get("baseRefName") or self.config.runners.default_branch
                 )
             if (
                 not sync_failed
-                and base_freshness_required
+                and base_currency_gated
                 and update_branch_strategy in {"front_of_train", "broadcast"}
             ):
                 base_current = self._is_base_current(pr)
@@ -11390,7 +11400,7 @@ class OrchestratorApp:
             # merge-base freshness gate: mergeStateStatus can lag, so verify
             # ancestry with the GitHub compare API before merging. Skipped
             # entirely when base freshness is not required (issue #812).
-            if not sync_failed and base_freshness_required:
+            if not sync_failed and base_currency_gated:
                 if base_current is None and update_branch_strategy not in {
                     "front_of_train",
                     "broadcast",
@@ -14056,6 +14066,60 @@ class OrchestratorApp:
         if not base_sha or not merge_base_sha:
             return None
         return bool(base_sha == merge_base_sha)
+
+    def _is_base_currency_gated(self, base_ref: str) -> bool:
+        """Return whether ``merge_ready`` must refuse to merge a stale-base PR.
+
+        This is the *merge gate* policy. It differs deliberately from
+        ``_is_base_freshness_required`` (the *broadcast sweep* policy) and the
+        difference is the entire point of issue #875.
+
+        Issue #812 made base-freshness policy protection-derived, so that a
+        repo with ``required_status_checks.strict: false`` would not burn CI
+        re-running every open PR against a base GitHub does not require it to
+        be current with. That reasoning is correct for the broadcast sweep,
+        which writes to *N* open PRs per merge.
+
+        Applying it to the merge gate too was the defect. This repo runs
+        ``strict: false`` (a deliberate capacity decision -- two self-hosted
+        runners cannot sustain strict mode), so the gate derived "currency not
+        required" and disabled *itself*. ``_is_base_current`` was still correct
+        and still failed closed; it was simply never reached. An approved PR
+        whose base had advanced merged without its merged tree ever being
+        tested, which is how ``main`` went red (both parents green, merge
+        untested -- the same class as #853 x #865).
+
+        So protection may *raise* the requirement, never *lower* it below what
+        the operator asked for:
+
+            gated = require_current_base OR protection_strict
+
+        - ``strict: true`` + ``require_current_base=False`` -> gated (unchanged
+          from #812: protection-derived enforcement still works for operators
+          who opted out in config).
+        - ``strict: false`` + ``require_current_base=True`` -> gated. **This is
+          the #875 fix.** Previously ungated.
+        - protection unreadable -> falls through to
+          ``_is_base_freshness_required``'s fail-closed contract, which returns
+          ``require_current_base``.
+
+        Cost: one ``pr_update_branch`` + one CI cycle for the single PR that is
+        actually merging, not N cycles across every open PR -- the broadcast
+        sweep keeps calling ``_is_base_freshness_required`` and keeps #812's
+        saving. The real cost is serialization: each merge staleness-invalidates
+        the next PR in the lane, which must then rebase and wait for CI before
+        it can land. That is the intended trade -- a slower lane against a lane
+        that merges untested trees.
+
+        Scope limit: this gate cannot retract a PR already handed to Aviator
+        MergeQueue (``already_in_mergequeue`` suppresses the write, and the
+        deferral does not remove the label), and it cannot stop a human
+        pressing merge in the GitHub UI. It prevents the *initial* handoff of a
+        stale PR, which is the path the orchestrator controls.
+        """
+        if self.config.auto_merge.require_current_base:
+            return True
+        return self._is_base_freshness_required(base_ref)
 
     def _is_base_freshness_required(self, base_ref: str) -> bool:
         """Return whether base currency is actually required for ``base_ref``.
