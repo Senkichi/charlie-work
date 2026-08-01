@@ -39,7 +39,20 @@ from dataclasses import dataclass
 # a replacement now". Distinct from 0 (deliberate stop: max-runtime, max-passes,
 # operator interrupt) and 1 (aborted). Deliberately consumed only inside Python:
 # the launcher script never compares against the literal, so the number lives in
-# exactly one place.
+# exactly one place *in the source tree*.
+#
+# NEVER CHANGE THIS VALUE. It is a cross-version wire contract between two
+# processes running different commits, not merely a module constant. The wrapper
+# imports it at startup and holds it in memory; the supervisor child it spawns
+# loads it fresh from disk. A self-deploy is precisely the moment those two
+# disagree -- stale wrapper, new child. If a commit changed 3 to anything else,
+# the wrapper would compare the child's new code against its old value, read the
+# restart request as a normal exit, and not relaunch: #862, reintroduced for one
+# watchdog interval, on the deploy that changed it.
+#
+# The recovery is bounded (the wrapper exits, the 5-minute tick starts a fresh
+# one), which is why this is a documented invariant rather than a runtime
+# handshake. Same discipline CLAUDE.md applies to label strings.
 EXIT_RESTART_REQUESTED = 3
 
 # Chosen to be generous relative to the real event (a self-deploy chain is

@@ -1787,7 +1787,10 @@ def run_fleet_supervise(
         return CommandResult(
             False,
             "fleet supervisor already running (fleet-supervisor.lock held)",
-            {},
+            # Reason carried here too so every exit route answers the same field.
+            # Not a relaunch: another supervisor already holds the lock, so the
+            # right move is to stand down, not to spawn a second one.
+            {"exit_reason": "lock_held", "restart_requested": False},
         )
 
     pass_number = 0
@@ -2005,26 +2008,43 @@ def run_fleet_supervise(
         # except clause below without reaching this line): an
         # operator-initiated stop is not the automatic-failure pattern this
         # alarm targets.
-        record_zero_pass_streak(
-            orchestrator_root(),
-            repo_passes=total_repo_passes,
-            repos_configured=_fleet_has_configured_repos(fleet_dir_override, repos),
-            threshold=cfg.zero_pass_alarm,
-        )
+        # Contained locally rather than left to the handler below. This call does
+        # real file I/O (mkdir, state_lock, log_event) and its own docstring says
+        # it can raise. If it did, the handler's `aborted` reason replaced an
+        # already-set `self_deploy`/`head_drift`, restart_requested went False,
+        # and the wrapper did NOT relaunch -- reintroducing #862 through a
+        # secondary bookkeeping failure. A zero-pass counter that failed to
+        # record is worth a log line; it is not worth suppressing a restart.
+        try:
+            record_zero_pass_streak(
+                orchestrator_root(),
+                repo_passes=total_repo_passes,
+                repos_configured=_fleet_has_configured_repos(fleet_dir_override, repos),
+                threshold=cfg.zero_pass_alarm,
+            )
+        except Exception as streak_exc:  # noqa: BLE001 - bookkeeping must not alter exit semantics
+            logger.warning(
+                "zero-pass streak bookkeeping failed (exit_reason=%s): %s",
+                exit_reason or "unknown",
+                streak_exc,
+            )
     except KeyboardInterrupt:
         # An operator stop must never relaunch. Named rather than left unset so
         # the exit event distinguishes it from a break site that forgot a reason.
         exit_reason = "interrupted"
     except Exception as exc:
         elapsed_s = clock() - start_time
+        # Defence in depth behind the contained streak call above: if any future
+        # post-break statement raises, an already-set restarting reason must
+        # survive. Overwriting it with "aborted" is what made a bookkeeping
+        # failure able to cancel a self-deploy relaunch.
+        reason = exit_reason or "aborted"
         return CommandResult(
             False,
             f"fleet supervisor aborted on pass {pass_number}: {exc}",
             {
-                # ok=False already prevents relaunch; carried for symmetry so
-                # every exit route reports a reason in the same field.
-                "exit_reason": "aborted",
-                "restart_requested": False,
+                "exit_reason": reason,
+                "restart_requested": reason in RESTART_EXIT_REASONS,
                 "passes": pass_number,
                 "total_repo_passes": total_repo_passes,
                 "total_attention_events": total_attention_events,
@@ -2115,12 +2135,20 @@ def run_fleet_supervise_loop(
     supervise_args: Sequence[str] = (),
     max_relaunches: int = DEFAULT_MAX_RELAUNCHES,
     spawn: Callable[[int], int] | None = None,
+    on_cap_reached: Callable[[SuperviseLoopResult], None] | None = None,
 ) -> CommandResult:
     """Run ``fleet supervise``, relaunching immediately on a restart request.
 
     ``supervise_args`` is forwarded to the child verbatim rather than being
     re-declared flag by flag here: a per-flag list would silently stop
     forwarding any option added to ``fleet supervise`` later.
+
+    ``on_cap_reached`` is injectable for the same reason ``spawn`` is. The
+    default writes a real event to the real state file resolved from
+    ``orchestrator_root()``, so a test exercising the cap path with defaults
+    writes into the **live** ``events.db`` that the running supervisor owns --
+    both polluting production data and contending for its state lock. Tests
+    pass their own recorder and assert on it.
     """
     args = tuple(supervise_args)
 
@@ -2131,7 +2159,9 @@ def run_fleet_supervise_loop(
         spawn if spawn is not None else _default_spawn,
         max_relaunches=max_relaunches,
         log=lambda message: print(message, flush=True),
-        on_cap_reached=_record_supervise_loop_cap_event,
+        on_cap_reached=(
+            on_cap_reached if on_cap_reached is not None else _record_supervise_loop_cap_event
+        ),
     )
 
     # A cap is a *clean handoff*, not a failure: the wrapper deliberately gives
