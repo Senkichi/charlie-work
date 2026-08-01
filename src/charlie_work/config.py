@@ -1151,10 +1151,6 @@ class RunnersConfig:
     fleet_autoscale_prologue: bool = False
 
 
-
-
-
-
 @dataclass(frozen=True)
 class SupervisorConfig:
     """Configuration for the supervised infill loop (``charlie bash-rats`` default mode).
