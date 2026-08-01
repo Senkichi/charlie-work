@@ -21,6 +21,7 @@ from .supervise import (
     LocalSnapshot,
     orchestrator_root,
     read_head_sha,
+    record_zero_pass_streak,
     self_deploy,
     take_snapshot,
     try_acquire_supervisor_lock,
@@ -1656,6 +1657,23 @@ def _has_fleet_delta(
     return before.repo_snapshots != after.repo_snapshots
 
 
+def _fleet_has_configured_repos(
+    fleet_dir_override: str | None, repos: tuple[str, ...] | None
+) -> bool:
+    """Return True when at least one repo is configured/selected for this scope.
+
+    Gates the zero-repo-pass streak (issue #855 acceptance criterion 4): a
+    fleet with zero registered repos -- or an explicit ``repos`` filter that
+    matches none of them -- is a configuration state, not an incident, and
+    must never move the streak counter. Reads the registry directly rather
+    than deriving the answer from a completed ``fleet_loop`` call, because
+    the #851 exit shape this alarm targets breaks out of the supervisor loop
+    *before* ``fleet_loop`` is ever called.
+    """
+    registry = _load_registry(layout.fleet_registry_path(override=fleet_dir_override))
+    return bool(_select_repos(registry, repos))
+
+
 def run_fleet_supervise(
     *,
     fleet_dir_override: str | None = None,
@@ -1864,7 +1882,7 @@ def run_fleet_supervise(
             # message below; folding the check into a bool() loses it.
             from_sha = deploy.from_sha
             to_sha = deploy.to_sha
-            if deploy.ok and deploy.pulled and from_sha and to_sha and from_sha != to_sha:
+            if deploy.ok and deploy.pulled and from_sha and to_sha and deploy.head_changed:
                 print(
                     f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
                     f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
@@ -1941,6 +1959,28 @@ def run_fleet_supervise(
                     else cfg.poll_interval_seconds
                 )
             )
+
+        # Issue #855 (the general shape behind #851): a cycle can complete
+        # with exit code 0 having done zero repo passes -- e.g. every restart
+        # exits via the self-deploy HEAD-moved break above before ever
+        # reaching fleet_loop -- and every existing health signal reads
+        # green because, by its own accounting, nothing failed. Record this
+        # process's aggregate total_repo_passes (already computed and
+        # printed in the summary below) against the persisted streak so N
+        # consecutive such cycles escalate instead of repeating silently.
+        # Placed inside the try block, after the loop, so a bookkeeping
+        # failure here is caught by the except Exception handler below
+        # instead of propagating out of run_fleet_supervise uncaught.
+        # Deliberately skipped on KeyboardInterrupt (falls through the
+        # except clause below without reaching this line): an
+        # operator-initiated stop is not the automatic-failure pattern this
+        # alarm targets.
+        record_zero_pass_streak(
+            orchestrator_root(),
+            repo_passes=total_repo_passes,
+            repos_configured=_fleet_has_configured_repos(fleet_dir_override, repos),
+            threshold=cfg.zero_pass_alarm,
+        )
     except KeyboardInterrupt:
         pass
     except Exception as exc:

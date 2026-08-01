@@ -94,6 +94,27 @@ from charlie_work.devin_shell import SessionRecord
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
 
+def future_timestamp(*, days: int = 3650) -> str:
+    """An ISO-8601 ``Z`` timestamp guaranteed to be in the future.
+
+    Several state predicates decide behaviour by comparing a stored timestamp
+    against ``datetime.now(UTC)`` -- ``is_reviewer_quota_exhausted`` (true only
+    while ``throttled_until`` is future), ``is_reviewer_probe_ready``,
+    ``is_throttled``. A test that hardcodes an absolute date to satisfy one of
+    those preconditions is a time bomb: it passes until wall-clock time crosses
+    the literal, then fails permanently, on every branch at once.
+
+    That is not a theoretical concern -- a hardcoded ``2026-08-01T00:00:00Z``
+    did exactly this, turning every open PR and main itself red at that instant
+    and blocking the merge lane. Use this helper for any timestamp whose
+    *futureness* is load-bearing.
+
+    Timestamps that are merely round-tripped or compared for equality do not
+    need this; an absolute literal is clearer there, and stable.
+    """
+    return (datetime.now(UTC) + timedelta(days=days)).isoformat().replace("+00:00", "Z")
+
+
 @pytest.fixture(autouse=True)
 def _stub_real_activity_probe_for_stalled_tests(
     monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
@@ -831,6 +852,22 @@ def test_summarize_checks_cancelled_classifies_as_infra_failed() -> None:
     assert summary.infra_failed == ("test",)
     assert summary.failed == ()
     assert summary.pending == ()
+
+
+def test_summarize_checks_timed_out_classifies_as_infra_failed() -> None:
+    """Issue #841: TIMED_OUT is a documented GitHub Actions conclusion value
+    distinct from this repo's observed CANCELLED-on-timeout behavior, but it
+    must not fall through the catch-all into a code failure -- there is no
+    code fix for a job that ran out of time."""
+    checks = [
+        {"name": "test", "state": "TIMED_OUT"},
+    ]
+
+    summary = summarize_checks(checks, ("test",))
+
+    assert summary.ready is False
+    assert summary.infra_failed == ("test",)
+    assert summary.failed == ()
 
 
 def test_summarize_checks_cancelled_case_insensitive() -> None:
@@ -9411,6 +9448,42 @@ def test_loop_checks_unavailable_review_lands_in_errors_bucket(tmp_path: Path) -
     assert "checks unavailable" in result.data["errors"][0]["error"].lower()
 
 
+def test_loop_zero_checks_pr_does_not_land_in_errors_bucket(tmp_path: Path) -> None:
+    """Issue #846: a PR with zero checks (pr_checks() == []) must not be
+    counted as a loop-pass error the way checks_unavailable (pr_checks() is
+    None) is. This mirrors test_loop_checks_unavailable_review_lands_in_errors_bucket
+    above but exercises the other outcome the client boundary must now
+    produce: [] means "genuinely no checks yet" (e.g. a conflicted/dirty PR
+    CI never ran on), which is a normal review outcome, not an
+    infrastructure failure.
+
+    This is a downstream-contract characterization test: it stubs
+    GitHub.pr_checks() directly, the same way the sibling test above does, so
+    it does not exercise GitHubClient.pr_checks()'s own gh-subprocess
+    disambiguation logic -- that regression coverage lives in
+    tests/test_github.py (test_pr_checks_zero_checks_returns_empty_list_not_none
+    and friends). What this test proves is that once the client returns []
+    (as it now correctly does for a zero-check PR), workflow.py's loop() does
+    not misclassify it as an error the way it misclassifies None.
+    """
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubWithZeroChecks(FakeGitHub):
+        def pr_checks(self, number: int):
+            return []
+
+    fake_gh = FakeGitHubWithZeroChecks()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.loop(merge=False)
+
+    assert result.data["errors"] == []
+    assert result.data["merges"] == []
+    assert len(result.data["reviews"]) == 1
+    assert result.data["reviews"][0]["pr"] == 456
+
+
 def _arm_unauthorized_merge_tripwire(paths, pre_existing: tuple[int, ...] = ()) -> None:
     """Declare the #502 tripwire already armed, so a test sees its steady state.
 
@@ -12381,25 +12454,40 @@ def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_fai
         set_throttled_until,
     )
 
-    state = set_reviewer_quota_exhausted(
-        empty_state(), throttled_until="2026-08-01T00:00:00Z", probe_after="2026-08-01T00:00:00Z"
-    )
+    # The reviewer-quota throttle MUST be derived from now, never hardcoded.
+    # ``clear_quota_throttles`` only resets ``consecutive_probe_failures`` when
+    # ``is_reviewer_quota_exhausted(data) or cleared_root`` holds, and
+    # ``is_reviewer_quota_exhausted`` is true only while ``throttled_until`` is
+    # still in the future (``datetime.now(UTC) < throttle_time``). This test
+    # deliberately uses a *devin* root throttle below so ``cleared_root`` is
+    # False, which makes the exhaustion check the sole path to the reset --
+    # so the instant a hardcoded date goes stale, the assertion below flips
+    # from testing the reset to testing nothing, and fails.
+    #
+    # This is not hypothetical: this test pinned "2026-08-01T00:00:00Z" and
+    # began failing on every PR and on main at exactly that instant, blocking
+    # the merge lane until the date was made relative.
+    future = future_timestamp(days=3650)
+    # Opaque by contrast: the root throttle is only ever round-tripped and
+    # compared for equality, never against the clock, so an absolute literal is
+    # safe here and keeps the "untouched" assertion easy to read.
+    root_throttle = "2026-08-01T00:00:00Z"
+
+    state = set_reviewer_quota_exhausted(empty_state(), throttled_until=future, probe_after=future)
     state = {
         **state,
         "reviewer_quota": {**state["reviewer_quota"], "consecutive_probe_failures": 3},
     }
     # Also carry a devin-adapter root throttle, to confirm reviewer_quota
     # clears independently of what the root-throttle branch decides.
-    state = set_throttled_until(
-        state, "2026-08-01T00:00:00Z", reason="rate_limited", adapter_kind="devin"
-    )
+    state = set_throttled_until(state, root_throttle, reason="rate_limited", adapter_kind="devin")
 
     cleared = clear_quota_throttles(state)
 
     assert "throttled_until" not in cleared["reviewer_quota"]
     assert cleared["reviewer_quota"]["consecutive_probe_failures"] == 0
     # The devin adapter's root throttle must still be untouched.
-    assert cleared["throttled_until"] == "2026-08-01T00:00:00Z"
+    assert cleared["throttled_until"] == root_throttle
 
 
 def test_clear_quota_throttles_records_last_probe_cleared_at() -> None:
@@ -14754,7 +14842,17 @@ def test_janitor_required_check_failure_without_linked_issue_stays_blocked(
 
 
 def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> None:
-    """Issue #376: an infrastructure check failure (CANCELLED) is not routed to rework."""
+    """Issue #376: an infrastructure check failure (CANCELLED) is never routed
+    to code-fix rework -- that part of this test's original intent is
+    unchanged. Issue #841: unlike issue #376's era, an infra failure no
+    longer sits in janitor_blocked forever with zero remediation -- this
+    fixture's check has no parseable Actions run id (no `link` field) at
+    all, so it cannot be auto-retried and correctly escalates to a human on
+    the very first pass rather than looping/blocking indefinitely (the bug
+    issue #841 fixes). A check that DOES carry a run id instead gets one
+    auto-rerun first -- see
+    test_janitor_infra_failed_first_cancel_triggers_rerun_without_failed_flag.
+    """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithChecks(
@@ -14769,9 +14867,15 @@ def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> N
     result = app.review(456)
 
     assert result.ok is False
+    assert result.data.get("infra_escalated") is True
     state = load_state(paths.state_file)
-    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    # Still never routed to the code-fix rework path -- issue #376's original
+    # assertion, unchanged.
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    # Issue #841: escalated to a human instead of blocking silently forever.
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
 
 
 def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> None:
@@ -14962,6 +15066,160 @@ def test_janitor_required_check_rerun_api_error_falls_through_to_rework(tmp_path
     # The rerun attempt was not persisted because the API call failed.
     assert "check_rerun_attempts" not in state["prs"]["456"]
     assert any(event["kind"] == "flake_rerun_failed" for event in state.get("events", []))
+
+
+# Infra-failed (CANCELLED/INFRA_FAILURE/TIMED_OUT) required-check auto-rerun +
+# escalation (issue #841). Before this, classify_check_failures only ever
+# iterated summary.failed (a code push can't fix an infra kill), so a PR
+# blocked on infra_failed sat there forever behind only a diagnostic
+# merge_failed_attempt_alarm event -- no rerun, no rework, no escalation.
+
+
+def test_janitor_infra_failed_first_cancel_triggers_rerun_without_failed_flag(
+    tmp_path: Path,
+) -> None:
+    """Criterion 1: a CANCELLED required check whose run is the current head
+    becomes eligible for exactly one auto-rerun. Also asserts the rerun is
+    dispatched WITHOUT --failed: the job never completed (cancelled, not
+    failed), so --failed's "rerun the failed jobs in this run" semantics do
+    not apply -- verified against classify_check_failures' own --failed call,
+    which this must NOT copy verbatim."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED", "link": link},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data.get("infra_rerun_run_ids") == [12345]
+    assert len(fake_gh.rerun_calls) == 1
+    assert fake_gh.rerun_calls[0] == ["run", "rerun", "12345"]
+    assert "--failed" not in fake_gh.rerun_calls[0]
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["infra_rerun_attempts"] == {
+        "sha-abc123": {"Tests passed": {"12345": 1}}
+    }
+    assert any(event["kind"] == "infra_rerun_triggered" for event in state.get("events", []))
+    # Not escalated, not routed to rework -- this pass only triggered the rerun.
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    assert "123" not in state.get("issues", {})
+
+
+def test_janitor_infra_failed_cap_exhausted_escalates_to_human_needed(tmp_path: Path) -> None:
+    """Criterion 2: once the infra rerun attempt cap (default 2) is exhausted,
+    there is no code-fix rework path -- the PR must escalate to
+    agent:human-needed instead of looping forever."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED", "link": link},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pass 1: first cancel -> rerun attempt 1.
+    result1 = app.review(456)
+    assert result1.ok is False
+    assert result1.data.get("infra_rerun_run_ids") == [12345]
+
+    # Pass 2: STILL cancelled (the rerun itself timed out again, same run id,
+    # per verified production behavior of `gh run rerun` reusing run ids) ->
+    # rerun attempt 2 (at the default cap).
+    result2 = app.review(456)
+    assert result2.ok is False
+    assert result2.data.get("infra_rerun_run_ids") == [12345]
+    assert len(fake_gh.rerun_calls) == 2
+
+    # Pass 3: STILL cancelled, cap (2) now exhausted -> escalate, not a third rerun.
+    result3 = app.review(456)
+    assert result3.ok is False
+    assert result3.data.get("infra_escalated") is True
+    assert len(fake_gh.rerun_calls) == 2  # no third rerun dispatched
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "infra_rerun_cap_exceeded"
+    assert state["issues"]["123"]["reason_class"] == "mechanical"
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert any(event["kind"] == "infra_rerun_escalated" for event in state.get("events", []))
+
+
+def test_janitor_infra_failed_rerun_api_error_does_not_consume_attempt_or_escalate(
+    tmp_path: Path,
+) -> None:
+    """A `gh run rerun` API error must not silently consume the attempt (the
+    next pass gets a fresh try) and must not escalate -- mirrors the genuine-
+    failure flake-rerun error handling, minus the rework fallback (infra has
+    none)."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED", "link": link},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        rerun_ok=False,
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    # The attempt was not persisted because the API call failed.
+    assert "infra_rerun_attempts" not in state["prs"].get("456", {})
+    assert any(event["kind"] == "infra_rerun_failed" for event in state.get("events", []))
+    # Not escalated -- an API error is not a genuine cap exhaustion.
+    assert "123" not in state.get("issues", {})
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
+
+
+def test_janitor_mixed_genuine_failure_and_infra_failure_routes_to_rework_not_infra_rerun(
+    tmp_path: Path,
+) -> None:
+    """Criterion 3: a genuine code FAILURE co-occurring with an infra-failed
+    check must still route to rework -- the infra-rerun/escalation wiring
+    must not shadow or double-dispatch. is_check_failure_block and
+    is_infra_failure_block are both False here (mirrors the pre-existing
+    is_draft-co-occurring precedent for is_check_failure_block), so this pass
+    triggers neither remediation and falls through to the plain
+    janitor_blocked path reporting both failures."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "state": "CANCELLED"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert len(fake_gh.rerun_calls) == 0
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    failures = state["prs"]["456"]["janitor_failures"]
+    assert any("Tests passed" in f for f in failures)
+    assert any("infrastructure" in f.lower() and "Lint & Format" in f for f in failures)
+    assert "123" not in state.get("issues", {})
 
 
 def test_render_test_adequacy_section_unit() -> None:
@@ -34350,6 +34608,7 @@ def test_supervisor_config_defaults() -> None:
     assert config.supervisor.active_cooldown_seconds == 30
     assert config.supervisor.max_runtime_minutes == 0
     assert config.supervisor.self_deploy_failure_alarm == 3
+    assert config.supervisor.zero_pass_alarm == 3
 
 
 def test_supervisor_config_parses_custom_values(tmp_path: Path) -> None:
@@ -34363,6 +34622,7 @@ supervisor:
   active_cooldown_seconds: 15
   max_runtime_minutes: 60
   self_deploy_failure_alarm: 5
+  zero_pass_alarm: 7
 """
     )
     config = load_config(config_file)
@@ -34371,6 +34631,7 @@ supervisor:
     assert config.supervisor.active_cooldown_seconds == 15
     assert config.supervisor.max_runtime_minutes == 60
     assert config.supervisor.self_deploy_failure_alarm == 5
+    assert config.supervisor.zero_pass_alarm == 7
 
 
 def test_supervisor_config_unknown_key_raises(tmp_path: Path) -> None:
@@ -34420,6 +34681,30 @@ def test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises(tmp_path:
         """
 supervisor:
   self_deploy_failure_alarm: "not-an-int"
+"""
+    )
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_supervisor_config_zero_pass_alarm_wrong_type_raises(tmp_path: Path) -> None:
+    """Wrong type for zero_pass_alarm raises ConfigError.
+
+    Issue #855 added this field alongside the existing supervisor int
+    fields; the supervisor section has its own manual int-type-validation
+    tuple in config.py (separate from the generic _build_section machinery),
+    which needed the new key added explicitly -- mirrors
+    test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
+    Locks that in so a future refactor of the tuple can't silently drop
+    validation for this field.
+    """
+    from charlie_work.config import ConfigError
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+supervisor:
+  zero_pass_alarm: "not-an-int"
 """
     )
     with pytest.raises(ConfigError, match="must be an int"):

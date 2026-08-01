@@ -1501,6 +1501,7 @@ def _is_review_dispatchable(
     candidate: dict[str, Any],
     *,
     max_attempts: int = 3,
+    now: datetime | None = None,
 ) -> bool:
     """Return True if ``pr_number`` is free to receive a new reviewer dispatch.
 
@@ -1513,6 +1514,13 @@ def _is_review_dispatchable(
 
     This reuses ``is_claim_stale`` for the timeout and ``_reviewer_pid_alive``
     for liveness, avoiding a parallel mechanism.
+
+    ``now`` is the injectable clock (issue #828), forwarded to every
+    ``is_claim_stale`` call below: defaults to ``datetime.now(UTC)`` there
+    when not supplied, so production behavior is byte-identical. Callers
+    evaluating a whole candidate list against one shared instant (e.g.
+    ``dispatch_reviews``) should sample ``now`` once and pass the same value
+    to each ``_is_review_dispatchable`` call.
     """
     pr_state = state["prs"].get(str(pr_number), {})
     status = pr_state.get("review_dispatch_status")
@@ -1531,7 +1539,7 @@ def _is_review_dispatchable(
     if status == "review_dispatch_pending":
         pending_at = pr_state.get("review_dispatch_pending_at")
         return pending_at is None or is_claim_stale(
-            pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
         )
 
     if status == "review_dispatch_dispatched":
@@ -1548,13 +1556,13 @@ def _is_review_dispatchable(
         # (e.g. died before its sidecar was written).
         dispatched_at = pr_state.get("review_dispatched_at")
         return dispatched_at is None or is_claim_stale(
-            dispatched_at, timeout_minutes=_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES
+            dispatched_at, timeout_minutes=_REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES, now=now
         )
 
     if status == "review_dispatch_failed":
         failed_at = pr_state.get("review_dispatch_failed_at")
         return failed_at is None or is_claim_stale(
-            failed_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+            failed_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
         )
 
     # Unknown status: treat as free so we don't silently orphan PRs.
@@ -2437,9 +2445,12 @@ def _detect_and_handle_stalled_reviews(
     retry/backoff path. This function is intentionally simpler than
     ``_detect_and_handle_stalled_sessions``: it performs claim/slot cleanup.
 
-    ``now`` (issue #828) is the injectable clock for this sweep: it seeds
-    ``resolved_now`` below, which both internal ``datetime.now(UTC)`` samples
-    in the throttled-reviewer branch (the parsed-reset-time lookup and the
+    ``now`` is the injectable clock (issue #828), forwarded to every
+    ``is_claim_stale`` check in this sweep so every claim in one sweep is
+    evaluated against a single consistent instant instead of each check
+    independently racing the wall clock. It also seeds ``resolved_now``
+    below, which both internal ``datetime.now(UTC)`` samples in the
+    throttled-reviewer branch (the parsed-reset-time lookup and the
     quota-exhaustion backoff) resolve from, instead of each independently
     racing the wall clock. Defaults to ``datetime.now(UTC)`` when omitted, so
     production behavior is byte-identical; tests can freeze it and assert
@@ -2481,7 +2492,9 @@ def _detect_and_handle_stalled_reviews(
         # Respect the stale-claim timeout so a very recently dead reviewer is
         # not immediately re-dispatched (which can thrash if the underlying
         # launch path is flaky). Old dead reviewers become re-dispatchable.
-        if not is_claim_stale(w.started_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
+        if not is_claim_stale(
+            w.started_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
+        ):
             continue
 
         seen_pr_keys.add(pr_key)
@@ -2738,7 +2751,7 @@ def _detect_and_handle_stalled_reviews(
         if status == "review_dispatch_pending":
             pending_at = pr_state.get("review_dispatch_pending_at")
             if pending_at and is_claim_stale(
-                pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+                pending_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
             ):
                 state["prs"][pr_key] = {
                     **pr_state,
@@ -2777,7 +2790,7 @@ def _detect_and_handle_stalled_reviews(
                 continue
             dispatched_at = pr_state.get("review_dispatched_at")
             if dispatched_at and is_claim_stale(
-                dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
+                dispatched_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
             ):
                 state["prs"][pr_key] = {
                     **pr_state,
@@ -2842,7 +2855,9 @@ def _detect_and_handle_stalled_reviews(
                 .isoformat()
                 .replace("+00:00", "Z")
             )
-            if not is_claim_stale(packet_age, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES):
+            if not is_claim_stale(
+                packet_age, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
+            ):
                 continue
 
             state["prs"][pr_key] = {
@@ -8016,6 +8031,150 @@ class OrchestratorApp:
                     )
                     save_state(self.paths.state_file, state)
 
+            # Infra-failure auto-rerun + escalation (issue #841): a job-level
+            # `timeout-minutes` kill on this repo's self-hosted runners reports
+            # CANCELLED (not TIMED_OUT), which summarize_checks correctly
+            # buckets into infra_failed (blocks merge via CheckSummary.ready),
+            # but nothing before this retried or escalated it --
+            # classify_check_failures only iterates summary.failed (a code push
+            # can't fix an infra kill), so an infra-failed PR sat blocked
+            # forever behind only a diagnostic merge_failed_attempt_alarm
+            # event. `gh run rerun RUN_ID` is dispatched WITHOUT --failed: the
+            # job never completed (cancelled/timed out, not failed), so
+            # --failed's "rerun the failed jobs in this run" semantics do not
+            # apply -- omitting it reruns the whole run, which is the correct
+            # behavior for a run that never produced a completed job to target.
+            if verdict.infra_rerun_run_ids:
+                infra_rerun_errors: list[str] = []
+                infra_triggered_run_ids: list[int] = []
+                for run_id in verdict.infra_rerun_run_ids:
+                    result = self.gh.run(["run", "rerun", str(run_id)], allow_failure=True)
+                    if isinstance(result, GitHubRunResult):
+                        if result.ok:
+                            infra_triggered_run_ids.append(run_id)
+                        else:
+                            infra_rerun_errors.append(
+                                result.error or f"gh run rerun {run_id} exited {result.returncode}"
+                            )
+                    elif isinstance(result, str):
+                        # Dry-run returns a descriptive string; treat as success.
+                        infra_triggered_run_ids.append(run_id)
+                    else:
+                        infra_rerun_errors.append(
+                            f"unexpected result from gh run rerun {run_id}: {result!r}"
+                        )
+
+                if infra_triggered_run_ids and not infra_rerun_errors:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state["prs"][str(pr_number)] = {
+                            **state["prs"].get(str(pr_number), {}),
+                            "number": pr_number,
+                            "issue_number": issue_number,
+                            "infra_rerun_attempts": verdict.infra_rerun_attempts,
+                        }
+                        state = append_event(
+                            state,
+                            "infra_rerun_triggered",
+                            {
+                                "pr_number": pr_number,
+                                "run_ids": infra_triggered_run_ids,
+                                "head_sha": pr.get("headRefOid"),
+                            },
+                            state_path=self.paths.state_file,
+                        )
+                        save_state(self.paths.state_file, state)
+                    return CommandResult(
+                        False,
+                        f"infra rerun triggered for PR #{pr_number}: run(s) "
+                        + ", ".join(str(rid) for rid in infra_triggered_run_ids),
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "infra_rerun_run_ids": infra_triggered_run_ids,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
+
+                # Rerun API error: record it, but do not consume the attempt.
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state = append_event(
+                        state,
+                        "infra_rerun_failed",
+                        {
+                            "pr_number": pr_number,
+                            "run_ids": list(verdict.infra_rerun_run_ids),
+                            "errors": infra_rerun_errors,
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                    save_state(self.paths.state_file, state)
+
+            if (
+                issue_number is not None
+                and verdict.is_infra_failure_block
+                and verdict.infra_definitive_failed
+            ):
+                # Attempt cap exhausted (or no parseable run id at all): there
+                # is no code-fix rework path for an infra failure, so escalate
+                # straight to a human instead of looping forever on a PR that
+                # can never clear the gate on its own -- this is the bug
+                # issue #841 fixes (previously: a diagnostic
+                # merge_failed_attempt_alarm event and nothing else).
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state["prs"][str(pr_number)] = {
+                        **state["prs"].get(str(pr_number), {}),
+                        "number": pr_number,
+                        "issue_number": issue_number,
+                        "status": "escalated",
+                        "escalation_reason": "infra_rerun_cap_exceeded",
+                        "infra_rerun_attempts": verdict.infra_rerun_attempts,
+                    }
+                    state["issues"][str(issue_number)] = {
+                        **state["issues"].get(str(issue_number), {}),
+                        "number": issue_number,
+                        "status": "escalated",
+                        "escalation_reason": "infra_rerun_cap_exceeded",
+                        "merge_alert": "OK",
+                        # Issue #841: an infra rerun attempt cap is a process
+                        # limit, not a judgment call -- mechanical (mirrors the
+                        # janitor rework cap's own reason_class at ~13230).
+                        "reason_class": escalation_reason_class("mechanical"),
+                    }
+                    state = append_event(
+                        state,
+                        "infra_rerun_escalated",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "checks": list(verdict.infra_definitive_failed),
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                    save_state(self.paths.state_file, state)
+                result = transition(self.gh, self.config.labels, issue_number, "escalated")
+                label_error = None
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "escalated",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+                return CommandResult(
+                    False,
+                    f"PR #{pr_number} infra-failed check(s) exhausted rerun cap: "
+                    + ", ".join(verdict.infra_definitive_failed),
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "infra_escalated": True,
+                        "label_error": label_error,
+                    },
+                )
+
             if issue_number is not None and verdict.is_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
@@ -8971,7 +9130,9 @@ class OrchestratorApp:
         }
 
     @_guard_state_lock
-    def dispatch_reviews(self, limit: int | None = None) -> CommandResult:
+    def dispatch_reviews(
+        self, limit: int | None = None, *, now: datetime | None = None
+    ) -> CommandResult:
         """Launch Claude Code reviewer sessions concurrently for queued PRs.
 
         Issue #370: a deterministic loop stage that turns ``review_queue()```
@@ -8988,6 +9149,15 @@ class OrchestratorApp:
         and skip until it goes stale. A reviewer that dies without a verdict is
         freed by ``_detect_and_handle_stalled_reviews`` after the stale-claim
         timeout, making the PR re-dispatchable.
+
+        ``now`` (issue #828) is the injectable clock for this entire pass: it
+        is resolved once below and forwarded to every ``is_claim_stale`` check
+        this method drives, directly (via ``_is_review_dispatchable``) and
+        indirectly (via ``_detect_and_handle_stalled_reviews``), instead of
+        each one independently racing the wall clock. Defaults to
+        ``datetime.now(UTC)`` when omitted, so production behavior is
+        byte-identical; tests can freeze it and assert exact equality instead
+        of a wall-clock-tolerance proximity check.
         """
         if not self.config.review_dispatch.enabled:
             return CommandResult(
@@ -9001,6 +9171,7 @@ class OrchestratorApp:
                 },
             )
 
+        resolved_now = now if now is not None else datetime.now(UTC)
         reviews_dir = self._layout.reviews_dir
 
         # Run the verdict-reaper and orphan/stalled sweeps BEFORE the quota
@@ -9013,7 +9184,11 @@ class OrchestratorApp:
         if not self.dry_run:
             verdict_result = self._reap_review_verdicts(reviews_dir)
             _detect_and_handle_stalled_reviews(
-                reviews_dir, self.paths.state_file, self.config, self.repo_root
+                reviews_dir,
+                self.paths.state_file,
+                self.config,
+                self.repo_root,
+                now=resolved_now,
             )
             _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
             _reap_orphaned_review_checkouts(
@@ -9289,7 +9464,9 @@ class OrchestratorApp:
                 c
                 for c in candidates
                 if c["pr"] not in escalated_skipped_set
-                and _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts)
+                and _is_review_dispatchable(
+                    state, c["pr"], c, max_attempts=max_attempts, now=resolved_now
+                )
             ]
 
         # Apply the human-needed label edge for each fresh escalation, outside
@@ -9471,8 +9648,11 @@ class OrchestratorApp:
         # Claim the selected PRs as pending before launching. This is the only
         # place that writes review_dispatch_pending; the upgrade happens after
         # each launch so a crash between claim and upgrade is recoverable via
-        # the stale-claim timeout.
-        now = utc_now()
+        # the stale-claim timeout. Named distinctly from `now`/`resolved_now`
+        # above (issue #828's injectable clock) -- this is a write-time stamp,
+        # not a staleness-comparison read, and utc_now() returns a formatted
+        # string rather than a datetime.
+        claim_stamp = utc_now()
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             review_effort_assignments: list[dict[str, Any]] = []
@@ -9495,7 +9675,7 @@ class OrchestratorApp:
                     "number": pr_number,
                     "issue_number": candidate["issue"],
                     "review_dispatch_status": "review_dispatch_pending",
-                    "review_dispatch_pending_at": now,
+                    "review_dispatch_pending_at": claim_stamp,
                     "review_dispatched_at": None,
                     "review_dispatch_failed_at": None,
                     "reviewer_pid": None,
@@ -14877,7 +15057,10 @@ class OrchestratorApp:
         # dispatch so a completed worker's review packet can be picked up by the
         # same loop pass only if the reviewer finishes immediately (tests); in
         # production the per-PR merge lane below fires on the next poll.
-        dispatch_reviews = self.dispatch_reviews()
+        # `now` (issue #822/#828) is this pass's injectable clock, threaded
+        # through so dispatch_reviews's is_claim_stale checks share the same
+        # instant as the rest of this pass instead of resampling.
+        dispatch_reviews = self.dispatch_reviews(now=now)
 
         # Auto-record cross-family verdicts for pending PRs when the
         # cross-family pass is the sole automated review (review_dispatch

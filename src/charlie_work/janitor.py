@@ -30,7 +30,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from charlie_work.checks import CheckSummary, classify_check_failures, summarize_checks
+from charlie_work.checks import (
+    CheckSummary,
+    classify_check_failures,
+    classify_infra_failures,
+    summarize_checks,
+)
 from charlie_work.github import linked_issue_number
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import (
@@ -148,6 +153,21 @@ class JanitorVerdict:
     is_check_failure_block: bool = False
     rerun_run_ids: tuple[int, ...] = ()
     check_rerun_attempts: dict[str, Any] = field(default_factory=dict)
+    # Infra-failed (CANCELLED/INFRA_FAILURE/TIMED_OUT) required-check auto-rerun
+    # and escalation (issue #841). is_infra_failure_block mirrors
+    # is_check_failure_block: True only when an infra-failed required check is
+    # the SOLE janitor blocker this pass. Consumers must branch on this
+    # structured flag, never on the failure-message text (same rule as the
+    # is_draft_only_block/is_no_op_rework flags below).
+    is_infra_failure_block: bool = False
+    infra_rerun_run_ids: tuple[int, ...] = ()
+    infra_rerun_attempts: dict[str, Any] = field(default_factory=dict)
+    # Infra-failed required checks that will NOT be retried this pass, either
+    # because every failing run id has exhausted auto_merge.infra_rerun_attempt_cap
+    # or because no run id could be parsed at all. Non-empty here together with
+    # is_infra_failure_block is the caller's signal to escalate to a human --
+    # there is no code-fix rework path for an infra failure.
+    infra_definitive_failed: tuple[str, ...] = ()
     # Structured flag for _check_no_op_rework's finding (either variant:
     # patch-id or head-SHA unchanged since the last request_changes verdict).
     # Consumers must branch on this, never on the failure-message text.
@@ -316,7 +336,13 @@ def run_janitor(
     is_draft = _check_draft(pr, failures)
     _check_state(pr, failures)
     _check_mergeable(pr, failures)
+    # Marker to isolate exactly what _check_required_checks contributes below,
+    # so is_infra_failure_block (issue #841) can tell "infra_failed is the only
+    # required-checks-derived failure" apart from a co-occurring missing/
+    # unavailable check, without parsing failure-message text.
+    pre_required_checks_len = len(failures)
     _check_required_checks(summary, failures, warnings)
+    required_checks_added = len(failures) - pre_required_checks_len
     _check_linked_issue(pr, config, failures)
     _check_body(pr, config, failures)
     _check_title_conventional(pr, warnings)
@@ -336,12 +362,34 @@ def run_janitor(
 
     is_check_failure_block = bool(failed_required_checks) and not failures
 
+    # issue #841: mirror is_check_failure_block for infra-failed required
+    # checks. `failures` at this point still excludes the "Required check(s)
+    # failed" message (appended below) but DOES include
+    # _check_required_checks' own infra_failed/missing/unavailable messages --
+    # `required_checks_added` isolates exactly that contribution so this is
+    # True only when infra_failed is non-empty, no missing/unavailable check
+    # co-occurs (which would inflate required_checks_added past 1), no
+    # genuine code failure co-occurs, and nothing else in `failures` (draft,
+    # state, mergeable, linked issue, body, no-op-rework) is set.
+    non_required_checks_failures = len(failures) - required_checks_added
+    is_infra_failure_block = (
+        summary is not None
+        and bool(summary.infra_failed)
+        and not failed_required_checks
+        and not summary.missing
+        and not summary.unavailable
+        and non_required_checks_failures == 0
+    )
+
     # Flake-aware debounce (issue #391): if the only blocker is failed required
     # checks, decide which runs get a one-time auto-rerun vs which are already
     # retried and therefore definitive. The actual gh run rerun call lives in
     # workflow.review; run_janitor stays pure and just returns the classification.
     rerun_run_ids: tuple[int, ...] = ()
     check_rerun_attempts: dict[str, Any] = {}
+    infra_rerun_run_ids: tuple[int, ...] = ()
+    infra_rerun_attempts: dict[str, Any] = {}
+    infra_definitive_failed: tuple[str, ...] = ()
     if summary is not None:
         head_sha = str(pr.get("headRefOid") or "") or None
         debounce = classify_check_failures(
@@ -353,6 +401,21 @@ def run_janitor(
         )
         rerun_run_ids = debounce.rerun_run_ids
         check_rerun_attempts = debounce.check_rerun_attempts
+
+        # Infra-failure auto-rerun + escalation (issue #841): same debounce
+        # shape as above, but over CANCELLED/INFRA_FAILURE/TIMED_OUT checks,
+        # which have no code-fix rework path -- see classify_infra_failures.
+        infra_debounce = classify_infra_failures(
+            checks,
+            required,
+            pr_state,
+            head_sha,
+            record_attempts=is_infra_failure_block,
+            attempt_cap=config.auto_merge.infra_rerun_attempt_cap,
+        )
+        infra_rerun_run_ids = infra_debounce.rerun_run_ids
+        infra_rerun_attempts = infra_debounce.infra_rerun_attempts
+        infra_definitive_failed = infra_debounce.definitive_failed
 
     if failed_required_checks:
         failures.append(f"Required check(s) failed: {', '.join(failed_required_checks)}")
@@ -371,6 +434,10 @@ def run_janitor(
         is_check_failure_block=is_check_failure_block,
         rerun_run_ids=rerun_run_ids,
         check_rerun_attempts=check_rerun_attempts,
+        is_infra_failure_block=is_infra_failure_block,
+        infra_rerun_run_ids=infra_rerun_run_ids,
+        infra_rerun_attempts=infra_rerun_attempts,
+        infra_definitive_failed=infra_definitive_failed,
         is_no_op_rework=is_no_op_rework,
         is_draft=is_draft,
         is_draft_only_block=is_draft_only_block,
