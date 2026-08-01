@@ -4041,6 +4041,11 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
             pulled=True,
             changed=True,
             synced=False,
+            # run_fleet_supervise's restart gate reads head_changed, NOT
+            # from_sha != to_sha (#853). Without this the simulated HEAD move
+            # is a no-op, the supervisor never exits for a watchdog restart,
+            # and this test stops exercising the #851 shape it is named for.
+            head_changed=True,
             from_sha="a" * 12,
             to_sha="b" * 12,
             message="updated and synced: " + "b" * 12,
@@ -4101,6 +4106,11 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
             pulled=True,
             changed=True,
             synced=False,
+            # run_fleet_supervise's restart gate reads head_changed, NOT
+            # from_sha != to_sha (#853). Without this the simulated HEAD move
+            # is a no-op, the supervisor never exits for a watchdog restart,
+            # and this test stops exercising the #851 shape it is named for.
+            head_changed=True,
             from_sha="a" * 12,
             to_sha="b" * 12,
             message="updated and synced: " + "b" * 12,
@@ -4175,6 +4185,11 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
         pulled=True,
         changed=True,
         synced=False,
+        # run_fleet_supervise's restart gate reads head_changed, NOT
+        # from_sha != to_sha (#853). Without this the simulated HEAD move
+        # is a no-op, the supervisor never exits for a watchdog restart,
+        # and this test stops exercising the #851 shape it is named for.
+        head_changed=True,
         from_sha="a" * 12,
         to_sha="b" * 12,
         message="updated and synced: " + "b" * 12,
