@@ -32,6 +32,7 @@ addopts = "-q --tb=short"
 testpaths = ["tests"]
 markers = [
     "real_activity_probe_live: test exercises the real (unstubbed) real_activity_probe_for instead of the autouse stale-probe stub (issue #307)",
+    "rollback_path: test covers a module superseded by ci_fleet and kept only as the rollback path -- a green run means 'rollback still works', NOT 'the live allocator is healthy' (issue #876). Membership is enforced against the import graph by tests/test_dormant_fleet_marking.py; do not add or remove by hand.",
 ]
 
 [tool.ruff]

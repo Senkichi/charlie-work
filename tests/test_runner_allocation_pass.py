@@ -12,6 +12,15 @@ the layer that composes them:
 - **Never actuate on a dry run.** The ``if not dry_run:`` guard around
   ``save_idle_streaks`` is the only thing keeping a simulated pass from
   advancing hysteresis state (issue #605).
+
+**``run_allocation_pass`` is no longer the pass that actuates (issue #876).**
+PR #869 repointed charlie-work's fleet consumers at the extracted ``ci_fleet``
+package; this module is retained, re-activatable by config, as the rollback
+path. Both safety properties above are still worth holding -- but a green run
+here means *rollback still works*, not that live allocation is safe, because the
+pass making live decisions is ci_fleet's. See
+``tests/test_dormant_fleet_marking.py``, which derives that from the import
+graph rather than trusting this paragraph.
 """
 
 from __future__ import annotations
@@ -31,6 +40,12 @@ from charlie_work.runner_slots import (
     load_allocation_stamp,
     load_idle_streaks,
 )
+
+# Issue #876: this whole module covers the dormant rollback path, not the live
+# allocator. Applied at module scope rather than per test because the dormancy is
+# a property of the module under test, not of any individual case. Membership is
+# enforced against the import graph by tests/test_dormant_fleet_marking.py.
+pytestmark = pytest.mark.rollback_path
 
 CW = "Senkichi/charlie-work"
 JC = "Senkichi/job-cannon"
