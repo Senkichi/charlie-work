@@ -11080,6 +11080,105 @@ class OrchestratorApp:
             },
         )
 
+    # Deliberately NOT @_guard_state_lock: merge_check takes no state lock, and
+    # the guard's contract is to return a *successful* skip (ok=True) when the
+    # lock is held. On an authorization preflight that would be fail-open —
+    # "cannot tell" rendered as "yes". Keep this method lock-free and pure.
+    def merge_check(self, pr_number: int) -> CommandResult:
+        """Answer "is this PR merge-authorized *right now*?" without merging it.
+
+        Issue #894. Merge authorization was enforced only on the paths that
+        merge through this codebase -- ``merge_ready`` (``ship-it``) and, for
+        the Aviator re-queue, ``reconcile._pr_review_approved_at_head``. A raw
+        ``gh pr merge`` bypassed both, and the #502 tripwire only reports the
+        bypass *after* the merge is irreversible. That is what happened to PR
+        #759, whose merge was justified from GitHub's review state while
+        ``review-decision.json`` recorded ``request_changes``.
+
+        This is the preflight those paths never exposed: same invariant, no
+        side effects, callable before the merge rather than after it. It is
+        the single command a ``PreToolUse`` hook can shell out to, so the
+        interception logic stays in the repo (versioned, CI-covered) instead
+        of in unversioned agent configuration.
+
+        **Fails closed.** Every unreadable, absent, malformed, or ambiguous
+        input yields ``ok=False``. An authorization preflight that answers
+        "yes" when it cannot tell is worse than no preflight, because it
+        launders uncertainty into permission. ``data["reason"]`` names which
+        condition fired so the caller can act on it; the distinction between
+        ``not_approved`` and ``head_moved`` is the difference between "get a
+        review" and "get a re-review".
+
+        Deliberately does *not* reuse ``merge_ready``'s inline gate: that one
+        may **mutate** state via approval carry-forward (``_update_approval_head``).
+        A preflight must be a pure question. The shared invariant is the pair
+        ``decision == "approved"`` and ``reviewed_head_sha == headRefOid``,
+        asserted identically here and in ``_pr_review_approved_at_head``.
+        """
+        pr = self.gh.pr_view(pr_number)
+        if not isinstance(pr, dict) or not pr:
+            return CommandResult(
+                False,
+                f"PR #{pr_number}: cannot read PR from GitHub — refusing to authorize",
+                {"pr": pr_number, "authorized": False, "reason": "pr_unreadable"},
+            )
+        if str(pr.get("state", "")).upper() == "MERGED":
+            return CommandResult(
+                False,
+                f"PR #{pr_number} is already merged — nothing to authorize",
+                {"pr": pr_number, "authorized": False, "reason": "already_merged"},
+            )
+
+        live_head_sha = pr.get("headRefOid")
+        decision = self._review_decision(pr_number)
+        decision_value = decision.get("decision")
+        reviewed_head_sha = decision.get("reviewed_head_sha")
+        base = {
+            "pr": pr_number,
+            "decision": decision_value,
+            "reviewed_head_sha": reviewed_head_sha,
+            "live_head_sha": live_head_sha,
+        }
+
+        if not live_head_sha:
+            return CommandResult(
+                False,
+                f"PR #{pr_number}: no live head sha — refusing to authorize",
+                {**base, "authorized": False, "reason": "no_live_head"},
+            )
+        if decision_value == "missing":
+            return CommandResult(
+                False,
+                f"PR #{pr_number}: no review-decision.json — not authorized",
+                {**base, "authorized": False, "reason": "no_decision"},
+            )
+        if decision_value == "invalid":
+            return CommandResult(
+                False,
+                f"PR #{pr_number}: review-decision.json unreadable — not authorized",
+                {**base, "authorized": False, "reason": "invalid_decision"},
+            )
+        if decision_value != "approved":
+            return CommandResult(
+                False,
+                f"PR #{pr_number}: recorded decision is {decision_value!r}, not 'approved'",
+                {**base, "authorized": False, "reason": "not_approved"},
+            )
+        if reviewed_head_sha != live_head_sha:
+            return CommandResult(
+                False,
+                (
+                    f"PR #{pr_number}: approved at {reviewed_head_sha} but head is now "
+                    f"{live_head_sha} — re-review required"
+                ),
+                {**base, "authorized": False, "reason": "head_moved"},
+            )
+        return CommandResult(
+            True,
+            f"PR #{pr_number}: approved at current head {live_head_sha}",
+            {**base, "authorized": True, "reason": "approved_at_head"},
+        )
+
     @_guard_state_lock
     def merge_ready(
         self,
