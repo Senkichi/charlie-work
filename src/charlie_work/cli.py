@@ -174,6 +174,17 @@ def build_parser() -> argparse.ArgumentParser:
     unescalate.add_argument("--issue", type=int, default=None)
     _add_dry_run(unescalate)
 
+    merge_check = subparsers.add_parser(
+        "merge-check",
+        help=(
+            "Preflight: exit 0 only if PR is approved at its current head "
+            "(issue #894). Read-only — never merges. Intended for a PreToolUse "
+            "hook to gate a raw `gh pr merge`, which otherwise bypasses every "
+            "authorization check in this codebase."
+        ),
+    )
+    merge_check.add_argument("pr", type=int, help="PR number to check")
+
     merge_ready = subparsers.add_parser("ship-it")
     merge_ready.add_argument("--pr", type=int, required=True)
     merge_group = merge_ready.add_mutually_exclusive_group()
@@ -1492,6 +1503,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             return app.unescalate(args.pr, args.issue, dry_run=args.dry_run)
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})
+    if args.command == "merge-check":
+        return app.merge_check(args.pr)
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
     if args.command == "tripwire":
