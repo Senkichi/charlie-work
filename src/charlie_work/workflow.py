@@ -17431,11 +17431,20 @@ class OrchestratorApp:
             )
             save_state(self.paths.state_file, state)
 
+        # Echo the resolved state file (issue #895). An ack is a write to a
+        # security control's audit record, and the operator's only evidence of
+        # *which repo* received it was previously the exit code. Naming the
+        # path makes a misrouted ack visible in the output that reports success.
         return CommandResult(
             True,
-            f"acknowledged unauthorized-merge finding for PR #{pr_number}; "
-            "it will no longer pin ok=False",
-            {"pr": pr_number, "reason": reason, "by": by},
+            f"acknowledged unauthorized-merge finding for PR #{pr_number} "
+            f"in {self.paths.state_file}; it will no longer pin ok=False",
+            {
+                "pr": pr_number,
+                "reason": reason,
+                "by": by,
+                "state_file": str(self.paths.state_file),
+            },
         )
 
     def _review_decision(self, pr_number: int) -> dict[str, Any]:

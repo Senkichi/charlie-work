@@ -423,8 +423,47 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _assert_config_repo_matches(config_arg: Path | None, repo_root: Path) -> None:
+    """Refuse to apply one repo's ``--config`` to another repo's state (issue #895).
+
+    ``--config`` selects the *config*; it never selected the *state*. ``repo_root``
+    comes from ``--repo`` (defaulting to cwd), and ``runtime_paths`` resolves a
+    **relative** ``state_dir`` against it. Every managed repo uses a relative
+    ``state_dir``, so ``charlie --config <job-cannon> tripwire ack 1392`` run from
+    a charlie-work cwd loaded job-cannon's settings and wrote job-cannon's ack into
+    *charlie-work's* state file — exit 0, no warning, and job-cannon's finding
+    still pinned ``ok=False``.
+
+    That silence is the danger, not the misroute: a misdirected write into a keyed
+    map is indistinguishable from a legitimate one afterwards. charlie-work's ack
+    map ended up holding entries for PR #1392/#1408 while its own numbering was in
+    the 800s and climbing — a security control pre-disarmed for two PRs that did
+    not exist yet.
+
+    Fails closed with the corrective invocation rather than inferring ``repo_root``
+    from the config's location: a shared or layered config may legitimately live
+    outside the repo it configures, and silently re-rooting would trade this bug
+    for a subtler one. Only fires when the config provably belongs to a *different
+    git work tree* — a config outside any repo is left alone for exactly that reason.
+    """
+    if config_arg is None:
+        return
+    config_dir = config_arg.expanduser().resolve().parent
+    if not config_dir.exists():
+        return
+    config_repo = find_repo_root(config_dir, explicit=False)
+    if config_repo == repo_root or not (config_repo / ".git").exists():
+        return
+    raise ConfigError(
+        f"--config points into {config_repo}, but state resolves against {repo_root}. "
+        f"--config does not select the state directory. "
+        f"Pass --repo {config_repo} to operate on that repo."
+    )
+
+
 def build_app(args: argparse.Namespace) -> OrchestratorApp:
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    _assert_config_repo_matches(args.config, repo_root)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)

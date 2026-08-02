@@ -10,6 +10,7 @@ import pytest
 
 from charlie_work import cli
 from charlie_work.config import (
+    ConfigError,
     NotifyConfig,
     OrchestratorConfig,
     RunnerAllocationConfig,
@@ -1686,3 +1687,65 @@ def test_migrate_state_dir_apply_happy_path_actuates_when_quiescent(tmp_path: Pa
 
     assert result.ok is True
     assert "moved 1 children" in result.message
+
+
+def _fake_repo(root: Path) -> Path:
+    """A directory git's fallback resolution will treat as a work-tree root.
+
+    `git rev-parse` fails inside it (no HEAD), which drives `find_repo_root`
+    into its documented `.git`-walking fallback — deterministic and offline.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".git").mkdir(exist_ok=True)
+    return root
+
+
+def test_config_from_another_repo_is_refused(tmp_path: Path) -> None:
+    """Issue #895: --config selects the config, never the state.
+
+    The real incident: `charlie --config <job-cannon> tripwire ack 1392` run from
+    a charlie-work cwd wrote job-cannon's ack into charlie-work's state, exit 0,
+    while job-cannon's finding kept pinning ok=False.
+    """
+    repo_a = _fake_repo(tmp_path / "charlie-work")
+    repo_b = _fake_repo(tmp_path / "job-cannon")
+    foreign_config = repo_b / "orchestrator.config.yaml"
+    foreign_config.write_text("runtime:\n  state_dir: .var/charlie-work\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError) as excinfo:
+        cli._assert_config_repo_matches(foreign_config, repo_a)
+
+    message = str(excinfo.value)
+    assert str(repo_b) in message
+    assert str(repo_a) in message
+    # The error must carry the corrective invocation, not just the diagnosis.
+    assert "--repo" in message
+
+
+def test_config_from_the_same_repo_is_allowed(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path / "charlie-work")
+    own_config = repo / "orchestrator.config.yaml"
+    own_config.write_text("runtime:\n  state_dir: .var/charlie-work\n", encoding="utf-8")
+
+    cli._assert_config_repo_matches(own_config, repo)  # must not raise
+
+
+def test_config_outside_any_git_repo_is_allowed(tmp_path: Path) -> None:
+    """A shared/layered config legitimately lives outside the repo it configures.
+
+    The gate fires only when the config provably belongs to a *different* work
+    tree — otherwise this would break exactly the deployment shape it must not
+    touch.
+    """
+    repo = _fake_repo(tmp_path / "charlie-work")
+    shared = tmp_path / "shared-config"
+    shared.mkdir()
+    loose_config = shared / "orchestrator.config.yaml"
+    loose_config.write_text("runtime:\n  state_dir: .var/charlie-work\n", encoding="utf-8")
+
+    cli._assert_config_repo_matches(loose_config, repo)  # must not raise
+
+
+def test_no_config_flag_is_allowed(tmp_path: Path) -> None:
+    repo = _fake_repo(tmp_path / "charlie-work")
+    cli._assert_config_repo_matches(None, repo)  # must not raise
