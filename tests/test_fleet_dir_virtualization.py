@@ -227,3 +227,42 @@ def test_touch_repo_is_silent_when_not_virtualized(tmp_path: Path, caplog: Any) 
         touch_repo(str(fleet), repo_root, paths, _FakeGH())  # type: ignore[arg-type]
 
     assert not any("Fleet dir virtualization" in record.message for record in caplog.records)
+
+
+# --- _paths_equal semantics (#899) -------------------------------------------
+# The helper's docstring claimed PurePath.__eq__ was case-sensitive on Windows.
+# It is not, and nothing here covered the claim, so it rotted undetected until a
+# mutation in ci_fleet's vendored copy (body -> `a == b`) left that suite green.
+# These pin the behaviour the corrected rationale actually rests on.
+
+
+def test_purepath_equality_already_folds_case_per_flavour() -> None:
+    """The premise the old docstring got backwards -- pinned, not asserted in prose."""
+    from pathlib import PurePosixPath, PureWindowsPath
+
+    assert PureWindowsPath("C:/Foo/Bar") == PureWindowsPath("c:/foo/bar")
+    assert PurePosixPath("/Foo/Bar") != PurePosixPath("/foo/bar")
+    # Separators, too -- so for two Path inputs the helper adds nothing.
+    assert PureWindowsPath("C:/Foo") == PureWindowsPath(r"C:\Foo")
+
+
+def test_paths_equal_collapses_str_and_path_operands(tmp_path: Path) -> None:
+    """The real reason the helper exists: a str operand makes ``==`` fail outright.
+
+    This is the mutation-killer. Replacing the body with ``a == b`` fails here,
+    because ``str`` and ``Path`` are never equal regardless of spelling -- and
+    the probe would read that inequality as a literal-vs-resolved divergence and
+    report virtualization that is not happening.
+    """
+    from charlie_work.fleet_paths import _paths_equal
+
+    assert str(tmp_path) != tmp_path  # plain == is not sufficient across types
+    assert _paths_equal(str(tmp_path), tmp_path)  # type: ignore[arg-type]
+    assert _paths_equal(tmp_path, str(tmp_path))  # type: ignore[arg-type]
+
+
+def test_paths_equal_still_reports_genuine_divergence(tmp_path: Path) -> None:
+    """The guard must not collapse paths that really do differ."""
+    from charlie_work.fleet_paths import _paths_equal
+
+    assert not _paths_equal(tmp_path / "literal", tmp_path / "redirected")
