@@ -3,6 +3,15 @@
 Covers the pure allocator (runner_allocation.py), the host/GitHub layer
 (runner_slots.py), and the pass that wires them together
 (runner_allocation_pass.py).
+
+**These modules are no longer on the live path (issue #876).** PR #869
+repointed charlie-work's fleet consumers at the extracted ``ci_fleet`` package;
+the modules under test here are retained, re-activatable by config, as the
+rollback path. A green run of this file therefore means *rollback still works*
+-- it does **not** mean fleet allocation is healthy, because the allocator
+making live decisions is ci_fleet's. See ``tests/test_dormant_fleet_marking.py``,
+which derives that claim from the import graph rather than trusting this
+paragraph.
 """
 
 from __future__ import annotations
@@ -41,6 +50,12 @@ from charlie_work.runner_slots import (
     park_runner_slot,
     save_idle_streaks,
 )
+
+# Issue #876: this whole module covers the dormant rollback path, not the live
+# allocator. Applied at module scope rather than per test because the dormancy is
+# a property of the module under test, not of any individual case. Membership is
+# enforced against the import graph by tests/test_dormant_fleet_marking.py.
+pytestmark = pytest.mark.rollback_path
 
 
 CW = "Senkichi/charlie-work"

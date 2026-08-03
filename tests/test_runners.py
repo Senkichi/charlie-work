@@ -1,4 +1,12 @@
-"""Tests for runner pool observability and provisioning (runners.py)."""
+"""Tests for runner pool observability and provisioning (runners.py).
+
+**``runners.py`` is no longer on the live path (issue #876).** PR #869 repointed
+charlie-work's fleet consumers at the extracted ``ci_fleet`` package; this module
+is retained, re-activatable by config, as the rollback path. A green run here
+means *rollback still works*, not that the live runner pool is healthy. See
+``tests/test_dormant_fleet_marking.py``, which derives that from the import
+graph rather than trusting this paragraph.
+"""
 
 from __future__ import annotations
 
@@ -51,6 +59,12 @@ from charlie_work.runners import (
     scale_down_idle_runners,
     stop_runner_process,
 )
+
+# Issue #876: this whole module covers the dormant rollback path, not the live
+# allocator. Applied at module scope rather than per test because the dormancy is
+# a property of the module under test, not of any individual case. Membership is
+# enforced against the import graph by tests/test_dormant_fleet_marking.py.
+pytestmark = pytest.mark.rollback_path
 
 
 def test_runner_pool_state_is_frozen() -> None:
