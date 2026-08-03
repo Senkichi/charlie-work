@@ -33,6 +33,27 @@ asserted to match exactly, which makes both directions loud:
   condition ("the modules and their tests are deleted together, not the modules
   alone") enforced mechanically rather than remembered.
 
+The trap this is most likely to be "corrected" against
+------------------------------------------------------
+The live supervisor still logs, every pass::
+
+    charlie_work.fleet_dispatch INFO Fleet allocation prologue: started=0 parked=0
+    notes=1 (budget=8, managed_root=C:/actions-runners)
+
+and ``fleet_dispatch.py`` really does call ``run_allocation_pass(...)``. Read from
+the runtime side that looks exactly like a live ``charlie_work.runner_allocation``
+consumer, and someone will eventually conclude this file is wrong. It is not: the
+symbol is imported at ``fleet_dispatch.py:32`` from
+``ci_fleet.charlie_work_adapter``, so it resolves to the *extracted* package. The
+logger name is the module that CALLS the adapter, not the module that does the
+work. That misreading is the most likely reason anyone would repoint an import
+back at ``charlie_work.runner_allocation`` -- which is precisely the edit this test
+exists to catch.
+
+(Independently confirmed from the runtime side by the charlie-work session on
+2026-08-03, which went looking for a contradiction and found none: no deferred or
+function-local imports of the four modules exist anywhere in ``src/``.)
+
 Known limitation, stated rather than papered over: reachability is computed from
 static ``import`` statements, so a module reached only through ``importlib`` or a
 plugin registry would look dormant. The failure mode is safe -- it demands a
