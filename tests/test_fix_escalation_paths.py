@@ -568,6 +568,13 @@ def _seed_dispatch_failed_at(paths, issue_number: int, attempts: list[str]) -> N
         state["issues"][str(issue_number)] = {
             **state["issues"].get(str(issue_number), {}),
             "dispatch_failed_at": attempts,
+            # Seed a stale escalation too (issues #837/#779): every non-
+            # terminal outcome arm calls clear_escalation(entry), including
+            # the transient-failure-under-cap arm. Without a prior value here
+            # "escalation_reason not in entry" is vacuously true for a fresh
+            # prev_entry, exactly like the dispatch_failed_at case above.
+            "escalation_reason": "stale_prior_reason",
+            "reason_class": "mechanical",
         }
         save_state(paths.state_file, state)
 
@@ -675,14 +682,19 @@ def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
     these apart; asserting both here pins that the branch, not the status
     value, is what determines the field set.
 
-    Every scenario seeds one prior ``dispatch_failed_at`` entry before
-    dispatching, so the assertions are non-vacuous in both directions: the
-    ``ok`` / ``live_worker`` / ``phantom_live_worker`` arms must actively
-    *clear* an existing field (an entry field that was never populated would
-    pass an "absent" assertion for free), and the two failure arms must
-    *append to* rather than replace prior history (``len == 2``, not
-    ``len == 1`` from a fresh list), pinning that ``all_attempts`` is seeded
-    from ``prev_entry`` and not reconstructed from scratch.
+    Every scenario seeds one prior ``dispatch_failed_at`` entry *and* a stale
+    ``escalation_reason``/``reason_class`` pair before dispatching, so the
+    assertions are non-vacuous in both directions: the ``ok`` /
+    ``live_worker`` / ``phantom_live_worker`` / ``transient_failure_under_cap``
+    arms must actively *clear* both fields (an entry field that was never
+    populated would pass an "absent" assertion for free -- this applies to
+    the escalation fields too, since every non-terminal arm calls
+    ``clear_escalation(entry)``), the two failure arms must *append to*
+    rather than replace prior ``dispatch_failed_at`` history (``len == 2``,
+    not ``len == 1`` from a fresh list, pinning that ``all_attempts`` is
+    seeded from ``prev_entry`` and not reconstructed from scratch), and the
+    deterministic-escalation arm must *overwrite* the stale escalation
+    reason with the new one rather than leaving it in place.
     """
     app, fake_gh = _closed_pr_app(tmp_path)
     _seed_dispatch_failed_at(app.paths, 123, ["2020-01-01T00:00:00+00:00"])
