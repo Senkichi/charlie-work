@@ -557,3 +557,160 @@ def test_dispatch_non_deterministic_failure_kind_still_uses_redispatch_cap(
     assert state["issues"]["123"]["status"] == "dispatch_failed"
     assert "escalation_reason" not in state["issues"]["123"]
     assert (123, app.config.labels.human_needed) not in fake_gh.labels_added
+
+
+# --- Issues #837 / #779: collapsed dispatch-outcome/escalation branch pin ---
+
+
+def _seed_dispatch_failed_at(paths, issue_number: int, attempts: list[str]) -> None:
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"][str(issue_number)] = {
+            **state["issues"].get(str(issue_number), {}),
+            "dispatch_failed_at": attempts,
+        }
+        save_state(paths.state_file, state)
+
+
+def _fake_dispatch_result_factory(
+    *,
+    ok: bool,
+    failure_kind: str | None,
+    pid: int | None,
+    process_start_time: float | None,
+):
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=ok,
+                error=None if ok else "launch failed",
+                failure_kind=failure_kind,
+                pid=pid,
+                process_start_time=process_start_time,
+            )
+            for request in requests
+        ]
+
+    return fake_dispatch_sessions
+
+
+@pytest.mark.parametrize(
+    (
+        "scenario",
+        "ok",
+        "failure_kind",
+        "pid_alive",
+        "expect_status",
+        "expect_dispatch_failed_at_len",
+        "expect_escalation_reason",
+    ),
+    [
+        ("ok", True, None, None, "dispatched", None, None),
+        (
+            "live_worker",
+            False,
+            "live_worker_redispatch_averted",
+            True,
+            "dispatched",
+            None,
+            None,
+        ),
+        (
+            "phantom_live_worker",
+            False,
+            "live_worker_redispatch_averted",
+            False,
+            "dispatch_failed",
+            None,
+            None,
+        ),
+        ("transient_failure_under_cap", False, None, None, "dispatch_failed", 2, None),
+        (
+            "deterministic_failure_escalates_first_try",
+            False,
+            "worktree_unsafe",
+            None,
+            "escalated",
+            2,
+            "worktree_unsafe",
+        ),
+    ],
+)
+def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    ok: bool,
+    failure_kind: str | None,
+    pid_alive: bool | None,
+    expect_status: str,
+    expect_dispatch_failed_at_len: int | None,
+    expect_escalation_reason: str | None,
+) -> None:
+    """Issues #837 / #779 regression pin.
+
+    ``_dispatch_impl`` used to decide the dispatch outcome (status /
+    dispatched_at) in one if/elif chain and its escalation bookkeeping
+    (dispatch_failed_at / escalation_reason / reason_class) in a second,
+    textually separate chain keyed on the same four predicates (ok /
+    is_live_worker / is_phantom_live_worker / else) -- safe only because the
+    two enumerations happened to agree, which is exactly what let
+    all_attempts / failed_result / terminal_failure be "possibly unbound" per
+    pyright. They are now decided together, one branch per outcome. This
+    test pins the *complete* field set each outcome produces so a future
+    re-split (or a new outcome added to one enumeration but not mirrored in
+    consumers of dispatch_failed_at) shows up here as a wrong field set,
+    not a silent NameError on a real dispatch-failure incident.
+
+    ``phantom_live_worker`` and ``transient_failure_under_cap`` both produce
+    ``status == "dispatch_failed"`` yet must NOT share a field set (a phantom
+    slot is freed without burning a redispatch attempt, so it never touches
+    dispatch_failed_at). A structure that branched on the resulting
+    ``status`` string instead of the originating predicate could not tell
+    these apart; asserting both here pins that the branch, not the status
+    value, is what determines the field set.
+
+    Every scenario seeds one prior ``dispatch_failed_at`` entry before
+    dispatching, so the assertions are non-vacuous in both directions: the
+    ``ok`` / ``live_worker`` / ``phantom_live_worker`` arms must actively
+    *clear* an existing field (an entry field that was never populated would
+    pass an "absent" assertion for free), and the two failure arms must
+    *append to* rather than replace prior history (``len == 2``, not
+    ``len == 1`` from a fresh list), pinning that ``all_attempts`` is seeded
+    from ``prev_entry`` and not reconstructed from scratch.
+    """
+    app, fake_gh = _closed_pr_app(tmp_path)
+    _seed_dispatch_failed_at(app.paths, 123, ["2020-01-01T00:00:00+00:00"])
+    monkeypatch.setattr(
+        "charlie_work.workflow.dispatch_sessions",
+        _fake_dispatch_result_factory(
+            ok=ok,
+            failure_kind=failure_kind,
+            pid=12345 if pid_alive is not None else None,
+            process_start_time=1_234_567.0 if pid_alive is not None else None,
+        ),
+    )
+    if pid_alive is not None:
+        monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: pid_alive)
+
+    app.dispatch(limit=1)
+
+    state = load_state(app.paths.state_file)
+    entry = state["issues"]["123"]
+
+    assert entry["status"] == expect_status, scenario
+    if expect_dispatch_failed_at_len is None:
+        assert "dispatch_failed_at" not in entry, scenario
+    else:
+        assert len(entry["dispatch_failed_at"]) == expect_dispatch_failed_at_len, scenario
+    if expect_escalation_reason is None:
+        assert "escalation_reason" not in entry, scenario
+        assert "reason_class" not in entry, scenario
+    else:
+        assert entry["escalation_reason"] == expect_escalation_reason, scenario
+        assert entry["reason_class"] == "mechanical", scenario
