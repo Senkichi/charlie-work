@@ -33,13 +33,20 @@ subsequent pass the condition holds, and fires ``runner_capacity_recovered``
 once when it turns false again — so a reader can always tell "still starved"
 from "signal stopped working" instead of the silence being ambiguous.
 
-This dedup state cannot live in memory. Note that it is *not* safe to assume a
-fresh process per pass: the ``charlie runners allocate`` CLI is one, but the
-fleet supervisor is not — ``run_fleet_supervise`` runs the pass loop in-process
-for its whole lifetime (``fleet_dispatch.py:1729``), so an in-memory global
-would survive across passes and be dropped only on respawn. That failure mode
-is rare and non-deterministic rather than immediate, which makes it worse than
-the one a fresh-process assumption would produce. It is derived entirely from
+This module is **not** the live implementation. Nothing in ``src/`` imports it;
+``fleet_dispatch`` and ``cli`` both resolve ``run_allocation_pass`` through
+``ci_fleet.charlie_work_adapter``, which re-exports
+``ci_fleet.runner_allocation_pass``. Only tests import this copy. Treat the
+ci_fleet module as authoritative and keep behavioural changes there; the
+rationale below is retained because this copy carries the same logic and the
+same trap.
+
+That dedup state cannot live in memory, and the reason is *not* that each pass
+is a fresh process — the fleet supervisor calls the pass in-process from inside
+its own loop and persists across passes. A module-global would therefore
+survive for a whole supervisor lifetime and lose its state only on respawn:
+a failure that passes every test and then misfires non-deterministically, which
+is worse than one that breaks immediately. So it is derived entirely from
 ``events.db`` itself (no new state file): the prior signaled state for a repo
 is "more ``runner_capacity_starved`` rows than ``runner_capacity_recovered``
 rows", which is immune to same-second timestamp collisions (``_now_iso()``
