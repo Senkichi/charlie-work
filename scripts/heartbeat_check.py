@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -71,6 +72,19 @@ GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
 MIN_BEAT_INTERVAL_MINUTES = 10
 CHARLIE_STATUS_TIMEOUT_SECONDS = 60
+
+# check_stale_open_issue_mentions (issue #902): two bulk API sources plus one
+# free local one, per the issue's "API economy matters" constraint -- never a
+# gh call per candidate issue. STALE_MENTION_PR_LOOKBACK_LIMIT bounds the
+# `gh pr list --state merged` call; 300 comfortably covers the "last 60
+# merged PRs" sample #902 was scoped from with headroom for a slower week.
+# STALE_MENTION_COMMIT_LOOKBACK bounds the local `git log` scan (issue #866's
+# reproduction: PR #864's squashed merge commit sits 19 commits back from
+# HEAD at filing time) -- purely a perf/output cap, not an API cost, since
+# `git log` never touches the network.
+STALE_MENTION_PR_LOOKBACK_LIMIT = 300
+STALE_MENTION_COMMIT_LOOKBACK = 500
+STALE_MENTION_REPORT_CAP = 20
 
 DELTA_SKIP_SUFFIX = " (delta skipped: last beat <10m ago)"
 
@@ -272,6 +286,157 @@ def get_dispatch_cap(config_path: Path) -> int | None:
     """Read dispatch.max_concurrent_sessions (per-repo concurrency cap), or None."""
     cap = load_orchestrator_config(config_path).get("dispatch", {}).get("max_concurrent_sessions")
     return cap if isinstance(cap, int) else None
+
+
+# --------------------------------------------------------------------------
+# Stale-open-issue-mention scanning primitives (issue #902)
+#
+# charlie_work.github already has `issue_numbers_mentioned_by_pr` (a same-repo
+# PR title/body scanner) and `iter_unnegated_closing_keyword_matches` (a
+# negation-aware `#N` scanner used by `closing_keyword_gate.py`). This script
+# deliberately does NOT import charlie_work (see the module docstring and
+# `fleet_dir`), so the small negation/quote-stripping heuristics below are a
+# minimal, self-contained reimplementation for this one check rather than a
+# reuse of those functions. Two differences from `issue_numbers_mentioned_by_pr`
+# are intentional, not drift:
+#
+# 1. Bare `#N` is matched, not just `issue #N` / closing-keyword `#N`. Issue
+#    #866's only trace anywhere is its fix's commit message, "refs #866" --
+#    neither "issue" nor a closing keyword precedes it, so the narrower
+#    pattern used by dispatch's mention detector would miss the exact
+#    reproduction this check exists to catch.
+# 2. It also scans commit messages (via local `git log`), not just PR
+#    title/body -- again, the #866 shape.
+#
+# Quote/negation suppression exists for the same reason #790 forced it onto
+# `iter_unnegated_closing_keyword_matches`: a literal, quoted example like
+# `"Fixes #649"` inside prose is not an intentional reference and must not
+# be surfaced (issue #902 acceptance criterion 6).
+# --------------------------------------------------------------------------
+
+_ISSUE_REF_RE = re.compile(r"#(\d+)\b")
+# The repo's own branch-naming convention for non-agent-dispatched work:
+# `<type>/<issueNumber>-<slug>` (e.g. `fix/817-fleet-health-latch`). Matched
+# separately from `_ISSUE_REF_RE` because there is no `#` in a branch name.
+# Deliberately does NOT match `agent/issue-N-...` branches (digit is not
+# immediately after the slash there) -- those are already covered by the
+# normal branch-prefix binding path (`linked_issue_number`), so a miss here
+# is not a gap, just redundant with machinery this check exists to backstop.
+_BRANCH_ISSUE_NUMBER_RE = re.compile(r"^[A-Za-z][\w.]*/(\d+)(?=[-_/]|$)")
+_FENCED_CODE_BLOCK_RE = re.compile(r"```.*?```", flags=re.DOTALL)
+_NEGATION_WORDS = ("not", "never", "without", "cannot")
+_NEGATION_CONTRACTION_SUFFIX = "n't"
+_NEGATION_RE = re.compile(
+    r"\b(?:" + "|".join(_NEGATION_WORDS) + r")\b|" + re.escape(_NEGATION_CONTRACTION_SUFFIX),
+    flags=re.IGNORECASE,
+)
+_NEGATION_LOOKBEHIND_CHARS = 32
+_QUOTE_CHARS = "\"'`"
+_QUOTE_LOOKAROUND_CHARS = 40
+
+
+def _has_preceding_negation(text: str, match_start: int) -> bool:
+    """True if a negation word/contraction appears shortly before match_start.
+
+    Same 32-char lookback window as `charlie_work.github._has_preceding_negation`
+    (kept in sync by convention, not import -- see the section docstring above).
+    """
+    window_start = max(0, match_start - _NEGATION_LOOKBEHIND_CHARS)
+    return bool(_NEGATION_RE.search(text, window_start, match_start))
+
+
+def _is_quoted(text: str, match_start: int, match_end: int) -> bool:
+    """True if the match sits inside a quoted span on the same line.
+
+    A bare `#N` match (unlike a `<keyword> #N` closing-keyword match) can sit
+    arbitrarily far from the quote character that wraps the whole phrase --
+    #790's incident was the literal text `"Fixes #649"`, where the opening
+    quote is 7 characters before the `#`. So this looks for a quote character
+    (`"`, `'`, or a backtick) within `_QUOTE_LOOKAROUND_CHARS` before the
+    match AND a matching quote character within the same distance after it,
+    both bounded to the current line so a quote on an unrelated line can
+    never suppress a real reference.
+    """
+    line_start = text.rfind("\n", 0, match_start) + 1
+    line_end = text.find("\n", match_end)
+    if line_end == -1:
+        line_end = len(text)
+    before = text[max(line_start, match_start - _QUOTE_LOOKAROUND_CHARS) : match_start]
+    after = text[match_end : min(line_end, match_end + _QUOTE_LOOKAROUND_CHARS)]
+    return any(q in before and q in after for q in _QUOTE_CHARS)
+
+
+def _mentioned_issue_numbers(text: str) -> set[int]:
+    """Return every bare `#N` reference in `text`, minus quoted/negated ones.
+
+    Fenced code blocks are stripped first (a code sample containing the
+    literal text `#123` is not a reference), mirroring
+    `charlie_work.github`'s same defense for its own mention scanner.
+    """
+    stripped = _FENCED_CODE_BLOCK_RE.sub("", text)
+    numbers: set[int] = set()
+    for match in _ISSUE_REF_RE.finditer(stripped):
+        if _has_preceding_negation(stripped, match.start()):
+            continue
+        if _is_quoted(stripped, match.start(), match.end()):
+            continue
+        numbers.add(int(match.group(1)))
+    return numbers
+
+
+def _branch_issue_number(branch: str) -> int | None:
+    match = _BRANCH_ISSUE_NUMBER_RE.match(branch)
+    return int(match.group(1)) if match else None
+
+
+_GIT_LOG_RECORD_SEP = "\x1e"
+_GIT_LOG_FIELD_SEP = "\x1f"
+
+
+def get_merged_commit_messages(
+    repo_root: Path, limit: int
+) -> tuple[bool, list[tuple[str, str]], str]:
+    """Return (ok, [(short_sha, full_message), ...], err) for the local checkout's history.
+
+    Reads `git log` on the already-checked-out branch -- every commit on it is
+    by definition already merged into that branch, so this needs no `--merged`
+    flag and, crucially, no `gh` call at all (issue #902's "API economy"
+    constraint: this is the free local source, not one of the two bulk `gh`
+    calls). This is what catches issue #866's reproduction: its fix rode in
+    as a commit inside PR #864, a PR *for a different issue*, so no scan of
+    PR title/body/branch name (for #864 or any other PR) could ever find it --
+    only a scan of #864's own commit messages can.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "log",
+                f"-n{limit}",
+                f"--pretty=format:%h{_GIT_LOG_FIELD_SEP}%B{_GIT_LOG_RECORD_SEP}",
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GH_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, [], f"git log failed to run: {exc}"
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip().replace("\n", " ")[:200]
+        return False, [], f"git log exited {proc.returncode}: {stderr}"
+
+    commits: list[tuple[str, str]] = []
+    for record in proc.stdout.split(_GIT_LOG_RECORD_SEP):
+        record = record.strip("\n")
+        if not record:
+            continue
+        sha, _, message = record.partition(_GIT_LOG_FIELD_SEP)
+        commits.append((sha, message))
+    return True, commits, ""
 
 
 # --------------------------------------------------------------------------
@@ -1008,6 +1173,154 @@ def check_merge_flow(
         report.ok(check, facts)
 
 
+def check_stale_open_issue_mentions(report: Report, repo: RepoInfo) -> None:
+    """Surface open issues referenced by already-merged work with no closure path (issue #902).
+
+    The gap: `workflow.py`'s finalization path (`_merged_pr_referenced_issue_numbers`)
+    intersects a merged PR's mentioned issue numbers against the *currently
+    `ready`-labelled* issue set before ever surfacing anything, by design --
+    its docstring is explicit that this exists so "a stray mention of an
+    issue not in the dispatch queue does not get actioned." That intersect is
+    correct and this check does not touch it: a bare mention must never
+    *authorize* a lifecycle transition (see #781/#790's false-close
+    incident). But the same intersect means an issue with **zero labels**
+    (never dispatched, never triaged) can be fully fixed and merged and the
+    finalization path will never even consider it, because it was never a
+    candidate to begin with. #817 and #866 are exactly this: both carried no
+    labels at all and both stayed open after their fixing PRs merged.
+
+    This check is a separate, read-only roll-call living entirely outside
+    the dispatch/finalization lane -- #203's originally-proposed option 3,
+    never implemented. Its candidate set is `gh issue list --state open`
+    with **no label filter and no `state.json` read**: that is the one
+    property that makes it able to see what the dispatch-lane check
+    structurally cannot. It never labels, comments, or closes anything --
+    only ever calls `report.anom`/`report.ok`.
+
+    Three sources, matching the issue's "API economy" constraint (this runs
+    unattended alongside nine other checks, so no `gh` call may scale with
+    the number of open issues or merged PRs):
+
+    1. One `gh issue list --state open --json number` call for the
+       candidate set.
+    2. One `gh pr list --state merged --json number,headRefName,title,body,
+       closingIssuesReferences,mergedAt` call (bounded by
+       `STALE_MENTION_PR_LOOKBACK_LIMIT`), scanned for a branch-name issue
+       number (`_branch_issue_number`) or a bare `#N` mention
+       (`_mentioned_issue_numbers`) in title/body. This is what would catch
+       #817: PR #824's branch is `fix/817-fleet-health-latch` (no
+       `agent/issue` prefix, so `linked_issue_number` never trusts it) and
+       its body reads "For issue #817:" (a reference, but not a closing
+       keyword, so `closingIssuesReferences` came back empty on the PR
+       itself).
+    3. Local `git log` on the already-checked-out branch (`get_merged_commit_messages`,
+       bounded by `STALE_MENTION_COMMIT_LOOKBACK`) -- zero API cost, and the
+       only source that can catch #866: its fix landed as a commit inside PR
+       #864, a PR *for a different issue*, so no scan of any PR's own
+       title/body/branch name -- #864's or otherwise -- could ever find it.
+
+    `closingIssuesReferences` is fetched (per the issue's specified command
+    shape) but not used to gate reporting: since the candidate set is
+    already restricted to *currently open* issues, any issue GitHub's native
+    auto-close already resolved via a real closing-keyword match is
+    definitionally no longer in that set. No extra filtering on that field
+    can change which issues get reported here.
+
+    Quoted or negated mentions are excluded (`_mentioned_issue_numbers`),
+    consistent with #781/#790: a mention is evidence for a human to check,
+    never grounds to act automatically, and a quoted/negated one is not even
+    that. Output is capped at `STALE_MENTION_REPORT_CAP` issues (with a
+    "+K more" suffix) so a large true positive count cannot flood the beat.
+    """
+    check = f"stale-open-issue-mentions {repo.slug}"
+
+    ok_open, open_data, err_open = run_gh_json(
+        [
+            "issue",
+            "list",
+            "-R",
+            repo.slug,
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--limit",
+            str(ISSUE_LIST_LIMIT),
+        ],
+        repo.repo_root,
+    )
+    if not ok_open:
+        report.anom(check, err_open)
+        return
+    open_numbers = {issue["number"] for issue in open_data}
+
+    ok_merged, merged_data, err_merged = run_gh_json(
+        [
+            "pr",
+            "list",
+            "-R",
+            repo.slug,
+            "--state",
+            "merged",
+            "--limit",
+            str(STALE_MENTION_PR_LOOKBACK_LIMIT),
+            "--json",
+            "number,headRefName,title,body,closingIssuesReferences,mergedAt",
+        ],
+        repo.repo_root,
+    )
+    if not ok_merged:
+        report.anom(check, err_merged)
+        return
+
+    ok_commits, commits, err_commits = get_merged_commit_messages(
+        repo.repo_root, STALE_MENTION_COMMIT_LOOKBACK
+    )
+
+    mentions: dict[int, list[str]] = {}
+
+    def record(number: int, evidence: str) -> None:
+        if number in open_numbers:
+            mentions.setdefault(number, []).append(evidence)
+
+    for pr in merged_data:
+        pr_number = pr.get("number")
+        branch = str(pr.get("headRefName") or "")
+        branch_issue = _branch_issue_number(branch)
+        if branch_issue is not None:
+            record(branch_issue, f"PR #{pr_number} branch {branch!r}")
+        text = f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
+        for number in _mentioned_issue_numbers(text):
+            record(number, f"PR #{pr_number} title/body")
+
+    for sha, message in commits:
+        for number in _mentioned_issue_numbers(message):
+            record(number, f"commit {sha}")
+
+    facts = (
+        f"open={len(open_numbers)} merged_prs_scanned={len(merged_data)} "
+        f"commits_scanned={len(commits)}"
+    )
+    if not ok_commits:
+        facts += f" (commit-message scan degraded: {err_commits})"
+
+    if not mentions:
+        report.ok(check, f"stale_mentions=0 ({facts})")
+        return
+
+    matched_numbers = sorted(mentions)
+    shown = matched_numbers[:STALE_MENTION_REPORT_CAP]
+    detail_parts = [f"#{n} ({mentions[n][0]})" for n in shown]
+    if len(matched_numbers) > STALE_MENTION_REPORT_CAP:
+        detail_parts.append(f"+{len(matched_numbers) - STALE_MENTION_REPORT_CAP} more")
+
+    report.anom(
+        check,
+        f"{len(matched_numbers)} open issue(s) referenced by merged work with no closure "
+        f"path: {'; '.join(detail_parts)} ({facts})",
+    )
+
+
 def check_github_rate(report: Report, any_repo_root: Path) -> None:
     check = "github-rate"
     ok, data, err = run_gh_json(["api", "rate_limit"], any_repo_root)
@@ -1138,6 +1451,7 @@ def main() -> int:
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
+        check_stale_open_issue_mentions(report, repo)
         new_state["repos"][repo.slug] = new_repo_state
 
     if repos:
