@@ -19376,6 +19376,13 @@ def test_is_mutating_api_method_spellings_and_preserved_reads() -> None:
         ["api", "--method"],
         ["api", "repos/o/r/issues", "-f", "title=x"],  # params switch gh to POST
         ["api", "repos/o/r/issues", "--field=labels[]=bug"],
+        # pflag takes an attached shorthand value here too, exactly as for -X (#919).
+        ["api", "repos/o/r/issues", "-ftitle=x"],
+        ["api", "repos/o/r/issues", "-Flabels[]=bug"],
+        ["api", "repos/o/r/issues", "-F"],
+        ["api", "repos/o/r/issues", "--raw-field", "title=x"],
+        ["api", "repos/o/r/issues", "--input", "body.json"],
+        ["api", "repos/o/r/issues", "--input=-"],
     ):
         assert _is_mutating(mutating) is True, mutating
 
@@ -19388,8 +19395,52 @@ def test_is_mutating_api_method_spellings_and_preserved_reads() -> None:
         ["api", "--method=HEAD", "repos/o/r"],
         # A header is not a method -- github.py:1033 fetches a diff this way.
         ["api", "repos/o/r/pulls/1", "-H", "Accept: application/vnd.github.v3.diff"],
+        # Other shorthands must not be swept up by the -f/-F prefix match (#919).
+        ["api", "repos/o/r/issues", "-q", ".[].number"],
+        ["api", "repos/o/r/issues", "-t", "{{.number}}"],
+        ["api", "repos/o/r/issues", "--paginate"],
     ):
         assert _is_mutating(readonly) is False, readonly
+
+
+def test_token_minting_posts_do_not_retry_post_send_failures() -> None:
+    """Credential-minting POSTs must retry only on provable pre-send failures.
+
+    `_is_mutating` has a second consumer besides the --dry-run gate: `run()` feeds it
+    to `_should_retry`, which grants reads an unconditional retry on any transient
+    error and restricts mutations to pre-connection errors, so a request that may
+    already have been applied is never re-sent.
+
+    Before #918 these two argvs classified as *reads* (the `-X` spelling fell through
+    the old enumeration), which put credential minting on the unconditional-retry
+    path: a post-send timeout on a request GitHub had actually served would mint a
+    second token. #918 fixed that as a side effect of the --dry-run work without
+    naming it, so pin it here -- a future reclassification of `-X POST` would
+    otherwise reopen the loop with every other test still green (#919).
+    """
+    from charlie_work.github import _is_mutating, _should_retry
+
+    for argv in (
+        ["api", "-X", "POST", "repos/{owner}/{repo}/actions/runners/remove-token"],
+        [
+            "api",
+            "-X",
+            "POST",
+            "repos/{owner}/{repo}/actions/runners/registration-token",
+        ],
+    ):
+        assert _is_mutating(argv) is True, argv
+        # Ambiguous: the request may have been served before the read timed out.
+        assert _should_retry(argv, "i/o timeout", _is_mutating(argv)) is False, argv
+        # Provably pre-send -- no token can have been minted, so retrying is safe.
+        assert _should_retry(argv, "dial tcp: connection refused", _is_mutating(argv)) is True, (
+            argv
+        )
+
+    # Control: a read is still granted the unconditional retry, so the assertions
+    # above are about the mutating classification and not about the error strings.
+    read = ["api", "repos/{owner}/{repo}/actions/runners"]
+    assert _should_retry(read, "i/o timeout", _is_mutating(read)) is True
 
 
 def test_dry_run_skips_worker_launch(monkeypatch, tmp_path: Path) -> None:
