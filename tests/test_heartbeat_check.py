@@ -1085,7 +1085,13 @@ def test_get_merged_commit_messages_parses_real_local_history(
     hb: ModuleType, tmp_path: Path
 ) -> None:
     """Builds a real (throwaway) git repo and reads it back with the real
-    `git log` plumbing -- not a mocked subprocess -- for the parsing stage."""
+    `git log` plumbing -- not a mocked subprocess -- for the parsing stage.
+
+    Self-contained by construction: the repo is created fresh under
+    `tmp_path` and never reads this checkout's own history, so unlike the
+    #866-shaped test below, it has no dependency on CI's clone depth
+    (verified 2026-08-04 after that test failed in CI on a shallow clone).
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_test_git_repo(repo)
@@ -1107,24 +1113,74 @@ def test_get_merged_commit_messages_error_on_non_git_dir(hb: ModuleType, tmp_pat
     assert err
 
 
-def test_real_git_log_extracts_866_reference_from_pr864_merge_commit(hb: ModuleType) -> None:
-    """Issue #902's #866 reproduction, run against THIS checkout's real
-    history (no network, no mocking).
+# Real (not paraphrased) excerpt of PR #864's squash-merge commit body on
+# `origin/main` (commit 740484f), captured verbatim via
+# `git show -s --format=%B 740484f` (2026-08-04). #864 was filed and merged
+# for a different issue (loop-pass staleness); this final bullet -- one of
+# three sub-commits GitHub squashed into 740484f -- is the ONLY place
+# anywhere that #866 is referenced. Neither "issue" nor a closing keyword
+# precedes the reference, so only a bare `#N` scan over commit messages
+# (never a PR title/body scan) can find it.
+_REAL_PR864_SQUASH_COMMIT_EXCERPT = """\
+* feat(heartbeat): surface error-level events with no consumer (refs #866)
 
-    PR #864 squash-merged three sub-commits into `origin/main`; the third's
-    message reads "...surface error-level events with no consumer
-    (refs #866)" and survives into the squash commit's body. No PR
-    title/body anywhere mentions #866 -- #864 was filed and merged for a
-    different issue (#864/loop-pass staleness) -- so a scan of PR text alone
-    can never find this; only the local commit-message scan can. This test
-    exercises the real `get_merged_commit_messages` + `_mentioned_issue_numbers`
-    pipeline against real repository state rather than a synthetic fixture.
+self_deploy_alarm and every other member of instrumentation._ERROR_KINDS
+(PR #865's supervisor_zero_pass_alarm included) are emitted, classified
+error-level, documented, and unit-tested -- but nothing in the codebase
+ever reads them back. A human had to manually open events.db and know
+which kind string to search for.
+
+check_error_events(report, repo, baseline) closes that gap by filtering
+each repo's events.db on the level column persisted at write time by
+_classify_level, so coverage is derived rather than a restated kind list
+-- new alarm kinds are picked up with zero changes here. Missing/unreadable
+events.db degrades to a reported ANOMALY (never an exception), which is
+the deliberate point of disagreement with check_loop_pass_freshness's
+"missing db = OK, no history yet" convention: this check's whole job is
+"did any alarm fire," so an unreadable db is a repo it cannot vouch for.
+Timestamps are compared in Python against baseline, never in SQL, per the
+same ISO T/Z-vs-SQLite-space-format trap check_loop_pass_freshness already
+guards against."""
+
+
+def test_mentioned_issue_numbers_extracts_866_from_real_pr864_commit_excerpt(
+    hb: ModuleType,
+) -> None:
+    """Extraction stage against the real PR #864 squash-commit text (see
+    `_REAL_PR864_SQUASH_COMMIT_EXCERPT` above for provenance)."""
+    assert 866 in hb._mentioned_issue_numbers(_REAL_PR864_SQUASH_COMMIT_EXCERPT)
+
+
+def test_get_merged_commit_messages_extracts_866_from_real_squash_commit_shape(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Issue #902's #866 reproduction, through the REAL `git log` pipeline,
+    against a throwaway repo this test owns.
+
+    An earlier version of this test asserted against THIS checkout's own
+    git history (commit 740484f, 19 commits back from `origin/main` HEAD at
+    filing time) and passed locally. It failed in CI: `.github/workflows/ci.yml`'s
+    `actions/checkout@v4` step sets no explicit `fetch-depth`, which defaults
+    to a depth-1 (single-commit) shallow clone there, so commit 740484f was
+    never fetched and unreachable from `git log` on the runner -- confirmed
+    by grepping the workflow file for `fetch-depth` (absent) rather than
+    assumed. Seeding an owned throwaway repo with the real commit-message
+    text removes the ambient-history dependency while still exercising the
+    real `git log` subprocess call end-to-end and the real payload shape --
+    the actual failure mode this check exists to catch (#866's fix is only
+    traceable via a commit message, never a PR title/body) requires running
+    the true plumbing, not mocking it.
     """
-    repo_root = Path(__file__).resolve().parent.parent
-    ok, commits, err = hb.get_merged_commit_messages(repo_root, limit=500)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_test_git_repo(repo)
+    _commit(repo, "unrelated.txt", "unrelated setup commit, PR #1")
+    _commit(repo, "heartbeat.py", _REAL_PR864_SQUASH_COMMIT_EXCERPT)
+
+    ok, commits, err = hb.get_merged_commit_messages(repo, limit=10)
     assert ok, err
     matches = [sha for sha, message in commits if 866 in hb._mentioned_issue_numbers(message)]
-    assert matches, "expected PR #864's squash-merge commit to reference #866 in this history"
+    assert matches, "expected the seeded commit to reference #866"
 
 
 def _stale_mention_gh_dispatch(
