@@ -32,6 +32,7 @@ process that is no longer the one it started.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -60,6 +61,26 @@ EXIT_RESTART_REQUESTED = 3
 # the 5-minute tick it must not starve.
 DEFAULT_MAX_RELAUNCHES = 10
 
+# How long a child must run before its restart request counts as "it did real
+# work, then deployed" rather than "it died on startup again" (#903).
+#
+# This does NOT gate the cap -- the cap is never reset, because exiting at it is
+# how this wrapper retires itself and hands restart authority back to the
+# scheduled tick (see the module docstring). It gates only the *diagnosis*
+# reported when the cap is reached, which is the one thing an operator reads at
+# that moment.
+#
+# Both shapes are observable in fleet-pass.log: a drift-exit at startup
+# completes in ~2s ("1 pass(es) in 0:00:02"), while a healthy child self-deploys
+# after minutes of work ("4 pass(es) in 0:22:03"). 60s sits well above the
+# former and well below the ~5-minute pass interval that bounds the latter.
+SUSTAINED_RUN_SECONDS = 60.0
+
+# ``cap_cause`` values. Both mean "the bound refused a restart"; they differ in
+# what the operator should do about it.
+CAP_CAUSE_NON_CONVERGENCE = "non_convergence"
+CAP_CAUSE_RETIREMENT = "retirement"
+
 
 @dataclass(frozen=True)
 class SuperviseLoopResult:
@@ -68,12 +89,22 @@ class SuperviseLoopResult:
     ``relaunches`` counts replacements only, so ``launches == relaunches + 1``.
     ``cap_reached`` is True when the final child asked for a restart that the
     bound refused -- the case that must log loudly rather than spin.
+
+    ``cap_cause`` distinguishes the two situations that reach the cap (#903):
+    ``retirement`` (children ran and worked between restarts -- this wrapper is
+    simply old, and stepping aside is the designed behavior) versus
+    ``non_convergence`` (every restart came from a child that died almost
+    immediately). It is ``None`` when the cap was not reached. Added with a
+    default so existing positional construction keeps working, and so a record
+    written before this field existed is not made to assert a cause it never
+    observed.
     """
 
     launches: int
     relaunches: int
     last_exit_code: int
     cap_reached: bool
+    cap_cause: str | None = None
 
 
 def run_supervise_relaunch_loop(
@@ -82,6 +113,8 @@ def run_supervise_relaunch_loop(
     max_relaunches: int = DEFAULT_MAX_RELAUNCHES,
     log: Callable[[str], None] = print,
     on_cap_reached: Callable[[SuperviseLoopResult], None] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sustained_run_seconds: float = SUSTAINED_RUN_SECONDS,
 ) -> SuperviseLoopResult:
     """Run the supervisor, relaunching while it requests a restart.
 
@@ -92,15 +125,28 @@ def run_supervise_relaunch_loop(
     ``on_cap_reached`` fires exactly once, only when the bound actually refuses a
     restart. Injected rather than calling ``log_event`` directly to keep this
     loop free of I/O -- the caller wires it to the fleet event sink.
+
+    ``monotonic`` is injected for the same reason ``spawn`` is: it keeps the loop
+    testable without real elapsed time. It must be a monotonic source, not a wall
+    clock -- a clock step during a long-lived wrapper run would otherwise
+    misclassify the cause reported at the cap.
     """
     if max_relaunches < 0:
         raise ValueError(f"max_relaunches must be >= 0, got {max_relaunches}")
 
     launches = 0
     relaunches = 0
+    # Counts only restarts whose child died before it could do any work. Reset
+    # by any sustained run, so it measures a *consecutive* fast-restart streak.
+    # Deliberately separate from ``relaunches``: that one is the bound, and
+    # resetting it would make this wrapper immortal and pin stale wrapper code
+    # in memory -- the failure mode the module docstring rules out.
+    consecutive_fast = 0
     while True:
         launches += 1
+        started_at = monotonic()
         exit_code = spawn(launches)
+        child_ran_for = monotonic() - started_at
         if exit_code != EXIT_RESTART_REQUESTED:
             # Includes 0 (max-runtime / max-passes / operator stop) and 1
             # (aborted). AC4: a normal exit must not relaunch.
@@ -111,19 +157,41 @@ def run_supervise_relaunch_loop(
                 cap_reached=False,
             )
 
+        sustained = child_ran_for >= sustained_run_seconds
+        consecutive_fast = 0 if sustained else consecutive_fast + 1
+
         if relaunches >= max_relaunches:
+            # Both causes exit here; only the diagnosis differs. Non-convergence
+            # requires that *every* child this wrapper ever spawned died fast --
+            # one sustained run anywhere is proof the child can get up and do
+            # work, which is the opposite of a restart loop. Stated as an
+            # equality against ``launches`` rather than a threshold on
+            # ``consecutive_fast`` so it stays obviously correct at the
+            # boundaries, including ``max_relaunches=0``.
+            non_converging = consecutive_fast == launches
             result = SuperviseLoopResult(
                 launches=launches,
                 relaunches=relaunches,
                 last_exit_code=exit_code,
                 cap_reached=True,
+                cap_cause=(CAP_CAUSE_NON_CONVERGENCE if non_converging else CAP_CAUSE_RETIREMENT),
             )
-            log(
-                f"supervise-loop: relaunch cap reached ({relaunches}/{max_relaunches}) "
-                f"after {launches} launch(es); the supervisor is still requesting a "
-                f"restart. Exiting so the scheduled task's next tick relaunches on "
-                f"current code -- repeated caps mean self-deploy is not converging."
-            )
+            if non_converging:
+                log(
+                    f"supervise-loop: relaunch cap reached ({relaunches}/{max_relaunches}) "
+                    f"after {launches} launch(es); every child exited within "
+                    f"{sustained_run_seconds:.0f}s without completing work. Exiting so "
+                    f"the scheduled task's next tick relaunches on current code -- "
+                    f"this means self-deploy is not converging."
+                )
+            else:
+                log(
+                    f"supervise-loop: relaunch cap reached ({relaunches}/{max_relaunches}) "
+                    f"after {launches} launch(es), with children running normally in "
+                    f"between. Retiring this wrapper so the scheduled task's next tick "
+                    f"starts one on current code -- expected after sustained uptime, "
+                    f"not a self-deploy fault."
+                )
             if on_cap_reached is not None:
                 on_cap_reached(result)
             return result
