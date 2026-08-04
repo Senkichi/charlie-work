@@ -20,6 +20,7 @@ from .fleet_dispatch import (
     run_fleet_supervise_loop,
 )
 from .supervise_loop import DEFAULT_MAX_RELAUNCHES, EXIT_RESTART_REQUESTED
+from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
 from .github import (
@@ -31,6 +32,7 @@ from .github import (
 )
 from . import layout
 from .logging_setup import configure_logging
+from .instrumentation import query_events
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, find_repo_root, resolved_layout, runtime_paths
 from .quiesce import check_quiescence
@@ -39,6 +41,7 @@ from .state_migration import apply_state_dir_migration, gather_migration_inputs
 from .supervise import orchestrator_root, self_deploy
 from ci_fleet.charlie_work_adapter import (
     CLI_ALLOCATION_SOURCE,
+    UNATTENDED_ALLOCATION_SOURCE,
     FleetTotals,
     ScaleAction,
     decide_autoscale,
@@ -51,6 +54,20 @@ from ci_fleet.charlie_work_adapter import (
     run_allocation_pass,
     scale_down_idle_runners,
 )
+
+# Not part of the charlie_work_adapter migration surface (issue #909's
+# reporter is a new consumer, not one of the four already-migrated ones), so
+# these come straight from ci_fleet, same as charlie_work_adapter itself does
+# above -- there is no rule against a direct ci_fleet import, only against
+# ci_fleet importing back out through the adapter (see that module's
+# docstring on the one-way boundary).
+from ci_fleet.diff_journal import read_all as read_shadow_journal
+from ci_fleet.shadow_gate import (
+    REQUIRED_CALENDAR_DAYS,
+    REQUIRED_STREAK,
+    evaluate as evaluate_shadow_gate,
+)
+from ci_fleet.shadow_pass import journal_path as shadow_journal_path
 from .worktree import clean_worktrees
 from .workflow import CommandResult, OrchestratorApp
 
@@ -313,6 +330,17 @@ def build_parser() -> argparse.ArgumentParser:
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
     runners_sub.add_parser("status")
+    runners_sub.add_parser(
+        "shadow-status",
+        help=(
+            "Read-only report of the ci_fleet shadow-planner state: the "
+            "actuating planner as of the last source='prologue' runner_allocation "
+            "event, a newer source='cli' row if one is configured-but-not-yet-in-"
+            "effect, and the shadow-vs-live agreement streak from the diff "
+            "journal. Resolves both source locations itself (issue #909); no "
+            "arguments to point them elsewhere."
+        ),
+    )
     ensure_started_parser = runners_sub.add_parser("ensure-started")
     _add_dry_run(ensure_started_parser)
     ensure_started_parser.add_argument(
@@ -1096,6 +1124,187 @@ def run_runners_status(args: argparse.Namespace) -> CommandResult:
         )
 
 
+def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
+    """Report the ci_fleet shadow-planner rollback state (issue #909).
+
+    Read-only. Reads two stores that live in two different directories and
+    resolves both itself so neither is an operator input -- the "obvious"
+    inference that the events DB lives beside the journal is wrong and fails
+    silently (issue #909, trap 1):
+
+    - ``events.db`` (this repo's state dir, ``<repo>/.var/charlie-work/``):
+      ``runner_allocation`` events. ``source`` and ``actuating_planner`` live
+      inside the JSON ``payload`` column, not as SQL columns, so they are read
+      back out of the parsed dicts ``query_events`` already returns rather
+      than pushed into a ``json_extract`` WHERE clause.
+    - ``shadow-planner-diff.jsonl`` (the global fleet dir, ``fleet_dir()``):
+      the shadow-vs-live diff journal.
+
+    ``source='prologue'`` (the supervisor) is the only row that reflects what
+    is actually actuating. The supervisor loads config once at startup and
+    reuses the same object every loop iteration (see
+    ``runner_allocation_pass.py``'s "the single flip point" comment), so after
+    a config flip there can be a newer ``source='cli'`` row naming the *new*
+    planner while the supervisor is still actuating the *old* one until it is
+    replaced. That makes the filter load-bearing, not decorative (issue #909,
+    trap 2): this command has no flag to drop it, and surfaces a newer
+    ``cli`` row separately, explicitly labelled "configured, not yet in
+    effect" rather than folding it into "actuating" where it would read as
+    confirmation.
+
+    The journal itself is NOT filtered by ``source`` -- unlike the events-db
+    rows, ``source`` was added to :class:`ci_fleet.diff_journal.DiffRecord`
+    recently and is ``None`` on the large majority of existing records
+    (verified 2026-08-04: 1024/1041 have no ``source`` at all). Filtering the
+    journal by it would silently drop nearly the whole corpus.
+
+    Two agreement streaks are reported, not one, because the obvious single
+    number is hollow: the fleet is idle almost every pass, so a streak over
+    *all* passes is dominated by two planners agreeing to do nothing.
+    Verified 2026-08-04: of 1041 journal records, only 1 has a non-empty
+    ``live_plan["changes"]`` (a single park action) -- the change-emitting
+    path has been compared exactly once, even though the all-passes streak is
+    over a thousand. Reporting only the all-passes number would let an
+    operator read "agreed 1040 times" as "the acting path is thoroughly
+    validated," which it is not. The change-restricted streak is the
+    load-bearing one and is labelled as such in both the data and the
+    rendered output.
+
+    The gate verdict (``ci_fleet.shadow_gate.evaluate``) is real §6.3
+    production logic, not reimplemented here -- its ``streak``/``total`` match
+    this command's "all passes" figures exactly, since both walk the same
+    journal the same way. Per the issue's closing note: ``ok: True`` here
+    licenses "agreed N consecutive times" and nothing stronger. In
+    particular ``adjudication_ok`` is true *vacuously* whenever there have
+    been zero disagreements to adjudicate -- it does not mean the adjudication
+    path has ever been exercised, and this command does not claim it does.
+    """
+    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    data: dict[str, Any] = {}
+
+    # --- Store 1: events.db (this repo's state dir) -----------------------
+    # Same location instrumentation.py's _db_path derives: state.json's
+    # parent, i.e. paths.root. Checked for existence before doing anything
+    # else so a missing DB is reported as missing rather than silently
+    # created -- sqlite3.connect() would otherwise create an empty file the
+    # instant query_events() opened it, which is not a "read-only reporter"
+    # for a store that was never written.
+    events_db_path = paths.root / "events.db"
+    events_db_found = events_db_path.exists()
+    data["events_db"] = {"path": str(events_db_path), "found": events_db_found}
+
+    prologue_event: dict[str, Any] | None = None
+    cli_event: dict[str, Any] | None = None
+    # True when the cli row is more recent than the prologue row (or there is
+    # no prologue row at all). Decided structurally from insertion order
+    # (query_events' id-ascending ordering, reversed below to scan newest
+    # first) rather than by comparing the ``ts`` strings: wall-clock time is
+    # exactly the kind of signal that can go backwards (NTP step, DST, a
+    # rebooted host with a wrong clock), and this comparison is the one
+    # trap-2 depends on to keep a dry-run pre-check from reading as
+    # confirmation -- it must not be the one field allowed to lie.
+    cli_newer_than_prologue = False
+    if events_db_found:
+        # kind is the only indexed column this query needs; source and
+        # actuating_planner are read back out of the parsed payload dict
+        # query_events() already returns, per trap 1 above. No limit: the
+        # live corpus is ~2000 runner_allocation rows, trivial to scan, and a
+        # limit risks missing the latest prologue row behind a burst of cli
+        # rows within the window.
+        allocation_events = query_events(paths.state_file, kind="runner_allocation")
+        for event in reversed(allocation_events):  # most recent (highest id) first
+            source = event.get("payload", {}).get("source")
+            if source == UNATTENDED_ALLOCATION_SOURCE and prologue_event is None:
+                prologue_event = event
+            elif source == CLI_ALLOCATION_SOURCE and cli_event is None:
+                cli_event = event
+                # If no prologue row has been seen yet while scanning newest
+                # first, none exists more recent than this cli row.
+                cli_newer_than_prologue = prologue_event is None
+            if prologue_event is not None and cli_event is not None:
+                break
+
+    if prologue_event is not None:
+        data["actuating"] = {
+            "planner": prologue_event["payload"].get("actuating_planner"),
+            "ts": prologue_event.get("ts"),
+            "source": UNATTENDED_ALLOCATION_SOURCE,
+        }
+    else:
+        data["actuating"] = None
+
+    # The cli row is surfaced only when it is more recent than the prologue
+    # row -- an *older* cli row is just a historical pre-check, not a
+    # pending, not-yet-actuated change. Trap 2: this check, and the fact that
+    # "actuating" above is keyed on source='prologue' alone, is the entire
+    # reason a dry-run pre-check cannot be misread as confirmation.
+    if cli_event is not None and cli_newer_than_prologue:
+        data["configured_not_yet_in_effect"] = {
+            "planner": cli_event["payload"].get("actuating_planner"),
+            "ts": cli_event.get("ts"),
+            "source": CLI_ALLOCATION_SOURCE,
+        }
+    else:
+        data["configured_not_yet_in_effect"] = None
+
+    # --- Store 2: shadow-planner-diff.jsonl (global fleet dir) -------------
+    journal_file = shadow_journal_path(fleet_dir(override=args.fleet_dir))
+    journal_found = journal_file.exists()
+    data["journal"] = {"path": str(journal_file), "found": journal_found}
+
+    if not journal_found:
+        data["agreement_streak"] = None
+        data["change_agreement_streak"] = None
+        data["gate"] = None
+        return CommandResult(ok=True, message="runners shadow-status complete", data=data)
+
+    records = read_shadow_journal(journal_file)
+
+    def _trailing_streak(recs: list[dict[str, Any]]) -> int:
+        streak = 0
+        for rec in reversed(recs):
+            if not rec.get("agreed"):
+                break
+            streak += 1
+        return streak
+
+    data["agreement_streak"] = {"streak": _trailing_streak(records), "total": len(records)}
+
+    # The load-bearing figure (see docstring): restricted to passes whose
+    # live plan actually emitted a change, i.e. non-empty
+    # live_plan["changes"]. live_plan is a dict, not a list -- len(live_plan)
+    # counts its keys ('budget', 'budget_reason', 'changes', 'notes',
+    # 'targets') and is always non-zero, which silently reports every no-op
+    # pass as a "real" one. The list to check is live_plan["changes"].
+    changed_records = [rec for rec in records if (rec.get("live_plan") or {}).get("changes")]
+    data["change_agreement_streak"] = {
+        "streak": _trailing_streak(changed_records),
+        "total": len(changed_records),
+    }
+
+    verdict = evaluate_shadow_gate(records)
+    data["gate"] = {
+        "ok": verdict.ok,
+        "streak": verdict.streak,
+        "streak_required": REQUIRED_STREAK,
+        "streak_ok": verdict.streak_ok,
+        "calendar_days": verdict.calendar_days,
+        "calendar_days_required": REQUIRED_CALENDAR_DAYS,
+        "days_ok": verdict.days_ok,
+        "classes_covered": sorted(verdict.classes_covered),
+        "classes_missing": sorted(verdict.classes_missing),
+        "classes_ok": verdict.classes_ok,
+        "unadjudicated": list(verdict.unadjudicated),
+        "adjudication_ok": verdict.adjudication_ok,
+        "report": verdict.report(),
+    }
+
+    return CommandResult(ok=True, message="runners shadow-status complete", data=data)
+
+
 def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
     """Ensure all configured managed runners are running.
 
@@ -1632,6 +1841,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "runners":
             if args.runners_command == "status":
                 result = run_runners_status(args)
+            elif args.runners_command == "shadow-status":
+                result = run_runners_shadow_status(args)
             elif args.runners_command == "ensure-started":
                 result = run_runners_ensure_started(args)
             elif args.runners_command == "scale-down":
@@ -1727,6 +1938,46 @@ def main(argv: list[str] | None = None) -> int:
                 f"  Host: {host_headroom.get('free_ram_gb', 0)} GB free RAM, {host_headroom.get('cpu_percent', 0)}% CPU"
             )
             print(f"  Pressure: {pressure}")
+        elif args.runners_command == "shadow-status" and result.ok:
+            events_db = result.data.get("events_db", {})
+            if not events_db.get("found"):
+                print(f"  events.db: not found: {events_db.get('path')}")
+            else:
+                actuating = result.data.get("actuating")
+                if actuating is None:
+                    print("  Actuating (source=prologue): no runner_allocation event found")
+                else:
+                    print(
+                        f"  Actuating (source=prologue, authoritative): "
+                        f"{actuating.get('planner')} as of {actuating.get('ts')}"
+                    )
+                configured = result.data.get("configured_not_yet_in_effect")
+                if configured is not None:
+                    print(
+                        f"  CONFIGURED, NOT YET IN EFFECT (source=cli, newer): "
+                        f"{configured.get('planner')} as of {configured.get('ts')}"
+                    )
+
+            journal = result.data.get("journal", {})
+            if not journal.get("found"):
+                print(f"  journal: not found: {journal.get('path')}")
+            else:
+                print(f"  Journal: {journal.get('path')}")
+                all_streak = result.data.get("agreement_streak") or {}
+                change_streak = result.data.get("change_agreement_streak") or {}
+                print(
+                    f"    Agreement streak (all passes):                     "
+                    f"{all_streak.get('streak')}/{all_streak.get('total')}"
+                )
+                print(
+                    f"    Agreement streak (passes with a real change) "
+                    f"[LOAD-BEARING]: {change_streak.get('streak')}/{change_streak.get('total')}"
+                )
+                gate = result.data.get("gate") or {}
+                if gate:
+                    print(f"  Gate ok={gate.get('ok')} (§6.3 -- ci_fleet.shadow_gate.evaluate):")
+                    for line in gate.get("report", "").splitlines():
+                        print(f"    {line}")
         elif args.runners_command == "ensure-started" and result.ok:
             started_count = result.data.get("started_count", 0)
             messages = result.data.get("messages", [])
