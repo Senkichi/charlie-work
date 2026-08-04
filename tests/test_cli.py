@@ -2039,3 +2039,54 @@ def test_main_dispatches_runners_shadow_status(monkeypatch: pytest.MonkeyPatch) 
 
     assert exit_code == 0
     mock.assert_called_once()
+
+
+def test_main_runners_shadow_status_renders_pending_planner_and_note_ordering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End-to-end through the real ``main()`` render path, not just ``result.data``.
+
+    The nine data-level tests above never exercise the ~40-line print block --
+    ``test_main_dispatches_runners_shadow_status`` takes the not-found branch
+    with ``data={}``. The single line whose *absence* is issue #909's actual
+    failure mode ("configured, not yet in effect") had zero assertions
+    covering it before this test. This drives the real ``cli.main()`` with a
+    prologue+cli event pair and a journal, then asserts on the rendered text:
+    the pending planner line is present and names the right planner, the
+    actuating line names the old one (never the pending one), and the
+    load-bearing-gap qualifier note prints *after* "GATE" -- proving the fix
+    for the advisor finding that "GATE OPEN" used to be the last word.
+    """
+    repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    state_file = _allocation_state_file(repo_root)
+    _write_allocation_event(state_file, source="prologue", actuating_planner="legacy")
+    _write_allocation_event(state_file, source="cli", actuating_planner="new")
+    real_change = [{"repo": "x/y", "runner": "r-1", "action": "start", "reason": "test"}]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=True, changes=[]),
+            _journal_record("p2", agreed=True, changes=real_change),
+        ],
+    )
+
+    exit_code = cli.main(["--fleet-dir", str(fleet_directory), "runners", "shadow-status"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    actuating_lines = [line for line in out.splitlines() if line.strip().startswith("Actuating")]
+    assert len(actuating_lines) == 1, out
+    assert "legacy" in actuating_lines[0]
+    assert "new" not in actuating_lines[0]
+    pending_lines = [line for line in out.splitlines() if "NOT YET IN EFFECT" in line]
+    assert len(pending_lines) == 1, out
+    assert "new" in pending_lines[0]
+    assert "legacy" not in pending_lines[0]
+    gate_idx = out.index("Gate ok=")
+    note_idx = out.index("Note: criterion 1a")
+    assert note_idx > gate_idx, (
+        "the qualifier note must print after the gate report, not before it -- "
+        "otherwise 'GATE OPEN' is the last word an operator reads, exactly the "
+        "advisor-flagged regression this test pins"
+    )
+    assert "compared 1 time(s)" in out

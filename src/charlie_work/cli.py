@@ -1975,9 +1975,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 gate = result.data.get("gate") or {}
                 if gate:
-                    print(f"  Gate ok={gate.get('ok')} (§6.3 -- ci_fleet.shadow_gate.evaluate):")
+                    print(
+                        f"  Gate ok={gate.get('ok')} (section 6.3 -- ci_fleet.shadow_gate.evaluate):"
+                    )
                     for line in gate.get("report", "").splitlines():
                         print(f"    {line}")
+                    # The gate's own streak/total (criterion 1a) is the
+                    # all-passes figure above, restated -- printed last here so
+                    # it lands as the final word instead of "GATE OPEN". Numbers
+                    # only, no editorializing: an operator who reads only the
+                    # gate report otherwise ends on an unqualified pass that
+                    # buries exactly the gap the load-bearing streak exists to
+                    # surface (a change-emitting comparison count of
+                    # change_streak.total, not all_streak.total).
+                    print(
+                        "    Note: criterion 1a's streak counts "
+                        f"{all_streak.get('total')} pass(es), of which "
+                        f"{(all_streak.get('total') or 0) - (change_streak.get('total') or 0)} "
+                        "emitted no change; the change-emitting path has been "
+                        f"compared {change_streak.get('total')} time(s)."
+                    )
         elif args.runners_command == "ensure-started" and result.ok:
             started_count = result.data.get("started_count", 0)
             messages = result.data.get("messages", [])
