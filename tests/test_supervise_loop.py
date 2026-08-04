@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from charlie_work.supervise_loop import (
+    CAP_CAUSE_NON_CONVERGENCE,
+    CAP_CAUSE_RETIREMENT,
     EXIT_RESTART_REQUESTED,
     SuperviseLoopResult,
     run_supervise_relaunch_loop,
@@ -165,3 +167,148 @@ def test_cap_event_is_not_emitted_on_a_normal_exit() -> None:
 def test_restart_exit_code_is_distinct_from_the_ordinary_ones() -> None:
     """AC1 at the vocabulary level: 0 (stopped) and 1 (aborted) are both taken."""
     assert EXIT_RESTART_REQUESTED not in (0, 1)
+
+
+class _ClockedSpawn:
+    """A restart-requesting supervisor whose children run for scripted durations.
+
+    Pairs the fake clock with the fake spawn deliberately: the loop reads the
+    clock either side of ``spawn``, so the only faithful way to model "this child
+    ran for N seconds" is to advance time *inside* the call. Durations shorter
+    than the list are held at the last value so a test can say "then it settles".
+    """
+
+    def __init__(self, durations: list[float], ceiling: int = 50) -> None:
+        self._durations = list(durations)
+        self.ceiling = ceiling
+        self.calls = 0
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __call__(self, launch_number: int) -> int:
+        self.calls += 1
+        if self.calls > self.ceiling:
+            raise AssertionError(
+                f"spawn was called {self.calls} times without the loop stopping; "
+                "the relaunch bound is not being enforced"
+            )
+        index = min(self.calls - 1, len(self._durations) - 1)
+        self.now += self._durations[index]
+        return EXIT_RESTART_REQUESTED
+
+
+def _cap_line(messages: list[str]) -> str:
+    lines = [line for line in messages if "cap reached" in line]
+    assert len(lines) == 1, f"expected exactly one cap line, got {lines}"
+    return lines[0]
+
+
+def test_cap_after_sustained_children_reports_retirement_not_non_convergence() -> None:
+    """#903: the routine path must not accuse self-deploy of failing to converge.
+
+    This is the live case -- a wrapper up for days, self-deploying normally, whose
+    children each run a full pass before asking to be replaced.
+    """
+    spawn = _ClockedSpawn([600.0])
+    messages: list[str] = []
+    cap_events: list[SuperviseLoopResult] = []
+
+    result = run_supervise_relaunch_loop(
+        spawn,
+        max_relaunches=3,
+        log=messages.append,
+        on_cap_reached=cap_events.append,
+        monotonic=spawn.monotonic,
+        sustained_run_seconds=60.0,
+    )
+
+    assert result.cap_cause == CAP_CAUSE_RETIREMENT
+    assert cap_events == [result]
+    line = _cap_line(messages)
+    assert "not a self-deploy fault" in line
+    assert "not converging" not in line
+
+
+def test_cap_after_only_fast_children_still_reports_non_convergence() -> None:
+    """#903 the other way: the real failure must keep its loud, correct wording.
+
+    Without this, a fix that reported "retirement" unconditionally would pass the
+    test above while destroying the diagnostic it exists to protect.
+    """
+    spawn = _ClockedSpawn([0.5])
+    messages: list[str] = []
+
+    result = run_supervise_relaunch_loop(
+        spawn,
+        max_relaunches=3,
+        log=messages.append,
+        monotonic=spawn.monotonic,
+        sustained_run_seconds=60.0,
+    )
+
+    assert result.cap_cause == CAP_CAUSE_NON_CONVERGENCE
+    line = _cap_line(messages)
+    assert "not converging" in line
+
+
+def test_a_single_sustained_run_is_enough_to_rule_out_non_convergence() -> None:
+    """The discriminator, at its boundary.
+
+    A child that got up and worked even once proves the deploy converges, so a
+    streak of fast restarts around it is not a restart loop. Pinned because the
+    tempting implementation -- looking only at the *last* child -- gets this wrong.
+    """
+    # Fast, fast, sustained, then fast forever.
+    spawn = _ClockedSpawn([0.5, 0.5, 600.0, 0.5])
+    messages: list[str] = []
+
+    result = run_supervise_relaunch_loop(
+        spawn,
+        max_relaunches=3,
+        log=messages.append,
+        monotonic=spawn.monotonic,
+        sustained_run_seconds=60.0,
+    )
+
+    assert result.cap_cause == CAP_CAUSE_RETIREMENT
+    assert "not converging" not in _cap_line(messages)
+
+
+def test_sustained_runs_do_not_reset_the_relaunch_bound() -> None:
+    """#903 AC4, and the regression guard for the fix that was *rejected*.
+
+    The first proposal for #903 was to reset the relaunch counter whenever a child
+    made progress. That would make a healthy wrapper immortal -- pinning stale
+    wrapper code in memory and taking restart authority away from the scheduled
+    tick, which the module docstring rules out explicitly. The cap must still be
+    reached after exactly ``max_relaunches`` replacements no matter how long the
+    children ran.
+    """
+    spawn = _ClockedSpawn([600.0])
+
+    result = run_supervise_relaunch_loop(
+        spawn,
+        max_relaunches=3,
+        log=lambda _: None,
+        monotonic=spawn.monotonic,
+        sustained_run_seconds=60.0,
+    )
+
+    assert result.cap_reached is True
+    assert result.relaunches == 3
+    assert result.launches == 4
+    assert spawn.calls == 4
+
+
+def test_cap_cause_is_absent_when_the_cap_was_not_reached() -> None:
+    """A result that never hit the bound must not assert a cause it never observed."""
+    result = run_supervise_relaunch_loop(
+        _ScriptedSpawn([EXIT_RESTART_REQUESTED, 0]),
+        max_relaunches=5,
+        log=lambda _: None,
+    )
+
+    assert result.cap_reached is False
+    assert result.cap_cause is None

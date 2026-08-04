@@ -2129,6 +2129,13 @@ def _record_supervise_loop_cap_event(result: SuperviseLoopResult) -> None:
                 "launches": result.launches,
                 "relaunches": result.relaunches,
                 "last_exit_code": result.last_exit_code,
+                # #903: which of the two cap conditions this was -- "retirement"
+                # (healthy wrapper stepping aside after sustained uptime) or
+                # "non_convergence" (every child died on startup). Without it a
+                # reader cannot tell an expected event from an incident, and
+                # this function's own contract above claims the event says
+                # exactly which condition occurred.
+                "cap_cause": result.cap_cause,
             },
         )
     except Exception:
@@ -2224,5 +2231,6 @@ def run_fleet_supervise_loop(
             "relaunches": result.relaunches,
             "last_exit_code": result.last_exit_code,
             "cap_reached": result.cap_reached,
+            "cap_cause": result.cap_cause,
         },
     )
