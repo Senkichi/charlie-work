@@ -33,8 +33,13 @@ subsequent pass the condition holds, and fires ``runner_capacity_recovered``
 once when it turns false again — so a reader can always tell "still starved"
 from "signal stopped working" instead of the silence being ambiguous.
 
-Because ``run_allocation_pass`` is invoked as a fresh process every fleet pass,
-this dedup state cannot live in memory. It is derived entirely from
+This dedup state cannot live in memory. Note that it is *not* safe to assume a
+fresh process per pass: the ``charlie runners allocate`` CLI is one, but the
+fleet supervisor is not — ``run_fleet_supervise`` runs the pass loop in-process
+for its whole lifetime (``fleet_dispatch.py:1729``), so an in-memory global
+would survive across passes and be dropped only on respawn. That failure mode
+is rare and non-deterministic rather than immediate, which makes it worse than
+the one a fresh-process assumption would produce. It is derived entirely from
 ``events.db`` itself (no new state file): the prior signaled state for a repo
 is "more ``runner_capacity_starved`` rows than ``runner_capacity_recovered``
 rows", which is immune to same-second timestamp collisions (``_now_iso()``
