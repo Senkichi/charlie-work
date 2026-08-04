@@ -1733,6 +1733,47 @@ def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:
     return _is_pre_connection_error(error)
 
 
+def _api_is_mutating(args: list[str]) -> bool:
+    """Classify a `gh api` invocation, for the --dry-run gate.
+
+    `gh api` defaults to GET, so a bare `gh api <path>` is read-only and MUST stay
+    runnable under --dry-run — roughly a dozen call sites (rate_limit, commits/{sha},
+    check-runs, compare, branches/*/protection, `fleet_registry.py`) depend on that.
+    Blanket-denying `api` would turn --dry-run from "observes without mutating" into
+    "cannot observe", so the classification keys off whether a method is *named*.
+
+    Structured on flag PRESENCE rather than on enumerating accepted spellings, and
+    fails CLOSED when a method flag is present but its value cannot be extracted.
+    The previous version enumerated `--method`/`--method=` only and fell through to
+    False for everything else, so `-X DELETE` — the form `delete_branch` builds —
+    classified as read-only and a --dry-run really deleted PR head branches
+    (#914, #917). Enumeration is the wrong shape here: it silently fails open on
+    each spelling nobody thought of (`-X`, `-X=`, `-XDELETE`, a trailing `--method`
+    with no value).
+    """
+    for i, arg in enumerate(args):
+        if arg in ("-X", "--method"):
+            method = args[i + 1] if i + 1 < len(args) else ""
+        elif arg.startswith("--method="):
+            method = arg.split("=", 1)[1]
+        elif arg.startswith("-X"):
+            # pflag shorthand accepts an attached value: `-XDELETE` and `-X=DELETE`.
+            method = arg[2:].lstrip("=")
+        else:
+            continue
+        # A named-but-unparseable method is not evidence of a read; fail closed.
+        return not method or method.upper() not in ("GET", "HEAD")
+    # No explicit method. gh switches GET -> POST when request parameters are added
+    # ("adding request parameters will automatically switch the request method to
+    # POST" -- gh api --help). No call site uses these today, so this arm is latent;
+    # it costs one condition and closes the same class before a site appears. Note
+    # it also classifies a read-only `gh api graphql -f query=...` as mutating, which
+    # over-blocks a dry run rather than under-blocking it -- the safe direction.
+    param_flags = ("-f", "--raw-field", "-F", "--field", "--input")
+    param_prefixes = ("--raw-field=", "--field=", "--input=")
+    return any(arg in param_flags or arg.startswith(param_prefixes) for arg in args)
+
+
 def _is_mutating(args: list[str]) -> bool:
     if not args:
         return False
@@ -1740,12 +1781,7 @@ def _is_mutating(args: list[str]) -> bool:
     # `gh api` defaults to GET and is read-only unless a mutating method is given.
     # run() passes args without the leading "gh" token.
     if text.startswith("api"):
-        for i, arg in enumerate(args):
-            if arg == "--method" and i + 1 < len(args):
-                return args[i + 1].upper() not in ("GET", "HEAD")
-            if arg.startswith("--method="):
-                return arg.split("=", 1)[1].upper() not in ("GET", "HEAD")
-        return False
+        return _api_is_mutating(args)
     readonly_prefixes = (
         "issue list",
         "issue view",
