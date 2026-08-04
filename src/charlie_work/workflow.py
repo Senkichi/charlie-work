@@ -10514,6 +10514,19 @@ class OrchestratorApp:
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
             rework_path: str | None = None
+            # str, not str | None: unlike rework_path (used as-is, Optional,
+            # in the returned CommandResult payload), rework_summary is only
+            # ever consumed at the _write_rework_prompt call below, whose
+            # dispatch_note parameter is a bare `str` (issue #782). A None
+            # default would relocate reportPossiblyUnboundVariable into a
+            # reportArgumentType mismatch instead of eliminating it. This
+            # default is unreachable dead code on every path (see #782):
+            # rework_summary is always rebound before use because the
+            # binding guard (`if not escalated:`, above the write) and the
+            # use guard (`decision == "request_changes" and not escalated`,
+            # at the write) are the same conjunction and `escalated` is not
+            # reassigned between them.
+            rework_summary: str = ""
             escalated = False
             rescue_dispatched = False
             # Durable per-PR rework counter — NOT derived from the global events
