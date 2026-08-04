@@ -19329,6 +19329,69 @@ def test_is_mutating_classifies_readonly_and_mutating() -> None:
         assert _is_mutating(mutating) is True
 
 
+def test_is_mutating_blocks_the_argv_delete_branch_actually_builds(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#914/#917: `-X DELETE` classified as read-only, so `--dry-run` really deleted
+    PR head branches.
+
+    The argv is captured from `delete_branch` itself rather than written out by hand,
+    so the gate cannot drift away from its most destructive caller: if someone changes
+    how that call is spelled, this test follows it.
+    """
+    from charlie_work.github import _is_mutating
+
+    captured: list[list[str]] = []
+    # GitHub is a frozen dataclass -- patch the class, not the instance.
+    monkeypatch.setattr(
+        github_module.GitHub,
+        "run",
+        lambda self, args, **kwargs: captured.append(args) or "",
+    )
+    gh = github_module.GitHub(repo_root=tmp_path)
+
+    assert gh.delete_branch("feature/x") is True
+    assert len(captured) == 1
+    assert _is_mutating(captured[0]) is True
+
+
+def test_is_mutating_api_method_spellings_and_preserved_reads() -> None:
+    """Every spelling `gh` accepts for a method must classify from that method, and
+    an unparseable one must fail CLOSED.
+
+    The read-only half is the half that protects `--dry-run` from being tightened into
+    uselessness: these are real live call sites, and without them a future "just deny
+    all `gh api`" change passes every other test in the suite.
+    """
+    from charlie_work.github import _is_mutating
+
+    for mutating in (
+        ["api", "-X", "DELETE", "repos/o/r/git/refs/heads/x"],
+        ["api", "-X=DELETE", "repos/o/r/git/refs/heads/x"],
+        ["api", "-XDELETE", "repos/o/r/git/refs/heads/x"],
+        ["api", "-X", "POST", "repos/o/r/actions/runners/remove-token"],
+        ["api", "--method", "PATCH", "repos/o/r/issues/1"],
+        ["api", "--method=PUT", "repos/o/r/branches/main/protection"],
+        ["api", "-X"],  # named but valueless -> fail closed, not open
+        ["api", "--method"],
+        ["api", "repos/o/r/issues", "-f", "title=x"],  # params switch gh to POST
+        ["api", "repos/o/r/issues", "--field=labels[]=bug"],
+    ):
+        assert _is_mutating(mutating) is True, mutating
+
+    for readonly in (
+        ["api", "rate_limit"],
+        ["api", "repos/o/r/commits/abc/check-runs"],
+        ["api", "repos/o/r/compare/main...topic"],
+        ["api", "repos/o/r/branches/main/protection"],
+        ["api", "-X", "GET", "repos/o/r/issues"],
+        ["api", "--method=HEAD", "repos/o/r"],
+        # A header is not a method -- github.py:1033 fetches a diff this way.
+        ["api", "repos/o/r/pulls/1", "-H", "Accept: application/vnd.github.v3.diff"],
+    ):
+        assert _is_mutating(readonly) is False, readonly
+
+
 def test_dry_run_skips_worker_launch(monkeypatch, tmp_path: Path) -> None:
     """Test that --dry-run prevents worker process launch and worktree creation."""
     from charlie_work.adapters import AdapterSettings, SessionRequest, dispatch_sessions
