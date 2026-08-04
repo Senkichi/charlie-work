@@ -562,6 +562,16 @@ def test_dispatch_non_deterministic_failure_kind_still_uses_redispatch_cap(
 # --- Issues #837 / #779: collapsed dispatch-outcome/escalation branch pin ---
 
 
+def _seed_dispatch_failed_at(paths, issue_number: int, attempts: list[str]) -> None:
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"][str(issue_number)] = {
+            **state["issues"].get(str(issue_number), {}),
+            "dispatch_failed_at": attempts,
+        }
+        save_state(paths.state_file, state)
+
+
 def _fake_dispatch_result_factory(
     *,
     ok: bool,
@@ -619,14 +629,14 @@ def _fake_dispatch_result_factory(
             None,
             None,
         ),
-        ("transient_failure_under_cap", False, None, None, "dispatch_failed", 1, None),
+        ("transient_failure_under_cap", False, None, None, "dispatch_failed", 2, None),
         (
             "deterministic_failure_escalates_first_try",
             False,
             "worktree_unsafe",
             None,
             "escalated",
-            1,
+            2,
             "worktree_unsafe",
         ),
     ],
@@ -664,8 +674,18 @@ def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
     ``status`` string instead of the originating predicate could not tell
     these apart; asserting both here pins that the branch, not the status
     value, is what determines the field set.
+
+    Every scenario seeds one prior ``dispatch_failed_at`` entry before
+    dispatching, so the assertions are non-vacuous in both directions: the
+    ``ok`` / ``live_worker`` / ``phantom_live_worker`` arms must actively
+    *clear* an existing field (an entry field that was never populated would
+    pass an "absent" assertion for free), and the two failure arms must
+    *append to* rather than replace prior history (``len == 2``, not
+    ``len == 1`` from a fresh list), pinning that ``all_attempts`` is seeded
+    from ``prev_entry`` and not reconstructed from scratch.
     """
     app, fake_gh = _closed_pr_app(tmp_path)
+    _seed_dispatch_failed_at(app.paths, 123, ["2020-01-01T00:00:00+00:00"])
     monkeypatch.setattr(
         "charlie_work.workflow.dispatch_sessions",
         _fake_dispatch_result_factory(
