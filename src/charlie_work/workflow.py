@@ -43,6 +43,7 @@ from .config import (
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from . import layout
+from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
 from .subprocess_runner import no_console_window_kwargs
@@ -14925,6 +14926,125 @@ class OrchestratorApp:
                 )
             save_state(state_file, state)
 
+    def _maybe_reclaim_superseded_main_ci(self) -> None:
+        """Cancel superseded, not-yet-started ``main`` CI runs every pass (#863, #815).
+
+        ``main_ci_reclaim.reclaim_superseded_main_ci_runs`` owns the actual
+        detection/cancellation logic and its safety invariant (never a
+        started run, never main's current tip, only strict ancestors of
+        tip) -- see that module's docstring. This method is wiring only.
+
+        Deliberately has NO cadence gate, unlike ``_maybe_reconcile_drift``
+        and ``_maybe_probe_quota_recovery`` above: running on every pass is
+        the mechanism that closes #815 (the reaper workflow gets only one
+        scheduling chance per main push and can permanently lose the race to
+        the stale run starting first). Since this lane needs no runner --
+        just a local ``git fetch`` plus a couple of cheap ``gh api`` calls --
+        running it unconditionally on every pass gives a superseded run
+        repeated chances to be reclaimed across passes, which a runner-bound
+        workflow retry could never provide regardless of how often it were
+        scheduled.
+
+        ``self.config.runners.default_branch`` is reused rather than adding
+        a second ``default_branch`` knob on ``MainCiReclaimConfig`` --
+        "what is this repo's default branch" is one fact, not one per
+        feature, and a second copy would only risk drifting out of sync with
+        the first.
+
+        Event policy (issue tracker: "signal without a consumer" is this
+        repo's #1 recurring defect class, so this is deliberate rather than
+        an oversight): unlike ``_maybe_reconcile_drift``, which emits one
+        summary event on every call because its cadence is bounded to once
+        per ``interval_minutes``, this method has no cadence gate and the
+        overwhelming majority of passes will find zero candidates -- writing
+        a ``main_ci_reclaim_completed`` event every single pass would add
+        events.db volume with zero diagnostic value and crowd the capped
+        200-entry ``state.json`` ring. So a durable event is written only
+        when there is something worth a durable record: an actual
+        cancellation (``main_ci_reclaim_cancelled``) or a pass-level failure
+        (``main_ci_reclaim_failed``). Both are consumed the same way
+        ``reconcile_pass_*`` events already are: ``query_events``/
+        ``event_counts_by_kind`` for structured aggregation, and
+        ``events_by_correlation_id`` to reconstruct a specific pass. The
+        zero-candidate case still gets an immediate, cheap consumer via
+        ``logger.debug`` below -- proof-of-life without a durable write.
+
+        Wrapped in exception containment for the same reason as every other
+        ``_maybe_*`` lane in this method: ``supervise.py``'s
+        ``except Exception`` sits outside its ``while True``, so one
+        uncaught exception here would kill the whole daemon rather than one
+        pass.
+        """
+        if not self.config.main_ci_reclaim.enabled:
+            return
+
+        import logging
+
+        logger = logging.getLogger(__name__)
+        state_file = self.paths.state_file
+        try:
+            result = reclaim_superseded_main_ci_runs(
+                self.gh,
+                self.repo_root,
+                default_branch=self.config.runners.default_branch,
+                workflow_filename=self.config.main_ci_reclaim.workflow_filename,
+            )
+        except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = self._record_event(
+                    state,
+                    "main_ci_reclaim_failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+                save_state(state_file, state)
+            logger.warning("main_ci_reclaim pass raised an exception", exc_info=True)
+            return
+
+        if not result.ok:
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = self._record_event(
+                    state, "main_ci_reclaim_failed", {"error": result.error}
+                )
+                save_state(state_file, state)
+            logger.warning("main_ci_reclaim pass failed: %s", result.error)
+            return
+
+        if not result.cancelled:
+            logger.debug(
+                "main_ci_reclaim: no superseded main CI runs to reclaim this pass "
+                "(tip=%s, checked=%d)",
+                result.tip_sha,
+                result.candidates_checked,
+            )
+            return
+
+        with state_lock(state_file):
+            state = load_state(state_file)
+            state = self._record_event(
+                state,
+                "main_ci_reclaim_cancelled",
+                {
+                    "tip_sha": result.tip_sha,
+                    "cancelled_run_ids": [run.run_id for run in result.cancelled],
+                    "candidates_checked": result.candidates_checked,
+                    "skipped_not_ancestor": result.skipped_not_ancestor,
+                    "skipped_started_before_cancel": result.skipped_started_before_cancel,
+                    "cancel_errors": list(result.cancel_errors),
+                },
+            )
+            save_state(state_file, state)
+        for run in result.cancelled:
+            logger.info(
+                "main_ci_reclaim: cancelled superseded main CI run %s "
+                "(sha %s, was %s, created %s)",
+                run.run_id,
+                run.head_sha,
+                run.status_before_cancel,
+                run.created_at,
+            )
+
     def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any] | None:
         """Re-evaluate one ``mechanical`` escalation and clear it if safe.
 
@@ -15404,6 +15524,12 @@ class OrchestratorApp:
         # `needs-rework` on an issue state already marked `escalated`) are
         # visible to this same pass's dispatch decisions, not just the next.
         self._maybe_reconcile_drift(now=now)
+
+        # Issues #863/#815: reclaim superseded, not-yet-started main CI runs
+        # every pass -- no runner needed, so unlike the workflow-based
+        # reaper this cannot lose the race for the capacity it exists to
+        # free. See _maybe_reclaim_superseded_main_ci's docstring.
+        self._maybe_reclaim_superseded_main_ci()
 
         # Issue #783: periodic re-evaluation of `mechanical` escalations --
         # the only automated re-entry from `agent:human-needed` for pure
