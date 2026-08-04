@@ -1667,9 +1667,9 @@ def test_get_rate_limit_defer_until_with_reset_time(tmp_path: Path) -> None:
     assert defer_until is not None
     assert "T" in defer_until
     assert "Z" in defer_until
-    expected = now + timedelta(minutes=10 + 2)
+    expected = (now + timedelta(minutes=10 + 2)).replace(microsecond=0)
     parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
-    assert abs((parsed - expected).total_seconds()) < 1
+    assert parsed == expected
 
 
 def test_get_rate_limit_defer_until_without_reset_time(tmp_path: Path) -> None:
@@ -1686,9 +1686,9 @@ def test_get_rate_limit_defer_until_without_reset_time(tmp_path: Path) -> None:
     defer_until = get_rate_limit_defer_until(log_path, slack_minutes=2, now=now)
 
     assert defer_until is not None
-    expected = now + timedelta(minutes=15 + 2)
+    expected = (now + timedelta(minutes=15 + 2)).replace(microsecond=0)
     parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
-    assert abs((parsed - expected).total_seconds()) < 1
+    assert parsed == expected
 
 
 def test_get_rate_limit_defer_until_no_match(tmp_path: Path) -> None:
@@ -1719,8 +1719,8 @@ def test_get_rate_limit_defer_until_includes_resume_margin(tmp_path: Path) -> No
 
     assert defer_until is not None
     parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
-    expected = now + timedelta(minutes=3 + 2, seconds=90)
-    assert abs((parsed - expected).total_seconds()) < 1
+    expected = (now + timedelta(minutes=3 + 2, seconds=90)).replace(microsecond=0)
+    assert parsed == expected
 
 
 def test_set_throttled_until_overwrites_no_accumulation() -> None:

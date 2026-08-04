@@ -1273,7 +1273,22 @@ def test_janitor_conflict_legacy_stall_since_without_head_reanchors_instead_of_e
     assert "conflict_rework_attempts_stall_head" not in state["prs"]["456"]
     save_state(app.paths.state_file, state)
 
+    # Issue #828: unlike loop(now=...) (added by PR 836/838), review() has no
+    # injectable-clock seam reaching `_check_janitor_rework_stall`'s
+    # re-anchor write -- adding one means a new keyword-only parameter on
+    # review(), a public entry point with production callers (cli.py,
+    # fleet_dispatch.py) that would never pass it. Bracketing the call with
+    # real before/after timestamps removes the wall-clock-tolerance window
+    # without that production diff: the written timestamp is mathematically
+    # bounded by the call's own start and end, so no stall between the call
+    # and the assertion can widen a gap the way a fixed-N-second tolerance
+    # eventually would. `before` is floored to whole seconds because the
+    # re-anchor write (`utc_now()`, state.py) truncates microseconds, so a
+    # `before` sampled with nonzero microseconds could otherwise sit above
+    # the truncated write.
+    before = datetime.now(UTC).replace(microsecond=0)
     result2 = app.review(456)
+    after = datetime.now(UTC)
 
     # Must NOT escalate off the untrustworthy legacy timestamp.
     assert result2.ok is False
@@ -1287,7 +1302,7 @@ def test_janitor_conflict_legacy_stall_since_without_head_reanchors_instead_of_e
     new_since = state["prs"]["456"].get("conflict_rework_attempts_stall_since")
     assert new_since is not None
     reanchored_at = datetime.fromisoformat(new_since)
-    assert (datetime.now(UTC) - reanchored_at).total_seconds() < 60
+    assert before <= reanchored_at <= after
     assert state["prs"]["456"].get("conflict_rework_attempts_stall_head") == app.gh.prs[0].get(
         "headRefOid"
     )
