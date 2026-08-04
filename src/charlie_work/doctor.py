@@ -198,14 +198,25 @@ def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
     call at all, so it inherits the orchestrator's full (unsanitized)
     environment. Neither has the failure mode this check targets.
 
-    ``routing.select_adapter`` can additionally route an *individual* issue to
-    the ``api`` adapter (``policy:rework``/``policy:complexity``, gated on
-    ``config.api_worker.enabled``) regardless of the configured default
-    adapter — so a ``devin-shell``/``manual``/``command`` default with
-    ``api_worker.enabled`` still dispatches some issues through the
-    claude-code launch path and ``claude_code.worker_env``. This is checked
-    as a second, separately-named finding so that combination isn't hidden
-    behind the primary adapter's check.
+    Two other paths dispatch through the claude-code launch path
+    (``claude_code.worker_env``) regardless of the configured default
+    ``devin.adapter``, so a ``devin-shell``/``manual``/``command`` default
+    can still stall a worker mid-pass with no visible finding unless both are
+    covered:
+
+    * ``routing.select_adapter`` can route an *individual* issue to the
+      ``api`` adapter (``policy:rework``/``policy:complexity``, gated on
+      ``config.api_worker.enabled``).
+    * ``_rescue_adapter_settings`` (workflow.py) *always* forces
+      ``adapter="claude-code"`` for the bounded rescue tier (issue #555)
+      once ``config.rescue.enabled`` is true, independent of
+      ``api_worker.enabled`` — rescue and the paid api tier are unrelated
+      toggles, so checking one does not imply the other is off.
+
+    Either toggle alone is enough for a dispatched worker to hit the
+    claude-code path, so this fires as a second, separately-named finding
+    whenever *either* is true, so that combination isn't hidden behind the
+    primary adapter's check.
 
     Severity is ``warning``, not the default ``error``: issue #873 is
     explicit that the sanctioned fix (an operator configuring a scoped token)
@@ -233,11 +244,12 @@ def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
             )
         )
 
-    if config.api_worker.enabled and adapter not in ("claude-code", "api"):
+    claude_code_reachable_via_routing = config.api_worker.enabled or config.rescue.enabled
+    if claude_code_reachable_via_routing and adapter not in ("claude-code", "api"):
         checks.append(
             (
-                "worker GitHub token (api-routed)",
-                "api",
+                "worker GitHub token (claude-code-routed)",
+                "api/rescue",
                 "claude_code.worker_env",
                 config.claude_code.worker_env,
             )
@@ -254,6 +266,7 @@ def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
                 f"{config_key} configures {configured_var} — restores a scoped "
                 "token for worker `gh` calls after sanitize_env strips the "
                 "orchestrator's own token (issue #502/#873)",
+                severity="warning",
             )
             continue
 

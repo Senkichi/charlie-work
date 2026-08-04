@@ -14,6 +14,7 @@ from charlie_work.config import (
     CrossFamilyConfig,
     DevinConfig,
     OrchestratorConfig,
+    RescueConfig,
     RuntimeConfig,
 )
 from charlie_work.config import ApiProviderConfig, ApiWorkerConfig
@@ -676,7 +677,7 @@ def test_worker_github_token_omitted_for_manual_and_command_adapters(tmp_path: P
 
         names = {check.name for check in checks}
         assert "worker GitHub token" not in names, adapter
-        assert "worker GitHub token (api-routed)" not in names, adapter
+        assert "worker GitHub token (claude-code-routed)" not in names, adapter
 
 
 def test_worker_github_token_api_routed_check_fires_alongside_default_adapter(
@@ -712,7 +713,42 @@ def test_worker_github_token_api_routed_check_fires_alongside_default_adapter(
 
     by_name = {check.name: check for check in checks}
     assert by_name["worker GitHub token"].ok is True  # devin-shell path is fine
-    routed = by_name["worker GitHub token (api-routed)"]
+    routed = by_name["worker GitHub token (claude-code-routed)"]
+    assert routed.ok is False  # claude_code.worker_env has no token
+    assert routed.severity == "warning"
+    assert "claude_code.worker_env" in routed.detail
+    assert ok is True
+
+
+def test_worker_github_token_rescue_routed_check_fires_when_api_worker_disabled(
+    tmp_path: Path,
+) -> None:
+    """rescue.enabled alone must trigger the claude-code-routed check.
+
+    _rescue_adapter_settings (workflow.py) always forces adapter="claude-code"
+    for the bounded rescue tier once rescue.enabled is True, independent of
+    api_worker.enabled — they are unrelated toggles. A devin-shell default
+    with rescue enabled but api_worker left at its default (disabled) must
+    still surface a missing claude_code.worker_env token, or a rescue-tier
+    dispatch can stall silently with doctor reporting fully healthy.
+    """
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(
+            adapter="devin-shell",
+            sessions_dir="sessions",
+            worker_env={"GH_TOKEN": "placeholder-not-a-real-token"},
+        ),
+        rescue=RescueConfig(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+
+    by_name = {check.name: check for check in checks}
+    assert by_name["worker GitHub token"].ok is True  # devin-shell path is fine
+    routed = by_name["worker GitHub token (claude-code-routed)"]
     assert routed.ok is False  # claude_code.worker_env has no token
     assert routed.severity == "warning"
     assert "claude_code.worker_env" in routed.detail
