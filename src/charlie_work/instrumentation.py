@@ -832,11 +832,31 @@ def close_db(state_path: Path) -> None:
 # both functions above are defined.
 #
 # Both seams are required, and the reader is the one that looks redundant.
-# Capacity signalling (#799) is edge-triggered and the fleet pass is a fresh
-# process every cycle, so "have I already signalled?" can only be answered by
-# reading the store back. With no reader installed, query_events() returns
-# None, the pass correctly declines to guess, and runner_capacity_starved never
-# fires -- indistinguishable from a host that was never starved.
+# Capacity signalling (#799) is edge-triggered, so "have I already signalled?"
+# can only be answered by reading the store back. With no reader installed,
+# query_events() returns None, the pass correctly declines to guess, and
+# runner_capacity_starved never fires -- indistinguishable from a host that was
+# never starved.
+#
+# This comment used to justify that by claiming the fleet pass is "a fresh
+# process every cycle". It is not, and the correction strengthens the argument
+# rather than weakening it. `fleet_dispatch.run_fleet_supervise` loads config
+# once (fleet_dispatch.py:1729) and runs the pass loop in-process for the
+# lifetime of the supervisor, so passes share a process across many cycles.
+#
+# That is exactly why the state must live in the store rather than a module
+# global. Under the old false premise a global would fail immediately and
+# obviously -- re-firing every pass, visible the first time anyone looked.
+# Under the truth it survives within one process lifetime and is dropped only
+# when the process is replaced (self-deploy restart, or the scheduled tick
+# after supervise_loop's relaunch cap). It would pass every test and misfire
+# rarely and non-deterministically, across respawns only.
+#
+# So: do not "optimise" this back into an in-memory global on discovering the
+# fresh-process claim was false. The false premise was load-bearing for the
+# wrong reason; the true one is a stronger argument for the same design.
+# ci_fleet carried the identical claim on its half of this seam
+# (runner_allocation_pass.py, observability.py) and corrected it in b20f3a4.
 from ci_fleet.observability import set_event_query, set_event_sink  # noqa: E402
 
 set_event_sink(log_event)

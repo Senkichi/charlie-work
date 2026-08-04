@@ -7278,12 +7278,53 @@ class OrchestratorApp:
                 is_live_worker = request.issue_number in live_worker_issue_numbers
                 is_phantom_live_worker = request.issue_number in phantom_live_worker_issue_numbers
                 prev_entry = state["issues"].get(str(request.issue_number), {})
+                # Issues #837 / #779: the dispatch outcome (status/dispatched_at)
+                # and its escalation bookkeeping (dispatch_failed_at /
+                # escalation_reason / reason_class) used to be decided in two
+                # textually separate if/elif chains keyed on the same four
+                # predicates (ok / is_live_worker / is_phantom_live_worker /
+                # else) -- one chain bound all_attempts/failed_result/
+                # terminal_failure only in its `else`, a second chain ~70 lines
+                # down read them only in its matching `elif`/`else`. That was
+                # safe only because the two enumerations happened to agree;
+                # nothing enforced it, and pyright could not prove it (reported
+                # possibly-unbound). Collapsed into one chain below so each
+                # branch binds and consumes its own locals -- there is no
+                # second enumeration left to drift out of sync with the first.
+                # status/dispatched_at are the only values that still cross out
+                # of this chain (applied once, after it); every arm binds them
+                # unconditionally, so a future arm that forgets to set one is a
+                # possibly-unbound error at type-check time, not a silently
+                # stale value copied from prev_entry.
+                entry = {
+                    **prev_entry,
+                    "number": request.issue_number,
+                    "title": full_issue.get("title"),
+                    "url": full_issue.get("url"),
+                    "branch_name": request.branch_name,
+                    "prompt_path": str(request.prompt_path),
+                }
+                # Clear the claim timestamp on successful upgrade
+                entry.pop("dispatch_pending_at", None)
+                entry.pop("label_error", None)
                 if ok:
                     status = "manifest_written" if manual else "dispatched"
                     dispatched_at = utc_now()
+                    # A successful recovery supersedes any previous orphan flag.
+                    entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
+                    entry.pop("dispatch_failed_at", None)
+                    clear_escalation(entry)
                 elif is_live_worker:
                     status = "dispatched"
                     dispatched_at = prev_entry.get("dispatched_at") or utc_now()
+                    # A live-worker recovery supersedes any previous orphan flag.
+                    entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
+                    entry.pop("dispatch_failed_at", None)
+                    clear_escalation(entry)
                 elif is_phantom_live_worker:
                     # Issue #523: the adapter reported a live worker, but the
                     # recorded PID failed the OS-level liveness + identity
@@ -7301,6 +7342,17 @@ class OrchestratorApp:
                         full_issue,
                         sessions_dir,
                     )
+                    # A phantom live worker is being routed as dead; do not
+                    # preserve a stale worker_pid that would keep the slot
+                    # occupied, and do not burn a redispatch attempt (the launch
+                    # was averted, not failed).
+                    entry.pop("orphan_flagged_at", None)
+                    entry.pop("orphan_drift_fingerprint", None)
+                    entry.pop("orphan_drift_at", None)
+                    entry.pop("dispatch_failed_at", None)
+                    clear_escalation(entry)
+                    entry.pop("worker_pid", None)
+                    entry.pop("worker_process_start_time", None)
                 else:
                     # Issue #461: bound dispatch_failed retries with the same
                     # redispatch-window cap used for rework.
@@ -7327,58 +7379,25 @@ class OrchestratorApp:
                         failed_result is not None
                         and failed_result.failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
                     )
+                    entry["dispatch_failed_at"] = all_attempts
                     if terminal_failure or len(recent) > self.config.watchdog.max_auto_redispatch:
                         status = "escalated"
                         dispatched_at = None
+                        set_escalation(
+                            entry,
+                            reason=(
+                                failed_result.failure_kind
+                                if terminal_failure and failed_result is not None
+                                else "dispatch_failed_cap_exceeded"
+                            ),
+                            reason_class="mechanical",
+                        )
                     else:
                         status = "dispatch_failed"
                         dispatched_at = None
-                entry = {
-                    **prev_entry,
-                    "number": request.issue_number,
-                    "title": full_issue.get("title"),
-                    "url": full_issue.get("url"),
-                    "branch_name": request.branch_name,
-                    "prompt_path": str(request.prompt_path),
-                    "status": status,
-                    "dispatched_at": dispatched_at,
-                }
-                # Clear the claim timestamp on successful upgrade
-                entry.pop("dispatch_pending_at", None)
-                entry.pop("label_error", None)
-                # A successful or live-worker recovery supersedes any previous orphan flag.
-                if ok or is_live_worker:
-                    entry.pop("orphan_flagged_at", None)
-                    entry.pop("orphan_drift_fingerprint", None)
-                    entry.pop("orphan_drift_at", None)
-                    entry.pop("dispatch_failed_at", None)
-                    clear_escalation(entry)
-                elif is_phantom_live_worker:
-                    # Issue #523: a phantom live worker is being routed as dead;
-                    # do not preserve a stale worker_pid that would keep the slot
-                    # occupied, and do not burn a redispatch attempt (the launch
-                    # was averted, not failed).
-                    entry.pop("orphan_flagged_at", None)
-                    entry.pop("orphan_drift_fingerprint", None)
-                    entry.pop("orphan_drift_at", None)
-                    entry.pop("dispatch_failed_at", None)
-                    clear_escalation(entry)
-                    entry.pop("worker_pid", None)
-                    entry.pop("worker_process_start_time", None)
-                elif status == "escalated":
-                    entry["dispatch_failed_at"] = all_attempts
-                    set_escalation(
-                        entry,
-                        reason=(
-                            failed_result.failure_kind
-                            if terminal_failure and failed_result is not None
-                            else "dispatch_failed_cap_exceeded"
-                        ),
-                        reason_class="mechanical",
-                    )
-                else:
-                    entry["dispatch_failed_at"] = all_attempts
-                    clear_escalation(entry)
+                        clear_escalation(entry)
+                entry["status"] = status
+                entry["dispatched_at"] = dispatched_at
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
@@ -7403,6 +7422,18 @@ class OrchestratorApp:
                 # transition is isolated per-issue so one failure never aborts the
                 # rest of the batch (orphaning already-launched workers).
                 save_state(self.paths.state_file, state)
+                # This re-tests the same four predicates as the outcome chain
+                # above for a fourth time (label transitions), rather than
+                # branching on the outcome directly. It cannot be folded into
+                # that chain: GitHub labels must only be touched after
+                # save_state has persisted the launched worker (comment above),
+                # so this enumeration is structurally separated from the one
+                # that decides status/escalation. It does not read
+                # all_attempts/failed_result/terminal_failure (issues #837,
+                # #779 do not apply here), only the already-bound ok /
+                # is_live_worker / status locals, so there is no possibly-
+                # unbound hazard -- just a fourth place that must be kept in
+                # sync with the outcome predicates if a new outcome is added.
                 if ok or is_live_worker:
                     target = "queued" if manual else "dispatched"
                     result = transition(
@@ -10515,6 +10546,19 @@ class OrchestratorApp:
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
             rework_path: str | None = None
+            # str, not str | None: unlike rework_path (used as-is, Optional,
+            # in the returned CommandResult payload), rework_summary is only
+            # ever consumed at the _write_rework_prompt call below, whose
+            # dispatch_note parameter is a bare `str` (issue #782). A None
+            # default would relocate reportPossiblyUnboundVariable into a
+            # reportArgumentType mismatch instead of eliminating it. This
+            # default is unreachable dead code on every path (see #782):
+            # rework_summary is always rebound before use because the
+            # binding guard (`if not escalated:`, above the write) and the
+            # use guard (`decision == "request_changes" and not escalated`,
+            # at the write) are the same conjunction and `escalated` is not
+            # reassigned between them.
+            rework_summary: str = ""
             escalated = False
             rescue_dispatched = False
             # Durable per-PR rework counter — NOT derived from the global events
