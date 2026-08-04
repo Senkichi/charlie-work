@@ -21040,7 +21040,12 @@ def test_loop_launch_failure_with_throttle_signature_persists_throttled_until(
 
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
-    result = app.loop(limit=0)
+    # Issue #828: freeze the clock and thread it through loop() so the
+    # assertion below can compare against an exact expected instant instead
+    # of a wall-clock-tolerance window (a stall between loop() and the
+    # assertion previously had ~5s to blow the tolerance and flake CI).
+    frozen_now = datetime.now(UTC)
+    result = app.loop(limit=0, now=frozen_now)
 
     # The launch-failure sidecar is reaped and reported
     reaped = result.data.get("reaped", [])
@@ -21053,10 +21058,10 @@ def test_loop_launch_failure_with_throttle_signature_persists_throttled_until(
     state = load_state(paths.state_file)
     assert state.get("throttled_until") is not None
     throttle_time = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(
-        minutes=10, seconds=config.runtime.throttle_resume_margin_s
-    )
-    assert abs((throttle_time - expected_time).total_seconds()) < 5
+    expected_time = (
+        frozen_now + timedelta(minutes=10, seconds=config.runtime.throttle_resume_margin_s)
+    ).replace(microsecond=0)
+    assert throttle_time == expected_time
 
 
 def test_loop_pid_none_no_error_not_classified_as_launch_failed(
