@@ -1185,6 +1185,30 @@ class RunnersConfig:
 
 
 @dataclass(frozen=True)
+class MainCiReclaimConfig:
+    """Per-pass reclaim of superseded, not-yet-started ``main`` CI runs (#863, #815).
+
+    Distinct from ``RunnersConfig.cancel_superseded_main_runs`` above: that
+    mechanism only fires inside this orchestrator's own successful-merge
+    codepath, has no strict-ancestor check, and keeps only the single
+    newest-by-``createdAt`` queued run. This section instead wires
+    ``main_ci_reclaim.reclaim_superseded_main_ci_runs`` into every fleet
+    loop pass regardless of merge source (Aviator, a direct ``gh pr merge``,
+    or this orchestrator's own merge) -- see that module's docstring for the
+    full rationale and safety invariant.
+
+    ``enabled`` defaults True for the same reason as ``ReconcilePassConfig``:
+    the repair direction is provably safe (only strict ancestors of main's
+    current tip, verified via local git, and only not-yet-started runs,
+    re-checked immediately before cancellation), so it is safe to run
+    unattended on every pass. The knob exists for rollback, not opt-in.
+    """
+
+    enabled: bool = True
+    workflow_filename: str = "ci.yml"
+
+
+@dataclass(frozen=True)
 class SupervisorConfig:
     """Configuration for the supervised infill loop (``charlie bash-rats`` default mode).
 
@@ -1314,6 +1338,7 @@ class OrchestratorConfig:
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
+    main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
     runner_allocation: RunnerAllocationConfig = field(default_factory=RunnerAllocationConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
@@ -2254,6 +2279,20 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 f"got {type(str_value).__name__}"
             )
     runners = _build_section(RunnersConfig, "runners", runners_data)
+    main_ci_reclaim_data = _section(data, "main_ci_reclaim")
+    mcr_enabled = main_ci_reclaim_data.get("enabled")
+    if mcr_enabled is not None and not isinstance(mcr_enabled, bool):
+        raise ConfigError(
+            "config section 'main_ci_reclaim' key 'enabled' must be a bool, "
+            f"got {type(mcr_enabled).__name__}"
+        )
+    mcr_workflow_filename = main_ci_reclaim_data.get("workflow_filename")
+    if mcr_workflow_filename is not None and not isinstance(mcr_workflow_filename, str):
+        raise ConfigError(
+            "config section 'main_ci_reclaim' key 'workflow_filename' must be a string, "
+            f"got {type(mcr_workflow_filename).__name__}"
+        )
+    main_ci_reclaim = _build_section(MainCiReclaimConfig, "main_ci_reclaim", main_ci_reclaim_data)
     runner_scaling_data = _section(data, "runner_scaling")
     # Validate numeric fields
     for numeric_key in (
@@ -2452,6 +2491,7 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         fleet=fleet,
         notify=notify,
         runners=runners,
+        main_ci_reclaim=main_ci_reclaim,
         runner_scaling=runner_scaling,
         runner_allocation=runner_allocation,
         supervisor=supervisor,

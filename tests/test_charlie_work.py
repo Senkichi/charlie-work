@@ -30210,6 +30210,187 @@ def test_maybe_reconcile_drift_runs_while_supervisor_lock_held(tmp_path: Path) -
     )
 
 
+def _main_ci_reclaim_app(
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    workflow_filename: str = "ci.yml",
+    gh: Any = None,
+) -> OrchestratorApp:
+    """Wiring-test fixture for _maybe_reclaim_superseded_main_ci (#863/#815).
+
+    Deliberately mirrors _reconcile_pass_app's shape. These wiring tests
+    monkeypatch charlie_work.workflow.reclaim_superseded_main_ci_runs itself
+    rather than exercising real git/gh calls -- the safety-property logic
+    (ancestor checks, tip exemption, race-safety re-fetch) already has
+    dedicated coverage in tests/test_main_ci_reclaim.py. This fixture's job
+    is only to prove the OrchestratorApp method is wired correctly: gated on
+    config.enabled, records the right event for each outcome, and is
+    actually called from loop().
+    """
+    from charlie_work.config import MainCiReclaimConfig
+
+    config = OrchestratorConfig(
+        main_ci_reclaim=MainCiReclaimConfig(enabled=enabled, workflow_filename=workflow_filename)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())
+
+
+def test_maybe_reclaim_superseded_main_ci_noop_when_disabled(tmp_path: Path) -> None:
+    from charlie_work import workflow as workflow_module
+
+    app = _main_ci_reclaim_app(tmp_path, enabled=False)
+
+    def _fail_if_called(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(
+            "reclaim_superseded_main_ci_runs must not be called when main_ci_reclaim is disabled"
+        )
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", _fail_if_called)
+    try:
+        app._maybe_reclaim_superseded_main_ci()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("main_ci_reclaim")]
+
+
+def test_maybe_reclaim_superseded_main_ci_records_event_on_cancellation(
+    tmp_path: Path,
+) -> None:
+    from charlie_work import workflow as workflow_module
+    from charlie_work.main_ci_reclaim import MainCiReclaimResult, ReclaimedRun
+
+    app = _main_ci_reclaim_app(tmp_path)
+    canned = MainCiReclaimResult(
+        ok=True,
+        tip_sha="tip-sha",
+        candidates_checked=2,
+        cancelled=(
+            ReclaimedRun(
+                run_id=42, head_sha="old-sha", status_before_cancel="queued", created_at="t1"
+            ),
+        ),
+        skipped_not_ancestor=1,
+        skipped_started_before_cancel=0,
+        cancel_errors=(),
+    )
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", lambda *a, **k: canned)
+    try:
+        app._maybe_reclaim_superseded_main_ci()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+    cancelled_events = [e for e in events if e.get("kind") == "main_ci_reclaim_cancelled"]
+    assert len(cancelled_events) == 1
+    payload = cancelled_events[0]["payload"]
+    assert payload["tip_sha"] == "tip-sha"
+    assert payload["cancelled_run_ids"] == [42]
+    assert payload["candidates_checked"] == 2
+    assert payload["skipped_not_ancestor"] == 1
+
+
+def test_maybe_reclaim_superseded_main_ci_no_event_when_nothing_to_reclaim(
+    tmp_path: Path,
+) -> None:
+    """Deliberate no-noise policy (see the method's docstring): this lane has
+    no cadence gate, so a durable event on every empty pass would flood
+    events.db with zero diagnostic value. Only an actual cancellation or a
+    pass-level failure is worth a durable record."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.main_ci_reclaim import MainCiReclaimResult
+
+    app = _main_ci_reclaim_app(tmp_path)
+    canned = MainCiReclaimResult(ok=True, tip_sha="tip-sha", candidates_checked=0, cancelled=())
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", lambda *a, **k: canned)
+    try:
+        app._maybe_reclaim_superseded_main_ci()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+    assert not [e for e in events if str(e.get("kind", "")).startswith("main_ci_reclaim")]
+
+
+def test_maybe_reclaim_superseded_main_ci_records_failed_event_on_pass_failure(
+    tmp_path: Path,
+) -> None:
+    from charlie_work import workflow as workflow_module
+    from charlie_work.main_ci_reclaim import MainCiReclaimResult
+
+    app = _main_ci_reclaim_app(tmp_path)
+    canned = MainCiReclaimResult(ok=False, error="git fetch origin main failed: boom")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", lambda *a, **k: canned)
+    try:
+        app._maybe_reclaim_superseded_main_ci()
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+    failed_events = [e for e in events if e.get("kind") == "main_ci_reclaim_failed"]
+    assert len(failed_events) == 1
+    assert "boom" in failed_events[0]["payload"]["error"]
+
+
+def test_maybe_reclaim_superseded_main_ci_contains_exception_and_records_event(
+    tmp_path: Path,
+) -> None:
+    """Exception containment is load-bearing: supervise.py's except Exception
+    sits outside its while True, so an uncaught exception from this lane
+    would kill the whole daemon rather than one pass."""
+    from charlie_work import workflow as workflow_module
+
+    app = _main_ci_reclaim_app(tmp_path)
+
+    def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(workflow_module, "reclaim_superseded_main_ci_runs", _raise)
+    try:
+        app._maybe_reclaim_superseded_main_ci()  # must not raise
+    finally:
+        monkeypatch.undo()
+
+    state = load_state(app.paths.state_file)
+    events = state.get("events", [])
+    failed_events = [e for e in events if e.get("kind") == "main_ci_reclaim_failed"]
+    assert len(failed_events) == 1
+    assert "RuntimeError" in failed_events[0]["payload"]["error"]
+    assert "boom" in failed_events[0]["payload"]["error"]
+
+
+def test_loop_calls_maybe_reclaim_superseded_main_ci(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L3 'wired' regression guard (#863/#815): proves _loop_body actually
+    calls this lane, not just that the lane works standalone."""
+    app = _main_ci_reclaim_app(tmp_path)
+    calls = {"count": 0}
+
+    def _record(self: OrchestratorApp) -> None:
+        calls["count"] += 1
+
+    monkeypatch.setattr(OrchestratorApp, "_maybe_reclaim_superseded_main_ci", _record)
+    app.loop(limit=0)
+    assert calls["count"] == 1
+
+
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     """_count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
     from charlie_work.workflow import _count_live_sessions

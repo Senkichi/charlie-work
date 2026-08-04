@@ -1258,3 +1258,66 @@ runner_allocation:
     assert config.runner_scaling.enabled is False
     assert config.runner_allocation.enabled is True
     assert config.runner_allocation.min_running_per_repo == 9
+
+
+def test_main_ci_reclaim_defaults_enabled_with_ci_yml(tmp_path: Path) -> None:
+    """Issue #863/#815: an absent ``main_ci_reclaim`` block must still enable
+    the pass (rollback knob, not opt-in -- see MainCiReclaimConfig's
+    docstring), defaulting to this repo's actual workflow filename."""
+    config = load_config(None)
+    assert config.main_ci_reclaim.enabled is True
+    assert config.main_ci_reclaim.workflow_filename == "ci.yml"
+
+
+def test_main_ci_reclaim_enabled_rejects_non_bool(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """
+main_ci_reclaim:
+  enabled: "true"
+""",
+    )
+    with pytest.raises(ConfigError, match="main_ci_reclaim.*enabled.*must be a bool"):
+        load_config(config_file)
+
+
+def test_main_ci_reclaim_workflow_filename_rejects_non_string(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """
+main_ci_reclaim:
+  workflow_filename: 5
+""",
+    )
+    with pytest.raises(ConfigError, match="main_ci_reclaim.*workflow_filename.*must be a string"):
+        load_config(config_file)
+
+
+def test_main_ci_reclaim_rejects_unknown_key(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """
+main_ci_reclaim:
+  interval_minutes: 15
+""",
+    )
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(config_file)
+
+
+def test_main_ci_reclaim_can_be_disabled_and_repointed(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """
+main_ci_reclaim:
+  enabled: false
+  workflow_filename: "tests.yml"
+""",
+    )
+    config = load_config(config_file)
+    assert config.main_ci_reclaim.enabled is False
+    assert config.main_ci_reclaim.workflow_filename == "tests.yml"
