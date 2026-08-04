@@ -1769,9 +1769,14 @@ def _api_is_mutating(args: list[str]) -> bool:
     # it costs one condition and closes the same class before a site appears. Note
     # it also classifies a read-only `gh api graphql -f query=...` as mutating, which
     # over-blocks a dry run rather than under-blocking it -- the safe direction.
-    param_flags = ("-f", "--raw-field", "-F", "--field", "--input")
-    param_prefixes = ("--raw-field=", "--field=", "--input=")
-    return any(arg in param_flags or arg.startswith(param_prefixes) for arg in args)
+    #
+    # Prefix-matched, not membership-tested, for the same reason as the method arm:
+    # pflag accepts both the detached (`-f title=x`, `--field=labels[]=bug`) and the
+    # attached (`-ftitle=x`) spelling, and a membership test sees only the detached
+    # one (#919). `--field`/`--raw-field`/`--input` are prefixes rather than exact
+    # matches so the bare and `=` forms collapse into one condition.
+    param_prefixes = ("--raw-field", "--field", "--input")
+    return any(arg.startswith(param_prefixes) or arg[:2] in ("-f", "-F") for arg in args)
 
 
 def _is_mutating(args: list[str]) -> bool:
