@@ -1697,6 +1697,13 @@ def _fleet_has_configured_repos(
 # zero-pass alarm also cannot currently tell these cases apart.
 RESTART_EXIT_REASONS = frozenset({"self_deploy", "head_drift"})
 
+# Bound on the per-repo failure reasons appended to the pass-summary line
+# (#893). ``message`` is operator-facing free text (e.g. "loop completed with
+# N PR error(s)", a tracebacks-derived string from an unclassified exception
+# path) with no length contract, so a single pathological message must not be
+# able to make the summary line unbounded.
+_PASS_SUMMARY_REASON_MAX_CHARS = 500
+
 
 def run_fleet_supervise(
     *,
@@ -1965,12 +1972,42 @@ def run_fleet_supervise(
             total_attention_events += attention_count
             total_failed_repos += failed
 
-            print(
+            summary = (
                 f"[{now_str}] fleet pass {pass_number}: {repo_count} repo(s), "
                 f"{repo_count - failed} ok, {failed} failed, "
-                f"{attention_count} attention event(s)",
-                flush=True,
+                f"{attention_count} attention event(s)"
             )
+            # #893: "N failed" alone is indistinguishable from a real outage --
+            # the per-repo failure reason (e.g. a known, acked-releasable
+            # control like the unauthorized-merge tripwire) is already sitting
+            # in repos_data[key]["message"] (set by fleet_loop) but was never
+            # read here. Append it, on the existing line (an attribute of the
+            # pass, not a separate report -- see the api_worker_report line
+            # below for the precedent on when a *second* line is warranted
+            # instead).
+            if failed:
+                # Strip before filtering, not after: a whitespace-only message
+                # is falsy-after-strip but truthy-before, so filtering on the
+                # raw value would let an empty-looking reason through as "[]".
+                raw_reasons = (
+                    str(r.get("message") or "").strip()
+                    for r in repos_data.values()
+                    if isinstance(r, dict) and not r.get("ok", True)
+                )
+                reasons = sorted({m for m in raw_reasons if m})
+                if reasons:
+                    reason_text = "; ".join(reasons)
+                    if len(reason_text) > _PASS_SUMMARY_REASON_MAX_CHARS:
+                        # Plain ASCII ellipsis, not U+2026: this print() runs
+                        # through whatever locale-derived stdout encoding the
+                        # supervisor's launch chain picked (wscript -> ps ->
+                        # cmd -> uv), and a codepage without U+2026 (cp437,
+                        # cp850) would turn a truncation marker into a
+                        # UnicodeEncodeError that crashes the whole pass.
+                        reason_text = reason_text[: _PASS_SUMMARY_REASON_MAX_CHARS - 3] + "..."
+                    summary += f" [{reason_text}]"
+
+            print(summary, flush=True)
 
             # api-worker fleet report line (issue #483): one line per pass
             # when any repo configures the section, keeping partial rollout
