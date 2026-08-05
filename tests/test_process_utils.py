@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -299,18 +300,31 @@ def test_kill_process_tree_enumerates_children() -> None:
     # The parent imports ``sys`` before referencing ``sys.executable``; without it
     # the parent crashes with NameError before spawning the child, and the test
     # silently no-ops via the empty-children skip path (a false positive).
+    #
+    # The sleeps must outlast the enumeration deadline below by a wide margin.
+    # They previously matched it exactly (both 10s), so under full-suite CPU
+    # contention a child that took several seconds to become visible left the
+    # parent with almost no lifetime remaining: it exited between the retry
+    # loop and ``kill_process_tree``, ``taskkill`` found nothing to kill, and
+    # the test failed on an empty ``killed`` list rather than skipping. Both
+    # processes are terminated explicitly below and in ``finally``, so a long
+    # sleep costs nothing -- nothing here waits for them to expire on their own.
     parent_proc = subprocess.Popen(
         [
             sys.executable,
             "-c",
             "import subprocess, sys, time; "
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
-            "time.sleep(10)",
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+            "time.sleep(120)",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=(os.name != "nt"),
     )
+
+    # Bound outside the ``try`` so the ``finally`` cleanup can always read it,
+    # including when a skip fires before the retry loop assigns it.
+    child_pids: list[int] = []
 
     try:
         import time
@@ -325,7 +339,6 @@ def test_kill_process_tree_enumerates_children() -> None:
         # child was spawned / enumeration failed" (skip), avoiding a spurious
         # assertion failure on unrelated PRs. See issue #608.
         deadline = time.monotonic() + 10.0
-        child_pids: list[int] = []
         while time.monotonic() < deadline:
             if parent_proc.poll() is not None:
                 pytest.skip(f"parent process {parent_proc.pid} exited before spawning a child")
@@ -338,6 +351,19 @@ def test_kill_process_tree_enumerates_children() -> None:
             pytest.skip(
                 f"no child of parent {parent_proc.pid} became visible within "
                 f"the deadline; enumeration may have failed under load"
+            )
+
+        # Re-check liveness immediately before the kill. The retry loop above
+        # only proves the parent was alive when enumeration started; a parent
+        # that died in between leaves nothing for the platform kill to find and
+        # returns an empty list, which would fail the assertion below for a
+        # reason that has nothing to do with child enumeration. Skipping here
+        # keeps that failure mode legible instead of surfacing as
+        # ``assert <pid> in []``.
+        if parent_proc.poll() is not None:
+            pytest.skip(
+                f"parent process {parent_proc.pid} exited between enumeration and kill; "
+                f"cannot assert on the killed set"
             )
 
         # Kill the parent process tree
@@ -354,6 +380,18 @@ def test_kill_process_tree_enumerates_children() -> None:
         if parent_proc.poll() is None:
             parent_proc.terminate()
             parent_proc.wait()
+
+        # ``parent_proc.terminate()`` does not reap the grandchild, and the
+        # sleeps are long enough now that a skipped run would otherwise leave
+        # it resident on the runner for two minutes. Reap any child the
+        # enumeration found; on the assertion path they are already dead, so
+        # this is a no-op there. Best-effort by design -- a failure to clean up
+        # a stray sleep must not mask the test's own result.
+        for stray_pid in child_pids:
+            try:
+                os.kill(stray_pid, signal.SIGTERM)
+            except OSError:
+                pass
 
 
 def test_is_session_stalled_custom_terminal_markers(tmp_path: Path) -> None:
