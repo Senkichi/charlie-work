@@ -87,10 +87,34 @@ adapter:
   `Runner.Worker` child immediately before terminating, because the plan is a
   snapshot and GitHub's `busy` flag lags. Terminating a working listener aborts
   a CI job.
-- **Never traverse outside `managed_root`.** `discover_runner_instances` walks
-  exactly the configured root, non-recursively. This host has an unrelated
-  runner *service* at `C:\actions-runner` that must never be touched; safety
-  comes from the traversal's shape, not from filtering names afterwards.
+- **Never traverse outside `managed_root` — and never assume `managed_root` is
+  itself right.** `discover_runner_instances` walks exactly the configured root,
+  non-recursively, and then enforces containment on each entry's *resolved* path
+  (`ci_fleet/runner_slots.py`, `contains()` → resolve both sides, then
+  `is_relative_to`). That defeats a junction, which a non-recursive walk alone does
+  not: a junction under `managed_root` hands back a tree somewhere else entirely.
+  This host has an unrelated runner *service* at `C:\actions-runner` that must never
+  be touched.
+
+  Do not restate this as "safety comes from the traversal's shape" — the code
+  deliberately rejects that, and said so before this file did. Shape bounds how
+  *deep* discovery reaches, not *which directory* an entry names.
+
+  **Never weaken or remove that containment check, and never replace it with filtering
+  entry names.** Name filtering is the wrong fix — it is what the resolved-path check
+  exists instead of, because a name tells you nothing about where a reparse point
+  actually lands. The check at `runner_slots.py` is the thing standing between
+  reallocation and `C:\actions-runner`.
+
+  What the containment check does **not** do is validate its own anchor.
+  `managed_root` is config-derived (`allocation.managed_root or
+  managed_root_fallback`) and config comes from the tree, so under a wrong tree every
+  entry beneath the wrong root is contained *by construction*. The guard cannot fail;
+  it answers a question whose subject was already substituted. Containment is relative
+  to its anchor, so anything asserting **which** checkout and config are live belongs
+  upstream of the containment check — **in addition to it, never instead of it.** Do
+  not read this paragraph as a reason to drop a containment check; adding the upstream
+  assertion is the change, removing anything is not.
 
 `charlie runners allocate` is also the *only* thing allowed to decide which
 listeners run. Operator scripts and post-reboot procedures must delegate to it
