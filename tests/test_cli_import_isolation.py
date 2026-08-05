@@ -22,14 +22,21 @@ merely un-imported.
 
 from __future__ import annotations
 
+import ast
+import functools
+import pathlib
 import subprocess
 import sys
 import textwrap
+
+import pytest
 
 # The three modules ci_fleet is retiring. Blocked as a set rather than only the
 # one that was actually deleted, because the point of the fix is that *none* of
 # them may be reachable from module scope -- testing only shadow_pass would keep
 # passing if someone re-hoisted the other two.
+_RETIRING = ("ci_fleet.diff_journal", "ci_fleet.shadow_gate", "ci_fleet.shadow_pass")
+
 _BLOCKER = '''
 import sys
 
@@ -63,6 +70,108 @@ def _run_unblocked(body: str) -> "subprocess.CompletedProcess[str]":
         capture_output=True,
         text=True,
     )
+
+
+def _module_scope_imports(path: pathlib.Path) -> set[str]:
+    """Every module name imported at module scope, ignoring function/class bodies.
+
+    A module-scope ``try:``/``if:`` still executes at import, so this descends into
+    those; it stops only at ``def``/``class``, which is exactly the boundary the fix
+    moved the imports across.
+    """
+    names: set[str] = set()
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            names.add(node.module)
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(ast.parse(path.read_text(encoding="utf-8")))
+    return names
+
+
+def test_cli_has_no_module_scope_shadow_import() -> None:
+    """The invariant, asserted statically so no ci_fleet tree state can hide it.
+
+    This is the guard that actually stops a regression. The runtime tests below are
+    stronger evidence -- they prove real behaviour rather than a source property --
+    but they can only run when ci_fleet's own tree permits the cluster to be absent
+    (see :func:`_shadow_cluster_is_severable`). This one holds unconditionally,
+    including on a ci_fleet tree where the cluster is load-bearing, which is
+    precisely when the runtime tests go quiet.
+
+    Locating ``cli.py`` through ``charlie_work.__path__`` rather than importing
+    ``charlie_work.cli`` is deliberate: ``charlie_work/__init__.py`` declares no
+    imports, so this test stays answerable even in the broken state it guards
+    against.
+    """
+    import charlie_work
+
+    cli_py = pathlib.Path(charlie_work.__path__[0]) / "cli.py"
+    assert cli_py.is_file(), f"expected {cli_py} to exist"
+
+    offenders = sorted(
+        name
+        for name in _module_scope_imports(cli_py)
+        if any(name == mod or name.startswith(f"{mod}.") for mod in _RETIRING)
+    )
+
+    assert not offenders, (
+        "cli.py imports ci_fleet's retiring shadow cluster at module scope: "
+        f"{offenders}. Issue #929 -- these must live inside "
+        "run_runners_shadow_status so that retiring one of them breaks only "
+        "`charlie runners shadow-status`, not `charlie runners allocate` and "
+        "`fleet supervise`, whose entry points import this module."
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _shadow_cluster_is_severable() -> str:
+    """Can this environment even observe the confinement? Returns '' if yes.
+
+    The runtime tests block the shadow cluster and then assert that the rest of the
+    CLI survives. That question is only meaningful if the cluster is severable *in
+    ci_fleet's own tree*. On ci_fleet's committed ``main`` it is not:
+    ``charlie_work_adapter`` imports ``runner_allocation_pass``, which imports
+    ``shadow_pass``. Blocking the cluster there breaks the adapter -- which every
+    ``charlie_work`` module imports -- so every runtime test below fails for a
+    reason that has nothing to do with our import site.
+
+    That is not a hypothetical either: it is why this file went red on PR #930's
+    first CI run while passing locally, where ci_fleet's working tree had already
+    severed it.
+
+    Skipping rather than failing is the honest outcome, and it is not a silent hole:
+    :func:`test_cli_has_no_module_scope_shadow_import` above covers the regression
+    unconditionally, and this returns to life on its own once ci_fleet lands the
+    severing change on their main.
+    """
+    probe = _run(
+        """
+        import ci_fleet.charlie_work_adapter
+        print("ADAPTER_OK")
+        """
+    )
+    if probe.returncode == 0 and "ADAPTER_OK" in probe.stdout:
+        return ""
+    return (
+        "ci_fleet's installed tree couples the shadow cluster into "
+        "charlie_work_adapter (adapter -> runner_allocation_pass -> shadow_pass), "
+        "so the cluster cannot be made absent without breaking the adapter, and "
+        "confinement is not observable here. Static coverage in "
+        "test_cli_has_no_module_scope_shadow_import still applies. "
+        f"Adapter probe stderr:\n{probe.stderr.strip()[-400:]}"
+    )
+
+
+def _require_severable_cluster() -> None:
+    if reason := _shadow_cluster_is_severable():
+        pytest.skip(reason)
 
 
 def test_the_blocker_actually_blocks() -> None:
@@ -107,6 +216,7 @@ def test_ci_fleet_itself_still_imports_under_the_blocker() -> None:
     If blocking these three also broke ``import ci_fleet`` or the adapter, the
     main test below would pass or fail for a reason unrelated to #929.
     """
+    _require_severable_cluster()
     result = _run(
         """
         import ci_fleet
@@ -121,6 +231,7 @@ def test_ci_fleet_itself_still_imports_under_the_blocker() -> None:
 
 def test_cli_imports_without_the_shadow_cluster() -> None:
     """The regression itself: a retired shadow module must not break the CLI."""
+    _require_severable_cluster()
     result = _run(
         """
         import charlie_work.cli
@@ -141,6 +252,7 @@ def test_the_parser_still_builds_without_the_shadow_cluster() -> None:
     reference in the parser wiring would pass the import test and still break the
     fleet's critical path.
     """
+    _require_severable_cluster()
     result = _run(
         """
         import charlie_work.cli as cli
@@ -164,6 +276,7 @@ def test_shadow_status_is_the_only_casualty() -> None:
     names to ``None`` behind a ``try/except ImportError`` would satisfy the tests
     above while turning this into an ``AttributeError`` with the cause erased.
     """
+    _require_severable_cluster()
     result = _run(
         """
         import argparse
