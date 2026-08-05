@@ -6,6 +6,7 @@ import errno
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -94,6 +95,12 @@ from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.devin_shell import SessionRecord
 
 EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
+
+
+def _load_external_fixture(name: str) -> list[dict[str, Any]]:
+    """Return a live-payload-shaped external findings fixture by name."""
+    path = Path(__file__).parent / "fixtures" / "external_findings" / f"{name}.json"
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def future_timestamp(*, days: int = 3650) -> str:
@@ -3084,6 +3091,9 @@ class FakeGitHub:
         self.pr_ready_error: str | None = None
         self.pr_head_shas: dict[int, str] = {}
         self.diffs: dict[int, str] = {}
+        self.pr_external_issue_comments: dict[int, list[dict[str, Any]]] = {}
+        self.pr_external_reviews: dict[int, list[dict[str, Any]]] = {}
+        self.pr_external_review_comments: dict[int, list[dict[str, Any]]] = {}
         self.closed_issues: list[int] = []
         self.commits: dict[str, dict[str, Any]] = {}
         # Default base head and per-(base,head) compare overrides for testing
@@ -3357,6 +3367,17 @@ class FakeGitHub:
         if "run" in args and "cancel" in args:
             # Default: return success string
             return "Cancelled"
+        # Handle external findings API calls (issue #950).
+        joined = " ".join(args)
+        m = re.search(r"/issues/(\d+)/comments", joined)
+        if m and "/pulls/" not in joined:
+            return self.pr_external_issue_comments.get(int(m.group(1)), [])
+        m = re.search(r"/pulls/(\d+)/reviews", joined)
+        if m and "/comments" not in joined:
+            return self.pr_external_reviews.get(int(m.group(1)), [])
+        m = re.search(r"/pulls/(\d+)/comments", joined)
+        if m and "/reviews/" not in joined:
+            return self.pr_external_review_comments.get(int(m.group(1)), [])
         # Handle other API calls (for reconcile tests)
         if json_output:
             return []
@@ -20311,6 +20332,71 @@ def test_record_review_blocked_also_derives_required_changes(tmp_path: Path) -> 
     )
     assert decision["findings_channel"] == "derived"
     assert decision["required_changes"] == ["Security review flagged an unauthenticated endpoint."]
+
+
+def test_record_review_folds_external_findings_into_required_changes(
+    tmp_path: Path,
+) -> None:
+    """Issue #950: verified external PR comments, review bodies, and inline
+    review threads are folded into ``review-decision.json`` at record time,
+    with ``findings_channel`` set to ``"external"``. Bot-authored content is
+    filtered using the API ``user.type`` discriminator."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_external_issue_comments[456] = _load_external_fixture("issue_comments")
+    fake_gh.pr_external_reviews[456] = _load_external_fixture("reviews")
+    fake_gh.pr_external_review_comments[456] = _load_external_fixture("review_comments")
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="The retry wrapper swallows the exception type (Fixes #649).",
+        required_changes=["add a regression test"],
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["findings_channel"] == "external"
+    assert decision["summary"] == "The retry wrapper swallows the exception type (Fixes #649)."
+    # Internal finding is preserved.
+    assert "add a regression test" in decision["required_changes"]
+    # Human-authored external findings are folded in.
+    assert any("interactive PR list" in item for item in decision["required_changes"])
+    assert any(
+        "https://github.com/cli/cli/pull/14076" in item for item in decision["required_changes"]
+    )
+    assert any("whole test" in item for item in decision["required_changes"])
+    # Bot-authored bodies are skipped via user.type == "Bot".
+    assert not any("v0.83.5" in item for item in decision["required_changes"])
+    assert not any("git.Client wrapper" in item for item in decision["required_changes"])
+
+
+def test_record_review_external_findings_override_vacuous_summary(
+    tmp_path: Path,
+) -> None:
+    """Issue #950: an entirely external verdict must not be mis-binned as
+    ``"vacuous"`` just because the internal summary is the legacy placeholder."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_external_issue_comments[456] = _load_external_fixture("issue_comments")
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["findings_channel"] == "external"
+    expected_body = _load_external_fixture("issue_comments")[0]["body"].strip()
+    assert decision["required_changes"] == [expected_body]
 
 
 def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
