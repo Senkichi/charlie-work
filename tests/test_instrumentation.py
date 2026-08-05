@@ -351,6 +351,34 @@ def test_fleet_pass_config_error_classified_and_queryable_by_level(tmp_path: Pat
     assert by_level[0]["repo"] == "owner/repo"
 
 
+def test_dispatch_blocked_chain_dead_classified_and_queryable_by_level(
+    tmp_path: Path,
+) -> None:
+    """#829: a permanently dead blocker chain must not sit at info level.
+
+    The event is emitted from ``Orchestrator.dispatch()`` when every open
+    blocker of a blocked issue is itself dead (escalated, or its tracked PR
+    is escalated/janitor_blocked). It makes no GitHub label change, so the
+    ``level`` column is its only consumer surface.
+    """
+    state_path = tmp_path / "state.json"
+    log_event(
+        state_path,
+        "dispatch_blocked_chain_dead",
+        {"issue": 829, "chain_root": [123, 456]},
+        repo="owner/repo",
+    )
+
+    events = read_event_log(state_path)
+    assert events[0]["level"] == "error"
+
+    by_level = query_events(state_path, level="error")
+    assert len(by_level) == 1
+    assert by_level[0]["kind"] == "dispatch_blocked_chain_dead"
+    assert by_level[0]["payload"]["issue"] == 829
+    assert by_level[0]["repo"] == "owner/repo"
+
+
 def test_query_events_by_kind(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     log_event(state_path, "dispatch", {"issue": 1})
