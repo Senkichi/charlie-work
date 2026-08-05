@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import importlib.util
 import json
 import logging
 import os
@@ -45,7 +46,7 @@ from ci_fleet.charlie_work_adapter import (
     scale_down_idle_runners,
 )
 from .state import state_lock, utc_now
-from .subprocess_runner import no_console_window_kwargs
+from .subprocess_runner import no_console_window_kwargs, run_captured
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
     EXIT_RESTART_REQUESTED,
@@ -63,6 +64,91 @@ from .supervisor_lifecycle import (
 from .workflow import DEFERRED_BY_CONCURRENCY_REASON_PREFIX, CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
+
+# Event kind for the guard that refuses to actuate runners when the editable
+# ci_fleet dependency has uncommitted changes in its working tree (issue #927).
+_CI_FLEET_WORKTREE_DIRTY_KIND = "ci_fleet_worktree_dirty"
+_CI_FLEET_STATUS_TIMEOUT_SECONDS = 10
+
+
+@dataclass(frozen=True)
+class _CiFleetDirtyCheck:
+    """Outcome of checking whether the editable ci_fleet source tree is dirty.
+
+    ``is_dirty`` is only True when a real git working tree was found and
+    ``git status --porcelain src/`` returned non-empty output. Every other
+    outcome (no origin, no .git, git error, clean tree) returns False so the
+    guard fails inert, never closed.
+    """
+
+    is_dirty: bool
+    repo_root: Path | None = None
+    dirty_paths: tuple[str, ...] = ()
+    reason: str | None = None
+
+
+def _ci_fleet_module_path() -> Path | None:
+    """Resolve the filesystem path of the imported ``ci_fleet`` module.
+
+    Returns None when ``ci_fleet`` is not importable, is a namespace package
+    with no ``__init__.py`` origin, or is installed as a real wheel inside
+    ``site-packages`` with no working tree.
+    """
+    spec = importlib.util.find_spec("ci_fleet")
+    if spec is None or not spec.origin:
+        return None
+    return Path(spec.origin).resolve()
+
+
+def _ci_fleet_worktree_dirty(module_file: Path | None = None) -> _CiFleetDirtyCheck:
+    """Check the editable ci_fleet source tree for uncommitted src/ changes.
+
+    Walks up from ``ci_fleet.__file__`` (or the supplied ``module_file``) to
+    the nearest ``.git`` and runs ``git status --porcelain -- src/``. Returns
+    ``is_dirty=True`` when that output is non-empty, with the dirty paths.
+    Returns ``is_dirty=False`` for a clean tree or whenever the check cannot
+    safely run, so the guard never blocks allocation because the guard itself
+    broke.
+    """
+    if module_file is None:
+        module_file = _ci_fleet_module_path()
+    if module_file is None:
+        return _CiFleetDirtyCheck(
+            is_dirty=False,
+            reason="ci_fleet has no resolvable module origin",
+        )
+
+    repo_root: Path | None = None
+    for parent in module_file.parents:
+        if (parent / ".git").exists():
+            repo_root = parent
+            break
+    if repo_root is None:
+        return _CiFleetDirtyCheck(
+            is_dirty=False,
+            reason=f"no .git found above {module_file}",
+        )
+
+    result = run_captured(
+        ["git", "status", "--porcelain", "--", "src/"],
+        cwd=repo_root,
+        timeout_seconds=_CI_FLEET_STATUS_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return _CiFleetDirtyCheck(
+            is_dirty=False,
+            repo_root=repo_root,
+            reason=f"git status failed: {result.error or result.stderr}",
+        )
+
+    dirty_paths = tuple(line for line in result.stdout.splitlines() if line.strip())
+    if dirty_paths:
+        return _CiFleetDirtyCheck(
+            is_dirty=True,
+            repo_root=repo_root,
+            dirty_paths=dirty_paths,
+        )
+    return _CiFleetDirtyCheck(is_dirty=False, repo_root=repo_root)
 
 
 def _select_repos(
@@ -172,7 +258,7 @@ def compute_api_worker_fleet_report(
     ``preloaded_configs`` is an optional ``repo_key -> config`` mapping for
     repos whose layered config the caller already loaded (e.g. ``fleet_loop``
     loads each selected repo's config for dispatch). When a repo_key is present
-    in this map, its config is reused instead of re-loading from disk — this
+    in this map, its config is reused instead of re-loading from disk â€” this
     avoids a redundant per-repo config reload on every fleet pass. Repos absent
     from the map (unselected, or callers that don't preload) fall back to
     ``load_layered_config``. The preloaded config must be the raw layered
@@ -294,7 +380,7 @@ def _run_fleet_allocation_prologue(
     the host needs *more* runners registered. A repo that looks starved often
     only needs a slot another repo is sitting on idle.
 
-    This is host-wide rather than per-repo — the repo set comes from the
+    This is host-wide rather than per-repo â€” the repo set comes from the
     ``.runner`` files under the managed root, not from the fleet registry, so a
     repo with runners on this host is covered whether or not it is registered
     for dispatch. Gated on ``runner_allocation.enabled``.
@@ -313,7 +399,7 @@ def _run_fleet_allocation_prologue(
 
     # Unconditional, before any branch. This line is the whole difference
     # between "the prologue ran and declined" and "the prologue was never
-    # reached" — and #590 stayed unisolated for hours precisely because every
+    # reached" â€” and #590 stayed unisolated for hours precisely because every
     # skip path lived inside a branch, so an absent log line was consistent
     # with both readings and could not be used as evidence either way. Logging
     # the resolved decision inputs here, where nothing can short-circuit past
@@ -346,16 +432,16 @@ def _run_fleet_allocation_prologue(
         return events
 
     if global_config is None:
-        # No global fleet config supplied at all — this is the documented default
+        # No global fleet config supplied at all â€” this is the documented default
         # of fleet_loop's parameter, not a disagreement between code and config,
         # so it must not be reported as an anomaly. Host-wide allocation has
         # nothing to read here; the entry line above already records that the
         # prologue was reached, which is the distinction #590 needed.
-        logger.info("Fleet allocation prologue: not run — no global fleet config was supplied")
+        logger.info("Fleet allocation prologue: not run â€” no global fleet config was supplied")
         return events
     if allocation is None:
         # The config object has no such section at all. That is not "the
-        # operator left it off" — it means this process is holding a config
+        # operator left it off" â€” it means this process is holding a config
         # built by different code, or a load failure already fell back to
         # defaults. Either way the feature is silently absent, so say so.
         logger.warning(
@@ -372,7 +458,7 @@ def _run_fleet_allocation_prologue(
         # all: during issue #590 a host where allocation never ran was
         # indistinguishable from a converged one, and the absence of a log line
         # could not be used as evidence either way.
-        # Name the fleet directory too — it identifies *which* config.yaml
+        # Name the fleet directory too â€” it identifies *which* config.yaml
         # governs, which is the thing an operator gets wrong when they set a
         # host-wide knob in a per-repo layer.
         # Deliberately log-only, unlike the other early returns: this is a state
@@ -381,7 +467,7 @@ def _run_fleet_allocation_prologue(
         # above already distinguishes it from "never reached", which was the
         # evidence gap that mattered.
         logger.info(
-            "Fleet allocation prologue: not run — runner_allocation.enabled is false "
+            "Fleet allocation prologue: not run â€” runner_allocation.enabled is false "
             "in the resolved config (fleet dir: %s)",
             fleet_dir(override=fleet_dir_override),
         )
@@ -421,6 +507,43 @@ def _run_fleet_allocation_prologue(
 
     runtime = getattr(global_config, "runtime", None)
     runner_scaling = getattr(global_config, "runner_scaling", None)
+
+    # Issue #927: the editable ci_fleet dependency is a foreign working tree.
+    # If its src/ directory has uncommitted changes, force this pass to run in
+    # dry-run mode so it plans and reports but never parks or starts a runner.
+    # The guard is deliberately inert on any failure (wheel install, no .git,
+    # git error) so an unrelated git problem cannot stop allocation.
+    dirty_check = _ci_fleet_worktree_dirty()
+    force_dry_run = dry_run
+    if dirty_check.is_dirty:
+        dirty_paths_text = "; ".join(dirty_check.dirty_paths)
+        reason = (
+            f"ci_fleet dependency tree at {dirty_check.repo_root} has uncommitted "
+            f"changes; refusing to actuate runners: {dirty_paths_text}"
+        )
+        logger.warning("Fleet allocation prologue: %s", reason)
+        if anchor_state is not None:
+            log_event(
+                anchor_state,
+                _CI_FLEET_WORKTREE_DIRTY_KIND,
+                {
+                    "ci_fleet_root": str(dirty_check.repo_root),
+                    "dirty_paths": list(dirty_check.dirty_paths),
+                    "dry_run_forced": True,
+                    "source": UNATTENDED_ALLOCATION_SOURCE,
+                },
+            )
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": _CI_FLEET_WORKTREE_DIRTY_KIND,
+                "reason": reason,
+                "ci_fleet_root": str(dirty_check.repo_root),
+                "dry_run_forced": True,
+            }
+        )
+        force_dry_run = True
+
     gh = GitHub(repo_root=anchor_root, runtime=runtime, dry_run=False)
 
     result = run_allocation_pass(
@@ -429,7 +552,7 @@ def _run_fleet_allocation_prologue(
         managed_root_fallback=getattr(runner_scaling, "managed_root", "") or "",
         fleet_dir_override=fleet_dir_override,
         state_path=anchor_state,
-        dry_run=dry_run,
+        dry_run=force_dry_run,
         source=UNATTENDED_ALLOCATION_SOURCE,
         full_pass_interval_seconds=full_pass_interval_seconds,
     )
@@ -447,13 +570,13 @@ def _run_fleet_allocation_prologue(
 
     if result.skipped:
         # Issue #958: the delegated pass (run_allocation_pass, not the local
-        # pre-flight checks above) can decline without raising an error —
+        # pre-flight checks above) can decline without raising an error â€”
         # AllocationPassResult.skipped was going unread here. Pre-fix this
         # branch did not exist at all, so control fell through to the
         # started/parked/notes check below: with notes present (both current
         # ci_fleet skip branches populate them) the decline was misfiled as a
-        # healthy no-op "runner_allocation" event — which the digest below
-        # deliberately drops as noise — and with no notes it produced nothing.
+        # healthy no-op "runner_allocation" event â€” which the digest below
+        # deliberately drops as noise â€” and with no notes it produced nothing.
         # Either way the decline reached neither the notify digest nor
         # events.db.
         #
@@ -474,7 +597,7 @@ def _run_fleet_allocation_prologue(
         logger.info("Fleet allocation prologue: skipped - %s", reason)
         if anchor_state is not None:
             # Durable record in events.db, not just the in-memory digest that
-            # feeds notify sinks — mirrors _record_lane_failure_event's
+            # feeds notify sinks â€” mirrors _record_lane_failure_event's
             # attention-event + log_event pairing just above. anchor_state is
             # only known once run_allocation_pass has actually been called
             # (this branch), unlike the earlier pre-flight skips, which
@@ -1055,7 +1178,7 @@ def _filter_fleet_health_transitions(
     a persistent health state subject to cross-pass dedup. Entries marked
     ``False`` are occurrence-style events (review_verdict_recorded/missed,
     skipped, live_worker_redispatch_averted, operational fallback) and pass
-    through unchanged every call — they never consult nor update the baseline,
+    through unchanged every call â€” they never consult nor update the baseline,
     so a constant-health confirmation keeps firing as a heartbeat (PR #669
     review). When ``persistent_mask`` is ``None`` every entry is treated as
     persistent (the self-deploy ERROR/REPAIRED path, which is always
@@ -1178,7 +1301,7 @@ def _build_fleet_attention_digest(
     vs the last-persisted baseline, while occurrence-style entries
     (``review_verdict_recorded``/``review_verdict_missed``, ``skipped``,
     ``live_worker_redispatch_averted``, operational fallback) pass through
-    every pass — collapsing those would defeat the recorded-verdict heartbeat
+    every pass â€” collapsing those would defeat the recorded-verdict heartbeat
     (PR #669 review). Without ``state_file`` every pass re-fires the same
     entries with ``previous_health: null`` (issue #554). The returned digest
     always carries the post-filter entries; callers that pass ``state_file``
@@ -1283,14 +1406,14 @@ def _build_fleet_attention_digest(
             )
             persistent_mask.append(is_persistent)
         elif event_type == "runner_allocation":
-            # Deliberately not in the digest — unlike the accidental drops the
+            # Deliberately not in the digest â€” unlike the accidental drops the
             # fallback below exists to prevent. This is the allocator's *success*
             # event, and the attention digest is for things needing attention.
             #
             # It also cannot be left to the fallback: the prologue emits it when
             # anything moved *or any note was produced*, and the notes include
             # standing advisory conditions that persist for as long as the condition
-            # does ("holding 4 surplus slot(s) — slack for 0/3 pass(es)", "demand 7
+            # does ("holding 4 surplus slot(s) â€” slack for 0/3 pass(es)", "demand 7
             # exceeds its 2 registered runner(s)"). Verified against this host's
             # events.db: every recorded pass carried a note while moving no slots, so
             # rendering it would put a near-identical entry in every 5-minute digest.
@@ -1299,7 +1422,7 @@ def _build_fleet_attention_digest(
             continue
         else:
             # Visible by default. This chain used to end here, so any event type
-            # without an explicit branch was dropped silently — which is how the
+            # without an explicit branch was dropped silently â€” which is how the
             # prologue's own ``runner_allocation_error`` never reached the digest
             # despite being emitted correctly (issue #590). Making the fallback
             # generic means adding an event type can no longer make it invisible;
@@ -1344,7 +1467,7 @@ def _lane_failure_state_path(repo_root: Path, entry: dict[str, Any]) -> Path:
 
     Note this can diverge from ``runtime_paths(...).state_file`` for a repo
     whose config overrides ``runtime.state_dir`` to a non-default path *and*
-    has no registry ``state_dir`` recorded yet (e.g. its very first pass) —
+    has no registry ``state_dir`` recorded yet (e.g. its very first pass) â€”
     the event would be recorded at the default location, and a doctor check
     reading the configured path would not find it until the repo registers
     successfully once. This is the same divergence class layout.py's
@@ -1367,7 +1490,7 @@ def _record_lane_failure_event(
     ``log_event`` is best-effort and no longer raises on directory-creation
     failures now that ``instrumentation._get_db`` catches ``OSError`` from
     ``mkdir`` (#746). A failure to *record* a lane failure must never itself
-    break the per-repo isolation boundary this is called from (D-4) — the
+    break the per-repo isolation boundary this is called from (D-4) â€” the
     caller has already logged the real error via ``logger.exception``.
     """
     state_path = _lane_failure_state_path(repo_root, entry)
@@ -1552,14 +1675,14 @@ def fleet_loop(
             # iteration boundary and continue. Keep the rest of the fleet
             # pass alive instead of crashing on one unclassified exception.
             # The exception type is part of the message and the full traceback
-            # goes to the log — an unclassified failure must stay diagnosable.
+            # goes to the log â€” an unclassified failure must stay diagnosable.
             error_message = f"{type(exc).__name__}: {exc}"
             per_repo_results[repo_key] = CommandResult(
                 False, f"fleet pass error: {error_message}", {}
             )
             logger.exception("Error processing repo %s", repo_key)
             # #6-G: the two lines above are an in-process dict and a line in a
-            # dated flat-text log — neither reaches events.db, state.json, or
+            # dated flat-text log â€” neither reaches events.db, state.json, or
             # the fleet digest, since _extract_attention_events() above only
             # runs after a successful app.loop(). A repo whose lane fails on
             # every pass (e.g. a config-load ConfigError, cw#... 2026-07-29)
@@ -1587,7 +1710,7 @@ def fleet_loop(
     # Build the digest whenever notify is on, then gate the *emission* on the
     # built digest's transitions (the inner ``if attention_digest.transitions``
     # added by #669). The previous outer ``and attention_events`` test was
-    # redundant with that inner gate and tested a different, rawer signal — a
+    # redundant with that inner gate and tested a different, rawer signal â€” a
     # converged pass (every event routed to an explicit ``continue``, e.g. a
     # healthy ``runner_allocation``) has a non-empty ``attention_events`` list
     # but an empty ``transitions`` tuple, so the two tests disagreed on whether
@@ -1875,7 +1998,7 @@ def run_fleet_supervise(
     # a killed supervisor (TerminateProcess, exit=-1) leaves a diagnosable gap
     # instead of only a launcher text marker. Acquiring the lock proves any
     # prior supervisor is gone, so a stale heartbeat with no ``exited_at`` here
-    # means the prior one was killed — emit a retroactive supervisor_exited and
+    # means the prior one was killed â€” emit a retroactive supervisor_exited and
     # alert on it before this supervisor records its own start.
     notify_config = getattr(global_config, "notify", None)
     prior = detect_prior_abnormal_exit(fleet_dir_override)
@@ -2062,7 +2185,7 @@ def run_fleet_supervise(
             # changes, so we must exit and let the watchdog relaunch with the
             # new code (observed 2026-07-23: ~90 minutes of ConfigError crashes
             # after an operator pulled origin/main while the daemon was
-            # already running — self_deploy saw "already up to date" every
+            # already running â€” self_deploy saw "already up to date" every
             # pass because HEAD was already at the new commit).
             current_head = read_head_sha(orchestrator_root())
             if startup_head and current_head and current_head != startup_head:
@@ -2222,7 +2345,7 @@ def run_fleet_supervise(
     finally:
         lock.release()
         # Record supervisor_exited for every in-control exit (issue #627). A
-        # TerminateProcess kill never reaches here — that is the gap the next
+        # TerminateProcess kill never reaches here â€” that is the gap the next
         # start's detect_prior_abnormal_exit recovers. Best-effort: wrapped so
         # an instrumentation failure cannot break the exit path.
         try:
@@ -2316,7 +2439,7 @@ def _spawn_supervise_child(supervise_args: Sequence[str]) -> int:
     output lands, unchanged from before this wrapper existed.
 
     This is a wrapper waiting on its own child, so it is outside the adapter
-    "never block on worker completion" invariant — blocking here is the point.
+    "never block on worker completion" invariant â€” blocking here is the point.
 
     ``sys.executable`` keeps the child in the venv the wrapper was started in;
     ``-m charlie_work`` rather than the console script because of #854 (the
@@ -2380,7 +2503,7 @@ def run_fleet_supervise_loop(
     # for the same reason #862 itself is: it makes two different conditions
     # indistinguishable. `except Exception` in `run_fleet_supervise` also exits 1,
     # so an operator seeing LastTaskResult=1 could not tell "supervisor crashed"
-    # from "self-deploy is not converging" — the ambiguity just moves up a layer
+    # from "self-deploy is not converging" â€” the ambiguity just moves up a layer
     # instead of being removed. The cap's signal is the distinct log line and the
     # `supervise_relaunch_cap_reached` event, both of which say exactly which
     # condition occurred; the exit code does not need to carry it too.
