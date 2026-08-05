@@ -1426,6 +1426,25 @@ def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
     return cls(**data)
 
 
+def known_config_sections() -> frozenset[str]:
+    """The section names ``load_config`` accepts at the top level.
+
+    Derived from ``OrchestratorConfig``'s dataclass fields rather than a
+    hand-maintained list, so a new section is automatically valid the moment
+    its field is added. Provenance fields (see ``OrchestratorConfig.sources``)
+    are excluded -- a config file must never be able to declare where it came
+    from -- and that exclusion is keyed off field metadata rather than a name
+    so it cannot be forgotten for a future provenance field.
+
+    Shared with :func:`charlie_work.global_config.load_layered_config`, which
+    needs the same set to reject an unknown *section name* before its
+    merge drops an empty-bodied one -- see issue #962.
+    """
+    return frozenset(
+        f.name for f in fields(OrchestratorConfig) if not f.metadata.get("provenance")
+    )
+
+
 def load_config(path: Path | None = None) -> OrchestratorConfig:
     # One binding for both the read and the provenance it produces. Deriving
     # ``sources`` from a *second* ``path.exists()`` call would let the two
@@ -1436,13 +1455,8 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         yaml.safe_load(source_path.read_text(encoding="utf-8")) if source_path is not None else {}
     )
     data = raw if isinstance(raw, dict) else {}
-    # Validate top-level keys before processing sections. Provenance fields are
-    # excluded so a config file cannot declare where it came from (see
-    # OrchestratorConfig.sources); the exclusion is derived from the field
-    # metadata rather than a name so it cannot be forgotten for a future one.
-    known_sections = {
-        f.name for f in fields(OrchestratorConfig) if not f.metadata.get("provenance")
-    }
+    # Validate top-level keys before processing sections.
+    known_sections = known_config_sections()
     unknown = sorted(set(data) - known_sections)
     if unknown:
         raise ConfigError(

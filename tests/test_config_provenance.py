@@ -16,6 +16,7 @@ to break the tie.
 from __future__ import annotations
 
 import pathlib
+from dataclasses import replace
 
 import pytest
 
@@ -201,9 +202,6 @@ def test_discarded_global_layer_is_not_claimed_as_a_source(
     saying so scrolls out of the buffer long before the config does."""
     fleet = tmp_path / "fleet"
     fleet.mkdir()
-    # The bogus section needs *content*. The merge drops falsy sections
-    # (`if merged_section:`) before validation runs, so `not_a_real_section: {}`
-    # is silently discarded and never triggers the rejection this test needs.
     (fleet / "config.yaml").write_text("not_a_real_section:\n  key: 1\n", encoding="utf-8")
     repo_root = tmp_path / "repo"
     repo_path = _repo_with_config(repo_root, "dispatch:\n  default_limit: 4\n")
@@ -212,3 +210,131 @@ def test_discarded_global_layer_is_not_claimed_as_a_source(
 
     assert config.dispatch.default_limit == 4
     assert config.sources == (str(repo_path),)
+
+
+def test_discarded_global_layer_rescue_reaches_an_empty_bodied_bogus_section(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Same rescue as above (#665), but the global layer's bogus section has
+    an *empty* body -- `not_a_real_section: {}` rather than `{key: 1}`. Before
+    issue #962's fix this never reached the rescue at all: the merge dropped
+    the falsy section before validation, so the bad global layer was silently
+    accepted instead of being detected-then-discarded. Guards against a fix
+    for #962 that makes empty-bodied unknown sections raise but bypasses the
+    #665 rescue path in the process (e.g. by validating before the merge
+    instead of feeding load_config's existing round-trip)."""
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text("not_a_real_section: {}\n", encoding="utf-8")
+    repo_root = tmp_path / "repo"
+    repo_path = _repo_with_config(repo_root, "dispatch:\n  default_limit: 4\n")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    assert config.dispatch.default_limit == 4
+    assert config.sources == (str(repo_path),)
+
+
+# --------------------------------------------------------------------------
+# Issue #962: load_layered_config must reject an unknown section regardless
+# of whether its body is empty, exactly like load_config does for the same
+# raw YAML. The matrix below is the one from the issue report, reproduced as
+# assertions so each cell has a durable pin.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("body", ["{}", "null", "[]", "{key: 1}"])
+def test_layered_rejects_unknown_section_regardless_of_body(
+    tmp_path: pathlib.Path, body: str
+) -> None:
+    """The core #962 bug: `bogus_section: {}` (and `null`, `[]`) merged to a
+    falsy value and vanished from the merged dict *before* load_config's
+    unknown-section check ever saw the name, so it was silently accepted --
+    while the identical file loaded directly through load_config, or the same
+    section with a non-empty body, was correctly rejected. No per-repo config
+    is required to trigger this: the merge dropped the section before the
+    #665 rescue path (which needs a per-repo config to fall back to) is even
+    reachable, so this is a distinct failure from the rescue-path tests above.
+    """
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text(f"bogus_section: {body}\n", encoding="utf-8")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    with pytest.raises(ConfigError, match="unknown config section"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+
+def test_layered_rejects_unknown_per_repo_section_with_empty_body(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Same bug, per-repo side: an unknown section with an empty body in the
+    per-repo file must raise too, not just when it originates in the global
+    layer."""
+    repo_root = tmp_path / "repo"
+    _repo_with_config(repo_root, "bogus_section: {}\n")
+
+    with pytest.raises(ConfigError, match="unknown config section"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(tmp_path / "no-fleet"))
+
+
+def test_layered_control_matches_direct_for_a_valid_section(tmp_path: pathlib.Path) -> None:
+    """Positive control from the issue report: a *valid* section must be
+    accepted by both loaders, so the reject/accept split measured above is a
+    real behavioural difference and not an artifact of how the two loaders
+    were invoked."""
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text("dispatch:\n  default_limit: 3\n", encoding="utf-8")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    direct = load_config(_repo_with_config(tmp_path / "direct", "dispatch:\n  default_limit: 3\n"))
+    layered = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    assert direct.dispatch.default_limit == 3
+    assert layered.dispatch.default_limit == 3
+
+
+def test_layered_still_drops_a_known_section_with_an_empty_body(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pin for a cell #962 must *not* change: a known section (`dispatch`)
+    with an empty body in the global layer is still dropped from the merged
+    dict rather than round-tripped through load_config. This is safe only
+    because load_config's own `_section()` defaults an absent-but-known
+    section identically to a present-but-empty one -- so dropping it changes
+    nothing observable, unlike the unknown-section case above."""
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text("dispatch: {}\n", encoding="utf-8")
+    repo_root = tmp_path / "repo"
+    repo_path = _repo_with_config(repo_root, "review:\n  require_issue_link: true\n")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    assert config == replace(
+        load_config(repo_path), sources=(str(fleet / "config.yaml"), str(repo_path))
+    )
+
+
+def test_layered_control_known_section_unknown_key_already_consistent(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Pin for the matrix's third cell (not #962's bug): a *known* section
+    with an *unknown key* inside it was already rejected consistently by both
+    loaders before this fix, because `_build_section`'s key check runs on the
+    section's own dict regardless of whether the section name is known at the
+    top level. Guards against a #962 fix that accidentally touches this path."""
+    direct_path = _repo_with_config(tmp_path / "direct", "dispatch:\n  not_a_real_key: 1\n")
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(direct_path)
+
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text("dispatch:\n  not_a_real_key: 1\n", encoding="utf-8")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
