@@ -11,10 +11,18 @@ import yaml
 
 from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
-# Re-exported in place, not re-declared. These two dataclasses are compared
-# and isinstance-checked across the seam, and two structurally identical
-# frozen dataclasses are never equal to each other.
-from ci_fleet.config import (  # noqa: F401
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# Re-exported in place, not re-declared. These two dataclasses are compared and
+# isinstance-checked across the seam, and two structurally identical frozen
+# dataclasses are never equal to each other — so a local re-declaration breaks
+# equality and isinstance at runtime without breaking any import.
+#
+# `tests/test_ci_fleet_seams.py` guards this seam; deletion fails the suite.
+# See the matching note in github.py for the same pattern applied to
+# GitHubError, where the consequence is uncaught exceptions.
+from ci_fleet.config import (  # noqa: F401  (deliberate re-export)
     RunnerAllocationConfig,
     RunnerScalingConfig,
 )
