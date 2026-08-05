@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
@@ -598,6 +599,126 @@ def test_check_log_freshness_anomaly_when_stale(hb: ModuleType, tmp_path: Path) 
     hb.check_log_freshness(report, repo)
     assert report.anomaly
     assert "older than threshold" in report.lines[0]
+
+
+def test_load_orchestrator_config_ok_when_no_config_path_registered(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    # load_repos() represents "no config registered for this repo" as
+    # Path("") -- not a real file, must not be treated as cwd (Path("")
+    # stringifies to "." and Path(".").exists() is True).
+    config, error = hb.load_orchestrator_config(Path(""))
+    assert config == {}
+    assert error is None
+
+
+def test_load_orchestrator_config_ok_when_file_absent(hb: ModuleType, tmp_path: Path) -> None:
+    config, error = hb.load_orchestrator_config(tmp_path / "does-not-exist.yaml")
+    assert config == {}
+    assert error is None
+
+
+def test_load_orchestrator_config_ok_when_valid(hb: ModuleType, tmp_path: Path) -> None:
+    path = tmp_path / "orchestrator.config.yaml"
+    path.write_text("dispatch:\n  max_concurrent_sessions: 3\n", encoding="utf-8")
+    config, error = hb.load_orchestrator_config(path)
+    assert config == {"dispatch": {"max_concurrent_sessions": 3}}
+    assert error is None
+
+
+def test_load_orchestrator_config_error_on_invalid_yaml(hb: ModuleType, tmp_path: Path) -> None:
+    path = tmp_path / "orchestrator.config.yaml"
+    path.write_text("dispatch: [unterminated\n", encoding="utf-8")
+    config, error = hb.load_orchestrator_config(path)
+    assert config == {}
+    assert error is not None
+    assert str(path) in error
+
+
+def test_load_orchestrator_config_error_on_non_utf8_bytes(hb: ModuleType, tmp_path: Path) -> None:
+    # A concurrent partial write can leave non-UTF-8 bytes on disk. The
+    # original implementation only caught (OSError, yaml.YAMLError) --
+    # UnicodeDecodeError is a ValueError subclass, so this used to raise
+    # straight out of read_text() instead of degrading. Must not raise.
+    path = tmp_path / "orchestrator.config.yaml"
+    path.write_bytes(b"\xff\xfe\x00garbage")
+    config, error = hb.load_orchestrator_config(path)
+    assert config == {}
+    assert error is not None
+    assert str(path) in error
+
+
+def test_load_orchestrator_config_error_on_non_mapping_top_level(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    path = tmp_path / "orchestrator.config.yaml"
+    path.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    config, error = hb.load_orchestrator_config(path)
+    assert config == {}
+    assert error is not None
+    assert "list" in error
+
+
+def test_get_mergequeue_label_and_dispatch_cap_default_quietly_on_broken_config(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    # get_mergequeue_label/get_dispatch_cap must keep degrading to None on a
+    # broken config rather than raising or propagating the error -- callers
+    # of these two functions are not where issue #703's signal should
+    # surface; check_orchestrator_config is.
+    path = tmp_path / "orchestrator.config.yaml"
+    path.write_text("dispatch: [unterminated\n", encoding="utf-8")
+    assert hb.get_mergequeue_label(path) is None
+    assert hb.get_dispatch_cap(path) is None
+
+
+def test_check_orchestrator_config_ok_when_not_registered(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo = replace(repo, config_path=Path(""))
+    report = hb.Report()
+    hb.check_orchestrator_config(report, repo)
+    assert not report.anomaly
+    assert "no config_path registered" in report.lines[0]
+
+
+def test_check_orchestrator_config_ok_when_absent(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)  # default config_path does not exist
+    report = hb.Report()
+    hb.check_orchestrator_config(report, repo)
+    assert not report.anomaly
+    assert "not present" in report.lines[0]
+
+
+def test_check_orchestrator_config_ok_when_valid(hb: ModuleType, tmp_path: Path) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch:\n  max_concurrent_sessions: 3\n", encoding="utf-8")
+    report = hb.Report()
+    hb.check_orchestrator_config(report, repo)
+    assert not report.anomaly
+    assert "readable" in report.lines[0]
+
+
+def test_check_orchestrator_config_anomaly_when_invalid_yaml(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("dispatch: [unterminated\n", encoding="utf-8")
+    report = hb.Report()
+    hb.check_orchestrator_config(report, repo)
+    assert report.anomaly
+    assert str(repo.config_path) in report.lines[0]
+
+
+def test_check_orchestrator_config_anomaly_when_non_utf8(hb: ModuleType, tmp_path: Path) -> None:
+    # Behavioral red case: pre-fix, this raised UnicodeDecodeError out of
+    # main()'s per-repo loop instead of degrading -- the strongest evidence
+    # that the fix, not just its return-type signature, changed behavior.
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_bytes(b"\xff\xfe\x00garbage")
+    report = hb.Report()
+    hb.check_orchestrator_config(report, repo)
+    assert report.anomaly
+    assert str(repo.config_path) in report.lines[0]
 
 
 def test_check_merge_flow_ok_when_no_mergequeue_label(
