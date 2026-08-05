@@ -2148,3 +2148,19 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_RESTART_REQUESTED
 
     return 0 if result.ok else 1
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by subprocess test
+    # Without this guard, `python -m charlie_work.cli <anything>` imports the
+    # module, runs nothing, prints nothing, and exits 0 -- a silent no-op
+    # indistinguishable from success (issue #959). That is worse than a
+    # traceback for write commands like `tripwire ack`: the operator records a
+    # mutation that never happened.
+    #
+    # SystemExit(main()) rather than a bare main() call, because main() returns
+    # a meaningful code and dropping it would reintroduce a quieter version of
+    # the same bug. EXIT_RESTART_REQUESTED (3) in particular is a cross-version
+    # wire contract read by the supervise-loop wrapper -- a module-form
+    # invocation that always exited 0 would make a restart request read as a
+    # clean exit, which is the #862 outage.
+    raise SystemExit(main())
