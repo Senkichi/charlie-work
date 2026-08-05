@@ -4168,10 +4168,17 @@ def _detect_and_handle_orphaned_workers(
                 candidate = pushed_branch_candidates.get(issue_number)
                 if candidate is not None:
                     details = no_pr_issue_details.get(issue_number, {})
+                    # ``getattr(gh, "repo_root", None)`` is not statically typed,
+                    # so it could in principle be any non-``Path`` value. Narrow
+                    # it to ``Path | None`` before passing it to the salvage
+                    # helper; ``None`` is a value the helper already handles by
+                    # returning an error, which preserves the existing drift/hold
+                    # behavior for no-repo-root orphans.
+                    salvage_repo_root = repo_root if isinstance(repo_root, Path) else None
                     pr_number, pr_error = _open_pr_for_orphaned_branch(
                         gh=gh,
                         config=config,
-                        repo_root=repo_root,
+                        repo_root=salvage_repo_root,
                         branch=candidate["branch"],
                         base_ref=config.dispatch.base_ref,
                         issue_number=issue_number,
@@ -5998,7 +6005,11 @@ def _classify_dead_sessions_and_update_throttle_state(
                         or len(redispatch_at) > config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review instead of relabeling to ready
-                        reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        reason = (
+                            failure_kind
+                            if terminal_failure and failure_kind is not None
+                            else "redispatch_cap_exceeded"
+                        )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
                         state = _escalate_issue(
@@ -8441,7 +8452,11 @@ class OrchestratorApp:
                             request.issue_number,
                             reason=(
                                 failed_result.failure_kind
-                                if terminal_failure and failed_result is not None
+                                if (
+                                    terminal_failure
+                                    and failed_result is not None
+                                    and failed_result.failure_kind is not None
+                                )
                                 else "dispatch_failed_cap_exceeded"
                             ),
                             reason_class="mechanical",
