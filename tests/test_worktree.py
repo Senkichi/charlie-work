@@ -5004,9 +5004,18 @@ def test_clean_worktrees_skips_open_pr(tmp_path: Path) -> None:
     assert info.path.exists()
 
 
-def test_clean_worktrees_skips_closed_unmerged_pr(tmp_path: Path) -> None:
-    """Review finding 2: a closed-but-not-merged PR's worktree must be skipped,
-    not treated as eligible just because the PR is no longer open.
+def test_clean_worktrees_removes_closed_unmerged_pr_with_nothing_to_lose(
+    tmp_path: Path,
+) -> None:
+    """Issue #990: a closed-and-never-merged PR is a terminal decision, not a
+    pending state -- it will never become ``MERGED``, so a worktree that only
+    waits on that condition is pinned forever (measured on the live host: 6
+    of 16 worktrees, all with confirmed-CLOSED PRs). When the worktree is
+    clean and has no commits beyond where it started (nothing a removal could
+    lose), it must be reclaimed exactly like a merged one instead of skipped
+    as "PR not merged" in perpetuity. No origin remote is configured here on
+    purpose -- the worktree never advanced past its base, so eligibility is
+    provable without a network round-trip at all.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
@@ -5023,9 +5032,197 @@ def test_clean_worktrees_skips_closed_unmerged_pr(tmp_path: Path) -> None:
         _FakeGH(pr_state="CLOSED", merged_at=None),
     )
 
-    assert len(result.data["removed"]) == 0
+    assert result.ok is True, result.message
+    assert result.data["skipped"] == []
+    assert len(result.data["removed"]) == 1
+    assert result.data["removed"][0]["issue_number"] == 9
+    assert not info.path.exists()
+
+
+def test_clean_worktrees_skips_closed_pr_with_merged_at_set(tmp_path: Path) -> None:
+    """Pins the other half of the ``gh_closed_unmerged`` conjunct (issue #990):
+    a PR can be ``state == "CLOSED"`` while ``mergedAt`` is non-null -- GitHub
+    sets both together for a PR that was merged and then closed (or reported
+    as closed by a stale/racing ``gh`` call). That is not the terminal
+    "closed, never merged" case the new eligibility path exists for, so it
+    must still fall into the fail-closed "PR not merged" branch rather than
+    being routed into the closed-unmerged removal path on ``state`` alone.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-10-closed-merged-at", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=10, pr_number=110, status="closed")
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(pr_state="CLOSED"),  # default merged_at is non-null
+    )
+
+    assert result.ok is True, result.message
+    assert result.data["removed"] == []
     assert len(result.data["skipped"]) == 1
-    assert "not merged" in result.data["skipped"][0]["reason"].lower()
+    assert "not merged" in result.data["skipped"][0]["reason"]
+    assert info.path.exists()
+
+
+def test_clean_worktrees_removes_closed_unmerged_pr_with_fully_pushed_branch(
+    tmp_path: Path,
+) -> None:
+    """The realistic shape from issue #990 (e.g. PR #980, closed as superseded
+    by a competing fix): the worker's committed work is still pushed to its
+    own remote branch, because closing a PR -- unlike a squash-merge with
+    ``delete_branch=True`` -- never deletes the branch. Eligibility here goes
+    through ``_worktree_refuse_to_reset_reason``'s ordinary remote-ahead
+    check: local HEAD equals the remote branch tip, so nothing would be lost
+    by removing the worktree.
+    """
+    remote, repo_root = _init_repo_with_remote(tmp_path)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _git(repo_root, "push", "origin", "main")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    branch_name = "agent/issue-12-closed-pushed"
+    info = create_worktree(repo_root, branch_name, base_ref="origin/main")
+    (info.path / "feature.txt").write_text("work later superseded\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "work for issue 12, later superseded")
+    push_ok, push_error = push_branch(repo_root, branch_name, worktree_path=info.path)
+    assert push_ok, push_error
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=12, pr_number=112, status="closed")
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(pr_state="CLOSED", merged_at=None),
+    )
+
+    assert result.ok is True, result.message
+    assert result.data["skipped"] == []
+    assert len(result.data["removed"]) == 1
+    assert not info.path.exists()
+
+
+def test_clean_worktrees_skips_closed_unmerged_pr_with_unpushed_commits(
+    tmp_path: Path,
+) -> None:
+    """Pins the case issue #990 calls out explicitly: a closed-unmerged PR is
+    precisely where a human may have abandoned work worth keeping, so a
+    worktree holding a commit that never made it to the remote branch must
+    still wait -- reclaiming it would destroy the only copy. This is the
+    "must still wait" counterpart to the fully-pushed removal case above.
+    """
+    remote, repo_root = _init_repo_with_remote(tmp_path)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _git(repo_root, "push", "origin", "main")
+
+    branch_name = "agent/issue-13-closed-unpushed"
+    info = create_worktree(repo_root, branch_name, base_ref="origin/main")
+    (info.path / "feature.txt").write_text("pushed work\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "pushed work for issue 13")
+    push_ok, push_error = push_branch(repo_root, branch_name, worktree_path=info.path)
+    assert push_ok, push_error
+
+    # A further commit made AFTER the push -- never made it to the remote.
+    (info.path / "orphaned.txt").write_text("never pushed\n", encoding="utf-8")
+    _git(info.path, "add", "orphaned.txt")
+    _git(info.path, "commit", "-m", "abandoned work, never pushed")
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=13, pr_number=113, status="closed")
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(pr_state="CLOSED", merged_at=None),
+    )
+
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    reason = result.data["skipped"][0]["reason"].lower()
+    assert "closed-unmerged pr" in reason
+    assert "not on remote branch" in reason
+    assert info.path.exists()
+
+
+def test_clean_worktrees_skips_closed_unmerged_pr_with_dirty_worktree(
+    tmp_path: Path,
+) -> None:
+    """A dirty working tree must still block reclamation on the
+    closed-unmerged path exactly as it does on the merged path."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-14-closed-dirty", base_ref="HEAD")
+    (info.path / "dirty_file.txt").write_text("local changes", encoding="utf-8")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=14, pr_number=114, status="closed")
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(pr_state="CLOSED", merged_at=None),
+    )
+
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    assert "uncommitted" in result.data["skipped"][0]["reason"].lower()
+    assert info.path.exists()
+
+
+def test_clean_worktrees_skips_closed_unmerged_pr_with_live_worker(tmp_path: Path) -> None:
+    """A closed-unmerged PR does not bypass the liveness gate: an active
+    worker still using the worktree must block reclamation exactly like the
+    merged path -- issue #990 only widens which terminal PR states qualify,
+    it never removes the liveness check.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    info = create_worktree(repo_root, "agent/issue-15-closed-live", base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    issue_state = {
+        "number": 15,
+        "worker_pid": os.getpid(),
+        "worker_process_start_time": get_process_start_time(os.getpid()),
+        "started_at": datetime.now(UTC).isoformat(),
+    }
+    state = _make_state(issue_number=15, pr_number=115, status="closed")
+    state["issues"]["15"] = issue_state
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(pr_state="CLOSED", merged_at=None),
+    )
+
+    assert result.ok is True
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    assert "live" in result.data["skipped"][0]["reason"].lower()
     assert info.path.exists()
 
 
