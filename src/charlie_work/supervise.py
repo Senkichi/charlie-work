@@ -213,14 +213,9 @@ def read_head_sha(
     return res.stdout.strip() or None
 
 
-def _pending_sync_marker_path(repo_root: Path) -> Path:
-    """Return the path to the pending-sync marker for this orchestrator tree.
-
-    NOTE: deliberately uses the *default* state root, ignoring a configured
-    ``runtime.state_dir`` override, preserving today's behavior. Deriving this
-    from the configured state dir instead is a deferred behavioral fix.
-    """
-    return layout.pending_sync_path(layout.default_state_root(repo_root))
+def _pending_sync_marker_path(state_root: Path) -> Path:
+    """Return the path to the deferred-``uv sync`` marker under ``state_root``."""
+    return layout.pending_sync_path(state_root)
 
 
 def _write_marker(path: Path, from_sha: str, to_sha: str) -> None:
@@ -578,9 +573,9 @@ def _self_deploy_state_path(repo_root: Path) -> Path:
 
     ``self_deploy`` operates on the orchestrator's own checkout (``repo_root``
     is ``orchestrator_root()`` at every real call site), not a per-repo fleet
-    target, so it logs against the *default* state root exactly the way
-    :func:`_pending_sync_marker_path` already does -- see that function's note
-    on deliberately ignoring a configured ``runtime.state_dir`` override.
+    target, so it logs against the *default* state root. The pending-sync
+    marker, by contrast, resolves from the ``state_root`` passed to
+    :func:`self_deploy`.
     """
     return layout.state_file_path(layout.default_state_root(repo_root))
 
@@ -812,6 +807,7 @@ def record_zero_pass_streak(
 def self_deploy(
     repo_root: Path,
     *,
+    state_root: Path | None = None,
     fleet_dir_override: str | None = None,
     run_command: Callable[..., RunResult] = run_captured,
     pull_timeout: int = 60,
@@ -836,6 +832,12 @@ def self_deploy(
     All subprocess errors are returned as values (non-fatal); the function
     never raises.
 
+    ``state_root`` is the resolved orchestrator state directory; when omitted,
+    the pending-sync marker falls back to the default state root under
+    ``repo_root``.  Other self-deploy state files (``events.db`` and the
+    consecutive-failure counter) continue to resolve from the default state
+    root regardless of ``state_root``.
+
     ``dry_run`` reports what would happen and touches nothing.  The gate sits
     above *every* mutating step, including ``_check_venv`` -- which repairs the
     editable ``.pth`` as a side effect of checking it, and so is not safe to run
@@ -850,7 +852,9 @@ def self_deploy(
     items 4-5). A preview is excluded from both: it is read-only by
     construction and reports nothing that actually happened.
     """
-    marker_path = _pending_sync_marker_path(repo_root)
+    marker_path = _pending_sync_marker_path(
+        state_root if state_root is not None else layout.default_state_root(repo_root)
+    )
     if dry_run:
         return _self_deploy_preview(
             repo_root, marker_path, run_command=run_command, timeout=pull_timeout
