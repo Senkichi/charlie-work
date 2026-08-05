@@ -440,6 +440,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Manage the #502 post-merge unauthorized-merge tripwire",
     )
     tripwire_sub = tripwire.add_subparsers(dest="tripwire_command", required=True)
+    tripwire_sub.add_parser(
+        "status",
+        help=(
+            "Show pending unauthorized-merge findings (detected and not yet "
+            "acknowledged) with the PR, branch and decision that pinned "
+            "ok=False (issue #933). Reads state.json only — no gh calls, and "
+            "it never arms the baseline as a side effect."
+        ),
+    )
     tripwire_ack = tripwire_sub.add_parser(
         "ack",
         help=(
@@ -1784,6 +1793,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "tripwire":
         if args.tripwire_command == "ack":
             return app.ack_unauthorized_merge(args.pr, args.reason or "", by=args.by)
+        if args.tripwire_command == "status":
+            return app.tripwire_status()
         return CommandResult(False, f"unknown tripwire command: {args.tripwire_command}", {})
     if args.command == "bash-rats":
         from .supervise import run_supervised, try_acquire_supervisor_lock

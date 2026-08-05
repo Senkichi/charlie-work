@@ -2018,6 +2018,88 @@ UNAUTHORIZED_MERGE_BASELINE_KEY = "unauthorized_merge_baseline"
 # — the tripwire never auto-acknowledges, or it would defeat itself.
 UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 
+# state.json key holding the durable first-detection record for post-arming
+# unauthorized-merge findings (issue #933). A `{pr_number: {detected_at, head,
+# issue, decision, ...}}` map, written the first time a finding is reported and
+# not rewritten while the finding stays open, so the
+# `unauthorized_merge_detected` event fires exactly once per PR instead of once
+# per pass. `ack_unauthorized_merge` deletes the entry, so the map holds
+# *currently-open announced findings* — bounded by the open set, not growing
+# with every PR ever found, and a finding re-detected after its ack is withdrawn
+# announces again instead of returning silently.
+#
+# Once-per-PR is the whole point. The tripwire re-detects the same unacked
+# finding on every pass — that is the 21-pass ok=False streak #933 was filed on
+# — so a per-pass event would be a second unbounded stream restating one fact
+# indefinitely, which is the "a control that can never go quiet is not a
+# control" failure the baseline and the ack set both exist to prevent.
+#
+# This is a *record*, not a suppressor: unlike the baseline and the ack set it
+# is never consulted by `_apply_unauthorized_merge_baseline`, so a finding
+# stays reported (and keeps pinning ok=False) until it is explicitly acked.
+# Presence here silences the event, never the finding.
+UNAUTHORIZED_MERGE_DETECTED_KEY = "unauthorized_merge_detected"
+
+# Caps for the error detail carried in the `loop_completed` payload. The
+# loop-body `errors` list is unbounded by construction — one entry per PR that
+# raised — and this payload lands in both the capped 200-entry `events` array in
+# state.json and the unlimited events.db, so a single bad pass could otherwise
+# push dozens of full exception strings through both.
+_LOOP_ERROR_MAX_PRS = 20
+_LOOP_ERROR_MAX_DETAILS = 5
+_LOOP_ERROR_DETAIL_CHARS = 300
+
+
+def summarize_loop_errors(
+    errors: list[dict[str, Any]],
+    *,
+    max_prs: int = _LOOP_ERROR_MAX_PRS,
+    max_details: int = _LOOP_ERROR_MAX_DETAILS,
+    detail_chars: int = _LOOP_ERROR_DETAIL_CHARS,
+) -> dict[str, Any]:
+    """Summarize `_loop_body`'s `errors` list into a bounded event payload.
+
+    `loop_completed` previously kept only `error_count`, so a pass that reported
+    ``"loop completed with 1 PR error(s)"`` left no stored artifact naming *which*
+    PR — diagnosing a live finding meant reading the detector source and
+    re-deriving the candidate set by hand (issue #933).
+
+    PR numbers are the cheap, high-value half and are emitted first and most
+    generously; free-text detail is the expensive half and is truncated hard.
+    Both are capped with an explicit ``*_truncated`` count rather than silently
+    dropped, so a reader can always tell a complete list from an elided one — a
+    silent cap would reproduce the same "the record understates the problem"
+    failure this function exists to fix.
+
+    The two ``*_truncated`` counts are over **different populations**, which the
+    similar names hide: ``error_prs_truncated`` counts elided *distinct PRs*
+    (deduped), while ``error_details_truncated`` counts elided *error entries*
+    (not deduped — several entries can share one PR). So ``error_prs_truncated:
+    6`` alongside ``error_details_truncated: 23`` is consistent, not a
+    contradiction; they answer "how many more PRs" and "how many more failures".
+    """
+    pr_numbers: list[int] = []
+    for entry in errors:
+        raw = entry.get("pr")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            continue
+        if raw not in pr_numbers:
+            pr_numbers.append(raw)
+
+    details: list[str] = []
+    for entry in errors[:max_details]:
+        text = str(entry.get("error") or "")
+        if len(text) > detail_chars:
+            text = text[: detail_chars - 3] + "..."
+        details.append(text)
+
+    return {
+        "error_prs": pr_numbers[:max_prs],
+        "error_prs_truncated": max(0, len(pr_numbers) - max_prs),
+        "error_details": details,
+        "error_details_truncated": max(0, len(errors) - max_details),
+    }
+
 
 @dataclass(frozen=True)
 class ReviewSessionOutcome:
@@ -14546,6 +14628,11 @@ class OrchestratorApp:
                     "message": result.message,
                     "elapsed_seconds": round(elapsed, 2),
                     "error_count": len(result.data.get("errors", [])),
+                    # Issue #933: the count alone made "loop completed with 1 PR
+                    # error(s)" undiagnosable — two independent sessions misread a
+                    # 21-pass ok=False streak as healthy because no stored artifact
+                    # named the PR. Bounded; see summarize_loop_errors.
+                    **summarize_loop_errors(result.data.get("errors", [])),
                 },
                 repo=self.repo_root.name,
                 correlation_id=cid,
@@ -17563,7 +17650,13 @@ class OrchestratorApp:
                         "live_head_sha": live_head_sha,
                     }
                 )
-        return self._apply_unauthorized_merge_baseline(candidates)
+        reported = self._apply_unauthorized_merge_baseline(candidates)
+        # Announce on the bounded set, never on raw candidates: the arming pass
+        # deliberately reports nothing, and an acked finding is deliberately
+        # silent. Emitting before the bound would re-introduce exactly the noise
+        # the baseline exists to suppress (issue #933).
+        self._announce_unauthorized_merges(reported)
+        return reported
 
     def _apply_unauthorized_merge_baseline(
         self, candidates: list[dict[str, Any]]
@@ -17703,6 +17796,151 @@ class OrchestratorApp:
         )
         return []
 
+    def _announce_unauthorized_merges(self, reported: list[dict[str, Any]]) -> None:
+        """Emit ``unauthorized_merge_detected`` once per PR, the first time it is reported.
+
+        The acknowledgement of a finding was durably recorded
+        (``unauthorized_merge_acknowledged``); the *finding itself* was not. A
+        control whose triage is auditable but whose alarm is not is only half a
+        control — and it is why a live finding took a source-reading session to
+        identify instead of one query (issue #933).
+
+        Fires on the post-baseline, post-ack set — exactly the candidates that
+        become ``errors`` entries and pin ``ok=False`` — and is keyed durably in
+        ``UNAUTHORIZED_MERGE_DETECTED_KEY`` so a finding that persists for 21
+        passes produces one event, not 21. See that constant for why the record
+        deliberately does not suppress the finding itself.
+
+        Classified ``error`` by ``instrumentation._classify_level``, which closes
+        the second of the two misreads in #933: a session reported "0 errors
+        since restart" from ``query_events(level='error')`` while this very
+        finding was pinning every pass, because nothing on the finding path ever
+        set that level.
+
+        Best-effort by construction: a state failure here must not crash a fleet
+        pass on the *reporting* path of a security control. The finding is
+        returned to the caller regardless.
+        """
+        import logging
+
+        if not reported or self.dry_run:
+            # dry_run: a preview must not write state (issues #609/#613/#621),
+            # matching _apply_unauthorized_merge_baseline's arming path.
+            return
+
+        logger = logging.getLogger(__name__)
+        key = UNAUTHORIZED_MERGE_DETECTED_KEY
+        try:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                record = state.get(key)
+                if not isinstance(record, dict):
+                    record = {}
+                fresh = [c for c in reported if str(c["pr"]) not in record]
+                if not fresh:
+                    return
+                detected_at = utc_now()
+                for candidate in fresh:
+                    record[str(candidate["pr"])] = {
+                        "detected_at": detected_at,
+                        "issue": candidate.get("issue"),
+                        "head": candidate.get("head"),
+                        "decision": candidate.get("decision"),
+                        "reviewed_head_sha": candidate.get("reviewed_head_sha"),
+                        "live_head_sha": candidate.get("live_head_sha"),
+                    }
+                state[key] = record
+                for candidate in fresh:
+                    state = self._record_event(
+                        state,
+                        "unauthorized_merge_detected",
+                        {
+                            "pr": candidate["pr"],
+                            "issue": candidate.get("issue"),
+                            "head": candidate.get("head"),
+                            "decision": candidate.get("decision"),
+                            "reviewed_head_sha": candidate.get("reviewed_head_sha"),
+                            "live_head_sha": candidate.get("live_head_sha"),
+                        },
+                    )
+                save_state(self.paths.state_file, state)
+        except (OSError, ValueError) as exc:
+            logger.warning("unauthorized-merge detection record not persisted: %s", exc)
+            return
+
+        logger.error(
+            "unauthorized-merge tripwire: %d new uncovered merge(s) detected (%s); "
+            "ack with `charlie tripwire ack <pr> --reason ...` once triaged",
+            len(fresh),
+            ", ".join(f"#{c['pr']}" for c in fresh),
+        )
+
+    def tripwire_status(self) -> CommandResult:
+        """Report the live unauthorized-merge tripwire state without re-running detection.
+
+        The consumer for ``unauthorized_merge_detected`` (issue #933). Reading a
+        finding out of ``state.json`` is deliberately cheaper and safer than
+        re-detecting: it needs no ``gh`` call, so it works while the API is down
+        and cannot itself arm the baseline as a side effect.
+
+        Pending findings are the ones that are still pinning ``ok=False``:
+        detected and not acknowledged.
+        """
+        state = load_state_locked(self.paths.state_file)
+
+        detected = state.get(UNAUTHORIZED_MERGE_DETECTED_KEY)
+        detected = detected if isinstance(detected, dict) else {}
+        acked = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
+        acked = acked if isinstance(acked, dict) else {}
+        baseline = state.get(UNAUTHORIZED_MERGE_BASELINE_KEY)
+        baseline = baseline if isinstance(baseline, dict) else {}
+
+        def _as_int(value: Any) -> int | None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        pending: list[dict[str, Any]] = []
+        for raw_pr, detail in sorted(detected.items(), key=lambda kv: _as_int(kv[0]) or 0):
+            if raw_pr in acked:
+                continue
+            entry = {"pr": _as_int(raw_pr)}
+            if isinstance(detail, dict):
+                entry.update(
+                    {
+                        "detected_at": detail.get("detected_at"),
+                        "issue": detail.get("issue"),
+                        "head": detail.get("head"),
+                        "decision": detail.get("decision"),
+                    }
+                )
+            pending.append(entry)
+
+        if not baseline:
+            message = "unauthorized-merge tripwire is NOT ARMED (no baseline recorded yet)"
+        elif pending:
+            message = (
+                f"{len(pending)} pending unauthorized-merge finding(s) pinning ok=False: "
+                + ", ".join(f"#{p['pr']}" for p in pending)
+            )
+        else:
+            message = "no pending unauthorized-merge findings"
+
+        return CommandResult(
+            True,
+            message,
+            {
+                "armed_at": baseline.get("armed_at"),
+                "baselined_count": len(baseline.get("pre_existing_prs") or []),
+                "pending": pending,
+                "pending_count": len(pending),
+                "acknowledged_count": len(acked),
+                "detected_count": len(detected),
+                "state_file": str(self.paths.state_file),
+            },
+        )
+
     def ack_unauthorized_merge(
         self, pr_number: int, reason: str, *, by: str | None = None
     ) -> CommandResult:
@@ -17748,6 +17986,22 @@ class OrchestratorApp:
                 "by": by,
             }
             state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
+            # Drop this PR's first-detection record (issue #933). That map exists
+            # solely to make `unauthorized_merge_detected` fire once per finding
+            # instead of once per pass; an ack ends the finding, so the entry has
+            # no remaining job. Clearing it here is what makes the map mean
+            # "announced findings still open" rather than "every PR ever found",
+            # which keeps it bounded and — the reason this is code and not a
+            # comment — makes re-detection after an ack is *withdrawn* announce
+            # again. There is no revoke command today; the one revocation on
+            # record (2026-08-02, the #895 misrouted acks) was an operator edit.
+            # Were the entry left behind, whoever adds that command would inherit
+            # a finding that silently re-pins ok=False with no fresh event.
+            detected = state.get(UNAUTHORIZED_MERGE_DETECTED_KEY)
+            if isinstance(detected, dict) and str(pr_number) in detected:
+                state[UNAUTHORIZED_MERGE_DETECTED_KEY] = {
+                    key: value for key, value in detected.items() if key != str(pr_number)
+                }
             state = self._record_event(
                 state,
                 "unauthorized_merge_acknowledged",
