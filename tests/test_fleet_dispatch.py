@@ -542,6 +542,88 @@ def test_fleet_loop_missing_repo_root_skipped(
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_missing_repo_root_records_lane_failure(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """#749: a repo whose repo_root no longer exists is recorded to events.db
+    and the fleet digest, not only per_repo_results."""
+    repo1_state_dir = tmp_path / "repo1-state"
+    repo1_state_dir.mkdir(parents=True)
+    repo2 = tmp_path / "repo2"
+    repo2.mkdir()
+
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "state_dir": str(repo1_state_dir),
+            },
+            "owner/repo2": {
+                "repo_root": str(repo2),
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app2 = MagicMock()
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.return_value = mock_app2
+    mock_gh_class.return_value = MagicMock()
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # repo1 is reported as a failed repo, repo2 still runs.
+    assert result.data["repos"]["owner/repo1"]["ok"] is False
+    assert "repo_root missing, skipped" in result.data["repos"]["owner/repo1"]["message"]
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+    assert mock_app_class.call_count == 1
+    assert mock_app2.loop.call_count == 1
+    assert mock_load_layered_config.call_count == 1
+
+    # The failure is durably recorded to repo1's own events.db.
+    state_path = layout.state_file_path(repo1_state_dir)
+    recorded = query_events(state_path, kind="fleet_pass_config_error")
+    assert len(recorded) == 1
+    assert recorded[0]["level"] == "error"
+    assert recorded[0]["payload"]["repo_key"] == "owner/repo1"
+    assert "repo_root missing, skipped" in recorded[0]["payload"]["error"]
+
+    # The fleet digest carries a matching ERROR entry.
+    digest_events = result.data["digest"]["events"]
+    error_events = [e for e in digest_events if e.get("repo_key") == "owner/repo1"]
+    assert len(error_events) == 1
+    assert error_events[0]["type"] == "error"
+    assert "repo_root missing, skipped" in error_events[0]["error"]
+
+    attention_digest = _build_fleet_attention_digest(digest_events)
+    matching = [e for e in attention_digest.transitions if e.adapter_kind == "owner/repo1"]
+    assert len(matching) == 1
+    assert matching[0].health == "ERROR"
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
 def test_fleet_loop_github_error_isolated(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
