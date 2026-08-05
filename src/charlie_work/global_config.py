@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -156,13 +157,24 @@ def load_layered_config(
         repo_config_path,
     )
 
-    # Load per-repo config if present
+    # Load per-repo config if present. Bound once rather than re-tested, so the
+    # provenance recorded below cannot disagree with what was actually read
+    # (issue #943).
+    repo_source = repo_config_path if repo_config_path and repo_config_path.exists() else None
     repo_raw = (
-        yaml.safe_load(repo_config_path.read_text(encoding="utf-8"))
-        if repo_config_path and repo_config_path.exists()
-        else {}
+        yaml.safe_load(repo_source.read_text(encoding="utf-8")) if repo_source is not None else {}
     )
     repo_data = repo_raw if isinstance(repo_raw, dict) else {}
+
+    # Provenance in merge order: global layer first, per-repo last, matching the
+    # override precedence below. Keyed off the *reads* above, not a fresh
+    # exists() check. A file that was read but contributed no sections still
+    # belongs here -- "read a 0-byte global layer" and "there is no global
+    # layer" are the two readings of #590 that took hours to separate, and they
+    # are only distinguishable if an empty-but-present file leaves a trace.
+    layer_sources: tuple[str, ...] = tuple(
+        str(p) for p in (global_config_path if global_exists else None, repo_source) if p
+    )
 
     # ``runner_allocation`` is host-wide only (see RunnerAllocationConfig's
     # docstring): three repos must not hold three opinions about how many jobs
@@ -202,9 +214,13 @@ def load_layered_config(
         if merged_section:
             merged_data[section] = merged_section
 
-    # If no config at all, delegate to the original load_config for consistency
+    # If no config at all, delegate to the original load_config for consistency.
+    # Its own provenance covers only the per-repo path it is handed, so restate
+    # the full layer list: reaching here with a *present* global layer means that
+    # file was read and parsed to nothing, which is a different diagnosis from
+    # never having had one.
     if not merged_data:
-        return load_config(repo_config_path)
+        return replace(load_config(repo_config_path), sources=layer_sources)
 
     # Use the existing load_config logic by writing a merged dict to a temp file
     # This ensures we reuse all validation logic (unknown keys, type checks, etc.)
@@ -219,7 +235,11 @@ def load_layered_config(
 
     try:
         try:
-            return load_config(tmp_path)
+            # The merged dict round-trips through a temp file to reuse the
+            # validation logic, so load_config records *that* file as the
+            # source. It is deleted in the finally below and names nothing an
+            # operator could open -- overwrite it with the real layers.
+            return replace(load_config(tmp_path), sources=layer_sources)
         except ConfigError:
             # A present-but-invalid global layer (e.g. an unknown key) makes
             # the merged load raise, and callers (fleet_dispatch) catch
@@ -232,7 +252,11 @@ def load_layered_config(
             # silently defaulting would itself reproduce the #623 shape.
             if not global_exists or not repo_data:
                 raise
-            repo_only = load_config(repo_config_path)
+            # Provenance is the per-repo file alone, deliberately: the global
+            # layer was *discarded*, so listing it would claim a contribution
+            # that was rolled back. This is the case the field earns its keep
+            # on -- the warning below scrolls away, the value does not.
+            repo_only = replace(load_config(repo_config_path), sources=(str(repo_config_path),))
             logger.warning(
                 "Layered config: merged load failed validation; the global "
                 "layer was discarded and the per-repo config used alone. "
