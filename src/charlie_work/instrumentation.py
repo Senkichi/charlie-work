@@ -181,6 +181,13 @@ _WARNING_KINDS = frozenset(
         "dispatch_merged_pr_mention_flagged",
         "review_dispatch_lifecycle_reaped",
         "session_rate_limit_deferred",
+        # Issue #937: the #502/#673 unauthorized-merge tripwire failed open on a
+        # GitHubError, so the control did not run for that pass. Warning, not
+        # error: nothing is broken and no finding is being suppressed -- a check
+        # simply did not happen, which is a handled degradation like the two
+        # above. The paired "unauthorized_merge_detected" stays error, because
+        # that one *is* an uncovered merge awaiting triage.
+        "unauthorized_merge_check_skipped",
         # Issue #873: the watchdog reaped a worker whose process was already
         # gone (WorkerHealth.DEAD). Split out of "session_stalled", which stays
         # an error and now means only the live-but-hung case. A vanished
