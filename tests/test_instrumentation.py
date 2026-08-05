@@ -1113,7 +1113,14 @@ def _resolve_literal(
             # producer boundary, not be assumed by every consumer.
             return values or None
         if node.id in module_constants:
-            return module_constants[node.id]
+            # Third empty-set guard, for the same reason as the two above.
+            # `_scan_tree` only inserts a key when `parts` is non-empty and
+            # every part came back non-empty, so this cannot be empty today --
+            # but that reasoning lives in a *different* function, and the
+            # docstring above promises the invariant is enforced at every exit
+            # of *this* one. Enforce it here rather than leaving the promise
+            # true only by inspection of a caller.
+            return module_constants[node.id] or None
         return None
     return None
 
