@@ -195,6 +195,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "review_quota_exhausted": "warning",
         "rework_issue_fetch_skipped": "warning",
         "runner_allocation_refused": "warning",
+        "runner_allocation_skipped": "warning",
         "runner_capacity_starved": "warning",
         "session_budget_exceeded": "warning",
         "session_exited": "warning",
