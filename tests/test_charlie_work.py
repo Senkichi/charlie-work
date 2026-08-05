@@ -30473,6 +30473,153 @@ def test_maybe_reclaim_worktrees_runs_and_emits_event(
     assert next_run_at == expected
 
 
+def test_maybe_reclaim_worktrees_event_carries_skip_reasons(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1012: ``clean_worktrees`` computes a distinct ``reason`` string
+    per skipped worktree, but only ``len(skipped)`` used to reach the durable
+    ``worktrees_reclaimed`` event. The full reason strings, plus the
+    out-of-scope/registered counts, must now survive into the persisted
+    payload -- an operator reading events.db, not live output, is the actual
+    consumer this event exists for."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+
+    skipped_entries = [
+        {
+            "worktree": "C:/wt/agent-issue-4",
+            "branch": "agent/issue-4",
+            "issue_number": 4,
+            "pr_number": 40,
+            "reason": "worktree HEAD (abc12345) is not contained in merged PR "
+            "head (def67890); stray post-merge commit(s)",
+        },
+        {
+            "worktree": "C:/wt/agent-issue-5",
+            "branch": "agent/issue-5",
+            "issue_number": 5,
+            "pr_number": 50,
+            "reason": "live worker detected: recorded PID 1234 is alive",
+        },
+    ]
+
+    def _fake_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
+        return WorktreeCleanResult(
+            ok=True,
+            message="worktree-clean: 0 removed, 2 skipped, 0 failed, 0 orphan(s)",
+            data={
+                "planned": [],
+                "removed": [],
+                "skipped": skipped_entries,
+                "failed": [],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+                "worktrees_registered": 3,
+                "worktrees_out_of_scope": 1,
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    assert summary["skipped"] == 2
+    # The exact reason strings -- not just a count -- reach the summary.
+    assert summary["skipped_examples"] == skipped_entries
+    assert summary["worktrees_registered"] == 3
+    assert summary["worktrees_out_of_scope"] == 1
+
+    state = load_state(app.paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    # This is the load-bearing assertion: the durable event -- not just the
+    # in-memory summary -- carries the reasons. Before this fix, `payload`
+    # had no `skipped_examples` key at all.
+    assert payload["skipped_examples"] == skipped_entries
+    assert "stray post-merge commit(s)" in payload["skipped_examples"][0]["reason"]
+    assert "live worker detected" in payload["skipped_examples"][1]["reason"]
+    assert payload["worktrees_out_of_scope"] == 1
+
+    # The issue's actual complaint is that reconstructing "why" from events.db
+    # was impossible -- state.json's 200-entry array is a convenience cache,
+    # not the durable store an operator queries after the fact. Round-trip
+    # through the real SQLite dual-write (append_event -> events.db) via the
+    # same query_events() helper an operator would use, not just state.json.
+    db_events = query_events(app.paths.state_file, kind="worktrees_reclaimed")
+    assert len(db_events) == 1
+    db_payload = db_events[0]["payload"]
+    assert db_payload["skipped_examples"] == skipped_entries
+    assert "stray post-merge commit(s)" in db_payload["skipped_examples"][0]["reason"]
+    assert "live worker detected" in db_payload["skipped_examples"][1]["reason"]
+    assert db_payload["worktrees_out_of_scope"] == 1
+    assert db_payload["worktrees_registered"] == 3
+
+
+def test_maybe_reclaim_worktrees_skip_examples_truncated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A standing backlog of skipped worktrees must not re-emit every reason
+    string into events.db on every cadence interval -- the same idiom as
+    ``_MAX_DEFERRED_CONCURRENCY_EXAMPLES`` (issue #1005). ``skipped`` stays
+    the exact count; ``skipped_examples`` is capped."""
+    from charlie_work import workflow as workflow_module
+    from charlie_work.workflow import _MAX_SKIPPED_WORKTREE_EXAMPLES
+    from charlie_work.worktree import WorktreeCleanResult
+
+    app = _reclamation_app(tmp_path, interval_minutes=60)
+
+    many_skipped = [
+        {
+            "worktree": f"C:/wt/agent-issue-{i}",
+            "branch": f"agent/issue-{i}",
+            "issue_number": i,
+            "pr_number": i * 10,
+            "reason": "PR not merged",
+        }
+        for i in range(_MAX_SKIPPED_WORKTREE_EXAMPLES + 7)
+    ]
+
+    def _fake_clean(*_args: object, **_kwargs: object) -> WorktreeCleanResult:
+        return WorktreeCleanResult(
+            ok=True,
+            message="worktree-clean: 0 removed, many skipped, 0 failed, 0 orphan(s)",
+            data={
+                "planned": [],
+                "removed": [],
+                "skipped": many_skipped,
+                "failed": [],
+                "orphans": {"planned": [], "removed": [], "failed": []},
+                "venv_ok": True,
+                "venv_message": "ok",
+                "attention_events": [],
+                "worktrees_registered": len(many_skipped) + 1,
+                "worktrees_out_of_scope": 1,
+            },
+        )
+
+    monkeypatch.setattr(workflow_module, "clean_worktrees", _fake_clean)
+
+    summary = app._maybe_reclaim_worktrees()
+
+    assert summary is not None
+    # The exact count is never truncated.
+    assert summary["skipped"] == len(many_skipped)
+    # The examples list IS truncated.
+    assert len(summary["skipped_examples"]) == _MAX_SKIPPED_WORKTREE_EXAMPLES
+    assert summary["skipped_examples"] == many_skipped[:_MAX_SKIPPED_WORKTREE_EXAMPLES]
+
+    state = load_state(app.paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
+    assert len(events[0]["payload"]["skipped_examples"]) == _MAX_SKIPPED_WORKTREE_EXAMPLES
+    assert events[0]["payload"]["skipped"] == len(many_skipped)
+
+
 def test_maybe_reclaim_worktrees_advances_schedule_before_sweep(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
