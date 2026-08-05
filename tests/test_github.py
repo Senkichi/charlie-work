@@ -237,6 +237,155 @@ def test_run_add_issue_label_retries_pre_connection_then_succeeds(
     assert call_count == 2
 
 
+def test_run_read_command_timeout_retries_then_succeeds(monkeypatch, tmp_path: Path) -> None:
+    """A read command that times out once is retried transparently, the same
+    as any other transient failure."""
+    call_count = 0
+    sleeps: list[float] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout='[{"number": 1}]', stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    gh = github_module.GitHub(
+        tmp_path,
+        runtime=RuntimeConfig(gh_max_retries=3, gh_retry_base_seconds=1.0),
+    )
+    result = gh.run(_issue_list_args(), json_output=True)
+
+    assert result == [{"number": 1}]
+    assert call_count == 2
+    assert len(sleeps) == 1
+
+
+def test_run_read_command_timeout_exhausts_retries_raises(monkeypatch, tmp_path: Path) -> None:
+    """A read command that always times out retries up to gh_max_retries and
+    then raises GitHubError."""
+    call_count = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
+
+    gh = github_module.GitHub(
+        tmp_path,
+        runtime=RuntimeConfig(gh_max_retries=2, gh_retry_base_seconds=1.0),
+    )
+    with pytest.raises(github_module.GitHubError, match="timed out"):
+        gh.run(_issue_list_args(), json_output=True)
+
+    assert call_count == 3
+
+
+def test_run_mutating_command_timeout_not_retried(monkeypatch, tmp_path: Path) -> None:
+    """A mutating command that times out is NOT retried, even though retries
+    remain — retrying risks double-applying a mutation (double merge, double
+    label write) because a timeout is not evidence the request never reached
+    GitHub. Exactly one attempt is made before GitHubError is raised."""
+    call_count = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
+
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=3))
+    with pytest.raises(github_module.GitHubError, match="timed out"):
+        gh.run(["pr", "merge", "123", "--squash"])
+
+    assert call_count == 1
+
+
+def test_run_mutating_command_timeout_allow_failure_returns_error_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """allow_failure=True on a timed-out mutating command returns a structured
+    error result — ok=False, returncode=124 (never 0, which callers read as
+    success) — after exactly one attempt, no retry."""
+    call_count = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
+
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=3))
+    result = gh.run(["pr", "merge", "123", "--squash"], allow_failure=True)
+
+    assert isinstance(result, github_module.GitHubRunResult)
+    assert result.ok is False
+    assert result.returncode == 124
+    assert "timed out" in (result.error or "")
+    assert call_count == 1
+
+
+def test_run_read_command_timeout_allow_failure_terminal_returns_124(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """allow_failure=True on a read command that always times out returns a
+    terminal error result once retries are exhausted, with returncode=124 —
+    not 0, which callers would misread as success."""
+    call_count = 0
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
+
+    gh = github_module.GitHub(
+        tmp_path,
+        runtime=RuntimeConfig(gh_max_retries=1, gh_retry_base_seconds=1.0),
+    )
+    result = gh.run(_issue_list_args(), json_output=True, allow_failure=True)
+
+    assert isinstance(result, github_module.GitHubRunResult)
+    assert result.ok is False
+    assert result.returncode == 124
+    assert result.returncode != 0
+    assert "timed out" in (result.error or "")
+    assert call_count == 2
+
+
+def test_run_passes_configured_gh_timeout_seconds_to_subprocess_run(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The configured gh_timeout_seconds reaches subprocess.run as the
+    `timeout=` kwarg — not the module default."""
+    captured_timeouts: list[float] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        captured_timeouts.append(kwargs.get("timeout"))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_timeout_seconds=7.5))
+    gh.run(_issue_list_args(), json_output=True)
+
+    assert captured_timeouts == [7.5]
+
+
 def test_pr_checks_injects_run_id(monkeypatch, tmp_path: Path) -> None:
     """Issue #391: pr_checks derives the GitHub Actions workflow run id from link."""
 
