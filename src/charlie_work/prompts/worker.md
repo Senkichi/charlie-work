@@ -132,3 +132,5 @@ branch is reviewed and merged by the orchestrator). Ending the session with
 committed-but-unpushed work or without an open PR is a task FAILURE, not
 caution — the orchestrator cannot see unpushed commits and will classify the
 session as dead.
+
+$section_push_pr_outcome

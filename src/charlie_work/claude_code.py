@@ -1341,6 +1341,7 @@ def launch_claude_worker(
         start_terminal_status_watcher(
             process,
             worker_terminal_status_path(sessions_dir, issue_number, _sidecar_suffix(adapter_kind)),
+            worktree_path=worktree.path,
         )
 
     try:

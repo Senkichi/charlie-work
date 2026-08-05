@@ -103,6 +103,8 @@ from .worktree import (
     clean_worktrees,
     inspect_worktree_state,
     push_branch,
+    read_worker_outcome,
+    remote_branch_ahead_count,
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
@@ -3522,6 +3524,78 @@ def _detect_and_handle_orphaned_workers(
                 "label_write_ok": label_write_ok,
             }
 
+    # Issue #935: for the no-open-PR orphans, determine whether the worker
+    # pushed a branch and reported push-succeeded-but-PR-failed. This is done
+    # outside the state lock because it can touch origin. The second lock below
+    # will use these pre-computed candidates to decide whether to open the PR
+    # itself instead of re-dispatching.
+    repo_root = getattr(gh, "repo_root", None)
+    worktrees_dir = None
+    if repo_root is not None:
+        worktrees_dir = resolved_layout(config, repo_root).worktrees
+
+    no_pr_issue_details: dict[int, dict[str, Any]] = {}
+    pushed_branch_candidates: dict[int, dict[str, Any]] = {}
+    state_snapshot = state
+    for issue_number in no_pr_orphans:
+        issue = issues_by_number.get(issue_number)
+        if issue is None:
+            # Issue not open/visible: we cannot safely mutate labels, and a
+            # closed issue should not get a new PR.
+            continue
+        issue_labels = label_names(issue)
+        active_labels = issue_labels & config.labels.active
+        no_pr_issue_details[issue_number] = {
+            "issue": issue,
+            "issue_labels": issue_labels,
+            "active_labels": active_labels,
+        }
+
+        entry = state_snapshot.get("issues", {}).get(str(issue_number), {})
+        branch = entry.get("branch_name")
+        if not branch:
+            branch = (
+                f"{config.dispatch.branch_prefix}-{issue_number}-"
+                f"{slugify(str(issue.get('title') or 'work'))}"
+            )
+
+        worktree_path = None
+        if repo_root is not None and worktrees_dir is not None:
+            worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
+
+        # The durable terminal status is authoritative because it is written
+        # after the worker exits and survives worktree removal.
+        terminal = find_worker_terminal_status(sessions_dir, issue_number)
+        terminal_outcome = terminal.get("worker_outcome") if terminal else None
+        worktree_outcome = read_worker_outcome(worktree_path) if worktree_path else None
+        worker_outcome = terminal_outcome or worktree_outcome
+
+        reported_push = (
+            isinstance(worker_outcome, dict)
+            and worker_outcome.get("push_succeeded") is True
+            and worker_outcome.get("pr_created") is False
+        )
+
+        ahead_count = None
+        ahead_error = None
+        if repo_root is not None:
+            ahead_count, ahead_error = remote_branch_ahead_count(
+                repo_root, branch, config.dispatch.base_ref
+            )
+
+        # Treat a branch as a PR-open candidate when:
+        # - the worker itself reported a successful push with a failed PR, OR
+        # - the branch exists on origin and is ahead of the base (has commits).
+        if reported_push or (ahead_count is not None and ahead_count > 0):
+            pushed_branch_candidates[issue_number] = {
+                "branch": branch,
+                "worktree_path": worktree_path,
+                "worker_outcome": worker_outcome,
+                "reported_push": reported_push,
+                "ahead_count": ahead_count,
+                "ahead_error": ahead_error,
+            }
+
     # Issue #439: route dead workers with stuck pre-review PRs to rework before
     # the state-update sweep. PR views are fetched outside the state lock; the
     # route helper updates state/labels in its own critical section. The second
@@ -3749,6 +3823,70 @@ def _detect_and_handle_orphaned_workers(
                             )
                         )
             else:
+                # Issue #935: before reclaim/drift, try to open a PR for a branch
+                # that the worker pushed but could not create a PR for.
+                candidate = pushed_branch_candidates.get(issue_number)
+                if candidate is not None:
+                    details = no_pr_issue_details.get(issue_number, {})
+                    pr_number, pr_error = _open_pr_for_orphaned_branch(
+                        gh=gh,
+                        config=config,
+                        repo_root=repo_root,
+                        branch=candidate["branch"],
+                        base_ref=config.dispatch.base_ref,
+                        issue_number=issue_number,
+                        active_labels=details.get("active_labels", set()),
+                        issue_labels=details.get("issue_labels", set()),
+                    )
+                    if pr_number is not None:
+                        entry["status"] = PASSIVE_OPEN_STATUS
+                        entry["pr_number"] = pr_number
+                        sweep_events.append(
+                            (
+                                "orphaned_worker_opened_pr",
+                                {
+                                    "issue_number": issue_number,
+                                    "pr_number": pr_number,
+                                    "branch_name": candidate["branch"],
+                                    "worker_reported": candidate["reported_push"],
+                                    "ahead_count": candidate["ahead_count"],
+                                    "previous_status": "dispatched",
+                                    "reason": "dead_worker_branch_pushed_no_pr",
+                                },
+                            )
+                        )
+                        state["issues"][str(issue_number)] = entry
+                        continue
+
+                    # PR creation failed -- surface as a distinct drift so the
+                    # orchestrator does not silently re-dispatch completed work.
+                    fingerprint = _drift_fingerprint(
+                        reason="dead_worker_branch_pushed_pr_create_failed",
+                        branch_name=candidate["branch"],
+                        error=pr_error or "unknown",
+                    )
+                    if entry.get("orphan_drift_fingerprint") == fingerprint:
+                        state["issues"][str(issue_number)] = entry
+                        continue
+                    entry["orphan_drift_fingerprint"] = fingerprint
+                    entry["orphan_drift_at"] = utc_now()
+                    sweep_events.append(
+                        (
+                            "orphaned_worker_drift",
+                            {
+                                "issue_number": issue_number,
+                                "branch_name": candidate["branch"],
+                                "previous_status": "dispatched",
+                                "reason": "dead_worker_branch_pushed_pr_create_failed",
+                                "pr_create_error": pr_error,
+                                "worker_reported": candidate["reported_push"],
+                                "ahead_count": candidate["ahead_count"],
+                            },
+                        )
+                    )
+                    state["issues"][str(issue_number)] = entry
+                    continue
+
                 # Issue #417: report (and, on success, resolve) the ground-truth
                 # label reclaim computed above before falling back to the
                 # unresolved-drift diagnostic. This is what makes the reap
@@ -5553,6 +5691,40 @@ def _attempt_salvage(
         )
         save_state(state_file, state)
     return True, None
+
+
+def _open_pr_for_orphaned_branch(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    active_labels: set[str],
+    issue_labels: set[str],
+) -> tuple[int | None, str | None]:
+    """Open a PR for a branch that the worker pushed but could not create a PR for.
+
+    Returns ``(pr_number, error)``. Errors are recorded as values and never
+    raised. This is the orchestrator-side recovery for issue #935: workers are
+    unauthenticated in their environment, so after pushing a completed branch
+    they cannot run ``gh pr create``. The orchestrator, which is authenticated,
+    creates the PR and moves the issue labels toward ``pr_open``.
+    """
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+    title = f"Salvaged work for issue #{issue_number}"
+    body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a worker branch that could not open a PR."
+    pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
+    if pr_number is None:
+        return None, "gh pr create failed or returned no PR number"
+
+    for label in sorted(active_labels):
+        gh.remove_issue_label(issue_number, label)
+    if config.labels.pr_open not in issue_labels:
+        gh.add_issue_label(issue_number, config.labels.pr_open)
+
+    return pr_number, None
 
 
 def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
