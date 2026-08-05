@@ -399,6 +399,42 @@ def test_extract_attention_events_nested_dispatch_failures() -> None:
     assert any(review_error in (e.last_log_line or "") for e in entries)
 
 
+def test_extract_attention_events_deferred_by_concurrency_truncation_desync() -> None:
+    """Issue #1005 review: ``deferred_by_concurrency`` is truncated to
+    ``_MAX_DEFERRED_CONCURRENCY_EXAMPLES`` (5) in the persisted payload, but
+    the ``failures`` map it feeds is not. A set-membership exclusion check
+    against the truncated list would silently re-report the 6th+ deferred
+    issue as a genuine launch failure -- a diagnostic regression in exactly
+    the dimension #1005 is about. Exclusion is matched by reason-string
+    prefix instead (``DEFERRED_BY_CONCURRENCY_REASON_PREFIX``), which is
+    immune to truncation of the list.
+    """
+    deferred_issue_numbers = [101, 102, 103, 104, 105, 106, 107]
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "intake": {"failed": []},
+            "dispatch": {
+                "selected_count": 0,
+                # Truncated to 5, mirroring the real persisted payload shape.
+                "deferred_by_concurrency": deferred_issue_numbers[:5],
+                "deferred_by_concurrency_count": len(deferred_issue_numbers),
+                "failures": {
+                    n: "deferred by concurrency cap (limit: 0)" for n in deferred_issue_numbers
+                },
+            },
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    error_events = [e for e in events if e["type"] == "error"]
+    assert error_events == []
+
+
 @patch("charlie_work.fleet_dispatch._load_registry")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.runtime_paths")

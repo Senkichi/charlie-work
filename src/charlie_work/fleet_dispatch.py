@@ -60,7 +60,7 @@ from .supervisor_lifecycle import (
     record_supervisor_started,
     update_supervisor_heartbeat,
 )
-from .workflow import CommandResult, OrchestratorApp
+from .workflow import DEFERRED_BY_CONCURRENCY_REASON_PREFIX, CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
 
@@ -913,26 +913,25 @@ def _add_launch_failures(
     ``dispatch_reviews`` stores a PR-keyed ``failed`` list. Both shapes are
     normalized to ``{"repo_key": ..., "type": "error", "issue_number"/"pr": ..., "error": ...}``.
 
-    Issues deferred by the concurrency cap are not launch failures, so they are
-    excluded from ``failures`` maps via the ``deferred_by_concurrency`` list.
+    Issues deferred by the concurrency cap are not launch failures, so they
+    are excluded from ``failures`` maps by matching the reason string
+    ``_build_failure_map`` writes for them (``DEFERRED_BY_CONCURRENCY_REASON_PREFIX``)
+    -- not by cross-referencing the ``deferred_by_concurrency`` list, which is
+    truncated to a fixed number of examples in the persisted payload (issue
+    #1005) while this ``failures`` map is not. A set-membership check against
+    the truncated list would silently re-report the Nth+ deferred issue as a
+    genuine launch failure.
     """
-    deferred_issue_numbers: set[int] = set()
-    for d in data.get("deferred_by_concurrency", []):
-        try:
-            deferred_issue_numbers.add(int(d))
-        except (TypeError, ValueError):
-            continue
-
     failures_map = data.get("failures")
     if isinstance(failures_map, dict):
         for key, error in failures_map.items():
             if not isinstance(error, str):
                 continue
+            if error.startswith(DEFERRED_BY_CONCURRENCY_REASON_PREFIX):
+                continue
             try:
                 issue_number = int(key)
             except (TypeError, ValueError):
-                continue
-            if issue_number in deferred_issue_numbers:
                 continue
             failures.append(
                 {
