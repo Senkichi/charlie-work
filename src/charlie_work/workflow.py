@@ -4176,6 +4176,7 @@ def _detect_and_handle_orphaned_workers(
                         issue_number=issue_number,
                         active_labels=details.get("active_labels", set()),
                         issue_labels=details.get("issue_labels", set()),
+                        issue_title=(details.get("issue") or {}).get("title"),
                     )
                     if pr_number is not None:
                         entry["status"] = PASSIVE_OPEN_STATUS
@@ -4191,6 +4192,8 @@ def _detect_and_handle_orphaned_workers(
                                     "ahead_count": candidate["ahead_count"],
                                     "previous_status": "dispatched",
                                     "reason": "dead_worker_branch_pushed_no_pr",
+                                    "label_write_ok": pr_error is None,
+                                    "pr_error": pr_error,
                                 },
                             )
                         )
@@ -5967,6 +5970,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                         issue_labels=issue_labels,
                         state_file=state_file,
                         failure_kind=failure_kind,
+                        issue_title=issue.get("title") if issue else None,
                     )
                     if salvaged:
                         continue
@@ -6120,6 +6124,57 @@ def _classify_dead_sessions_and_update_throttle_state(
     return reaped
 
 
+def _open_salvage_pr(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path | None,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    active_labels: set[str],
+    issue_labels: set[str],
+    issue_title: str | None = None,
+    source_description: str = "worker branch",
+) -> tuple[int | None, str | None]:
+    """Open a PR for a salvaged worker branch and move issue labels toward ``pr_open``.
+
+    Returns ``(pr_number, error)``. ``pr_number`` is the created PR number,
+    or ``None`` when the PR could not be created. ``error`` is ``None`` when
+    both the PR and the label swap succeeded; otherwise it describes the first
+    failure encountered (a missing ``repo_root``, a failed PR create, or a
+    label write failure after the PR was created).
+    """
+    if repo_root is None:
+        return None, "repo_root is required to open a salvage PR"
+
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+
+    title = (
+        f"Salvaged work for #{issue_number}: {issue_title}"
+        if issue_title
+        else f"Salvaged work for issue #{issue_number}"
+    )
+    body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
+
+    pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
+    if pr_number is None:
+        return None, "gh pr create failed or returned no PR number"
+
+    label_write_ok = True
+    for label in sorted(active_labels):
+        if not gh.remove_issue_label(issue_number, label):
+            label_write_ok = False
+    if config.labels.pr_open not in issue_labels:
+        if not gh.add_issue_label(issue_number, config.labels.pr_open):
+            label_write_ok = False
+
+    if not label_write_ok:
+        return pr_number, "PR created but label write failed"
+
+    return pr_number, None
+
+
 def _attempt_salvage(
     *,
     gh: GitHubLike,
@@ -6133,27 +6188,33 @@ def _attempt_salvage(
     issue_labels: set[str],
     state_file: Path,
     failure_kind: str | None,
+    issue_title: str | None = None,
 ) -> tuple[bool, str | None]:
     """Push a completed branch and open a PR, then move labels to ``pr_open``.
 
     Returns ``(ok, error)``. Errors are recorded as values and never raised.
+    ``ok`` is ``True`` once the PR is created, even if the label swap failed;
+    in that case ``error`` describes the label failure and the
+    ``session_salvaged`` event records ``label_write_ok=False``.
     """
     push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
     if not push_ok:
         return False, push_error
 
-    base_branch = resolve_base_branch_name(repo_root, base_ref)
-    title = f"Salvaged work for issue #{issue_number}"
-    body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a completed-but-unpublished worker worktree."
-    pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
+    pr_number, pr_error = _open_salvage_pr(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        issue_title=issue_title,
+        source_description="completed-but-unpublished worker worktree",
+    )
     if pr_number is None:
-        pr_error = "gh pr create failed or returned no PR number"
-        return False, pr_error
-
-    for label in sorted(active_labels):
-        gh.remove_issue_label(issue_number, label)
-    if config.labels.pr_open not in issue_labels:
-        gh.add_issue_label(issue_number, config.labels.pr_open)
+        return False, pr_error or "gh pr create failed or returned no PR number"
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -6167,23 +6228,26 @@ def _attempt_salvage(
                 "failure_kind": failure_kind,
                 "removed_labels": sorted(active_labels),
                 "pr_number": pr_number,
+                "label_write_ok": pr_error is None,
+                "label_error": pr_error,
             },
             state_path=state_file,
         )
         save_state(state_file, state)
-    return True, None
+    return True, pr_error
 
 
 def _open_pr_for_orphaned_branch(
     *,
     gh: GitHubLike,
     config: OrchestratorConfig,
-    repo_root: Path,
+    repo_root: Path | None,
     branch: str,
     base_ref: str,
     issue_number: int,
     active_labels: set[str],
     issue_labels: set[str],
+    issue_title: str | None = None,
 ) -> tuple[int | None, str | None]:
     """Open a PR for a branch that the worker pushed but could not create a PR for.
 
@@ -6193,19 +6257,18 @@ def _open_pr_for_orphaned_branch(
     they cannot run ``gh pr create``. The orchestrator, which is authenticated,
     creates the PR and moves the issue labels toward ``pr_open``.
     """
-    base_branch = resolve_base_branch_name(repo_root, base_ref)
-    title = f"Salvaged work for issue #{issue_number}"
-    body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a worker branch that could not open a PR."
-    pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
-    if pr_number is None:
-        return None, "gh pr create failed or returned no PR number"
-
-    for label in sorted(active_labels):
-        gh.remove_issue_label(issue_number, label)
-    if config.labels.pr_open not in issue_labels:
-        gh.add_issue_label(issue_number, config.labels.pr_open)
-
-    return pr_number, None
+    return _open_salvage_pr(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        issue_title=issue_title,
+        source_description="worker branch that could not open a PR",
+    )
 
 
 def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
