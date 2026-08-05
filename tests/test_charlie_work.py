@@ -40149,6 +40149,105 @@ def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) ->
     assert "does not fix #649" not in brief, "live closing keyword leaked into brief"
 
 
+def test_no_op_rework_repair_note_survives_dispatch_rework_regeneration(tmp_path: Path) -> None:
+    """Issue #887: the operational note from _route_to_rework must survive
+    a dispatch_rework re-render unchanged.
+
+    _request_no_op_rework_repair routes through _route_to_rework, which uses
+    the shared _write_rework_prompt. That writer also writes the
+    rework-dispatch-note.txt sidecar. dispatch_rework re-renders stale briefs
+    and replays the note from the sidecar; this test extends the same no-op
+    repair setup through a full dispatch_rework call and a newer-verdict
+    re-render, asserting the operational note is still present in the
+    regenerated brief. A future writer that bypasses _write_rework_prompt and
+    leaves the sidecar absent or stale would fail this test, because the
+    re-render would either drop the note (mtime-gate empty note) or replay a
+    stale one."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    reviewer_summary = (
+        "BLOCKER - does not fix #649. The pin is a no-op over uv's resolver; "
+        "the underlying version conflict is still unresolved."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": reviewer_summary,
+        "required_changes": [],
+    }
+    (pr_dir / "review-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+    pr = fake_gh.pr_view(456)
+
+    result = app._request_no_op_rework_repair(pr, 123, decision)
+    assert result is None, f"expected a clean label transition, got {result!r}"
+
+    brief_path = pr_dir / "rework-prompt.md"
+    note_path = pr_dir / "rework-dispatch-note.txt"
+    before = brief_path.read_text(encoding="utf-8")
+    # The no-op operational note (the "dispatch_note") is present...
+    assert "no actual content change" in before
+    # ...and the reviewer's original findings are present alongside it.
+    assert "does not fix issue 649" in before
+    # _write_rework_prompt produced a sidecar for dispatch-time re-render.
+    operational_note = (
+        "The previous rework cycle produced no actual content change (the diff or head "
+        "matches the last request_changes verdict). Check the branch worktree for "
+        "unpushed commits and push the real fix, or explain in the PR body why no "
+        "further change was needed."
+    )
+    assert note_path.read_text(encoding="utf-8") == operational_note
+
+    # The operator / reviewer updates the verdict with a new finding and makes
+    # it newer than the brief. This is the #632 axis that forces a re-render.
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": reviewer_summary,
+                "required_changes": ["add a regression test for the empty-list case"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = time.time()
+    os.utime(brief_path, (now, now))
+    os.utime(note_path, (now, now))
+    os.utime(pr_dir / "review-decision.json", (now + 10, now + 10))
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True, result.message
+    assert result.data["selected_count"] == 1
+    after = brief_path.read_text(encoding="utf-8")
+    # The regenerated brief picked up the new verdict finding.
+    assert "add a regression test for the empty-list case" in after
+    # The operational note from _route_to_rework was replayed from the sidecar
+    # and survived the re-render.
+    assert "no actual content change" in after
+    # The sidecar itself is unchanged.
+    assert note_path.read_text(encoding="utf-8") == operational_note
+    # The regeneration is recorded with the correct axis.
+    events = query_events(paths.state_file, kind="rework_brief_regenerated")
+    assert len(events) == 1, events
+    assert events[0]["payload"]["reason"] == "verdict_newer"
+    assert events[0]["payload"]["pr_number"] == 456
+
+
 def _normalize_ws(text: str) -> str:
     """Collapse whitespace (including the template's hard line-wraps) so
     substring assertions don't depend on exact word-wrap columns."""
