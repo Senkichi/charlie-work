@@ -316,13 +316,16 @@ def test_check_quiescence_all_invalid_patterns_are_not_quiescent() -> None:
     assert report.ok is False
 
 
-def test_some_invalid_patterns_stay_governed_by_matching() -> None:
-    """A mix of valid and invalid patterns is not the all-invalid case: the
-    search space is narrowed (surfaced via ``invalid_patterns``) but not
-    empty, so a clean result from the still-usable pattern(s) is a real
-    "nothing matched" answer, not a vacuous one. `ok` stays governed by
-    ``matched``, same as before the #732 fix -- only the fully-unusable case
-    changes.
+def test_some_invalid_patterns_refuse_even_when_valid_ones_find_nothing() -> None:
+    """A partially-invalid pattern set is a narrower fail-open than the
+    all-invalid case, but the same shape: one class of process the operator
+    asked to watch for was silently dropped from the search. A clean result
+    from the patterns that *did* compile is not evidence the dropped one
+    would have been clean too, so this must refuse -- not just the
+    every-pattern-invalid case. ``invalid_patterns`` still surfaces which
+    pattern was dropped, matching the drop-don't-raise contract
+    (`_compile_patterns`'s docstring) that this test intentionally keeps
+    exercising alongside the stricter ``ok``.
     """
     processes = [
         _proc(1, 0, "explorer.exe", "explorer.exe"),
@@ -335,10 +338,11 @@ def test_some_invalid_patterns_stay_governed_by_matching() -> None:
         self_pid=999,
     )
 
-    assert report.ok is True
+    assert report.ok is False
     assert report.matched == ()
     assert report.invalid_patterns == (r"\Users\bad\path",)
     assert "invalid pattern" in report.summary
+    assert "narrowed by invalid pattern" in report.summary
 
 
 def test_qu_report_is_frozen_dataclass() -> None:

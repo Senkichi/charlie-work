@@ -104,16 +104,15 @@ class QuiesceReport:
     but are surfaced so a bad pattern doesn't silently make the gate looser
     than the caller intended.
 
-    ``ok`` is ``False`` whenever zero patterns compiled -- including the
-    all-invalid case -- not just when a process matched. A gate with no
-    usable pattern cannot prove anything; reporting ``ok=True`` off an empty
-    search space is exactly the fail-open this type exists to prevent (#732).
-    A caller that supplies *some* valid patterns alongside invalid ones keeps
-    the current match-governed behaviour (``invalid_patterns`` narrows what
-    was searched but doesn't itself flip an otherwise-clean result), since a
-    still-nonempty search space is the check the caller asked for, just
-    narrower than intended -- surfaced, not silently strengthened past what
-    was requested.
+    ``ok`` is ``False`` whenever any pattern failed to compile, or zero
+    patterns compiled, regardless of whether a process matched (#732): a
+    quiescence gate that skips some of the process classes the caller asked
+    it to watch for cannot prove the ones it dropped are stopped. That holds
+    even when other, valid patterns in the same call found nothing --
+    "narrower coverage found nothing" and "full coverage found nothing" read
+    identically as ``ok=True`` to a caller that only checks the boolean, and
+    the former is not evidence of the latter. The invariant this type upholds
+    is ``ok is True`` implies ``invalid_patterns == ()``.
     """
 
     ok: bool
@@ -187,22 +186,34 @@ def _build_summary(
             f"quiescent: no process command line matched (excluded {len(excluded_pids)} "
             "self/ancestor pid(s))"
         )
-    elif compiled_count == 0:
-        # Distinct from "processes matched": here nothing *could* have
-        # matched, because no supplied pattern compiled. Reporting this the
-        # same way as a real process match would bury the actual reason
-        # (unusable patterns, not a live fleet) in the summary text.
-        lines.append(
-            "NOT quiescent: no usable pattern (0 patterns compiled) -- "
-            "quiescence cannot be established"
-        )
-    else:
+    elif matched:
+        # Real process evidence takes priority in the message even if the
+        # pattern set was also narrowed by invalid entries -- that's the
+        # actionable reason an operator needs first.
         lines.append(f"NOT quiescent: {len(matched)} matching process(es):")
         for proc in matched:
             lines.append(
                 f"  pid={proc.pid} ppid={proc.ppid} name={proc.name!r} "
                 f"command_line={proc.command_line!r}"
             )
+    elif compiled_count == 0:
+        # Nothing *could* have matched: no supplied pattern compiled.
+        # Reporting this the same way as a real process match would bury the
+        # actual reason (unusable patterns, not a live fleet) in the summary.
+        lines.append(
+            "NOT quiescent: no usable pattern (0 patterns compiled) -- "
+            "quiescence cannot be established"
+        )
+    else:
+        # compiled is non-empty (so something real was checked and found
+        # clean) but invalid_patterns is also non-empty: coverage was
+        # narrower than the caller asked for, so a clean result from the
+        # patterns that did compile is not proof the dropped ones would
+        # have been clean too.
+        lines.append(
+            "NOT quiescent: pattern set narrowed by invalid pattern(s) -- "
+            "quiescence cannot be established"
+        )
     if invalid_patterns:
         lines.append(f"invalid pattern(s) skipped (never matched): {list(invalid_patterns)!r}")
     return "\n".join(lines)
@@ -236,12 +247,12 @@ def assert_quiescent(
         if any(rx.search(proc.command_line) for rx in compiled):
             matched.append(proc)
 
-    # A gate with zero usable patterns can never observe a match regardless
-    # of what's actually running, so "nothing matched" alone is not
-    # sufficient for "quiescent" -- see the `ok` docstring on `QuiesceReport`
-    # for why this must be enforced here (single point of enforcement) and
-    # not left to each caller.
-    ok = bool(compiled) and not matched
+    # A gate that skipped any pattern (whole set invalid, or narrowed by a
+    # subset) can never observe a match against what it dropped, so
+    # "nothing matched" alone is not sufficient for "quiescent" -- see the
+    # `ok` docstring on `QuiesceReport` for why this must be enforced here
+    # (single point of enforcement) and not left to each caller.
+    ok = bool(compiled) and not invalid_patterns and not matched
     summary = _build_summary(
         ok=ok,
         matched=matched,
