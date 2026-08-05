@@ -4165,12 +4165,19 @@ def _detect_and_handle_orphaned_workers(
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
                 # that the worker pushed but could not create a PR for.
                 candidate = pushed_branch_candidates.get(issue_number)
-                if candidate is not None and isinstance(repo_root, Path):
+                if candidate is not None:
                     details = no_pr_issue_details.get(issue_number, {})
+                    # ``getattr(gh, "repo_root", None)`` is not statically typed,
+                    # so it could in principle be any non-``Path`` value. Narrow
+                    # it to ``Path | None`` before passing it to the salvage
+                    # helper; ``None`` is a value the helper already handles by
+                    # returning an error, which preserves the existing drift/hold
+                    # behavior for no-repo-root orphans.
+                    salvage_repo_root = repo_root if isinstance(repo_root, Path) else None
                     pr_number, pr_error = _open_pr_for_orphaned_branch(
                         gh=gh,
                         config=config,
-                        repo_root=repo_root,
+                        repo_root=salvage_repo_root,
                         branch=candidate["branch"],
                         base_ref=config.dispatch.base_ref,
                         issue_number=issue_number,

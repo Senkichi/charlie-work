@@ -19,6 +19,7 @@ from charlie_work.config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
 )
+from charlie_work.state import PASSIVE_OPEN_STATUS, load_state
 from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
 from test_charlie_work import FakeGitHub
@@ -34,27 +35,31 @@ def test_none_not_in_deterministic_escalation_failure_kinds() -> None:
 
 
 @pytest.mark.parametrize(
-    ("repo_root", "expect_called"),
+    ("repo_root_value", "is_valid_path"),
     [
         (None, False),
         ("a/string/path", False),
-        ("a_real_path", True),
+        ("tmp_path", True),
     ],
     ids=["repo_root_none", "repo_root_string", "repo_root_path"],
 )
 def test_orphan_salvage_repo_root_guard(
-    repo_root: Any,
-    expect_called: bool,
+    repo_root_value: Any,
+    is_valid_path: bool,
     tmp_path: Path,
 ) -> None:
-    """The no-open-PR orphan salvage path only reaches
-    ``_open_pr_for_orphaned_branch`` when ``repo_root`` is an actual,
-    existing ``pathlib.Path``.
+    """The no-open-PR orphan salvage path narrows ``repo_root`` to ``Path | None``.
 
-    The two invalid cases verify the structural guard; removing the guard
-    causes ``_open_pr_for_orphaned_branch`` to be called with a non-``Path``
-    value and the patched helper below raises. The ``path`` case covers the
-    reachable, valid path and asserts the real path is passed through.
+    ``getattr(gh, "repo_root", None)`` is not statically typed, so a non-``Path``
+    value is treated the same as ``None``: ``_open_pr_for_orphaned_branch`` is
+    still called, but with ``repo_root=None``. The helper already handles ``None``
+    by returning an error, which preserves the pre-#1041 drift/hold semantics for
+    a missing repo root.
+
+    The invalid cases also serve as a guard test: if the ``isinstance`` narrowing
+    were removed and a string were passed through, the patched helper below
+    raises. The ``path`` case verifies the real ``Path`` is passed through and the
+    worker branch is salvaged into a passively-opened PR.
     """
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -90,12 +95,12 @@ def test_orphan_salvage_repo_root_guard(
         encoding="utf-8",
     )
 
-    if repo_root == "a_real_path":
-        repo_root_value: Any = tmp_path
+    if repo_root_value == "tmp_path":
+        actual_repo_root: Any = tmp_path
     else:
-        repo_root_value = repo_root
+        actual_repo_root = repo_root_value
 
-    fake_gh = FakeGitHub(repo_root=repo_root_value)
+    fake_gh = FakeGitHub(repo_root=actual_repo_root)
     fake_gh.issues = [
         {
             "number": issue_number,
@@ -108,18 +113,28 @@ def test_orphan_salvage_repo_root_guard(
     ]
     fake_gh.prs = []
 
-    calls: list[tuple[Path, ...]] = []
+    calls: list[Any] = []
 
-    def fake_open_pr(*, repo_root: Path, **kwargs: Any) -> tuple[int | None, str | None]:
-        if not isinstance(repo_root, Path):
+    def fake_open_pr(
+        *,
+        repo_root: Any,
+        **kwargs: Any,
+    ) -> tuple[int | None, str | None]:
+        # Record every invocation first, before any guard logic, so the test can
+        # assert the actual value that reached the helper.
+        calls.append(repo_root)
+        if repo_root is not None and not isinstance(repo_root, Path):
             raise AssertionError(
                 f"_open_pr_for_orphaned_branch called with non-Path repo_root: {repo_root!r}"
             )
+        if repo_root is None:
+            # Mirror the real helper's None handling: it returns an error so the
+            # caller follows the existing salvage-failure drift path.
+            return (None, "repo_root is required to open a salvage PR")
         if not repo_root.exists():
             raise AssertionError(
                 f"_open_pr_for_orphaned_branch called with non-existent repo_root: {repo_root}"
             )
-        calls.append((repo_root,))
         return (101, None)
 
     with (
@@ -128,6 +143,37 @@ def test_orphan_salvage_repo_root_guard(
     ):
         _detect_and_handle_orphaned_workers(sessions_dir, state_file, config, fake_gh)
 
-    assert len(calls) == (1 if expect_called else 0)
-    if expect_called:
-        assert calls[0][0] == tmp_path
+    state = load_state(state_file)
+    issue_state = state["issues"][str(issue_number)]
+
+    drift_events = [
+        e
+        for e in state.get("events", [])
+        if e.get("kind") == "orphaned_worker_drift"
+        and e.get("payload", {}).get("reason") == "dead_worker_branch_pushed_pr_create_failed"
+    ]
+    opened_events = [
+        e for e in state.get("events", []) if e.get("kind") == "orphaned_worker_opened_pr"
+    ]
+    relabel_events = [
+        e for e in state.get("events", []) if e.get("kind") == "session_failed_relabeled"
+    ]
+
+    if is_valid_path:
+        assert calls == [tmp_path]
+        assert len(opened_events) == 1
+        assert opened_events[0]["payload"]["pr_number"] == 101
+        assert opened_events[0]["payload"]["issue_number"] == issue_number
+        assert len(drift_events) == 0
+        assert len(relabel_events) == 0
+        assert issue_state["status"] == PASSIVE_OPEN_STATUS
+        assert issue_state["pr_number"] == 101
+    else:
+        assert calls == [None]
+        assert len(opened_events) == 0
+        assert len(relabel_events) == 0
+        assert len(drift_events) == 1
+        assert drift_events[0]["payload"]["issue_number"] == issue_number
+        # The issue is held as drift, not silently relabeled/reopened.
+        assert issue_state["status"] == "dispatched"
+        assert issue_state.get("orphan_drift_fingerprint") is not None
