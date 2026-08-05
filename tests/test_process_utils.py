@@ -687,6 +687,25 @@ def test_write_worker_terminal_status_round_trips_and_is_atomic(tmp_path: Path) 
     }
 
 
+def test_write_worker_terminal_status_round_trips_worker_outcome(tmp_path: Path) -> None:
+    """Issue #935: terminal status preserves the worker's push/PR-failure signal."""
+    path = tmp_path / "issue-1.claude.terminal.json"
+    worker_outcome = {"push_succeeded": True, "pr_created": False, "error": "gh unauthenticated"}
+    write_worker_terminal_status(
+        path,
+        pid=4242,
+        exit_code=0,
+        started_at="2026-07-30T00:00:00Z",
+        ended_at="2026-07-30T00:05:00Z",
+        duration_seconds=300.0,
+        worker_outcome=worker_outcome,
+    )
+
+    record = find_worker_terminal_status(tmp_path, 1)
+    assert record is not None
+    assert record["worker_outcome"] == worker_outcome
+
+
 def test_write_worker_terminal_status_creates_missing_parent(tmp_path: Path) -> None:
     """The sessions directory does not need to pre-exist."""
     path = tmp_path / "nested" / "issue-1.claude.terminal.json"

@@ -24,6 +24,7 @@ from charlie_work.fleet_dispatch import (
     _build_fleet_attention_digest,
     _emit_fleet_transition,
     _extract_attention_events,
+    _fleet_has_configured_repos,
     _is_fleet_pass_active,
     _lane_failure_state_path,
     _run_fleet_allocation_prologue,
@@ -31,19 +32,21 @@ from charlie_work.fleet_dispatch import (
     compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
+    run_fleet_supervise_loop,
 )
 from charlie_work.notify import AttentionEntry
 from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.instrumentation import query_events
-from charlie_work.runner_allocation import (
+from ci_fleet.charlie_work_adapter import ALLOCATION_STATE_FILENAME, load_allocation_stamp
+from ci_fleet.runner_allocation import (
     AllocationPlan,
     SlotAction,
     SlotChange,
     SlotChangeResult,
 )
-from charlie_work.runner_allocation_pass import AllocationPassResult
-from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME, load_allocation_stamp
+from ci_fleet.runner_allocation_pass import AllocationPassResult
 from charlie_work.supervise import SelfDeployResult
+from charlie_work.supervise_loop import EXIT_RESTART_REQUESTED
 from charlie_work.github import GitHubError
 from charlie_work.workflow import CommandResult
 
@@ -1580,6 +1583,294 @@ def test_run_fleet_supervise_loops_until_max_passes(
     assert result.data["passes"] == 3
     assert mock_fleet_loop.call_count == 3
     assert fc.sleep_calls == [5.0, 5.0, 5.0]
+    # #862 AC4: exhausting the pass budget is a deliberate stop. It shares
+    # ok=True with the restart-requesting exits, so the launcher distinguishes
+    # them on this field alone -- a regression here would relaunch forever.
+    assert result.data["exit_reason"] == "max_passes"
+    assert result.data["restart_requested"] is False
+
+
+def _failed_fleet_result(
+    repo_messages: dict[str, str | None],
+) -> CommandResult:
+    """A fleet pass with one or more failing repos, each carrying its own message.
+
+    Mirrors the shape ``fleet_loop`` actually returns (fleet_dispatch.py:1559-1565):
+    every repo entry gets an ``ok`` bool and a ``message`` string alongside its
+    ordinary data, regardless of pass outcome.
+    """
+    repos = {key: {"ok": False, "message": message} for key, message in repo_messages.items()}
+    return CommandResult(
+        False,
+        "fleet pass complete",
+        {"repos": repos, "digest": {"count": 0, "events": []}},
+    )
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_includes_failure_reason(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #893: the per-pass summary line must surface *why* repos failed.
+
+    ``repos_data[key]["message"]`` (fleet_dispatch.py:1564) already carries the
+    per-repo failure reason -- e.g. "loop completed with N PR error(s)" -- all
+    the way to the print site, but the summary line only ever counted ``ok``
+    and dropped the message. A repeating "0 ok, N failed" with no reason reads
+    identically to a real outage as it does to a known, acked-releasable
+    control (e.g. the unauthorized-merge tripwire) firing every pass.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _failed_fleet_result(
+        {"owner/repo1": "loop completed with 2 PR error(s)"}
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines, f"no per-pass summary line found in output: {captured.out!r}"
+    assert "loop completed with 2 PR error(s)" in summary_lines[0], (
+        f"the failure reason must be on the summary line, not just counted: {summary_lines[0]!r}"
+    )
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_dedupes_repeated_reasons(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """N repos failing for one shared cause must not repeat the string N times."""
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    same_reason = "unauthorized-merge tripwire: unacked finding #502"
+    mock_fleet_loop.return_value = _failed_fleet_result(
+        {"owner/repo1": same_reason, "owner/repo2": same_reason}
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines
+    assert summary_lines[0].count(same_reason) == 1, (
+        f"a shared failure reason must be deduped, not repeated per repo: {summary_lines[0]!r}"
+    )
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_bounds_long_reason(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A single pathological message must not let the log line grow unbounded."""
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    huge_reason = "x" * 5000
+    mock_fleet_loop.return_value = _failed_fleet_result({"owner/repo1": huge_reason})
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines
+    assert len(summary_lines[0]) < 2000, (
+        f"an unbounded per-repo message must not dominate the summary line "
+        f"(got {len(summary_lines[0])} chars)"
+    )
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_guards_missing_message(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed repo with no/empty/whitespace-only message must not crash or append junk.
+
+    Whitespace-only is the case that a naive ``if r.get("message")`` guard
+    (truthy on unstripped text) lets through as a dangling ``" []"`` -- the
+    filter must run *after* stripping, not before.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _failed_fleet_result(
+        {"owner/repo1": None, "owner/repo2": "", "owner/repo3": "   "}
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True  # the supervisor loop itself must not crash
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines
+    assert "3 failed" in summary_lines[0]
+    # No dangling empty reason marker when every message is absent -- check
+    # only the text after "fleet pass N:" so the leading "[HH:MM:SS]"
+    # timestamp bracket (unrelated to the reason suffix) is not confused for it.
+    after_prefix = summary_lines[0].split("fleet pass 1:", 1)[1]
+    assert "[]" not in after_prefix
+    assert not after_prefix.rstrip().endswith("[")
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_silent_when_all_ok(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A fully healthy pass must not grow a reason suffix at all."""
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines
+    assert "0 failed" in summary_lines[0]
+    # No reason suffix at all when nothing failed -- check only the text after
+    # "fleet pass N:" so the leading "[HH:MM:SS]" timestamp bracket is not
+    # confused for a (nonexistent) reason marker.
+    after_prefix = summary_lines[0].split("fleet pass 1:", 1)[1]
+    assert "[" not in after_prefix
+
+
+def test_run_fleet_supervise_loop_reports_ok_on_a_clean_child_exit() -> None:
+    """The wrapper is transparent when the supervisor stops deliberately."""
+    result = run_fleet_supervise_loop(spawn=lambda _n: 0, max_relaunches=3)
+
+    assert result.ok is True
+    assert result.data["launches"] == 1
+    assert result.data["cap_reached"] is False
+
+
+def test_run_fleet_supervise_loop_reports_ok_when_the_cap_is_hit() -> None:
+    """Hitting the cap is a clean handoff, not a failure.
+
+    Stopping at the bound is the wrapper doing its job: it returns restart
+    authority to the 5-minute trigger instead of spinning. Reporting it as
+    ok=False would exit 1, which `except Exception` in `run_fleet_supervise`
+    already uses -- collapsing "self-deploy is not converging" and "supervisor
+    crashed" into one indistinguishable code. That is #862's own defect shape
+    one layer up, so the cap is signalled by the event and log instead.
+    """
+    recorded: list[object] = []
+    result = run_fleet_supervise_loop(
+        spawn=lambda _n: EXIT_RESTART_REQUESTED,
+        max_relaunches=2,
+        on_cap_reached=recorded.append,
+    )
+
+    assert result.ok is True
+    assert result.data["cap_reached"] is True
+    assert result.data["launches"] == 3
+    assert result.data["relaunches"] == 2
+    # Never exit 3 upward: the wrapper is the thing that consumed the restart
+    # request, so re-signalling it would ask the launcher to relaunch too.
+    assert "restart_requested" not in result.data
+    # ok=True is only defensible because the cap still announces itself.
+    assert len(recorded) == 1
+
+
+def test_run_fleet_supervise_loop_distinguishes_a_cap_from_an_abort() -> None:
+    """The paired control for the test above -- ok=True must not mask a crash.
+
+    Both conditions stop the wrapper, and the whole argument for ok=True on cap
+    is that a crash keeps exit 1 to itself. If that ever stopped being true the
+    cap's ok=True would be hiding real failures rather than disambiguating them.
+    """
+    capped_events: list[object] = []
+    aborted_events: list[object] = []
+    capped = run_fleet_supervise_loop(
+        spawn=lambda _n: EXIT_RESTART_REQUESTED,
+        max_relaunches=1,
+        on_cap_reached=capped_events.append,
+    )
+    aborted = run_fleet_supervise_loop(
+        spawn=lambda _n: 1, max_relaunches=1, on_cap_reached=aborted_events.append
+    )
+
+    assert (capped.ok, capped.data["cap_reached"]) == (True, True)
+    assert (aborted.ok, aborted.data["cap_reached"]) == (False, False)
+    assert (len(capped_events), len(aborted_events)) == (1, 0)
+
+
+def test_run_fleet_supervise_loop_does_not_touch_the_real_state_file() -> None:
+    """The cap callback must be injectable, not resolved from the live repo.
+
+    Its default writes through ``orchestrator_root()`` to the real ``events.db``
+    and ``state.json`` -- the ones the running supervisor owns. A cap test using
+    defaults therefore injects fake events into production and contends for the
+    live state lock. Asserting the parameter exists is what keeps the next cap
+    test from quietly reaching production again.
+    """
+    import inspect
+
+    signature = inspect.signature(run_fleet_supervise_loop)
+    assert "on_cap_reached" in signature.parameters
+
+
+def test_run_fleet_supervise_loop_propagates_a_child_failure() -> None:
+    """An aborted supervisor stays non-ok rather than being masked by the wrapper."""
+    result = run_fleet_supervise_loop(
+        spawn=lambda _n: 1, max_relaunches=3, on_cap_reached=lambda _r: None
+    )
+
+    assert result.ok is False
+    assert result.data["last_exit_code"] == 1
+    assert result.data["cap_reached"] is False
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -1745,6 +2036,11 @@ def test_run_fleet_supervise_respects_max_runtime(
     assert result.data["passes"] == 1
     assert mock_fleet_loop.call_count == 1
     assert fc.sleep_calls == [7.0]
+    # A runtime budget expiring is a deliberate stop, not a request to be
+    # replaced -- it shares ok=True with the restarting exits, so this field is
+    # the only thing keeping the wrapper from relaunching forever.
+    assert result.data["exit_reason"] == "max_runtime"
+    assert result.data["restart_requested"] is False
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -1984,11 +2280,20 @@ def test_supervisor_lifecycle_abnormal_exit_alerts_when_notify_enabled(
     with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
         run_fleet_supervise(max_passes=3)
 
-    mock_emit.assert_called_once()
-    entry = mock_emit.call_args.args[1]
+    # The autouse fixture's self-deploy no-op also emits its own OK transition
+    # unconditionally on every successful self-deploy (issue #817 fix, main-side
+    # and unrelated to supervisor lifecycle), so two calls are expected here --
+    # find the fleet-supervisor one specifically.
+    fleet_supervisor_calls = [
+        call
+        for call in mock_emit.call_args_list
+        if call.args[1].adapter_kind == "fleet-supervisor"
+    ]
+    assert len(fleet_supervisor_calls) == 1
+    entry = fleet_supervisor_calls[0].args[1]
     assert entry.adapter_kind == "fleet-supervisor"
     assert entry.health == "ERROR"
-    assert mock_emit.call_args.kwargs.get("persistent") is False
+    assert fleet_supervisor_calls[0].kwargs.get("persistent") is False
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -2012,7 +2317,17 @@ def test_supervisor_lifecycle_clean_exit_does_not_alert(
         fc = _FakeClock(auto_advance=1.0)
         run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
 
-    mock_emit.assert_not_called()
+    # The autouse fixture's self-deploy no-op emits its own OK transition
+    # unconditionally on every successful self-deploy (issue #817 fix, main-side
+    # and unrelated to supervisor lifecycle) -- that is expected. What this test
+    # actually guards is that the clean supervisor exit itself does not
+    # additionally alert.
+    fleet_supervisor_calls = [
+        call
+        for call in mock_emit.call_args_list
+        if call.args[1].adapter_kind == "fleet-supervisor"
+    ]
+    assert fleet_supervisor_calls == []
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -2087,6 +2402,7 @@ def test_supervisor_lifecycle_self_deploy_head_move_reason(
             pulled=True,
             changed=True,
             synced=False,
+            head_changed=True,
             from_sha="aaa",
             to_sha="bbb",
             message="moved",
@@ -2390,6 +2706,7 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
             pulled=True,
             changed=True,
             synced=True,
+            head_changed=True,
             from_sha="abc123",
             to_sha="def456",
             message="updated and synced: def456",
@@ -2407,6 +2724,141 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     assert deploy_mock.call_count == 1
     # fleet_loop must never run this pass's (now-stale) code path.
     assert mock_fleet_loop.call_count == 0
+    # #862: the exit must say *why*, so the launcher can relaunch immediately
+    # instead of leaving the fleet unsupervised for a full watchdog interval.
+    # ok=True alone is what made this indistinguishable from a clean timeout.
+    assert result.data["exit_reason"] == "self_deploy"
+    assert result.data["restart_requested"] is True
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A failure in post-loop bookkeeping must not suppress the restart signal.
+
+    ``record_zero_pass_streak`` runs after the loop and does real file I/O
+    (mkdir, state_lock, log_event); its own docstring says it can raise. It used
+    to sit bare inside the outer ``try``, whose handler rewrote ``exit_reason``
+    to ``aborted`` and ``restart_requested`` to False unconditionally. So a
+    self-deploy that pulled new code, followed by a counter write failing on a
+    locked state file, produced an exit the wrapper read as "do not relaunch" --
+    the #862 outage, reachable through a secondary failure that has nothing to
+    do with whether new code is on disk.
+
+    The important assertion is ``restart_requested``, not ``ok``: the run really
+    did fail, so ok=False is correct. What must survive is the instruction to
+    replace this process.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=True,
+            head_changed=True,
+            from_sha="abc123",
+            to_sha="def456",
+            message="updated and synced: def456",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    def _boom(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("state file locked by another process")
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.record_zero_pass_streak", _boom)
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.data["exit_reason"] == "self_deploy"
+    assert result.data["restart_requested"] is True
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_an_operator_interrupt_never_asks_to_be_relaunched(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Ctrl-C means stop, and a wrapper that relaunched would defeat that.
+
+    ``interrupted`` is a named reason rather than an unset default precisely so
+    this intent is stated and testable. Nothing verified it when the vocabulary
+    was introduced, which left the one exit an operator triggers by hand relying
+    on ``None`` happening to fall outside ``RESTART_EXIT_REASONS``.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.side_effect = KeyboardInterrupt()
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.data["exit_reason"] == "interrupted"
+    assert result.data["restart_requested"] is False
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_a_mid_loop_crash_reports_aborted_and_does_not_relaunch(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A crash with no restarting reason already set stays non-restarting.
+
+    The control for
+    ``test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart``:
+    that test proves an already-set reason survives the handler, and this one
+    proves the handler did not simply start relaunching on every exception.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.side_effect = RuntimeError("boom")
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is False
+    assert result.data["exit_reason"] == "aborted"
+    assert result.data["restart_requested"] is False
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -2448,6 +2900,65 @@ def test_run_fleet_supervise_does_not_restart_when_already_up_to_date(
 
     assert result.ok is True
     assert result.data["passes"] == 3
+    assert mock_fleet_loop.call_count == 3
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_does_not_restart_on_deferred_sync_with_unmoved_head(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Regression guard for the total-fleet-outage bug (issue root cause).
+
+    self_deploy reports a differing ``from_sha``/``to_sha`` pair even though
+    HEAD did not move on *this* attempt, because those shas are carried
+    forward from an earlier deferred-sync marker (see
+    ``test_self_deploy_loud_warning_on_repeated_deferral`` in
+    test_supervise.py for the producer side of this exact scenario). Gating
+    the restart-exit on ``from_sha != to_sha`` instead of ``head_changed``
+    made the supervisor exit and relaunch every single pass without ever
+    reaching zero live workers to complete the deferred sync -- a total
+    fleet outage. ``head_changed=False`` here must keep the loop running.
+    """
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            head_changed=False,
+            from_sha="abc123",
+            to_sha="def456",
+            message="sync deferred: 2 runners active",
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+
+    assert result.ok is True
+    assert result.data["passes"] == 3
+    assert deploy_mock.call_count == 3
+    # The pending-sync marker's from_sha != to_sha must not trigger a
+    # restart-exit when head_changed is False -- the loop must keep running
+    # so live-worker draining can eventually reach zero and complete the
+    # deferred sync.
     assert mock_fleet_loop.call_count == 3
 
 
@@ -2508,6 +3019,12 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     assert deploy_mock.call_count == 1
     # fleet_loop must never run with stale code.
     assert mock_fleet_loop.call_count == 0
+    # head_drift is the OTHER half of the restart contract (RESTART_EXIT_REASONS
+    # holds exactly self_deploy and head_drift). Only self_deploy was asserted
+    # when the field was introduced, so an edit dropping the reason here would
+    # have left drift silently non-restarting with every test still green.
+    assert result.data["exit_reason"] == "head_drift"
+    assert result.data["restart_requested"] is True
 
 
 @patch("charlie_work.fleet_dispatch.emit_digest")
@@ -2931,7 +3448,17 @@ def test_api_worker_fleet_report_to_dict() -> None:
 
 
 def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
-    """The report reads spend from the representative (enabled) repo's ledger."""
+    """The report reads spend from the representative (enabled) repo's ledger.
+
+    Regression for issue #828 (originally #822's class): production derives
+    its own `today = now.strftime("%Y-%m-%d")` ledger key independently of
+    this test's fixture write. If the wall clock crosses UTC midnight between
+    the write and `compute_api_worker_fleet_report`'s read, the lookup misses
+    and the report shows $0.00 instead of the expected spend -- a real (if
+    rare) production defect, not just a test flake. `now` is frozen and
+    passed to both the fixture and the report call so the ledger key always
+    matches regardless of any stall or midnight boundary in between.
+    """
     from datetime import UTC, datetime
 
     fleet_dir = tmp_path / "fleet"
@@ -2940,7 +3467,8 @@ def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
     state_dir0 = repo0 / ".var" / "charlie-work"
 
     # Write a ledger with today's spend.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    frozen_now = datetime(2026, 7, 29, 12, 0, 0, tzinfo=UTC)
+    today = frozen_now.strftime("%Y-%m-%d")
     ledger_data = {
         "days": {today: {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "usd": 2.25}},
         "lifetime_usd": 8.75,
@@ -2962,7 +3490,7 @@ def test_api_worker_fleet_report_spend_from_ledger(tmp_path: Path) -> None:
     }
     _make_fleet_json(tmp_path, fleet_dir, repos_map)
 
-    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir), now=frozen_now)
 
     assert report is not None
     assert report.today_usd == 2.25
@@ -3577,7 +4105,7 @@ def test_fleet_loop_actually_reaches_the_allocation_pass(
         work_only=False,
     )
 
-    from charlie_work.runner_slots import UNATTENDED_ALLOCATION_SOURCE
+    from ci_fleet.charlie_work_adapter import UNATTENDED_ALLOCATION_SOURCE
 
     mock_run_allocation_pass.assert_called_once()
     assert mock_run_allocation_pass.call_args.kwargs["dry_run"] is False
@@ -4096,3 +4624,614 @@ def test_build_fleet_attention_digest_stateful_mixed_persistent_and_occurrence(
     healths3 = [t.health for t in digest3.transitions]
     assert healths3 == ["STALLED", "OK"]
     assert digest3.transitions[0].previous_health == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Issue #817: fleet health latch (producer never fed a recovery observation)
+# ---------------------------------------------------------------------------
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_self_deploy_failure_success_failure_emits_three_transitions(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_emit_digest: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #817 AC1: failure -> success -> failure must emit three digest
+    entries, not one.
+
+    Before this fix, the producer only ever constructed an AttentionEntry
+    for a *failed* self_deploy (item 1's defect): the recovery pass built no
+    entry at all, so the baseline sidecar stayed latched at ERROR from the
+    first failure onward. ``_filter_fleet_health_transitions`` itself was
+    already a correct edge-detector -- the second failure would read
+    ERROR -> ERROR against that latched baseline and be suppressed as a
+    non-transition, even though a real recovery happened in between.
+    """
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import _fleet_health_state_path
+    from charlie_work.fleet_dispatch import _load_fleet_health_state as _load_state
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        ),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    mock_lock.return_value = MagicMock()
+
+    deploy_mock = MagicMock(
+        side_effect=[
+            SelfDeployResult(
+                ok=False,
+                pulled=False,
+                changed=False,
+                synced=False,
+                error="fatal: Not possible to fast-forward, aborting.",
+            ),
+            SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=False,
+                synced=False,
+                from_sha="abc123",
+                to_sha="abc123",
+                message="already up to date",
+            ),
+            SelfDeployResult(
+                ok=False,
+                pulled=False,
+                changed=False,
+                synced=False,
+                error="fatal: Not possible to fast-forward, aborting.",
+            ),
+        ]
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    # from_sha == to_sha on the success pass deliberately: a real HEAD move
+    # would trigger the supervisor's separate restart-for-fresh-code exit
+    # (see test_run_fleet_supervise_restarts_when_self_deploy_moves_head),
+    # which would end the loop after pass 2 and never reach the third
+    # failure this test needs to observe.
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(
+        max_passes=3,
+        clock=fc.now,
+        sleep=fc.sleep,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    assert mock_emit_digest.call_count == 3
+    healths = [call.args[1].transitions[0].health for call in mock_emit_digest.call_args_list]
+    assert healths == ["ERROR", "OK", "ERROR"]
+    previous = [
+        call.args[1].transitions[0].previous_health for call in mock_emit_digest.call_args_list
+    ]
+    assert previous == [None, "ERROR", "OK"]
+
+    # Final persisted baseline reflects the third (failed) pass.
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    assert _load_state(state_file) == {"self-deploy:-1": "ERROR"}
+
+
+@patch("charlie_work.fleet_dispatch.emit_digest")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_self_deploy_success_clears_error_baseline(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_emit_digest: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #817 AC2: after a failure -> success sequence, the *persisted*
+    baseline sidecar itself reads back the healthy value -- not just the
+    digest object returned in-process for that pass -- proving state
+    genuinely moved off the ERROR latch. This is the fact AC1's third
+    (failure) emission depends on: if the sidecar file did not actually
+    change, the in-memory digest assertion alone would not distinguish a
+    real fix from one that merely happens to return the right object once.
+    """
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import _fleet_health_state_path
+    from charlie_work.fleet_dispatch import _load_fleet_health_state as _load_state
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        ),
+        notify=NotifyConfig(
+            enabled=True,
+            sink="file",
+            file_path=str(tmp_path / "digest.jsonl"),
+        ),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    mock_lock.return_value = MagicMock()
+
+    deploy_mock = MagicMock(
+        side_effect=[
+            SelfDeployResult(
+                ok=False, pulled=False, changed=False, synced=False, error="pull failed"
+            ),
+            SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=False,
+                synced=False,
+                from_sha="abc123",
+                to_sha="abc123",
+                message="already up to date",
+            ),
+        ]
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(
+        max_passes=2,
+        clock=fc.now,
+        sleep=fc.sleep,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    assert _load_state(state_file) == {"self-deploy:-1": "OK"}
+
+
+# ---------------------------------------------------------------------------
+# Zero-repo-pass streak (issue #855, the general shape behind #851)
+# ---------------------------------------------------------------------------
+
+
+def test_fleet_has_configured_repos_true_with_registered_repo(tmp_path: Path) -> None:
+    fleet_dir = tmp_path / "fleet"
+    _make_fleet_json(tmp_path, fleet_dir, {"owner/repo": {"repo_root": str(tmp_path / "repo")}})
+    assert _fleet_has_configured_repos(str(fleet_dir), None) is True
+
+
+def test_fleet_has_configured_repos_false_with_empty_registry(tmp_path: Path) -> None:
+    fleet_dir = tmp_path / "fleet"
+    _make_fleet_json(tmp_path, fleet_dir, {})
+    assert _fleet_has_configured_repos(str(fleet_dir), None) is False
+
+
+def test_fleet_has_configured_repos_false_with_no_registry_file(tmp_path: Path) -> None:
+    """A fleet.json that was never written (fresh host, nothing registered
+    yet) must read the same as an explicitly empty registry."""
+    assert _fleet_has_configured_repos(str(tmp_path / "never-written"), None) is False
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #855 acceptance criterion 7: replay the #851 outage shape.
+
+    N consecutive supervisor *process* restarts -- each modeled as a
+    separate ``run_fleet_supervise()`` call, exactly like the Task Scheduler
+    watchdog relaunching the process every cycle -- every one exiting via
+    the self-deploy HEAD-moved break before ``fleet_loop`` ever runs: exit
+    code 0 every cycle, ``repo_passes == 0`` every cycle (the log line the
+    issue's evidence quotes: "1 pass(es) ... 0 repo pass(es)"), despite a
+    repo being registered in the fleet. Exactly one
+    ``supervisor_zero_pass_alarm`` must fire, at the cycle the persisted
+    streak reaches the configured threshold (3) -- not one per restart.
+    """
+    mock_lock.return_value = MagicMock()
+
+    fleet_dir = tmp_path / "fleet"
+    isolated_root = tmp_path / "orchestrator-root"
+    isolated_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _make_fleet_json(tmp_path, fleet_dir, {"owner/repo": {"repo_root": str(repo_root)}})
+
+    # Isolate orchestrator_root() so the streak counter and alarm event
+    # land under an ephemeral tmp_path state dir, never the real checkout
+    # this test suite runs from.
+    monkeypatch.setattr("charlie_work.fleet_dispatch.orchestrator_root", lambda: isolated_root)
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+            zero_pass_alarm=3,
+        )
+    )
+    mock_load_config.return_value = cfg
+
+    # Every self_deploy call reports a HEAD move -> run_fleet_supervise
+    # exits (break) right after pass 1, before ever reaching fleet_loop this
+    # process's lifetime.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        lambda _repo_root, **_kwargs: SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            # run_fleet_supervise's restart gate reads head_changed, NOT
+            # from_sha != to_sha (#853). Without this the simulated HEAD move
+            # is a no-op, the supervisor never exits for a watchdog restart,
+            # and this test stops exercising the #851 shape it is named for.
+            head_changed=True,
+            from_sha="a" * 12,
+            to_sha="b" * 12,
+            message="updated and synced: " + "b" * 12,
+        ),
+    )
+
+    state_path = layout.state_file_path(layout.default_state_root(isolated_root))
+
+    for cycle in range(1, 4):
+        fc = _FakeClock(auto_advance=1.0)
+        result = run_fleet_supervise(
+            fleet_dir_override=str(fleet_dir),
+            max_passes=5,
+            clock=fc.now,
+            sleep=fc.sleep,
+        )
+        assert result.ok is True
+        assert result.data["passes"] == 1
+        assert result.data["total_repo_passes"] == 0
+        # fleet_loop must never run -- every cycle exits before reaching it.
+        assert mock_fleet_loop.call_count == 0
+
+        alarms = query_events(state_path, kind="supervisor_zero_pass_alarm")
+        if cycle < 3:
+            assert alarms == [], f"alarm fired early at cycle {cycle}"
+        else:
+            assert len(alarms) == 1, f"expected exactly one alarm by cycle {cycle}"
+            assert alarms[0]["payload"]["consecutive_zero_pass_cycles"] == 3
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Issue #855 acceptance criterion 4, exercised end to end: a fleet with
+    zero registered repos never fires the alarm, no matter how many
+    consecutive zero-repo-pass cycles it runs -- that is a configuration
+    state, not an incident.
+    """
+    mock_lock.return_value = MagicMock()
+
+    fleet_dir = tmp_path / "fleet"
+    isolated_root = tmp_path / "orchestrator-root"
+    isolated_root.mkdir()
+    # Deliberately no _make_fleet_json call: the registry is empty.
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.orchestrator_root", lambda: isolated_root)
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        lambda _repo_root, **_kwargs: SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            # run_fleet_supervise's restart gate reads head_changed, NOT
+            # from_sha != to_sha (#853). Without this the simulated HEAD move
+            # is a no-op, the supervisor never exits for a watchdog restart,
+            # and this test stops exercising the #851 shape it is named for.
+            head_changed=True,
+            from_sha="a" * 12,
+            to_sha="b" * 12,
+            message="updated and synced: " + "b" * 12,
+        ),
+    )
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+            zero_pass_alarm=3,
+        )
+    )
+    mock_load_config.return_value = cfg
+
+    state_path = layout.state_file_path(layout.default_state_root(isolated_root))
+
+    for _ in range(6):
+        fc = _FakeClock(auto_advance=1.0)
+        result = run_fleet_supervise(
+            fleet_dir_override=str(fleet_dir),
+            max_passes=5,
+            clock=fc.now,
+            sleep=fc.sleep,
+        )
+        assert result.ok is True
+        assert result.data["total_repo_passes"] == 0
+
+    assert mock_fleet_loop.call_count == 0
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A cycle that actually reaches fleet_loop and performs repo work resets
+    the streak to 0, so a later zero-pass streak has to build back up to the
+    threshold instead of alarming immediately off carried-over count.
+    """
+    mock_lock.return_value = MagicMock()
+
+    fleet_dir = tmp_path / "fleet"
+    isolated_root = tmp_path / "orchestrator-root"
+    isolated_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _make_fleet_json(tmp_path, fleet_dir, {"owner/repo": {"repo_root": str(repo_root)}})
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.orchestrator_root", lambda: isolated_root)
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+            zero_pass_alarm=3,
+        )
+    )
+    mock_load_config.return_value = cfg
+    state_path = layout.state_file_path(layout.default_state_root(isolated_root))
+
+    head_moved = SelfDeployResult(
+        ok=True,
+        pulled=True,
+        changed=True,
+        synced=False,
+        # run_fleet_supervise's restart gate reads head_changed, NOT
+        # from_sha != to_sha (#853). Without this the simulated HEAD move
+        # is a no-op, the supervisor never exits for a watchdog restart,
+        # and this test stops exercising the #851 shape it is named for.
+        head_changed=True,
+        from_sha="a" * 12,
+        to_sha="b" * 12,
+        message="updated and synced: " + "b" * 12,
+    )
+    no_op = SelfDeployResult(
+        ok=True, pulled=True, changed=False, synced=False, message="already up to date"
+    )
+
+    # Two zero-repo-pass cycles (streak -> 2, below threshold 3).
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: head_moved
+    )
+    for _ in range(2):
+        fc = _FakeClock(auto_advance=1.0)
+        run_fleet_supervise(
+            fleet_dir_override=str(fleet_dir), max_passes=5, clock=fc.now, sleep=fc.sleep
+        )
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
+
+    # A cycle that actually performs repo work: self_deploy is a no-op, so
+    # the loop proceeds to fleet_loop, which reports one repo processed.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: no_op
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(
+        fleet_dir_override=str(fleet_dir), max_passes=1, clock=fc.now, sleep=fc.sleep
+    )
+    assert result.data["total_repo_passes"] == 1
+
+    # Two more zero-repo-pass cycles: if the streak had not reset, this
+    # would already be 4 (past threshold 3) and would have alarmed already;
+    # since it reset to 0, two more cycles land at 2 -- still below 3.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy", lambda _repo_root, **_kwargs: head_moved
+    )
+    for _ in range(2):
+        fc = _FakeClock(auto_advance=1.0)
+        run_fleet_supervise(
+            fleet_dir_override=str(fleet_dir), max_passes=5, clock=fc.now, sleep=fc.sleep
+        )
+    assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
+
+
+def test_filter_fleet_health_transitions_reconciles_stale_key_when_repo_observed(
+    tmp_path: Path,
+) -> None:
+    """Issue #817 item 2/AC5: a stale ERROR baseline for an issue that is
+    healthy again (produces no unhealthy event this pass) is cleared once
+    its repo's lane is confirmed observed, instead of latching forever.
+
+    This is also the drain mechanism for the pre-existing 34 latched keys
+    (issue #817's diagnosis): each key's repo needs exactly one observed
+    pass with no matching unhealthy entry to clear it, after which the next
+    real failure emits with ``previous_health: null`` again instead of
+    staying permanently suppressed by a baseline that could never move
+    except deeper into an unhealthy value.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entry = AttentionEntry(
+        issue_number=42,
+        adapter_kind="owner/repo",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="failed to launch claude: OSError",
+        pid=None,
+    )
+
+    # Pass 1: latch ERROR.
+    first = _filter_fleet_health_transitions([entry], state_file)
+    assert len(first) == 1
+    assert _load_fleet_health_state(state_file) == {"owner/repo:42": "ERROR"}
+
+    # Pass 2: issue #42 recovered -- no unhealthy entry for it this pass, but
+    # its repo's lane still ran to completion (observed_repo_keys includes
+    # "owner/repo"). The stale key must be cleared, not re-emitted as a
+    # synthetic recovery entry.
+    second = _filter_fleet_health_transitions(
+        [], state_file, observed_repo_keys=frozenset({"owner/repo"})
+    )
+    assert second == []
+    assert _load_fleet_health_state(state_file) == {}
+
+    # Pass 3: the same issue fails again. Because the baseline was cleared,
+    # this is a fresh null -> ERROR transition, not a suppressed repeat.
+    third = _filter_fleet_health_transitions([entry], state_file)
+    assert len(third) == 1
+    assert third[0].previous_health is None
+
+
+def test_filter_fleet_health_transitions_leaves_unobserved_repo_keys_untouched(
+    tmp_path: Path,
+) -> None:
+    """A repo whose lane did NOT run this pass (missing repo_root, lock held,
+    unhandled exception) must not have its stale keys reconciled away --
+    absence of a check is not evidence of health. Only keys under repos
+    present in ``observed_repo_keys`` are eligible for clearing.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    entry = AttentionEntry(
+        issue_number=7,
+        adapter_kind="owner/skipped-repo",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="stalled",
+        pid=None,
+    )
+    first = _filter_fleet_health_transitions([entry], state_file)
+    assert len(first) == 1
+
+    # A different repo's lane ran this pass; "owner/skipped-repo" did not.
+    second = _filter_fleet_health_transitions(
+        [], state_file, observed_repo_keys=frozenset({"owner/other-repo"})
+    )
+    assert second == []
+    assert _load_fleet_health_state(state_file) == {"owner/skipped-repo:7": "ERROR"}
+
+
+def test_filter_fleet_health_transitions_self_deploy_key_survives_repo_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Item 1's ``self-deploy:-1`` baseline key and item 2's per-repo
+    reconciliation share the same sidecar file within one supervisor pass
+    (self_deploy emits first, then fleet_loop's digest reconciles). The
+    ``self-deploy`` adapter_kind is a fixed literal, never a real repo's
+    ``name_with_owner``, so it can never appear in ``observed_repo_keys`` and
+    must never be cleared by issue-health reconciliation -- confirmed here by
+    a test rather than left as an unverified by-construction claim.
+    """
+    from charlie_work.fleet_dispatch import (
+        _fleet_health_state_path,
+        _filter_fleet_health_transitions,
+        _load_fleet_health_state,
+    )
+    from charlie_work.notify import AttentionEntry
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    self_deploy_entry = AttentionEntry(
+        issue_number=-1,
+        adapter_kind="self-deploy",
+        health="ERROR",
+        previous_health=None,
+        last_log_line="pull failed",
+        pid=None,
+    )
+    _filter_fleet_health_transitions([self_deploy_entry], state_file)
+    assert _load_fleet_health_state(state_file) == {"self-deploy:-1": "ERROR"}
+
+    # A real repo's lane runs and reconciles this pass; self-deploy's key
+    # must not be touched even though no self-deploy entry was emitted.
+    result = _filter_fleet_health_transitions(
+        [], state_file, observed_repo_keys=frozenset({"owner/repo"})
+    )
+    assert result == []
+    assert _load_fleet_health_state(state_file) == {"self-deploy:-1": "ERROR"}
+
+
+def test_build_fleet_attention_digest_observed_repo_keys_reconciles_stale_error(
+    tmp_path: Path,
+) -> None:
+    """Issue #817 item 2: ``_build_fleet_attention_digest`` forwards
+    ``observed_repo_keys`` through to ``_filter_fleet_health_transitions``,
+    so ``fleet_loop``'s per-pass reconciliation actually reaches the
+    baseline sidecar rather than being silently dropped somewhere in
+    between.
+    """
+    from charlie_work.fleet_dispatch import (
+        _build_fleet_attention_digest,
+        _fleet_health_state_path,
+        _load_fleet_health_state,
+    )
+
+    state_file = _fleet_health_state_path(str(tmp_path / "fleet"))
+    events = [
+        {
+            "repo_key": "owner/repo",
+            "type": "error",
+            "issue_number": 100,
+            "error": "PR #100 review failed: timeout",
+        }
+    ]
+    digest1 = _build_fleet_attention_digest(events, state_file=state_file)
+    assert len(digest1.transitions) == 1
+    assert _load_fleet_health_state(state_file) == {"owner/repo:100": "ERROR"}
+
+    # Next pass: issue #100 is healthy again (no error event for it), but
+    # the repo's lane ran to completion -- observed_repo_keys reconciles the
+    # stale key away.
+    digest2 = _build_fleet_attention_digest(
+        [], state_file=state_file, observed_repo_keys=frozenset({"owner/repo"})
+    )
+    assert digest2.transitions == ()
+    assert _load_fleet_health_state(state_file) == {}

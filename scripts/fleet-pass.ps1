@@ -26,7 +26,11 @@ $logDir = Join-Path $root '.var\charlie-work\logs'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 $log = Join-Path $logDir 'fleet-pass.log'
 
-"--- fleet supervise start $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
+# Must name the same command as the exit marker below. These two lines bracket one
+# run in the log, and #862 changed the command under the exit marker only, leaving a
+# pass that started as "supervise" and ended as "supervise-loop" -- which reads like
+# two interleaved runs precisely when someone is untangling a restart.
+"--- fleet supervise-loop start $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
 
 # Native supervisor call. Three settings are REQUIRED for this to run at all under
 # Windows PowerShell 5.1 (observed 2026-07-17 — old launcher wrote the marker then
@@ -72,6 +76,38 @@ $env:PYTHONIOENCODING = 'utf-8'
 # (FF-pull origin/main + uv sync on dep changes) before each fleet_loop pass.
 # The one-pass lag applies: a pass pulls new code but runs the already-imported
 # module; the pulled code takes effect on the NEXT pass.
-$cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" charlie fleet supervise --max-runtime 0 >> `"$log`" 2>&1"
+#
+# INVOKED AS `python -m charlie_work`, NOT AS THE `charlie` CONSOLE SCRIPT.
+# This is load-bearing and must not be "simplified" back (issue #854).
+#
+# `uv sync` reinstalls the editable project on every run, and its uninstall half
+# must delete `.venv/Scripts/charlie.exe`. Windows locks running executables, so
+# launching via the console script means the supervisor holds an exclusive handle
+# on the exact file its own in-process self-deploy has to replace:
+#
+#   error: failed to remove file `...\.venv\...\../../Scripts/charlie.exe`:
+#          Access is denied. (os error 5)
+#
+# That is structural, not a race — the process invoking the sync IS the lock
+# holder, so no retry or backoff can ever succeed. Entering through
+# `python -m charlie_work` (src/charlie_work/__main__.py, same `cli:main`) means
+# the locked image is python.exe, which `uv sync` never replaces, leaving
+# charlie.exe free to be rewritten.
+# Entered through `fleet supervise-loop`, which runs `fleet supervise` as a child
+# and relaunches it immediately when it exits to pick up new code (issue #862).
+#
+# Before this, the only thing that relaunched a self-deployed supervisor was this
+# script's own 5-minute scheduled trigger, so every self-deploy left the fleet
+# with no supervisor for up to a full interval -- silently, because the exit code
+# was 0 either way.
+#
+# The relaunch decision stays inside Python: `supervise-loop` compares the child's
+# exit code against its own EXIT_RESTART_REQUESTED constant, so this script never
+# hardcodes that number. The bound (--max-relaunches) matters as much as the
+# relaunch: on hitting it the wrapper EXITS, handing restart authority back to the
+# 5-minute trigger below rather than pinning a stale wrapper process forever.
+#
+# Everything after `--` is forwarded to `fleet supervise` verbatim.
+$cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" python -m charlie_work fleet supervise-loop -- --max-runtime 0 >> `"$log`" 2>&1"
 & cmd /c $cmdLine
-"--- fleet supervise exit=$LASTEXITCODE $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
+"--- fleet supervise-loop exit=$LASTEXITCODE $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8

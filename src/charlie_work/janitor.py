@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import builtins
 import fnmatch
+import logging
 import re
 import subprocess
 from collections.abc import Iterator
@@ -29,8 +30,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from charlie_work.checks import CheckSummary, classify_check_failures, summarize_checks
+from charlie_work.checks import (
+    CheckSummary,
+    classify_check_failures,
+    classify_infra_failures,
+    summarize_checks,
+)
 from charlie_work.github import linked_issue_number
+from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import (
     hidden_console_kwargs,
     no_console_window_kwargs,
@@ -42,6 +49,8 @@ if TYPE_CHECKING:
 
 # Builtin names that should not be treated as external constants in assertions.
 _BUILTIN_NAMES = frozenset(name for name in dir(builtins) if not name.startswith("_"))
+
+logger = logging.getLogger(__name__)
 
 
 # Case-insensitive word-boundary regex for tests/rationale markers.
@@ -144,10 +153,34 @@ class JanitorVerdict:
     is_check_failure_block: bool = False
     rerun_run_ids: tuple[int, ...] = ()
     check_rerun_attempts: dict[str, Any] = field(default_factory=dict)
+    # Infra-failed (CANCELLED/INFRA_FAILURE/TIMED_OUT) required-check auto-rerun
+    # and escalation (issue #841). is_infra_failure_block mirrors
+    # is_check_failure_block: True only when an infra-failed required check is
+    # the SOLE janitor blocker this pass. Consumers must branch on this
+    # structured flag, never on the failure-message text (same rule as the
+    # is_draft_only_block/is_no_op_rework flags below).
+    is_infra_failure_block: bool = False
+    infra_rerun_run_ids: tuple[int, ...] = ()
+    infra_rerun_attempts: dict[str, Any] = field(default_factory=dict)
+    # Infra-failed required checks that will NOT be retried this pass, either
+    # because every failing run id has exhausted auto_merge.infra_rerun_attempt_cap
+    # or because no run id could be parsed at all. Non-empty here together with
+    # is_infra_failure_block is the caller's signal to escalate to a human --
+    # there is no code-fix rework path for an infra failure.
+    infra_definitive_failed: tuple[str, ...] = ()
     # Structured flag for _check_no_op_rework's finding (either variant:
     # patch-id or head-SHA unchanged since the last request_changes verdict).
     # Consumers must branch on this, never on the failure-message text.
     is_no_op_rework: bool = False
+    # Structured flags for _check_draft's finding (issue #818). is_draft is
+    # true whenever GitHub reports the PR as a draft, regardless of any other
+    # failure. is_draft_only_block is true only when draft is the SOLE janitor
+    # failure -- i.e. every other gate (checks, mergeable, linked issue, body,
+    # ...) already passed -- which is the "otherwise ready" condition workflow
+    # review() uses to decide whether auto-readying the PR is safe. Consumers
+    # must branch on these flags, never on the failure-message text.
+    is_draft: bool = False
+    is_draft_only_block: bool = False
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -300,10 +333,16 @@ def run_janitor(
     if summary is not None:
         failed_required_checks = summary.failed
 
-    _check_draft(pr, failures)
+    is_draft = _check_draft(pr, failures)
     _check_state(pr, failures)
     _check_mergeable(pr, failures)
+    # Marker to isolate exactly what _check_required_checks contributes below,
+    # so is_infra_failure_block (issue #841) can tell "infra_failed is the only
+    # required-checks-derived failure" apart from a co-occurring missing/
+    # unavailable check, without parsing failure-message text.
+    pre_required_checks_len = len(failures)
     _check_required_checks(summary, failures, warnings)
+    required_checks_added = len(failures) - pre_required_checks_len
     _check_linked_issue(pr, config, failures)
     _check_body(pr, config, failures)
     _check_title_conventional(pr, warnings)
@@ -323,12 +362,34 @@ def run_janitor(
 
     is_check_failure_block = bool(failed_required_checks) and not failures
 
+    # issue #841: mirror is_check_failure_block for infra-failed required
+    # checks. `failures` at this point still excludes the "Required check(s)
+    # failed" message (appended below) but DOES include
+    # _check_required_checks' own infra_failed/missing/unavailable messages --
+    # `required_checks_added` isolates exactly that contribution so this is
+    # True only when infra_failed is non-empty, no missing/unavailable check
+    # co-occurs (which would inflate required_checks_added past 1), no
+    # genuine code failure co-occurs, and nothing else in `failures` (draft,
+    # state, mergeable, linked issue, body, no-op-rework) is set.
+    non_required_checks_failures = len(failures) - required_checks_added
+    is_infra_failure_block = (
+        summary is not None
+        and bool(summary.infra_failed)
+        and not failed_required_checks
+        and not summary.missing
+        and not summary.unavailable
+        and non_required_checks_failures == 0
+    )
+
     # Flake-aware debounce (issue #391): if the only blocker is failed required
     # checks, decide which runs get a one-time auto-rerun vs which are already
     # retried and therefore definitive. The actual gh run rerun call lives in
     # workflow.review; run_janitor stays pure and just returns the classification.
     rerun_run_ids: tuple[int, ...] = ()
     check_rerun_attempts: dict[str, Any] = {}
+    infra_rerun_run_ids: tuple[int, ...] = ()
+    infra_rerun_attempts: dict[str, Any] = {}
+    infra_definitive_failed: tuple[str, ...] = ()
     if summary is not None:
         head_sha = str(pr.get("headRefOid") or "") or None
         debounce = classify_check_failures(
@@ -341,8 +402,29 @@ def run_janitor(
         rerun_run_ids = debounce.rerun_run_ids
         check_rerun_attempts = debounce.check_rerun_attempts
 
+        # Infra-failure auto-rerun + escalation (issue #841): same debounce
+        # shape as above, but over CANCELLED/INFRA_FAILURE/TIMED_OUT checks,
+        # which have no code-fix rework path -- see classify_infra_failures.
+        infra_debounce = classify_infra_failures(
+            checks,
+            required,
+            pr_state,
+            head_sha,
+            record_attempts=is_infra_failure_block,
+            attempt_cap=config.auto_merge.infra_rerun_attempt_cap,
+        )
+        infra_rerun_run_ids = infra_debounce.rerun_run_ids
+        infra_rerun_attempts = infra_debounce.infra_rerun_attempts
+        infra_definitive_failed = infra_debounce.definitive_failed
+
     if failed_required_checks:
         failures.append(f"Required check(s) failed: {', '.join(failed_required_checks)}")
+
+    # "Otherwise ready" (issue #818): draft is the ONLY failure once every
+    # other gate above (state, mergeable, required checks, linked issue,
+    # body, no-op-rework, ...) has had its say. A real failing check or any
+    # other janitor failure lengthens `failures` and disqualifies auto-ready.
+    is_draft_only_block = is_draft and len(failures) == 1
 
     return JanitorVerdict(
         ok=not failures,
@@ -352,15 +434,24 @@ def run_janitor(
         is_check_failure_block=is_check_failure_block,
         rerun_run_ids=rerun_run_ids,
         check_rerun_attempts=check_rerun_attempts,
+        is_infra_failure_block=is_infra_failure_block,
+        infra_rerun_run_ids=infra_rerun_run_ids,
+        infra_rerun_attempts=infra_rerun_attempts,
+        infra_definitive_failed=infra_definitive_failed,
         is_no_op_rework=is_no_op_rework,
+        is_draft=is_draft,
+        is_draft_only_block=is_draft_only_block,
     )
 
 
-def _check_draft(pr: dict[str, Any], failures: list[str]) -> None:
+def _check_draft(pr: dict[str, Any], failures: list[str]) -> bool:
+    """Detect a draft PR. Returns True iff the draft failure was appended."""
     if "isDraft" not in pr:
-        return
+        return False
     if bool(pr.get("isDraft")):
         failures.append("PR is a draft")
+        return True
+    return False
 
 
 def _check_state(pr: dict[str, Any], failures: list[str]) -> None:
@@ -591,12 +682,27 @@ def _check_no_op_rework(
             # Enrich with unpushed-commit count if worktree exists
             head_ref = pr.get("headRefName")
             if head_ref:
-                unpushed_info = _get_unpushed_commit_info(
-                    head_ref, repo_root, base_ref=pr.get("baseRefName")
-                )
-                if unpushed_info:
-                    failure_msg += f"; {unpushed_info}"
-                else:
+                try:
+                    validated_head_ref = require_valid_ref_name(
+                        head_ref, context="_check_no_op_rework head_ref (patch-id)"
+                    )
+                    validated_base_ref = None
+                    base_ref_raw = pr.get("baseRefName")
+                    if base_ref_raw:
+                        validated_base_ref = require_valid_ref_name(
+                            base_ref_raw, context="_check_no_op_rework base_ref (patch-id)"
+                        )
+                    unpushed_info = _get_unpushed_commit_info(
+                        validated_head_ref, repo_root, base_ref=validated_base_ref
+                    )
+                    if unpushed_info:
+                        failure_msg += f"; {unpushed_info}"
+                    else:
+                        failure_msg += (
+                            "; check the branch worktree for unpushed work before re-reviewing"
+                        )
+                except ValueError as exc:
+                    warnings.append(str(exc))
                     failure_msg += (
                         "; check the branch worktree for unpushed work before re-reviewing"
                     )
@@ -618,6 +724,21 @@ def _check_no_op_rework(
     if not current_head_sha:
         return False
 
+    try:
+        # Validate before the values reach any git argv: reviewed_head_sha comes
+        # from persisted state.json, which can diverge or be hand-edited over a
+        # long lifetime (issue #659). The ^ prefix in the rev-list arg currently
+        # prevents flag parsing, but this guard keeps that true after refactors.
+        reviewed_head_sha = require_valid_sha(
+            reviewed_head_sha, context="_check_no_op_rework reviewed_head_sha"
+        )
+        current_head_sha = require_valid_sha(
+            current_head_sha, context="_check_no_op_rework current_head_sha"
+        )
+    except ValueError as exc:
+        warnings.append(str(exc))
+        return False
+
     # If heads match exactly, it's a no-op rework
     if current_head_sha == reviewed_head_sha:
         failure_msg = (
@@ -628,12 +749,27 @@ def _check_no_op_rework(
         # Enrich with unpushed-commit count if worktree exists
         head_ref = pr.get("headRefName")
         if head_ref:
-            unpushed_info = _get_unpushed_commit_info(
-                head_ref, repo_root, base_ref=pr.get("baseRefName")
-            )
-            if unpushed_info:
-                failure_msg += f"; {unpushed_info}"
-            else:
+            try:
+                validated_head_ref = require_valid_ref_name(
+                    head_ref, context="_check_no_op_rework head_ref (sha-match)"
+                )
+                validated_base_ref = None
+                base_ref_raw = pr.get("baseRefName")
+                if base_ref_raw:
+                    validated_base_ref = require_valid_ref_name(
+                        base_ref_raw, context="_check_no_op_rework base_ref (sha-match)"
+                    )
+                unpushed_info = _get_unpushed_commit_info(
+                    validated_head_ref, repo_root, base_ref=validated_base_ref
+                )
+                if unpushed_info:
+                    failure_msg += f"; {unpushed_info}"
+                else:
+                    failure_msg += (
+                        "; check the branch worktree for unpushed work before re-reviewing"
+                    )
+            except ValueError as exc:
+                warnings.append(str(exc))
                 failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
         else:
             failure_msg += "; check the branch worktree for unpushed work before re-reviewing"
@@ -651,6 +787,17 @@ def _check_no_op_rework(
         return False
 
     try:
+        # Validate ref names before they reach git argv (issue #659): head_ref is
+        # passed as a plain positional to ``git fetch origin``, so a flag-like
+        # value would be parsed as an option without this guard.
+        head_ref = require_valid_ref_name(
+            head_ref, context="_check_no_op_rework head_ref (merge-only)"
+        )
+        if base_ref:
+            base_ref = require_valid_ref_name(
+                base_ref, context="_check_no_op_rework base_ref (merge-only)"
+            )
+
         # Fetch both the PR head ref and base ref from origin
         # We need the base ref to exclude base-reachable commits from the count
         fetch_refs = [head_ref]
@@ -701,9 +848,13 @@ def _check_no_op_rework(
 
             failures.append(failure_msg)
             return True
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
-        # Git failed (no network, unknown ref, shallow history, or parse error)
-        # Fall back to SHA equality result and append a warning
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as exc:
+        # Git failed (no network, unknown ref, shallow history, parse error) or
+        # a ref/SHA value failed format validation. Fall back to the SHA equality
+        # result and append a warning; include the validation message if that is
+        # what failed so callers can tell the difference.
+        if isinstance(exc, ValueError):
+            warnings.append(str(exc))
         warnings.append(
             f"Could not verify whether PR head advance ({reviewed_head_sha} → {current_head_sha}) "
             f"included non-merge commits; git fetch/rev-list failed. "
@@ -830,6 +981,12 @@ def detect_cross_pr_revert(
         return None
 
     try:
+        # Validate ref names before they reach git argv (issue #659). Both
+        # values are passed as plain positionals to ``git fetch origin``, so a
+        # flag-like value would be parsed as an option without this guard.
+        head_ref = require_valid_ref_name(head_ref, context="detect_cross_pr_revert head_ref")
+        base_ref = require_valid_ref_name(base_ref, context="detect_cross_pr_revert base_ref")
+
         fetch = subprocess.run(
             ["git", "fetch", "origin", str(head_ref), str(base_ref)],
             cwd=repo_root_path,
@@ -911,7 +1068,13 @@ def detect_cross_pr_revert(
                             f"would silently undo base commit {base_sha[:12]}; add an explicit "
                             f"'{allow_marker}: <reason>' line to the PR body to proceed"
                         )
-    except (OSError, ValueError):
+    except ValueError as exc:
+        # Ref validation failed (issue #659). The function returns None for a
+        # false negative, so a diagnostic is required to distinguish this from
+        # "no revert detected".
+        logger.warning("detect_cross_pr_revert ref validation failed: %s", exc)
+        return None
+    except OSError:
         return None
 
     return None

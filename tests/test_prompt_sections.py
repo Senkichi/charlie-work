@@ -4,6 +4,7 @@ import re
 import string
 from pathlib import Path
 
+from charlie_work.markdown_fence import fenced_block
 from charlie_work.prompt_sections import section_variables
 from charlie_work.prompts import render_prompt
 
@@ -12,12 +13,15 @@ ISSUE_VALUES = {
     "issue_title": "Fix search",
     "issue_url": "https://example.test/issues/123",
     "issue_body": "Body text",
+    "issue_body_block": fenced_block("Body text", "md"),
     "branch_name": "agent/issue-123-fix-search",
     "worker_model_tier": "capable",
+    "issue_comments": "",
     "pr_number": 456,
     "pr_title": "fix: search is broken",
     "pr_url": "https://example.test/pull/456",
     "dispatch_note": "Fix the typo in the search function.",
+    "dispatch_note_block": fenced_block("Fix the typo in the search function.", "md"),
     "required_changes_section": "",
 }
 
@@ -168,8 +172,12 @@ def test_attacker_controlled_placeholders_not_expanded() -> None:
         "issue_title": "Test issue",
         "issue_url": "https://example.test/issues/8",
         "issue_body": "This contains $section_scope_contract and $issue_number",
+        "issue_body_block": fenced_block(
+            "This contains $section_scope_contract and $issue_number", "md"
+        ),
         "branch_name": "agent/issue-8-test",
         "worker_model_tier": "capable",
+        "issue_comments": "",
     }
 
     for template_name in ("worker.md", "worker_claude_code.md"):
@@ -213,6 +221,7 @@ def test_rework_prompt_includes_conditional_base_merge_instruction() -> None:
         "pr_url": "https://example.test/pull/456",
         "issue_number": 123,
         "dispatch_note": "Fix the typo in the search function.",
+        "dispatch_note_block": fenced_block("Fix the typo in the search function.", "md"),
         "required_changes_section": "",
         "branch_name": "agent/issue-123-fix-search",
     }

@@ -28,11 +28,37 @@ name: Reclaim superseded main CI runs
 #
 # Runs on self-hosted, matching ci.yml: hosted-runner minutes are suspended
 # for this repo as of 2026-07 (see ci.yml's own comment) and there is no
-# hosted fallback available today. That means this job waits in the same
-# queue as everything else and is not instant -- but that only bounds how
-# quickly a superseded run gets reclaimed, not whether it eventually is, and
-# the job itself is a few seconds of github-script with no checkout/install,
-# so it clears quickly once scheduled.
+# hosted fallback available today (unverified-unless-proven: the billing
+# endpoint needed to confirm hosted-minute availability returns a
+# token-scope error on this account).
+#
+# CORRECTED (#863): the previous version of this comment claimed waiting in
+# the runner queue "only bounds how quickly a superseded run gets reclaimed,
+# not whether it eventually is". That is false, and #863 has the evidence --
+# `runs-on: self-hosted` means this job competes for the exact 2-runner
+# capacity (#799) it exists to free, and the old `cancel-in-progress: true`
+# above meant every *queued* instance of this workflow got killed by the
+# next push's instance before it ever acquired a runner, so it could starve
+# indefinitely rather than merely run late.
+#
+# The real fix (#863) is `src/charlie_work/main_ci_reclaim.py`: the same
+# cancellation logic, ported into the Python orchestrator, which runs every
+# fleet pass with local `gh` CLI access and needs no runner at all -- so it
+# cannot lose the race for the capacity it is trying to reclaim. That is now
+# the primary, reliable path, and it also closes #815 (repeated,
+# runner-free attempts across passes, instead of a single push-triggered
+# coin flip). This workflow is kept as the fallback for the window when the
+# orchestrator itself is not running -- main also advances via Aviator's
+# MergeQueue and direct human/operator merges, independent of the
+# supervisor's uptime, so "supervisor down" and "a superseded main run gets
+# created" are uncorrelated and this workflow still has a job to do.
+# `cancel-in-progress` is now `false` (was `true`): a queued instance is no
+# longer killed by the next push's instance, so a run that does make it
+# through the queue is not preempted before it can act. Accumulation under
+# `false` is bounded by push volume during supervisor-down windows, not by
+# steady-state merge traffic -- each queued instance is a single
+# github-script step with no checkout/install, and the orchestrator handles
+# the congested steady-state case without ever touching this queue.
 on:
   push:
     branches:
@@ -40,7 +66,7 @@ on:
 
 concurrency:
   group: reclaim-superseded-main-ci
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reclaim:

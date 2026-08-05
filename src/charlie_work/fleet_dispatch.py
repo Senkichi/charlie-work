@@ -4,7 +4,10 @@ import datetime
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -22,24 +25,33 @@ from .supervise import (
     LocalSnapshot,
     orchestrator_root,
     read_head_sha,
+    record_zero_pass_streak,
     self_deploy,
     take_snapshot,
     try_acquire_supervisor_lock,
 )
-from .runner_allocation_pass import run_allocation_pass
-from .runner_slots import save_allocation_skip, UNATTENDED_ALLOCATION_SOURCE
-from .runners import (
-    decide_autoscale,
+from ci_fleet.charlie_work_adapter import (
     FleetTotals,
+    ScaleAction,
+    UNATTENDED_ALLOCATION_SOURCE,
+    decide_autoscale,
     is_in_cooldown,
     is_pool_idle_for_minutes,
     observe_runner_pool,
     provision_runner,
     record_scale_event,
+    run_allocation_pass,
+    save_allocation_skip,
     scale_down_idle_runners,
-    ScaleAction,
 )
 from .state import state_lock, utc_now
+from .subprocess_runner import no_console_window_kwargs
+from .supervise_loop import (
+    DEFAULT_MAX_RELAUNCHES,
+    EXIT_RESTART_REQUESTED,
+    SuperviseLoopResult,
+    run_supervise_relaunch_loop,
+)
 from .supervisor_lifecycle import (
     detect_prior_abnormal_exit,
     is_exit_alertable,
@@ -148,6 +160,7 @@ def compute_api_worker_fleet_report(
     *,
     fleet_dir_override: str | None = None,
     preloaded_configs: dict[str, OrchestratorConfig] | None = None,
+    now: datetime.datetime | None = None,
 ) -> ApiWorkerFleetReport | None:
     """Compute the fleet-wide api-worker report line (issue #483).
 
@@ -171,6 +184,12 @@ def compute_api_worker_fleet_report(
     a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
     filesystem mutation. All errors surface as report values (zeroed spend,
     zero live), never raised.
+
+    ``now`` is the injectable clock used to derive the ledger's ``today`` key
+    (issue #828): defaults to ``datetime.now(UTC)`` when not supplied, so
+    production behavior is byte-identical. Without it, the day-granularity
+    lookup below can miss a UTC-midnight boundary crossed between a caller
+    writing the ledger and this function reading it.
     """
     from datetime import UTC, datetime
 
@@ -228,7 +247,8 @@ def compute_api_worker_fleet_report(
         try:
             ledger_file = ledger_path(Path(state_dir_str))
             ledger = load_ledger(ledger_file)
-            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            resolved_now = now if now is not None else datetime.now(UTC)
+            today = resolved_now.strftime("%Y-%m-%d")
             status = budget_status(ledger, rep_config.api_worker.budget, today)
             today_usd = status.spent_today_usd
             lifetime_usd = status.lifetime_spent_usd
@@ -977,6 +997,7 @@ def _filter_fleet_health_transitions(
     state_file: Path,
     *,
     persistent_mask: list[bool] | None = None,
+    observed_repo_keys: frozenset[str] | None = None,
 ) -> list[AttentionEntry]:
     """Stateful filter: keep only persistent-health entries whose health changed.
 
@@ -1003,8 +1024,32 @@ def _filter_fleet_health_transitions(
     Entries are processed in order so a within-pass health change (e.g.
     ERROR then OK for the same issue) emits both transitions; the persisted
     baseline ends at the final health.
+
+    ``observed_repo_keys`` (issue #817 item 2) reconciles the baseline
+    against issues that were genuinely re-checked this pass and found
+    healthy. Persistent-health entries only ever exist for *unhealthy*
+    observations (stalled/error/health_transition) -- a healthy issue
+    produces no event at all, so without this the baseline can only ever
+    move *into* an unhealthy value and never back out, latching every
+    tracked issue at its first failure forever (the same defect item 1 fixes
+    for self-deploy, whose producer always has a distinct success value to
+    feed; issue health has no such value to hang a recovery entry on). After
+    the loop above, any *other* persisted key whose ``adapter_kind`` (the
+    part before the first ``:``) is in ``observed_repo_keys`` -- meaning
+    that repo's lane ran to completion this pass, so every issue it tracks
+    was genuinely looked at -- and that was not itself re-affirmed unhealthy
+    in this same call is silently cleared, not re-emitted as a recovery
+    entry (there is no "issue confirmed healthy" event to attach one to).
+    This does not create a false transition; it lets the *next* unhealthy
+    observation for that key read ``previous_health: null`` and emit as a
+    fresh incident instead of being suppressed by a latch that could never
+    leave its last value. A repo lane that did not run this pass (missing
+    repo_root, supervisor lock held, an unhandled per-repo exception) is not
+    in ``observed_repo_keys``, so its keys are left untouched -- absence of
+    a check is not evidence of health.
     """
     emitted: list[AttentionEntry] = []
+    touched_keys: set[str] = set()
     # Ensure the parent directory exists before state_lock tries to create the
     # sibling .lock file (advisory_file_lock touches it directly).
     state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1019,11 +1064,19 @@ def _filter_fleet_health_transitions(
                 emitted.append(entry)
                 continue
             key = f"{entry.adapter_kind}:{entry.issue_number}"
+            touched_keys.add(key)
             last = baselines.get(key)
             if last == entry.health:
                 continue
             emitted.append(replace(entry, previous_health=last))
             baselines[key] = entry.health
+        if observed_repo_keys:
+            for key in list(baselines):
+                if key in touched_keys:
+                    continue
+                adapter_kind = key.split(":", 1)[0]
+                if adapter_kind in observed_repo_keys:
+                    del baselines[key]
         _save_fleet_health_state(state_file, baselines)
     return emitted
 
@@ -1064,6 +1117,7 @@ def _emit_fleet_transition(
 def _build_fleet_attention_digest(
     attention_events: list[dict[str, Any]],
     state_file: Path | None = None,
+    observed_repo_keys: frozenset[str] | None = None,
 ) -> AttentionDigest:
     """Convert fleet-aggregated event dicts into a single AttentionDigest.
 
@@ -1089,6 +1143,12 @@ def _build_fleet_attention_digest(
     entries with ``previous_health: null`` (issue #554). The returned digest
     always carries the post-filter entries; callers that pass ``state_file``
     should still check ``digest.transitions`` for emptiness before emitting.
+
+    ``observed_repo_keys`` (issue #817 item 2) is forwarded to
+    ``_filter_fleet_health_transitions`` so a persistent baseline key whose
+    issue was genuinely re-checked this pass and found healthy is reconciled
+    away instead of latching at its last unhealthy value forever -- see that
+    function's docstring for the exact semantics.
     """
     entries: list[AttentionEntry] = []
     # Parallel to ``entries``: True for persistent-health event types subject
@@ -1218,7 +1278,10 @@ def _build_fleet_attention_digest(
 
     if state_file is not None:
         entries = _filter_fleet_health_transitions(
-            entries, state_file, persistent_mask=persistent_mask
+            entries,
+            state_file,
+            persistent_mask=persistent_mask,
+            observed_repo_keys=observed_repo_keys,
         )
 
     return AttentionDigest(
@@ -1320,6 +1383,14 @@ def fleet_loop(
 
     per_repo_results: dict[str, CommandResult] = {}
     attention_events: list[dict[str, Any]] = []
+    # repo_keys whose lane actually ran app.loop()/app.dispatch() to
+    # completion this pass -- i.e. every issue that repo tracks was genuinely
+    # looked at. Threaded into _build_fleet_attention_digest so a healthy
+    # issue's stale health-baseline entry can be reconciled away instead of
+    # latching forever (issue #817 item 2). A repo that was skipped (missing
+    # repo_root, supervisor lock held) or raised is deliberately excluded --
+    # absence of a check is not evidence of health.
+    observed_repo_keys: set[str] = set()
     orphan_sweep_calls = 0
     # Collect each selected repo's raw layered config so the api-worker fleet
     # report below can reuse it instead of re-loading every config each pass
@@ -1424,6 +1495,7 @@ def fleet_loop(
 
                 per_repo_results[repo_key] = result
                 attention_events.extend(_extract_attention_events(repo_key, result))
+                observed_repo_keys.add(repo_key)
 
                 # Count orphan sweep calls (B6a interaction)
                 # Each loop() call internally triggers orphan sweep via
@@ -1486,7 +1558,9 @@ def fleet_loop(
     if notify_config is not None and getattr(notify_config, "enabled", False):
         health_state_file = _fleet_health_state_path(fleet_dir_override)
         attention_digest = _build_fleet_attention_digest(
-            attention_events, state_file=health_state_file
+            attention_events,
+            state_file=health_state_file,
+            observed_repo_keys=frozenset(observed_repo_keys),
         )
         if attention_digest.transitions:
             notify_result = emit_digest(notify_config, attention_digest)
@@ -1612,6 +1686,43 @@ def _has_fleet_delta(
     return before.repo_snapshots != after.repo_snapshots
 
 
+def _fleet_has_configured_repos(
+    fleet_dir_override: str | None, repos: tuple[str, ...] | None
+) -> bool:
+    """Return True when at least one repo is configured/selected for this scope.
+
+    Gates the zero-repo-pass streak (issue #855 acceptance criterion 4): a
+    fleet with zero registered repos -- or an explicit ``repos`` filter that
+    matches none of them -- is a configuration state, not an incident, and
+    must never move the streak counter. Reads the registry directly rather
+    than deriving the answer from a completed ``fleet_loop`` call, because
+    the #851 exit shape this alarm targets breaks out of the supervisor loop
+    *before* ``fleet_loop`` is ever called.
+    """
+    registry = _load_registry(layout.fleet_registry_path(override=fleet_dir_override))
+    return bool(_select_repos(registry, repos))
+
+
+# Exit reasons that mean "the code on disk changed underneath this process", so
+# the supervisor must be replaced *now* rather than after a watchdog interval
+# (#862). Every other reason is a deliberate stop and must not relaunch.
+#
+# This is a reason vocabulary rather than a `restart_requested` boolean set at
+# the two restarting break sites, because the failure directions differ. A new
+# break site that forgets to set a boolean reads as "normal exit" and silently
+# reintroduces #862's downtime hole; one that forgets to set a reason reports
+# "unknown", which is visible in the exit event and the launcher log. #855's
+# zero-pass alarm also cannot currently tell these cases apart.
+RESTART_EXIT_REASONS = frozenset({"self_deploy", "head_drift"})
+
+# Bound on the per-repo failure reasons appended to the pass-summary line
+# (#893). ``message`` is operator-facing free text (e.g. "loop completed with
+# N PR error(s)", a tracebacks-derived string from an unclassified exception
+# path) with no length contract, so a single pathological message must not be
+# able to make the summary line unbounded.
+_PASS_SUMMARY_REASON_MAX_CHARS = 500
+
+
 def run_fleet_supervise(
     *,
     fleet_dir_override: str | None = None,
@@ -1701,7 +1812,10 @@ def run_fleet_supervise(
         return CommandResult(
             False,
             "fleet supervisor already running (fleet-supervisor.lock held)",
-            {},
+            # Reason carried here too so every exit route answers the same field.
+            # Not a relaunch: another supervisor already holds the lock, so the
+            # right move is to stand down, not to spawn a second one.
+            {"exit_reason": "lock_held", "restart_requested": False},
         )
 
     pass_number = 0
@@ -1709,6 +1823,8 @@ def run_fleet_supervise(
     total_attention_events = 0
     total_failed_repos = 0
     start_time = clock()
+    # Set at every route out of the loop below; see RESTART_EXIT_REASONS.
+    exit_reason: str | None = None
     full_pass_interval = cfg.full_pass_interval_seconds
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
@@ -1792,9 +1908,11 @@ def run_fleet_supervise(
             if cfg.max_runtime_minutes is not None and cfg.max_runtime_minutes > 0:
                 elapsed_minutes = (now - start_time) / 60.0
                 if elapsed_minutes >= cfg.max_runtime_minutes:
+                    exit_reason = "max_runtime"
                     _exit_reason = "max_runtime"
                     break
             if max_passes is not None and pass_number >= max_passes:
+                exit_reason = "max_passes"
                 _exit_reason = "max_passes"
                 break
 
@@ -1816,19 +1934,19 @@ def run_fleet_supervise(
             # dependencies when pyproject.toml/uv.lock changed.  Non-fatal on a
             # diverged or dirty tree.
             deploy = self_deploy(
-                orchestrator_root(), fleet_dir_override=fleet_dir_override, dry_run=dry_run
+                orchestrator_root(),
+                fleet_dir_override=fleet_dir_override,
+                dry_run=dry_run,
+                failure_alarm_threshold=cfg.self_deploy_failure_alarm,
             )
+            notify_config = getattr(global_config, "notify", None)
+            notify_enabled = notify_config is not None and getattr(notify_config, "enabled", False)
             if not deploy.ok:
                 print(
                     f"[{now_str}] self-deploy skipped: {deploy.error}",
                     flush=True,
                 )
-                notify_config = getattr(global_config, "notify", None)
-                if (
-                    deploy.alertable
-                    and notify_config is not None
-                    and getattr(notify_config, "enabled", False)
-                ):
+                if deploy.alertable and notify_enabled:
                     entry = AttentionEntry(
                         issue_number=-1,
                         adapter_kind="self-deploy",
@@ -1840,16 +1958,26 @@ def run_fleet_supervise(
                     _emit_fleet_transition(notify_config, entry, fleet_dir_override)
             elif deploy.previewed:
                 print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
-            elif deploy.synced:
-                print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
-            elif deploy.venv_repaired:
-                print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
-                notify_config = getattr(global_config, "notify", None)
-                if notify_config is not None and getattr(notify_config, "enabled", False):
+            else:
+                # Real (non-previewed) success. Console output is unchanged from
+                # before this fix -- print only on the previously-notable
+                # outcomes -- but the notify digest gets a health-OK entry
+                # unconditionally, on *every* real success, not only when the
+                # venv was repaired. This is the single-point fix for issue
+                # #817: _filter_fleet_health_transitions is a correct
+                # recovery-edge detector, but it can only detect a recovery if
+                # *some* entry carries a non-ERROR health value -- before this
+                # fix only the venv_repaired branch ever produced one, so a
+                # plain successful deploy fed the baseline nothing and the
+                # first failure latched "self-deploy:-1" at ERROR forever
+                # (34/34 tracked keys were latched this way).
+                if deploy.synced or deploy.venv_repaired:
+                    print(f"[{now_str}] self-deploy: {deploy.message}", flush=True)
+                if notify_enabled:
                     entry = AttentionEntry(
                         issue_number=-1,
                         adapter_kind="self-deploy",
-                        health="REPAIRED",
+                        health="REPAIRED" if deploy.venv_repaired else "OK",
                         previous_health=None,
                         last_log_line=deploy.message,
                         pid=None,
@@ -1876,12 +2004,13 @@ def run_fleet_supervise(
             # message below; folding the check into a bool() loses it.
             from_sha = deploy.from_sha
             to_sha = deploy.to_sha
-            if deploy.ok and deploy.pulled and from_sha and to_sha and from_sha != to_sha:
+            if deploy.ok and deploy.pulled and from_sha and to_sha and deploy.head_changed:
                 print(
                     f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
                     f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
                     flush=True,
                 )
+                exit_reason = "self_deploy"
                 _exit_reason = "self_deploy_head_moved"
                 break
 
@@ -1902,6 +2031,7 @@ def run_fleet_supervise(
                     f"watchdog restart to pick up new code",
                     flush=True,
                 )
+                exit_reason = "head_drift"
                 _exit_reason = "head_drift_restart"
                 break
 
@@ -1928,12 +2058,42 @@ def run_fleet_supervise(
             total_attention_events += attention_count
             total_failed_repos += failed
 
-            print(
+            summary = (
                 f"[{now_str}] fleet pass {pass_number}: {repo_count} repo(s), "
                 f"{repo_count - failed} ok, {failed} failed, "
-                f"{attention_count} attention event(s)",
-                flush=True,
+                f"{attention_count} attention event(s)"
             )
+            # #893: "N failed" alone is indistinguishable from a real outage --
+            # the per-repo failure reason (e.g. a known, acked-releasable
+            # control like the unauthorized-merge tripwire) is already sitting
+            # in repos_data[key]["message"] (set by fleet_loop) but was never
+            # read here. Append it, on the existing line (an attribute of the
+            # pass, not a separate report -- see the api_worker_report line
+            # below for the precedent on when a *second* line is warranted
+            # instead).
+            if failed:
+                # Strip before filtering, not after: a whitespace-only message
+                # is falsy-after-strip but truthy-before, so filtering on the
+                # raw value would let an empty-looking reason through as "[]".
+                raw_reasons = (
+                    str(r.get("message") or "").strip()
+                    for r in repos_data.values()
+                    if isinstance(r, dict) and not r.get("ok", True)
+                )
+                reasons = sorted({m for m in raw_reasons if m})
+                if reasons:
+                    reason_text = "; ".join(reasons)
+                    if len(reason_text) > _PASS_SUMMARY_REASON_MAX_CHARS:
+                        # Plain ASCII ellipsis, not U+2026: this print() runs
+                        # through whatever locale-derived stdout encoding the
+                        # supervisor's launch chain picked (wscript -> ps ->
+                        # cmd -> uv), and a codepage without U+2026 (cp437,
+                        # cp850) would turn a truncation marker into a
+                        # UnicodeEncodeError that crashes the whole pass.
+                        reason_text = reason_text[: _PASS_SUMMARY_REASON_MAX_CHARS - 3] + "..."
+                    summary += f" [{reason_text}]"
+
+            print(summary, flush=True)
 
             # api-worker fleet report line (issue #483): one line per pass
             # when any repo configures the section, keeping partial rollout
@@ -1955,16 +2115,62 @@ def run_fleet_supervise(
                     else cfg.poll_interval_seconds
                 )
             )
+
+        # Issue #855 (the general shape behind #851): a cycle can complete
+        # with exit code 0 having done zero repo passes -- e.g. every restart
+        # exits via the self-deploy HEAD-moved break above before ever
+        # reaching fleet_loop -- and every existing health signal reads
+        # green because, by its own accounting, nothing failed. Record this
+        # process's aggregate total_repo_passes (already computed and
+        # printed in the summary below) against the persisted streak so N
+        # consecutive such cycles escalate instead of repeating silently.
+        # Placed inside the try block, after the loop, so a bookkeeping
+        # failure here is caught by the except Exception handler below
+        # instead of propagating out of run_fleet_supervise uncaught.
+        # Deliberately skipped on KeyboardInterrupt (falls through the
+        # except clause below without reaching this line): an
+        # operator-initiated stop is not the automatic-failure pattern this
+        # alarm targets.
+        # Contained locally rather than left to the handler below. This call does
+        # real file I/O (mkdir, state_lock, log_event) and its own docstring says
+        # it can raise. If it did, the handler's `aborted` reason replaced an
+        # already-set `self_deploy`/`head_drift`, restart_requested went False,
+        # and the wrapper did NOT relaunch -- reintroducing #862 through a
+        # secondary bookkeeping failure. A zero-pass counter that failed to
+        # record is worth a log line; it is not worth suppressing a restart.
+        try:
+            record_zero_pass_streak(
+                orchestrator_root(),
+                repo_passes=total_repo_passes,
+                repos_configured=_fleet_has_configured_repos(fleet_dir_override, repos),
+                threshold=cfg.zero_pass_alarm,
+            )
+        except Exception as streak_exc:  # noqa: BLE001 - bookkeeping must not alter exit semantics
+            logger.warning(
+                "zero-pass streak bookkeeping failed (exit_reason=%s): %s",
+                exit_reason or "unknown",
+                streak_exc,
+            )
     except KeyboardInterrupt:
         _exit_reason = "keyboard_interrupt"
+        # An operator stop must never relaunch. Named rather than left unset so
+        # the exit event distinguishes it from a break site that forgot a reason.
+        exit_reason = "interrupted"
     except Exception as exc:
         _exit_code = 1
         _exit_reason = "exception"
         elapsed_s = clock() - start_time
+        # Defence in depth behind the contained streak call above: if any future
+        # post-break statement raises, an already-set restarting reason must
+        # survive. Overwriting it with "aborted" is what made a bookkeeping
+        # failure able to cancel a self-deploy relaunch.
+        reason = exit_reason or "aborted"
         return CommandResult(
             False,
             f"fleet supervisor aborted on pass {pass_number}: {exc}",
             {
+                "exit_reason": reason,
+                "restart_requested": reason in RESTART_EXIT_REASONS,
                 "passes": pass_number,
                 "total_repo_passes": total_repo_passes,
                 "total_attention_events": total_attention_events,
@@ -2016,12 +2222,139 @@ def run_fleet_supervise(
         True,
         f"fleet supervisor complete: {pass_number} pass(es) in {elapsed_str}, "
         f"{total_repo_passes} repo pass(es), {total_attention_events} attention "
-        f"event(s), {total_failed_repos} failed repo(s)",
+        f"event(s), {total_failed_repos} failed repo(s) "
+        f"[exit_reason={exit_reason or 'unknown'}]",
         {
             "passes": pass_number,
             "total_repo_passes": total_repo_passes,
             "total_attention_events": total_attention_events,
             "total_failed_repos": total_failed_repos,
             "elapsed_seconds": elapsed_s,
+            "exit_reason": exit_reason or "unknown",
+            "restart_requested": exit_reason in RESTART_EXIT_REASONS,
+        },
+    )
+
+
+def _record_supervise_loop_cap_event(result: SuperviseLoopResult) -> None:
+    """Best-effort fleet-level record that the relaunch bound refused a restart.
+
+    Same never-escape discipline as ``_record_lane_failure_event``: the whole
+    point of the cap is to exit cleanly so the scheduled task's tick regains
+    restart authority, and a failure to *record* that must not turn the clean
+    exit into a crash.
+    """
+    try:
+        state_path = layout.state_file_path(layout.default_state_root(orchestrator_root()))
+        log_event(
+            state_path,
+            "supervise_relaunch_cap_reached",
+            {
+                "launches": result.launches,
+                "relaunches": result.relaunches,
+                "last_exit_code": result.last_exit_code,
+                # #903: which of the two cap conditions this was -- "retirement"
+                # (healthy wrapper stepping aside after sustained uptime) or
+                # "non_convergence" (every child died on startup). Without it a
+                # reader cannot tell an expected event from an incident, and
+                # this function's own contract above claims the event says
+                # exactly which condition occurred.
+                "cap_cause": result.cap_cause,
+            },
+        )
+    except Exception:
+        logger.exception("Failed to record supervise relaunch cap event")
+
+
+def _spawn_supervise_child(supervise_args: Sequence[str]) -> int:
+    """Run one ``fleet supervise`` child to completion; return its exit code.
+
+    ``Popen`` + ``wait`` with *inherited* stdio, deliberately not
+    ``subprocess_runner.run_captured``: the child runs for hours and
+    ``capture_output=True`` would buffer its entire log in memory. Inheriting
+    also leaves the launcher's own ``>> $log`` redirection as the single place
+    output lands, unchanged from before this wrapper existed.
+
+    This is a wrapper waiting on its own child, so it is outside the adapter
+    "never block on worker completion" invariant — blocking here is the point.
+
+    ``sys.executable`` keeps the child in the venv the wrapper was started in;
+    ``-m charlie_work`` rather than the console script because of #854 (the
+    running ``charlie.exe`` is the file ``uv sync`` must delete on self-deploy).
+
+    ``no_console_window_kwargs`` and *not* ``hidden_console_kwargs``, even though
+    this is a long-lived worker-shaped spawn: ``CREATE_NEW_CONSOLE`` gives the
+    child that console's std handles instead of the ones it inherits, which
+    would silently redirect the supervisor's entire log away from the launcher's
+    ``>> $log`` and into a hidden console nobody can read. ``CREATE_NO_WINDOW``
+    suppresses the window while leaving inherited handles intact.
+    """
+    command = [sys.executable, "-m", "charlie_work", "fleet", "supervise", *supervise_args]
+    process = subprocess.Popen(
+        command,
+        cwd=str(orchestrator_root()),
+        **no_console_window_kwargs(),
+    )
+    return process.wait()
+
+
+def run_fleet_supervise_loop(
+    *,
+    supervise_args: Sequence[str] = (),
+    max_relaunches: int = DEFAULT_MAX_RELAUNCHES,
+    spawn: Callable[[int], int] | None = None,
+    on_cap_reached: Callable[[SuperviseLoopResult], None] | None = None,
+) -> CommandResult:
+    """Run ``fleet supervise``, relaunching immediately on a restart request.
+
+    ``supervise_args`` is forwarded to the child verbatim rather than being
+    re-declared flag by flag here: a per-flag list would silently stop
+    forwarding any option added to ``fleet supervise`` later.
+
+    ``on_cap_reached`` is injectable for the same reason ``spawn`` is. The
+    default writes a real event to the real state file resolved from
+    ``orchestrator_root()``, so a test exercising the cap path with defaults
+    writes into the **live** ``events.db`` that the running supervisor owns --
+    both polluting production data and contending for its state lock. Tests
+    pass their own recorder and assert on it.
+    """
+    args = tuple(supervise_args)
+
+    def _default_spawn(_launch_number: int) -> int:
+        return _spawn_supervise_child(args)
+
+    result = run_supervise_relaunch_loop(
+        spawn if spawn is not None else _default_spawn,
+        max_relaunches=max_relaunches,
+        log=lambda message: print(message, flush=True),
+        on_cap_reached=(
+            on_cap_reached if on_cap_reached is not None else _record_supervise_loop_cap_event
+        ),
+    )
+
+    # A cap is a *clean handoff*, not a failure: the wrapper deliberately gives
+    # restart authority back to the 5-minute trigger rather than spinning. So the
+    # last exit being EXIT_RESTART_REQUESTED is ok, exactly like a plain 0.
+    #
+    # Reporting the cap as ok=False (exit 1) was the first draft, and it is wrong
+    # for the same reason #862 itself is: it makes two different conditions
+    # indistinguishable. `except Exception` in `run_fleet_supervise` also exits 1,
+    # so an operator seeing LastTaskResult=1 could not tell "supervisor crashed"
+    # from "self-deploy is not converging" — the ambiguity just moves up a layer
+    # instead of being removed. The cap's signal is the distinct log line and the
+    # `supervise_relaunch_cap_reached` event, both of which say exactly which
+    # condition occurred; the exit code does not need to carry it too.
+    ok = result.last_exit_code in (0, EXIT_RESTART_REQUESTED)
+    return CommandResult(
+        ok,
+        f"supervise-loop: {result.launches} launch(es), {result.relaunches} relaunch(es), "
+        f"last exit {result.last_exit_code}"
+        + (" (relaunch cap reached)" if result.cap_reached else ""),
+        {
+            "launches": result.launches,
+            "relaunches": result.relaunches,
+            "last_exit_code": result.last_exit_code,
+            "cap_reached": result.cap_reached,
+            "cap_cause": result.cap_cause,
         },
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from pathlib import Path
@@ -17,6 +18,7 @@ from charlie_work.janitor import (
     _calculate_patch_id,
     _get_unpushed_commit_info,
     CONVENTIONAL_COMMIT_TYPES,
+    detect_cross_pr_revert,
     JANITOR_PR_KEYS,
     JanitorVerdict,
     check_operator_containment,
@@ -100,6 +102,11 @@ def test_draft_pr_fails() -> None:
 
     assert verdict.ok is False
     assert any("draft" in f.lower() for f in verdict.failures)
+    # Issue #818: draft is the ONLY failure here (checks/mergeable/issue-link/
+    # body all pass), so this is the "otherwise ready" case workflow.review()
+    # uses to decide whether auto-readying the PR via `gh pr ready` is safe.
+    assert verdict.is_draft is True
+    assert verdict.is_draft_only_block is True
 
 
 def test_non_open_state_fails() -> None:
@@ -186,6 +193,11 @@ def test_required_check_failure_with_other_blocker_is_not_check_failure_block() 
     assert verdict.ok is False
     assert verdict.failed_required_checks == ("Tests passed",)
     assert verdict.is_check_failure_block is False
+    # Issue #818: draft co-occurring with a real failing required check must
+    # NOT be treated as "otherwise ready" -- a draft PR with a genuine
+    # failure is not silently auto-readied.
+    assert verdict.is_draft is True
+    assert verdict.is_draft_only_block is False
 
 
 def test_required_check_infra_failed_is_not_check_failure_block() -> None:
@@ -2521,6 +2533,47 @@ index 123..456 100644
     assert verdict.facts.added_test_loc == 0
 
 
+def test_check_test_adequacy_examples_only_passes() -> None:
+    """Examples-only diff (files under examples/** match exempt_path_globs) → ok=True, facts.added_product_loc == 0.
+
+    The examples/ directory holds portable templates and config samples (XML,
+    YAML, cron), not executable product code — same category as docs/**. This
+    guards against the false positive that flagged
+    examples/schedule/charlie-fleet-task.xml as untested product code (PR #690).
+    """
+    diff = """diff --git a/examples/schedule/charlie-fleet-task.xml b/examples/schedule/charlie-fleet-task.xml
+index 123..456 100644
+--- a/examples/schedule/charlie-fleet-task.xml
++++ b/examples/schedule/charlie-fleet-task.xml
+@@ -1,3 +1,5 @@
+ <?xml version="1.0" encoding="UTF-8"?>
+ <Task>
++  <Triggers>
++    <TimeTrigger/>
++  </Triggers>
+ </Task>
+diff --git a/examples/orchestrator.config.devin.yaml b/examples/orchestrator.config.devin.yaml
+index 123..456 100644
+--- a/examples/orchestrator.config.devin.yaml
++++ b/examples/orchestrator.config.devin.yaml
+@@ -1,3 +1,5 @@
+ fleet:
+-  old: value
++  new: value
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    assert verdict.facts.added_product_loc == 0
+    assert verdict.facts.added_test_loc == 0
+    assert verdict.facts.untested_product_files == ()
+
+
 def test_check_test_adequacy_rename_only_passes() -> None:
     """Rename-only diff (100% similarity, no hunk body) → ok=True, facts.added_product_loc == 0."""
     diff = """diff --git a/old_name.py b/new_name.py
@@ -3017,3 +3070,301 @@ index 0000000..1234567
 
     assert verdict.ok is True
     assert any("test_pass_stub" in w for w in verdict.warnings)
+
+
+# --- issue #659: git argv validation (defense-in-depth) -----------------------
+#
+# These tests verify that _check_no_op_rework and detect_cross_pr_revert
+# reject flag-like or malformed SHA/ref values *before* they reach any
+# subprocess argv, and that run_janitor never raises in the process.
+
+
+def test_no_op_rework_warns_on_flag_like_reviewed_head_sha() -> None:
+    """A flag-like reviewed_head_sha is caught as a warning, not a crash."""
+    pr = _green_pr(headRefOid="abc123")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "--exec=foo",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework reviewed_head_sha" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_non_hex_reviewed_head_sha() -> None:
+    """A non-hex reviewed_head_sha is caught as a warning, not a crash."""
+    pr = _green_pr(headRefOid="abc123")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "not-a-sha!",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework reviewed_head_sha" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_current_head_sha() -> None:
+    """A flag-like headRefOid is caught as a warning before reaching argv."""
+    pr = _green_pr(headRefOid="--upload-pack=evil")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework current_head_sha" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_head_ref() -> None:
+    """A flag-like headRefName is caught as a warning before ``git fetch origin``."""
+    pr = _green_pr(headRefOid="def456", headRefName="--exec=foo")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework head_ref (merge-only)" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_base_ref() -> None:
+    """A flag-like baseRefName is caught as a warning before ``git fetch origin``."""
+    pr = _green_pr(headRefOid="def456", headRefName="agent/issue-1-fix", baseRefName="--exec=bar")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("_check_no_op_rework base_ref (merge-only)" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_accepts_valid_sha_and_ref_values(tmp_path: Path) -> None:
+    """Valid SHA and ref-name values pass validation and reach the normal path."""
+    pr = _green_pr(headRefOid="def456", headRefName="agent/issue-1-fix", baseRefName="main")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    # Heads differ and no real git repo at tmp_path — the merge-only check will
+    # fail gracefully (subprocess error → warning), but validation must pass.
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=tmp_path)
+
+    assert isinstance(verdict, JanitorVerdict)
+    assert not verdict.is_no_op_rework
+    assert any("git fetch/rev-list failed" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_head_ref_patch_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-like headRefName on the patch-id branch must not reach
+    ``_get_unpushed_commit_info`` (issue #659).
+
+    Pins the conflict-resolution hunk that merges 694's validation with PR
+    #761's ``base_ref`` addition: a naive marker-only merge-conflict
+    resolution dedents the ``_get_unpushed_commit_info`` call out of the
+    ``except ValueError`` block, so it runs unconditionally with the raw,
+    unvalidated ref even when validation just rejected it. This test fails
+    against that regression.
+    """
+    from charlie_work import janitor as janitor_module
+
+    diff = """diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    current_patch_id = _calculate_patch_id(diff)
+    pr = _green_pr(headRefName="--upload-pack=evil")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_patch_id": current_patch_id,
+    }
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_get_unpushed_commit_info should not be called with an invalid ref")
+
+    monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
+
+    verdict = run_janitor(
+        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+    )
+
+    assert verdict.ok is False
+    assert any("_check_no_op_rework head_ref (patch-id)" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_base_ref_patch_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-like baseRefName on the patch-id branch must not reach
+    ``_get_unpushed_commit_info`` (issue #659, same hunk as the head_ref
+    variant above).
+    """
+    from charlie_work import janitor as janitor_module
+
+    diff = """diff --git a/test.txt b/test.txt
+index 1234567..abcdef0 100644
+--- a/test.txt
++++ b/test.txt
+@@ -1,2 +1,2 @@
+ line 1
+-line 2
++line 2 modified
+"""
+    current_patch_id = _calculate_patch_id(diff)
+    pr = _green_pr(headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_patch_id": current_patch_id,
+    }
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_get_unpushed_commit_info should not be called with an invalid ref")
+
+    monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
+
+    verdict = run_janitor(
+        pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd(), pr_diff=diff
+    )
+
+    assert verdict.ok is False
+    assert any("_check_no_op_rework base_ref (patch-id)" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_head_ref_sha_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-like headRefName on the sha-match branch must not reach
+    ``_get_unpushed_commit_info`` (issue #659). Pins the second
+    conflict-resolution hunk against the same marker-strip dedent hazard as
+    the patch-id variant above.
+    """
+    from charlie_work import janitor as janitor_module
+
+    pr = _green_pr(headRefOid="abc123", headRefName="--upload-pack=evil")
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_get_unpushed_commit_info should not be called with an invalid ref")
+
+    monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert any("_check_no_op_rework head_ref (sha-match)" in w for w in verdict.warnings)
+
+
+def test_no_op_rework_warns_on_flag_like_base_ref_sha_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag-like baseRefName on the sha-match branch must not reach
+    ``_get_unpushed_commit_info`` (issue #659, same hunk as the head_ref
+    variant above).
+    """
+    from charlie_work import janitor as janitor_module
+
+    pr = _green_pr(
+        headRefOid="abc123", headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil"
+    )
+    pr_state = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("_get_unpushed_commit_info should not be called with an invalid ref")
+
+    monkeypatch.setattr(janitor_module, "_get_unpushed_commit_info", _fail_if_called)
+
+    verdict = run_janitor(pr, _green_checks(), _config(), pr_state=pr_state, repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert any("_check_no_op_rework base_ref (sha-match)" in w for w in verdict.warnings)
+
+
+def test_detect_cross_pr_revert_skips_invalid_head_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flag-like headRefName must not reach ``git fetch origin <head> <base>``."""
+    from charlie_work import janitor as janitor_module
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    pr = _green_pr(headRefName="--upload-pack=evil")
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("subprocess.run should not be called with invalid refs")
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _fail_if_called)
+
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result is None
+
+
+def test_detect_cross_pr_revert_skips_invalid_base_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A flag-like baseRefName must not reach ``git fetch origin <head> <base>``."""
+    from charlie_work import janitor as janitor_module
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    pr = _green_pr(headRefName="agent/issue-1-fix", baseRefName="--upload-pack=evil")
+
+    def _fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("subprocess.run should not be called with invalid refs")
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _fail_if_called)
+
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result is None
+
+
+def test_detect_cross_pr_revert_warns_on_invalid_ref(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ref validation failure must be logged, not silently treated as no revert."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    pr = _green_pr(headRefName="--upload-pack=evil")
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.janitor"):
+        result = detect_cross_pr_revert(pr, repo_root)
+
+    assert result is None
+    assert any(
+        "detect_cross_pr_revert" in record.message and "not a valid git ref name" in record.message
+        for record in caplog.records
+    )

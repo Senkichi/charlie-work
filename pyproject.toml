@@ -9,6 +9,7 @@ dependencies = [
     "pyyaml>=6.0",
     "psutil>=5.9",
     "tzdata>=2026.3",
+    "ci-fleet",
 ]
 
 [project.scripts]
@@ -17,7 +18,7 @@ charlie = "charlie_work.cli:main"
 charlie-work = "charlie_work.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "pytest-xdist>=3.6", "ruff>=0.6"]
 
 [build-system]
 requires = ["hatchling"]
@@ -31,6 +32,7 @@ addopts = "-q --tb=short"
 testpaths = ["tests"]
 markers = [
     "real_activity_probe_live: test exercises the real (unstubbed) real_activity_probe_for instead of the autouse stale-probe stub (issue #307)",
+    "rollback_path: test covers a module superseded by ci_fleet and kept only as the rollback path -- a green run means 'rollback still works', NOT 'the live allocator is healthy' (issue #876). Membership is enforced against the import graph by tests/test_dormant_fleet_marking.py; do not add or remove by hand.",
 ]
 
 [tool.ruff]
@@ -38,3 +40,6 @@ line-length = 99
 src = ["src", "tests"]
 # Frozen reference copies from the archived freecode repo — docs, not live code.
 extend-exclude = ["docs/freecode-salvage/reference"]
+
+[tool.uv.sources]
+ci-fleet = { path = "../ci_runners", editable = true }

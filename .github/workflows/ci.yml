@@ -39,16 +39,127 @@ jobs:
     # box (job-cannon #1440: 40, 51, 86 min). Tests is a required status
     # check, so a spurious timeout wedges merges -- 3x median headroom
     # avoids firing on ordinary contention. Sibling: job-cannon PR #1443.
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false
+      # ci_fleet is consumed as an editable path dependency at ../ci_runners
+      # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
+      # exist BEFORE uv sync runs -- without it, sync exits 2 with
+      # "Distribution not found" and both required checks wedge every PR.
+      #
+      # Idempotent by necessity: $GITHUB_WORKSPACE/.. is outside the directory
+      # actions/checkout manages, so it is neither created for us nor cleaned
+      # between runs. A plain clone would succeed once per runner and fail on
+      # every run after that. actions/checkout cannot do this itself -- it
+      # refuses a path: outside the workspace, and the location is fixed by the
+      # relative path recorded in uv.lock.
+      #
+      # Tracks ci_runners' main rather than a pinned SHA. Deliberate, but NOT
+      # for the reason this comment used to give -- it claimed the lock would
+      # disagree with a pin, and uv.lock records
+      # `source = { editable = "../ci_runners" }` with no revision anywhere in
+      # the entry, so there is nothing here for a pin to contradict (see #954).
+      #
+      # The real reason: production does not run a revision. The live
+      # supervisor imports ci_fleet through an editable .pth that prepends
+      # ..\ci_runners\src to sys.path, so it executes whatever is SAVED in that
+      # working tree -- committed or not. Pinning a SHA here would buy a
+      # reproducible CI at the cost of validating a ci_fleet that production
+      # demonstrably does not run, which is the more expensive of the two.
+      #
+      # Revisit when ci_fleet ships as a versioned dependency: at that point CI
+      # and the supervisor resolve the same artifact and a pin costs nothing.
+      - name: Check out ci_runners as a sibling
+        shell: powershell
+        env:
+          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
+          # Credential passed per-command, never written to disk. `git -c`
+          # applies to the single invocation and is not copied into the new
+          # repo's config, unlike embedding a token in the remote URL -- which
+          # would persist in .git/config on the runner between runs.
+          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $auth = "AUTHORIZATION: basic $b64"
+          # Actions masks the *literal* secret string; the base64 of it is a
+          # different string and is NOT masked automatically. Basic-auth base64
+          # is encoding, not encryption -- anything that echoed $b64 or $auth
+          # would print a trivially reversible credential in the clear. Register
+          # it so the masker covers this form too.
+          Write-Host "::add-mask::$b64"
+          if (Test-Path (Join-Path $dest '.git')) {
+            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
+            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
+            git -C $dest reset --hard FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
+          } elseif (Test-Path $dest) {
+            # Something is there that is not a git checkout. Fail rather than
+            # remove it: this step has no business deleting an unexplained
+            # directory on the host, and on Windows a junction would be
+            # followed by a recursive delete (R-15).
+            throw "$dest exists but is not a git checkout -- refusing to touch it"
+          } else {
+            git -c http.extraheader="$auth" clone --depth 1 --branch main `
+              https://github.com/Senkichi/ci_runners.git $dest
+            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
+          }
+          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
+            throw "ci_runners checkout at $dest has no pyproject.toml"
+          }
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Run tests
-        run: uv run pytest -q --tb=short
+        # -n 2 (pytest-xdist, fixed count -- deliberately not "auto"): this
+        # box runs 2 self-hosted runners, so 2 Tests jobs can already execute
+        # concurrently, and charlie-work's own worker-dispatch tree can add
+        # more pytest sessions on the same shared box independent of CI. That
+        # tree's default worker count for its own dispatched sessions is
+        # PYTEST_XDIST_AUTO_NUM_WORKERS=2 (src/charlie_work/env_sanitize.py),
+        # itself chosen after a 2026-07-26 incident (issue 646) where ~36
+        # uncapped xdist workers stacked on this box's 8 physical cores took
+        # a 6.4min suite to ~145min. That constant only governs the
+        # dispatch tree's own "-n auto" resolution and has no enforcement
+        # reach into this workflow file -- but matching its number here
+        # keeps this job's box footprint consistent with the rest of the
+        # system's box-sharing discipline rather than picking an unrelated,
+        # uncoordinated worker count for the one job that also runs
+        # concurrently (x2 runners) on the same shared hardware.
+        # --dist=load (pytest-xdist's default, spelled out for clarity)
+        # rather than loadfile: tests/test_worktree.py alone is ~150 of
+        # ~3100 tests and the heaviest file by wall time (real git.exe
+        # subprocesses), so pinning it to a single worker would floor the
+        # achievable speedup.
+        #
+        # Measured full-suite, full local run, ambient box load 35-70% (other
+        # CI jobs and fleet worktree processes concurrently active -- not an
+        # idealized clean-room benchmark) (2026-07-31, this box, all runs
+        # identical pass/skip count -- 3092 passed, 2 skipped):
+        #   serial:    1593.55s (26:33)
+        #   -n 2:       458.86s ( 7:38)  3.47x
+        #   -n 4:       457.45s ( 7:37)  3.48x  (measured for comparison,
+        #                                        not used -- ties -n 2)
+        #   -n 6:       369.76s ( 6:10)  4.31x  (measured for comparison,
+        #                                        not used -- see below)
+        # -n 2 ties -n 4 and -n 6 is only moderately faster than both; given
+        # ambient load varied 35-70% CPU across these runs (uncontrolled,
+        # shared box), this spread is consistent with ambient-load noise
+        # rather than a clean worker-count scaling curve, so it is not being
+        # read as proof the suite is IO-bound past 2 workers. The choice of
+        # -n 2 rests on the box-sharing argument above, not on a claimed
+        # throughput advantage -- and the data at minimum rules out a large
+        # speed cost to the safer, convention-matching count.
+        # -q dropped here (pyproject.toml addopts already sets it): stacking
+        # an explicit -q on top of addopts' -q silently drops pytest's final
+        # "N passed" summary line -- verified locally, exit code is
+        # unaffected either way but CI logs become unreadable for a human
+        # skimming a pass without failures. Pre-existing on this line before
+        # this change; fixed in the same edit rather than left in place.
+        run: uv run pytest --tb=short -n 2 --dist=load
 
   Lint:
     name: Lint
@@ -94,6 +205,101 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false
+      # ci_fleet is consumed as an editable path dependency at ../ci_runners
+      # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
+      # exist BEFORE uv sync runs -- without it, sync exits 2 with
+      # "Distribution not found" and both required checks wedge every PR.
+      #
+      # Idempotent by necessity: $GITHUB_WORKSPACE/.. is outside the directory
+      # actions/checkout manages, so it is neither created for us nor cleaned
+      # between runs. A plain clone would succeed once per runner and fail on
+      # every run after that. actions/checkout cannot do this itself -- it
+      # refuses a path: outside the workspace, and the location is fixed by the
+      # relative path recorded in uv.lock.
+      #
+      # Tracks ci_runners' main rather than a pinned SHA. Deliberate, but NOT
+      # for the reason this comment used to give -- it claimed the lock would
+      # disagree with a pin, and uv.lock records
+      # `source = { editable = "../ci_runners" }` with no revision anywhere in
+      # the entry, so there is nothing here for a pin to contradict (see #954).
+      #
+      # The real reason: production does not run a revision. The live
+      # supervisor imports ci_fleet through an editable .pth that prepends
+      # ..\ci_runners\src to sys.path, so it executes whatever is SAVED in that
+      # working tree -- committed or not. Pinning a SHA here would buy a
+      # reproducible CI at the cost of validating a ci_fleet that production
+      # demonstrably does not run, which is the more expensive of the two.
+      #
+      # Revisit when ci_fleet ships as a versioned dependency: at that point CI
+      # and the supervisor resolve the same artifact and a pin costs nothing.
+      - name: Check out ci_runners as a sibling
+        shell: powershell
+        env:
+          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
+          # Credential passed per-command, never written to disk. `git -c`
+          # applies to the single invocation and is not copied into the new
+          # repo's config, unlike embedding a token in the remote URL -- which
+          # would persist in .git/config on the runner between runs.
+          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $auth = "AUTHORIZATION: basic $b64"
+          # Actions masks the *literal* secret string; the base64 of it is a
+          # different string and is NOT masked automatically. Basic-auth base64
+          # is encoding, not encryption -- anything that echoed $b64 or $auth
+          # would print a trivially reversible credential in the clear. Register
+          # it so the masker covers this form too.
+          Write-Host "::add-mask::$b64"
+          if (Test-Path (Join-Path $dest '.git')) {
+            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
+            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
+            git -C $dest reset --hard FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
+          } elseif (Test-Path $dest) {
+            # Something is there that is not a git checkout. Fail rather than
+            # remove it: this step has no business deleting an unexplained
+            # directory on the host, and on Windows a junction would be
+            # followed by a recursive delete (R-15).
+            throw "$dest exists but is not a git checkout -- refusing to touch it"
+          } else {
+            git -c http.extraheader="$auth" clone --depth 1 --branch main `
+              https://github.com/Senkichi/ci_runners.git $dest
+            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
+          }
+          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
+            throw "ci_runners checkout at $dest has no pyproject.toml"
+          }
+      - name: Lock currency gate (issue 889)
+        # `uv sync --frozen` below consumes uv.lock as-is and deliberately
+        # SKIPS the "is this lock still current with pyproject.toml?"
+        # assertion. That skip is the hole this closes.
+        #
+        # uv.lock carries a [package.metadata.requires-dev] snapshot of
+        # ../ci_runners' dev dependency-group, because ci-fleet is an
+        # editable path dependency. A change to that group in the sibling
+        # repo silently staleness the lock committed here. The drift is
+        # metadata-only -- no [[package]] entry moves, the resolved
+        # dependency set is unchanged, the build cannot break -- which is
+        # precisely why nothing caught it until the regenerated line nearly
+        # rode into an unrelated PR as an unexplained diff hunk.
+        #
+        # Deliberately a step of the existing "Lint" job, and deliberately
+        # NOT a `--frozen` -> `--locked` swap on the step below:
+        #   * A new job name would need matching edits to required_checks in
+        #     BOTH .aviator/config.yml and the deployed
+        #     orchestrator.config.yaml. Same reasoning as the
+        #     closing-keyword gate: a step changes no check names, so no
+        #     downstream consumer has to learn about it.
+        #   * Kept separate from `uv sync` so "lock is stale" and "install
+        #     failed" cannot collapse into one exit code -- exactly the
+        #     ambiguity #888 and #891 were spent pulling back apart.
+        #
+        # When this fires it fires uniformly: every open PR goes red at once
+        # and identically, which reads as a clock/merge-class signal rather
+        # than a branch defect. The fix is one command -- `uv lock`, commit.
+        run: uv lock --check
       - name: Install dependencies
         run: uv sync --frozen --all-extras
       - name: Ruff check

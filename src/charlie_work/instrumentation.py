@@ -143,6 +143,34 @@ _ERROR_KINDS = frozenset(
         # reachable through query_events(level="error") without any new
         # query infrastructure.
         "fleet_pass_config_error",
+        # Issue #817 items 4-5: self_deploy failed this pass (venv repair,
+        # pull, HEAD read, diff, or uv sync), or a consecutive-failure streak
+        # just crossed the escalation threshold. Both are reachable via
+        # query_events(level="error") for the same reason as
+        # fleet_pass_config_error above -- deploy status was previously the
+        # least observable thing in the system (121 consecutive failures,
+        # zero events.db rows).
+        "self_deploy_failed",
+        "self_deploy_alarm",
+        # Issue #855 (the general shape behind #851): a fleet-supervisor
+        # cycle completed with zero repo passes, despite at least one repo
+        # being configured, N times in a row -- exit code 0 every cycle, so
+        # this is the only signal that distinguishes the outage from a
+        # healthy fleet. Classified as an error for the same reason as
+        # self_deploy_alarm above: reachable via query_events(level="error")
+        # without any new query infrastructure.
+        "supervisor_zero_pass_alarm",
+        # Issue #933: the #502/#673 unauthorized-merge tripwire fired and pinned
+        # ok=False on every pass for 21 consecutive passes, while a session
+        # reading query_events(level="error") reported "0 errors since restart"
+        # -- nothing on the finding path had ever set a non-info level. The
+        # paired "unauthorized_merge_acknowledged" and
+        # "unauthorized_merge_baseline_armed" events stay "info": a triaged
+        # finding and a suppressed backlog are bookkeeping, whereas an
+        # unacknowledged uncovered merge is the alarm the control exists to
+        # raise. Fires once per PR, not once per pass -- see
+        # workflow.UNAUTHORIZED_MERGE_DETECTED_KEY.
+        "unauthorized_merge_detected",
     }
 )
 _WARNING_KINDS = frozenset(
@@ -153,6 +181,24 @@ _WARNING_KINDS = frozenset(
         "dispatch_merged_pr_mention_flagged",
         "review_dispatch_lifecycle_reaped",
         "session_rate_limit_deferred",
+        # Issue #937: the #502/#673 unauthorized-merge tripwire failed open on a
+        # GitHubError, so the control did not run for that pass. Warning, not
+        # error: nothing is broken and no finding is being suppressed -- a check
+        # simply did not happen, which is a handled degradation like the two
+        # above. The paired "unauthorized_merge_detected" stays error, because
+        # that one *is* an uncovered merge awaiting triage.
+        "unauthorized_merge_check_skipped",
+        # Issue #873: the watchdog reaped a worker whose process was already
+        # gone (WorkerHealth.DEAD). Split out of "session_stalled", which stays
+        # an error and now means only the live-but-hung case. A vanished
+        # process is also the normal terminal state of every worker that
+        # finished and exited, so error level reported successful completions
+        # as faults once #864/#866 gave error-level events their first
+        # consumer. Warning rather than info because liveness alone does not
+        # distinguish a clean exit from a crash -- the reap is still worth
+        # surfacing, it is just not evidence of a fault. The paired
+        # "session_stalled" (error) fires for WorkerHealth.STALLED instead.
+        "session_exited",
         # Issue #612: a quota-dead reviewer session is a handled backoff
         # (the fleet defers and probes), not a crash — warning, like the
         # analogous session_rate_limit_deferred. Distinct from the per-PR
@@ -165,6 +211,24 @@ _WARNING_KINDS = frozenset(
         # actionable backoff kinds above. The paired "runner_capacity_recovered"
         # event stays at the default "info" level.
         "runner_capacity_starved",
+        # Issue #818: a draft PR is a park that would otherwise be invisible
+        # without a manual `gh pr list` sweep -- warning, so both the failed
+        # un-draft attempt and a mixed draft+other-failure block are reachable
+        # via query_events(level="warning") distinct from routine
+        # janitor_gate bookkeeping (which stays "info"). The paired
+        # "draft_pr_ready_triggered" success event stays at the default
+        # "info" level, matching "flake_rerun_triggered".
+        "draft_pr_ready_failed",
+        "draft_pr_blocked",
+        # Issue #820: an operator merge-hold (or an unavailable hold check,
+        # which fails safe the same way) suppresses the #818 auto-ready
+        # actuator. Grouped as a warning alongside its two siblings above --
+        # even though the hold itself may be a deliberate operator action,
+        # not an error -- so all three "why is this draft PR not moving"
+        # signals are reachable together via query_events(level="warning")
+        # rather than the deliberate-park case being invisible next to the
+        # other two.
+        "draft_pr_ready_held",
     }
 )
 
@@ -777,3 +841,41 @@ def close_db(state_path: Path) -> None:
     if lock is not None:
         with _db_init_lock:
             _db_locks.pop(key, None)
+
+
+# --- ci_fleet seams ---------------------------------------------------------
+# ci_fleet must never import charlie_work -- that would make it un-importable
+# without charlie-work installed, which is the independence this extraction
+# exists to create. So the *provider* registers itself, at module scope, after
+# both functions above are defined.
+#
+# Both seams are required, and the reader is the one that looks redundant.
+# Capacity signalling (#799) is edge-triggered, so "have I already signalled?"
+# can only be answered by reading the store back. With no reader installed,
+# query_events() returns None, the pass correctly declines to guess, and
+# runner_capacity_starved never fires -- indistinguishable from a host that was
+# never starved.
+#
+# This comment used to justify that by claiming the fleet pass is "a fresh
+# process every cycle". It is not, and the correction strengthens the argument
+# rather than weakening it. `fleet_dispatch.run_fleet_supervise` loads config
+# once (fleet_dispatch.py:1729) and runs the pass loop in-process for the
+# lifetime of the supervisor, so passes share a process across many cycles.
+#
+# That is exactly why the state must live in the store rather than a module
+# global. Under the old false premise a global would fail immediately and
+# obviously -- re-firing every pass, visible the first time anyone looked.
+# Under the truth it survives within one process lifetime and is dropped only
+# when the process is replaced (self-deploy restart, or the scheduled tick
+# after supervise_loop's relaunch cap). It would pass every test and misfire
+# rarely and non-deterministically, across respawns only.
+#
+# So: do not "optimise" this back into an in-memory global on discovering the
+# fresh-process claim was false. The false premise was load-bearing for the
+# wrong reason; the true one is a stronger argument for the same design.
+# ci_fleet carried the identical claim on its half of this seam
+# (runner_allocation_pass.py, observability.py) and corrected it in b20f3a4.
+from ci_fleet.observability import set_event_query, set_event_sink  # noqa: E402
+
+set_event_sink(log_event)
+set_event_query(query_events)

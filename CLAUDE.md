@@ -58,13 +58,31 @@ All label strings must be read from a `LabelConfig` instance (default fields in
 business logic — use `config.labels.queued`, `config.labels.in_progress`, etc.
 
 ### Runner slots move by start/park — never by re-registration
-`runner_allocation`/`runner_slots` rebalance CI capacity across repos by
-starting and stopping *already-configured* listeners. A parked runner keeps its
-registration and reports `offline`. Never make reallocation mint a registration
-token, run `config.cmd remove`, or delete a runner directory — that is
-`runners.py`'s provisioning job, on a different (much slower) cadence.
+**The implementation lives in `ci_fleet`, not here.** Since #869 (2026-08-01) every
+runner/fleet consumer in this repo resolves `run_allocation_pass`, `runner_slots`,
+and `runners` from `ci_fleet.charlie_work_adapter`. The identically-named modules
+that used to shadow them under `src/charlie_work/` were a dormant island with no
+importer in `src/`, retained only as a rollback path; #921 deleted them once that
+window closed. A surviving reference to `charlie_work.runners` or
+`charlie_work.runner_allocation` is therefore a stale name, not a second
+implementation — it will `ImportError`, not silently diverge.
+`tests/test_dormant_fleet_marking.py` still runs and is not vacuous: it derives the
+dormant set from the import graph (now empty) and fails both if a `rollback_path`
+marker outlives the module it guarded and if a *new* island appears — a module with
+a test file and no importer in `src/`. Trust it over any grep.
+Note `charlie_work.fleet_dispatch`
+is the *logger* name on the live allocation-prologue line — that is the module that
+calls the adapter, not the one doing the work.
 
-Two safety properties must survive any change here:
+`ci_fleet`'s `runner_allocation`/`runner_slots` rebalance CI capacity across repos
+by starting and stopping *already-configured* listeners. A parked runner keeps its
+registration and reports `offline`. Never make reallocation mint a registration
+token, run `config.cmd remove`, or delete a runner directory — that is `ci_fleet`'s
+provisioning job (`ci_fleet/runners.py`), on a different (much slower) cadence.
+
+Two safety properties must survive any change here. Both are `ci_fleet`'s code now;
+they are listed because a change made *here* can still violate them through the
+adapter:
 - **Never stop a busy listener.** `park_runner_slot` re-checks for a live
   `Runner.Worker` child immediately before terminating, because the plan is a
   snapshot and GitHub's `busy` flag lags. Terminating a working listener aborts
@@ -78,6 +96,23 @@ Two safety properties must survive any change here:
 listeners run. Operator scripts and post-reboot procedures must delegate to it
 rather than starting every runner directly — a second controller silently undoes
 parking and burns a full `demand_idle_samples` hysteresis window reconverging.
+
+The `runner_allocation` **config section** (`config.RunnerAllocationConfig`, and the
+cross-section floor check against `runner_scaling` in `config.py`) stays in this repo
+regardless — `ci_fleet` reads that knob. It shared a name with the deleted module and
+was deliberately **not** part of #921. That deletion makes the trap sharper, not
+softer: the module is gone, so a later reader who greps `runner_allocation`, finds
+only this config section, and concludes it is the island's last remnant would
+silently disable allocation. It is live config, not residue.
+
+### `EXIT_RESTART_REQUESTED` is a cross-version wire contract — never change it
+`supervise_loop.EXIT_RESTART_REQUESTED` (3) is how the `fleet supervise-loop`
+wrapper learns that its `fleet supervise` child wants to be replaced. The wrapper
+holds the value in memory from *its* commit; the child loads it fresh from disk.
+A self-deploy is exactly when those differ. Changing the number makes a stale
+wrapper misread a restart request as a normal exit and skip the relaunch — the
+#862 outage, reintroduced on the very deploy that changed it. Treat it like a
+label string: read from the constant, never re-declare, and never renumber.
 
 ### Adapters must not block on worker completion
 `devin_shell.launch_devin_session` and `claude_code.launch_claude_worker` both use

@@ -23,8 +23,8 @@ from .fleet_registry import _load_registry
 from . import layout
 from .instrumentation import _db_path, query_events
 from .github import (
-    GitHub,
     GitHubError,
+    GitHubLike,
     ISSUE_LIST_FIELDS,
     ISSUE_VIEW_FIELDS,
     LABEL_LIST_FIELDS,
@@ -36,7 +36,7 @@ from .github import (
 )
 from .paths import RuntimePaths, resolved_layout
 from .prompts import resolve_template
-from .runner_slots import (
+from ci_fleet.charlie_work_adapter import (
     ALLOCATION_STATE_FILENAME,
     CLI_ALLOCATION_SOURCE,
     UNATTENDED_ALLOCATION_SOURCE,
@@ -144,7 +144,154 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
         )
 
 
-def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig) -> None:
+#  Issue #873 Part 2: the token variable names sanitize_env() strips from
+#  every worker subprocess's environment (issue #502). Mirrored here, not
+#  imported from env_sanitize, so this preflight check touches only its own
+#  module — see _check_worker_github_token's docstring for why.
+_STRIPPED_GH_TOKEN_VARS = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+)
+
+
+def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
+    """Flag a dispatch-enabled adapter with no scoped GitHub token configured
+    for its workers (issue #873 Part 2).
+
+    Background: ``env_sanitize.sanitize_env`` (issue #502) is a deliberate
+    security control — it strips ``GH_TOKEN``/``GITHUB_TOKEN`` (and the GHES
+    equivalents) from every worker subprocess's environment and points
+    ``GH_CONFIG_DIR`` at an empty, worktree-local directory, so a worker can
+    never use the orchestrator's own ``gh`` credentials. The *only* sanctioned
+    way for a worker to reach ``gh`` is an operator-supplied token in
+    ``devin.worker_env``/``claude_code.worker_env``, which ``launch_devin_session``
+    (devin_shell.py) and ``launch_claude_worker`` (claude_code.py) each merge
+    back in AFTER ``sanitize_env()`` runs — see the "Merge order" comments on
+    ``DevinConfig.worker_env``/``ClaudeCodeConfig.worker_env`` in config.py.
+
+    Without an operator-configured token, a dispatched worker has no
+    sanctioned credential and either stalls waiting on a human, or — the
+    porousness issue #873 also names — improvises its way to a locally cached
+    Git Credential Manager entry that ``sanitize_env`` does not (and, per that
+    issue, deliberately does not yet) neutralize. Both outcomes are silent
+    until this check: nothing about a missing token fails loudly before
+    dispatch today.
+
+    This check reads only ``config.devin.worker_env`` /
+    ``config.claude_code.worker_env`` — it never reads the process
+    environment and never calls ``sanitize_env`` — so it cannot report a
+    false-healthy result from an ambient ``GH_TOKEN`` the sanitizer would
+    strip anyway, and it cannot widen what ``sanitize_env`` passes through;
+    it only observes whether the sanctioned provisioning path (the config
+    ``worker_env`` mapping) has been used. It reports presence as a boolean
+    only — it never logs a token value or any prefix of one.
+
+    Only fires for the adapter families that actually route through
+    ``sanitize_env``'s merge: ``devin-shell`` (sources ``devin.worker_env``)
+    and ``claude-code``/``api`` (both source ``claude_code.worker_env`` — the
+    ``api`` adapter reuses the claude-code launch path, see
+    ``workflow.py:_adapter_settings``). ``manual`` only writes a session
+    manifest for a human to act on and never launches a worker subprocess;
+    ``command`` runs ``subprocess_runner.run_captured`` with no ``sanitize_env``
+    call at all, so it inherits the orchestrator's full (unsanitized)
+    environment. Neither has the failure mode this check targets.
+
+    Two other paths dispatch through the claude-code launch path
+    (``claude_code.worker_env``) regardless of the configured default
+    ``devin.adapter``, so a ``devin-shell``/``manual``/``command`` default
+    can still stall a worker mid-pass with no visible finding unless both are
+    covered:
+
+    * ``routing.select_adapter`` can route an *individual* issue to the
+      ``api`` adapter (``policy:rework``/``policy:complexity``, gated on
+      ``config.api_worker.enabled``).
+    * ``_rescue_adapter_settings`` (workflow.py) *always* forces
+      ``adapter="claude-code"`` for the bounded rescue tier (issue #555)
+      once ``config.rescue.enabled`` is true, independent of
+      ``api_worker.enabled`` — rescue and the paid api tier are unrelated
+      toggles, so checking one does not imply the other is off.
+
+    Either toggle alone is enough for a dispatched worker to hit the
+    claude-code path, so this fires as a second, separately-named finding
+    whenever *either* is true, so that combination isn't hidden behind the
+    primary adapter's check.
+
+    Severity is ``warning``, not the default ``error``: issue #873 is
+    explicit that the sanctioned fix (an operator configuring a scoped token)
+    is a deferred, human action this check only surfaces — not one this
+    check performs or can force. An ``error`` severity would make
+    ``run_doctor``'s overall ``ok`` unconditionally ``False`` on every
+    production config that hasn't yet been given a token, with no path to
+    green except that same deferred human step (see ``cli.py``'s
+    severity-independent ``failed`` list — the finding is exactly as visible
+    at ``warning``, it just doesn't block).
+    """
+    adapter = config.devin.adapter
+    checks: list[tuple[str, str, str, dict[str, str]]] = []
+    if adapter == "devin-shell":
+        checks.append(
+            ("worker GitHub token", adapter, "devin.worker_env", config.devin.worker_env)
+        )
+    elif adapter in ("claude-code", "api"):
+        checks.append(
+            (
+                "worker GitHub token",
+                adapter,
+                "claude_code.worker_env",
+                config.claude_code.worker_env,
+            )
+        )
+
+    claude_code_reachable_via_routing = config.api_worker.enabled or config.rescue.enabled
+    if claude_code_reachable_via_routing and adapter not in ("claude-code", "api"):
+        checks.append(
+            (
+                "worker GitHub token (claude-code-routed)",
+                "api/rescue",
+                "claude_code.worker_env",
+                config.claude_code.worker_env,
+            )
+        )
+
+    for name, context, config_key, worker_env in checks:
+        configured_var = next(
+            (var for var in _STRIPPED_GH_TOKEN_VARS if worker_env.get(var)), None
+        )
+        if configured_var is not None:
+            add(
+                name,
+                True,
+                f"{config_key} configures {configured_var} — restores a scoped "
+                "token for worker `gh` calls after sanitize_env strips the "
+                "orchestrator's own token (issue #502/#873)",
+                severity="warning",
+            )
+            continue
+
+        add(
+            name,
+            False,
+            f"{config_key} has no GH_TOKEN/GITHUB_TOKEN (or GHES equivalent) — "
+            "sanitize_env (issue #502) strips the orchestrator's token from "
+            "every worker and points GH_CONFIG_DIR at an empty directory, so "
+            f"workers dispatched via the `{context}` adapter right now have no "
+            "sanctioned credential for `gh` and will stall or silently fall "
+            "back to an ambient Git Credential Manager entry (issue #873). Set "
+            f"{config_key}={{'GH_TOKEN': '<scoped-PAT>'}} to fix — never widen "
+            "sanitize_env itself to pass the orchestrator's token through.",
+            severity="warning",
+        )
+
+
+def _probe_api_worker(
+    add: Any,
+    paths: RuntimePaths,
+    config: OrchestratorConfig,
+    *,
+    now: datetime.datetime | None = None,
+) -> None:
     """Observability probes for the paid ``api`` worker tier (issue #483).
 
     When the ``api_worker`` section is configured (non-default):
@@ -161,6 +308,11 @@ def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig)
     ``api_budget.load_ledger`` quarantines a corrupt ledger file (renames it to
     a ``.corrupt-*`` sibling) as a side effect of detecting it. That is the only
     filesystem mutation. Errors surface as check details, never raised.
+
+    ``now`` is the injectable clock used to derive the ledger's ``today`` key
+    (issue #828): defaults to ``datetime.now(UTC)`` when not supplied, so
+    production behavior is byte-identical. ``run_doctor`` samples one ``now``
+    per doctor run and passes it here and to ``_check_runner_allocation``.
     """
     # ``configured`` = the section is not the package default. A bare
     # ``api_worker: {enabled: false}`` with no providers/budget is the default
@@ -250,7 +402,8 @@ def _probe_api_worker(add: Any, paths: RuntimePaths, config: OrchestratorConfig)
         )
 
     # 4. Remaining daily/lifetime budget headroom.
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    resolved_now = now if now is not None else datetime.now(UTC)
+    today = resolved_now.strftime("%Y-%m-%d")
     status = budget_status(ledger, config.api_worker.budget, today)
     daily_remaining = max(0.0, config.api_worker.budget.max_usd_per_day - status.spent_today_usd)
     lifetime_remaining = max(
@@ -380,7 +533,11 @@ def _allocation_writer_label(source: str | None) -> str:
 
 
 def _check_runner_allocation(
-    add: Any, config: OrchestratorConfig, fleet_dir_override: str | None = None
+    add: Any,
+    config: OrchestratorConfig,
+    fleet_dir_override: str | None = None,
+    *,
+    now: datetime.datetime | None = None,
 ) -> None:
     """Report whether host-wide runner allocation is actually running (issue #590).
 
@@ -417,6 +574,12 @@ def _check_runner_allocation(
       every stale-or-absent file — "the daemon never reached allocation" and "the
       daemon ran it and found no runners" are different problems with different
       fixes.
+
+    ``now`` is the injectable clock used for the age computation below (issue
+    #828): defaults to ``datetime.datetime.now(datetime.timezone.utc)`` when
+    not supplied, so production behavior is byte-identical. ``run_doctor``
+    samples one ``now`` per doctor run and passes it here and to
+    ``_probe_api_worker``.
     """
     allocation = getattr(config, "runner_allocation", None)
     if allocation is None or not allocation.enabled:
@@ -460,8 +623,8 @@ def _check_runner_allocation(
     # Clock skew or a hand-edited stamp can date the write in the future. A
     # negative age is not freshness evidence, so clamp it instead of reporting
     # "last pass -42s ago" as healthy.
-    now = datetime.datetime.now(datetime.timezone.utc)
-    age = max(0, int((now - stamp.updated_at).total_seconds()))
+    resolved_now = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    age = max(0, int((resolved_now - stamp.updated_at).total_seconds()))
     writer = _allocation_writer_label(stamp.source)
 
     # A recorded skip reason is the pass saying "I ran, and here is why I did not
@@ -658,7 +821,7 @@ def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> 
     )
 
 
-def _validate_gh_field_lists(add: Any, gh: GitHub) -> None:
+def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
     """Validate gh --json field lists against the live gh CLI.
 
     Executes each field list as a read-only query with --limit 1 and reports
@@ -918,13 +1081,22 @@ def run_doctor(
     paths: RuntimePaths,
     config: OrchestratorConfig,
     config_path: Path | None,
-    gh: GitHub,
+    gh: GitHubLike,
     *,
     adapter_probe: bool = False,
     live: bool = False,
     fleet_dir_override: str | None = None,
+    now: datetime.datetime | None = None,
 ) -> tuple[bool, list[DoctorCheck]]:
     checks: list[DoctorCheck] = []
+
+    # Sampled once for this entire doctor run (issue #828) and threaded into
+    # every sub-check that reads the wall clock, instead of each one
+    # independently racing it -- see _probe_api_worker's today-derivation and
+    # _check_runner_allocation's age computation. Defaults to
+    # datetime.datetime.now(datetime.timezone.utc), so production behavior is
+    # byte-identical when now is not passed.
+    resolved_now = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
 
     def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
         checks.append(DoctorCheck(name=name, ok=ok, detail=detail, severity=severity))
@@ -1073,10 +1245,15 @@ def run_doctor(
             "(set it to null to disable venv sharing)",
         )
 
+    # -- worker GitHub token (issue #873 Part 2) -----------------------------
+    # Config-only, no I/O: reads devin.worker_env/claude_code.worker_env, never
+    # the process environment or sanitize_env's output.
+    _check_worker_github_token(add, config)
+
     # -- api worker observability (issue #483) ------------------------------
     # Always runs (not gated on --adapter-probe): these are config/environment
     # checks, not external CLI probes. Read-only — never mutates the ledger.
-    _probe_api_worker(add, paths, config)
+    _probe_api_worker(add, paths, config, now=resolved_now)
 
     if adapter_probe:
         _probe_adapter(add, repo_root, config)
@@ -1133,7 +1310,7 @@ def run_doctor(
     # -- host-wide runner allocation (issue #590) ----------------------------
     # Read-only: compares the allocation state file's age against the pass
     # interval. Never starts, parks, or plans anything.
-    _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override)
+    _check_runner_allocation(add, config, fleet_dir_override=fleet_dir_override, now=resolved_now)
 
     # -- recent lane-startup failures (#6-G) ---------------------------------
     # Read-only: queries this repo's own events.db for past

@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -40,6 +42,31 @@ MERGED_PR_LOOKBACK_LIMIT = 5
 QUEUED_STALE_MINUTES = 20
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
+# Measured production cadence (charlie-work `loop_started` gaps, last 39
+# intervals, 2026-07-31): min=5.5m median=10.4m p90=20.2m max=53.9m.
+# `loop_started` is logged per repo (workflow.py's `_loop_impl`, into that
+# repo's own events.db), and the supervisor processes repos sequentially in
+# one pass, so a single repo's gap is gated by how long its SIBLING repos
+# take, not by supervisor health -- job-cannon's reconcile alone walks
+# ~690 issues / ~877 PRs and can push charlie-work's gap past 50 minutes on
+# a perfectly healthy fleet.
+#
+# Set to 90: comfortably above the observed healthy maximum (53.9m) so a
+# slow-but-alive fleet cannot false-alarm (at 30m this fired on 1 of 39
+# healthy intervals, ~3-4 false alarms/day). This deliberately means it
+# will NOT catch a sub-90-minute stall -- the outage that motivated this
+# check (issues #851/#854) was only ~45 minutes, shorter than charlie-work's
+# own legitimate worst-case gap, so no per-repo threshold can separate a
+# real stall of that length from a healthy-but-slow pass. This check is a
+# coarse backstop for prolonged, total fleet death (fresh log, zero passes,
+# for well over an hour) -- not a detector for the #851/#854 class. That
+# class is caught by PR #865 (issue #855), which escalates consecutive
+# zero-repo-pass supervisor cycles: edge-triggered on the actual failure
+# mode, needs no cadence-based threshold, and can't be confused with a
+# merely slow loop. Do not lower this value to "catch" that outage faster --
+# it will just reintroduce the false-alarm noise measured above; extend
+# PR #865's check instead.
+LOOP_PASS_STALE_MINUTES = 90
 MERGEQUEUE_STALL_BEATS = 2
 GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
@@ -61,6 +88,19 @@ CHARLIE_STATUS_TIMEOUT_SECONDS = 60
 SUPERVISOR_HEARTBEAT_FILENAME = "supervisor-heartbeat.json"
 SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = 2
 SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
+
+# check_stale_open_issue_mentions (issue #902): two bulk API sources plus one
+# free local one, per the issue's "API economy matters" constraint -- never a
+# gh call per candidate issue. STALE_MENTION_PR_LOOKBACK_LIMIT bounds the
+# `gh pr list --state merged` call; 300 comfortably covers the "last 60
+# merged PRs" sample #902 was scoped from with headroom for a slower week.
+# STALE_MENTION_COMMIT_LOOKBACK bounds the local `git log` scan (issue #866's
+# reproduction: PR #864's squashed merge commit sits 19 commits back from
+# HEAD at filing time) -- purely a perf/output cap, not an API cost, since
+# `git log` never touches the network.
+STALE_MENTION_PR_LOOKBACK_LIMIT = 300
+STALE_MENTION_COMMIT_LOOKBACK = 500
+STALE_MENTION_REPORT_CAP = 20
 
 DELTA_SKIP_SUFFIX = " (delta skipped: last beat <10m ago)"
 
@@ -265,16 +305,175 @@ def get_dispatch_cap(config_path: Path) -> int | None:
 
 
 # --------------------------------------------------------------------------
+# Stale-open-issue-mention scanning primitives (issue #902)
+#
+# charlie_work.github already has `issue_numbers_mentioned_by_pr` (a same-repo
+# PR title/body scanner) and `iter_unnegated_closing_keyword_matches` (a
+# negation-aware `#N` scanner used by `closing_keyword_gate.py`). This script
+# deliberately does NOT import charlie_work (see the module docstring and
+# `fleet_dir`), so the small negation/quote-stripping heuristics below are a
+# minimal, self-contained reimplementation for this one check rather than a
+# reuse of those functions. Two differences from `issue_numbers_mentioned_by_pr`
+# are intentional, not drift:
+#
+# 1. Bare `#N` is matched, not just `issue #N` / closing-keyword `#N`. Issue
+#    #866's only trace anywhere is its fix's commit message, "refs #866" --
+#    neither "issue" nor a closing keyword precedes it, so the narrower
+#    pattern used by dispatch's mention detector would miss the exact
+#    reproduction this check exists to catch.
+# 2. It also scans commit messages (via local `git log`), not just PR
+#    title/body -- again, the #866 shape.
+#
+# Quote/negation suppression exists for the same reason #790 forced it onto
+# `iter_unnegated_closing_keyword_matches`: a literal, quoted example like
+# `"Fixes #649"` inside prose is not an intentional reference and must not
+# be surfaced (issue #902 acceptance criterion 6).
+# --------------------------------------------------------------------------
+
+_ISSUE_REF_RE = re.compile(r"#(\d+)\b")
+# The repo's own branch-naming convention for non-agent-dispatched work:
+# `<type>/<issueNumber>-<slug>` (e.g. `fix/817-fleet-health-latch`). Matched
+# separately from `_ISSUE_REF_RE` because there is no `#` in a branch name.
+# Deliberately does NOT match `agent/issue-N-...` branches (digit is not
+# immediately after the slash there) -- those are already covered by the
+# normal branch-prefix binding path (`linked_issue_number`), so a miss here
+# is not a gap, just redundant with machinery this check exists to backstop.
+_BRANCH_ISSUE_NUMBER_RE = re.compile(r"^[A-Za-z][\w.]*/(\d+)(?=[-_/]|$)")
+_FENCED_CODE_BLOCK_RE = re.compile(r"```.*?```", flags=re.DOTALL)
+_NEGATION_WORDS = ("not", "never", "without", "cannot")
+_NEGATION_CONTRACTION_SUFFIX = "n't"
+_NEGATION_RE = re.compile(
+    r"\b(?:" + "|".join(_NEGATION_WORDS) + r")\b|" + re.escape(_NEGATION_CONTRACTION_SUFFIX),
+    flags=re.IGNORECASE,
+)
+_NEGATION_LOOKBEHIND_CHARS = 32
+_QUOTE_CHARS = "\"'`"
+_QUOTE_LOOKAROUND_CHARS = 40
+
+
+def _has_preceding_negation(text: str, match_start: int) -> bool:
+    """True if a negation word/contraction appears shortly before match_start.
+
+    Same 32-char lookback window as `charlie_work.github._has_preceding_negation`
+    (kept in sync by convention, not import -- see the section docstring above).
+    """
+    window_start = max(0, match_start - _NEGATION_LOOKBEHIND_CHARS)
+    return bool(_NEGATION_RE.search(text, window_start, match_start))
+
+
+def _is_quoted(text: str, match_start: int, match_end: int) -> bool:
+    """True if the match sits inside a quoted span on the same line.
+
+    A bare `#N` match (unlike a `<keyword> #N` closing-keyword match) can sit
+    arbitrarily far from the quote character that wraps the whole phrase --
+    #790's incident was the literal text `"Fixes #649"`, where the opening
+    quote is 7 characters before the `#`. So this looks for a quote character
+    (`"`, `'`, or a backtick) within `_QUOTE_LOOKAROUND_CHARS` before the
+    match AND a matching quote character within the same distance after it,
+    both bounded to the current line so a quote on an unrelated line can
+    never suppress a real reference.
+    """
+    line_start = text.rfind("\n", 0, match_start) + 1
+    line_end = text.find("\n", match_end)
+    if line_end == -1:
+        line_end = len(text)
+    before = text[max(line_start, match_start - _QUOTE_LOOKAROUND_CHARS) : match_start]
+    after = text[match_end : min(line_end, match_end + _QUOTE_LOOKAROUND_CHARS)]
+    return any(q in before and q in after for q in _QUOTE_CHARS)
+
+
+def _mentioned_issue_numbers(text: str) -> set[int]:
+    """Return every bare `#N` reference in `text`, minus quoted/negated ones.
+
+    Fenced code blocks are stripped first (a code sample containing the
+    literal text `#123` is not a reference), mirroring
+    `charlie_work.github`'s same defense for its own mention scanner.
+    """
+    stripped = _FENCED_CODE_BLOCK_RE.sub("", text)
+    numbers: set[int] = set()
+    for match in _ISSUE_REF_RE.finditer(stripped):
+        if _has_preceding_negation(stripped, match.start()):
+            continue
+        if _is_quoted(stripped, match.start(), match.end()):
+            continue
+        numbers.add(int(match.group(1)))
+    return numbers
+
+
+def _branch_issue_number(branch: str) -> int | None:
+    match = _BRANCH_ISSUE_NUMBER_RE.match(branch)
+    return int(match.group(1)) if match else None
+
+
+_GIT_LOG_RECORD_SEP = "\x1e"
+_GIT_LOG_FIELD_SEP = "\x1f"
+
+
+def get_merged_commit_messages(
+    repo_root: Path, limit: int
+) -> tuple[bool, list[tuple[str, str]], str]:
+    """Return (ok, [(short_sha, full_message), ...], err) for the local checkout's history.
+
+    Reads `git log` on the already-checked-out branch -- every commit on it is
+    by definition already merged into that branch, so this needs no `--merged`
+    flag and, crucially, no `gh` call at all (issue #902's "API economy"
+    constraint: this is the free local source, not one of the two bulk `gh`
+    calls). This is what catches issue #866's reproduction: its fix rode in
+    as a commit inside PR #864, a PR *for a different issue*, so no scan of
+    PR title/body/branch name (for #864 or any other PR) could ever find it --
+    only a scan of #864's own commit messages can.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "git",
+                "log",
+                f"-n{limit}",
+                f"--pretty=format:%h{_GIT_LOG_FIELD_SEP}%B{_GIT_LOG_RECORD_SEP}",
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GH_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, [], f"git log failed to run: {exc}"
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip().replace("\n", " ")[:200]
+        return False, [], f"git log exited {proc.returncode}: {stderr}"
+
+    commits: list[tuple[str, str]] = []
+    for record in proc.stdout.split(_GIT_LOG_RECORD_SEP):
+        record = record.strip("\n")
+        if not record:
+            continue
+        sha, _, message = record.partition(_GIT_LOG_FIELD_SEP)
+        commits.append((sha, message))
+    return True, commits, ""
+
+
+# --------------------------------------------------------------------------
 # Checks
 # --------------------------------------------------------------------------
 
 
-def check_dispatch_throttle(report: Report, repo: RepoInfo) -> None:
+def check_dispatch_throttle(
+    report: Report, repo: RepoInfo, *, now: datetime | None = None
+) -> None:
     """Report the provider throttle cooldown (state.json's throttled_until).
 
     Being throttled is normal self-protection (OK-level), but the line must
     always print so a zero-dispatch beat is instantly explainable. Only an
     unusually long cooldown (beyond DISPATCH_THROTTLE_MAX_MINUTES) is an anomaly.
+
+    ``now`` is the injectable clock (issue #828): defaults to
+    ``datetime.now(timezone.utc)`` when not supplied, so production behavior
+    is byte-identical. Callers running multiple checks in one pass (see
+    ``main``) should sample ``now`` once and pass the same value to every
+    check instead of letting each check independently race the wall clock.
     """
     check = f"dispatch-throttle {repo.slug}"
     state_json = repo.state_dir / "state.json"
@@ -289,12 +488,12 @@ def check_dispatch_throttle(report: Report, repo: RepoInfo) -> None:
 
     throttled_until_raw = data.get("throttled_until") if isinstance(data, dict) else None
     until = parse_iso(throttled_until_raw)
-    now = datetime.now(timezone.utc)
-    if until is None or until <= now:
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
+    if until is None or until <= resolved_now:
         report.ok(check, "none")
         return
 
-    remaining_min = round((until - now).total_seconds() / 60)
+    remaining_min = round((until - resolved_now).total_seconds() / 60)
     facts = f"throttled until {throttled_until_raw} ({remaining_min} min remaining)"
     if remaining_min > DISPATCH_THROTTLE_MAX_MINUTES:
         report.anom(
@@ -312,7 +511,10 @@ def check_dispatch_coverage(
     skip_delta: bool,
     blocked_numbers: set[int] | None,
     blocked_err: str,
+    *,
+    now: datetime | None = None,
 ) -> None:
+    """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
     check = f"dispatch-coverage {repo.slug}"
     args = [
         "issue",
@@ -376,12 +578,12 @@ def check_dispatch_coverage(
                 )
         new_repo_state["dispatchable_issues"] = sorted(cur_dispatchable)
 
-    now = datetime.now(timezone.utc)
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
     stale_queued = []
     for number, updated in queued:
         if updated is None:
             continue
-        age_min = (now - updated).total_seconds() / 60
+        age_min = (resolved_now - updated).total_seconds() / 60
         if age_min > QUEUED_STALE_MINUTES:
             stale_queued.append((number, round(age_min)))
     if stale_queued:
@@ -404,7 +606,7 @@ def check_dispatch_coverage(
     else:
         report.ok(check, facts)
 
-    check_dispatch_throttle(report, repo)
+    check_dispatch_throttle(report, repo, now=resolved_now)
     check_in_progress_staleness(
         report, repo, in_progress, prev_repo_state, new_repo_state, skip_delta
     )
@@ -555,7 +757,8 @@ def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
     return newest
 
 
-def check_review_liveness(report: Report, repo: RepoInfo) -> None:
+def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | None = None) -> None:
+    """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
     check = f"review-liveness {repo.slug}"
     prs_dir = repo.state_dir / "prs"
     if not prs_dir.exists():
@@ -585,7 +788,7 @@ def check_review_liveness(report: Report, repo: RepoInfo) -> None:
     if not isinstance(prs_state, dict):
         prs_state = {}
 
-    now = datetime.now(timezone.utc)
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
     open_claims = 0
     stale: list[str] = []
     claims: list[tuple[int, int, str]] = []
@@ -620,7 +823,7 @@ def check_review_liveness(report: Report, repo: RepoInfo) -> None:
             # primary clock (issue #517).
             claim_time = datetime.fromtimestamp(entry.stat().st_mtime, tz=timezone.utc)
 
-        age_min = (now - claim_time).total_seconds() / 60
+        age_min = (resolved_now - claim_time).total_seconds() / 60
         age_rounded = round(age_min)
 
         pid_alive = _reviewer_pid_alive(pr_state)
@@ -684,7 +887,8 @@ def check_dispatch_failures(report: Report, repo: RepoInfo, baseline: datetime) 
         report.ok(check, facts)
 
 
-def check_log_freshness(report: Report, repo: RepoInfo) -> None:
+def check_log_freshness(report: Report, repo: RepoInfo, *, now: datetime | None = None) -> None:
+    """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
     check = f"log-freshness {repo.slug}"
     candidates = list(repo.state_dir.glob("*.log"))
     state_json = repo.state_dir / "state.json"
@@ -698,15 +902,198 @@ def check_log_freshness(report: Report, repo: RepoInfo) -> None:
         return
 
     freshest = max(candidates, key=lambda p: p.stat().st_mtime)
-    now = datetime.now(timezone.utc)
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
     mtime = datetime.fromtimestamp(freshest.stat().st_mtime, tz=timezone.utc)
-    age_min = (now - mtime).total_seconds() / 60
+    age_min = (resolved_now - mtime).total_seconds() / 60
 
     facts = f"freshest={freshest.name} age={round(age_min)}m"
     if age_min > LOG_FRESHNESS_STALE_MINUTES:
         report.anom(
             check, f"freshest file older than threshold={LOG_FRESHNESS_STALE_MINUTES}m ({facts})"
         )
+    else:
+        report.ok(check, facts)
+
+
+def check_loop_pass_freshness(
+    report: Report,
+    repo: RepoInfo,
+    *,
+    now: datetime | None = None,
+    stale_minutes: int = LOOP_PASS_STALE_MINUTES,
+) -> None:
+    """Coarse backstop for prolonged, total fleet death -- NOT a detector
+    for the #851/#854 outage class specifically (see ``LOOP_PASS_STALE_MINUTES``
+    for the measured cadence data and why: that outage was shorter than this
+    repo's own legitimate worst-case gap between loop passes, so no per-repo
+    threshold can separate the two; PR #865 / issue #855 catches that class
+    instead, by watching for consecutive zero-repo-pass cycles rather than
+    elapsed time).
+
+    What this still catches: the process exited 0, the scheduled task
+    reported success, and the state dir kept getting touched
+    (``self_deploy_succeeded`` fires every beat), so ``check_log_freshness``
+    reads healthy indefinitely even though the loop body itself
+    (``workflow.py``'s ``_loop_impl``, which is the only place that logs
+    ``loop_started``) has not run in any of this repo's passes for well
+    over an hour. The only ground truth for "is the loop actually running"
+    is the ABSENCE of ``loop_started`` rows in ``events.db``.
+
+    ``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``.
+
+    Missing DB, missing table, and zero ``loop_started`` rows are each
+    reported OK with a distinct message -- a fresh install/state dir with no
+    history yet is not the same failure as a fleet that stopped mid-flight.
+
+    CRITICAL: the freshness comparison is done in Python on parsed
+    ``datetime`` objects, never in SQL. ``ts`` values are ISO strings like
+    ``2026-07-31T22:25:04Z`` (``T``/``Z``); SQLite's
+    ``datetime('now','-90 minutes')`` returns a space-separated,
+    non-``Z`` string like ``2026-07-31 22:25:04``. A predicate such as
+    ``WHERE ts < datetime('now','-90 minutes')`` compares them as strings,
+    where ``'T'`` (0x54) sorts after ``' '`` (0x20) -- this silently
+    misclassifies rows in both directions instead of raising, so the bug
+    doesn't fail loudly, it just returns the wrong answer.
+    """
+    check = f"loop-pass-freshness {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.ok(check, "no events.db (fresh install or pre-instrumentation state dir)")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.ok(check, "events.db has no events table yet")
+                return
+            newest_ts = conn.execute(
+                "SELECT MAX(ts) FROM events WHERE kind = 'loop_started'"
+            ).fetchone()[0]
+        except sqlite3.Error as exc:
+            report.anom(check, f"events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    if newest_ts is None:
+        report.ok(check, "no loop_started rows recorded yet")
+        return
+
+    newest_dt = parse_iso(newest_ts)
+    if newest_dt is None:
+        report.anom(check, f"newest loop_started ts unparseable: {newest_ts!r}")
+        return
+
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
+    age_min = (resolved_now - newest_dt).total_seconds() / 60
+    facts = f"newest_loop_started={newest_ts} age={round(age_min)}m"
+
+    if age_min > stale_minutes:
+        marker_path = repo.state_dir / "pending-sync.json"
+        report.anom(
+            check,
+            f"no loop pass in {repo.slug} for {round(age_min)}m "
+            f"(newest loop_started {newest_ts}), threshold={stale_minutes}m -- "
+            f"at or beyond the observed healthy worst case, so the supervisor "
+            f"may be dead or wedged. Cause is open-ended at this duration; "
+            f"{marker_path} is one thing worth checking, not the only one. "
+            f"({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
+def check_error_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface error-level events that fire but have no consumer (issue #866).
+
+    `self_deploy_alarm` and every other member of `instrumentation._ERROR_KINDS`
+    (e.g. PR #865's `supervisor_zero_pass_alarm`) are emitted, classified
+    error-level, documented, and unit-tested -- but before this check,
+    nothing in the codebase ever read them. A human had to manually open
+    `events.db` and know which `kind` string to search for. This check
+    closes that detection-to-delivery gap; `check_loop_pass_freshness` above
+    is a separate, coarser backstop (defense in depth), not a substitute --
+    that one answers "did the loop run recently," this one answers "did
+    anything already flag itself as an error."
+
+    Coverage is DERIVED, never a hardcoded `kind` list: `level` is computed
+    once and persisted per-row at write time by
+    `instrumentation._classify_level` (checked against `_ERROR_KINDS`/
+    `_WARNING_KINDS` there), so filtering on the persisted `level = 'error'`
+    column here picks up every current and future error kind without this
+    script importing `charlie_work` or restating its kind list. This is more
+    correct than importing `_ERROR_KINDS` directly would be, too:
+    `_ERROR_KINDS` reflects the currently-installed code, while a row's
+    `level` reflects what the classifier actually assigned when that row was
+    written -- the two can disagree across a deploy boundary, and the
+    persisted column is ground truth for "what actually happened."
+
+    Unlike `check_loop_pass_freshness` (missing db/table = OK, "no history
+    yet" -- a fresh install is not a failure), a missing or unreadable
+    events.db HERE is an ANOMALY: this check's entire job is "did any alarm
+    fire," and a registered repo this check cannot read is a repo it cannot
+    vouch for, not one it can call clean.
+
+    Only rows with `ts` strictly after `baseline` (the previous heartbeat
+    beat -- same mechanism as `check_dispatch_failures`) are reported, so an
+    already-seen alarm is not re-flagged forever. On a cold start (no prior
+    `heartbeat-state.json`), `main()` falls `baseline` back to
+    `now - LOG_FRESHNESS_STALE_MINUTES`, so alarms older than that fallback
+    window are silently out of scope on the very first run -- a deliberate,
+    bounded blind spot, not an oversight.
+
+    CRITICAL: timestamps are compared in Python, never in SQL -- the same
+    ISO-`T`/`Z`-vs-SQLite-space-format trap documented on
+    `check_loop_pass_freshness`. All `level='error'` rows are pulled
+    unfiltered by time and each `ts` is parsed with `parse_iso` and compared
+    against the `baseline` `datetime` in Python.
+    """
+    check = f"error-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check for alarms: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check for alarms: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check for alarms: events.db has no events table")
+                return
+            rows = conn.execute("SELECT ts, kind FROM events WHERE level = 'error'").fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check for alarms: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_alarms: list[str] = []
+    for ts, kind in rows:
+        ts_dt = parse_iso(ts)
+        # An unparseable ts fails toward visibility (reported), not silence.
+        if ts_dt is None or ts_dt > baseline:
+            new_alarms.append(f"{kind}@{ts}")
+
+    facts = f"error_rows={len(rows)} new_since_last_beat={len(new_alarms)}"
+    if new_alarms:
+        report.anom(check, f"new error-level event(s) since last beat: {new_alarms} ({facts})")
     else:
         report.ok(check, facts)
 
@@ -800,6 +1187,154 @@ def check_merge_flow(
         )
     else:
         report.ok(check, facts)
+
+
+def check_stale_open_issue_mentions(report: Report, repo: RepoInfo) -> None:
+    """Surface open issues referenced by already-merged work with no closure path (issue #902).
+
+    The gap: `workflow.py`'s finalization path (`_merged_pr_referenced_issue_numbers`)
+    intersects a merged PR's mentioned issue numbers against the *currently
+    `ready`-labelled* issue set before ever surfacing anything, by design --
+    its docstring is explicit that this exists so "a stray mention of an
+    issue not in the dispatch queue does not get actioned." That intersect is
+    correct and this check does not touch it: a bare mention must never
+    *authorize* a lifecycle transition (see #781/#790's false-close
+    incident). But the same intersect means an issue with **zero labels**
+    (never dispatched, never triaged) can be fully fixed and merged and the
+    finalization path will never even consider it, because it was never a
+    candidate to begin with. #817 and #866 are exactly this: both carried no
+    labels at all and both stayed open after their fixing PRs merged.
+
+    This check is a separate, read-only roll-call living entirely outside
+    the dispatch/finalization lane -- #203's originally-proposed option 3,
+    never implemented. Its candidate set is `gh issue list --state open`
+    with **no label filter and no `state.json` read**: that is the one
+    property that makes it able to see what the dispatch-lane check
+    structurally cannot. It never labels, comments, or closes anything --
+    only ever calls `report.anom`/`report.ok`.
+
+    Three sources, matching the issue's "API economy" constraint (this runs
+    unattended alongside nine other checks, so no `gh` call may scale with
+    the number of open issues or merged PRs):
+
+    1. One `gh issue list --state open --json number` call for the
+       candidate set.
+    2. One `gh pr list --state merged --json number,headRefName,title,body,
+       closingIssuesReferences,mergedAt` call (bounded by
+       `STALE_MENTION_PR_LOOKBACK_LIMIT`), scanned for a branch-name issue
+       number (`_branch_issue_number`) or a bare `#N` mention
+       (`_mentioned_issue_numbers`) in title/body. This is what would catch
+       #817: PR #824's branch is `fix/817-fleet-health-latch` (no
+       `agent/issue` prefix, so `linked_issue_number` never trusts it) and
+       its body reads "For issue #817:" (a reference, but not a closing
+       keyword, so `closingIssuesReferences` came back empty on the PR
+       itself).
+    3. Local `git log` on the already-checked-out branch (`get_merged_commit_messages`,
+       bounded by `STALE_MENTION_COMMIT_LOOKBACK`) -- zero API cost, and the
+       only source that can catch #866: its fix landed as a commit inside PR
+       #864, a PR *for a different issue*, so no scan of any PR's own
+       title/body/branch name -- #864's or otherwise -- could ever find it.
+
+    `closingIssuesReferences` is fetched (per the issue's specified command
+    shape) but not used to gate reporting: since the candidate set is
+    already restricted to *currently open* issues, any issue GitHub's native
+    auto-close already resolved via a real closing-keyword match is
+    definitionally no longer in that set. No extra filtering on that field
+    can change which issues get reported here.
+
+    Quoted or negated mentions are excluded (`_mentioned_issue_numbers`),
+    consistent with #781/#790: a mention is evidence for a human to check,
+    never grounds to act automatically, and a quoted/negated one is not even
+    that. Output is capped at `STALE_MENTION_REPORT_CAP` issues (with a
+    "+K more" suffix) so a large true positive count cannot flood the beat.
+    """
+    check = f"stale-open-issue-mentions {repo.slug}"
+
+    ok_open, open_data, err_open = run_gh_json(
+        [
+            "issue",
+            "list",
+            "-R",
+            repo.slug,
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--limit",
+            str(ISSUE_LIST_LIMIT),
+        ],
+        repo.repo_root,
+    )
+    if not ok_open:
+        report.anom(check, err_open)
+        return
+    open_numbers = {issue["number"] for issue in open_data}
+
+    ok_merged, merged_data, err_merged = run_gh_json(
+        [
+            "pr",
+            "list",
+            "-R",
+            repo.slug,
+            "--state",
+            "merged",
+            "--limit",
+            str(STALE_MENTION_PR_LOOKBACK_LIMIT),
+            "--json",
+            "number,headRefName,title,body,closingIssuesReferences,mergedAt",
+        ],
+        repo.repo_root,
+    )
+    if not ok_merged:
+        report.anom(check, err_merged)
+        return
+
+    ok_commits, commits, err_commits = get_merged_commit_messages(
+        repo.repo_root, STALE_MENTION_COMMIT_LOOKBACK
+    )
+
+    mentions: dict[int, list[str]] = {}
+
+    def record(number: int, evidence: str) -> None:
+        if number in open_numbers:
+            mentions.setdefault(number, []).append(evidence)
+
+    for pr in merged_data:
+        pr_number = pr.get("number")
+        branch = str(pr.get("headRefName") or "")
+        branch_issue = _branch_issue_number(branch)
+        if branch_issue is not None:
+            record(branch_issue, f"PR #{pr_number} branch {branch!r}")
+        text = f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
+        for number in _mentioned_issue_numbers(text):
+            record(number, f"PR #{pr_number} title/body")
+
+    for sha, message in commits:
+        for number in _mentioned_issue_numbers(message):
+            record(number, f"commit {sha}")
+
+    facts = (
+        f"open={len(open_numbers)} merged_prs_scanned={len(merged_data)} "
+        f"commits_scanned={len(commits)}"
+    )
+    if not ok_commits:
+        facts += f" (commit-message scan degraded: {err_commits})"
+
+    if not mentions:
+        report.ok(check, f"stale_mentions=0 ({facts})")
+        return
+
+    matched_numbers = sorted(mentions)
+    shown = matched_numbers[:STALE_MENTION_REPORT_CAP]
+    detail_parts = [f"#{n} ({mentions[n][0]})" for n in shown]
+    if len(matched_numbers) > STALE_MENTION_REPORT_CAP:
+        detail_parts.append(f"+{len(matched_numbers) - STALE_MENTION_REPORT_CAP} more")
+
+    report.anom(
+        check,
+        f"{len(matched_numbers)} open issue(s) referenced by merged work with no closure "
+        f"path: {'; '.join(detail_parts)} ({facts})",
+    )
 
 
 def check_github_rate(report: Report, any_repo_root: Path) -> None:
@@ -979,6 +1514,10 @@ def main() -> int:
 
     prev_state = load_state()
     prev_last_beat_at = parse_iso(prev_state.get("last_beat_at"))
+    # Sampled once for this entire beat (issue #828) and threaded into every
+    # sub-check below instead of each one independently racing the wall
+    # clock -- keeps all checks in one run reporting against a single
+    # consistent instant, and makes the run's own last_beat_at exact.
     now = datetime.now(timezone.utc)
     baseline = prev_last_beat_at or (now - timedelta(minutes=LOG_FRESHNESS_STALE_MINUTES))
     skip_delta = prev_last_beat_at is not None and (now - prev_last_beat_at) < timedelta(
@@ -1006,11 +1545,15 @@ def main() -> int:
             skip_delta,
             blocked_by_repo.get(repo.slug),
             blocked_err,
+            now=now,
         )
-        check_review_liveness(report, repo)
+        check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
-        check_log_freshness(report, repo)
+        check_error_events(report, repo, baseline)
+        check_log_freshness(report, repo, now=now)
+        check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
+        check_stale_open_issue_mentions(report, repo)
         new_state["repos"][repo.slug] = new_repo_state
 
     if repos:

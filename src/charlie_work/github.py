@@ -7,12 +7,35 @@ import re
 import subprocess
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from .config import RuntimeConfig
+
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# GitHubError was MOVED to ci_fleet, not copied, because it is *caught*. Two
+# structurally identical exception classes are unrelated types, so a local
+# re-declaration would stop every `except GitHubError` in charlie_work from
+# catching what ci_fleet raises — with no import error and no failure at the
+# raise site. Re-exported here rather than at the adapter because consumers
+# already do `from .github import GitHubError`.
+#
+# Measured 2026-08-05 by AST, not grep — a line matcher misses parenthesized
+# multi-line imports and counts non-handler mentions, and it errs in both
+# directions at once, so two greps agreeing is not corroboration. An earlier
+# version of this comment claimed "16 modules" and was wrong: 16 is exactly
+# workflow.py's own handler count, which is where the number came from.
+# Actual: 7 modules import the name and 37 `except` handlers across 6 files
+# depend on it being ci_fleet's class (independently reproduced ci_fleet-side).
+# Counts are indicative only — `tests/test_ci_fleet_seams.py` is the guard, and
+# it asserts the identity directly, so deleting or re-declaring this fails the
+# suite rather than degrading silently. Fix the seam, never the assertion.
+from ci_fleet.github import GitHubError  # noqa: F401  (deliberate re-export)
 
 from .checks import _run_id_from_link
 from .subprocess_runner import no_console_window_kwargs
@@ -27,6 +50,13 @@ _LIST_LIMIT = 500
 _DEFAULT_GH_MAX_RETRIES = 3
 _DEFAULT_GH_RETRY_BASE_SECONDS = 1.0
 _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD = 1500
+
+# Bound on concurrent `gh` subprocesses spawned by are_issues_open() for a
+# single batch of cache misses. Each `gh` call is I/O-bound (process spawn +
+# network round trip, ~1-7s observed), so this is a fan-out width, not a CPU
+# budget -- picked to keep well clear of GitHub's secondary rate limits while
+# still cutting a serial N x ~2s loop down substantially. See issue #870.
+_MAX_ISSUE_STATE_WORKERS = 8
 
 # Fractional jitter applied to each retry backoff (e.g. 0.25 => +/- 25%).
 _JITTER_FRACTION = 0.25
@@ -115,10 +145,6 @@ ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
 )
 
 
-class GitHubError(RuntimeError):
-    pass
-
-
 class GitHubNotFoundError(GitHubError):
     """The referenced GitHub object does not exist in this repository.
 
@@ -165,7 +191,7 @@ class GitHubRunResult:
     error: str | None = None
 
 
-class _MergedPRSearchResult(list):
+class MergedPRSearchResult(list):
     """List-like result from ``merged_prs_for_issue`` with an ``ok`` flag.
 
     Behaves like a normal list so existing list-consuming callers keep working,
@@ -176,6 +202,9 @@ class _MergedPRSearchResult(list):
     def __init__(self, items: list[Any], ok: bool = True) -> None:
         super().__init__(items)
         self.ok = ok
+
+
+_MergedPRSearchResult = MergedPRSearchResult
 
 
 # Matches the job-id segment of a GitHub Actions check link, e.g.
@@ -624,7 +653,7 @@ class GitHub:
         self,
         issue_number: int,
         branch_prefix: str,
-    ) -> _MergedPRSearchResult:
+    ) -> MergedPRSearchResult:
         """Return merged PRs that hijack-safely bind to ``issue_number``.
 
         Uses ``gh pr list --state merged --search`` so PRs merged long ago
@@ -662,7 +691,7 @@ class GitHub:
                     issue_number,
                     result.error,
                 )
-                return _MergedPRSearchResult([], ok=False)
+                return MergedPRSearchResult([], ok=False)
             items = result.value if isinstance(result.value, list) else []
         else:
             items = result if isinstance(result, list) else []
@@ -678,7 +707,7 @@ class GitHub:
             )
             if bound == issue_number:
                 matched.append(pr)
-        return _MergedPRSearchResult(matched, ok=True)
+        return MergedPRSearchResult(matched, ok=True)
 
     def pr_view(self, number: int, *, fields: str = PR_VIEW_FIELDS) -> dict[str, Any]:
         """Fetch a PR via ``gh pr view --json <fields>``.
@@ -726,15 +755,34 @@ class GitHub:
                 # Empty successful response (no checks reported) is legitimate.
                 return []
             else:
-                # Command-level failure (Unknown JSON field, GraphQL error, etc.)
-                return None
+                # gh pr checks ALSO exits non-zero -- with empty stdout, so
+                # result.value is None here too -- when the PR simply has no
+                # checks reported yet (issue #846, measured against this repo:
+                # `gh pr checks 700 ...` -> exit 1, stderr "no checks reported
+                # on the '...' branch", no JSON). That is indistinguishable
+                # from a genuine command failure (unsupported JSON field,
+                # GraphQL error, transient outage) using result.ok/result.value
+                # alone, so disambiguate with a second, different endpoint
+                # rather than guessing from the exit code or stderr text.
+                fallback = self._pr_checks_fallback(number)
+                if fallback is None:
+                    # Fallback also failed (or returned an unmappable shape):
+                    # genuine unavailability. Preserves pr_checks' existing
+                    # None contract -- callers/loop still count this as an
+                    # infrastructure error.
+                    return None
+                if not fallback:
+                    return []
+                checks = fallback
         else:
             # Legacy pre-result-object fallback
             checks = result if isinstance(result, list) else []
         # gh pr checks --json has no databaseId/runId fields; derive both the
         # GitHub Actions job id and the workflow run id from "link" and inject
         # them so downstream consumers keep reading check.get("databaseId") and
-        # check.get("runId") unchanged.
+        # check.get("runId") unchanged. This also normalizes the fallback path
+        # above: its mapped entries carry a "link" field in the same URL shape
+        # (Actions job URL), so the same regex-based derivation applies.
         return [
             {
                 **check,
@@ -743,6 +791,91 @@ class GitHub:
             }
             for check in checks
         ]
+
+    def _pr_checks_fallback(self, number: int) -> list[dict[str, Any]] | None:
+        """Disambiguate a ``gh pr checks`` failure via ``statusCheckRollup`` (issue #846).
+
+        ``gh pr checks`` cannot represent "no checks reported yet" as a
+        successful empty response -- it exits non-zero with empty stdout for
+        that case, identically to a genuine command failure (see the caller).
+        ``gh pr view --json statusCheckRollup`` CAN: it returns a clean empty
+        list with exit 0 for a PR with zero checks (measured against PR #700
+        in this repo: ``{"statusCheckRollup":[]}``, exit 0).
+
+        This field carries its own risk -- it is a per-item GraphQL graph walk
+        that can fail on token scope (see the PR_CHECKS_FIELDS note above and
+        issue #361) -- but any failure here simply falls through to this
+        function's ``None`` return, which is exactly pr_checks' pre-existing
+        "unavailable" behavior. This call can never make pr_checks' result
+        worse than it was before issue #846's fix, only better (turning some
+        `None`s into accurate `[]`s).
+
+        Returns:
+        - ``None`` if the fallback call itself failed, or its rollup contains
+          an entry this function cannot faithfully map (see below). Callers
+          treat this exactly like today's "gh command failed" case.
+        - ``[]`` if the rollup is empty: legitimately no checks.
+        - a list of dicts shaped like ``gh pr checks --json name,state,link``
+          (name/state/link only -- databaseId/runId are injected by the
+          caller) if the rollup is non-empty and every entry is a GitHub
+          Actions ``CheckRun``. This covers the "gh pr checks glitched
+          transiently while checks do exist" case.
+
+        Mapping notes (verified against live PRs in this repo, not assumed):
+        - ``link`` <- ``detailsUrl``: both are the same Actions job URL in
+          every sample (PR #679, #839).
+        - ``state`` <- ``conclusion if status == "COMPLETED" else status``:
+          this is the same rule gh's own `pr checks` uses internally to
+          collapse CheckRun's two-field status/conclusion into one "state".
+          Verified pairwise on live data: PR #679 IN_PROGRESS check has
+          ``state: IN_PROGRESS`` / ``status: IN_PROGRESS, conclusion: ""``;
+          its SUCCESS check has ``state: SUCCESS`` / ``status: COMPLETED,
+          conclusion: SUCCESS``; PR #839's cancelled-run checks have
+          ``state: CANCELLED`` / ``status: COMPLETED, conclusion: CANCELLED``.
+        - ``bucket`` is intentionally NOT mapped: it is a `gh`-CLI-side
+          classification (pass/fail/pending/cancel/skipping) computed from
+          state, with no GraphQL equivalent to read it back from (see the
+          PR_CHECKS_FIELDS note above). Every consumer that reads "bucket"
+          (checks.py, workflow.py) only uses it as an `or` alternative to
+          "state" (e.g. ``state == "SUCCESS" or bucket == "pass"``), never as
+          an independent requirement, so an absent bucket does not change
+          classification -- "state" alone still carries it correctly.
+        - Any rollup entry whose ``__typename`` is not ``"CheckRun"`` (e.g. a
+          ``StatusContext`` from an external, non-Actions status check) makes
+          the whole call return ``None`` instead of guessing: this repo has
+          no live sample of that shape's fields, and fabricating one risks
+          silently inventing check state, which is exactly what issue #846
+          warns against doing at this boundary.
+        """
+        result = self.run(
+            ["pr", "view", str(number), "--json", "statusCheckRollup"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if not (
+            isinstance(result, GitHubRunResult) and result.ok and isinstance(result.value, dict)
+        ):
+            return None
+        rollup = result.value.get("statusCheckRollup")
+        if not isinstance(rollup, list):
+            return None
+        if not rollup:
+            return []
+        mapped: list[dict[str, Any]] = []
+        for entry in rollup:
+            if not isinstance(entry, dict) or entry.get("__typename") != "CheckRun":
+                return None
+            status = str(entry.get("status") or "")
+            conclusion = str(entry.get("conclusion") or "")
+            state = conclusion if status == "COMPLETED" and conclusion else status
+            mapped.append(
+                {
+                    "name": entry.get("name"),
+                    "state": state,
+                    "link": entry.get("detailsUrl"),
+                }
+            )
+        return mapped
 
     def actions_job(self, job_id: int) -> dict[str, Any] | None:
         """Fetch a single GitHub Actions job by ID.
@@ -1120,12 +1253,44 @@ class GitHub:
         except GitHubError:
             return False
 
+    def pr_ready(self, number: int) -> GitHubRunResult:
+        """Mark a draft PR as ready for review via ``gh pr ready`` (issue #818).
+
+        Returns a structured result so callers can distinguish success from
+        failure without inferring from output shape -- errors from external
+        processes come back as values here, never exceptions. Dry-run mode
+        returns a synthetic ok=True result (the operation would succeed if not
+        for dry-run); this mirrors ``_run_bool``'s explicit guard because
+        ``.run()`` itself returns a bare string under dry-run, not a
+        ``GitHubRunResult``.
+        """
+        args = ["pr", "ready", str(number)]
+        if self.dry_run and _is_mutating(args):
+            return GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        result = self.run(args, allow_failure=True)
+        assert isinstance(result, GitHubRunResult)
+        return result
+
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
         """Check which of the given issue numbers are currently open.
 
         Returns a set of issue numbers that are open. Issues that don't exist
         or are closed are not included in the result. This is used for the
         dependency gate to check if blocker issues are still open.
+
+        Per-issue-number results are cached in the pass-scoped ``_list_cache``
+        (keyed ``("issue_open", number)``), and cache misses are resolved
+        concurrently. This function was previously a fully serial, one
+        `gh issue view` per number loop, and with dozens of ready issues
+        sharing overlapping blockers, was the dominant cost of `fleet status`
+        (issue #870: ~140s of a ~184s run). Errors are cached the same as a
+        real "closed" answer -- that mirrors this function's existing
+        per-call contract (an errored/nonexistent issue is already treated as
+        "not open" / not blocking), so caching it for the rest of this one
+        pass changes nothing about correctness, only how many times it's
+        re-derived.
 
         Args:
             issue_numbers: List of issue numbers to check
@@ -1137,16 +1302,34 @@ class GitHub:
             return set()
 
         open_issues: set[int] = set()
+        uncached: list[int] = []
         for number in issue_numbers:
-            try:
-                issue = self.issue_view(number)
-                # GitHub API returns issues regardless of state; we need to check
-                # the state field. If the issue doesn't exist, issue_view raises.
-                if str(issue.get("state") or "").upper() == "OPEN":
-                    open_issues.add(number)
-            except (GitHubError, ValueError, TypeError):
-                # Issue doesn't exist or API error — treat as not blocking
-                continue
+            cached = self._list_cache.get(("issue_open", number))
+            if cached is None:
+                uncached.append(number)
+            elif cached:
+                open_issues.add(number)
+
+        if uncached:
+
+            def _fetch_state(number: int) -> tuple[int, bool]:
+                try:
+                    issue = self.issue_view(number)
+                    # GitHub API returns issues regardless of state; we need to
+                    # check the state field. If the issue doesn't exist,
+                    # issue_view raises.
+                    is_open = str(issue.get("state") or "").upper() == "OPEN"
+                except (GitHubError, ValueError, TypeError):
+                    # Issue doesn't exist or API error — treat as not blocking
+                    is_open = False
+                return number, is_open
+
+            max_workers = min(_MAX_ISSUE_STATE_WORKERS, len(uncached))
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for number, is_open in pool.map(_fetch_state, uncached):
+                    self._list_cache[("issue_open", number)] = is_open
+                    if is_open:
+                        open_issues.add(number)
 
         return open_issues
 
@@ -1166,6 +1349,97 @@ class GitHub:
         if not isinstance(name_with_owner, str):
             raise GitHubError("Expected nameWithOwner string in gh repo view output")
         return name_with_owner
+
+
+@runtime_checkable
+class GitHubLike(Protocol):
+    """Structural interface for the GitHub surface the orchestrator calls.
+
+    Production functions accept ``gh: GitHubLike`` instead of the concrete
+    ``GitHub`` class so test doubles can satisfy the contract structurally
+    without subclassing the frozen dataclass (issue #593).
+    """
+
+    dry_run: bool = False
+
+    def run(
+        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> Any: ...
+
+    def check_graphql_rate_limit(self, threshold: int = ...) -> tuple[bool, int, int | None]: ...
+
+    def invalidate_list_cache(self) -> None: ...
+
+    def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]: ...
+
+    def issue_view(self, number: int) -> dict[str, Any]: ...
+
+    def pr_list(self) -> list[dict[str, Any]]: ...
+
+    def merged_pr_list(self) -> list[dict[str, Any]]: ...
+
+    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str) -> MergedPRSearchResult:
+        """Return merged PRs binding to ``issue_number``.
+
+        The returned object is list-like and carries an ``ok`` flag. Callers
+        must check ``ok`` before treating an empty result as "no merged PRs";
+        ``ok=False`` means the search itself failed (rate limit, etc.).
+        """
+        ...
+
+    def pr_view(self, number: int, *, fields: str = ...) -> dict[str, Any]: ...
+
+    def pr_diff(self, number: int) -> str: ...
+
+    def pr_checks(self, number: int) -> list[dict[str, Any]] | None: ...
+
+    def actions_job(self, job_id: int) -> dict[str, Any] | None: ...
+
+    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]: ...
+
+    def commit(self, sha: str) -> dict[str, Any] | None: ...
+
+    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None: ...
+
+    def pr_commits(self, number: int) -> list[dict[str, Any]] | None: ...
+
+    def compare(self, base: str, head: str) -> dict[str, Any] | None: ...
+
+    def branch_protection(self, base: str) -> dict[str, Any] | None: ...
+
+    def compare_diff(self, base: str, head: str) -> str | None: ...
+
+    def add_issue_label(self, number: int, label: str) -> bool: ...
+
+    def remove_issue_label(self, number: int, label: str) -> bool: ...
+
+    def add_pr_label(self, number: int, label: str) -> bool: ...
+
+    def remove_pr_label(self, number: int, label: str) -> bool: ...
+
+    def close_issue(self, number: int) -> bool: ...
+
+    def pr_comment(self, number: int, body_file: Path) -> None: ...
+
+    def label_list(self) -> list[dict[str, Any]]: ...
+
+    def label_create(self, label: str, color: str, description: str) -> None: ...
+
+    def merge_pr(
+        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
+    ) -> str: ...
+
+    def delete_branch(self, branch: str) -> bool: ...
+
+    def pr_update_branch(self, pr_number: int) -> bool: ...
+
+    def pr_ready(self, number: int) -> GitHubRunResult: ...
+
+    def are_issues_open(self, issue_numbers: list[int]) -> set[int]: ...
+
+    def name_with_owner(self) -> str: ...
+
+    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None: ...
 
 
 def label_names(item: dict[str, Any]) -> set[str]:
@@ -1473,6 +1747,52 @@ def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:
     return _is_pre_connection_error(error)
 
 
+def _api_is_mutating(args: list[str]) -> bool:
+    """Classify a `gh api` invocation, for the --dry-run gate.
+
+    `gh api` defaults to GET, so a bare `gh api <path>` is read-only and MUST stay
+    runnable under --dry-run — roughly a dozen call sites (rate_limit, commits/{sha},
+    check-runs, compare, branches/*/protection, `fleet_registry.py`) depend on that.
+    Blanket-denying `api` would turn --dry-run from "observes without mutating" into
+    "cannot observe", so the classification keys off whether a method is *named*.
+
+    Structured on flag PRESENCE rather than on enumerating accepted spellings, and
+    fails CLOSED when a method flag is present but its value cannot be extracted.
+    The previous version enumerated `--method`/`--method=` only and fell through to
+    False for everything else, so `-X DELETE` — the form `delete_branch` builds —
+    classified as read-only and a --dry-run really deleted PR head branches
+    (#914, #917). Enumeration is the wrong shape here: it silently fails open on
+    each spelling nobody thought of (`-X`, `-X=`, `-XDELETE`, a trailing `--method`
+    with no value).
+    """
+    for i, arg in enumerate(args):
+        if arg in ("-X", "--method"):
+            method = args[i + 1] if i + 1 < len(args) else ""
+        elif arg.startswith("--method="):
+            method = arg.split("=", 1)[1]
+        elif arg.startswith("-X"):
+            # pflag shorthand accepts an attached value: `-XDELETE` and `-X=DELETE`.
+            method = arg[2:].lstrip("=")
+        else:
+            continue
+        # A named-but-unparseable method is not evidence of a read; fail closed.
+        return not method or method.upper() not in ("GET", "HEAD")
+    # No explicit method. gh switches GET -> POST when request parameters are added
+    # ("adding request parameters will automatically switch the request method to
+    # POST" -- gh api --help). No call site uses these today, so this arm is latent;
+    # it costs one condition and closes the same class before a site appears. Note
+    # it also classifies a read-only `gh api graphql -f query=...` as mutating, which
+    # over-blocks a dry run rather than under-blocking it -- the safe direction.
+    #
+    # Prefix-matched, not membership-tested, for the same reason as the method arm:
+    # pflag accepts both the detached (`-f title=x`, `--field=labels[]=bug`) and the
+    # attached (`-ftitle=x`) spelling, and a membership test sees only the detached
+    # one (#919). `--field`/`--raw-field`/`--input` are prefixes rather than exact
+    # matches so the bare and `=` forms collapse into one condition.
+    param_prefixes = ("--raw-field", "--field", "--input")
+    return any(arg.startswith(param_prefixes) or arg[:2] in ("-f", "-F") for arg in args)
+
+
 def _is_mutating(args: list[str]) -> bool:
     if not args:
         return False
@@ -1480,12 +1800,7 @@ def _is_mutating(args: list[str]) -> bool:
     # `gh api` defaults to GET and is read-only unless a mutating method is given.
     # run() passes args without the leading "gh" token.
     if text.startswith("api"):
-        for i, arg in enumerate(args):
-            if arg == "--method" and i + 1 < len(args):
-                return args[i + 1].upper() not in ("GET", "HEAD")
-            if arg.startswith("--method="):
-                return arg.split("=", 1)[1].upper() not in ("GET", "HEAD")
-        return False
+        return _api_is_mutating(args)
     readonly_prefixes = (
         "issue list",
         "issue view",
@@ -1687,20 +2002,42 @@ def detect_prose_only_dependencies(text: str) -> bool:
     return False
 
 
-def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
+def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int]:
     """Fetch GitHub's native issue dependencies (blocked_by relationships).
 
     Uses the GitHub API to check for issue dependencies. Tolerates 404/410 errors
     for repos that don't have the feature enabled. Returns an empty list on any
     error (fail-open for compatibility).
 
+    Successful resolutions (a real dependency list, including a legitimate
+    empty one, and the 404/410 "feature not available" case) are cached in
+    ``gh``'s pass-scoped ``_list_cache`` keyed ``("issue_dependencies",
+    issue_number)`` -- issue #870 found this call, made once per ready issue
+    with zero caching, serial and uncached, was the single largest cost of
+    `fleet status` (~140s of a ~184s run for 62 issues). Transient failures
+    are deliberately NOT cached: caching a fail-open `[]` would silently
+    erase a real dependency edge for the rest of this pass, which is a
+    correctness change, not just a performance one -- so a transient error
+    is retried on the next lookup within the same pass instead of being
+    locked in.
+
     Args:
-        gh: GitHub client instance
+        gh: GitHub client instance. Duck-typed test doubles without a
+            ``_list_cache`` attribute (several exist in tests/test_charlie_work.py,
+            predating this cache) are tolerated -- caching is simply skipped
+            for them rather than raising.
         issue_number: The issue number to check dependencies for
 
     Returns:
         List of issue numbers that block this issue via GitHub's native API
     """
+    cache = getattr(gh, "_list_cache", None)
+    cache_key = ("issue_dependencies", issue_number)
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     result = gh.run(
         [
             "api",
@@ -1713,7 +2050,8 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
     # Handle different return types from allow_failure=True
     if isinstance(result, GitHubRunResult):
         if not result.ok:
-            # Transient error or gh not available — fail open with warning
+            # Transient error or gh not available — fail open with warning.
+            # Not cached: see docstring.
             logger.warning(
                 "GitHub dependencies API failed for issue #%d: %s - treating as no dependencies",
                 issue_number,
@@ -1727,20 +2065,28 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
     if value is None:
         # Legacy FakeGitHub may return None for an allow_failure=True call; in
         # production gh.run returns a GitHubRunResult with ok=False and error.
+        # Not cached: indistinguishable from a transient failure here.
         logger.warning(
             "GitHub dependencies API returned None for issue #%d - treating as no dependencies",
             issue_number,
         )
         return []
     elif isinstance(value, dict):
-        # 404/410 error response — feature not available on this repo
-        # This is expected for repos without dependencies enabled
+        # 404/410 error response — feature not available on this repo. This
+        # is a stable, successful resolution (not a transient error), so it's
+        # safe and correct to cache.
+        if cache is not None:
+            cache[cache_key] = []
         return []
     elif isinstance(value, list):
-        # Extract issue numbers from the dependency list
-        return [int(dep.get("number", 0)) for dep in value if dep.get("number")]
+        # Extract issue numbers from the dependency list — a real, successful
+        # resolution, cached.
+        deps = [int(dep.get("number", 0)) for dep in value if dep.get("number")]
+        if cache is not None:
+            cache[cache_key] = deps
+        return deps
     else:
-        # Unexpected type — fail open with warning
+        # Unexpected type — fail open with warning. Not cached.
         logger.warning(
             "GitHub dependencies API returned unexpected type %s for issue #%d - treating as no dependencies",
             type(value),
@@ -1750,7 +2096,7 @@ def get_github_issue_dependencies(gh: GitHub, issue_number: int) -> list[int]:
 
 
 def cancel_superseded_runs(
-    gh: GitHub,
+    gh: GitHubLike,
     default_branch: str,
     workflow_name: str,
 ) -> dict[str, Any]:

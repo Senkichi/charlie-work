@@ -11,7 +11,24 @@ import yaml
 
 from charlie_work.github import ORCHESTRATOR_MANAGED_MERGE_FLAGS
 
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# Re-exported in place, not re-declared. These two dataclasses are compared and
+# isinstance-checked across the seam, and two structurally identical frozen
+# dataclasses are never equal to each other — so a local re-declaration breaks
+# equality and isinstance at runtime without breaking any import.
+#
+# `tests/test_ci_fleet_seams.py` guards this seam; deletion fails the suite.
+# See the matching note in github.py for the same pattern applied to
+# GitHubError, where the consequence is uncaught exceptions.
+from ci_fleet.config import (  # noqa: F401  (deliberate re-export)
+    RunnerAllocationConfig,
+    RunnerScalingConfig,
+)
+
 from . import layout
+from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
 DEFAULT_CONFIG_FILENAME = "orchestrator.config.yaml"
 
@@ -200,6 +217,25 @@ class DispatchConfig:
     # explicitly. Paths are normalized to forward slashes so Windows-style
     # backslash separators in config still match git-reported paths.
     injected_paths: tuple[str, ...] = ()
+    # Issue comments rendered into the worker prompt (issue #872). A worker that
+    # only sees ``issue.body`` cannot see the comment that corrected it.
+    #
+    # The include filter is an allow-list on GitHub's ``authorAssociation``, not
+    # a deny-list of bot logins: a new bot then needs no code change to be
+    # excluded, and the comment payload carries no ``is_bot`` field to key off.
+    # ``viewerDidAuthor`` looks like the natural self-filter and is the wrong
+    # one -- the orchestrator authenticates as the operator's own account, so it
+    # is true for exactly the human corrections this feature exists to deliver.
+    worker_prompt_comment_associations: tuple[str, ...] = DEFAULT_COMMENT_ASSOCIATIONS
+    # Logins whose comments are dropped regardless of association. Empty by
+    # default; the escape hatch for a bot that comments as a COLLABORATOR, or
+    # for the orchestrator's own future issue-side chatter.
+    worker_prompt_excluded_comment_authors: tuple[str, ...] = ()
+    # Prompt budget. Newest comments win when either bound binds, and the
+    # rendered block says how many were dropped rather than truncating silently.
+    # 0 disables the respective bound.
+    worker_prompt_max_comments: int = 20
+    worker_prompt_max_comment_chars: int = 12000
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -211,6 +247,19 @@ class DispatchConfig:
         if WRITER_MARKER_FILENAME not in base:
             base.append(WRITER_MARKER_FILENAME)
         object.__setattr__(self, "injected_paths", _normalize_injected_paths(base))
+        # Coerce the comment-filter sequences here rather than only in
+        # ``load_config``: this is the one path every construction goes through,
+        # so a direct ``DispatchConfig(...)`` in a test or a caller cannot smuggle
+        # in a list and silently make a frozen instance unhashable. A bare string
+        # is wrapped rather than iterated -- ``tuple("OWNER")`` would otherwise
+        # yield five single-character "associations" that match nothing.
+        for field_name in (
+            "worker_prompt_comment_associations",
+            "worker_prompt_excluded_comment_authors",
+        ):
+            value = getattr(self, field_name)
+            normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
+            object.__setattr__(self, field_name, normalized)
 
 
 @dataclass(frozen=True)
@@ -479,6 +528,12 @@ class AutoMergeConfig:
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
     failed_attempt_alarm: int = 3
+    # Maximum `gh run rerun` attempts per workflow run id for a required check
+    # that is infra-failed (CANCELLED/INFRA_FAILURE/TIMED_OUT -- see
+    # checks.classify_infra_failures, issue #841). Once every infra-failing
+    # run id for a check has been retried this many times on the current
+    # head, the PR escalates to a human instead of retrying forever.
+    infra_rerun_attempt_cap: int = 2
     # Maximum minutes after the PR's last update (updatedAt) to wait for any
     # required check run to appear before routing an approved PR to readiness
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
@@ -1049,7 +1104,15 @@ class TestAdequacyConfig:
     enabled: bool = False
     min_product_lines: int = 10
     test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
-    exempt_path_globs: tuple[str, ...] = ("*.md", "docs/**", "*.lock", "*.toml", "*.cfg", "*.ini")
+    exempt_path_globs: tuple[str, ...] = (
+        "*.md",
+        "docs/**",
+        "examples/**",
+        "*.lock",
+        "*.toml",
+        "*.cfg",
+        "*.ini",
+    )
     assertion_markers: tuple[str, ...] = (
         "assert ",
         "pytest.raises",
@@ -1130,97 +1193,27 @@ class RunnersConfig:
 
 
 @dataclass(frozen=True)
-class RunnerScalingConfig:
-    """Self-hosted GitHub Actions runner pool scaling configuration.
+class MainCiReclaimConfig:
+    """Per-pass reclaim of superseded, not-yet-started ``main`` CI runs (#863, #815).
 
-    ``enabled`` defaults False so an absent config block is a no-op — mirrors
-    CrossFamilyConfig (config.py:236). This is the foundation for read-only
-    observability; scaling actions are deferred to future issues.
+    Distinct from ``RunnersConfig.cancel_superseded_main_runs`` above: that
+    mechanism only fires inside this orchestrator's own successful-merge
+    codepath, has no strict-ancestor check, and keeps only the single
+    newest-by-``createdAt`` queued run. This section instead wires
+    ``main_ci_reclaim.reclaim_superseded_main_ci_runs`` into every fleet
+    loop pass regardless of merge source (Aviator, a direct ``gh pr merge``,
+    or this orchestrator's own merge) -- see that module's docstring for the
+    full rationale and safety invariant.
+
+    ``enabled`` defaults True for the same reason as ``ReconcilePassConfig``:
+    the repair direction is provably safe (only strict ancestors of main's
+    current tip, verified via local git, and only not-yet-started runs,
+    re-checked immediately before cancellation), so it is safe to run
+    unattended on every pass. The knob exists for rollback, not opt-in.
     """
 
-    enabled: bool = False
-    # Root directory where runner instances are managed (e.g., "C:\\actions-runners")
-    managed_root: str = ""
-    # Directory name prefix for runner instances (e.g., "jc-" for "jc-1", "jc-2")
-    runner_dir_prefix: str = "jc-"
-    # Template for GitHub runner names (e.g., "jc-9800x3d-{n}" where {n} is the instance number)
-    runner_name_template: str = "jc-{n}"
-    # Path to the runner package zip file for installation
-    package_zip: str = ""
-    # Minimum number of runners to maintain in the pool
-    min_runners: int = 1
-    # Maximum number of runners allowed in the pool
-    max_runners: int = 10
-    # Estimated RAM required per job in GB (empirical: ~2)
-    ram_per_job_gb: float = 2.0
-    # Minimum free RAM required in GB before scaling up
-    min_free_ram_gb: float = 4.0
-    # Maximum host CPU percentage before scaling up
-    max_host_cpu_pct: float = 80.0
-    # Minutes of idle time before scaling down runners
-    idle_scale_down_minutes: int = 15
-    # Cooldown period between scaling actions in minutes
-    cooldown_minutes: int = 5
-
-
-@dataclass(frozen=True)
-class RunnerAllocationConfig:
-    """Host-wide elastic allocation of self-hosted runner slots across repos.
-
-    Distinct from :class:`RunnerScalingConfig`, which scales *one* repo's pool
-    vertically by provisioning and deregistering runners (epic #231). This
-    section redistributes a fixed host-wide budget of *running listeners*
-    across every repo that already has runners registered under
-    ``managed_root``. Registration is left untouched — a slot moves between
-    repos by stopping an idle listener in one directory and starting an
-    already-configured one in another, so reallocation costs no registration
-    token, no GitHub write, and no package extraction.
-
-    Because this governs one physical host, it belongs in the **global** fleet
-    layer (``%LOCALAPPDATA%\\charlie-work\\config.yaml``) rather than a
-    per-repo ``orchestrator.config.yaml`` — three repos must not hold three
-    different opinions about how many jobs one machine can run.
-
-    ``enabled`` defaults False so an absent config block is a no-op.
-
-    ``max_running_runners`` is the host's total concurrent-CI-job budget. 0
-    means "derive from host CPU count" (see
-    ``runner_allocation.derive_budget``); set it explicitly once the host's
-    real ceiling is known, since CI jobs share the machine with Devin workers
-    and reviewers that this number cannot see.
-
-    ``min_running_per_repo`` is load-bearing, not cosmetic. A repo whose every
-    registered runner is offline has its queued jobs sit unclaimed until a
-    listener comes back (and GitHub fails them after 24h). Keeping one
-    listener alive per repo means a queued job is always picked up
-    immediately, and makes queue depth observable without waiting for the next
-    allocation pass. Lower it below 1 only if you accept that latency.
-
-    ``demand_idle_samples`` is the asymmetric-hysteresis knob: promotion to a
-    hotter repo happens on the first pass that sees demand, but demotion of an
-    over-allocated repo waits for this many consecutive passes of slack — a
-    single global cooldown would instead block helping a newly hot repo just
-    because a slot was parked elsewhere. Reclamation is immediate regardless
-    when another repo has unmet demand, since an idle slot someone else is
-    waiting on is exactly what this feature exists to move.
-
-    ``max_runs_scanned`` caps the per-repo Actions-runs page used to derive
-    demand; truncation is reported in the plan's notes rather than silently
-    under-counting.
-    """
-
-    enabled: bool = False
-    # Root directory holding the runner instance directories. Falls back to
-    # runner_scaling.managed_root when empty so the path is configured once.
-    managed_root: str = ""
-    # Host-wide cap on simultaneously running listeners. 0 = derive from cores.
-    max_running_runners: int = 0
-    # Listeners kept alive per repo regardless of demand (see docstring).
-    min_running_per_repo: int = 1
-    # Consecutive slack passes required before parking an over-allocated slot.
-    demand_idle_samples: int = 3
-    # Upper bound on Actions runs inspected per repo when measuring demand.
-    max_runs_scanned: int = 60
+    enabled: bool = True
+    workflow_filename: str = "ci.yml"
 
 
 @dataclass(frozen=True)
@@ -1238,6 +1231,15 @@ class SupervisorConfig:
     duration. The supervisor heartbeat freshness check uses this bound so a
     long-running pass is not mistaken for a dead supervisor (default 1800 s /
     30 min).
+    ``self_deploy_failure_alarm``: consecutive ``self_deploy`` failures before
+    a ``self_deploy_alarm`` events.db entry fires (default 3, mirrors
+    ``AutoMergeConfig.failed_attempt_alarm``). 0 disables the alarm.
+    ``zero_pass_alarm``: consecutive fleet-supervisor cycles that complete
+    with zero repo passes, despite at least one repo being configured,
+    before a ``supervisor_zero_pass_alarm`` events.db entry fires (default 3,
+    mirrors ``self_deploy_failure_alarm``). 0 disables the alarm. A cycle
+    with zero repos configured never counts toward this streak in either
+    direction -- that is a configuration state, not an incident (issue #855).
     """
 
     poll_interval_seconds: int = 20
@@ -1245,6 +1247,8 @@ class SupervisorConfig:
     active_cooldown_seconds: int = 30
     max_runtime_minutes: int = 0
     max_pass_runtime_seconds: int = 1800
+    self_deploy_failure_alarm: int = 3
+    zero_pass_alarm: int = 3
 
 
 @dataclass(frozen=True)
@@ -1347,10 +1351,37 @@ class OrchestratorConfig:
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
+    main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
     runner_allocation: RunnerAllocationConfig = field(default_factory=RunnerAllocationConfig)
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
+
+    # Provenance, not values (issue #943). Paths of the config files that were
+    # actually read to produce this value, in merge order (global layer first,
+    # per-repo last). An empty tuple means *nothing was read* and every section
+    # below is a dataclass default.
+    #
+    # Why this belongs on the value rather than only in a log line: a resolved
+    # config records what a section *became*, never whether the file that
+    # declares it was read, so `load_config()` with no path returns something
+    # indistinguishable from a fully-configured fleet whose features happen to
+    # be switched off. That ambiguity is the #590 diagnosis cost and it is what
+    # `global_config.load_layered_config` already logs about but could not
+    # hand to a caller.
+    #
+    # ``metadata={"provenance": True}`` is load-bearing: `load_config` derives
+    # the set of valid YAML section names from `fields(OrchestratorConfig)`, so
+    # without the marker a config file could declare `sources:` and assert its
+    # own provenance -- a field whose entire purpose is to be trustworthy would
+    # become the one field an untrusted input can forge. The marker is read
+    # there rather than a hard-coded name so a second provenance field cannot
+    # be added without inheriting the exclusion.
+    #
+    # ``compare=False`` because provenance is metadata about how a value was
+    # obtained, not part of the value: two configs with identical sections are
+    # the same config whether they came from one file, two, or none.
+    sources: tuple[str, ...] = field(default=(), compare=False, metadata={"provenance": True})
 
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
@@ -1383,10 +1414,22 @@ def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
 
 
 def load_config(path: Path | None = None) -> OrchestratorConfig:
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path and path.exists() else {}
+    # One binding for both the read and the provenance it produces. Deriving
+    # ``sources`` from a *second* ``path.exists()`` call would let the two
+    # disagree if the file is created or removed between them, which is exactly
+    # the class of lie this field exists to prevent.
+    source_path = path if path is not None and path.exists() else None
+    raw = (
+        yaml.safe_load(source_path.read_text(encoding="utf-8")) if source_path is not None else {}
+    )
     data = raw if isinstance(raw, dict) else {}
-    # Validate top-level keys before processing sections
-    known_sections = {f.name for f in fields(OrchestratorConfig)}
+    # Validate top-level keys before processing sections. Provenance fields are
+    # excluded so a config file cannot declare where it came from (see
+    # OrchestratorConfig.sources); the exclusion is derived from the field
+    # metadata rather than a name so it cannot be forgotten for a future one.
+    known_sections = {
+        f.name for f in fields(OrchestratorConfig) if not f.metadata.get("provenance")
+    }
     unknown = sorted(set(data) - known_sections)
     if unknown:
         raise ConfigError(
@@ -1455,6 +1498,42 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         dispatch_data["injected_paths"] = _normalize_injected_paths(
             tuple(str(item) for item in injected_paths)
         )
+    # Worker-prompt comment controls (issue #872). ``DispatchConfig.__post_init__``
+    # does the list->tuple coercion for every construction path; these checks exist
+    # so a *config file* mistake fails loudly at load with the offending key named,
+    # rather than silently degrading the prompt for every dispatched issue.
+    for _seq_key in (
+        "worker_prompt_comment_associations",
+        "worker_prompt_excluded_comment_authors",
+    ):
+        _seq_value = dispatch_data.get(_seq_key)
+        if _seq_value is not None:
+            if not isinstance(_seq_value, list):
+                raise ConfigError(
+                    f"config section 'dispatch' key '{_seq_key}' must be a list of "
+                    f"strings, got {type(_seq_value).__name__}"
+                )
+            for item in _seq_value:
+                if not isinstance(item, str):
+                    raise ConfigError(
+                        f"config section 'dispatch' key '{_seq_key}' must be a list of "
+                        f"strings, got element of type {type(item).__name__}"
+                    )
+            dispatch_data[_seq_key] = tuple(str(item) for item in _seq_value)
+    for _int_key in ("worker_prompt_max_comments", "worker_prompt_max_comment_chars"):
+        _int_value = dispatch_data.get(_int_key)
+        if _int_value is not None:
+            # bool is an int subclass; rejecting it explicitly (as the api_worker
+            # section does) keeps `true` in YAML from silently meaning "1 comment".
+            if isinstance(_int_value, bool) or not isinstance(_int_value, int):
+                raise ConfigError(
+                    f"config section 'dispatch' key '{_int_key}' must be an int, "
+                    f"got {type(_int_value).__name__}"
+                )
+            if _int_value < 0:
+                raise ConfigError(
+                    f"config section 'dispatch' key '{_int_key}' must be >= 0, got {_int_value}"
+                )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     review_dispatch_data = _section(data, "review_dispatch")
@@ -2251,6 +2330,20 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
                 f"got {type(str_value).__name__}"
             )
     runners = _build_section(RunnersConfig, "runners", runners_data)
+    main_ci_reclaim_data = _section(data, "main_ci_reclaim")
+    mcr_enabled = main_ci_reclaim_data.get("enabled")
+    if mcr_enabled is not None and not isinstance(mcr_enabled, bool):
+        raise ConfigError(
+            "config section 'main_ci_reclaim' key 'enabled' must be a bool, "
+            f"got {type(mcr_enabled).__name__}"
+        )
+    mcr_workflow_filename = main_ci_reclaim_data.get("workflow_filename")
+    if mcr_workflow_filename is not None and not isinstance(mcr_workflow_filename, str):
+        raise ConfigError(
+            "config section 'main_ci_reclaim' key 'workflow_filename' must be a string, "
+            f"got {type(mcr_workflow_filename).__name__}"
+        )
+    main_ci_reclaim = _build_section(MainCiReclaimConfig, "main_ci_reclaim", main_ci_reclaim_data)
     runner_scaling_data = _section(data, "runner_scaling")
     # Validate numeric fields
     for numeric_key in (
@@ -2354,6 +2447,8 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         "active_cooldown_seconds",
         "max_runtime_minutes",
         "max_pass_runtime_seconds",
+        "self_deploy_failure_alarm",
+        "zero_pass_alarm",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):
@@ -2448,8 +2543,14 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         fleet=fleet,
         notify=notify,
         runners=runners,
+        main_ci_reclaim=main_ci_reclaim,
         runner_scaling=runner_scaling,
         runner_allocation=runner_allocation,
         supervisor=supervisor,
         post_mortem=post_mortem,
+        # ``path`` as given, not ``resolve()``d: this is the string the caller
+        # passed and the one the layered-config log lines print, so the two are
+        # directly comparable, and resolve() can raise on paths exists() already
+        # tolerated.
+        sources=(str(source_path),) if source_path is not None else (),
     )

@@ -31,6 +31,7 @@ from charlie_work.reconcile import (
     apply_fixes,
     detect_aviator_stale_blocked,
     detect_drift,
+    detect_mergequeue_not_approved,
 )
 from charlie_work.state import empty_state, is_claim_stale, load_state
 from charlie_work.worktree import create_worktree
@@ -252,6 +253,37 @@ def test_detect_drift_finds_state_pr_missing_on_github() -> None:
     assert len(matches) == 1
     assert matches[0].pr_number == 999
     assert matches[0].issue_number == 5
+
+
+def test_detect_drift_pr_snapshot_truncated_still_skips_state_pr_missing_on_github(
+    caplog,
+) -> None:
+    """Issue #857 acceptance criterion 2: state_pr_missing_on_github stays fully gated.
+
+    Unlike the issue-side sweeps (state_active_status_issue_closed,
+    issue_status_normalized), this sweep's per-item fix is NOT safe to run
+    against a partial snapshot: a false positive here reaches
+    ``new_prs.pop(...)`` in ``apply_fixes`` and erases ``decision`` /
+    ``reviewed_head_sha`` for an approved PR fleet-wide. Issue #857 deliberately
+    leaves this gate untouched -- pin that it still skips outright when the PR
+    snapshot is truncated, so a future refactor of the issue-side gate doesn't
+    accidentally also lift this one.
+    """
+    caplog.set_level(logging.WARNING)
+    config = OrchestratorConfig()
+    # Exactly _LIST_LIMIT PRs, none numbered 999: the PR snapshot is provably
+    # truncated AND PR #999 (tracked in state, "missing" on GitHub) fell off it.
+    prs = [_pr(i, "OPEN") for i in range(1, reconcile_list_limit + 1)]
+    gh = FakeGitHub(prs=prs, issues=[])
+    state = empty_state()
+    state["prs"]["999"] = {"issue_number": 5, "status": "reviewing"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "state_pr_missing_on_github"] == []
+    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
+    assert len(truncated) == 1
+    assert "incomplete" in caplog.text.lower()
 
 
 def test_detect_drift_finds_issue_active_label_no_open_pr(tmp_path: Path) -> None:
@@ -688,13 +720,33 @@ def test_reconcile_and_github_share_list_limit_constant() -> None:
     assert reconcile_list_limit == github_list_limit
 
 
-def test_detect_drift_snapshot_truncated_skips_closed_issue_finalization(
+def test_detect_drift_snapshot_truncated_still_finalizes_in_window_closed_issue(
     caplog,
 ) -> None:
-    """Issue #259 review: a snapshot that hits the page limit is incomplete.
+    """Issue #857: an in-window closed issue is finalized while an out-of-window
+    entry in the SAME pass is still skipped silently.
 
-    The finalization sweep must be skipped to avoid acting on a provably
-    incomplete snapshot, and a warning drift item must be emitted.
+    This test used to assert ZERO finalization whenever the issue snapshot hit
+    the page limit at all. That assertion was wrong: it conflated "the snapshot
+    as a whole is incomplete" with "this specific item is unanswerable". The
+    closed issue built below IS present in the truncated snapshot -- GitHub gave
+    a definite CLOSED answer for it -- so skipping its finalization discarded a
+    known-good signal for no reason. The per-item lookup
+    (`issues_by_number.get(...)` -> ``None`` -> ``continue``) already fails safe
+    on issues that truly fell off the page; the outer total-skip gate added
+    nothing beyond that and is removed by issue #857.
+
+    Both entries share one ``detect_drift()`` call (issue #857 acceptance
+    criterion 4's exact wording: "assert the in-window issue IS finalized while
+    genuinely out-of-window entries are still skipped"). A version of this test
+    with only the out-of-window entry would pass unchanged under the OLD, fully
+    gated code too -- a lone out-of-window entry produces zero drift either
+    way -- so it alone would not prove per-item discrimination replaced the
+    outer gate. Combining both in one pass is what actually pins that.
+
+    A warning drift item (``snapshot_truncated``) is still emitted so operators
+    know the snapshot is incomplete, but it must not claim the sweeps were
+    skipped outright now that they partially ran (acceptance criterion 5).
     """
     caplog.set_level(logging.WARNING)
     config = OrchestratorConfig()
@@ -708,14 +760,70 @@ def test_detect_drift_snapshot_truncated_skips_closed_issue_finalization(
         "number": closed_issue_number,
         "status": "dispatched",
     }
+    # A second entry whose number never appears in the snapshot above: GitHub's
+    # answer for it is genuinely unknown (not "closed"), so it must be skipped
+    # silently rather than flagged (acceptance criterion 3).
+    out_of_window_issue_number = reconcile_list_limit + 1000
+    state["issues"][str(out_of_window_issue_number)] = {
+        "number": out_of_window_issue_number,
+        "status": "dispatched",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    closed_items = [item for item in drift if item.kind == "state_active_status_issue_closed"]
+    assert len(closed_items) == 1
+    assert closed_items[0].issue_number == closed_issue_number
+    assert [item for item in drift if item.kind == "issue_status_normalized"] == []
+    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
+    assert len(truncated) == 1
+    assert truncated[0].issue_number is None
+
+    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warning_records) == 1
+    message = warning_records[0].getMessage()
+    # Positive check (acceptance criterion 5): the message must name both
+    # sweeps and describe partial coverage, not just "truncated".
+    assert "state_active_status_issue_closed" in message
+    assert "issue_status_normalized" in message
+    assert "ran against" in message
+    # It must not claim the sweeps were skipped outright now that they
+    # partially run. Scoped to this one record (not all of caplog.text) so an
+    # unrelated future warning containing "skip" can't false-fail this test.
+    assert "skipping" not in message.lower()
+
+
+def test_detect_drift_snapshot_truncated_skips_out_of_window_issue() -> None:
+    """Issue #857 acceptance criterion 3: an out-of-window entry is skipped silently.
+
+    An issue tracked in state.json with an active status, but whose number does
+    NOT appear anywhere in the (truncated, exactly-_LIST_LIMIT) snapshot, is
+    genuinely unanswerable -- GitHub may have closed it, or it may still be
+    open; the snapshot simply doesn't say. It must be skipped, not flagged, and
+    the skip must not itself produce a drift item (the single snapshot_truncated
+    warning already covers that). This is a standalone companion to the combined
+    in-window/out-of-window test above: it isolates the out-of-window case on
+    its own so a future change to the in-window path can't accidentally also
+    break this one without a dedicated assertion catching it.
+    """
+    config = OrchestratorConfig()
+    # Exactly _LIST_LIMIT issues, none numbered `out_of_window_issue_number`:
+    # the snapshot is provably truncated AND this issue fell off the page.
+    out_of_window_issue_number = reconcile_list_limit + 1000
+    issues = [_issue(i, [config.labels.ready]) for i in range(1, reconcile_list_limit + 1)]
+    gh = FakeGitHub(prs=[], issues=issues)
+    state = empty_state()
+    state["issues"][str(out_of_window_issue_number)] = {
+        "number": out_of_window_issue_number,
+        "status": "dispatched",
+    }
 
     drift = detect_drift(gh, state, config)
 
     assert [item for item in drift if item.kind == "state_active_status_issue_closed"] == []
+    assert [item for item in drift if item.kind == "issue_status_normalized"] == []
     truncated = [item for item in drift if item.kind == "snapshot_truncated"]
     assert len(truncated) == 1
-    assert truncated[0].issue_number is None
-    assert "truncated" in caplog.text.lower()
 
 
 def test_detect_drift_snapshot_not_truncated_finalizes_closed_issues() -> None:
@@ -3381,3 +3489,293 @@ def test_detect_drift_leaves_state_untouched_when_snapshot_unreadable() -> None:
 
     assert json.dumps(state, sort_keys=True) == before
     assert state["prs"]["999"]["decision"] == "approved"
+
+
+# ---------------------------------------------------------------------------
+# detect_mergequeue_not_approved (issue #819 -- irrevocable mergequeue label)
+# ---------------------------------------------------------------------------
+
+
+def _mergequeue_config(mergequeue_label: str | None = "mergequeue") -> OrchestratorConfig:
+    config = OrchestratorConfig()
+    return replace(
+        config, auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label)
+    )
+
+
+def test_detect_mergequeue_not_approved_regression_pr_695(tmp_path: Path) -> None:
+    """Reproduces PR #695's exact sequence (issue #819): ``mergequeue`` was
+    applied by ship_it, the recorded verdict later flipped to
+    ``request_changes`` at the PR's still-current head, and nothing in the
+    orchestrator ever called ``remove_pr_label`` for ``mergequeue`` --
+    Aviator (``number_of_approvals: 0``) merged the PR anyway once CI went
+    green, over a standing request-changes verdict. This is the single most
+    important test in this change: it must fail red on main (label never
+    removed) and pass green with the fix."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(695, "OPEN"),
+        "headRefOid": "sha-695-live",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    _write_review_decision(
+        tmp_path,
+        config,
+        695,
+        {"decision": "request_changes", "reviewed_head_sha": "sha-695-live"},
+    )
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    item = drift[0]
+    assert item.kind == "mergequeue_revoked"
+    assert item.pr_number == 695
+    assert item.remove_labels == (mergequeue_label,)
+    assert item.add_labels == ()
+
+    # And the fix actually strips the label on the next reconcile pass --
+    # this is the mechanical step that would have saved #695.
+    state_path = tmp_path / "state.json"
+    new_state = apply_fixes(gh, empty_state(), drift, config, state_path=state_path)
+    assert gh.pr_labels_removed == [(695, mergequeue_label)]
+
+    events = read_event_log(state_path)
+    reconcile_events = [e for e in events if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert reconcile_events[0]["payload"]["kind"] == "mergequeue_revoked"
+    assert reconcile_events[0]["payload"]["pr_number"] == 695
+    assert new_state["prs"] == {}
+
+
+def test_detect_mergequeue_not_approved_leaves_approved_at_head_alone(tmp_path: Path) -> None:
+    """Negative test, equally important: a PR genuinely approved at its
+    current head must never be revoked -- a false-positive revocation here
+    would kick every legitimately-queued PR in the fleet out of Aviator."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(700, "OPEN"),
+        "headRefOid": "sha-700",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    _write_review_decision(
+        tmp_path, config, 700, {"decision": "approved", "reviewed_head_sha": "sha-700"}
+    )
+
+    assert detect_mergequeue_not_approved(gh, config, repo_root=tmp_path) == []
+
+
+def test_detect_mergequeue_not_approved_fails_closed_when_decision_missing(
+    tmp_path: Path,
+) -> None:
+    """No review-decision.json at all (never reviewed) must revoke, not
+    leave a merge-authorizing label in place by default."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(701, "OPEN"),
+        "headRefOid": "sha-701",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    # Deliberately no _write_review_decision call -- the file is absent.
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].remove_labels == (mergequeue_label,)
+    assert "no readable review-decision.json" in drift[0].detail
+
+
+def test_detect_mergequeue_not_approved_fails_closed_when_decision_malformed(
+    tmp_path: Path,
+) -> None:
+    """Corrupt/unreadable JSON must revoke, not be silently ignored --
+    mirrors ``_pr_review_approved_at_head``'s own fail-closed contract."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(702, "OPEN"),
+        "headRefOid": "sha-702",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    pr_dir = paths.prs / "pr-702"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text("{not valid json", encoding="utf-8")
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].remove_labels == (mergequeue_label,)
+
+
+def test_detect_mergequeue_not_approved_stale_head_still_revoked(tmp_path: Path) -> None:
+    """Issue #819 item 4 -- carry-forward interaction: a PR approved at an
+    OLDER sha whose head then moved (a rebase in flight) is revoked too,
+    not deferred. reconcile.py cannot cheaply re-validate a rebase itself
+    (that needs merge_ready's per-PR gh.pr_diff carry-forward check, the
+    issue-#361 cost class this module stays out of), and merge_ready's own
+    carry-forward-failure path never strips mergequeue either -- so leaving
+    a stale-head approval alone reopens the exact #695 hole through a second
+    door. This is deliberately revoked rather than escalated to a human:
+    revoke-then-cooperative-reapply (a clean rebase gets mergequeue back via
+    carry-forward + the idempotent add_pr_label on its next merge_ready
+    pass) is safe, and the emitted detail distinguishes this case from a
+    genuine request_changes revoke instead of collapsing both into one
+    indistinguishable string."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(703, "OPEN"),
+        "headRefOid": "sha-703-new",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+    _write_review_decision(
+        tmp_path, config, 703, {"decision": "approved", "reviewed_head_sha": "sha-703-old"}
+    )
+
+    drift = detect_mergequeue_not_approved(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    item = drift[0]
+    assert item.remove_labels == (mergequeue_label,)
+    assert "approved at stale head" in item.detail
+    assert "sha-703-old" in item.detail
+    # Distinguishable from the genuine not-approved case in the same field.
+    assert "recorded decision is" not in item.detail
+
+
+def test_detect_mergequeue_not_approved_skips_fs_reads_when_no_pr_labeled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cost gate: the per-PR review-decision.json read must only happen for
+    PRs that are OPEN and already carry mergequeue -- cost must not scale
+    with open-PR count, matching detect_aviator_stale_blocked's discipline."""
+    config = _mergequeue_config()
+    prs = [{**_pr(n, "OPEN"), "headRefOid": f"sha-{n}"} for n in range(1, 6)]
+    gh = FakeGitHub(prs=prs, issues=[])
+
+    calls: list[int] = []
+    import charlie_work.reconcile as reconcile_module
+
+    original_predicate = reconcile_module._pr_review_approved_at_head
+
+    def _spy(cfg: Any, root: Any, pr_number: int, head_sha: str) -> bool:
+        calls.append(pr_number)
+        return original_predicate(cfg, root, pr_number, head_sha)
+
+    monkeypatch.setattr(reconcile_module, "_pr_review_approved_at_head", _spy)
+
+    assert detect_mergequeue_not_approved(gh, config, repo_root=tmp_path) == []
+    assert calls == []
+
+    # Sanity: labeling exactly one PR triggers exactly one predicate call --
+    # proves the spy would have caught a scaling regression above.
+    mergequeue_label = config.auto_merge.mergequeue_label
+    prs[2] = {**prs[2], "labels": [{"name": mergequeue_label}]}
+    gh2 = FakeGitHub(prs=prs, issues=[])
+    calls.clear()
+    detect_mergequeue_not_approved(gh2, config, repo_root=tmp_path)
+    assert calls == [3]
+
+
+def test_detect_mergequeue_not_approved_blind_without_repo_root_does_not_revoke_fleet(
+    tmp_path: Path,
+) -> None:
+    """``repo_root is None`` means the detector cannot read ANY decision
+    file -- it must return [] rather than revoke mergequeue from every
+    labeled PR in the fleet. A blanket revocation triggered by the
+    detector's own blindness would be a false-positive catastrophe, not
+    fail-closed behavior."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    prs = [
+        {**_pr(n, "OPEN"), "headRefOid": f"sha-{n}", "labels": [{"name": mergequeue_label}]}
+        for n in (710, 711, 712)
+    ]
+    gh = FakeGitHub(prs=prs, issues=[])
+
+    assert detect_mergequeue_not_approved(gh, config, repo_root=None) == []
+
+
+def test_detect_mergequeue_not_approved_noop_when_label_unconfigured(tmp_path: Path) -> None:
+    """No mergequeue_label configured means Aviator handoff isn't in use at
+    all -- nothing to revoke, and no decision-file reads should happen."""
+    config = _mergequeue_config(mergequeue_label=None)
+    pr = {**_pr(713, "OPEN"), "headRefOid": "sha-713", "labels": [{"name": "mergequeue"}]}
+    gh = FakeGitHub(prs=[pr], issues=[])
+
+    assert detect_mergequeue_not_approved(gh, config, repo_root=tmp_path) == []
+
+
+def test_detect_mergequeue_not_approved_ignores_merged_pr_carrying_label(
+    tmp_path: Path,
+) -> None:
+    """Issue #819 notes PR #695 still carries mergequeue today, post-merge --
+    the repo has merged PRs wearing the label right now. Only OPEN PRs are
+    eligible for revocation; a merged PR's label is cosmetic history, not a
+    live merge authorization."""
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    pr = {
+        **_pr(695, "MERGED"),
+        "headRefOid": "sha-695-final",
+        "labels": [{"name": mergequeue_label}],
+    }
+    gh = FakeGitHub(prs=[pr], issues=[])
+
+    assert detect_mergequeue_not_approved(gh, config, repo_root=tmp_path) == []
+
+
+def test_apply_fixes_mergequeue_revoked_removes_label(tmp_path: Path) -> None:
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="mergequeue_revoked",
+            issue_number=None,
+            pr_number=695,
+            detail="PR #695 carries mergequeue but is not approved at its current head",
+            fix_actions=(f"remove label {mergequeue_label!r} from PR #695",),
+            remove_labels=(mergequeue_label,),
+        )
+    ]
+
+    apply_fixes(gh, state, drift, config)
+
+    assert gh.pr_labels_removed == [(695, mergequeue_label)]
+    assert gh.pr_labels_added == []
+
+
+def test_apply_fixes_mergequeue_revoked_records_label_write_failure() -> None:
+    config = _mergequeue_config()
+    mergequeue_label = config.auto_merge.mergequeue_label
+    gh = FakeGitHub(prs=[], issues=[])
+    gh._fail_remove_pr_labels = {(695, mergequeue_label)}
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="mergequeue_revoked",
+            issue_number=None,
+            pr_number=695,
+            detail="PR #695 carries mergequeue but is not approved at its current head",
+            fix_actions=(f"remove label {mergequeue_label!r} from PR #695",),
+            remove_labels=(mergequeue_label,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    events = [e for e in new_state.get("events", []) if e.get("kind") == "reconcile"]
+    assert any(
+        "label_write_failed: true" in e.get("payload", {}).get("fix_actions", []) for e in events
+    )

@@ -357,6 +357,7 @@ def write_worker_terminal_status(
     started_at: str,
     ended_at: str,
     duration_seconds: float,
+    worker_outcome: dict[str, Any] | None = None,
 ) -> None:
     """Atomically persist a worker process's terminal status (issue #773).
 
@@ -372,6 +373,8 @@ def write_worker_terminal_status(
         "ended_at": ended_at,
         "duration_seconds": duration_seconds,
     }
+    if worker_outcome is not None:
+        payload["worker_outcome"] = worker_outcome
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -424,7 +427,9 @@ def find_worker_terminal_status(sessions_dir: Path, issue_number: int) -> dict[s
 _TERMINAL_STATUS_POLL_INTERVAL_SECONDS = 2.0
 
 
-def start_terminal_status_watcher(process: subprocess.Popen[Any], path: Path) -> threading.Thread:
+def start_terminal_status_watcher(
+    process: subprocess.Popen[Any], path: Path, worktree_path: Path | None = None
+) -> threading.Thread:
     """Spawn a daemon thread that records ``process``'s terminal status at exit.
 
     This is the durable half of issue #773's fix: reading ``GetExitCodeProcess``
@@ -433,6 +438,12 @@ def start_terminal_status_watcher(process: subprocess.Popen[Any], path: Path) ->
     process is long reaped and the PID may already be recycled), so the exit
     code must be captured once, at the moment the process actually exits, and
     persisted where a later poll can find it.
+
+    When ``worktree_path`` is provided, the watcher also reads the worker's
+    structured outcome file (``WORKER_OUTCOME_FILENAME``) after the process
+    exits and copies it into the durable terminal status. This preserves the
+    worker's push/PR-failure signal even after the worktree is removed
+    (issue #935).
 
     Does NOT call ``Popen.wait()`` or ``Popen.communicate()`` -- on the caller
     thread or any other. CLAUDE.md's "adapters must not block on worker
@@ -462,6 +473,13 @@ def start_terminal_status_watcher(process: subprocess.Popen[Any], path: Path) ->
         duration_seconds = time.monotonic() - started_monotonic
         ended_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         try:
+            worker_outcome = None
+            if worktree_path is not None:
+                # Local import to avoid a circular import: worktree.py already
+                # imports is_pid_alive from this module (issue #935).
+                from .worktree import read_worker_outcome
+
+                worker_outcome = read_worker_outcome(worktree_path)
             write_worker_terminal_status(
                 path,
                 pid=pid,
@@ -469,6 +487,7 @@ def start_terminal_status_watcher(process: subprocess.Popen[Any], path: Path) ->
                 started_at=started_at,
                 ended_at=ended_at,
                 duration_seconds=duration_seconds,
+                worker_outcome=worker_outcome,
             )
         except Exception:
             # Best-effort telemetry: a write failure (disk full, permissions,

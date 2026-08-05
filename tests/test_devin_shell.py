@@ -1545,7 +1545,8 @@ def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    failure_kind, throttled_until = _classify_session_failure(log_path)
+    now = datetime.now(UTC)
+    failure_kind, throttled_until = _classify_session_failure(log_path, now=now)
 
     assert failure_kind == "rate_limited"
     assert throttled_until is not None
@@ -1554,9 +1555,8 @@ def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> 
     assert "Z" in throttled_until
     # Verify the cooldown reflects the parsed 10 minutes
     throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    expected_time = datetime.now(UTC) + timedelta(minutes=10)
-    # Allow 1 second tolerance for test execution time
-    assert abs((throttle_time - expected_time).total_seconds()) < 1
+    expected_time = (now + timedelta(minutes=10)).replace(microsecond=0)
+    assert throttle_time == expected_time
 
 
 def test_classify_session_failure_rate_limit_without_reset_time(tmp_path: Path) -> None:
@@ -1639,13 +1639,15 @@ def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None
     )
 
     now = datetime.now(UTC)
-    failure_kind, throttled_until = _classify_session_failure(log_path, resume_margin_seconds=90)
+    failure_kind, throttled_until = _classify_session_failure(
+        log_path, resume_margin_seconds=90, now=now
+    )
 
     assert failure_kind == "rate_limited"
     assert throttled_until is not None
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    expected = now + timedelta(minutes=3, seconds=90)
-    assert abs((parsed - expected).total_seconds()) < 1
+    expected = (now + timedelta(minutes=3, seconds=90)).replace(microsecond=0)
+    assert parsed == expected
 
 
 def test_get_rate_limit_defer_until_with_reset_time(tmp_path: Path) -> None:
@@ -1665,9 +1667,9 @@ def test_get_rate_limit_defer_until_with_reset_time(tmp_path: Path) -> None:
     assert defer_until is not None
     assert "T" in defer_until
     assert "Z" in defer_until
-    expected = now + timedelta(minutes=10 + 2)
+    expected = (now + timedelta(minutes=10 + 2)).replace(microsecond=0)
     parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
-    assert abs((parsed - expected).total_seconds()) < 1
+    assert parsed == expected
 
 
 def test_get_rate_limit_defer_until_without_reset_time(tmp_path: Path) -> None:
@@ -1684,9 +1686,9 @@ def test_get_rate_limit_defer_until_without_reset_time(tmp_path: Path) -> None:
     defer_until = get_rate_limit_defer_until(log_path, slack_minutes=2, now=now)
 
     assert defer_until is not None
-    expected = now + timedelta(minutes=15 + 2)
+    expected = (now + timedelta(minutes=15 + 2)).replace(microsecond=0)
     parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
-    assert abs((parsed - expected).total_seconds()) < 1
+    assert parsed == expected
 
 
 def test_get_rate_limit_defer_until_no_match(tmp_path: Path) -> None:
@@ -1717,8 +1719,8 @@ def test_get_rate_limit_defer_until_includes_resume_margin(tmp_path: Path) -> No
 
     assert defer_until is not None
     parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
-    expected = now + timedelta(minutes=3 + 2, seconds=90)
-    assert abs((parsed - expected).total_seconds()) < 1
+    expected = (now + timedelta(minutes=3 + 2, seconds=90)).replace(microsecond=0)
+    assert parsed == expected
 
 
 def test_set_throttled_until_overwrites_no_accumulation() -> None:
@@ -1814,16 +1816,16 @@ def test_update_session_record_with_failure_classification_includes_resume_margi
     )
 
     config = OrchestratorConfig(runtime=RuntimeConfig(throttle_resume_margin_s=90))
+    now = datetime.now(UTC)
     failure_kind, throttled_until = update_session_record_with_failure_classification(
-        sessions_dir, 42, config=config
+        sessions_dir, 42, config=config, now=now
     )
 
     assert failure_kind == "rate_limited"
     assert throttled_until is not None
-    now = datetime.now(UTC)
     parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-    expected = now + timedelta(minutes=5, seconds=90)
-    assert abs((parsed - expected).total_seconds()) < 1
+    expected = (now + timedelta(minutes=5, seconds=90)).replace(microsecond=0)
+    assert parsed == expected
 
 
 def test_update_session_record_with_failure_classification_session_completed_skips_log_tail(

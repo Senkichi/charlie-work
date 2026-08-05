@@ -11,10 +11,26 @@ logger = logging.getLogger(__name__)
 def _paths_equal(a: Path, b: Path) -> bool:
     """Compare two paths for equality using the OS's own normalization.
 
-    ``PurePath.__eq__`` is case-sensitive even on Windows, so ``C:\\Foo`` and
-    ``c:\\foo`` (the same file) would falsely report virtualization. The probe
-    keys on a real divergence between literal and resolved paths, not on a
-    case-only spelling difference, so normalize before comparing.
+    **Not** a case-sensitivity guard, despite what this docstring said until
+    #899. ``PurePath.__eq__`` already applies flavour-appropriate case folding,
+    and already normalizes separators, so for two ``Path`` inputs this is
+    exactly equivalent to ``a == b``::
+
+        PureWindowsPath("C:/Foo") == PureWindowsPath("c:/foo")   # True
+        PurePosixPath("/Foo")     == PurePosixPath("/foo")       # False
+        Path("C:/Foo")            == Path("C:\\\\Foo")             # True
+
+    The original claim was never covered by a test, which is how it survived;
+    ci_fleet's vendored copy caught it when a mutation replacing the body with
+    ``a == b`` left all ten of its tests green.
+
+    Kept, with the real rationale: the ``Path`` annotation is not enforced at
+    runtime, and a ``str`` on either side makes ``==`` fail outright —
+    ``"C:/Foo" == Path("C:/Foo")`` is ``False``, which the probe would read as
+    a genuine literal-vs-resolved divergence and report as virtualization.
+    ``os.fspath`` + ``normcase`` collapses that case. Deliberately not narrowed
+    to ``a == b``: the guard costs nothing and the failure it prevents is a
+    false positive on a security-adjacent probe (#624).
     """
     return os.path.normcase(os.fspath(a)) == os.path.normcase(os.fspath(b))
 
