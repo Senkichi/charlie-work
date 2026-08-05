@@ -358,7 +358,20 @@ class GitHub:
                     if not json_output:
                         return output
                     if not output:
-                        return None
+                        # gh exited 0 with empty stdout: cannot distinguish an
+                        # empty-but-legitimate result from an unreadable one.
+                        # Callers of this path (allow_failure=False) already
+                        # handle GitHubError from the retry-exhausted branch
+                        # below on every call site; treat this the same way
+                        # rather than silently coercing to None, which callers
+                        # doing `result if isinstance(result, list) else []`
+                        # (or dict equivalents) would read as "genuinely
+                        # empty" (issue #756). Not retried here — the next
+                        # orchestrator loop pass is the retry.
+                        raise GitHubError(
+                            f"gh exited 0 with empty stdout for command: {' '.join(command)}; "
+                            "cannot distinguish an empty result from an unreadable one"
+                        )
                     try:
                         return json.loads(output)
                     except json.JSONDecodeError as exc:

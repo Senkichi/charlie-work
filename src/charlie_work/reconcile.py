@@ -136,10 +136,13 @@ def _issue_state(issue: dict[str, Any] | None) -> str:
 def _fetch_snapshot(gh: GitHubLike, args: list[str], *, what: str) -> list[dict[str, Any]]:
     """Run a ``gh ... list --json`` query, refusing to degrade a failed read to ``[]``.
 
-    ``GitHub.run`` does not raise on every failure mode. On the *success* path
-    -- ``returncode == 0``, ``allow_failure=False``, ``json_output=True`` -- an
-    empty stdout returns ``None`` (``github.py``'s ``if not output: return
-    None``). Coercing that ``None`` to ``[]``, as both fetchers used to, makes
+    As of issue #756, ``GitHub.run`` itself raises ``GitHubError`` on the
+    *success-with-empty-stdout* path (``returncode == 0``, ``allow_failure=False``,
+    ``json_output=True``, empty output) rather than returning ``None`` -- so this
+    method's own ``isinstance`` check is now defense-in-depth against test
+    doubles (``GitHubLike`` fakes) that still return a non-list, plus any future
+    ``gh.run`` implementation that reintroduces the ambiguity. Coercing a
+    non-list result to ``[]`` here, as both fetchers used to before #742, makes
     "I could not read GitHub" indistinguishable from "GitHub has zero ``what``".
 
     That distinction is load-bearing. ``detect_drift`` answers "GitHub has zero
