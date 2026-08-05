@@ -20399,6 +20399,60 @@ def test_record_review_external_findings_override_vacuous_summary(
     assert decision["required_changes"] == [expected_body]
 
 
+def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
+    tmp_path: Path,
+) -> None:
+    """Issue #950 follow-up: the orchestrator's own PR comments must not come
+    back as "external findings".
+
+    The orchestrator authenticates with a *user* token -- ``gh api user``
+    reports ``type=User`` -- so ``_is_bot_comment`` cannot see its output, and
+    filtering by login would drop the genuine human findings this feature
+    exists to ingest. Provenance therefore travels in the body via
+    ``ORCHESTRATOR_COMMENT_MARKER``.
+
+    This is deliberately a round trip rather than two assertions against a
+    hardcoded marker string: the body is produced by the real ``_comment_pr``
+    write path and then filtered by the real collection path, so the writer and
+    the reader cannot drift apart without this failing.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Produce a comment body through the real posting path.
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    app._comment_pr(456, "## Request changes\n\nThe retry wrapper swallows the type.")
+    posted_body = (pr_dir / "review-comment.md").read_text(encoding="utf-8")
+    assert "Request changes" in posted_body, "sanity: the summary survived stamping"
+
+    # Feed it back as GitHub reports it: authored by a User, not a Bot.
+    fake_gh.pr_external_issue_comments[456] = [
+        {"body": posted_body, "user": {"login": "orchestrator-operator", "type": "User"}},
+        {
+            "body": "The migration needs a rollback path before this can land.",
+            "user": {"login": "a-real-human", "type": "User"},
+        },
+    ]
+
+    result = app.record_review(
+        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+    )
+
+    assert result.ok is True
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    changes = decision["required_changes"]
+
+    # The orchestrator's own echo is filtered out...
+    assert not any("retry wrapper swallows the type" in item for item in changes)
+    # ...while a genuine human finding from an identical account type is kept.
+    assert any("rollback path" in item for item in changes)
+    # And the internal finding survives untouched.
+    assert "keep me" in changes
+
+
 def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
     """AC-3 regression pin, referenced by name in record_review's derivation
     comment. A reject-on-empty-required_changes gate here would recreate the

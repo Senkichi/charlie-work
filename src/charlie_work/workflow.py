@@ -4711,11 +4711,41 @@ def _required_changes_from_checks(
     return required_changes
 
 
+ORCHESTRATOR_COMMENT_MARKER = "<!-- charlie-work:orchestrator-generated -->"
+"""Provenance marker stamped into every PR comment the orchestrator writes.
+
+Issue #950's external-findings ingestion cannot use author identity to tell its
+own output apart from a human's: the orchestrator authenticates with a *user*
+token, so ``gh api user`` reports ``type=User`` and its comments are
+indistinguishable from genuine review comments by the same person. Filtering on
+the login would suppress exactly the human findings the feature exists to
+capture.
+
+So provenance travels in the body instead. ``_comment_pr`` stamps this marker;
+``_is_orchestrator_comment`` skips anything carrying it. An HTML comment is
+invisible in rendered markdown, so the posted comment is unchanged for readers.
+
+Note this covers only comments written by *this* process. A worker's own rework
+reply is machine-generated too and is not stamped here -- see the follow-up
+issue referenced in ``_collect_external_findings``.
+"""
+
+
+def _is_orchestrator_comment(item: dict[str, Any]) -> bool:
+    """Return True if a comment body carries the orchestrator's provenance marker."""
+    body = item.get("body")
+    return isinstance(body, str) and ORCHESTRATOR_COMMENT_MARKER in body
+
+
 def _is_bot_comment(item: dict[str, Any]) -> bool:
     """Return True if a comment/review author is a GitHub App/bot account.
 
     Uses the API-supplied ``user.type``/``author.type`` or ``author.is_bot``
     discriminator. Does not rely on a hardcoded login list.
+
+    This catches genuine GitHub Apps (Aviator, dependabot, ...) but *not* the
+    orchestrator itself, which posts under a user token -- see
+    ``ORCHESTRATOR_COMMENT_MARKER``.
     """
     user = item.get("user")
     if isinstance(user, dict) and user.get("type") == "Bot":
@@ -4747,36 +4777,45 @@ def _collect_external_findings(gh: GitHubLike, pr_number: int) -> list[str]:
     """Collect non-bot human feedback from the three external PR surfaces.
 
     Fetches issue-level comments, review bodies, and inline review comments.
-    Filters out comments authored by GitHub Apps/bots using the API-supplied
-    ``user.type == "Bot"`` discriminator. Returns a flat list of markdown
-    bodies ready to be folded into ``review-decision.json`` at record time.
+    Returns a flat list of markdown bodies ready to be folded into
+    ``review-decision.json`` at record time.
+
+    Two provenance filters apply, and they are deliberately different in kind:
+
+    * **Bots** are excluded by author (``user.type == "Bot"``) -- GitHub Apps
+      such as Aviator have their own identity, so identity is a sound
+      discriminator for them.
+    * **The orchestrator's own comments** are excluded by *body marker*, not by
+      author. The orchestrator posts through a user token, so its comments are
+      indistinguishable by identity from a genuine human review by the same
+      person, and filtering on that login would drop exactly the findings #950
+      exists to ingest. See ``ORCHESTRATOR_COMMENT_MARKER``.
+
+    Known gap: a worker's own rework reply ("Reworked in <sha>, here is what I
+    changed") is machine-generated but posted through the worker's path, so it
+    carries no marker and is still ingested -- it would be presented back to
+    the worker as a required change. Tracked separately; fixing it needs either
+    a marker on the worker side or a cutoff at ``reviewed_head_sha``.
     """
     bodies: list[str] = []
     owner_repo = "{owner}/{repo}"
 
-    # Issue-level comments (a PR is also an issue).
-    for comment in _gh_api_list(gh, f"repos/{owner_repo}/issues/{pr_number}/comments"):
-        if _is_bot_comment(comment):
-            continue
-        body = (comment.get("body") or "").strip()
-        if body:
-            bodies.append(body)
+    surfaces = (
+        # A PR is also an issue, so issue-level comments live here.
+        f"repos/{owner_repo}/issues/{pr_number}/comments",
+        # Top-level PR review bodies.
+        f"repos/{owner_repo}/pulls/{pr_number}/reviews",
+        # Inline review comments on specific diff lines.
+        f"repos/{owner_repo}/pulls/{pr_number}/comments",
+    )
 
-    # Top-level PR review bodies.
-    for review in _gh_api_list(gh, f"repos/{owner_repo}/pulls/{pr_number}/reviews"):
-        if _is_bot_comment(review):
-            continue
-        body = (review.get("body") or "").strip()
-        if body:
-            bodies.append(body)
-
-    # Inline review comments on specific diff lines.
-    for comment in _gh_api_list(gh, f"repos/{owner_repo}/pulls/{pr_number}/comments"):
-        if _is_bot_comment(comment):
-            continue
-        body = (comment.get("body") or "").strip()
-        if body:
-            bodies.append(body)
+    for path in surfaces:
+        for item in _gh_api_list(gh, path):
+            if _is_bot_comment(item) or _is_orchestrator_comment(item):
+                continue
+            body = (item.get("body") or "").strip()
+            if body:
+                bodies.append(body)
 
     return bodies
 
@@ -18968,9 +19007,17 @@ class OrchestratorApp:
             return None
 
     def _comment_pr(self, pr_number: int, summary: str) -> None:
+        """Post a comment on ``pr_number``, stamped with the orchestrator's marker.
+
+        The marker is what lets #950's external-findings ingestion recognise this
+        comment as its own output rather than a human finding -- author identity
+        cannot make that distinction, because the orchestrator posts under a user
+        token. Stamping happens here, at the single point every orchestrator
+        comment passes through, so no call site can forget it.
+        """
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         body_path = pr_dir / "review-comment.md"
-        body_path.write_text(summary, encoding="utf-8")
+        body_path.write_text(f"{ORCHESTRATOR_COMMENT_MARKER}\n{summary}", encoding="utf-8")
         self.gh.pr_comment(pr_number, body_path)
 
     def _summarize_issue(self, issue: dict[str, Any]) -> dict[str, Any]:
