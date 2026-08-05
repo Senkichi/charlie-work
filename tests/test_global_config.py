@@ -148,6 +148,51 @@ def test_layered_merge_leaves_no_temp_file(tmp_path: Path) -> None:
     assert after == before, f"layered config load leaked temp file(s): {after - before}"
 
 
+def _imported_module_names(source: str) -> set[str]:
+    """Collect every module name ``source`` imports, in either import form.
+
+    ``ast.ImportFrom`` carries the module name on ``node.module``, NOT on its
+    aliases: for ``from tempfile import NamedTemporaryFile`` the only alias is
+    ``NamedTemporaryFile``, and the string "tempfile" appears nowhere in
+    ``node.names``. A collection that reads only ``alias.name`` therefore
+    passes on exactly the import form it is meant to forbid -- while still
+    listing ``ast.ImportFrom`` in its isinstance check, which makes it read as
+    though both forms were covered. ``ast.walk`` visits nested nodes, so a
+    function-local import is caught the same way.
+    """
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def test_imported_module_names_detects_every_import_form() -> None:
+    """Positive control for the guard below.
+
+    Without this, the guard's own blind spots are invisible: an assertion that
+    "tempfile" is absent passes both when the module is clean and when the
+    detector cannot see the import at all. Each form here is one a regression
+    could plausibly take.
+    """
+    for snippet in (
+        "import tempfile",
+        "import tempfile as tf",
+        "from tempfile import NamedTemporaryFile",
+        "def f():\n    import tempfile\n",
+        "def f():\n    from tempfile import mkstemp\n",
+    ):
+        assert "tempfile" in _imported_module_names(snippet), (
+            f"detector blind to this import form, so the guard below would "
+            f"pass against it: {snippet!r}"
+        )
+    # Negative half: the detector must not fire on prose mentioning the word,
+    # which is the whole reason this is an AST check and not a substring scan.
+    assert "tempfile" not in _imported_module_names('"""explains why tempfile is gone."""')
+
+
 def test_global_config_module_does_not_use_tempfile() -> None:
     """Structural pin for the fix: the merge must not round-trip through disk
     at all, not merely clean up after itself. Guards against a regression
@@ -162,14 +207,7 @@ def test_global_config_module_does_not_use_tempfile() -> None:
     import charlie_work.global_config as global_config_module
 
     source = Path(global_config_module.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    imported_names = {
-        alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.Import, ast.ImportFrom))
-        for alias in node.names
-    }
-    assert "tempfile" not in imported_names
+    assert "tempfile" not in _imported_module_names(source)
 
 
 # ---------------------------------------------------------------------------
