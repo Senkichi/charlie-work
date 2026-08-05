@@ -115,6 +115,7 @@ from .worktree import (
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
+    summarize_branch_work,
     worktree_path_for_branch,
     write_worktree_marker,
 )
@@ -6166,7 +6167,21 @@ def _open_salvage_pr(
         if issue_title
         else f"Salvaged work for issue #{issue_number}"
     )
+    # The body must satisfy the same janitor gate as a worker-authored one
+    # (`review.require_tests_or_rationale`). A fixed boilerplate string cannot:
+    # it carries no rationale token, so every salvage PR failed a gate on text
+    # the orchestrator itself wrote. Derive the rationale from the worker's own
+    # commit log instead of injecting the gate's keywords -- a branch with no
+    # commits still yields no summary, and still correctly fails.
     body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
+    summary = summarize_branch_work(
+        repo_root,
+        branch,
+        base_ref,
+        test_path_globs=config.test_adequacy.test_path_globs,
+    )
+    if summary:
+        body = f"{body}\n\n{summary}"
 
     pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
     if pr_number is None:
