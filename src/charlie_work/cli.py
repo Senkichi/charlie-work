@@ -1199,7 +1199,22 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
         REQUIRED_STREAK,
         evaluate as evaluate_shadow_gate,
     )
-    from ci_fleet.shadow_pass import journal_path as shadow_journal_path
+
+    # TRANSITIONAL, remove once ci_runners' step A is on their main.
+    # ci_fleet is moving journal_path from shadow_pass (being deleted) into
+    # diff_journal (surviving). Our CI clones ci_runners' *main*, not a pinned
+    # SHA, so there is no instant at which one spelling is correct everywhere:
+    # before their push only shadow_pass resolves, after it only diff_journal
+    # does. Accepting both is what removes the deadlock -- otherwise the
+    # repoint cannot go green until they push, and their push reddens every
+    # charlie-work PR until the repoint merges.
+    #
+    # Narrow on purpose: it falls back to one specific module for one symbol,
+    # and if BOTH are gone it raises rather than degrading to None.
+    try:
+        from ci_fleet.diff_journal import journal_path as shadow_journal_path
+    except ImportError:
+        from ci_fleet.shadow_pass import journal_path as shadow_journal_path
 
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
