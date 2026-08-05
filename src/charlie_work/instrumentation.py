@@ -152,6 +152,15 @@ _ERROR_KINDS = frozenset(
         # zero events.db rows).
         "self_deploy_failed",
         "self_deploy_alarm",
+        # Issue #829: an issue whose every open blocker is itself dead
+        # (escalated, or its tracked PR is escalated/janitor_blocked) can
+        # never unblock through any automated path. ``dispatch_skip_blocked``
+        # already skips the issue every pass; this event fires once on the
+        # transition into the all-dead state and makes no GitHub label
+        # change, so the ``level`` column is the only consumer surface.
+        # Classified as an error so it is reachable through
+        # query_events(level="error") without any new query infrastructure.
+        "dispatch_blocked_chain_dead",
         # Issue #855 (the general shape behind #851): a fleet-supervisor
         # cycle completed with zero repo passes, despite at least one repo
         # being configured, N times in a row -- exit code 0 every cycle, so
