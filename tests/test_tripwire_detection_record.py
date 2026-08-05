@@ -27,7 +27,7 @@ from charlie_work import cli
 from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import _classify_level
 from charlie_work.paths import runtime_paths
-from charlie_work.state import load_state
+from charlie_work.state import load_state, save_state
 from charlie_work.workflow import (
     OrchestratorApp,
     UNAUTHORIZED_MERGE_DETECTED_KEY,
@@ -340,3 +340,59 @@ def test_cli_tripwire_status_parses_with_no_extra_args(monkeypatch, tmp_path: Pa
 
     exit_code = cli.main(["tripwire", "status"])
     assert exit_code == 0
+
+
+def test_ack_clears_the_detected_record_so_a_withdrawn_ack_announces_again(
+    tmp_path: Path,
+) -> None:
+    """`ack_unauthorized_merge` must delete the PR's detected-record entry.
+
+    The detected record's only job is to keep `unauthorized_merge_detected`
+    firing once per *open* finding. An ack ends the finding, so leaving the
+    entry behind would make the map grow with every PR ever found and -- the
+    reason this is asserted rather than left to a comment -- would make a
+    finding whose ack is later withdrawn re-pin `ok=False` with no fresh event,
+    which is exactly the silence issue #933 was filed about.
+
+    There is no revoke command today, so this test *is* the guard: it fails the
+    moment someone adds one on top of a stale entry.
+    """
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [_merged_worker_pr(1408, 1404, "sha-1408")]
+    app, paths = _make_app(tmp_path, fake_gh)
+    _arm_unauthorized_merge_tripwire(paths)
+
+    app._detect_unauthorized_merges(fake_gh.prs)
+    assert "1408" in load_state(paths.state_file)[UNAUTHORIZED_MERGE_DETECTED_KEY]
+
+    # The real ack path (not the direct-state test helper) must clear it.
+    result = app.ack_unauthorized_merge(1408, "root cause fixed")
+    assert result.ok
+    after_ack = load_state(paths.state_file)
+    assert "1408" not in after_ack.get(UNAUTHORIZED_MERGE_DETECTED_KEY, {}), (
+        "acking must drop the detected-record entry, so the map tracks only "
+        "findings that are still open"
+    )
+    # The ack still suppresses the finding itself.
+    assert app._detect_unauthorized_merges(fake_gh.prs) == []
+
+    # Withdraw the ack the only way it has ever actually been withdrawn: an
+    # operator edit to state.json (2026-08-02, the #895 misrouted acks). The
+    # finding returns -- and must announce again rather than returning silent.
+    state = load_state(paths.state_file)
+    state["unauthorized_merge_acknowledged"] = {}
+    save_state(paths.state_file, state)
+
+    reported = app._detect_unauthorized_merges(fake_gh.prs)
+    assert [d["pr"] for d in reported] == [1408]
+    assert "1408" in load_state(paths.state_file)[UNAUTHORIZED_MERGE_DETECTED_KEY]
+    events = [
+        e
+        for e in load_state(paths.state_file)["events"]
+        if e.get("kind") == "unauthorized_merge_detected"
+    ]
+    assert len(events) == 2, (
+        "a finding re-detected after its ack was withdrawn must emit a second "
+        f"unauthorized_merge_detected event, got {len(events)}"
+    )

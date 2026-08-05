@@ -2021,8 +2021,12 @@ UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 # state.json key holding the durable first-detection record for post-arming
 # unauthorized-merge findings (issue #933). A `{pr_number: {detected_at, head,
 # issue, decision, ...}}` map, written the first time a finding is reported and
-# never rewritten, so the `unauthorized_merge_detected` event fires exactly once
-# per PR instead of once per pass.
+# not rewritten while the finding stays open, so the
+# `unauthorized_merge_detected` event fires exactly once per PR instead of once
+# per pass. `ack_unauthorized_merge` deletes the entry, so the map holds
+# *currently-open announced findings* — bounded by the open set, not growing
+# with every PR ever found, and a finding re-detected after its ack is withdrawn
+# announces again instead of returning silently.
 #
 # Once-per-PR is the whole point. The tripwire re-detects the same unacked
 # finding on every pass — that is the 21-pass ok=False streak #933 was filed on
@@ -2066,6 +2070,13 @@ def summarize_loop_errors(
     dropped, so a reader can always tell a complete list from an elided one — a
     silent cap would reproduce the same "the record understates the problem"
     failure this function exists to fix.
+
+    The two ``*_truncated`` counts are over **different populations**, which the
+    similar names hide: ``error_prs_truncated`` counts elided *distinct PRs*
+    (deduped), while ``error_details_truncated`` counts elided *error entries*
+    (not deduped — several entries can share one PR). So ``error_prs_truncated:
+    6`` alongside ``error_details_truncated: 23`` is consistent, not a
+    contradiction; they answer "how many more PRs" and "how many more failures".
     """
     pr_numbers: list[int] = []
     for entry in errors:
@@ -17975,6 +17986,22 @@ class OrchestratorApp:
                 "by": by,
             }
             state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
+            # Drop this PR's first-detection record (issue #933). That map exists
+            # solely to make `unauthorized_merge_detected` fire once per finding
+            # instead of once per pass; an ack ends the finding, so the entry has
+            # no remaining job. Clearing it here is what makes the map mean
+            # "announced findings still open" rather than "every PR ever found",
+            # which keeps it bounded and — the reason this is code and not a
+            # comment — makes re-detection after an ack is *withdrawn* announce
+            # again. There is no revoke command today; the one revocation on
+            # record (2026-08-02, the #895 misrouted acks) was an operator edit.
+            # Were the entry left behind, whoever adds that command would inherit
+            # a finding that silently re-pins ok=False with no fresh event.
+            detected = state.get(UNAUTHORIZED_MERGE_DETECTED_KEY)
+            if isinstance(detected, dict) and str(pr_number) in detected:
+                state[UNAUTHORIZED_MERGE_DETECTED_KEY] = {
+                    key: value for key, value in detected.items() if key != str(pr_number)
+                }
             state = self._record_event(
                 state,
                 "unauthorized_merge_acknowledged",
