@@ -16816,6 +16816,17 @@ class OrchestratorApp:
                 data,
             )
 
+        # Representative PR for the aggregate dispatch_rework event. The events table
+        # has a single pr_number column, so the first selected issue's open PR is used
+        # as the indexed representative (mirroring the singular pr_number in
+        # rework_already_pushed).
+        first_selected_issue_number = selected_issue_numbers[0]
+        first_rework_pr_number = (
+            int(pr_by_issue[first_selected_issue_number]["number"])
+            if first_selected_issue_number in pr_by_issue
+            else None
+        )
+
         # Do all network calls, file writes, and worker launches outside the lock
         session_requests: list[SessionRequest] = []
         full_issues: dict[int, dict[str, Any]] = {}
@@ -17016,6 +17027,7 @@ class OrchestratorApp:
                     state,
                     "dispatch_rework",
                     {
+                        "pr_number": first_rework_pr_number,
                         "issue_numbers": [],
                         "failed_issue_numbers": [],
                         "skipped_issue_numbers": sorted(skipped_issue_numbers),
@@ -17284,6 +17296,7 @@ class OrchestratorApp:
                 state,
                 "dispatch_rework",
                 {
+                    "pr_number": first_rework_pr_number,
                     "issue_numbers": sorted(successful_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "skipped_issue_numbers": sorted(skipped_issue_numbers),
