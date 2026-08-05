@@ -61,10 +61,16 @@ business logic — use `config.labels.queued`, `config.labels.in_progress`, etc.
 **The implementation lives in `ci_fleet`, not here.** Since #869 (2026-08-01) every
 runner/fleet consumer in this repo resolves `run_allocation_pass`, `runner_slots`,
 and `runners` from `ci_fleet.charlie_work_adapter`. The identically-named modules
-under `src/charlie_work/` are a dormant island with no importer in `src/`, kept
-only as a rollback path and slated for deletion (#921). `tests/
-test_dormant_fleet_marking.py` derives that set from the import graph and fails if
-anything repoints back, so trust it over any grep. Note `charlie_work.fleet_dispatch`
+that used to shadow them under `src/charlie_work/` were a dormant island with no
+importer in `src/`, retained only as a rollback path; #921 deleted them once that
+window closed. A surviving reference to `charlie_work.runners` or
+`charlie_work.runner_allocation` is therefore a stale name, not a second
+implementation — it will `ImportError`, not silently diverge.
+`tests/test_dormant_fleet_marking.py` still runs and is not vacuous: it derives the
+dormant set from the import graph (now empty) and fails both if a `rollback_path`
+marker outlives the module it guarded and if a *new* island appears — a module with
+a test file and no importer in `src/`. Trust it over any grep.
+Note `charlie_work.fleet_dispatch`
 is the *logger* name on the live allocation-prologue line — that is the module that
 calls the adapter, not the one doing the work.
 
@@ -93,8 +99,11 @@ parking and burns a full `demand_idle_samples` hysteresis window reconverging.
 
 The `runner_allocation` **config section** (`config.RunnerAllocationConfig`, and the
 cross-section floor check against `runner_scaling` in `config.py`) stays in this repo
-regardless — `ci_fleet` reads that knob. It shares a name with the dormant module and
-is not part of #921; deleting it would silently disable allocation.
+regardless — `ci_fleet` reads that knob. It shared a name with the deleted module and
+was deliberately **not** part of #921. That deletion makes the trap sharper, not
+softer: the module is gone, so a later reader who greps `runner_allocation`, finds
+only this config section, and concludes it is the island's last remnant would
+silently disable allocation. It is live config, not residue.
 
 ### `EXIT_RESTART_REQUESTED` is a cross-version wire contract — never change it
 `supervise_loop.EXIT_RESTART_REQUESTED` (3) is how the `fleet supervise-loop`
