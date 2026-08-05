@@ -6,6 +6,7 @@ import errno
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -58,7 +59,7 @@ from charlie_work.cross_family import (
     run_cross_family_review,
 )
 from charlie_work.github import issue_numbers_mentioned_by_pr, label_names, linked_issue_number
-from charlie_work.instrumentation import query_events
+from charlie_work.instrumentation import log_event, query_events
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
@@ -3720,6 +3721,96 @@ def test_dispatch_excludes_issue_with_open_tracked_pr(tmp_path: Path) -> None:
     assert not prompt_path.exists()
     assert (123, "agent:queued") not in fake_gh.labels_added
     assert (123, "agent:in-progress") not in fake_gh.labels_added
+
+
+def _seed_backdated_dispatch_event(state_path: Path, ts: str, issue_numbers: list[int]) -> None:
+    """Write one ``dispatch`` event to events.db with a caller-chosen ``ts``.
+
+    ``log_event`` always stamps real wall-clock time, so this inserts
+    normally and then backdates the row -- the same pattern
+    ``tests/test_dispatch_staleness.py`` uses to build a staleness baseline.
+    """
+    log_event(state_path, "dispatch", {"issue_numbers": issue_numbers})
+    db_path = state_path.parent / "events.db"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.execute("SELECT MAX(id) FROM events WHERE kind = 'dispatch'")
+        row = cursor.fetchone()
+        if row and row[0]:
+            conn.execute("UPDATE events SET ts = ? WHERE id = ?", (ts, row[0]))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def test_dispatch_pass_emits_dispatch_stale_event_when_backlog_is_stuck(
+    tmp_path: Path,
+) -> None:
+    """Issue #946 (L3 wiring gap): ``check_dispatch_staleness`` was only ever
+    unit-tested directly with hand-built dicts -- nothing verified a real
+    ``dispatch()`` pass actually calls it and records the result. Drives a
+    full ``app.dispatch()`` pass against a backlog that never gets dispatched
+    (the default fixture's issue 123 has an open tracked PR, so
+    ``selected_count`` stays 0 every pass) with a stale baseline already in
+    events.db, and asserts the ``dispatch_stale`` warning event actually
+    lands.
+    """
+    config = OrchestratorConfig(dispatch=DispatchConfig(dispatch_staleness_minutes=1))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Issue 123 has an open tracked PR (default fixture), so it is never
+    # selected this pass -- the short-circuit in check_dispatch_staleness
+    # (recent_issue_numbers) does not fire, and the real age comparison runs.
+    assert app.gh.prs[0]["state"] == "OPEN"
+    old_ts = (
+        (datetime.now(UTC) - timedelta(minutes=50))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    _seed_backdated_dispatch_event(paths.state_file, old_ts, [999])
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    stale_events = query_events(paths.state_file, kind="dispatch_stale")
+    assert len(stale_events) == 1, stale_events
+    assert stale_events[0]["level"] == "warning"
+    payload = stale_events[0]["payload"]
+    assert payload["stale"] is True
+    assert payload["last_dispatch_at"] == old_ts
+
+
+def test_dispatch_pass_does_not_emit_dispatch_stale_when_within_threshold(
+    tmp_path: Path,
+) -> None:
+    """Negative counterpart: a healthy pass (a recent non-empty dispatch
+    already on record, well within the configured threshold) must not emit
+    ``dispatch_stale``, even though nothing is dispatched on this particular
+    pass either."""
+    config = OrchestratorConfig(dispatch=DispatchConfig(dispatch_staleness_minutes=240))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    assert app.gh.prs[0]["state"] == "OPEN"
+    recent_ts = (
+        (datetime.now(UTC) - timedelta(minutes=5))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    _seed_backdated_dispatch_event(paths.state_file, recent_ts, [999])
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    stale_events = query_events(paths.state_file, kind="dispatch_stale")
+    assert stale_events == []
 
 
 def test_dispatch_skips_ready_issue_with_merged_pr_reference(tmp_path: Path) -> None:

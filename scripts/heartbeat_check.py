@@ -122,6 +122,18 @@ class Report:
         self.lines.append(f"ANOMALY {check}: {detail}")
         self.anomaly = True
 
+    def warn(self, check: str, detail: str) -> None:
+        """Surface a non-fatal finding.
+
+        Unlike `anom`, this does not set `self.anomaly`, so it never flips
+        `main()`'s exit code. Issue #946: warning-level events (e.g.
+        `dispatch_stale`) are worth surfacing but several existing
+        `_WARNING_KINDS` members are normal-operation events, not faults --
+        alarming on them would make this check permanently red and get
+        ignored within a day.
+        """
+        self.lines.append(f"WARN {check}: {detail}")
+
 
 # --------------------------------------------------------------------------
 # Small utilities
@@ -1082,6 +1094,86 @@ def check_error_events(report: Report, repo: RepoInfo, baseline: datetime) -> No
         report.ok(check, facts)
 
 
+def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface warning-level events that fire but have no consumer (issue #946).
+
+    Mirrors `check_error_events` above one level down the `level` column:
+    every member of `instrumentation._WARNING_KINDS` -- including issue
+    #946's own `dispatch_stale`, plus roughly six pre-existing kinds such as
+    `dispatch_skip_blocked`, `session_exited`, `runner_capacity_starved`, and
+    `draft_pr_ready_held` -- is emitted, classified, documented, and unit
+    tested, but before this check nothing in the codebase ever read a
+    warning-level row. This gives all of them their first reader at once,
+    the same detection-to-delivery gap `check_error_events` closed for
+    `level = 'error'`.
+
+    Coverage is DERIVED, never a hardcoded `kind` list, for the identical
+    reason as `check_error_events`: `level` is computed once and persisted
+    per-row at write time by `instrumentation._classify_level` (checked
+    against `_WARNING_KINDS` there), so filtering on the persisted
+    `level = 'warning'` column here picks up every current and future
+    warning kind without this script importing `charlie_work` or restating
+    its kind list.
+
+    Deliberately different from `check_error_events` in exactly one place:
+    a new warning-level event is reported via `report.warn`, not
+    `report.anom`. Several `_WARNING_KINDS` members
+    (`runner_capacity_starved`, `session_exited`, `draft_pr_ready_held`) are
+    normal-operation events, not faults -- and a deliberately paused fleet
+    with a non-empty backlog (the `dispatch_stale` case this check exists
+    to surface) is not a crash either. Flipping the heartbeat to failure on
+    every one of those would make this check permanently red and get
+    ignored within a day; visibility is the goal, not a new alarm. The
+    db-availability guards below stay `report.anom`, matching
+    `check_error_events`: an unreadable events.db means this check cannot
+    vouch for the repo at all, which is a genuine anomaly independent of
+    whether any warning fired.
+
+    See `check_error_events`'s docstring for the missing-db-is-an-anomaly
+    rationale and the ISO-vs-SQLite string-comparison trap this avoids by
+    comparing `ts` in Python against `baseline`, never in SQL.
+    """
+    check = f"warning-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check for warnings: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check for warnings: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check for warnings: events.db has no events table")
+                return
+            rows = conn.execute("SELECT ts, kind FROM events WHERE level = 'warning'").fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check for warnings: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_warnings: list[str] = []
+    for ts, kind in rows:
+        ts_dt = parse_iso(ts)
+        # An unparseable ts fails toward visibility (reported), not silence.
+        if ts_dt is None or ts_dt > baseline:
+            new_warnings.append(f"{kind}@{ts}")
+
+    facts = f"warning_rows={len(rows)} new_since_last_beat={len(new_warnings)}"
+    if new_warnings:
+        report.warn(check, f"new warning-level event(s) since last beat: {new_warnings} ({facts})")
+    else:
+        report.ok(check, facts)
+
+
 def check_merge_flow(
     report: Report,
     repo: RepoInfo,
@@ -1448,6 +1540,7 @@ def main() -> int:
         check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
         check_error_events(report, repo, baseline)
+        check_warning_events(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)

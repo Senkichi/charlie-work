@@ -37,6 +37,7 @@ from .checks import CheckSummary, _is_failing_run, summarize_checks
 from .config import (
     AutoMergeConfig,
     CrossFamilyConfig,
+    DispatchConfig,
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
 )
@@ -3442,6 +3443,143 @@ def classify_backlog_reachability(
         # dispatchable count alongside a dispatch of nothing).
         reachability["consistent"] = ready_seen >= ready_open_count
     return reachability
+
+
+def _backlog_is_non_empty(reachability: dict[str, Any]) -> bool:
+    """Return True only when the unfiltered backlog is observed and non-empty.
+
+    ``observed: False`` (e.g. a failed or empty ``gh issue_list``) must never be
+    treated as "backlog empty" -- that would make a silent outage look healthy.
+    """
+    if not reachability.get("observed"):
+        return False
+    return reachability.get("open_total", 0) > 0
+
+
+def _latest_non_empty_dispatch(state_path: Path) -> dict[str, Any] | None:
+    """Return the most recent ``dispatch`` event whose ``issue_numbers`` is non-empty.
+
+    Empty-payload dispatch events happen on every healthy zero-dispatch pass,
+    so they cannot be used to measure cadence. We scan newest-first.
+
+    Bounded to the most recent 100 ``dispatch`` rows: ``query_events``'s
+    ``limit=`` selects with ``ORDER BY id DESC LIMIT ?`` and then re-orders
+    the result ascending, so this returns the newest 100 rows (oldest of
+    that 100 first) -- exactly what "scan newest-first" below needs, not
+    the oldest 100. Without a bound this ran an unindexed-by-limit full
+    scan of every ``dispatch`` row on every dispatch pass; this repo's own
+    events.db already holds thousands of them and the table grows without
+    bound. 100 is generous headroom: even at a 5-minute dispatch cadence,
+    the default 240-minute ``dispatch_staleness_minutes`` threshold only
+    needs to look back ~48 dispatch events to find the most recent
+    non-empty one.
+    """
+    events = query_events(state_path, kind="dispatch", limit=100)
+    for event in reversed(events):
+        issue_numbers = event.get("payload", {}).get("issue_numbers")
+        if isinstance(issue_numbers, list) and issue_numbers:
+            return event
+    return None
+
+
+def _parse_iso_ts(ts: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def check_dispatch_staleness(
+    state_path: Path,
+    config: DispatchConfig,
+    backlog_reachability: dict[str, Any],
+    *,
+    recent_issue_numbers: list[int] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Issue #946: detect when a non-empty backlog has had no dispatch for too long.
+
+    Reads events.db for the most recent ``dispatch`` event whose payload
+    ``issue_numbers`` is non-empty. When that event is older than
+    ``config.dispatch_staleness_minutes`` and the unfiltered backlog is observed
+    to be non-empty, returns a stale diagnostic. Otherwise returns a no-op
+    diagnostic with ``stale: False``.
+
+    ``backlog_reachability`` must come from ``classify_backlog_reachability``.
+    The ``observed: False`` case is treated as "unknown", not "empty", so a
+    failed unfiltered fetch does not silently suppress the alarm.
+
+    ``recent_issue_numbers`` lets callers short-circuit with the current pass:
+    if this pass itself dispatched issues, the most recent non-empty dispatch is
+    now and the check returns ``stale: False``.
+    """
+    result: dict[str, Any] = {
+        "stale": False,
+        "last_dispatch_at": None,
+        "last_dispatch_issue_numbers": None,
+        "age_seconds": None,
+        "threshold_seconds": None,
+        "backlog_observed": bool(backlog_reachability.get("observed", False)),
+        "backlog_open_total": int(backlog_reachability.get("open_total", 0) or 0),
+        "reason": None,
+    }
+
+    threshold_minutes = config.dispatch_staleness_minutes
+    if threshold_minutes <= 0:
+        result["threshold_seconds"] = 0
+        result["reason"] = "threshold_disabled"
+        return result
+
+    result["threshold_seconds"] = threshold_minutes * 60
+
+    if now is None:
+        now = datetime.now(UTC)
+
+    if recent_issue_numbers:
+        # Format the already-sampled `now` rather than taking a second,
+        # uninjected clock read here -- the single-frozen-clock-per-pass
+        # invariant established by #828/#838. `utc_now()` reads the real
+        # wall clock, which would let this short-circuit's timestamp drift
+        # from the `now` the caller sampled once for the whole pass. Uses
+        # `utc_now()`'s own formula (seconds precision, trailing "Z") so the
+        # string matches every other event timestamp in events.db, including
+        # the `latest["ts"]` value this same field holds in the non-short-
+        # circuit branch below.
+        result["last_dispatch_at"] = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        result["last_dispatch_issue_numbers"] = sorted(recent_issue_numbers)
+        result["age_seconds"] = 0
+        result["reason"] = "current_pass_dispatched"
+        return result
+
+    if not _backlog_is_non_empty(backlog_reachability):
+        if not backlog_reachability.get("observed"):
+            result["reason"] = "backlog_not_observed"
+        else:
+            result["reason"] = "empty_backlog"
+        return result
+
+    latest = _latest_non_empty_dispatch(state_path)
+    if latest is None:
+        result["reason"] = "no_baseline"
+        return result
+
+    last_ts = _parse_iso_ts(latest["ts"])
+    if last_ts is None:
+        result["reason"] = "no_baseline"
+        return result
+
+    age_seconds = int((now - last_ts).total_seconds())
+    result["last_dispatch_at"] = latest["ts"]
+    result["last_dispatch_issue_numbers"] = list(latest["payload"].get("issue_numbers", []))
+    result["age_seconds"] = age_seconds
+
+    if age_seconds > result["threshold_seconds"]:
+        result["stale"] = True
+        result["reason"] = "dispatch_stale"
+    else:
+        result["reason"] = "within_threshold"
+
+    return result
 
 
 def _detect_and_handle_orphaned_workers(
@@ -8059,6 +8197,17 @@ class OrchestratorApp:
                 dispatch_limit,
                 extra_failures=label_error_failures,
             )
+            # Issue #946: warn when a non-empty backlog has not produced a
+            # non-empty dispatch event for longer than the configured threshold.
+            dispatch_staleness = check_dispatch_staleness(
+                self.paths.state_file,
+                self.config.dispatch,
+                backlog_reachability,
+                recent_issue_numbers=sorted(successful_issue_numbers),
+                now=datetime.now(UTC),
+            )
+            if dispatch_staleness["stale"]:
+                state = self._record_event(state, "dispatch_stale", dispatch_staleness)
             state = append_event(
                 state,
                 "dispatch",
@@ -8079,6 +8228,9 @@ class OrchestratorApp:
                     # here describes issues the ready-filtered query returned;
                     # this one describes the backlog that query cannot see.
                     "backlog_reachability": backlog_reachability,
+                    # Issue #946: cadence-staleness diagnostic, always present so
+                    # the capped state.json ring carries the signal.
+                    "dispatch_staleness": dispatch_staleness,
                 },
                 state_path=self.paths.state_file,
             )

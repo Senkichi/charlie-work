@@ -233,6 +233,11 @@ _WARNING_KINDS = frozenset(
         # rather than the deliberate-park case being invisible next to the
         # other two.
         "draft_pr_ready_held",
+        # Issue #946: the dispatch-cadence staleness detector fires when a
+        # non-empty backlog has gone longer than ``dispatch_staleness_minutes``
+        # without a non-empty ``dispatch`` event. Warning, not error: the fleet
+        # may be intentionally paused and the backlog may be non-dispatchable.
+        "dispatch_stale",
     }
 )
 
