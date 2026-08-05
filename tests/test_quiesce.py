@@ -273,6 +273,78 @@ def test_invalid_regex_pattern_is_skipped_not_raised() -> None:
     assert "invalid pattern" in report.summary
 
 
+def test_all_invalid_patterns_are_not_quiescent() -> None:
+    """Regression for #732: if every ``--quiesce-pattern`` fails to compile,
+    ``compiled`` is empty, so nothing can ever match -- but an empty search
+    space must not be reported as "quiescent". Before the fix, ``ok`` was
+    computed as ``not matched`` alone, so this all-invalid case (e.g. a
+    pasted Windows path like ``\\Users\\...``, an invalid regex escape) came
+    back ``ok=True`` and let ``--apply`` migrate the state dir out from under
+    a live fleet.
+    """
+    live_process = _proc(42, 1, "charlie.exe", "charlie.exe fleet supervise --repo charlie-work")
+
+    report = assert_quiescent(
+        patterns=[r"\Users\senki\repos\charlie-work"],
+        processes=[live_process],
+        self_pid=999,
+    )
+
+    assert report.ok is False
+    assert report.matched == ()
+    assert report.invalid_patterns == (r"\Users\senki\repos\charlie-work",)
+    assert "no usable pattern" in report.summary
+
+
+def test_check_quiescence_all_invalid_patterns_are_not_quiescent() -> None:
+    """Same regression as above, through the actual CLI-facing entry point.
+
+    `check_quiescence` has its own fail-closed branch for a lister error, but
+    delegates everything else verbatim to `assert_quiescent` -- so this must
+    also refuse, not just the inner function, to close the full path the
+    issue traced (`check_quiescence` does not rescue the bug).
+    """
+    live_process = _proc(42, 1, "charlie.exe", "charlie.exe fleet supervise --repo charlie-work")
+
+    def _fake_lister() -> tuple[list[ProcessInfo], str | None]:
+        return [live_process], None
+
+    report = check_quiescence(
+        patterns=[r"\Users\senki\repos\charlie-work"], self_pid=999, lister=_fake_lister
+    )
+
+    assert report.ok is False
+
+
+def test_some_invalid_patterns_refuse_even_when_valid_ones_find_nothing() -> None:
+    """A partially-invalid pattern set is a narrower fail-open than the
+    all-invalid case, but the same shape: one class of process the operator
+    asked to watch for was silently dropped from the search. A clean result
+    from the patterns that *did* compile is not evidence the dropped one
+    would have been clean too, so this must refuse -- not just the
+    every-pattern-invalid case. ``invalid_patterns`` still surfaces which
+    pattern was dropped, matching the drop-don't-raise contract
+    (`_compile_patterns`'s docstring) that this test intentionally keeps
+    exercising alongside the stricter ``ok``.
+    """
+    processes = [
+        _proc(1, 0, "explorer.exe", "explorer.exe"),
+        _proc(2, 1, "chrome.exe", "chrome.exe --type=renderer"),
+    ]
+
+    report = assert_quiescent(
+        patterns=[r"\Users\bad\path", _SUPERVISE_PATTERN],
+        processes=processes,
+        self_pid=999,
+    )
+
+    assert report.ok is False
+    assert report.matched == ()
+    assert report.invalid_patterns == (r"\Users\bad\path",)
+    assert "invalid pattern" in report.summary
+    assert "narrowed by invalid pattern" in report.summary
+
+
 def test_qu_report_is_frozen_dataclass() -> None:
     """Config/value-object types in this repo are frozen dataclasses
     (CLAUDE.md invariant); QuiesceReport must not be mutable.
