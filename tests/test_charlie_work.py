@@ -33950,7 +33950,11 @@ def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> 
     # Mock GitHub to return empty issue/PR lists
     from charlie_work.github import GitHub
 
-    def mock_issue_list(self, label):
+    def mock_issue_list(self, labels=None, state=None):
+        # Mirrors github.GitHub.issue_list exactly. This double previously
+        # took a required positional `label`, so it raised TypeError the
+        # moment a caller used the real interface's `state=` kwarg with no
+        # labels -- the unfiltered backlog query added in issue #944.
         return []
 
     def mock_pr_list(self):
@@ -34024,7 +34028,11 @@ def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
     # Mock GitHub to return empty issue/PR lists
     from charlie_work.github import GitHub
 
-    def mock_issue_list(self, label):
+    def mock_issue_list(self, labels=None, state=None):
+        # Mirrors github.GitHub.issue_list exactly. This double previously
+        # took a required positional `label`, so it raised TypeError the
+        # moment a caller used the real interface's `state=` kwarg with no
+        # labels -- the unfiltered backlog query added in issue #944.
         return []
 
     def mock_pr_list(self):
@@ -34108,8 +34116,17 @@ def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
         mutating_calls.append(args)
         return ""
 
-    def mock_issue_list(self, label):
-        return [{"number": 123, "title": "Test issue", "labels": [{"name": label}]}]
+    def mock_issue_list(self, labels=None, state=None):
+        # Mirrors github.GitHub.issue_list exactly. This double previously
+        # took a required positional `label`, so it raised TypeError the
+        # moment a caller used the real interface's `state=` kwarg with no
+        # labels -- the unfiltered backlog query added in issue #944.
+        # The unfiltered call must return a SUPERSET of the ready-filtered
+        # one -- that relation is what the classifier cross-checks.
+        name = labels[0] if isinstance(labels, (list, tuple)) and labels else labels
+        if name is None:
+            name = OrchestratorConfig().labels.ready
+        return [{"number": 123, "title": "Test issue", "labels": [{"name": name}]}]
 
     def mock_pr_list(self):
         return []
@@ -34183,7 +34200,11 @@ def test_fleet_status_json_output_shape(tmp_path: Path, monkeypatch) -> None:
     # Mock GitHub to return empty issue/PR lists
     from charlie_work.github import GitHub
 
-    def mock_issue_list(self, label):
+    def mock_issue_list(self, labels=None, state=None):
+        # Mirrors github.GitHub.issue_list exactly. This double previously
+        # took a required positional `label`, so it raised TypeError the
+        # moment a caller used the real interface's `state=` kwarg with no
+        # labels -- the unfiltered backlog query added in issue #944.
         return []
 
     def mock_pr_list(self):

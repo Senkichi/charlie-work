@@ -1825,6 +1825,60 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     return CommandResult(False, f"unknown command: {args.command}", {})
 
 
+def _render_backlog_reachability(reachability: Any) -> str:
+    """Issue #944: one-line suffix saying why a repo has nothing to dispatch.
+
+    The counts on the fleet-status line all derive from the ready-FILTERED
+    issue query, so "nothing to do" and "the whole backlog is unreachable"
+    render identically as zeroes. Between 2026-07-31 and 2026-08-05 that
+    ambiguity hid a total dispatch stall: 87 open issues, 0 dispatchable, four
+    days, every pass green.
+
+    Returns "" when there is nothing to say -- a healthy repo with work
+    flowing keeps its line unchanged. ASCII only: the console codepage here is
+    cp437.
+    """
+    if not isinstance(reachability, dict):
+        return ""
+    if not reachability.get("observed"):
+        # NOT the same as "0 open issues": the unfiltered fetch returned
+        # nothing, and an empty list is indistinguishable from a failed `gh`
+        # call. Saying "0 open" here would be the very error this exists to
+        # catch. See workflow.classify_backlog_reachability.
+        return "  [backlog not observed]"
+
+    notes: list[str] = []
+    # `is False` deliberately, not falsiness: `consistent` is tri-state and
+    # None means the cross-check never ran. Neither "passed" nor "failed" is
+    # an honest rendering of that, and it cannot reach here anyway -- the
+    # unobserved path returns above.
+    if reachability.get("consistent") is False:
+        notes.append("INCONSISTENT backlog fetch (missing ready-labelled issues)")
+
+    open_total = int(reachability.get("open_total") or 0)
+    dispatchable = int(reachability.get("dispatchable") or 0)
+    if open_total and not dispatchable:
+        reasons = ", ".join(
+            f"{reason}={reachability[reason]}"
+            for reason in (
+                "missing_ready",
+                "terminal_label",
+                "active_label",
+                "operator_claimed",
+                "unidentified",
+            )
+            if reachability.get(reason)
+        )
+        # The bins partition the backlog, so `reasons` is non-empty whenever
+        # open_total is. Kept as a guard rather than an assumption: an alarm
+        # that fires without naming a cause is worse than no alarm.
+        if not reasons:
+            reasons = "no reason recorded -- classifier bug"
+        notes.append(f"!! {open_total} open, 0 dispatchable ({reasons})")
+
+    return "  " + "; ".join(notes) if notes else ""
+
+
 def _render_api_worker_report(data: dict[str, Any]) -> None:
     """Print the api-worker fleet report line when present (issue #483).
 
@@ -1930,9 +1984,17 @@ def main(argv: list[str] | None = None) -> int:
                 active = repo_data.get("active_issue_count", 0)
                 blocked = len(repo_data.get("blocked", []))
                 stalled = len(repo_data.get("stalled", []))
-                print(
-                    f"  {repo_key}: {ready} ready, {active} active, {blocked} blocked, {stalled} stalled"
+                line = (
+                    f"  {repo_key}: {ready} ready, {active} active, "
+                    f"{blocked} blocked, {stalled} stalled"
                 )
+                # Issue #944: every count above is derived from the
+                # ready-FILTERED issue query, so a repo with 87 open issues and
+                # none reachable prints identically to a repo with nothing to
+                # do. That ambiguity hid a four-day total dispatch stall. Say
+                # which one it is.
+                suffix = _render_backlog_reachability(repo_data.get("backlog_reachability"))
+                print(line + suffix)
             errors = result.data.get("errors", [])
             if errors:
                 print("Errors:")
