@@ -107,9 +107,29 @@ def _read_heartbeat_for_merge(path: Path) -> dict[str, Any] | None:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        # Log the cause here rather than leaving the call sites to say only
+        # "unreadable". A transient lock or AV scan (OSError) and genuinely
+        # corrupt JSON (JSONDecodeError) demand opposite responses, and they
+        # are indistinguishable to an operator who inspects the file
+        # afterwards -- by then a transient lock is gone and the file reads
+        # fine, so a cause-free warning is unactionable exactly when the
+        # cause was transient.
+        logger.warning(
+            "Supervisor heartbeat at %s is unreadable (%s): %s",
+            path,
+            type(exc).__name__,
+            exc,
+        )
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        logger.warning(
+            "Supervisor heartbeat at %s parsed as %s, not a JSON object",
+            path,
+            type(data).__name__,
+        )
+        return None
+    return data
 
 
 def _write_heartbeat(path: Path, payload: dict[str, Any]) -> None:

@@ -126,6 +126,35 @@ def test_update_supervisor_heartbeat_skips_write_when_file_corrupt(
     # less-complete (but validly-parsing) record.
     assert heartbeat_path.read_text(encoding="utf-8") == "{not json"
     assert "unreadable" in caplog.text
+    # The warning must name *why* it was unreadable. A transient lock
+    # (OSError) and genuinely corrupt JSON (JSONDecodeError) call for
+    # opposite responses, and by the time an operator inspects the file a
+    # transient cause has healed -- so a warning without the cause is
+    # unactionable exactly in the case where the cause mattered most.
+    assert "JSONDecodeError" in caplog.text
+
+
+def test_heartbeat_read_for_merge_warns_with_cause_when_not_an_object(
+    tmp_path: Path,
+    caplog: Any,
+) -> None:
+    """Valid JSON that is not an object is also "unreadable", and says so.
+
+    ``json.loads("[]")`` raises nothing, so this path never reaches the
+    exception handler -- it used to return ``None`` silently, producing a
+    skipped write with no log line at all.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True)
+    heartbeat_path = _heartbeat_file(fleet_dir)
+    heartbeat_path.write_text("[]", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="charlie_work.supervisor_lifecycle"):
+        update_supervisor_heartbeat(str(fleet_dir), pass_number=4, last_beat_at=BEAT_AT)
+
+    assert heartbeat_path.read_text(encoding="utf-8") == "[]"
+    assert "not a JSON object" in caplog.text
+    assert "list" in caplog.text
 
 
 def test_update_supervisor_heartbeat_starts_fresh_when_file_missing(
