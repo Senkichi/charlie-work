@@ -22251,7 +22251,11 @@ def test_classify_dead_rework_session_escalates_at_redispatch_cap(
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
-    assert entry["escalation_reason"] == "redispatch_cap_exceeded"
+    # Issue #760: a dead/launch-failed rework worker that exhausts its redispatch
+    # budget is reported as an unrecoverable orphaned worker, not a generic cap
+    # failure, so the parked issue can be triaged by escalation_reason alone.
+    assert entry["escalation_reason"] == "orphaned_worker_unrecoverable"
+    assert entry["reason_class"] == "mechanical"
     assert len(entry["redispatch_at"]) == 4
     assert (123, config.labels.human_needed) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added

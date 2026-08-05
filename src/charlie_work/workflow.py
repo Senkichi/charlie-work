@@ -151,6 +151,7 @@ from .state import (
     set_escalation,
     set_operator_claimed,
     set_reviewer_quota_exhausted,
+    set_status_escalated,
     set_throttled_until,
     stale_operator_claims,
     state_lock,
@@ -4462,11 +4463,14 @@ def _reap_restore_rework_requested(
         )
 
         if should_escalate:
-            entry["status"] = "escalated"
             entry["redispatch_at"] = redispatch_at
-            set_escalation(
+            # Issue #760: a dead/launch-failed rework worker is an
+            # orphaned/unrecoverable process failure, not a generic
+            # redispatch-cap exhaustion. Use a distinct reason so triage can
+            # group parked issues without replaying their event history.
+            set_status_escalated(
                 entry,
-                reason=(failure_kind if terminal_failure else "redispatch_cap_exceeded"),
+                reason=(failure_kind if terminal_failure else "orphaned_worker_unrecoverable"),
                 reason_class="mechanical",
             )
             # Preserve worker_pid/worker_process_start_time (issue #282): the
@@ -5140,13 +5144,12 @@ def _route_dead_worker_to_pre_review_rework(
             entry = {
                 **entry,
                 "number": issue_number,
-                "status": "escalated",
                 "redispatch_at": redispatch_at,
                 "pre_review_rework_reason": reason,
             }
             # Issue #783: merge conflict / rework-branch conflict / stale-CI
             # redispatch cap are all process failures, not judgment calls.
-            set_escalation(
+            set_status_escalated(
                 entry,
                 reason=(failure_kind if terminal_failure else "redispatch_cap_exceeded"),
                 reason_class="mechanical",
@@ -5384,11 +5387,10 @@ def _classify_dead_sessions_and_update_throttle_state(
                     redispatch_at = _windowed_redispatch_at(
                         entry, window_minutes=config.watchdog.redispatch_window_minutes
                     ) + [now.isoformat().replace("+00:00", "Z")]
-                    entry["status"] = "escalated"
                     entry["redispatch_at"] = redispatch_at
                     # Issue #783: a deterministic launch failure kind is a
                     # process failure, not a judgment call -- mechanical.
-                    set_escalation(
+                    set_status_escalated(
                         entry,
                         reason=failure_kind,
                         reason_class="mechanical",
@@ -5692,14 +5694,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                         or len(redispatch_at) > config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review instead of relabeling to ready
-                        entry["status"] = "escalated"
                         entry["redispatch_at"] = redispatch_at
-                        # Issue #783: dead worker session / redispatch cap is a
-                        # process failure, not a judgment call -- mechanical.
-                        set_escalation(
+                        # Issue #760: a dead worker with no open PR is an
+                        # orphaned/unrecoverable process failure when it hits the
+                        # redispatch cap, not a generic cap-exceeded escalation.
+                        set_status_escalated(
                             entry,
                             reason=(
-                                failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                                failure_kind
+                                if terminal_failure
+                                else "orphaned_worker_unrecoverable"
                             ),
                             reason_class="mechanical",
                         )
@@ -8008,7 +8012,7 @@ class OrchestratorApp:
                     if terminal_failure or len(recent) > self.config.watchdog.max_auto_redispatch:
                         status = "escalated"
                         dispatched_at = None
-                        set_escalation(
+                        set_status_escalated(
                             entry,
                             reason=(
                                 failed_result.failure_kind
@@ -8895,25 +8899,31 @@ class OrchestratorApp:
                 # merge_failed_attempt_alarm event and nothing else).
                 with state_lock(self.paths.state_file):
                     state = load_state(self.paths.state_file)
-                    state["prs"][str(pr_number)] = {
+                    pr_entry = {
                         **state["prs"].get(str(pr_number), {}),
                         "number": pr_number,
                         "issue_number": issue_number,
-                        "status": "escalated",
-                        "escalation_reason": "infra_rerun_cap_exceeded",
                         "infra_rerun_attempts": verdict.infra_rerun_attempts,
                     }
-                    state["issues"][str(issue_number)] = {
+                    # Issue #841: an infra rerun attempt cap is a process
+                    # limit, not a judgment call -- mechanical.
+                    set_status_escalated(
+                        pr_entry,
+                        reason="infra_rerun_cap_exceeded",
+                        reason_class="mechanical",
+                    )
+                    state["prs"][str(pr_number)] = pr_entry
+                    issue_entry = {
                         **state["issues"].get(str(issue_number), {}),
                         "number": issue_number,
-                        "status": "escalated",
-                        "escalation_reason": "infra_rerun_cap_exceeded",
                         "merge_alert": "OK",
-                        # Issue #841: an infra rerun attempt cap is a process
-                        # limit, not a judgment call -- mechanical (mirrors the
-                        # janitor rework cap's own reason_class at ~13230).
-                        "reason_class": escalation_reason_class("mechanical"),
                     }
+                    set_status_escalated(
+                        issue_entry,
+                        reason="infra_rerun_cap_exceeded",
+                        reason_class="mechanical",
+                    )
+                    state["issues"][str(issue_number)] = issue_entry
                     state = append_event(
                         state,
                         "infra_rerun_escalated",
@@ -10220,25 +10230,28 @@ class OrchestratorApp:
                     continue
                 if attempt_count >= max_attempts and pr_state.get("status") != "escalated":
                     issue_num = pr_state.get("issue_number") or c.get("issue")
-                    state["prs"][pr_key] = {
+                    pr_entry = {
                         **pr_state,
-                        "status": "escalated",
                         "review_dispatch_status": "review_dispatch_failed",
                         "review_dispatch_failed_at": utc_now(),
                         "review_dispatch_pending_at": None,
                         "review_dispatched_at": None,
                         "reviewer_pid": None,
                         "reviewer_process_start_time": None,
-                        "escalation_reason": "max_review_dispatch_attempts_exceeded",
                     }
+                    set_status_escalated(
+                        pr_entry,
+                        reason="max_review_dispatch_attempts_exceeded",
+                        reason_class="mechanical",
+                    )
+                    state["prs"][pr_key] = pr_entry
                     if issue_num is not None:
                         issue_entry = {
                             **state["issues"].get(str(issue_num), {}),
                             "number": issue_num,
-                            "status": "escalated",
                             "merge_alert": "OK",
                         }
-                        set_escalation(
+                        set_status_escalated(
                             issue_entry,
                             reason="max_review_dispatch_attempts_exceeded",
                             reason_class="mechanical",
@@ -10916,21 +10929,24 @@ class OrchestratorApp:
         rescue_escalation_reason = f"rescue_review_{cause}"
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            state["prs"][str(pr_number)] = {
+            pr_entry = {
                 **state["prs"].get(str(pr_number), {}),
                 "number": pr_number,
                 "issue_number": issue_number,
-                "status": "escalated",
-                "escalation_reason": rescue_escalation_reason,
             }
+            set_status_escalated(
+                pr_entry,
+                reason=rescue_escalation_reason,
+                reason_class=rescue_reason_class,
+            )
+            state["prs"][str(pr_number)] = pr_entry
             if issue_number is not None:
                 issue_entry = {
                     **state["issues"].get(str(issue_number), {}),
                     "number": issue_number,
-                    "status": "escalated",
                     "merge_alert": "OK",
                 }
-                set_escalation(
+                set_status_escalated(
                     issue_entry,
                     reason=rescue_escalation_reason,
                     reason_class=rescue_reason_class,
@@ -11249,6 +11265,13 @@ class OrchestratorApp:
                 if (decision == "request_changes" and escalated)
                 else ("review_blocked" if decision == "blocked" else None)
             )
+            pr_escalation_reason_class = (
+                "mechanical"
+                if pr_escalation_reason == "max_rework_cycles_exceeded"
+                else "judgment"
+                if pr_escalation_reason == "review_blocked"
+                else None
+            )
             # Persist the verdict BEFORE rendering the rework brief: the brief
             # reads review-decision.json itself (issue #632, single point of
             # enforcement) to surface required_changes, so the decision file
@@ -11264,7 +11287,7 @@ class OrchestratorApp:
             )
             if rescue_dispatched:
                 rescue_fields["rescue_dispatched_at"] = utc_now()
-            state["prs"][str(pr_number)] = {
+            pr_entry = {
                 **pr_state,
                 "number": pr_number,
                 "issue_number": issue_number,
@@ -11274,7 +11297,6 @@ class OrchestratorApp:
                 "reviewed_patch_id": reviewed_patch_id,
                 "carried_forward_from": [],
                 "request_changes_count": request_changes_count,
-                "status": "escalated" if escalated else decision,
                 "consecutive_failed_merge_attempts": 0,
                 **rescue_fields,
                 # The reviewer agent has recorded its verdict. The hub no longer
@@ -11303,10 +11325,17 @@ class OrchestratorApp:
                     else pr_state.get("review_session_metrics")
                 ),
             }
-            if pr_escalation_reason is not None:
-                state["prs"][str(pr_number)]["escalation_reason"] = pr_escalation_reason
+            if escalated:
+                set_status_escalated(
+                    pr_entry,
+                    reason=pr_escalation_reason,
+                    reason_class=pr_escalation_reason_class,
+                )
             else:
-                state["prs"][str(pr_number)].pop("escalation_reason", None)
+                pr_entry["status"] = decision
+                pr_entry.pop("escalation_reason", None)
+                pr_entry.pop("reason_class", None)
+            state["prs"][str(pr_number)] = pr_entry
             # Update the linked issue's status to reconcile out of rework_requested:
             # the previous worker session is definitionally finished, so the issue
             # status must reflect the actual decision. This prevents state-driven
@@ -11327,13 +11356,12 @@ class OrchestratorApp:
                         issue_entry = {
                             **state["issues"].get(str(issue_number), {}),
                             "number": issue_number,
-                            "status": "escalated",
                             "merge_alert": "OK",
                         }
                         # Issue #783: rework-cycle cap reached is a
                         # process limit, not a judgment call --
                         # mechanical.
-                        set_escalation(
+                        set_status_escalated(
                             issue_entry,
                             reason="max_rework_cycles_exceeded",
                             reason_class="mechanical",
@@ -14236,23 +14264,28 @@ class OrchestratorApp:
             escalation_reason = f"{attempts_key}_cap_exceeded"
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
-                state["prs"][str(pr_number)] = {
+                pr_entry = {
                     **state["prs"].get(str(pr_number), {}),
                     "number": pr_number,
                     "issue_number": issue_number,
-                    "status": "escalated",
-                    "escalation_reason": escalation_reason,
                     attempts_key: attempts,
                 }
+                # Issue #783: janitor-gate rework attempt cap is a
+                # process limit, not a judgment call -- mechanical.
+                set_status_escalated(
+                    pr_entry,
+                    reason=escalation_reason,
+                    reason_class="mechanical",
+                )
+                state["prs"][str(pr_number)] = pr_entry
                 issue_entry = {
                     **state["issues"].get(str(issue_number), {}),
                     "number": issue_number,
-                    "status": "escalated",
                     "merge_alert": "OK",
                 }
                 # Issue #783: janitor-gate rework attempt cap is a
                 # process limit, not a judgment call -- mechanical.
-                set_escalation(
+                set_status_escalated(
                     issue_entry,
                     reason=escalation_reason,
                     reason_class="mechanical",
@@ -14478,24 +14511,29 @@ class OrchestratorApp:
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             attempts_so_far = int(state["prs"].get(str(pr_number), {}).get(attempts_key, 0))
-            state["prs"][str(pr_number)] = {
+            pr_entry = {
                 **state["prs"].get(str(pr_number), {}),
                 "number": pr_number,
                 "issue_number": issue_number,
-                "status": "escalated",
-                "escalation_reason": escalation_reason,
                 stall_since_key: None,
                 stall_head_key: None,
             }
+            # Issue #783: a stalled rework worker is a process failure,
+            # not a judgment call -- mechanical.
+            set_status_escalated(
+                pr_entry,
+                reason=escalation_reason,
+                reason_class="mechanical",
+            )
+            state["prs"][str(pr_number)] = pr_entry
             issue_entry = {
                 **state["issues"].get(str(issue_number), {}),
                 "number": issue_number,
-                "status": "escalated",
                 "merge_alert": "OK",
             }
             # Issue #783: a stalled rework worker is a process failure,
             # not a judgment call -- mechanical.
-            set_escalation(
+            set_status_escalated(
                 issue_entry,
                 reason=escalation_reason,
                 reason_class="mechanical",
@@ -16918,13 +16956,12 @@ class OrchestratorApp:
                     entry = {
                         **entry,
                         "number": issue_number,
-                        "status": "escalated",
                         "redispatch_at": redispatch_at,
                         "dispatched_at": None,
                     }
                     # Issue #783: no-op rework redispatch cap is a process
                     # failure, not a judgment call -- mechanical.
-                    set_escalation(
+                    set_status_escalated(
                         entry,
                         reason="redispatch_cap_exceeded",
                         reason_class="mechanical",
@@ -17402,11 +17439,10 @@ class OrchestratorApp:
                     ) + [now.isoformat().replace("+00:00", "Z")]
                     if len(redispatch_at) > self.config.watchdog.max_auto_redispatch:
                         # Escalate to human review
-                        entry["status"] = "escalated"
                         entry["redispatch_at"] = redispatch_at
                         # Issue #783: rework dispatch redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
-                        set_escalation(
+                        set_status_escalated(
                             entry,
                             reason="redispatch_cap_exceeded",
                             reason_class="mechanical",
@@ -17477,12 +17513,11 @@ class OrchestratorApp:
                         or len(redispatch_at) > self.config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review
-                        entry["status"] = "escalated"
                         entry["redispatch_at"] = redispatch_at
                         entry["dispatched_at"] = None
-                        # Issue #783: dead worker session / redispatch cap is a
+                        # Issue #783: rework dispatch redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
-                        set_escalation(
+                        set_status_escalated(
                             entry,
                             reason=(
                                 failure_kind if terminal_failure else "redispatch_cap_exceeded"

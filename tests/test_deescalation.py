@@ -660,7 +660,7 @@ def _escalation_event_kinds_from_workflow() -> set[str]:
                     name = node.func.id
                 elif isinstance(node.func, ast.Attribute):
                     name = node.func.attr
-                if name in ("escalation_reason_class", "set_escalation"):
+                if name in ("escalation_reason_class", "set_escalation", "set_status_escalated"):
                     return True
         return False
 

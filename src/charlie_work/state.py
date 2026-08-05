@@ -229,6 +229,23 @@ def set_escalation(
     return entry
 
 
+def set_status_escalated(
+    entry: dict[str, Any],
+    *,
+    reason: str,
+    reason_class: str,
+) -> dict[str, Any]:
+    """Set ``status`` to ``"escalated"`` and the paired escalation fields atomically.
+
+    This is the single-point state transition for escalation. Every code path
+    that moves an issue or PR to ``"escalated"`` must route through here so
+    ``escalation_reason`` and ``reason_class`` are always written together with
+    the status flip.
+    """
+    entry["status"] = "escalated"
+    return set_escalation(entry, reason=reason, reason_class=reason_class)
+
+
 def clear_escalation(entry: dict[str, Any]) -> dict[str, Any]:
     """Remove the paired escalation fields from ``entry``.
 
