@@ -15371,10 +15371,15 @@ class FakeGitHubWithRerunCapture(FakeGitHubWithChecks):
     """FakeGitHub that captures gh run rerun calls and can simulate failures."""
 
     def __init__(
-        self, checks: list[dict[str, Any]] | None = None, *, rerun_ok: bool = True
+        self,
+        checks: list[dict[str, Any]] | None = None,
+        *,
+        rerun_ok: bool = True,
+        rerun_error: str = "This workflow run cannot be retried",
     ) -> None:
         super().__init__(checks)
         self.rerun_ok = rerun_ok
+        self.rerun_error = rerun_error
         self.rerun_calls: list[list[str]] = []
 
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):  # noqa: ANN202
@@ -15386,9 +15391,9 @@ class FakeGitHubWithRerunCapture(FakeGitHubWithChecks):
                 ok=False,
                 returncode=1,
                 stdout="",
-                stderr="rate limit exceeded",
+                stderr=self.rerun_error,
                 value=None,
-                error="rate limit exceeded",
+                error=self.rerun_error,
             )
         return super().run(args, json_output=json_output, allow_failure=allow_failure)
 
@@ -15479,6 +15484,48 @@ def test_janitor_required_check_rerun_api_error_falls_through_to_rework(tmp_path
     assert state["prs"]["456"]["decision"] == "request_changes"
     # The rerun attempt was not persisted because the API call failed.
     assert "check_rerun_attempts" not in state["prs"]["456"]
+    assert any(event["kind"] == "flake_rerun_failed" for event in state.get("events", []))
+
+
+def test_janitor_required_check_rerun_refused_while_sibling_running_defers_to_next_pass(
+    tmp_path: Path,
+) -> None:
+    """Issue #992: a flake rerun refused because the containing workflow run is
+    still in progress must defer to the next pass, not fall through to a
+    request_changes verdict. The rerun attempt must not be consumed so a later
+    pass can retry once the run has completed."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fixture = Path(__file__).parent / "fixtures" / "gh_run_rerun_already_running.json"
+    rerun_error = json.loads(fixture.read_text(encoding="utf-8"))["error"]
+    fake_gh = FakeGitHubWithRerunCapture(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "link": link},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        rerun_ok=False,
+        rerun_error=rerun_error,
+    )
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    assert result.data.get("already_running") is True
+    assert result.data.get("rerun_run_ids") == [12345]
+    assert fake_gh.rerun_calls == [["run", "rerun", "12345", "--failed"]]
+    state = load_state(paths.state_file)
+    # The rerun attempt was not persisted and the PR was not routed to rework.
+    assert "check_rerun_attempts" not in state["prs"].get("456", {})
+    assert "decision" not in state["prs"].get("456", {})
+    assert "request_changes_count" not in state["prs"].get("456", {})
+    assert state.get("issues", {}).get("123", {}).get("status") != "rework_requested"
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
     assert any(event["kind"] == "flake_rerun_failed" for event in state.get("events", []))
 
 
