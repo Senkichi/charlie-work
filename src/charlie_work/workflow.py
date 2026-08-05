@@ -4165,7 +4165,7 @@ def _detect_and_handle_orphaned_workers(
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
                 # that the worker pushed but could not create a PR for.
                 candidate = pushed_branch_candidates.get(issue_number)
-                if candidate is not None:
+                if candidate is not None and isinstance(repo_root, Path):
                     details = no_pr_issue_details.get(issue_number, {})
                     pr_number, pr_error = _open_pr_for_orphaned_branch(
                         gh=gh,
@@ -5997,7 +5997,11 @@ def _classify_dead_sessions_and_update_throttle_state(
                         or len(redispatch_at) > config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review instead of relabeling to ready
-                        reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        reason = (
+                            failure_kind
+                            if terminal_failure and failure_kind is not None
+                            else "redispatch_cap_exceeded"
+                        )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
                         state = _escalate_issue(
@@ -8426,7 +8430,11 @@ class OrchestratorApp:
                             request.issue_number,
                             reason=(
                                 failed_result.failure_kind
-                                if terminal_failure and failed_result is not None
+                                if (
+                                    terminal_failure
+                                    and failed_result is not None
+                                    and failed_result.failure_kind is not None
+                                )
                                 else "dispatch_failed_cap_exceeded"
                             ),
                             reason_class="mechanical",
