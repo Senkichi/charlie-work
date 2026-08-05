@@ -3386,18 +3386,17 @@ def _append_sweep_events(
     for kind, payload in sweep_events:
         grouped.setdefault(kind, []).append(payload)
 
+    # Deliberately no level= classification here. Every payload routed through
+    # this batching path carries `status` (pending/dispatched/unclaimed) or no
+    # reason at all -- the two `provider_throttled*` reasons call append_event
+    # directly and are classified at those call sites. Adding a level= here
+    # would also suppress test_event_kind_registry_exhaustive's coverage of this
+    # function's unresolvable `kind` loop variable, since a site that declares
+    # its own level is exempt from kind verification. See #1029.
     for kind, payloads in grouped.items():
-        if kind == "review_dispatch_stalled":
-            level = (
-                "warning"
-                if all(_classify_review_dispatch_stalled_level(p) == "warning" for p in payloads)
-                else None
-            )
-        else:
-            level = None
         if len(payloads) == 1:
             state = append_event(
-                state, kind, payloads[0], max_size=max_size, state_path=state_file, level=level
+                state, kind, payloads[0], max_size=max_size, state_path=state_file
             )
         else:
             numbers: list[int] = []
@@ -3421,7 +3420,6 @@ def _append_sweep_events(
                 },
                 max_size=max_size,
                 state_path=state_file,
-                level=level,
             )
     return state
 
