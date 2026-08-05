@@ -4732,9 +4732,26 @@ issue referenced in ``_collect_external_findings``.
 
 
 def _is_orchestrator_comment(item: dict[str, Any]) -> bool:
-    """Return True if a comment body carries the orchestrator's provenance marker."""
+    """Return True if a comment body *begins* with the orchestrator's provenance marker.
+
+    Deliberately a prefix test, not a substring test. ``_comment_pr`` writes the
+    marker as the literal first line, so a prefix check catches every comment this
+    process posts -- and a substring check would catch strictly more than that, in
+    the one direction that costs real findings.
+
+    The extra case a substring check would swallow: GitHub's "Quote reply" inserts
+    the *raw markdown* of the quoted comment, HTML comments included, as a
+    blockquote above the reply. Quote-replying to one of our ``request_changes``
+    comments is a natural way for a human to respond point by point, and the
+    resulting body contains the marker without starting with it. Under a substring
+    test that whole comment -- quote plus whatever new finding the human wrote
+    below it -- is dropped from ``required_changes`` silently.
+
+    Dropping a genuine human finding is worse than ingesting one of our own
+    comments, so this predicate is written to fail toward ingestion.
+    """
     body = item.get("body")
-    return isinstance(body, str) and ORCHESTRATOR_COMMENT_MARKER in body
+    return isinstance(body, str) and body.lstrip().startswith(ORCHESTRATOR_COMMENT_MARKER)
 
 
 def _is_bot_comment(item: dict[str, Any]) -> bool:

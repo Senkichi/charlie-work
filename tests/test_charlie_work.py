@@ -76,6 +76,7 @@ from charlie_work.state import (
 )
 import charlie_work.state as state_module
 from charlie_work.workflow import (
+    ORCHESTRATOR_COMMENT_MARKER,
     CommandResult,
     ConcurrencyGovernorResult,
     OrchestratorApp,
@@ -20450,6 +20451,63 @@ def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
     # ...while a genuine human finding from an identical account type is kept.
     assert any("rollback path" in item for item in changes)
     # And the internal finding survives untouched.
+    assert "keep me" in changes
+
+
+def test_human_quote_reply_to_orchestrator_comment_is_still_ingested(
+    tmp_path: Path,
+) -> None:
+    """The provenance marker must be matched as a *prefix*, not a substring.
+
+    GitHub's "Quote reply" copies the raw markdown of the quoted comment --
+    HTML comments included -- into a blockquote above the reply. Quote-replying
+    to one of our ``request_changes`` comments is a natural way for a human to
+    answer point by point, and it produces a body that *contains*
+    ``ORCHESTRATOR_COMMENT_MARKER`` without starting with it.
+
+    Under a substring test that comment is classified as ours and dropped, so
+    the human's new finding below the quote never reaches ``required_changes``.
+    Losing a genuine finding is the expensive direction of this filter, so the
+    predicate must fail toward ingestion. This test fails if the check is
+    weakened back to ``MARKER in body``.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    app._comment_pr(456, "## Request changes\n\nThe retry wrapper swallows the type.")
+    posted_body = (pr_dir / "review-comment.md").read_text(encoding="utf-8")
+
+    # Exactly what GitHub stores when a human uses "Quote reply": every line of
+    # the quoted comment prefixed with "> ", then the human's own text.
+    quoted = "\n".join(f"> {line}" for line in posted_body.splitlines())
+    human_reply = f"{quoted}\n\nAgreed, and separately: the migration needs a rollback path."
+    assert ORCHESTRATOR_COMMENT_MARKER in human_reply, (
+        "sanity: the quote really does carry the marker -- otherwise this test "
+        "would pass without exercising the prefix-vs-substring distinction"
+    )
+    assert not human_reply.startswith(ORCHESTRATOR_COMMENT_MARKER)
+
+    fake_gh.pr_external_issue_comments[456] = [
+        {"body": posted_body, "user": {"login": "orchestrator-operator", "type": "User"}},
+        {"body": human_reply, "user": {"login": "a-real-human", "type": "User"}},
+    ]
+
+    result = app.record_review(
+        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+    )
+
+    assert result.ok is True
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    changes = decision["required_changes"]
+
+    # The human's finding survives even though their comment embeds our marker.
+    assert any("rollback path" in item for item in changes)
+    # Our own unquoted comment is still filtered out.
+    assert not any(item.lstrip().startswith(ORCHESTRATOR_COMMENT_MARKER) for item in changes)
     assert "keep me" in changes
 
 
