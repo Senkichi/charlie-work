@@ -2,9 +2,47 @@ from __future__ import annotations
 
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
+from unittest.mock import create_autospec
 
 import pytest
+
+
+_UNSET = object()
+
+
+def autospec_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    target: Any,
+    name: str,
+    side_effect: Callable[..., Any] | None = None,
+    return_value: Any = _UNSET,
+) -> Any:
+    """Replace ``target.name`` with a ``create_autospec``-wrapped double.
+
+    The mock's call signature is derived from the real object, so a double that
+    omits parameters or uses different names fails immediately in the test that
+    installed it, rather than in a later unrelated test.  ``side_effect`` and/or
+    ``return_value`` configure the replacement as in ``unittest.mock``.
+    """
+    real = getattr(target, name)
+    if not callable(real):
+        raise TypeError(f"cannot autospec non-callable {name!r} on {target!r}")
+    mock = create_autospec(real)
+    if side_effect is not None:
+        mock.side_effect = side_effect
+    if return_value is not _UNSET:
+        mock.return_value = return_value
+    monkeypatch.setattr(target, name, mock)
+    return mock
+
+
+@pytest.fixture
+def autospec() -> Callable[..., Any]:
+    """Provide the autospec_patch helper to tests."""
+    return autospec_patch
 
 
 @pytest.fixture(autouse=True)
