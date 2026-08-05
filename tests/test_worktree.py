@@ -29,8 +29,10 @@ from charlie_work.worktree import (
     ReworkMergeConflict,
     _default_worktrees_dir,
     _has_origin_remote,
+    _is_confirmed_missing_ref,
     _resolve_default_branch_ref,
     _worker_authored_dirty,
+    _worktree_refuse_to_reset_reason,
     clean_worktrees,
     create_review_checkout,
     create_worktree,
@@ -1886,6 +1888,119 @@ def test_dirty_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
         assert (info1.path / "dirty.txt").read_text(encoding="utf-8") == "uncommitted\n"
     finally:
         charlie_work.worktree.run_captured = original_run_captured
+
+
+def test_is_confirmed_missing_ref_true_for_quiet_verify_miss() -> None:
+    """Issue #1011: with ``-q``, ``git rev-parse --verify`` reserves exit code
+    1 exclusively for "the given ref does not resolve" (confirmed against git
+    2.45 for both an unborn ``HEAD`` in an empty repo and a missing branch
+    name -- both produce ``returncode=1`` with empty stdout/stderr). This is
+    the one shape the discriminator must treat as "nothing to lose".
+    """
+    result = RunResult(returncode=1, stdout="", stderr="", error="command exited 1")
+    assert _is_confirmed_missing_ref(result) is True
+
+
+def test_is_confirmed_missing_ref_false_for_git_error_exit_128() -> None:
+    """A broken probe -- not a git repository, corrupted refs, permissions --
+    exits 128, not 1. Before this fix, ANY non-ok `rev-parse --verify` result
+    (including this one) fell through to "nothing to lose"; this pins that
+    the discriminator refuses instead of misreading a broken probe as a
+    confirmed-absent ref.
+    """
+    result = RunResult(
+        returncode=128,
+        stdout="",
+        stderr="fatal: not a git repository (or any of the parent directories): .git",
+        error="command exited 128",
+    )
+    assert _is_confirmed_missing_ref(result) is False
+
+
+def test_is_confirmed_missing_ref_false_for_timeout() -> None:
+    """A timed-out probe must never be read as a confirmed-absent ref."""
+    result = RunResult(
+        returncode=None,
+        stdout="",
+        stderr="",
+        timed_out=True,
+        error="command timed out after 60s",
+    )
+    assert _is_confirmed_missing_ref(result) is False
+
+
+def test_is_confirmed_missing_ref_false_for_missing_git_binary() -> None:
+    """An ``OSError`` from a git binary that is not on PATH at all comes back
+    as ``returncode=None`` with ``error`` set (not a timeout). This must
+    refuse too, not be misread as a confirmed-absent ref -- the discriminator
+    must survive the case where git cannot be found at all, not just where it
+    runs and errors.
+    """
+    result = RunResult(
+        returncode=None,
+        stdout="",
+        stderr="",
+        error="[WinError 2] The system cannot find the file specified",
+    )
+    assert _is_confirmed_missing_ref(result) is False
+
+
+def test_local_tip_probe_failure_refuses_to_reset(tmp_path: Path) -> None:
+    """Issue #1011: the confirmed data-loss path. When the local-tip
+    ``git rev-parse --verify -q`` probe fails for a reason OTHER than a
+    confirmed-absent ref (index lock, AV-held handle, transient I/O error --
+    simulated here as a "not a git repository" failure, exit 128), a fresh
+    branch that was never created still has no worktree directory to trip
+    the dirty check, so this is the pre-fix code's only way in: before this
+    fix, ANY non-ok probe result fell through to ``return None`` --
+    "nothing to lose" -- and authorized discarding unpushed commits. It must
+    now raise ``WorktreeProbeFailedError`` (refuse) instead.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    branch_name = "agent/issue-1011-probe-fail"
+    _git(repo_root, "branch", branch_name)
+
+    import charlie_work.worktree
+
+    original_run_captured = charlie_work.worktree.run_captured
+
+    def mock_run_captured(*args: object, **kwargs: object) -> object:
+        if (
+            isinstance(args[0], list)
+            and args[0][:4] == ["git", "rev-parse", "--verify", "-q"]
+            and args[0][-1] == branch_name
+        ):
+            return RunResult(
+                returncode=128,
+                stdout="",
+                stderr="fatal: not a git repository (or any of the parent directories): .git",
+                error="command exited 128",
+            )
+        return original_run_captured(*args, **kwargs)
+
+    charlie_work.worktree.run_captured = mock_run_captured
+    try:
+        with pytest.raises(WorktreeProbeFailedError, match="not a confirmed-missing ref"):
+            _worktree_refuse_to_reset_reason(repo_root, branch_name, "HEAD")
+    finally:
+        charlie_work.worktree.run_captured = original_run_captured
+
+
+def test_absent_ref_still_returns_none_not_a_permanent_refusal(tmp_path: Path) -> None:
+    """Issue #1011's other failure direction: a branch that genuinely does
+    not exist (never dispatched, or already cleaned up) must still resolve
+    to ``None`` ("nothing to lose") through the real ``git`` binary -- not
+    mocked, unlike the probe-failure test above. Getting this backwards (
+    treating every non-ok ``rev-parse --verify`` as a refusal) would make
+    every legitimately-absent branch permanently un-reclaimable, leaking a
+    worktree/reclaim slot forever.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    reason = _worktree_refuse_to_reset_reason(repo_root, "agent/does-not-exist-1011", "HEAD")
+    assert reason is None
 
 
 def test_list_worktrees_porcelain_parser_handles_flag_lines(tmp_path: Path) -> None:
@@ -5037,6 +5152,65 @@ def test_clean_worktrees_removes_closed_unmerged_pr_with_nothing_to_lose(
     assert len(result.data["removed"]) == 1
     assert result.data["removed"][0]["issue_number"] == 9
     assert not info.path.exists()
+
+
+def test_clean_worktrees_skips_closed_unmerged_pr_on_probe_failure(tmp_path: Path) -> None:
+    """Issue #1011, through the actual destructive caller: when the closed-
+    unmerged-PR reclaim path's local-tip probe (``git rev-parse --verify -q
+    HEAD`` run inside the worktree) fails for a reason other than a
+    confirmed-missing ref, ``clean_worktrees`` must skip -- not remove -- so
+    that ``remove_worktree(..., force=True, branch=branch)`` never runs
+    ``git branch -D`` on a branch whose "nothing to lose" status was never
+    actually confirmed. Before this fix, the helper would have returned
+    ``None`` here (misreading the broken probe as a confirmed-absent ref) and
+    this caller would have deleted the worktree AND the branch ref, leaving
+    only reflog-based recovery. This is the worktree-HEAD probe shape
+    (``cwd == wt_path``), the sibling of the branch-name-in-repo-root shape
+    already covered by ``test_local_tip_probe_failure_refuses_to_reset``.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    branch_name = "agent/issue-11-closed-probe-fail"
+    info = create_worktree(repo_root, branch_name, base_ref="HEAD")
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=11, pr_number=111, status="closed")
+
+    import charlie_work.worktree
+
+    original_run_captured = charlie_work.worktree.run_captured
+
+    def mock_run_captured(*args: object, **kwargs: object) -> object:
+        if (
+            isinstance(args[0], list)
+            and args[0] == ["git", "rev-parse", "--verify", "-q", "HEAD"]
+            and Path(kwargs.get("cwd", "")) == info.path
+        ):
+            return RunResult(
+                returncode=128,
+                stdout="",
+                stderr="fatal: not a git repository (or any of the parent directories): .git",
+                error="command exited 128",
+            )
+        return original_run_captured(*args, **kwargs)
+
+    charlie_work.worktree.run_captured = mock_run_captured
+    try:
+        result = clean_worktrees(
+            repo_root,
+            worktrees_dir,
+            state,
+            config,
+            _FakeGH(pr_state="CLOSED", merged_at=None),
+        )
+    finally:
+        charlie_work.worktree.run_captured = original_run_captured
+
+    assert result.ok is True, result.message
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    assert "safety probe failed" in result.data["skipped"][0]["reason"]
+    assert info.path.exists()
 
 
 def test_clean_worktrees_skips_closed_pr_with_merged_at_set(tmp_path: Path) -> None:
