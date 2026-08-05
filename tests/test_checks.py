@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import pytest
+
 from charlie_work.checks import (
     CheckDebounceResult,
     InfraRerunResult,
+    _is_failing_run,
     _run_id_from_link,
     classify_check_failures,
     classify_infra_failures,
+    summarize_checks,
 )
+from charlie_work.workflow import _non_required_check_findings
 
 
 REQUIRED = ("Tests passed", "Lint & Format")
@@ -333,3 +338,88 @@ def test_classify_infra_timed_out_state_is_treated_as_infra() -> None:
         head_sha="sha-1",
     )
     assert result.rerun_run_ids == (100,)
+
+
+def test_summarize_checks_skipped_required_check_not_failing() -> None:
+    """A required check with conclusion SKIPPED is a legitimate non-outcome
+    and must not be counted as failing."""
+    checks = [{"name": "Tests passed", "state": "SKIPPED"}]
+    summary = summarize_checks(checks, ("Tests passed",))
+    assert "Tests passed" not in summary.failed
+    assert "Tests passed" not in summary.infra_failed
+    assert summary.ready is True
+
+
+def test_summarize_checks_neutral_required_check_not_failing() -> None:
+    """A required check with conclusion NEUTRAL is a legitimate non-outcome
+    and must not be counted as failing."""
+    checks = [{"name": "Tests passed", "state": "NEUTRAL"}]
+    summary = summarize_checks(checks, ("Tests passed",))
+    assert "Tests passed" not in summary.failed
+    assert "Tests passed" not in summary.infra_failed
+    assert summary.ready is True
+
+
+def test_is_failing_run_skipped_and_neutral_return_false() -> None:
+    """SKIPPED and NEUTRAL single check runs are not code failures."""
+    assert _is_failing_run({"name": "x", "state": "SKIPPED"}) is False
+    assert _is_failing_run({"name": "x", "state": "NEUTRAL"}) is False
+
+
+def test_non_required_check_findings_skipped_and_neutral_not_listed() -> None:
+    """workflow.py must continue to treat SKIPPED/NEUTRAL as non-outcomes
+    for non-required checks (regression guard for the shared helper)."""
+    checks = [{"name": "Optional Job", "state": "SKIPPED"}]
+    failing, cancelled = _non_required_check_findings(checks, ("Tests",))
+    assert failing == ()
+    assert cancelled == ()
+
+    checks = [{"name": "Optional Job", "state": "NEUTRAL"}]
+    failing, cancelled = _non_required_check_findings(checks, ("Tests",))
+    assert failing == ()
+    assert cancelled == ()
+
+
+@pytest.mark.parametrize("state", ["SKIPPED", "NEUTRAL"])
+def test_all_three_call_sites_agree_skipped_and_neutral_are_not_failures(
+    state: str,
+) -> None:
+    """The shared classification helper must keep summarize_checks,
+    _is_failing_run, and _non_required_check_findings consistent."""
+    check = {"name": "Check", "state": state}
+    summary = summarize_checks([check], ("Check",))
+    assert "Check" not in summary.failed
+    assert "Check" not in summary.infra_failed
+    assert _is_failing_run(check) is False
+    failing, cancelled = _non_required_check_findings([check], ("Other",))
+    assert failing == ()
+    assert cancelled == ()
+
+
+@pytest.mark.parametrize(
+    "state,summary_bucket,is_failing,non_required_failing,non_required_cancelled",
+    [
+        ("SUCCESS", "passed", False, (), ()),
+        ("PENDING", "pending", False, (), ()),
+        ("FAILURE", "failed", True, ("Check",), ()),
+        ("CANCELLED", "infra_failed", False, (), ("Check",)),
+        ("INFRA_FAILURE", "infra_failed", False, ("Check",), ()),
+        ("TIMED_OUT", "infra_failed", False, ("Check",), ()),
+    ],
+)
+def test_known_check_states_classify_consistently(
+    state: str,
+    summary_bucket: str,
+    is_failing: bool,
+    non_required_failing: tuple[str, ...],
+    non_required_cancelled: tuple[str, ...],
+) -> None:
+    """Existing state classifications must be unchanged at all three call sites
+    after the SKIPPED/NEUTRAL carve-out is moved to a shared helper."""
+    check = {"name": "Check", "state": state}
+    summary = summarize_checks([check], ("Check",))
+    assert getattr(summary, summary_bucket) == ("Check",)
+    assert _is_failing_run(check) is is_failing
+    failing, cancelled = _non_required_check_findings([check], ("Other",))
+    assert failing == non_required_failing
+    assert cancelled == non_required_cancelled

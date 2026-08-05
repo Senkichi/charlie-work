@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 
@@ -24,6 +25,54 @@ class CheckSummary:
             and not self.infra_failed
             and not self.unavailable
         )
+
+
+class _CheckClassification(Enum):
+    """Single-check-run classification used by all check consumers.
+
+    Each call site maps these values to its own output shape:
+    ``summarize_checks`` aggregates them into ``CheckSummary`` buckets;
+    ``_is_failing_run`` returns ``True`` only for ``FAIL``;
+    ``_non_required_check_findings`` in ``workflow.py`` reports ``CANCELLED``
+    separately and treats ``INFRA`` as a failure in the informational context.
+    """
+
+    PASS = "pass"
+    PENDING = "pending"
+    EMPTY = "empty"  # null/empty state+bucket, treated as pending
+    SKIPPED = "skipped"  # SKIPPED/NEUTRAL — legitimate non-outcomes
+    CANCELLED = "cancelled"  # CANCELLED (infra hiccup, reported distinctly)
+    INFRA = "infra"  # INFRA_FAILURE or TIMED_OUT
+    FAIL = "fail"  # FAILURE or any other unrecognized terminal state
+
+
+def _classify_check_run(check: dict[str, Any]) -> _CheckClassification:
+    """Classify a single check run into a shared enum.
+
+    ``state`` carries the canonical conclusion (``gh pr checks`` exposes it
+    directly and the GraphQL fallback reconstructs it from status/conclusion).
+    ``bucket`` is used only as the pass/pending alternatives it is documented
+    to provide (see ``PR_CHECKS_FIELDS`` in ``github.py``), never as an
+    independent requirement.
+    """
+    state = str(check.get("state") or "").upper()
+    bucket = str(check.get("bucket") or "").lower()
+
+    if state == "SUCCESS" or bucket == "pass":
+        return _CheckClassification.PASS
+    if state in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"} or bucket == "pending":
+        return _CheckClassification.PENDING
+    if not state and not bucket:
+        return _CheckClassification.EMPTY
+    if state in {"SKIPPED", "NEUTRAL"}:
+        # Legitimate non-outcomes (path-filtered/matrix-conditional
+        # jobs) — never a failure.
+        return _CheckClassification.SKIPPED
+    if state == "CANCELLED":
+        return _CheckClassification.CANCELLED
+    if state in {"INFRA_FAILURE", "TIMED_OUT"}:
+        return _CheckClassification.INFRA
+    return _CheckClassification.FAIL
 
 
 def summarize_checks(
@@ -72,39 +121,21 @@ def summarize_checks(
         name_infra_failed = False
 
         for check in runs:
-            state = str(check.get("state") or "").upper()
-            bucket = str(check.get("bucket") or "").lower()
+            classification = _classify_check_run(check)
 
-            if state == "SUCCESS" or bucket == "pass":
+            if classification == _CheckClassification.PASS:
                 # This run passed - continue checking other runs
                 continue
-            elif state in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"} or bucket == "pending":
+            if classification in {_CheckClassification.PENDING, _CheckClassification.EMPTY}:
+                # Not yet completed - the whole check name is pending unless a later run fails
                 name_pending = True
-            elif not state and not bucket:
-                # Null/empty state and bucket means the check-run hasn't populated yet - classify as pending
-                name_pending = True
-            elif state == "FAILURE":
-                # FAILURE state indicates code failure - highest priority
-                name_failed = True
-            elif state == "CANCELLED":
-                # CANCELLED state indicates infrastructure failure (e.g., billing lapse, runner death)
-                # Note: Signal-3's head-unchanged qualifier is omitted here because checks are evaluated
-                # at the current head, so cancellations in scope are genuine infrastructure failures
+            elif classification == _CheckClassification.SKIPPED:
+                # Legitimate non-outcomes (path-filtered/matrix-conditional
+                # jobs) — never a failure.
+                continue
+            elif classification in {_CheckClassification.CANCELLED, _CheckClassification.INFRA}:
                 name_infra_failed = True
-            elif state == "INFRA_FAILURE":
-                # INFRA_FAILURE is a marker state set by the GitHub adapter enrichment layer
-                # to indicate jobs with zero steps or billing annotations (signals 1 and 2 from #210)
-                name_infra_failed = True
-            elif state == "TIMED_OUT":
-                # A genuine step/job timeout is an infrastructure condition, not a
-                # code failure (mirrors CANCELLED/INFRA_FAILURE just above). On
-                # this repo's self-hosted runners, a `timeout-minutes` kill is
-                # observed to report CANCELLED rather than TIMED_OUT (issue #841),
-                # but TIMED_OUT is a documented GitHub Actions conclusion value
-                # and must not fall through to the code-failure catch-all below.
-                name_infra_failed = True
-            else:
-                # Any other failure state.
+            elif classification == _CheckClassification.FAIL:
                 name_failed = True
 
         if name_failed:
@@ -274,19 +305,8 @@ def classify_check_failures(
 
 
 def _is_failing_run(check: dict[str, Any]) -> bool:
-    """Return True if a single check run represents a code failure (not pending/infra)."""
-    state = str(check.get("state") or "").upper()
-    bucket = str(check.get("bucket") or "").lower()
-
-    if state == "SUCCESS" or bucket == "pass":
-        return False
-    if state in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"} or bucket == "pending":
-        return False
-    if not state and not bucket:
-        return False
-    if state in {"CANCELLED", "INFRA_FAILURE", "TIMED_OUT"}:
-        return False
-    return True
+    """Return True if a single check run represents a code failure (not pending/infra/skipped)."""
+    return _classify_check_run(check) == _CheckClassification.FAIL
 
 
 def _is_infra_run(check: dict[str, Any]) -> bool:
