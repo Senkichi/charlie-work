@@ -35299,6 +35299,72 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     assert payload["duration_seconds"] == 300.0
 
 
+def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> None:
+    """Regression test for issue #996.
+
+    The #417 ground-truth label-reclaim sweep only calls the bounded-cost
+    ``gh.issue_list(state="open")`` when ``no_pr_orphans`` (dead-PID orphans
+    with no linked open PR) is non-empty -- that guard is also what makes the
+    later ``issues_by_number.get(...)`` read reachable. This pins the other
+    side of that invariant: when the only orphan already has a linked open
+    PR, ``no_pr_orphans`` is empty and ``issue_list`` must never be called.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.issue_list_calls = 0
+
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",  # Unchanged since request_changes
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+        def issue_list(self, labels=None, state=None):
+            self.issue_list_calls += 1
+            return super().issue_list(labels=labels, state=state)
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Issue 207 has a linked open PR (number 100), so no_pr_orphans is empty
+    # and the bulk issue-list sweep must not run.
+    assert fake_gh.issue_list_calls == 0
+
+
 def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Path) -> None:
     """Issue #773: a non-zero exit code recorded in the terminal-status file
     must still take the pre-#773 recovery path (reset to rework_requested) --

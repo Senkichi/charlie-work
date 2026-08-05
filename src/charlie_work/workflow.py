@@ -3735,8 +3735,8 @@ def _detect_and_handle_orphaned_workers(
     # have accumulated in state.json over time.
     no_pr_orphans = [n for n in orphaned_issues if n not in pr_by_issue]
     reclaim_results: dict[int, dict[str, Any]] = {}
+    issues_by_number: dict[int, dict[str, Any]] = {}
     if no_pr_orphans:
-        issues_by_number: dict[int, dict[str, Any]] = {}
         for issue in gh.issue_list(state="open"):
             number = issue.get("number")
             if number is not None:
