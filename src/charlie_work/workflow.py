@@ -7458,12 +7458,12 @@ class OrchestratorApp:
             # (it intersects against the ready-issue-number set) — skip the
             # expensive listing query entirely rather than fetch-and-discard
             # (issue #361).
-            merged_prs = _resolve_merged_prs(merged_prs)
+            resolved_merged_prs = _resolve_merged_prs(merged_prs)
             (
                 merged_pr_bound_issue_numbers,
                 merged_pr_mention_only_issue_numbers,
                 _,
-            ) = self._merged_pr_referenced_issue_numbers(issues, merged_prs)
+            ) = self._merged_pr_referenced_issue_numbers(issues, resolved_merged_prs)
             merged_pr_issue_numbers = (
                 merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
             )
@@ -7593,7 +7593,7 @@ class OrchestratorApp:
                 "failed_count": 0,
                 "skipped_issue_numbers": skipped_issue_numbers,
                 "deferred_by_concurrency": deferred_by_concurrency,
-                "merged_prs": merged_prs,
+                "merged_prs": resolved_merged_prs,
                 "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                 "merged_pr_mention_only_issue_numbers": sorted(
                     merged_pr_mention_only_issue_numbers
@@ -7631,12 +7631,12 @@ class OrchestratorApp:
         # return empty sets regardless of what merged_pr_list() returns (it
         # intersects against the ready-issue-number set) — skip the expensive
         # listing query entirely rather than fetch-and-discard (issue #361).
-        merged_prs = _resolve_merged_prs(merged_prs)
+        resolved_merged_prs = _resolve_merged_prs(merged_prs)
         (
             merged_pr_bound_issue_numbers,
             merged_pr_mention_only_issue_numbers,
             merged_pr_bound_pr_numbers,
-        ) = self._merged_pr_referenced_issue_numbers(issues, merged_prs)
+        ) = self._merged_pr_referenced_issue_numbers(issues, resolved_merged_prs)
         merged_pr_issue_numbers = (
             merged_pr_bound_issue_numbers | merged_pr_mention_only_issue_numbers
         )
@@ -8493,7 +8493,7 @@ class OrchestratorApp:
             "foreign_writer_count": len(foreign_writer_issue_numbers),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
-            "merged_prs": merged_prs,
+            "merged_prs": resolved_merged_prs,
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
             "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
