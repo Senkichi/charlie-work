@@ -3340,6 +3340,13 @@ def classify_backlog_reachability(
         "terminal_label": 0,
         "active_label": 0,
         "operator_claimed": 0,
+        # An issue with no ``number`` cannot be dispatched or named as an
+        # example, but it must still be BINNED rather than skipped: the
+        # renderer joins the non-zero reasons, so a backlog of these would
+        # print "N open, 0 dispatchable ()" -- firing the alarm while naming
+        # no cause. Every fetched issue lands in exactly one bin, so the bins
+        # always sum to ``open_total``.
+        "unidentified": 0,
         "unreachable_examples": {},
     }
 
@@ -3355,6 +3362,7 @@ def classify_backlog_reachability(
     for issue in issues:
         number = issue.get("number")
         if number is None:
+            reachability["unidentified"] += 1
             continue
         number = int(number)
         names = label_names(issue)

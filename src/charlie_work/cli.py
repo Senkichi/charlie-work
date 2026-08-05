@@ -1860,9 +1860,20 @@ def _render_backlog_reachability(reachability: Any) -> str:
     if open_total and not dispatchable:
         reasons = ", ".join(
             f"{reason}={reachability[reason]}"
-            for reason in ("missing_ready", "terminal_label", "active_label", "operator_claimed")
+            for reason in (
+                "missing_ready",
+                "terminal_label",
+                "active_label",
+                "operator_claimed",
+                "unidentified",
+            )
             if reachability.get(reason)
         )
+        # The bins partition the backlog, so `reasons` is non-empty whenever
+        # open_total is. Kept as a guard rather than an assumption: an alarm
+        # that fires without naming a cause is worse than no alarm.
+        if not reasons:
+            reasons = "no reason recorded -- classifier bug"
         notes.append(f"!! {open_total} open, 0 dispatchable ({reasons})")
 
     return "  " + "; ".join(notes) if notes else ""
