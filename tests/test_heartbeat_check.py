@@ -1001,6 +1001,108 @@ def test_check_error_events_anomaly_when_db_unreadable(hb: ModuleType, tmp_path:
 
 
 # ---------------------------------------------------------------------------
+# check_warning_events (issue #946)
+#
+# Mirrors the check_error_events tests above one level down the `level`
+# column, plus the one deliberate behavioral difference: a found warning
+# must surface (via `report.warn`) without setting `report.anomaly`.
+# ---------------------------------------------------------------------------
+
+
+def test_check_warning_events_surfaces_seeded_dispatch_stale(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Regression for issue #946: warning-level events (dispatch_stale and
+    ~6 pre-existing kinds) are emitted, classified, documented, and unit
+    tested -- and had NO consumer anywhere in the codebase before this
+    check. `dispatch_stale` is a real production example (emitted from
+    `workflow.check_dispatch_staleness`, classified warning-level by
+    `instrumentation._classify_level` via `_WARNING_KINDS`).
+
+    This test must fail with an AttributeError before `check_warning_events`
+    exists -- if it doesn't fail first, it isn't testing the gap.
+    """
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(2), "dispatch_stale", "warning")])
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "dispatch_stale" in report.lines[-1]
+    assert report.lines[-1].startswith("WARN ")
+
+
+def test_check_warning_events_ok_when_only_info_and_error_events(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [
+            (_iso(1), "dispatch_started", "info"),
+            (_iso(1), "self_deploy_alarm", "error"),
+        ],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "warning_rows=0" in report.lines[0]
+
+
+def test_check_warning_events_covers_synthetic_kind_not_hardcoded(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Coverage must be derived from the persisted `level` column, never a
+    hardcoded list of `kind` strings, matching
+    `test_check_error_events_covers_synthetic_kind_not_hardcoded` above."""
+    repo = _make_repo(hb, tmp_path)
+    _write_events_db(repo.state_dir, [(_iso(1), "totally_novel_warning_kind_xyz", "warning")])
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "totally_novel_warning_kind_xyz" in report.lines[-1]
+
+
+def test_check_warning_events_excludes_old_row(hb: ModuleType, tmp_path: Path) -> None:
+    """Positive control mirroring
+    `test_check_error_events_excludes_old_row_despite_sql_trap_shape`: a row
+    60 minutes older than baseline must be excluded from `new_since_last_beat`."""
+    repo = _make_repo(hb, tmp_path)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=5)
+    _write_events_db(repo.state_dir, [(_iso(60), "dispatch_stale", "warning")])
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert "warning_rows=1" in report.lines[0]
+    assert "new_since_last_beat=0" in report.lines[0]
+
+
+def test_check_warning_events_anomaly_when_db_missing(hb: ModuleType, tmp_path: Path) -> None:
+    """Unlike a found warning (non-fatal), the check's OWN inability to read
+    events.db is still a genuine anomaly, matching
+    `test_check_error_events_anomaly_when_db_missing`: this check cannot
+    vouch for the repo at all without a readable database."""
+    repo = _make_repo(hb, tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert report.anomaly
+    assert "no events.db" in report.lines[-1]
+
+
+def test_report_warn_does_not_set_anomaly(hb: ModuleType) -> None:
+    """Direct unit test of the `Report.warn` primitive itself: it must append
+    a line but never flip `anomaly`, unlike `Report.anom`."""
+    report = hb.Report()
+    report.warn("some-check", "some non-fatal detail")
+    assert report.anomaly is False
+    assert report.lines == ["WARN some-check: some non-fatal detail"]
+
+
+# ---------------------------------------------------------------------------
 # check_stale_open_issue_mentions (issue #902)
 #
 # Real captured payload text, not paraphrased: PR #824's body starts with

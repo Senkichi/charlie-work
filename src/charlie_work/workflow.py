@@ -3417,8 +3417,20 @@ def _latest_non_empty_dispatch(state_path: Path) -> dict[str, Any] | None:
 
     Empty-payload dispatch events happen on every healthy zero-dispatch pass,
     so they cannot be used to measure cadence. We scan newest-first.
+
+    Bounded to the most recent 100 ``dispatch`` rows: ``query_events``'s
+    ``limit=`` selects with ``ORDER BY id DESC LIMIT ?`` and then re-orders
+    the result ascending, so this returns the newest 100 rows (oldest of
+    that 100 first) -- exactly what "scan newest-first" below needs, not
+    the oldest 100. Without a bound this ran an unindexed-by-limit full
+    scan of every ``dispatch`` row on every dispatch pass; this repo's own
+    events.db already holds thousands of them and the table grows without
+    bound. 100 is generous headroom: even at a 5-minute dispatch cadence,
+    the default 240-minute ``dispatch_staleness_minutes`` threshold only
+    needs to look back ~48 dispatch events to find the most recent
+    non-empty one.
     """
-    events = query_events(state_path, kind="dispatch")
+    events = query_events(state_path, kind="dispatch", limit=100)
     for event in reversed(events):
         issue_numbers = event.get("payload", {}).get("issue_numbers")
         if isinstance(issue_numbers, list) and issue_numbers:
@@ -3480,7 +3492,16 @@ def check_dispatch_staleness(
         now = datetime.now(UTC)
 
     if recent_issue_numbers:
-        result["last_dispatch_at"] = utc_now()
+        # Format the already-sampled `now` rather than taking a second,
+        # uninjected clock read here -- the single-frozen-clock-per-pass
+        # invariant established by #828/#838. `utc_now()` reads the real
+        # wall clock, which would let this short-circuit's timestamp drift
+        # from the `now` the caller sampled once for the whole pass. Uses
+        # `utc_now()`'s own formula (seconds precision, trailing "Z") so the
+        # string matches every other event timestamp in events.db, including
+        # the `latest["ts"]` value this same field holds in the non-short-
+        # circuit branch below.
+        result["last_dispatch_at"] = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         result["last_dispatch_issue_numbers"] = sorted(recent_issue_numbers)
         result["age_seconds"] = 0
         result["reason"] = "current_pass_dispatched"
