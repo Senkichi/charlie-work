@@ -1438,6 +1438,39 @@ def detect_drift(
     # both-closed case (the overwhelming majority of "closed" entries)
     # just confirms target_status == current_status and continues without
     # emitting drift.
+    #
+    # Issue #859 (PER-ITEM, not the global pr_snapshot_incomplete flag -- see
+    # the elif branch below for why): a per-issue index of PRs state.json
+    # itself still tracks as open (status not yet "closed"/"merged") whose PR
+    # number does not appear anywhere in this pass's `prs` snapshot at all
+    # (`pr_numbers_on_github`, built above alongside state_pr_missing_on_github).
+    # That absence is the same kind of "unanswered query" #789 already
+    # protects on the issue side, scoped to exactly the issues state.json's
+    # own bookkeeping says are affected -- not every issue in the loop.
+    untrusted_open_pr_by_issue: dict[int, list[int]] = {}
+    for _pr_number_str, _pr_entry in state_prs.items():
+        if not isinstance(_pr_entry, dict):
+            continue
+        try:
+            _tracked_pr_number = int(_pr_number_str)
+        except ValueError:
+            continue
+        if _tracked_pr_number in pr_numbers_on_github:
+            continue  # positively observed (open or closed) in this pass
+        _tracked_issue_number = _pr_entry.get("issue_number")
+        if _tracked_issue_number is None:
+            continue
+        if _pr_entry.get("status") in ("closed", "merged"):
+            continue
+        untrusted_open_pr_by_issue.setdefault(int(_tracked_issue_number), []).append(
+            _tracked_pr_number
+        )
+    # Issues whose issue_status_normalized None-outcome was deferred this
+    # pass because of the above -- reported once, after the loop, so the
+    # drift log names what was skipped instead of going silent (issue #859
+    # review comment 4).
+    issue_status_normalization_deferred: dict[int, list[int]] = {}
+
     for issue_number_str, entry in state_issues.items():
         if not isinstance(entry, dict):
             continue
@@ -1467,6 +1500,43 @@ def detect_drift(
             target_status: str | None = "closed"
         elif open_prs_by_issue.get(issue_number):
             target_status = PASSIVE_OPEN_STATUS
+        elif untrusted_open_pr_by_issue.get(issue_number):
+            # Issue #859 review: the first version of this fix gated on the
+            # GLOBAL `pr_snapshot_incomplete` flag, which is monotonic under
+            # `--state all` -- once total PR count crosses _LIST_LIMIT it is
+            # True on every future pass, forever, turning a `continue` here
+            # into a permanent repo-wide kill switch on issue_status_normalized
+            # (exactly what issue #857/#860 already fixed once, for the issue
+            # side of this same loop, in commit 09721d5: "the per-item lookup
+            # already fails safe ... the outer gate added nothing beyond
+            # that"). Rejected in review.
+            #
+            # This is the per-item replacement: `untrusted_open_pr_by_issue`
+            # (built above) is keyed on state.json's OWN PR record for this
+            # specific issue being both still-open (by state's bookkeeping)
+            # and absent from `prs` entirely -- not on the global truncation
+            # flag. A negative answer here is unreliable only for the issues
+            # this positively implicates; every other issue in the loop falls
+            # through to `target_status = None` exactly as before, regardless
+            # of whether the overall snapshot happens to be truncated.
+            #
+            # `target_status = None` is also the correct, legitimate outcome
+            # for an issue that is genuinely open with no PRs at all --
+            # state.json's own record is what tells the two cases apart here.
+            # Recovery for a deferred issue requires its tracked PR number to
+            # reappear in a future `prs` snapshot (or for state's PR record to
+            # itself converge to "closed"/"merged" via the sweeps above): that
+            # is guaranteed only while total PR count stays under
+            # _LIST_LIMIT. Above the cap, `--state all` is monotonic (closed
+            # PRs never leave it), so an old PR number that has permanently
+            # fallen out of the window makes this deferral permanent for that
+            # one issue too -- a narrower, self-contained blast radius than
+            # the rejected global gate, not a guarantee of eventual
+            # convergence.
+            issue_status_normalization_deferred[issue_number] = sorted(
+                untrusted_open_pr_by_issue[issue_number]
+            )
+            continue
         else:
             target_status = None
         if target_status == current_status:
@@ -1486,6 +1556,41 @@ def detect_drift(
                     f"(was {current_status!r})",
                 ),
                 new_status=target_status,
+            )
+        )
+
+    # Issue #859 review comment 4: name what was actually deferred rather than
+    # going silent. This fires only on passes where the per-item check above
+    # actually deferred at least one issue -- unlike the two blanket
+    # truncation warnings below, it is not tied to a global len(...) >=
+    # _LIST_LIMIT flag, so it stays proportionate to what really happened.
+    if issue_status_normalization_deferred:
+        logger.warning(
+            "issue_status_normalized deferred for %d issue(s) whose "
+            "state-tracked open PR(s) are absent from this pass's PR "
+            "snapshot: %s",
+            len(issue_status_normalization_deferred),
+            issue_status_normalization_deferred,
+        )
+        drift.append(
+            DriftItem(
+                kind="snapshot_truncated",
+                issue_number=None,
+                pr_number=None,
+                detail=(
+                    "issue_status_normalized deferred its None-outcome for "
+                    f"{len(issue_status_normalization_deferred)} issue(s) "
+                    f"{sorted(issue_status_normalization_deferred)}: state.json "
+                    "tracks an open PR for each that is absent from this "
+                    "pass's PR snapshot"
+                ),
+                fix_actions=(
+                    "issue_status_normalized skipped these issues' None-outcome "
+                    "rather than normalizing away a possibly-stale status; "
+                    "re-run once the tracked PR reappears in the snapshot or "
+                    "its state record converges to closed/merged",
+                    "see issue #859",
+                ),
             )
         )
 
