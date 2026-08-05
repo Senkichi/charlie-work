@@ -108,6 +108,15 @@ ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
         "dispatch_failed",
         "rework_requested",
         "reviewing",
+        # Issue #955: PASSIVE_OPEN_STATUS's own value (distinct from the
+        # active "reviewing" above). Both are "still in the open pipeline"
+        # -- this set answers "does this need repair convergence?", not "is
+        # a reviewer expected?", so the passive placeholder must stay a
+        # member or a passively-open entry stops converging when its PR
+        # closes unmerged (reconcile.py's closed_unmerged_pr_issue_state_
+        # converged) or its issue closes on GitHub (state_active_status_
+        # issue_closed).
+        "open_passive",
         "escalated",
     }
 )
@@ -784,9 +793,15 @@ def detect_drift(
             # e.g. a review packet generation crashed between creating the
             # entry and recording its first status -- is invisible to every
             # status-driven selector. Normalize it to the same passive
-            # "reviewing" placeholder issues get in the sibling sweep below;
-            # never invent a status for a PR the orchestrator never tracked
-            # (state_entry is None) since that may not be one of ours.
+            # PASSIVE_OPEN_STATUS placeholder issues get in the sibling sweep
+            # below; never invent a status for a PR the orchestrator never
+            # tracked (state_entry is None) since that may not be one of
+            # ours. Issue #955: this used to write the literal "reviewing"
+            # -- the same value ``review()`` writes when a reviewer really
+            # is coming -- which made the #487 stalled-review sweep
+            # (workflow.py) misidentify this placeholder as an undispatched
+            # review packet. PASSIVE_OPEN_STATUS is now a distinct value so
+            # this write can never collide with that sweep's target.
             if state_entry is not None and state_entry.get("status") is None:
                 drift.append(
                     DriftItem(
@@ -1893,13 +1908,14 @@ def apply_fixes(
 
         elif item.kind == "issue_active_label_with_open_pr":
             # Issue #515 (generalized): repair the stale/missing active label
-            # and mirror the fix into state as the passive "reviewing"
-            # placeholder -- the same status the normal dispatch->pr-open flow
-            # writes once a PR is open and no verdict has landed -- so
-            # state-driven dispatch_rework stops selecting the issue without
-            # falsely implying a review verdict was actually recorded (the
-            # previous "approved" write here was itself wrong: no reviewer
-            # ever ran).
+            # and mirror the fix into state as the PASSIVE_OPEN_STATUS
+            # placeholder -- so state-driven dispatch_rework stops selecting
+            # the issue without falsely implying a review verdict was
+            # actually recorded (the previous "approved" write here was
+            # itself wrong: no reviewer ever ran). Issue #955: this is a
+            # distinct value from the active "reviewing" ``review()`` writes
+            # once a PR is open and a review packet has actually been
+            # generated -- this self-heal never generates one.
             if item.issue_number is not None:
                 label_ok = True
                 for label in item.remove_labels:
@@ -1982,7 +1998,9 @@ def apply_fixes(
 
         elif item.kind == "pr_status_normalized":
             # A tracked PR record with no status field is normalized to the
-            # passive "reviewing" placeholder (item.new_status).
+            # PASSIVE_OPEN_STATUS placeholder (item.new_status). Issue #955:
+            # distinct from the active "reviewing" review() writes -- see
+            # detect_drift's matching comment above.
             if item.pr_number is not None and item.new_status is not None:
                 pr_key = str(item.pr_number)
                 existing_pr = new_prs.get(pr_key, {})

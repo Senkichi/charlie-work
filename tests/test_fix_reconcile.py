@@ -18,11 +18,23 @@ plain top-level import, same pattern ``test_reconcile.py`` itself uses for
 
 from __future__ import annotations
 
+import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
 import pytest
 
 from charlie_work.config import OrchestratorConfig
+from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.reconcile import apply_fixes, detect_drift
-from charlie_work.state import ORCHESTRATOR_OWNED_ISSUE_STATUSES, empty_state
+from charlie_work.state import (
+    ORCHESTRATOR_OWNED_ISSUE_STATUSES,
+    PASSIVE_OPEN_STATUS,
+    empty_state,
+    load_state,
+    save_state,
+)
+from charlie_work.workflow import _detect_and_handle_stalled_reviews
 
 from test_reconcile import FakeGitHub, _issue, _pr
 
@@ -51,7 +63,7 @@ def test_orphan_no_active_label_with_open_pr_is_drift() -> None:
     assert item.pr_number == 50
     assert item.remove_labels == ()
     assert item.add_labels == (config.labels.pr_open,)
-    assert item.new_status == "reviewing"
+    assert item.new_status == PASSIVE_OPEN_STATUS
 
 
 def test_orphan_no_active_label_with_open_pr_gets_label_and_status_repaired() -> None:
@@ -74,10 +86,10 @@ def test_orphan_no_active_label_with_open_pr_gets_label_and_status_repaired() ->
 
     assert (40, config.labels.pr_open) in gh.labels_added
     assert gh.labels_removed == []  # nothing to remove: no stale active label was present
-    # "reviewing" -- not "ready" and not "approved" -- is the passive status
-    # the normal dispatch->pr-open flow writes once a PR is open and no
-    # verdict has landed.
-    assert new_state["issues"]["40"]["status"] == "reviewing"
+    # PASSIVE_OPEN_STATUS -- not "ready" and not "approved" -- is the passive
+    # status this self-heal writes once a PR is open and no verdict has
+    # landed. Distinct from the active "reviewing" review() writes (#955).
+    assert new_state["issues"]["40"]["status"] == PASSIVE_OPEN_STATUS
 
 
 def test_corrupt_stub_status_normalized_on_closed_issue() -> None:
@@ -150,11 +162,11 @@ def test_reopened_issue_with_closed_state_status_and_open_pr_is_rederived() -> N
     ]
     assert len(drift) == 1
     assert drift[0].issue_number == 649
-    assert drift[0].new_status == "reviewing"  # PASSIVE_OPEN_STATUS
+    assert drift[0].new_status == PASSIVE_OPEN_STATUS
 
     new_state = apply_fixes(gh, state, drift, config)
 
-    assert new_state["issues"]["649"]["status"] == "reviewing"
+    assert new_state["issues"]["649"]["status"] == PASSIVE_OPEN_STATUS
 
 
 def test_both_closed_issue_is_unchanged_and_costs_no_extra_github_call() -> None:
@@ -250,12 +262,79 @@ def test_pr_status_normalized_when_tracked_pr_missing_status() -> None:
     ]
     assert len(drift) == 1
     assert drift[0].pr_number == 60
-    assert drift[0].new_status == "reviewing"
+    assert drift[0].new_status == PASSIVE_OPEN_STATUS
 
     new_state = apply_fixes(gh, state, drift, config)
 
-    assert new_state["prs"]["60"]["status"] == "reviewing"
+    assert new_state["prs"]["60"]["status"] == PASSIVE_OPEN_STATUS
     assert new_state["prs"]["60"]["issue_number"] == 45
+
+
+def test_pr_status_normalization_does_not_trip_stalled_review_sweep(
+    tmp_path: Path,
+) -> None:
+    """Issue #955 regression: ``pr_status_normalized`` used to write the
+    literal "reviewing" -- the identical value ``review()`` writes when a
+    reviewer really is coming -- into a tracked PR's status. workflow.py's
+    #487 stalled-review sweep (``_detect_and_handle_stalled_reviews``) keys
+    on exactly that pair (``status == "reviewing"`` and no
+    ``review_dispatch_status`` claim at all) to detect "a review packet was
+    generated but never dispatched", so it could not tell reconcile's
+    self-heal placeholder apart from a genuinely undispatched packet --
+    firing one spurious ``review_dispatch_stalled`` event per affected PR
+    (production: PR #951, per the issue).
+
+    Reproduces the real trigger shape: a ``prompt_path`` left behind by a
+    ``review()`` run that crashed before recording ``status`` (reconcile's
+    own comment on this drift kind), aged past the stale-claim timeout, so
+    the sweep's file/age gates are satisfied and only the status-string
+    comparison stands between it and a false positive.
+
+    Before the fix (PASSIVE_OPEN_STATUS == "reviewing"): the sweep's elif
+    branch matches and reaps a claim that was never made, emitting
+    ``review_dispatch_stalled``. After the fix, the two statuses are
+    distinct values and the sweep must not fire.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    reviews_dir = resolved_layout(config, tmp_path).reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_path = reviews_dir / "pr-100" / "review-prompt.md"
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text("packet", encoding="utf-8")
+    old_mtime = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(prompt_path, (old_mtime, old_mtime))
+
+    state = empty_state()
+    state["prs"]["100"] = {
+        "number": 100,
+        "issue_number": 10,
+        "prompt_path": str(prompt_path),
+        # no "status" key at all -- the crashed-before-first-status gap
+    }
+    save_state(paths.state_file, state)
+
+    gh = FakeGitHub(
+        prs=[_pr(100, "OPEN", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.pr_open])],
+    )
+    drift = [
+        item for item in detect_drift(gh, state, config) if item.kind == "pr_status_normalized"
+    ]
+    assert len(drift) == 1
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["100"]["status"] == PASSIVE_OPEN_STATUS
+    save_state(paths.state_file, new_state)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, paths.state_file, config, tmp_path / "repo")
+
+    final_state = load_state(paths.state_file)
+    assert final_state["prs"]["100"]["status"] == PASSIVE_OPEN_STATUS
+    assert final_state["prs"]["100"].get("review_dispatch_status") is None
+    assert not any(
+        event.get("kind") == "review_dispatch_stalled" for event in final_state.get("events", [])
+    )
 
 
 def test_valid_status_and_healthy_labels_produce_no_normalization_drift() -> None:

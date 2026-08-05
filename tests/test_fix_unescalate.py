@@ -130,7 +130,7 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
     assert result.data["changed"] is True
     state = load_state(app.paths.state_file)
     pr_entry = state["prs"]["456"]
-    assert pr_entry["status"] == PASSIVE_OPEN_STATUS == "reviewing"
+    assert pr_entry["status"] == PASSIVE_OPEN_STATUS
     assert pr_entry["review_dispatch_attempt_count"] == 0
     assert pr_entry["request_changes_count"] == 0
     for stale_field in (
