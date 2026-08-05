@@ -550,7 +550,7 @@ def _get_db(state_path: Path) -> sqlite3.Connection | None:
             with _db_init_lock:
                 _db_connections[key] = conn
             return conn
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, OSError) as exc:
             logger.warning("Failed to open event database at %s: %s", db_path, exc)
             return None
 

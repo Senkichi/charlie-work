@@ -1306,24 +1306,19 @@ def _record_lane_failure_event(
 ) -> None:
     """Durably record a lane-startup failure to the repo's own events.db (#6-G).
 
-    This is best-effort and must never escape: ``log_event`` already guards
-    its own sqlite calls, but the directory-creation call it makes before
-    that guard is not caught by that guard's exception type, so this wraps
-    the whole call in its own try/except. A failure to *record* a lane
-    failure must never itself break the per-repo isolation boundary this is
-    called from (D-4) — the caller has already logged the real error via
-    ``logger.exception`` regardless of what happens here.
+    ``log_event`` is best-effort and no longer raises on directory-creation
+    failures now that ``instrumentation._get_db`` catches ``OSError`` from
+    ``mkdir`` (#746). A failure to *record* a lane failure must never itself
+    break the per-repo isolation boundary this is called from (D-4) — the
+    caller has already logged the real error via ``logger.exception``.
     """
-    try:
-        state_path = _lane_failure_state_path(repo_root, entry)
-        log_event(
-            state_path,
-            "fleet_pass_config_error",
-            {"repo_key": repo_key, "error": error_message},
-            repo=repo_key,
-        )
-    except Exception:
-        logger.exception("Failed to record lane failure event for repo %s", repo_key)
+    state_path = _lane_failure_state_path(repo_root, entry)
+    log_event(
+        state_path,
+        "fleet_pass_config_error",
+        {"repo_key": repo_key, "error": error_message},
+        repo=repo_key,
+    )
 
 
 def fleet_loop(
@@ -2115,10 +2110,9 @@ def run_fleet_supervise(
 def _record_supervise_loop_cap_event(result: SuperviseLoopResult) -> None:
     """Best-effort fleet-level record that the relaunch bound refused a restart.
 
-    Same never-escape discipline as ``_record_lane_failure_event``: the whole
-    point of the cap is to exit cleanly so the scheduled task's tick regains
-    restart authority, and a failure to *record* that must not turn the clean
-    exit into a crash.
+    The whole point of the cap is to exit cleanly so the scheduled task's tick
+    regains restart authority, and a failure to *record* that must not turn the
+    clean exit into a crash.
     """
     try:
         state_path = layout.state_file_path(layout.default_state_root(orchestrator_root()))

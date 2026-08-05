@@ -168,6 +168,23 @@ def test_log_event_best_effort_no_crash(tmp_path: Path) -> None:
     log_event(state_path, "test", {})
 
 
+def test_log_event_swallows_mkdir_oserror(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#746: _get_db's mkdir() failure must be caught like sqlite errors.
+
+    If Path.mkdir raises an OSError (permissions, race, virtualized path),
+    log_event must remain best-effort and return without escaping.
+    """
+    state_path = tmp_path / "blocked_dir" / "state.json"
+
+    def _raising_mkdir(self, *args, **kwargs):
+        raise PermissionError("simulated directory-creation failure")
+
+    monkeypatch.setattr("pathlib.Path.mkdir", _raising_mkdir)
+
+    # Must not raise; best-effort logging should swallow the OSError.
+    log_event(state_path, "test_mkdir_blocked", {})
+
+
 def test_pr_number_extraction(tmp_path: Path) -> None:
     state_path = tmp_path / "state.json"
     log_event(state_path, "dispatch", {"pr_number": 42, "issue_number": 7})
