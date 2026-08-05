@@ -2051,6 +2051,50 @@ _LOOP_ERROR_MAX_PRS = 20
 _LOOP_ERROR_MAX_DETAILS = 5
 _LOOP_ERROR_DETAIL_CHARS = 300
 
+# Cap for the issue-number list in the ``rework_issue_fetch_skipped`` event.
+# A repo-wide gh outage can make every rework candidate's ``issue_view``
+# fail in one pass; the list is capped so one such pass cannot push an
+# unbounded payload through the 200-entry event ring.
+_REWORK_ISSUE_FETCH_SKIPPED_MAX_ISSUES = 20
+_REWORK_ISSUE_FETCH_SKIPPED_REASON_CHARS = 300
+
+
+def _build_rework_issue_fetch_skip_payload(
+    failures: list[tuple[int, Exception]],
+    *,
+    max_issue_numbers: int = _REWORK_ISSUE_FETCH_SKIPPED_MAX_ISSUES,
+    reason_chars: int = _REWORK_ISSUE_FETCH_SKIPPED_REASON_CHARS,
+) -> dict[str, Any]:
+    """Summarize per-issue ``gh.issue_view`` failures into a bounded payload.
+
+    ``rework_issue_fetch_skipped`` is intentionally one event per pass, not
+    one per issue, so a repo-wide ``gh`` outage does not emit N events for
+    the same root cause. The issue list is capped with an explicit
+    ``issue_numbers_truncated`` count so the record does not understate the
+    number of affected issues. The reason uses the first exception as a
+    representative root cause.
+    """
+    if not failures:
+        return {
+            "issue_numbers": [],
+            "issue_numbers_truncated": 0,
+            "reason": "",
+            "error_type": "",
+        }
+
+    issue_numbers = sorted({issue for issue, _ in failures})
+    representative = failures[0][1]
+    reason = str(representative) or representative.__class__.__name__
+    if len(reason) > reason_chars:
+        reason = reason[: reason_chars - 3] + "..."
+
+    return {
+        "issue_numbers": issue_numbers[:max_issue_numbers],
+        "issue_numbers_truncated": max(0, len(issue_numbers) - max_issue_numbers),
+        "reason": reason,
+        "error_type": representative.__class__.__name__,
+    }
+
 
 def summarize_loop_errors(
     errors: list[dict[str, Any]],
@@ -16511,7 +16555,11 @@ class OrchestratorApp:
         # rework_requested issue with no open PR is not a launch candidate
         # (the PR was closed-unmerged or never existed), so the per-issue
         # gh.issue_view fetch is skipped entirely.
-        rework_issues = []
+        import logging
+
+        logger = logging.getLogger(__name__)
+        rework_issues: list[dict[str, Any]] = []
+        failed_issue_fetches: list[tuple[int, Exception]] = []
         for number, entry in state.get("issues", {}).items():
             if not isinstance(entry, dict):
                 continue
@@ -16530,9 +16578,40 @@ class OrchestratorApp:
                 try:
                     full_issue = self.gh.issue_view(issue_number)
                     rework_issues.append(full_issue)
-                except GitHubError:
-                    # Skip issues that can't be fetched (deleted, etc.)
+                except GitHubError as exc:
+                    # Skip issues that can't be fetched (deleted, transient
+                    # outage, etc.), but record the degradation so a later
+                    # stall escalation has a reason (issue #939).
+                    failed_issue_fetches.append((issue_number, exc))
                     continue
+
+        if failed_issue_fetches:
+            payload = _build_rework_issue_fetch_skip_payload(failed_issue_fetches)
+            logger.warning(
+                "rework dispatch skipped fetching %d issue(s) this pass: %s",
+                len(failed_issue_fetches),
+                payload["reason"],
+            )
+            if not self.dry_run:
+                try:
+                    with state_lock(self.paths.state_file):
+                        event_state = load_state(self.paths.state_file)
+                        event_state = self._record_event(
+                            event_state,
+                            "rework_issue_fetch_skipped",
+                            payload,
+                        )
+                        save_state(self.paths.state_file, event_state)
+                except (OSError, ValueError, StateLockBusy) as write_exc:
+                    # StateLockBusy is a RuntimeError, so it is not covered by the
+                    # two above. Without it here the *diagnostic* write can abort
+                    # the pass it was only meant to describe: it would propagate to
+                    # dispatch_rework's own `except StateLockBusy`, which defers the
+                    # whole call and discards the legitimate candidates already
+                    # scanned. #939 asked for observation without a control-flow
+                    # change; letting a best-effort write decide the pass outcome
+                    # is exactly the control-flow change it ruled out.
+                    logger.warning("could not record rework_issue_fetch_skipped: %s", write_exc)
 
         rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
@@ -18229,7 +18308,12 @@ class OrchestratorApp:
                     {"reason": reason, "error_type": exc.__class__.__name__},
                 )
                 save_state(self.paths.state_file, state)
-        except (OSError, ValueError) as write_exc:  # pragma: no cover - defensive
+        except (OSError, ValueError, StateLockBusy) as write_exc:  # pragma: no cover
+            # StateLockBusy is a RuntimeError and so escapes the other two. This
+            # handler's whole promise is that recording a degraded pass never
+            # crashes it; contention on the state lock is the single most likely
+            # reason this write fails, so omitting it left the promise unmet in
+            # exactly its expected case.
             logger.warning("could not record unauthorized_merge_check_skipped: %s", write_exc)
 
     def _announce_unauthorized_merges(self, reported: list[dict[str, Any]]) -> None:

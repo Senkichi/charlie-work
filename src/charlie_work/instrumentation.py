@@ -188,6 +188,10 @@ _WARNING_KINDS = frozenset(
         # above. The paired "unauthorized_merge_detected" stays error, because
         # that one *is* an uncovered merge awaiting triage.
         "unauthorized_merge_check_skipped",
+        # Issue #939: a ``gh.issue_view`` failure during the rework-dispatch
+        # candidate scan is a handled degradation (the issue stays queued and
+        # is retried next pass), not an error.
+        "rework_issue_fetch_skipped",
         # Issue #873: the watchdog reaped a worker whose process was already
         # gone (WorkerHealth.DEAD). Split out of "session_stalled", which stays
         # an error and now means only the live-but-hung case. A vanished
