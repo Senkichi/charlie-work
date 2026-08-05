@@ -3163,10 +3163,18 @@ class WorktreeCleanResult:
     """Result of a ``clean_worktrees`` run.
 
     ``data`` carries ``planned``/``removed``/``skipped``/``failed`` (lists of
-    per-worktree dicts), ``orphans`` (planned/removed/failed orphan dirs),
-    ``venv_ok``/``venv_message``, and ``attention_events``. Kept as a dict
-    rather than further nested dataclasses since callers (``CommandResult``)
-    consume it as a JSON-able blob for CLI output.
+    per-worktree dicts, each ``skipped`` entry carrying a distinct ``reason``
+    string), ``orphans`` (planned/removed/failed orphan dirs),
+    ``venv_ok``/``venv_message``, ``attention_events``, and
+    ``worktrees_registered``/``worktrees_out_of_scope`` (total worktrees git
+    reports vs. how many were outside ``worktrees_dir`` or off the dispatch
+    branch prefix and so never became candidates at all -- issue #1012).
+    ``worktrees_out_of_scope`` has a floor of 1 in practice: the repo's own
+    main checkout is itself a ``git worktree list`` entry and is always
+    outside ``worktrees_dir``, so a bare count of 1 does not by itself mean
+    an operator-created worktree was found.
+    Kept as a dict rather than further nested dataclasses since callers
+    (``CommandResult``) consume it as a JSON-able blob for CLI output.
     """
 
     ok: bool
@@ -3279,13 +3287,21 @@ def clean_worktrees(
 
     registered_worktrees, list_error = _list_worktrees_porcelain(repo_root)
     worktree_list_failed = list_error is not None
+    # Worktrees git knows about that this sweep never even considers: outside
+    # `worktrees_dir`, or on a branch that doesn't carry the dispatch prefix
+    # (e.g. an operator-created worktree). These never reach `skipped` --
+    # counting them separately is what lets a durable payload distinguish
+    # "never a candidate" from "considered and skipped" (issue #1012).
+    out_of_scope = 0
     for wt in registered_worktrees:
         wt_path = wt.get("worktree")
         if not isinstance(wt_path, Path) or not contains(worktrees_dir, wt_path):
+            out_of_scope += 1
             continue
         raw_branch = str(wt.get("branch", ""))
         branch = raw_branch.removeprefix("refs/heads/")
         if not branch.startswith(config.dispatch.branch_prefix):
+            out_of_scope += 1
             continue
         issue_number = linked_issue_number(
             {"headRefName": branch},
@@ -3662,6 +3678,8 @@ def clean_worktrees(
         "venv_ok": venv_ok,
         "venv_message": venv_message,
         "attention_events": attention_events,
+        "worktrees_registered": len(registered_worktrees),
+        "worktrees_out_of_scope": out_of_scope,
     }
     ok = not failed and not orphans["failed"] and venv_ok and not worktree_list_failed
     if dry_run:

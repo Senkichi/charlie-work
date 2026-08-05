@@ -4587,6 +4587,57 @@ def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
     assert info.path.exists()
 
 
+def test_clean_worktrees_reports_registered_and_out_of_scope_counts(
+    tmp_path: Path,
+) -> None:
+    """Issue #1012: a worktree outside the dispatch branch prefix is never a
+    dispatch candidate at all -- it must count toward
+    ``worktrees_out_of_scope``, not silently vanish with zero accounting, so
+    a durable payload can distinguish "never a candidate" from "considered
+    and skipped"."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    _git(repo_root, "add", "src/charlie_work/__init__.py")
+    _git(repo_root, "commit", "-m", "add charlie_work")
+    _create_shared_venv(repo_root, pth_target=repo_root / "src")
+
+    # A real dispatch candidate that gets skipped for cause (dirty tree).
+    info = create_worktree(repo_root, "agent/issue-2-dirty", base_ref="HEAD")
+    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+    (info.path / "dirty_file.txt").write_text("local changes", encoding="utf-8")
+
+    # An operator-created worktree whose branch never matches the dispatch
+    # prefix -- this is the exact "never a candidate" shape from issue #1012's
+    # "How it surfaced" section.
+    create_worktree(repo_root, "operator/manual-fix", base_ref="HEAD")
+
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
+    state = _make_state(issue_number=2, pr_number=102)
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        state,
+        config,
+        _FakeGH(head_sha=head_sha),
+    )
+
+    assert result.ok is True
+    # `git worktree list` reports 3 entries: the repo's own main checkout,
+    # the dirty candidate, and the operator one. The main checkout is
+    # outside worktrees_dir and the operator worktree's branch is off the
+    # dispatch prefix, so 2 of the 3 registered worktrees never became
+    # candidates -- only the dirty one entered per-worktree eligibility
+    # logic and landed in `skipped`.
+    assert result.data["worktrees_registered"] == 3
+    assert result.data["worktrees_out_of_scope"] == 2
+    assert len(result.data["skipped"]) == 1
+    assert "uncommitted" in result.data["skipped"][0]["reason"]
+
+
 def test_clean_worktrees_ignores_injected_only_dirtiness(tmp_path: Path) -> None:
     """Issue #381: merged worktree with only injected prompt files dirty should be removed."""
     repo_root = tmp_path / "repo"
