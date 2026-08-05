@@ -298,22 +298,73 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def load_orchestrator_config(config_path: Path) -> dict[str, Any]:
-    """Load an orchestrator.config.yaml. Returns {} on any read/parse failure."""
+def load_orchestrator_config(config_path: Path) -> tuple[dict[str, Any], str | None]:
+    """Load an orchestrator.config.yaml.
+
+    Returns (config, error). error is None when the config is legitimately
+    absent -- including an unset config_path, which load_repos() represents
+    as Path("") (== Path("."), the "no config registered for this repo"
+    sentinel -- deliberately not treated as cwd-relative) -- or when the file
+    parses cleanly to a mapping. error is a message when config_path is set
+    and points at something that exists but fails to read, isn't valid UTF-8,
+    fails to parse as YAML, or parses to something other than a mapping.
+    That "present but broken" case (issue #703) must not be treated the same
+    as "absent" -- callers that need it surfaced use check_orchestrator_config
+    below rather than reading the error here.
+    """
+    if config_path == Path(""):
+        return {}, None
     try:
-        return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError):
-        return {}
+        if not config_path.exists():
+            return {}, None
+        raw = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {}, f"{config_path}: {exc}"
+    try:
+        data = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:
+        return {}, f"{config_path}: invalid YAML: {exc}"
+    if not isinstance(data, dict):
+        return {}, f"{config_path}: expected a mapping at top level, got {type(data).__name__}"
+    return data, None
 
 
 def get_mergequeue_label(config_path: Path) -> str | None:
-    return load_orchestrator_config(config_path).get("auto_merge", {}).get("mergequeue_label")
+    config, _error = load_orchestrator_config(config_path)
+    return config.get("auto_merge", {}).get("mergequeue_label")
 
 
 def get_dispatch_cap(config_path: Path) -> int | None:
     """Read dispatch.max_concurrent_sessions (per-repo concurrency cap), or None."""
-    cap = load_orchestrator_config(config_path).get("dispatch", {}).get("max_concurrent_sessions")
+    config, _error = load_orchestrator_config(config_path)
+    cap = config.get("dispatch", {}).get("max_concurrent_sessions")
     return cap if isinstance(cap, int) else None
+
+
+def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
+    """Surface a present-but-broken orchestrator.config.yaml as a loud anomaly.
+
+    get_mergequeue_label/get_dispatch_cap deliberately keep defaulting to
+    None/absent on a broken config so the checks that consume them (dispatch
+    cap, mergequeue label) degrade gracefully instead of raising. But that
+    means the read error itself would otherwise never reach any
+    operator-visible surface -- a signal without a consumer. This check is
+    the single dedicated reader of that error: it turns "config exists but
+    is corrupt/unreadable/malformed" into a loud report.anom (this script's
+    stdout/exit-code contract is the only channel an operator actually sees),
+    while "no config registered" and "config absent/valid" both stay quiet.
+    """
+    check = f"orchestrator-config {repo.slug}"
+    if repo.config_path == Path(""):
+        report.ok(check, "no config_path registered")
+        return
+    _config, error = load_orchestrator_config(repo.config_path)
+    if error:
+        report.anom(check, error)
+    elif repo.config_path.exists():
+        report.ok(check, f"{repo.config_path} readable")
+    else:
+        report.ok(check, f"{repo.config_path} not present (defaults apply)")
 
 
 # --------------------------------------------------------------------------
@@ -1629,6 +1680,7 @@ def main() -> int:
     for repo in repos:
         prev_repo_state = prev_state.get("repos", {}).get(repo.slug, {})
         new_repo_state: dict[str, Any] = {}
+        check_orchestrator_config(report, repo)
         check_dispatch_coverage(
             report,
             repo,
