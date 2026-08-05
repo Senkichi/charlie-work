@@ -17936,13 +17936,20 @@ class OrchestratorApp:
     def tripwire_status(self) -> CommandResult:
         """Report the live unauthorized-merge tripwire state without re-running detection.
 
-        The consumer for ``unauthorized_merge_detected`` (issue #933). Reading a
-        finding out of ``state.json`` is deliberately cheaper and safer than
-        re-detecting: it needs no ``gh`` call, so it works while the API is down
-        and cannot itself arm the baseline as a side effect.
+        The consumer for ``unauthorized_merge_detected`` (issue #933) and for
+        ``unauthorized_merge_check_skipped`` (issue #940). Reading a finding out of
+        ``state.json`` is deliberately cheaper and safer than re-detecting: it needs
+        no ``gh`` call, so it works while the API is down and cannot itself arm the
+        baseline as a side effect. The skip counts come from ``events.db``, which is
+        local SQLite and so preserves that property.
 
         Pending findings are the ones that are still pinning ``ok=False``:
         detected and not acknowledged.
+
+        The two halves answer different questions and both are needed: ``pending``
+        says whether the tripwire *found* anything, ``skipped_count`` says whether it
+        *ran*. A pass that failed open reports no findings, so without the second
+        number an unrun control is indistinguishable from a clean one.
         """
         state = load_state_locked(self.paths.state_file)
 
@@ -17975,6 +17982,36 @@ class OrchestratorApp:
                 )
             pending.append(entry)
 
+        # How often did the check fail open and not run at all (issue #940)? Without
+        # this the command answers "are there findings?" but not "did the control
+        # actually look?", and those differ precisely when it matters: a skipped pass
+        # reports no findings, so a blinded tripwire and a clean one are identical in
+        # every field above.
+        #
+        # Reading events.db here does not compromise the no-``gh`` property this method
+        # is built around -- it is local SQLite, so the command still works during an
+        # API outage. That is the point rather than a tolerated cost: a skip is *caused
+        # by* a GitHubError, so an operator running this during a gh outage is exactly
+        # the person who needs to know the tripwire has stopped looking.
+        #
+        # Bound the count by ``armed_at`` instead of a fixed lookback: it is real state
+        # rather than a constant needing revision, and skips recorded before arming say
+        # nothing about the armed control's coverage. ``skipped_window_start`` reports
+        # the bound actually used, so a caller never has to guess whether a count is
+        # since-arming or all-time.
+        armed_at = baseline.get("armed_at")
+        skipped_window_start = armed_at if isinstance(armed_at, str) and armed_at else None
+        skips = query_events(
+            self.paths.state_file,
+            kind="unauthorized_merge_check_skipped",
+            since=skipped_window_start,
+        )
+        last_skip = skips[-1] if skips else None
+        last_skip_payload = last_skip.get("payload") if isinstance(last_skip, dict) else None
+        last_skipped_reason = (
+            last_skip_payload.get("reason") if isinstance(last_skip_payload, dict) else None
+        )
+
         if not baseline:
             message = "unauthorized-merge tripwire is NOT ARMED (no baseline recorded yet)"
         elif pending:
@@ -17985,16 +18022,32 @@ class OrchestratorApp:
         else:
             message = "no pending unauthorized-merge findings"
 
+        if last_skip is not None:
+            # Appended rather than substituted: "no pending findings" stays true, and
+            # the whole problem is that it reads as "all clear" on its own.
+            # Conditioned on ``last_skip`` rather than ``skips`` -- equivalent, since one
+            # is the other's last element, but it narrows the subscript below instead of
+            # relying on a reader to re-derive that they cannot disagree.
+            window = f" since {skipped_window_start}" if skipped_window_start else ""
+            message += (
+                f" (warning: the check did not run on {len(skips)} pass(es){window}; "
+                f"most recent {last_skip['ts']})"
+            )
+
         return CommandResult(
             True,
             message,
             {
-                "armed_at": baseline.get("armed_at"),
+                "armed_at": armed_at,
                 "baselined_count": len(baseline.get("pre_existing_prs") or []),
                 "pending": pending,
                 "pending_count": len(pending),
                 "acknowledged_count": len(acked),
                 "detected_count": len(detected),
+                "skipped_count": len(skips),
+                "skipped_window_start": skipped_window_start,
+                "last_skipped_at": last_skip["ts"] if last_skip else None,
+                "last_skipped_reason": last_skipped_reason,
                 "state_file": str(self.paths.state_file),
             },
         )
