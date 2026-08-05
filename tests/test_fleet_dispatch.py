@@ -1603,6 +1603,54 @@ def test_count_fleet_runners_propagates_runtime_config(
     mock_gh_class.assert_called_once_with(repo_root=repo_root, runtime=runtime)
 
 
+@patch("charlie_work.fleet_registry._load_registry")
+@patch("charlie_work.fleet_registry.GitHub")
+def test_count_fleet_runners_skips_repo_on_unreadable_response(
+    mock_gh_class: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #756: a repo whose runner query is unreadable (gh.run raises
+    GitHubError, e.g. because github.py's own boundary fix now raises on
+    empty-stdout-success) must land in skipped_repos, not silently contribute
+    0 to total_runners/total_busy_runners.
+
+    Before the #756 fix, ``GitHub.run()`` could return a bare ``None`` for
+    this case, which ``runners_data.get(...) if runners_data else []``
+    coerced to "this repo has zero runners" -- feeding decide_autoscale() a
+    false reading that looks identical to a genuinely idle repo. The
+    surrounding ``except (GitHubError, Exception)`` here already routes any
+    raised exception to skipped_repos; this test proves that contract holds
+    end to end.
+    """
+    repo_root = tmp_path / "repo1"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(repo_root),
+                "config_path": str(repo_root / "orchestrator.config.yaml"),
+            }
+        }
+    }
+    mock_load_registry.return_value = registry
+
+    mock_gh = MagicMock()
+    mock_gh.run.side_effect = GitHubError(
+        "gh exited 0 with empty stdout for command: gh api ...; "
+        "cannot distinguish an empty result from an unreadable one"
+    )
+    mock_gh_class.return_value = mock_gh
+
+    total, busy, skipped = count_fleet_runners(str(tmp_path / "fleet"))
+
+    assert total == 0
+    assert busy == 0
+    assert skipped == ["owner/repo1"]
+
+
 def _drained_fleet_result() -> CommandResult:
     return CommandResult(
         True,

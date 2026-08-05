@@ -583,8 +583,11 @@ def test_merged_pr_list_raises_on_empty_stdout_not_silent_empty(
 ) -> None:
     """gh exiting 0 with empty stdout is an unusable response, not an empty page.
 
-    run() returns None for that case (github.py:284-285). A genuine empty page
-    comes back as the JSON array ``[]`` (a list). The previous idiom
+    As of issue #756, run() itself raises GitHubError for that case (the
+    ambiguous success-with-empty-stdout path). Before #756 it returned None,
+    which merged_pr_list's own isinstance check also raised on — this test
+    is unaffected by where the raise originates. A genuine empty page comes
+    back as the JSON array ``[]`` (a list). The previous idiom
     ``result if isinstance(result, list) else []`` coerced None to [] and
     silently broke the pagination loop, returning [] as though the repository
     had no merged PRs — indistinguishable from a successful empty fetch. This
@@ -596,7 +599,7 @@ def test_merged_pr_list_raises_on_empty_stdout_not_silent_empty(
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
-        # gh exits 0 with empty stdout — run() returns None.
+        # gh exits 0 with empty stdout — run() now raises GitHubError directly.
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
@@ -629,6 +632,115 @@ def test_merged_pr_list_empty_page_terminates_cleanly(monkeypatch, tmp_path: Pat
     result = gh.merged_pr_list()
 
     assert result == []
+
+
+def _empty_stdout_success(cmd: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+
+def test_run_raises_on_empty_stdout_success_not_none(monkeypatch, tmp_path: Path) -> None:
+    """Issue #756: gh exiting 0 with empty stdout under json_output=True and
+    allow_failure=False (the default) must raise GitHubError, not return None.
+
+    Callers throughout the codebase coerce a non-list/non-dict result with
+    ``result if isinstance(result, X) else DEFAULT`` -- a bare ``None`` return
+    silently reads as "the response was empty" (DEFAULT) rather than "the
+    response was unreadable". This is the boundary-level fix: GitHub.run()
+    itself no longer returns None for this ambiguous case.
+    """
+
+    def fake_run(cmd, *args, **kwargs):
+        return _empty_stdout_success(cmd)
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(github_module.GitHubError):
+        gh.run(["issue", "list", "--json", "number"], json_output=True)
+
+
+def test_run_returns_empty_list_for_genuine_empty_json_array(monkeypatch, tmp_path: Path) -> None:
+    """Positive control for test_run_raises_on_empty_stdout_success_not_none:
+    a genuinely empty result (stdout is the JSON array "[]", not empty stdout)
+    must still parse cleanly and must NOT raise."""
+
+    def fake_run(cmd, *args, **kwargs):
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.run(["issue", "list", "--json", "number"], json_output=True)
+
+    assert result == []
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("issue_list", ()),
+        ("pr_list", ()),
+        pytest.param("issue_view", (123,), id="issue_view"),
+        pytest.param("pr_view", (123,), id="pr_view"),
+        ("label_list", ()),
+    ],
+)
+def test_wrapper_method_raises_on_unreadable_empty_stdout(
+    monkeypatch, tmp_path: Path, method_name: str, args: tuple
+) -> None:
+    """Issue #756: issue_list/pr_list/issue_view/pr_view/label_list must not
+    silently coerce an unreadable (empty-stdout, gh exit 0) response to []/{}
+    -- that reads "I could not read GitHub" as "GitHub has zero items", which
+    is the exact bug this issue fixes. These wrapper methods rely on
+    GitHub.run() raising GitHubError for this case; this test proves the
+    raise actually propagates all the way out to the caller.
+    """
+
+    def fake_run(cmd, *a, **kwargs):
+        return _empty_stdout_success(cmd)
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    method = getattr(gh, method_name)
+    with pytest.raises(github_module.GitHubError):
+        method(*args)
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args", "empty_json_stdout", "expected"),
+    [
+        ("issue_list", (), "[]", []),
+        ("pr_list", (), "[]", []),
+        pytest.param("issue_view", (123,), "{}", {}, id="issue_view"),
+        pytest.param("pr_view", (123,), "{}", {}, id="pr_view"),
+        ("label_list", (), "[]", []),
+    ],
+)
+def test_wrapper_method_returns_empty_for_genuine_empty_json(
+    monkeypatch,
+    tmp_path: Path,
+    method_name: str,
+    args: tuple,
+    empty_json_stdout: str,
+    expected: object,
+) -> None:
+    """Positive control for test_wrapper_method_raises_on_unreadable_empty_stdout:
+    a genuinely empty JSON response ("[]" or "{}", not empty stdout) must still
+    return the empty container cleanly, without raising."""
+
+    def fake_run(cmd, *a, **kwargs):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout=empty_json_stdout, stderr=""
+        )
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    method = getattr(gh, method_name)
+    result = method(*args)
+
+    assert result == expected
 
 
 def test_merged_prs_for_issue_returns_bound_pr_without_graphql_budget_check(
