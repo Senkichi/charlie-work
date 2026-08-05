@@ -28071,6 +28071,179 @@ def test_fleet_concurrency_governor_result_report_fields_includes_fleet() -> Non
     assert "fleet_live_session_count" not in fields_unlimited
 
 
+def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1005: a dispatch pass clamped to zero by the concurrency governor
+    must be distinguishable, from events.db alone, from a pass with an empty
+    backlog.
+
+    Before the fix: (a) the automatic (non-``--issues``) selection path
+    unconditionally reported ``deferred_by_concurrency=[]`` even though
+    candidates existed and were dropped by the clamp, and (b) the governor's
+    own numbers (``report_fields()``) were merged into ``CommandResult.data``
+    but never into the persisted ``dispatch`` event -- so ``events.db`` carried
+    no capacity axis at all. Both defects are exercised here on the automatic
+    path, which the existing ``--issues``-only governor tests do not cover.
+
+    Three scenarios, each pinning a distinct acceptance criterion:
+
+    1. Repo-cap clamp with 8 candidates -- proves truncation
+       (``_MAX_DEFERRED_CONCURRENCY_EXAMPLES=5``) actually engages, and that
+       the bounded ``failures`` map (built from the same truncated list) does
+       not silently grow unbounded even though 8 issues were deferred.
+    2. The *same* clamped governor config against a genuinely empty backlog --
+       proves the forensic case that actually matters: two passes that are
+       BOTH ``clamped=True`` are still distinguishable via
+       ``deferred_by_concurrency_count``. (Clamped-vs-disabled would let
+       ``clamped`` alone do the discriminating, which is a weaker claim.)
+    3. A fleet-only-binding clamp -- repo governor recomputes
+       ``available_slots=1`` (nonzero!) while the fleet cap independently
+       zeroes ``dispatch_limit``. Confirms ``dispatch_limit`` -- not
+       ``available_slots`` -- is the field that states the effective limit
+       was zero, and that ``fleet_concurrency_limit``/``fleet_live_session_count``
+       are present to identify which cap bound.
+    """
+
+    def mock_count_live_one(sessions_dir, state_file=None):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class SaturatedGitHub(FakeGitHub):
+        def __init__(self, count: int) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 201 + i,
+                    "title": f"Fix {i}",
+                    "url": f"https://example.test/issues/{201 + i}",
+                    "body": "backlog issue",
+                    "labels": [{"name": "automated-ready"}],
+                    "state": "OPEN",
+                }
+                for i in range(count)
+            ]
+            self.prs = []
+
+    # --- Scenario 1: repo-cap clamp, 8 candidates, truncation engaged -----
+    fake_gh = SaturatedGitHub(8)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Governor: max_concurrent_sessions=1, one session already live -> 0
+    # available slots. dispatch_limit is clamped to 0 even though 8 issues
+    # are dispatchable (mirrors the live incident: N dispatchable, 0
+    # dispatched, fleet/repo at cap).
+    result = app.dispatch()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["concurrency_limit"] == 1
+    assert result.data["live_session_count"] == 1
+    assert result.data["available_slots"] == 0
+
+    # Defect 2: the automatic path must populate deferred_by_concurrency, not
+    # report it as unconditionally empty. Truncated to the first 5 by number,
+    # with the untruncated total carried separately.
+    assert result.data["deferred_by_concurrency"] == [201, 202, 203, 204, 205]
+    assert result.data["deferred_by_concurrency_count"] == 8
+    # The bounded failures map mirrors the truncated list exactly -- it must
+    # not independently carry all 8 (that would defeat the truncation and
+    # would also desync from _extract_attention_events' exclusion set, which
+    # cross-references this same deferred_by_concurrency field).
+    assert sorted(result.data["failures"].keys()) == [201, 202, 203, 204, 205]
+
+    # Defect 1: the persisted event -- not just the transient CommandResult.data
+    # -- must carry the governor's decision.
+    events = query_events(paths.state_file, kind="dispatch")
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["deferred_by_concurrency"] == [201, 202, 203, 204, 205]
+    assert payload["deferred_by_concurrency_count"] == 8
+    assert payload["concurrency_governor"] == {
+        "clamped": True,
+        "dispatch_limit": 0,
+        "concurrency_limit": 1,
+        "live_session_count": 1,
+        "available_slots": 0,
+    }
+
+    # --- Scenario 2: same clamped config, genuinely empty backlog ---------
+    # Machine-checkable differentiation (acceptance criterion): two passes
+    # that are BOTH clamped must still be distinguishable from events.db
+    # alone. Reusing the identical governor config (not a disabled one) means
+    # `clamped` is True in both payloads -- deferred_by_concurrency_count is
+    # the field that actually separates "nothing to dispatch" from "nothing
+    # COULD be dispatched", which is the realistic forensic question.
+    empty_gh = SaturatedGitHub(0)
+    empty_app = OrchestratorApp(tmp_path, paths, config, empty_gh)
+    empty_result = empty_app.dispatch()
+    assert empty_result.data["selected_count"] == 0
+    empty_events = query_events(paths.state_file, kind="dispatch")
+    empty_payload = empty_events[-1]["payload"]
+    assert empty_payload["concurrency_governor"]["clamped"] is True
+    assert empty_payload["deferred_by_concurrency_count"] == 0
+    assert empty_payload["deferred_by_concurrency"] == []
+    assert empty_payload["concurrency_governor"] == payload["concurrency_governor"]
+    assert (
+        empty_payload["deferred_by_concurrency_count"] != payload["deferred_by_concurrency_count"]
+    )
+
+    # --- Scenario 3: fleet-only-binding clamp ------------------------------
+    # Repo governor recomputes available_slots=1 (nonzero: 2 - 1 live), but
+    # the fleet cap independently saturates and drives dispatch_limit to 0.
+    # available_slots alone would misleadingly suggest a slot was open.
+    def mock_count_live_one_of_two(sessions_dir, state_file=None):
+        return 1
+
+    def mock_count_fleet_live_saturated(fleet_dir_override):
+        return 3, []
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one_of_two)
+    monkeypatch.setattr(
+        "charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live_saturated
+    )
+
+    fleet_config = OrchestratorConfig(
+        fleet=FleetConfig(global_max_concurrent_sessions=3),
+        dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    fleet_gh = SaturatedGitHub(3)
+    fleet_app = OrchestratorApp(
+        tmp_path,
+        paths,
+        fleet_config,
+        fleet_gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+    fleet_result = fleet_app.dispatch()
+
+    assert fleet_result.ok is True
+    assert fleet_result.data["selected_count"] == 0
+    assert fleet_result.data["available_slots"] == 1
+    assert fleet_result.data["fleet_concurrency_limit"] == 3
+    assert fleet_result.data["fleet_live_session_count"] == 3
+
+    fleet_events = query_events(paths.state_file, kind="dispatch")
+    fleet_payload = fleet_events[-1]["payload"]
+    assert fleet_payload["concurrency_governor"] == {
+        "clamped": True,
+        "dispatch_limit": 0,
+        "concurrency_limit": 2,
+        "live_session_count": 1,
+        "available_slots": 1,
+        "fleet_concurrency_limit": 3,
+        "fleet_live_session_count": 3,
+    }
+
+
 def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypatch) -> None:
     """count_fleet_live_sessions should skip repos that no longer exist and report them."""
     from charlie_work.fleet_registry import count_fleet_live_sessions
