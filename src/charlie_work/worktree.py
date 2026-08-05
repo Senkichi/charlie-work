@@ -1041,6 +1041,36 @@ def _worker_authored_dirty(
     return False
 
 
+def _is_confirmed_missing_ref(result: RunResult) -> bool:
+    """True only when ``git rev-parse --verify -q <ref>`` ran to completion and
+    definitively reported that ``<ref>`` does not resolve to a single
+    revision (unborn ``HEAD`` in an empty repo, or a branch/tag/sha that does
+    not exist) -- the one non-``ok`` outcome where "nothing to lose" is a
+    sound conclusion.
+
+    This is an allow-list on git's exit code, not a deny-list on failure
+    reasons: with ``-q``/``--quiet``, git reserves exit code 1 exclusively
+    for "the given ref does not resolve" and suppresses the fatal message
+    entirely (confirmed against git 2.45 for an empty repo's unborn ``HEAD``
+    and for a missing branch name -- both produce ``returncode=1`` with empty
+    stdout/stderr). Any other non-zero outcome -- ``returncode=128`` (not a
+    git repository, corrupted refs, permissions error), a git binary missing
+    from PATH entirely (``RunResult.error`` set, ``returncode is None``), or
+    the probe timing out -- fails this check and is therefore treated as a
+    probe failure by the caller, not as a confirmed-absent ref.
+
+    Exit code, not a stderr string match, is the discriminator on purpose:
+    git's fatal messages are locale-translatable, so matching on message text
+    would silently stop working (fail closed forever, not loudly) on a host
+    with a non-English git locale. The exit-code contract for ``--verify -q``
+    is part of git's documented plumbing behavior and does not vary with
+    locale. This is the safe default either way: we only ever fail OPEN
+    (report "nothing to lose") on a positive match, never on the absence of
+    one.
+    """
+    return not result.timed_out and result.returncode == 1
+
+
 def _worktree_refuse_to_reset_reason(
     repo_root: Path,
     branch: str,
@@ -1062,30 +1092,49 @@ def _worktree_refuse_to_reset_reason(
     local branch has commits beyond ``base_ref``.
 
     Raises:
-        WorktreeProbeFailedError: if a probe (``git status --porcelain`` or
-            ``git ls-remote``) itself fails. The reset is still refused (we cannot
-            confirm the worktree is clean), but this is classified distinctly from
-            a confirmed-dirty worktree — see the class docstring for why callers
-            must not conflate the two under the same ``failure_kind``.
+        WorktreeProbeFailedError: if a probe (``git status --porcelain``,
+            ``git rev-parse --verify`` on the local tip, or ``git ls-remote``)
+            itself fails. The reset is still refused (we cannot confirm the
+            worktree is clean), but this is classified distinctly from a
+            confirmed-dirty worktree — see the class docstring for why callers
+            must not conflate the two under the same ``failure_kind``. The
+            local-tip ``rev-parse --verify`` only counts as "nothing to lose"
+            (returns ``None``) when it confirms the ref is genuinely absent —
+            see ``_is_confirmed_missing_ref``; any other failure (index lock,
+            AV-held handle, timeout, missing git binary) refuses instead.
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
         if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
             return "worktree has uncommitted modifications"
         local_tip_result = run_captured(
-            ["git", "rev-parse", "--verify", "HEAD"],
+            ["git", "rev-parse", "--verify", "-q", "HEAD"],
             cwd=worktree_path,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
     else:
         local_tip_result = run_captured(
-            ["git", "rev-parse", "--verify", branch],
+            ["git", "rev-parse", "--verify", "-q", branch],
             cwd=repo_root,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         )
 
-    if not local_tip_result.ok or not local_tip_result.stdout.strip():
-        # No branch or no commit; nothing to lose.
+    if not local_tip_result.ok:
+        if _is_confirmed_missing_ref(local_tip_result):
+            # Confirmed: no branch or no commit exists to lose.
+            return None
+        detail = local_tip_result.error or local_tip_result.stderr.strip() or "unknown error"
+        raise WorktreeProbeFailedError(
+            f"git rev-parse --verify local-tip probe failed (not a confirmed-"
+            f"missing ref): {detail}"
+        )
+
+    if not local_tip_result.stdout.strip():
+        # `rev-parse --verify` succeeded (exit 0) but produced no sha. Not
+        # reachable in practice -- a successful verify always prints the
+        # resolved revision -- but if it ever happens, git did not error at
+        # all, so there is no ambiguity to fail closed on: no sha means
+        # nothing to compare against, so nothing to lose.
         return None
 
     local_sha = local_tip_result.stdout.strip()
