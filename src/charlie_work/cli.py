@@ -1848,7 +1848,11 @@ def _render_backlog_reachability(reachability: Any) -> str:
         return "  [backlog not observed]"
 
     notes: list[str] = []
-    if not reachability.get("consistent", True):
+    # `is False` deliberately, not falsiness: `consistent` is tri-state and
+    # None means the cross-check never ran. Neither "passed" nor "failed" is
+    # an honest rendering of that, and it cannot reach here anyway -- the
+    # unobserved path returns above.
+    if reachability.get("consistent") is False:
         notes.append("INCONSISTENT backlog fetch (missing ready-labelled issues)")
 
     open_total = int(reachability.get("open_total") or 0)

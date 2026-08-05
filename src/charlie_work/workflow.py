@@ -3319,12 +3319,21 @@ def classify_backlog_reachability(
 
     ``ready_open_count`` is an optional cross-check: the unfiltered open list
     must be a superset of the ready-labelled open issues the caller already
-    fetched. If it is not, the unfiltered fetch is unreliable and
-    ``consistent`` is False.
+    fetched. ``consistent`` is tri-state -- None when the check did not run,
+    True when it ran and passed, False when the unfiltered fetch is missing
+    issues the caller already saw. It is never True by default, because a
+    reassuring value standing in for an unrun check is this bug wearing a
+    different field name.
     """
     reachability: dict[str, Any] = {
         "observed": False,
-        "consistent": True,
+        # Tri-state, and deliberately not defaulted to True: None means the
+        # cross-check did not RUN (the fetch failed, or the caller supplied no
+        # ``ready_open_count``), True means it ran and passed, False means it
+        # ran and failed. Defaulting an unverified claim to "verified" would be
+        # the exact defect this function exists to catch, one field over -- a
+        # healthy-looking default standing in for an unknown state.
+        "consistent": None,
         "open_total": 0,
         "dispatchable": 0,
         "missing_ready": 0,
@@ -3370,10 +3379,14 @@ def classify_backlog_reachability(
     reachability["observed"] = True
     reachability["open_total"] = len(issues)
     reachability["unreachable_examples"] = {k: sorted(v) for k, v in sorted(examples.items())}
-    if ready_open_count is not None and ready_seen < ready_open_count:
-        # The unfiltered list is missing issues the caller already saw with the
-        # ready label, so it cannot be a superset -- the fetch is unreliable.
-        reachability["consistent"] = False
+    if ready_open_count is not None:
+        # The unfiltered list must be a superset of the ready-labelled OPEN
+        # issues the caller already fetched. If it is missing some, it cannot
+        # be a superset and the fetch is unreliable. One-directional by
+        # design: a failure of the *filtered* query yields ready_open_count=0
+        # and passes here, but that case is loud elsewhere (a non-zero
+        # dispatchable count alongside a dispatch of nothing).
+        reachability["consistent"] = ready_seen >= ready_open_count
     return reachability
 
 
@@ -6123,6 +6136,14 @@ class OrchestratorApp:
             # so "0 ready issues" and "0 issues at all" print identically. This
             # is the unfiltered view: how big the backlog really is and which
             # gate is rejecting it.
+            # len(issues) with no OPEN filter is correct HERE and would be a bug
+            # in _dispatch_impl: this method's query (above) is
+            # issue_list(labels.ready) with no state, and GitHubClient defaults
+            # to state="open" (github.py: `effective_state = state or "open"`),
+            # so `issues` is already open-only. _dispatch_impl passes
+            # state="all" and must therefore count OPEN itself, or closed
+            # ready-labelled issues would inflate the count and report
+            # consistent=False on every healthy pass.
             "backlog_reachability": classify_backlog_reachability(
                 self.gh,
                 self.config,
