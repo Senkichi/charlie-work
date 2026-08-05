@@ -14,6 +14,7 @@ call graph instead, which fails closed.
 from __future__ import annotations
 
 import ast
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -386,3 +387,35 @@ def test_escalate_issue_helper_sets_issue_and_pr_reason() -> None:
     assert pr["decision"] == "request_changes"
     # PRs do not carry reason_class; only the issue record does.
     assert "reason_class" not in pr
+
+
+def test_escalate_issue_helper_stamps_terminal_since() -> None:
+    """Issue #947: every escalation stamps ``terminal_since`` so a periodic
+    sweep can alert on an issue parked in ``agent:human-needed`` past a
+    configurable age -- without this the state a human-needed issue silently
+    invisible."""
+    state: dict[str, Any] = {"issues": {"1": {"number": 1}}, "prs": {}}
+
+    before = datetime.now(UTC)
+    state = _escalate_issue(state, 1, reason="test_reason", reason_class="mechanical")
+    after = datetime.now(UTC)
+
+    stamped = state["issues"]["1"]["terminal_since"]
+    parsed = datetime.fromisoformat(stamped.replace("Z", "+00:00"))
+    # utc_now() truncates to whole seconds, so `parsed` can trail `before` by
+    # up to (just under) one second -- allow that rounding slack on both ends.
+    assert before - timedelta(seconds=1) <= parsed <= after + timedelta(seconds=1)
+
+
+def test_escalate_issue_helper_refreshes_terminal_since_on_reescalation() -> None:
+    """A re-escalation after a prior terminal episode is a fresh episode, not
+    a continuation -- ``terminal_since`` must move forward, not be preserved
+    from the stale prior value."""
+    state: dict[str, Any] = {
+        "issues": {"1": {"number": 1, "terminal_since": "2020-01-01T00:00:00Z"}},
+        "prs": {},
+    }
+
+    state = _escalate_issue(state, 1, reason="test_reason", reason_class="judgment")
+
+    assert state["issues"]["1"]["terminal_since"] != "2020-01-01T00:00:00Z"

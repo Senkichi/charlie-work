@@ -389,6 +389,16 @@ class ReconcilePassConfig:
     # still comfortably beats "only ever runs when an operator remembers to
     # run mop-up".
     interval_minutes: int = 30
+    # Issue #947: ``agent:human-needed`` is a forced terminal state with no
+    # other alerting -- an issue parked there (e.g. #894) is silently
+    # invisible until an operator happens to look. detect_drift() reports any
+    # OPEN issue that has carried the label at least this many days as
+    # ``terminal_state_stale`` on every pass it stays that way (repeated
+    # firing while true, matching the existing ``aviator_stale_blocked`` /
+    # ``mergequeue_revoked`` alert-only kinds -- no dedup marker). 2 days
+    # balances catching a genuinely stuck issue against not paging on every
+    # escalation that clears same-day via ``charlie unescalate``.
+    terminal_state_alert_days: int = 2
 
 
 @dataclass(frozen=True)
@@ -1760,6 +1770,19 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if rp_interval is not None and rp_interval < 1:
         raise ConfigError(
             f"config section 'reconcile_pass' key 'interval_minutes' must be >= 1, got {rp_interval}"
+        )
+    rp_alert_days = reconcile_pass_data.get("terminal_state_alert_days")
+    if rp_alert_days is not None and (
+        isinstance(rp_alert_days, bool) or not isinstance(rp_alert_days, int)
+    ):
+        raise ConfigError(
+            "config section 'reconcile_pass' key 'terminal_state_alert_days' must be an int, "
+            f"got {type(rp_alert_days).__name__}"
+        )
+    if rp_alert_days is not None and rp_alert_days < 1:
+        raise ConfigError(
+            "config section 'reconcile_pass' key 'terminal_state_alert_days' must be >= 1, "
+            f"got {rp_alert_days}"
         )
     reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
     auto_merge_data = _section(data, "auto_merge")

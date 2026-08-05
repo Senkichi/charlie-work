@@ -441,6 +441,178 @@ def test_detect_drift_finds_done_label_with_active_labels(tmp_path: Path) -> Non
     assert matches[0].remove_labels == (config.labels.reviewing,)
 
 
+# --- issue #947: agent:human-needed silently invisible past a configurable age ---
+
+
+def test_detect_drift_finds_terminal_state_stale_via_terminal_since(tmp_path: Path) -> None:
+    """A `terminal_since` stamp (written by `_escalate_issue` since #947) past
+    the configured threshold fires `terminal_state_stale` with the parked
+    issue's number and a numeric age, not merely "some event fired"."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(894, [config.labels.human_needed])])
+    state = empty_state()
+    now = datetime(2026, 1, 10, tzinfo=UTC)
+    state["issues"]["894"] = {
+        "number": 894,
+        "status": "escalated",
+        "terminal_since": "2026-01-05T00:00:00Z",  # 5 days before `now`
+    }
+
+    drift = detect_drift(gh, state, config, now=now)
+
+    matches = [item for item in drift if item.kind == "terminal_state_stale"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 894
+    assert "5.0 day" in matches[0].detail
+    assert matches[0].fix_actions == ()
+
+
+def test_detect_drift_terminal_state_stale_not_yet_due(tmp_path: Path) -> None:
+    """A fresh escalation (age below the configured threshold) must not fire
+    -- this is the negative control for the positive case above."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(895, [config.labels.human_needed])])
+    state = empty_state()
+    now = datetime(2026, 1, 10, 1, 0, 0, tzinfo=UTC)
+    state["issues"]["895"] = {
+        "number": 895,
+        "status": "escalated",
+        "terminal_since": "2026-01-10T00:00:00Z",  # 1 hour before `now`
+    }
+
+    drift = detect_drift(gh, state, config, now=now)
+
+    assert [item for item in drift if item.kind == "terminal_state_stale"] == []
+
+
+def test_detect_drift_terminal_state_stale_legacy_escalation_via_events_db(
+    tmp_path: Path,
+) -> None:
+    """Issue #894 shape: an issue escalated BEFORE #947 shipped carries no
+    `terminal_since` field at all. The detector must still report a real
+    numeric age (not "never observed") by falling back to the most recent
+    escalation-transition event in events.db -- the same CI-verified kind
+    registry `_backfill_missing_reason_classes` already relies on. Without
+    this fallback tier the original design silently degraded #894 itself to
+    the "never observed" bucket, which is the exact bug this PR fixes."""
+    from charlie_work.instrumentation import log_event
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(894, [config.labels.human_needed])])
+    state = empty_state()
+    # Deliberately no terminal_since / merged_pr_mention_flagged_at: this is
+    # the legacy (pre-#947) shape.
+    state["issues"]["894"] = {"number": 894, "status": "escalated"}
+
+    state_path = tmp_path / ".var" / "charlie-work" / "state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    log_event(state_path, "session_failed_escalated", {"issue_number": 894}, repo="test-repo")
+
+    now = datetime.now(UTC) + timedelta(days=5)
+    drift = detect_drift(gh, state, config, state_path=state_path, now=now)
+
+    matches = [item for item in drift if item.kind == "terminal_state_stale"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 894
+    assert "never observed" not in matches[0].detail
+    assert "4." in matches[0].detail or "5." in matches[0].detail
+
+
+def test_detect_drift_terminal_state_stale_events_db_ignores_non_escalation_kinds(
+    tmp_path: Path,
+) -> None:
+    """A non-escalation event for the issue (e.g. a routine dispatch record)
+    must NOT be mistaken for an escalation-transition timestamp -- proves the
+    events.db fallback filters by the CI-verified escalation-kind registry,
+    not "any event for this issue_number"."""
+    from charlie_work.instrumentation import log_event
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(898, [config.labels.human_needed])])
+    state = empty_state()
+    state["issues"]["898"] = {"number": 898, "status": "escalated"}
+
+    state_path = tmp_path / ".var" / "charlie-work" / "state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    # "dispatch" is not an escalation-transition kind: it neither ends in
+    # "_escalated" nor is registered in ESCALATION_REASON_CLASS_BY_EVENT_KIND
+    # / DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS.
+    log_event(state_path, "dispatch", {"issue_number": 898}, repo="test-repo")
+
+    drift = detect_drift(gh, state, config, state_path=state_path)
+
+    matches = [item for item in drift if item.kind == "terminal_state_stale"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 898
+    assert "never observed" in matches[0].detail
+
+
+def test_detect_drift_terminal_state_stale_never_observed_without_any_timestamp(
+    tmp_path: Path,
+) -> None:
+    """No `terminal_since`, no `merged_pr_mention_flagged_at`, and no
+    matching events.db row (or no `state_path` at all): the detector must
+    still surface the issue immediately, distinctly labeled "never observed"
+    rather than silently defaulting an unknown age to "healthy" -- mirroring
+    `classify_backlog_reachability`'s `observed: False` precedent."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(896, [config.labels.human_needed])])
+    state = empty_state()
+    state["issues"]["896"] = {"number": 896, "status": "escalated"}
+
+    drift = detect_drift(gh, state, config)  # No state_path passed at all.
+
+    matches = [item for item in drift if item.kind == "terminal_state_stale"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 896
+    assert "never observed" in matches[0].detail
+
+
+def test_detect_drift_terminal_state_stale_ignores_done_label() -> None:
+    """`agent:done` is a normal, expected terminal state (issue closed via
+    the ordinary lifecycle) -- it must never be treated as a stuck
+    human-needed issue, even though both are members of `labels.terminal`."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(897, [config.labels.done])])
+    state = empty_state()
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "terminal_state_stale"] == []
+
+
+def test_apply_fixes_terminal_state_stale_emits_reconcile_event_with_content() -> None:
+    """The generic unfixable-kind fallback in `apply_fixes` (precedented by
+    `snapshot_truncated`/`escalated_labels_converged`) must emit a
+    `"reconcile"` event whose payload carries the specific kind and the
+    parked issue's number -- asserting on content, not just that some event
+    fired."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    drift = [
+        DriftItem(
+            kind="terminal_state_stale",
+            issue_number=894,
+            pr_number=None,
+            detail="issue #894 has been parked in 'agent:human-needed' for 5.0 day(s)",
+            fix_actions=(),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    events = [e for e in new_state["events"] if e.get("kind") == "reconcile"]
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["kind"] == "terminal_state_stale"
+    assert payload["issue_number"] == 894
+    assert "5.0 day" in payload["detail"]
+    # No GitHub label mutation for an alert-only kind.
+    assert gh.labels_added == []
+    assert gh.labels_removed == []
+
+
 def test_apply_fixes_returns_new_state_without_mutating_original() -> None:
     config = OrchestratorConfig()
     gh = FakeGitHub(prs=[], issues=[])

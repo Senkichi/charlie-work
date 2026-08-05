@@ -304,6 +304,43 @@ def test_load_config_quota_probe_interval_minutes_rejects_non_int(tmp_path: Path
         load_config(config_file)
 
 
+def test_load_config_reconcile_pass_terminal_state_alert_days_default() -> None:
+    """Issue #947: defaults to 2 days so a stuck human_needed issue is
+    caught quickly without paging on same-day escalate/unescalate cycles."""
+    config = load_config(Path("nonexistent.yaml"))
+    assert config.reconcile_pass.terminal_state_alert_days == 2
+
+
+def test_load_config_reconcile_pass_terminal_state_alert_days_override(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "reconcile_pass:\n  terminal_state_alert_days: 5\n")
+    config = load_config(config_file)
+    assert config.reconcile_pass.terminal_state_alert_days == 5
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_load_config_reconcile_pass_terminal_state_alert_days_rejects_non_positive(
+    tmp_path: Path, value: int
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, f"reconcile_pass:\n  terminal_state_alert_days: {value}\n")
+    with pytest.raises(
+        ConfigError, match="reconcile_pass.*terminal_state_alert_days.*must be >= 1"
+    ):
+        load_config(config_file)
+
+
+def test_load_config_reconcile_pass_terminal_state_alert_days_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "reconcile_pass:\n  terminal_state_alert_days: '2'\n")
+    with pytest.raises(
+        ConfigError, match="reconcile_pass.*terminal_state_alert_days.*must be an int"
+    ):
+        load_config(config_file)
+
+
 def test_load_config_quota_probe_model_rejects_empty(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "quota_probe:\n  model: '   '\n")
