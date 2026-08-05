@@ -15893,9 +15893,11 @@ class OrchestratorApp:
         already threads ``state_path`` so ``apply_fixes`` emits one
         ``"reconcile"`` event per repaired drift item for free -- see
         ``reconcile.py``). It also owns the safety invariant this
-        workstream exists to preserve: reconcile only ever converges labels
-        *from* state, never the reverse -- an escalated issue's ``status``
-        is never rewritten (D-2). This method does not touch ``status``.
+        workstream exists to preserve: an escalated issue's ``status`` is
+        never rewritten (D-2), and reconcile never rewrites ``status`` to an
+        active dispatch/rework value. Any status writes it does make are to
+        terminal or passive values (``closed``, ``merged``, ``open_passive``)
+        or to clear a stale/missing key. This method does not touch ``status``.
 
         Calls with ``skip_dead_session_sweep=True``: this pass already ran
         the loop's own stall/dead lanes (``_detect_and_handle_stalled_sessions``

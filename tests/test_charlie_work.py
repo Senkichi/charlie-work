@@ -31023,8 +31023,9 @@ def test_loop_corrects_escalated_label_divergence_via_reconcile_pass(tmp_path: P
     assert (40, "agent:human-needed") in gh.labels_added
     assert (40, "agent:needs-rework") in gh.labels_removed
 
-    # B-AC7 (critical safety invariant): reconcile must never rewrite status
-    # to match labels -- only `charlie unescalate` re-enters the machine.
+    # B-AC7 (critical safety invariant): reconcile must never rewrite an
+    # escalated issue's status to match labels -- only `charlie unescalate`
+    # re-enters the machine.
     final_state = load_state(app.paths.state_file)
     assert final_state["issues"]["40"]["status"] == "escalated"
 
