@@ -11,6 +11,7 @@ from .config import (
     ConfigError,
     OrchestratorConfig,
     find_config_path,
+    known_config_sections,
     load_config,
 )
 from . import layout
@@ -194,6 +195,7 @@ def load_layered_config(
     # Merge: global as base, per-repo as override (section-by-section, deep)
     merged_data: dict[str, Any] = {}
     all_sections = set(global_data.keys()) | set(repo_data.keys())
+    known_sections = known_config_sections()
 
     for section in all_sections:
         global_section = global_data.get(section, {})
@@ -211,7 +213,23 @@ def load_layered_config(
             merged_section = _deep_merge(global_section, repo_section)
         else:
             merged_section = {**global_section, **repo_section}
-        if merged_section:
+        # A falsy merged section (both layers empty/absent for this name) is
+        # dropped so it doesn't shadow a dataclass default -- load_config's own
+        # `_section()` already defaults a *known* section that's absent
+        # entirely, so dropping an empty-but-known one changes nothing.
+        #
+        # An *unknown* section name must survive this filter even when its
+        # body is empty (`{}`, `null`, `[]` all coerce to `{}` above), or it
+        # never reaches load_config's unknown-section check at all -- that was
+        # issue #962: `bogus_section: {}` merged to falsy and vanished from
+        # merged_data before validation ever saw the name, so a typo'd section
+        # with no body was silently accepted here while load_config (which
+        # checks raw key presence, not truthiness) rejected the identical
+        # file. Keeping the name (with its coerced-empty value) lets the
+        # existing round-trip through load_config raise "unknown config
+        # section(s)" exactly as it does for a non-empty bogus section, and
+        # keeps the #665 discarded-global-layer rescue below in play for it.
+        if merged_section or section not in known_sections:
             merged_data[section] = merged_section
 
     # If no config at all, delegate to the original load_config for consistency.
