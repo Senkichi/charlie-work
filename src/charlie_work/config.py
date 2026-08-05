@@ -236,6 +236,11 @@ class DispatchConfig:
     # 0 disables the respective bound.
     worker_prompt_max_comments: int = 20
     worker_prompt_max_comment_chars: int = 12000
+    # Issue #946: maximum age (in minutes) of the most recent non-empty
+    # ``dispatch`` event (payload ``issue_numbers != []``) before a warning
+    # fires while the unfiltered backlog is observed to be non-empty. 0
+    # disables the check.
+    dispatch_staleness_minutes: int = 240
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -1476,6 +1481,20 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
     if finalize_limit is not None and finalize_limit < 0:
         raise ConfigError(
             f"config section 'dispatch' key 'finalize_limit' must be >= 0, got {finalize_limit}"
+        )
+    dispatch_staleness_minutes = dispatch_data.get("dispatch_staleness_minutes")
+    if dispatch_staleness_minutes is not None and (
+        isinstance(dispatch_staleness_minutes, bool)
+        or not isinstance(dispatch_staleness_minutes, int)
+    ):
+        raise ConfigError(
+            "config section 'dispatch' key 'dispatch_staleness_minutes' must be an int, "
+            f"got {type(dispatch_staleness_minutes).__name__}"
+        )
+    if dispatch_staleness_minutes is not None and dispatch_staleness_minutes < 0:
+        raise ConfigError(
+            f"config section 'dispatch' key 'dispatch_staleness_minutes' must be >= 0, "
+            f"got {dispatch_staleness_minutes}"
         )
     injected_paths = dispatch_data.get("injected_paths")
     if injected_paths is not None:
