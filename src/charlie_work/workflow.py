@@ -6368,6 +6368,19 @@ class _MergedPRListOutcome:
     called: bool = False
 
 
+def _is_rerun_already_running_error(error: str) -> bool:
+    """Return True if a ``gh run rerun`` error means the run is still in progress.
+
+    GitHub refuses to rerun a workflow while any job in the run is still
+    running. The CLI surfaces this with the phrase ``already running`` in the
+    error, e.g. ``run <id> cannot be rerun; This workflow is already running``
+    or ``The workflow run containing this job is already running``. Other
+    refusal reasons (expired run, broken workflow file, missing permissions,
+    ...) do not contain this phrase and should not be treated as retryable.
+    """
+    return "already running" in error.lower()
+
+
 class OrchestratorApp:
     def __init__(
         self,
@@ -9131,6 +9144,30 @@ class OrchestratorApp:
                         state_path=self.paths.state_file,
                     )
                     save_state(self.paths.state_file, state)
+
+                # Issue #992: a refusal because the containing run is still in
+                # progress is a retry-later signal, not a reason to route the
+                # PR to rework. The attempt stays unconsumed (we did not write
+                # check_rerun_attempts above), so a later pass can retry once
+                # the run completes.
+                if (
+                    not triggered_run_ids
+                    and rerun_errors
+                    and all(_is_rerun_already_running_error(e) for e in rerun_errors)
+                ):
+                    return CommandResult(
+                        False,
+                        f"flake rerun for PR #{pr_number} refused: "
+                        + "workflow run(s) still in progress",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "rerun_run_ids": list(verdict.rerun_run_ids),
+                            "rerun_errors": rerun_errors,
+                            "already_running": True,
+                            "checks_unavailable": checks is None,
+                        },
+                    )
 
             # Infra-failure auto-rerun + escalation (issue #841): a job-level
             # `timeout-minutes` kill on this repo's self-hosted runners reports
