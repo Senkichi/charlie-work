@@ -3151,11 +3151,13 @@ def clean_worktrees(
     *,
     dry_run: bool = False,
 ) -> WorktreeCleanResult:
-    """Junction-safe cleanup of worker worktrees for merged PRs.
+    """Junction-safe cleanup of worker worktrees for merged or closed-unmerged PRs.
 
     Enumerates worktrees under ``worktrees_dir`` whose linked issue/PR resolves
-    to a PR number in ``state.json``, then applies a merged-PR-aware
-    eligibility check per worktree:
+    to a PR number in ``state.json``, then applies one of two eligibility
+    checks per worktree, chosen by the PR's *terminal* state:
+
+    **Merged path** (PR state ``MERGED``):
 
       1. The PR must be confirmed ``MERGED`` by a *live* ``gh pr view`` call.
          ``state.json`` claiming "merged" is corroboration only -- it is never
@@ -3166,6 +3168,22 @@ def clean_worktrees(
       3. The worktree's local HEAD is *contained in* the merged PR's
          ``headRefOid`` (equal to it, or an ancestor of it).
       4. No live worker (see ``_cleanup_live_writer_reason``).
+
+    **Closed-unmerged path** (PR state ``CLOSED`` with ``mergedAt`` null, from
+    the same live ``gh pr view`` call -- no extra quota): a closed-and-never-
+    merged PR is a decision, not a pending state, so waiting on it to become
+    ``MERGED`` waits forever (issue #990). This path substitutes an
+    "ordinary" nothing-would-be-lost check for the merged path's containment
+    check (there is no merged head to contain against): the working tree is
+    clean and the branch has no commits absent from its remote copy, both via
+    ``_worktree_refuse_to_reset_reason``. Unlike a merge, closing a PR never
+    deletes the remote branch, so this is not the squash-merge special case
+    described below. Same liveness gate as the merged path.
+
+    A PR that is neither confirmed ``MERGED`` nor confirmed closed-unmerged
+    (open, unknown, or an erroring/ambiguous ``gh`` call) falls through to the
+    fail-closed "PR not merged" skip -- still waiting is the correct default
+    for a PR that might yet merge.
 
     The order matters and is load-bearing. Checks 2 and 3 together prove the
     tree is byte-identical to what already landed on the base branch, so
@@ -3258,17 +3276,29 @@ def clean_worktrees(
         )
         gh_ok = isinstance(gh_result, GitHubRunResult) and gh_result.ok
         gh_merged = False
+        gh_closed_unmerged = False
         merged_head_sha: str | None = None
         if gh_ok and isinstance(gh_result.value, dict):
-            gh_merged = gh_result.value.get("state") == "MERGED"
+            gh_pr_state = gh_result.value.get("state")
+            gh_merged = gh_pr_state == "MERGED"
             merged_head_sha = gh_result.value.get("headRefOid")
+            # Terminal, not pending: CLOSED-and-never-merged is a decision, not
+            # a not-yet-merged state, so it must not collapse into the
+            # "PR not merged" wait-forever branch below (issue #990). This is
+            # still positive proof from the SAME live `gh pr view` call the
+            # merged path already makes -- no extra quota -- and it is exactly
+            # as fail-closed: an erroring/ambiguous `gh` call still falls
+            # through to the generic "not merged" branch, which skips.
+            gh_closed_unmerged = (
+                gh_pr_state == "CLOSED" and gh_result.value.get("mergedAt") is None
+            )
 
-        if not gh_merged:
-            # Fail-closed: only a live `gh pr view` MERGED confirmation may
-            # authorize destructive removal. state.json is corroboration at
-            # best -- never sufficient on its own (state.json reliability
-            # history: #285/#309/#310). An unavailable/erroring `gh` call
-            # falls into this branch too and is DISTINGUISHED from a
+        if not gh_merged and not gh_closed_unmerged:
+            # Fail-closed: only a live `gh pr view` MERGED or CLOSED-unmerged
+            # confirmation may authorize destructive removal. state.json is
+            # corroboration at best -- never sufficient on its own (state.json
+            # reliability history: #285/#309/#310). An unavailable/erroring
+            # `gh` call falls into this branch too and is DISTINGUISHED from a
             # confirmed-not-merged PR rather than falling back to trusting
             # state.json.
             if not gh_ok:
@@ -3288,123 +3318,195 @@ def clean_worktrees(
                 }
             )
             continue
-        try:
-            dirty_reason = _worktree_dirty_reason(
-                wt_path,
-                config.dispatch.injected_paths,
-                config.dispatch.materialize_dirs,
-            )
-        except WorktreeProbeFailedError as exc:
-            skipped.append(
-                {
-                    "worktree": str(wt_path),
-                    "branch": branch,
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "reason": f"worktree status probe failed: {exc}",
-                }
-            )
-            continue
-        if dirty_reason:
-            skipped.append(
-                {
-                    "worktree": str(wt_path),
-                    "branch": branch,
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "reason": dirty_reason,
-                }
-            )
-            continue
-        if not merged_head_sha:
-            skipped.append(
-                {
-                    "worktree": str(wt_path),
-                    "branch": branch,
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "reason": "gh pr view did not return headRefOid for the merged PR",
-                }
-            )
-            continue
-        head_result = run_captured(
-            ["git", "rev-parse", "--verify", "HEAD"],
-            cwd=wt_path,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if not head_result.ok or not head_result.stdout.strip():
-            skipped.append(
-                {
-                    "worktree": str(wt_path),
-                    "branch": branch,
-                    "issue_number": issue_number,
-                    "pr_number": pr_number,
-                    "reason": "could not resolve worktree HEAD",
-                }
-            )
-            continue
-        local_head_sha = head_result.stdout.strip()
-        if local_head_sha != merged_head_sha:
-            # Containment, NOT equality. The question this gate exists to ask
-            # is "does the worktree hold commits that did not get merged?",
-            # and an equality test cannot tell the two directions apart:
-            #
-            #   local BEHIND merged  -> everything here is reachable from the
-            #       merged head; nothing to lose. This is the ORDINARY shape,
-            #       because the merge path advances the PR branch after the
-            #       worker's last local commit (Aviator merge-queue rebases,
-            #       merge-train updates, base-into-branch merges). 46 of 47
-            #       mismatching worktrees on this host were this shape and were
-            #       all reported as "stray post-merge commit(s)".
-            #   local AHEAD/DIVERGED -> real unmerged work; refuse.
-            #
-            # This is the same class of error the note above records for
-            # `_worktree_refuse_to_reset_reason`: a check whose shape counts
-            # the expected post-merge topology as danger.
-            #
-            # Known limitation, deliberately left fail-closed: the containment
-            # test needs `merged_head_sha` to still be in the local object
-            # store. For a squash-merged PR whose remote branch was deleted,
-            # nothing references that SHA once the local branch sits behind it,
-            # so a `git gc` can prune it and the object-presence gate below
-            # starts refusing. That is the safe direction (refuse, don't
-            # remove), and it reports its own distinct reason string — if
-            # worktree-clean ever "stops removing things" again, read the
-            # reasons before re-deriving anything.
-            if not _object_exists(repo_root, merged_head_sha):
+
+        if gh_merged:
+            try:
+                dirty_reason = _worktree_dirty_reason(
+                    wt_path,
+                    config.dispatch.injected_paths,
+                    config.dispatch.materialize_dirs,
+                )
+            except WorktreeProbeFailedError as exc:
                 skipped.append(
                     {
                         "worktree": str(wt_path),
                         "branch": branch,
                         "issue_number": issue_number,
                         "pr_number": pr_number,
-                        "reason": (
-                            f"merged PR head ({merged_head_sha[:8]}) is not present in the "
-                            "local object store; cannot verify the worktree adds nothing "
-                            "beyond it"
-                        ),
+                        "reason": f"worktree status probe failed: {exc}",
                     }
                 )
                 continue
-            if not _is_ancestor(repo_root, local_head_sha, merged_head_sha):
+            if dirty_reason:
                 skipped.append(
                     {
                         "worktree": str(wt_path),
                         "branch": branch,
                         "issue_number": issue_number,
                         "pr_number": pr_number,
-                        "reason": (
-                            f"worktree HEAD ({local_head_sha[:8]}) is not contained in merged "
-                            f"PR head ({merged_head_sha[:8]}); stray post-merge commit(s)"
-                        ),
+                        "reason": dirty_reason,
                     }
                 )
                 continue
-        # Liveness is checked LAST, and deliberately so: the three gates above
-        # have already proven this tree holds nothing that is not already
-        # merged, which is what reduces the question to "is a process using
-        # this directory right now?" See _cleanup_live_writer_reason for why
-        # the redispatch lane's fail-closed probe is the wrong instrument here.
+            if not merged_head_sha:
+                skipped.append(
+                    {
+                        "worktree": str(wt_path),
+                        "branch": branch,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "reason": "gh pr view did not return headRefOid for the merged PR",
+                    }
+                )
+                continue
+            head_result = run_captured(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=wt_path,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if not head_result.ok or not head_result.stdout.strip():
+                skipped.append(
+                    {
+                        "worktree": str(wt_path),
+                        "branch": branch,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "reason": "could not resolve worktree HEAD",
+                    }
+                )
+                continue
+            local_head_sha = head_result.stdout.strip()
+            if local_head_sha != merged_head_sha:
+                # Containment, NOT equality. The question this gate exists to ask
+                # is "does the worktree hold commits that did not get merged?",
+                # and an equality test cannot tell the two directions apart:
+                #
+                #   local BEHIND merged  -> everything here is reachable from the
+                #       merged head; nothing to lose. This is the ORDINARY shape,
+                #       because the merge path advances the PR branch after the
+                #       worker's last local commit (Aviator merge-queue rebases,
+                #       merge-train updates, base-into-branch merges). 46 of 47
+                #       mismatching worktrees on this host were this shape and were
+                #       all reported as "stray post-merge commit(s)".
+                #   local AHEAD/DIVERGED -> real unmerged work; refuse.
+                #
+                # This is the same class of error the note above records for
+                # `_worktree_refuse_to_reset_reason`: a check whose shape counts
+                # the expected post-merge topology as danger.
+                #
+                # Known limitation, deliberately left fail-closed: the containment
+                # test needs `merged_head_sha` to still be in the local object
+                # store. For a squash-merged PR whose remote branch was deleted,
+                # nothing references that SHA once the local branch sits behind it,
+                # so a `git gc` can prune it and the object-presence gate below
+                # starts refusing. That is the safe direction (refuse, don't
+                # remove), and it reports its own distinct reason string — if
+                # worktree-clean ever "stops removing things" again, read the
+                # reasons before re-deriving anything.
+                if not _object_exists(repo_root, merged_head_sha):
+                    skipped.append(
+                        {
+                            "worktree": str(wt_path),
+                            "branch": branch,
+                            "issue_number": issue_number,
+                            "pr_number": pr_number,
+                            "reason": (
+                                f"merged PR head ({merged_head_sha[:8]}) is not present in the "
+                                "local object store; cannot verify the worktree adds nothing "
+                                "beyond it"
+                            ),
+                        }
+                    )
+                    continue
+                if not _is_ancestor(repo_root, local_head_sha, merged_head_sha):
+                    skipped.append(
+                        {
+                            "worktree": str(wt_path),
+                            "branch": branch,
+                            "issue_number": issue_number,
+                            "pr_number": pr_number,
+                            "reason": (
+                                f"worktree HEAD ({local_head_sha[:8]}) is not contained in "
+                                f"merged PR head ({merged_head_sha[:8]}); stray post-merge "
+                                "commit(s)"
+                            ),
+                        }
+                    )
+                    continue
+        elif gh_closed_unmerged:
+            # A closed-and-never-merged PR is a terminal decision (issue
+            # #990), not a pending state -- nothing will ever advance it to
+            # MERGED, so the worktree cannot wait on that. There is no
+            # "merged head" to compare against here (the PR never landed), so
+            # eligibility is the ORDINARY "would removing this lose anything"
+            # question instead of the merged path's special
+            # squash-with-deleted-branch containment check: is the working
+            # tree clean, and does the branch have any commits that are not
+            # also on its remote copy? `_worktree_refuse_to_reset_reason`
+            # already answers exactly that (dirty-tree check + remote-ahead
+            # check, positive-proof throughout) for the redispatch lane, and a
+            # closed-unmerged PR's branch is the ordinary case it was built
+            # for -- closing without merging does not *automatically* delete
+            # the remote branch the way GitHub's merge-time auto-delete does
+            # (an operator or Aviator can still delete it by hand), so this is
+            # not the squash-merge special case documented above; the helper's
+            # remote-ahead check already refuses when the remote branch is
+            # gone and the local tip carries commits beyond base. Reused as-is
+            # rather than re-derived.
+            try:
+                closed_unsafe_reason = _worktree_refuse_to_reset_reason(
+                    repo_root,
+                    branch,
+                    config.dispatch.base_ref,
+                    wt_path,
+                    config.dispatch.injected_paths,
+                    config.dispatch.materialize_dirs,
+                )
+            except (WorktreeProbeFailedError, RuntimeError) as exc:
+                skipped.append(
+                    {
+                        "worktree": str(wt_path),
+                        "branch": branch,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "reason": f"closed-unmerged PR reclaim safety probe failed: {exc}",
+                    }
+                )
+                continue
+            if closed_unsafe_reason:
+                skipped.append(
+                    {
+                        "worktree": str(wt_path),
+                        "branch": branch,
+                        "issue_number": issue_number,
+                        "pr_number": pr_number,
+                        "reason": f"closed-unmerged PR: {closed_unsafe_reason}",
+                    }
+                )
+                continue
+        else:
+            # Unreachable today: the `not gh_merged and not gh_closed_unmerged`
+            # guard above already continues for every state that is neither.
+            # Kept as an explicit fail-closed branch rather than relying on
+            # that guard alone, so a future third eligibility state added
+            # above this `if` cannot silently fall through into either
+            # removal path via a bare `else`.
+            skipped.append(
+                {
+                    "worktree": str(wt_path),
+                    "branch": branch,
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "reason": "PR eligibility state not recognized (neither merged nor closed-unmerged)",
+                }
+            )
+            continue
+        # Liveness is checked LAST, and deliberately so: the gates above have
+        # already proven this tree holds nothing that is not already merged
+        # or already pushed, which is what reduces the question to "is a
+        # process using this directory right now?" See
+        # _cleanup_live_writer_reason for why the redispatch lane's
+        # fail-closed probe is the wrong instrument here.
         live_reason = _cleanup_live_writer_reason(issue_state, wt_path)
         if live_reason:
             skipped.append(
