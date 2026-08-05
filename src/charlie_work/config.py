@@ -38,6 +38,13 @@ CLAUDE_CODE_PROMPT_FILENAME = ".orchestrator-prompt.md"
 # Worktree writer marker used to enforce single-writer-per-branch (issue #400).
 WRITER_MARKER_FILENAME = ".charlie-writer.json"
 
+# Structured outcome a worker writes when it pushed a branch but could not open a
+# PR (per the ``$section_push_pr_outcome`` prompt contract); read back by
+# ``worktree.read_worker_outcome``. Lives here rather than in ``worktree`` so that
+# ``DispatchConfig`` can exclude it without importing ``worktree`` (which imports
+# this module) -- the same arrangement as ``WRITER_MARKER_FILENAME`` above.
+WORKER_OUTCOME_FILENAME = ".worker-outcome.json"
+
 
 def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     """Return path strings with Windows backslash separators normalized to '/'.
@@ -249,8 +256,9 @@ class DispatchConfig:
             base = list(self.injected_paths)
         else:
             base = [CLAUDE_CODE_PROMPT_FILENAME]
-        if WRITER_MARKER_FILENAME not in base:
-            base.append(WRITER_MARKER_FILENAME)
+        for protocol_file in (WRITER_MARKER_FILENAME, WORKER_OUTCOME_FILENAME):
+            if protocol_file not in base:
+                base.append(protocol_file)
         object.__setattr__(self, "injected_paths", _normalize_injected_paths(base))
         # Coerce the comment-filter sequences here rather than only in
         # ``load_config``: this is the one path every construction goes through,

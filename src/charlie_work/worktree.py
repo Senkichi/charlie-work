@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
-from .config import OrchestratorConfig, WRITER_MARKER_FILENAME
+from .config import OrchestratorConfig, WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
 from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .janitor import _calculate_patch_id
 from . import layout
@@ -287,9 +287,6 @@ def _write_json_atomic(path: Path, value: Any) -> None:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
     tmp.replace(path)
-
-
-WORKER_OUTCOME_FILENAME = ".worker-outcome.json"
 
 
 def read_worker_outcome(worktree_path: Path) -> dict[str, Any] | None:
