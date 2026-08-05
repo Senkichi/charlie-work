@@ -1395,9 +1395,15 @@ def fleet_loop(
         repo_root = Path(entry.get("repo_root") or "")
         if not repo_root.is_dir():
             # Tolerate vanished/moved repo (#169 precedent)
-            per_repo_results[repo_key] = CommandResult(
-                False, f"repo_root missing, skipped: {repo_root}", {}
+            error_message = f"repo_root missing, skipped: {repo_root}"
+            per_repo_results[repo_key] = CommandResult(False, error_message, {})
+            attention_events.append(
+                {"repo_key": repo_key, "type": "error", "error": error_message}
             )
+            try:
+                _record_lane_failure_event(repo_root, repo_key, entry, error_message)
+            except Exception:
+                logger.exception("Failed to record repo_root missing event for %s", repo_key)
             continue
 
         try:
