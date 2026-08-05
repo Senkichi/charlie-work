@@ -34947,31 +34947,25 @@ def test_redispatch_timestamps_pruned_outside_window(tmp_path: Path) -> None:
 def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     """Test that redispatch_at is only written by known call sites."""
     # This test verifies by code inspection that redispatch_at is only written in:
-    # 1. dispatch_rework success + escalation paths, and now the failure path
-    #    (issue #515: failed rework-dispatch attempts also append redispatch_at
-    #    so they count toward the cap).
-    # 2. _classify_dead_sessions_and_update_throttle_state (launch-failure
-    #    escalation + dead-session normal + dead-session escalation).
+    # 1. dispatch_rework normal paths (success + failure + no-op rework pre-dispatch).
+    # 2. _classify_dead_sessions_and_update_throttle_state normal paths.
     # 3. _reap_restore_rework_requested (issue #315 review finding 2).
-    # 4. dispatch_rework no-op rework escalation path (pre-dispatch check
-    #    that escalates issues whose redispatch cap is already exhausted).
-    # No other code paths write to redispatch_at.
+    # Escalated paths now consolidate on _escalate_issue and pass redispatch_at
+    # through issue_extra, so direct entry["redispatch_at"] assignments only
+    # remain in the non-escalated branches below.
 
     import charlie_work.workflow as workflow_module
     import inspect
 
     workflow_source = inspect.getsource(workflow_module)
 
-    # Count occurrences of redispatch_at assignments to entry:
-    # dispatch_rework: 2 (success normal + escalation) +
-    #                  2 (failure normal + escalation, issue #515) +
-    #                  1 (no-op rework escalation, pre-dispatch check) = 5
-    # _classify_dead_sessions_and_update_throttle_state: 3
-    # _reap_restore_rework_requested: 2
-    # Total of 10 assignments is correct.
+    # Count direct redispatch_at assignments to entry. After issue #750, the
+    # escalated call sites all route through _escalate_issue, so this count
+    # only covers non-escalated branches. Any unexpected increase means a new
+    # call site is writing redispatch_at.
     redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    assert redispatch_assignments == 10, (
-        f"Expected 10 redispatch_at assignments, found {redispatch_assignments}"
+    assert redispatch_assignments == 5, (
+        f"Expected 5 redispatch_at assignments, found {redispatch_assignments}"
     )
 
 
