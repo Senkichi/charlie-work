@@ -15,13 +15,27 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from .config import RuntimeConfig
 
-# GitHubError was MOVED to ci_fleet, not copied, because it is *caught*.
-# Two structurally identical exception classes are unrelated types, so a
-# local re-declaration would silently stop every `except GitHubError` in
-# charlie_work from catching what ci_fleet raises. Re-exported here rather
-# than at the adapter because 16 modules already do
-# `from .github import GitHubError`.
-from ci_fleet.github import GitHubError  # noqa: F401
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# GitHubError was MOVED to ci_fleet, not copied, because it is *caught*. Two
+# structurally identical exception classes are unrelated types, so a local
+# re-declaration would stop every `except GitHubError` in charlie_work from
+# catching what ci_fleet raises — with no import error and no failure at the
+# raise site. Re-exported here rather than at the adapter because consumers
+# already do `from .github import GitHubError`.
+#
+# Measured 2026-08-05 by AST, not grep — a line matcher misses parenthesized
+# multi-line imports and counts non-handler mentions, and it errs in both
+# directions at once, so two greps agreeing is not corroboration. An earlier
+# version of this comment claimed "16 modules" and was wrong: 16 is exactly
+# workflow.py's own handler count, which is where the number came from.
+# Actual: 7 modules import the name and 37 `except` handlers across 6 files
+# depend on it being ci_fleet's class (independently reproduced ci_fleet-side).
+# Counts are indicative only — `tests/test_ci_fleet_seams.py` is the guard, and
+# it asserts the identity directly, so deleting or re-declaring this fails the
+# suite rather than degrading silently. Fix the seam, never the assertion.
+from ci_fleet.github import GitHubError  # noqa: F401  (deliberate re-export)
 
 from .checks import _run_id_from_link
 from .subprocess_runner import no_console_window_kwargs
