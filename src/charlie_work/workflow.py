@@ -4320,6 +4320,47 @@ def _required_changes_from_checks(
     return required_changes
 
 
+_EXTERNAL_FINDINGS_POINTER = (
+    "## Also required: findings posted on the PR itself\n"
+    "\n"
+    "The findings above come from the orchestrator's own reviewer. They "
+    "are not necessarily the only ones. A human or a peer agent may have "
+    "posted verified findings as PR comments, review bodies, or inline "
+    "review threads — none of which reach this brief. **Read the PR's "
+    "review comments and review threads on GitHub before you start**, "
+    "and address what you find there too.\n"
+)
+
+
+def _finish_required_changes_section(lines: list[str]) -> str:
+    """Join a rendered findings section and append the external-findings pointer.
+
+    Single point of enforcement for issue #950. Before this, the
+    instruction to go read the PR's own review comments existed in exactly
+    two places — the ``findings_channel == "vacuous"`` tier and the
+    both-empty tier — and both fire *only when the internal channel came
+    back empty*. The three tiers that render substantive content carried no
+    pointer at all, so the sole reference to externally-posted findings was
+    conditioned on the absence of internal ones: the better the
+    orchestrator's own review, the more certainly a human's or a peer
+    agent's comment was discarded. Observed on PR #948, where two verified
+    findings posted as PR comments were invisible to the rework worker
+    precisely because the internal verdict was substantive.
+
+    The pointer is deliberately *not* a render-time fetch of the comments
+    themselves. ``_render_rework_prompt`` is a pure function of the verdict
+    file, the dispatch note, and the template set, and ``dispatch_rework``
+    depends on that purity — it re-renders and diffs against the bytes on
+    disk to detect renderer drift (#800). Live comment traffic as a render
+    input would make every new comment read as drift, trading a silent drop
+    for a permanently noisy detector. Telling the worker to fetch them
+    itself costs no purity and no API call, and reads the freshest state.
+    Folding comments into the verdict at ``record_review`` time is the
+    separate half of #950.
+    """
+    return "\n".join([*lines, _EXTERNAL_FINDINGS_POINTER])
+
+
 def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     """Render the ``$required_changes_section`` for a rework brief.
 
@@ -4443,7 +4484,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             defang_closing_keywords(summary_text),
             "",
         ]
-        return "\n".join(lines)
+        return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and changes:
         lines = [
@@ -4456,7 +4497,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         ]
         lines.extend(f"- {defang_closing_keywords(change)}" for change in changes)
         lines.append("")
-        return "\n".join(lines)
+        return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and summary_text:
         lines = [
@@ -4470,7 +4511,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             defang_closing_keywords(summary_text),
             "",
         ]
-        return "\n".join(lines)
+        return _finish_required_changes_section(lines)
 
     if not changes and not summary_text:
         lines = [
