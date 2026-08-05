@@ -70,6 +70,9 @@ VALID_ISSUE_STATUSES: frozenset[str] = frozenset(
         # and re-expose the issue as a fresh dispatch candidate past the cap
         "dispatch_failed",
         "reviewing",
+        # Issue #955: PASSIVE_OPEN_STATUS's own value, distinct from the
+        # active "reviewing" above -- see that constant's docstring.
+        "open_passive",
         "rework_requested",
         "approved",
         "blocked",
@@ -94,18 +97,35 @@ ORCHESTRATOR_OWNED_ISSUE_STATUSES: frozenset[str] = (
     VALID_ISSUE_STATUSES - EXTERNALLY_DERIVED_ISSUE_STATUSES
 )
 
-# The status the normal dispatch -> PR-open flow writes once a PR exists (for
-# an issue) or a fresh review packet has been generated (for a PR) and no
-# reviewer verdict has landed yet -- see workflow.py's
-# dispatched/rework_requested -> "reviewing" transitions (e.g. the
-# orphaned-worker-routed-to-review and rework-already-pushed recovery paths)
-# and the PR-level "reviewing" status ``review()`` writes alongside its
-# ``review_started`` label transition. reconcile.py's self-heal and
-# status-normalization sweep reuse this same passive placeholder for both
-# issue and PR records so a drift-repair pass never resurrects an issue into
-# "rework_requested" -- which would trigger a fresh worker dispatch -- purely
-# by fixing a label or a corrupt status field.
-PASSIVE_OPEN_STATUS = "reviewing"
+# Issue #955: this used to be the literal string "reviewing" -- the same
+# value ``review()`` writes (guarded by ``review_dispatch.enabled``, see
+# workflow.py's two ``dispatch_disabled`` call sites) to mean "a fresh review
+# packet was generated, a reviewer is expected". Sharing one string across
+# both meanings meant a reader could not tell "a reviewer is coming" from
+# "this record is just open, nothing is tracked yet" -- reconcile.py's
+# unconditional ``pr_status_normalized`` write landed PRs in the exact status
+# the #487 stalled-review sweep (workflow.py) keys on to detect "packet
+# generated but never dispatched", producing one spurious
+# ``review_dispatch_stalled`` event per PR whenever review dispatch is
+# disabled. See the issue for the full trace.
+#
+# PASSIVE_OPEN_STATUS is now a distinct value, used only where the record
+# should read "open, no reviewer implied" -- reconcile.py's self-heal and
+# status-normalization sweeps (for both issue and PR records), and
+# workflow.py's ``unescalate``/mechanical-deescalation/orphaned-worker-
+# opened-a-PR recovery paths. None of these fire the ``review_started`` label
+# transition or claim a reviewer is coming; they exist so a drift-repair or
+# reset pass never resurrects an issue into "rework_requested" (which would
+# trigger a fresh worker dispatch) purely by fixing a label or a corrupt
+# status field.
+#
+# It must stay a member of ``reconcile.ACTIVE_STATE_STATUSES`` alongside the
+# real "reviewing" status: both are "this entry is in the open pipeline"
+# states that the closed-unmerged-PR and issue-closed-on-GitHub repair sweeps
+# must keep converging to a terminal status. Dropping it from that set to
+# "fix the naming" would silently disable those repairs for every
+# passively-open entry.
+PASSIVE_OPEN_STATUS = "open_passive"
 
 # Issue #783: every transition into the ``human_needed`` label must record
 # WHY, durably and atomically with the label change, so an automated

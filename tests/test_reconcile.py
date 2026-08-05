@@ -381,7 +381,7 @@ def test_detect_drift_finds_issue_active_label_with_open_pr() -> None:
     assert matches[0].fix_actions == (
         f"remove label '{config.labels.needs_rework}' from issue #30",
         f"add label '{config.labels.pr_open}' to issue #30",
-        "set state issues[30].status = 'reviewing'",
+        f"set state issues[30].status = {PASSIVE_OPEN_STATUS!r}",
     )
 
 
@@ -410,10 +410,11 @@ def test_apply_fixes_issue_active_label_with_open_pr() -> None:
 
     assert (30, config.labels.needs_rework) in gh.labels_removed
     assert (30, config.labels.pr_open) in gh.labels_added
-    # Issue #515 (generalized): "reviewing" -- not "approved" -- is the status
-    # the normal dispatch->pr-open flow writes; the repair mirrors that same
-    # passive placeholder instead of implying a review verdict was recorded.
-    assert new_state["issues"]["30"]["status"] == "reviewing"
+    # Issue #515 (generalized): PASSIVE_OPEN_STATUS -- not "approved" -- is
+    # the status this repair mirrors, instead of implying a review verdict
+    # was recorded. Distinct from the active "reviewing" review() writes
+    # (#955).
+    assert new_state["issues"]["30"]["status"] == PASSIVE_OPEN_STATUS
     assert "worker_pid" not in new_state["issues"]["30"]
 
 
