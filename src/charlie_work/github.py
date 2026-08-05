@@ -212,6 +212,30 @@ _MergedPRSearchResult = MergedPRSearchResult
 # followed by a query string or #fragment, e.g. "?check_suite_focus=true").
 _ACTIONS_JOB_LINK_RE = re.compile(r"/actions/runs/\d+/job/(\d+)")
 
+# Matches the PR-number segment of a pull-request URL, e.g.
+# https://github.com/OWNER/REPO/pull/123
+_PR_URL_RE = re.compile(r"/pull/(\d+)")
+
+
+def _pr_number_from_url(output: str) -> int | None:
+    """Extract a PR number from ``gh pr create`` output.
+
+    ``gh pr create`` prints the created PR's URL on stdout; it has no ``--json``
+    flag, so this is the only machine-readable channel it offers.
+
+    The *last* match wins, not the first. ``gh`` may precede the URL with
+    progress chatter ("Creating pull request for X into main in OWNER/REPO"),
+    and a caller-supplied title or body echoed into that preamble could contain
+    a ``/pull/N`` link of its own -- a PR body that says "supersedes
+    .../pull/900" is ordinary. The URL gh appends last is the one it created.
+
+    Never raises; returns None when no PR URL is present.
+    """
+    match = None
+    for match in _PR_URL_RE.finditer(output):  # noqa: B007 - last match wins
+        pass
+    return int(match.group(1)) if match is not None else None
+
 
 def _job_id_from_link(link: str | None) -> int | None:
     """Derive a GitHub Actions job id from a check's ``link`` field.
@@ -428,38 +452,59 @@ class GitHub:
     ) -> int | None:
         """Create a GitHub PR for ``head`` into ``base``.
 
-        Returns the PR number, or ``None`` if creation failed or the local ``gh``
-        does not support JSON output. Errors are returned as values, never raised.
+        Returns the new PR number, or ``None`` if creation failed. Errors are
+        returned as values, never raised.
+
+        ``gh pr create`` has no ``--json`` flag -- unlike ``gh pr view``/``list``,
+        it is a mutation and reports the created PR by printing its URL. Passing
+        ``--json number`` made ``gh`` exit non-zero at argument parsing
+        ("unknown flag: --json") *before* contacting the API, so this method
+        could never succeed and no PR was ever created. It failed in the most
+        expensive possible way: the caller's error string said "gh pr create
+        failed", which reads as a rejection by GitHub, so the natural next step
+        was to investigate permissions and branch state rather than the command
+        we sent. The number is therefore parsed out of the URL, which is the
+        only channel this subcommand offers.
         """
         if self.dry_run:
             return 0
-        try:
-            result = self.run(
-                [
-                    "pr",
-                    "create",
-                    "--head",
-                    head,
-                    "--base",
-                    base,
-                    "--title",
-                    title,
-                    "--body",
-                    body,
-                    "--json",
-                    "number",
-                ],
-                json_output=True,
+        result = self.run(
+            [
+                "pr",
+                "create",
+                "--head",
+                head,
+                "--base",
+                base,
+                "--title",
+                title,
+                "--body",
+                body,
+            ],
+            allow_failure=True,
+        )
+        if not result.ok:
+            # Logged here rather than left to the caller: the caller sees only
+            # ``None`` and cannot say whether gh was missing, unauthenticated,
+            # rejected by the API, or handed a bad flag -- the ambiguity that
+            # hid this bug.
+            logger.warning(
+                "gh pr create failed (head=%s base=%s rc=%s): %s",
+                head,
+                base,
+                result.returncode,
+                (result.stderr or "").strip()[:500] or "(no stderr)",
             )
-        except GitHubError:
             return None
-        if isinstance(result, dict) and "number" in result:
-            return int(result["number"])
-        if isinstance(result, list) and result:
-            first = result[0]
-            if isinstance(first, dict) and "number" in first:
-                return int(first["number"])
-        return None
+        number = _pr_number_from_url(str(result.value or ""))
+        if number is None:
+            logger.warning(
+                "gh pr create reported success for head=%s but no PR URL was found "
+                "in its output: %r",
+                head,
+                str(result.value or "")[:500],
+            )
+        return number
 
     def _run_bool(self, args: list[str]) -> bool:
         """Run a gh command and return True iff returncode == 0.
