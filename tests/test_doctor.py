@@ -1491,7 +1491,7 @@ def test_allocation_probe_reports_enabled_but_never_run(tmp_path: Path) -> None:
 def test_allocation_probe_passes_on_a_fresh_pass(tmp_path: Path) -> None:
     import datetime
 
-    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+    from ci_fleet.runner_slots import ALLOCATION_STATE_FILENAME
 
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     (tmp_path / ALLOCATION_STATE_FILENAME).write_text(
@@ -1511,7 +1511,7 @@ def test_allocation_probe_flags_a_stale_pass(tmp_path: Path) -> None:
     """A configured-but-inert allocator is the exact shape of issue #590."""
     import datetime
 
-    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+    from ci_fleet.runner_slots import ALLOCATION_STATE_FILENAME
 
     config = _doctor_allocation_config()
     stale_by = config.supervisor.full_pass_interval_seconds * 3 + 60
@@ -1530,7 +1530,7 @@ def test_allocation_probe_flags_a_stale_pass(tmp_path: Path) -> None:
 
 
 def test_allocation_probe_survives_a_corrupt_state_file(tmp_path: Path) -> None:
-    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+    from ci_fleet.runner_slots import ALLOCATION_STATE_FILENAME
 
     (tmp_path / ALLOCATION_STATE_FILENAME).write_text("{not json", encoding="utf-8")
     checks = _collect_allocation_checks(_doctor_allocation_config(), tmp_path)
@@ -1559,7 +1559,7 @@ def _write_allocation_stamp(
     """
     import datetime
 
-    from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME
+    from ci_fleet.runner_slots import ALLOCATION_STATE_FILENAME
 
     reference = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
     when = reference - datetime.timedelta(seconds=age_seconds)

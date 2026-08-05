@@ -34,14 +34,14 @@ from charlie_work.fleet_dispatch import (
 )
 from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.instrumentation import query_events
-from charlie_work.runner_allocation import (
+from ci_fleet.runner_allocation import (
     AllocationPlan,
     SlotAction,
     SlotChange,
     SlotChangeResult,
 )
-from charlie_work.runner_allocation_pass import AllocationPassResult
-from charlie_work.runner_slots import ALLOCATION_STATE_FILENAME, load_allocation_stamp
+from ci_fleet.runner_allocation_pass import AllocationPassResult
+from ci_fleet.runner_slots import ALLOCATION_STATE_FILENAME, load_allocation_stamp
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.supervise_loop import EXIT_RESTART_REQUESTED
 from charlie_work.github import GitHubError
@@ -3704,7 +3704,7 @@ def test_fleet_loop_actually_reaches_the_allocation_pass(
         work_only=False,
     )
 
-    from charlie_work.runner_slots import UNATTENDED_ALLOCATION_SOURCE
+    from ci_fleet.runner_slots import UNATTENDED_ALLOCATION_SOURCE
 
     mock_run_allocation_pass.assert_called_once()
     assert mock_run_allocation_pass.call_args.kwargs["dry_run"] is False

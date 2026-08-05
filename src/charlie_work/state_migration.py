@@ -11,7 +11,8 @@ prose accumulated roughly a dozen defects because shell prose has no
 verifier. This module replaces both the *decision* half of that migration --
 "which children may be moved, and which cannot" -- and the *actuation* half
 that applies the decision, following the plan/actuate split already
-established by :mod:`charlie_work.runner_allocation`:
+established by :mod:`ci_fleet.runner_allocation_pass` (charlie-work's own
+copy was deleted by issue #921; the split it pioneered lives on there):
 :func:`plan_state_dir_migration` turns a snapshot into an immutable plan;
 :func:`apply_state_dir_migration` applies it.
 
@@ -577,8 +578,9 @@ def apply_state_dir_migration(
     *plan* is a snapshot taken at some time T; this function may run at
     T+n. Immediately before moving each child, this re-verifies that
     ``child.src_path`` still exists and ``child.dst_path`` still does not --
-    mirroring ``runner_slots.park_runner_slot``'s re-check for a live
-    ``Runner.Worker`` immediately before stopping a listener, because a plan
+    mirroring ``ci_fleet.runner_slots.park_runner_slot``'s re-check for a live
+    ``Runner.Worker`` immediately before stopping a listener (charlie-work's
+    own copy was deleted by issue #921), because a plan
     is a snapshot and the world can change between planning and actuation.
     On divergence the whole run aborts (``ok=False``, ``aborted_at`` set,
     ``moved`` holding exactly what succeeded before this child) rather than

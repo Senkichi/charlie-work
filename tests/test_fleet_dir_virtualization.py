@@ -132,48 +132,17 @@ def test_warn_on_write_never_raises_on_resolve_error(tmp_path: Path, monkeypatch
     warn_fleet_dir_virtualization_on_write(literal, context="writing test-state.json")
 
 
-# ---------------------------------------------------------------------------
-# write-side integration: save_idle_streaks (the #590 "I deployed it" case)
-# ---------------------------------------------------------------------------
-
-
-def test_save_idle_streaks_warns_when_fleet_dir_is_virtualized(
-    tmp_path: Path, monkeypatch: Any, caplog: Any
-) -> None:
-    """The runner-allocation.json write must warn when it lands in a copy.
-
-    This is the exact #590 shape: ``charlie runners allocate`` reports success
-    while the file the fleet supervisor reads never updates.
-    """
-    from charlie_work.runner_slots import save_idle_streaks
-
-    fleet = tmp_path / "fleet"
-    fleet.mkdir(parents=True, exist_ok=True)
-    redirected = tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work"
-    _patch_resolve_to_diverge(monkeypatch, fleet, redirected)
-
-    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_paths"):
-        save_idle_streaks(
-            fleet, {"owner/repo": 1}, source="prologue", full_pass_interval_seconds=300
-        )
-
-    assert any("runner-allocation.json" in record.message for record in caplog.records)
-    # The write still lands (the warning never blocks it).
-    assert (fleet / "runner-allocation.json").exists()
-
-
-def test_save_idle_streaks_is_silent_when_not_virtualized(tmp_path: Path, caplog: Any) -> None:
-    from charlie_work.runner_slots import save_idle_streaks
-
-    fleet = tmp_path / "fleet"
-    fleet.mkdir(parents=True, exist_ok=True)
-
-    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_paths"):
-        save_idle_streaks(
-            fleet, {"owner/repo": 1}, source="prologue", full_pass_interval_seconds=300
-        )
-
-    assert not any("Fleet dir virtualization" in record.message for record in caplog.records)
+# Note: this file used to also carry a "save_idle_streaks" integration pair
+# here (the #590 "I deployed it" case), exercising charlie_work's own
+# runner_slots.save_idle_streaks against charlie_work.fleet_paths. Issue #921
+# deleted charlie_work.runner_slots -- the live save_idle_streaks is now
+# ci_fleet.runner_slots.save_idle_streaks, which calls ci_fleet's own vendored
+# _vendor.fleet_paths, not this module's warn_fleet_dir_virtualization_on_write.
+# Repointing the import would silently start asserting on a different logger
+# ("ci_fleet._vendor.fleet_paths") under a docstring about *this* probe, and
+# the integration is already covered where the live code lives: ci_runners'
+# own tests/test_fleet_dir_virtualization.py exercises the same save_idle_streaks
+# x vendored-warn pairing (confirmed present, not assumed).
 
 
 # ---------------------------------------------------------------------------

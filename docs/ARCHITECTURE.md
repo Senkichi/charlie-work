@@ -76,10 +76,15 @@ should not need to be read to reason about it.
 | `worker.py` (health) | Beyond the `WorkerView` abstraction, owns the supervisor's `WorkerHealth` enum, `UsageSnapshot`, and `classify_worker_health()` — the multi-signal (liveness, log staleness, terminal markers, wall-clock, loop, cost/token) classifier the per-repo supervisor sweep and `status()`'s `workers` section both consume. |
 | `env_sanitize.py` | `sanitize_env(target_path)` — single implementation of worker-subprocess environment sanitization; drops `VIRTUAL_ENV`/`UV_PROJECT_ENVIRONMENT` (or repoints `VIRTUAL_ENV` at the target's `.venv`) so the orchestrator's env never leaks into a worker. Shared by `claude_code`, `devin_shell`, and `cross_family`. |
 | `process_utils.py` | Shared cross-adapter process helpers — `/proc/<pid>/stat` starttime parsing (PID-reuse-safe liveness), process-age computation, and related primitives used by the liveness/orphan-reaping paths. |
-| `runners.py` | **Vertical** self-hosted runner scaling for one repo: pool observability (`observe_runner_pool`, pressure classification, idle sampling), the `decide_autoscale` policy core, provisioning (`provision_runner` — token mint, package extract, unattended config), and teardown (`gracefully_remove_runner` — drain, deregister, delete). `launch_runner_listener()` is the single spawn site for every runner listener, so the decontaminated env and hidden-console flags cannot drift between callers. |
-| `runner_allocation.py` | **Horizontal** allocation policy — pure, no I/O. `allocate_slots()` water-fills one host-wide budget of running listeners across repos by demand (floors first, then largest-unmet-demand, capped by each repo's registered runner count); `plan_allocation()` turns that into start/park changes under asymmetric hysteresis (promote on first demand, demote only after N slack passes or when another repo is waiting). Registration is never touched: a slot moves by stopping one already-configured listener and starting another. |
-| `runner_slots.py` | The world-touching half of allocation: `discover_runner_instances()` (walks exactly the configured `managed_root`, non-recursively — a runner installed elsewhere on the host is structurally unreachable, not merely filtered; repo ownership read from each `.runner` file, so no configured repo list exists to drift), `measure_repo_demand()` (self-hosted *jobs* queued/in-progress, all branches), `park_runner_slot()` (re-checks for a live `Runner.Worker` before stopping, so a job is never aborted), and the slack-streak state file. |
-| `runner_allocation_pass.py` | `run_allocation_pass()` — the one observe→decide→actuate→record path shared by `charlie runners allocate` and the fleet prologue. Persists hysteresis state last and never on `--dry-run`. |
+
+`runners.py`, `runner_allocation.py`, `runner_slots.py`, and `runner_allocation_pass.py`
+were charlie-work's original copies of runner provisioning and allocation. PR #869
+(2026-08-01) repointed every consumer at the extracted `ci_fleet` package
+(`ci_fleet.charlie_work_adapter`, `ci_fleet.runners`, `ci_fleet.runner_allocation`,
+`ci_fleet.runner_slots`, `ci_fleet.runner_allocation_pass`); issue #921 deleted the
+dormant copies once the rollback-retention window and coverage-porting precondition
+(#898) both closed. `config.runner_allocation` (`RunnerAllocationConfig`) stays — it is
+the config section ci_fleet's allocator reads, not a module.
 
 ## Label state machine
 
