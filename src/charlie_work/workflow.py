@@ -33,7 +33,13 @@ from .claude_code import (
     resolve_review_effort,
     run_quota_probe,
 )
-from .checks import CheckSummary, _is_failing_run, summarize_checks
+from .checks import (
+    CheckSummary,
+    _CheckClassification,
+    _classify_check_run,
+    _is_failing_run,
+    summarize_checks,
+)
 from .config import (
     AutoMergeConfig,
     CrossFamilyConfig,
@@ -733,24 +739,20 @@ def _non_required_check_findings(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Classify non-required checks into (failing, cancelled) name lists.
 
-    Deliberately does NOT reuse ``summarize_checks`` here: its ``else:
-    name_failed = True`` catch-all (checks.py) is correct for REQUIRED checks
-    (any non-passing/non-pending/non-infra state should gate the janitor) but
-    wrong for informational awareness of non-required checks, where it
-    silently swept SKIPPED and NEUTRAL conclusions (a path-filtered or
-    matrix-conditional job that correctly did not run) into "failed", making
-    every such PR's packet falsely claim an unrelated check was "currently
-    failing". ``summarize_checks`` itself must not change — it is the
-    janitor's required-check semantics — so this classifies non-required
-    checks directly from their raw per-run state/bucket instead.
+    Reuses ``_classify_check_run`` from ``checks.py`` so the
+    pass/pending/empty/SKIPPED carve-out, cancelled split, and infra/fail
+    distinction are enforced in one place. The output shape is different here
+    because non-required checks are advisory only:
 
-    A genuine failure is FAILURE, INFRA_FAILURE, or any other unrecognized
-    terminal state (e.g. TIMED_OUT, ACTION_REQUIRED) — the same "anything
-    else is a real failure" posture ``summarize_checks`` takes, minus the
-    SKIPPED/NEUTRAL carve-out. CANCELLED is reported separately (worded as
-    "cancelled," never "failing") since it is frequently an infra hiccup
-    rather than a code problem. Multiple runs sharing a name use worst-of
-    semantics, mirroring ``summarize_checks``.
+    - PASS, PENDING, EMPTY, and SKIPPED are ignored (non-outcomes).
+    - CANCELLED is reported separately (worded as "cancelled," never
+      "failing") since it is frequently an infra hiccup.
+    - FAIL and INFRA (INFRA_FAILURE, TIMED_OUT) are reported as failing in
+      this informational context, unlike in ``summarize_checks`` where INFRA
+      blocks merge as an infrastructure failure.
+
+    Multiple runs sharing a name use worst-of semantics, mirroring
+    ``summarize_checks``.
     """
     required_set = set(required)
     by_name: dict[str, list[dict[str, Any]]] = {}
@@ -766,23 +768,20 @@ def _non_required_check_findings(
         name_failed = False
         name_cancelled = False
         for check in runs:
-            state = str(check.get("state") or "").upper()
-            bucket = str(check.get("bucket") or "").lower()
-            if state == "SUCCESS" or bucket == "pass":
+            classification = _classify_check_run(check)
+            if classification in {
+                _CheckClassification.PASS,
+                _CheckClassification.PENDING,
+                _CheckClassification.EMPTY,
+                _CheckClassification.SKIPPED,
+            }:
                 continue
-            if state in {"PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED"} or bucket == "pending":
-                continue
-            if not state and not bucket:
-                continue
-            if state in {"SKIPPED", "NEUTRAL"}:
-                # Legitimate non-outcomes (path-filtered/matrix-conditional
-                # jobs) — never a failure.
-                continue
-            if state == "CANCELLED":
+            if classification == _CheckClassification.CANCELLED:
                 name_cancelled = True
                 continue
-            # FAILURE, INFRA_FAILURE, or any other unrecognized state
-            # (TIMED_OUT, ACTION_REQUIRED, ...): a genuine failure.
+            # Everything else is a genuine failure in this non-required,
+            # informational context: FAILURE, INFRA_FAILURE, TIMED_OUT, and
+            # any other unrecognized terminal state.
             name_failed = True
         if name_failed:
             failing.append(name)
