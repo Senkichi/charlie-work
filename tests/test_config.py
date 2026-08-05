@@ -111,11 +111,46 @@ watchdog:
 
 
 def test_dispatch_config_injected_paths_default_excludes_injected_files() -> None:
-    """Issue #381/#400: default injected_paths exclude the in-worktree Claude Code prompt file and writer marker."""
-    from charlie_work.config import CLAUDE_CODE_PROMPT_FILENAME, WRITER_MARKER_FILENAME
+    """Issue #381/#400/#989: default injected_paths exclude the in-worktree Claude Code prompt file and both protocol markers."""
+    from charlie_work.config import (
+        CLAUDE_CODE_PROMPT_FILENAME,
+        WORKER_OUTCOME_FILENAME,
+        WRITER_MARKER_FILENAME,
+    )
 
     config = DispatchConfig()
-    assert config.injected_paths == (CLAUDE_CODE_PROMPT_FILENAME, WRITER_MARKER_FILENAME)
+    assert config.injected_paths == (
+        CLAUDE_CODE_PROMPT_FILENAME,
+        WRITER_MARKER_FILENAME,
+        WORKER_OUTCOME_FILENAME,
+    )
+
+
+def test_protocol_markers_survive_an_operator_injected_paths_override() -> None:
+    """Issue #400/#989: an explicit override replaces the prompt-file default but must
+    not drop either protocol marker.
+
+    ``__post_init__`` builds its base list from the override when one is given, so the
+    prompt filename is deliberately dropped -- the operator has taken control of that.
+    The two protocol markers are appended unconditionally instead, because neither can
+    ever be worker-authored work: dropping one silently pins the worktree against
+    reclamation.
+    """
+    from charlie_work.config import (
+        CLAUDE_CODE_PROMPT_FILENAME,
+        WORKER_OUTCOME_FILENAME,
+        WRITER_MARKER_FILENAME,
+    )
+
+    config = DispatchConfig(injected_paths=(".devin/prompts/worker.md",))
+
+    assert ".devin/prompts/worker.md" in config.injected_paths
+    assert WRITER_MARKER_FILENAME in config.injected_paths
+    assert WORKER_OUTCOME_FILENAME in config.injected_paths
+    # Negative control: the override really did displace the default, so the
+    # assertions above are testing the unconditional append and not merely the
+    # default list surviving.
+    assert CLAUDE_CODE_PROMPT_FILENAME not in config.injected_paths
 
 
 def test_claude_code_prompt_filename_in_default_injected_paths() -> None:
@@ -128,8 +163,8 @@ def test_claude_code_prompt_filename_in_default_injected_paths() -> None:
 
 
 def test_load_config_injected_paths_coerces_list_to_tuple(tmp_path: Path) -> None:
-    """Issue #381/#400: injected_paths list in YAML becomes a tuple and the writer marker is always appended."""
-    from charlie_work.config import WRITER_MARKER_FILENAME
+    """Issue #381/#400/#989: injected_paths list in YAML becomes a tuple and both protocol markers are always appended."""
+    from charlie_work.config import WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
 
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
@@ -146,20 +181,25 @@ dispatch:
         ".orchestrator-prompt.md",
         ".devin/prompts/custom.md",
         WRITER_MARKER_FILENAME,
+        WORKER_OUTCOME_FILENAME,
     )
 
 
 def test_dispatch_config_injected_paths_normalizes_backslashes() -> None:
-    """Issue #381/#400: backslash separators in an override are normalized to '/' and the writer marker is appended."""
-    from charlie_work.config import WRITER_MARKER_FILENAME
+    """Issue #381/#400/#989: backslash separators in an override are normalized to '/' and both protocol markers are appended."""
+    from charlie_work.config import WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
 
     config = DispatchConfig(injected_paths=[r".devin\prompts\worker.md"])
-    assert config.injected_paths == (".devin/prompts/worker.md", WRITER_MARKER_FILENAME)
+    assert config.injected_paths == (
+        ".devin/prompts/worker.md",
+        WRITER_MARKER_FILENAME,
+        WORKER_OUTCOME_FILENAME,
+    )
 
 
 def test_load_config_injected_paths_normalizes_backslashes(tmp_path: Path) -> None:
-    """Issue #381/#400: YAML override with Windows-style separators is normalized and the writer marker is appended."""
-    from charlie_work.config import WRITER_MARKER_FILENAME
+    """Issue #381/#400/#989: YAML override with Windows-style separators is normalized and both protocol markers are appended."""
+    from charlie_work.config import WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
 
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
@@ -170,7 +210,11 @@ def test_load_config_injected_paths_normalizes_backslashes(tmp_path: Path) -> No
 """,
     )
     config = load_config(config_file)
-    assert config.dispatch.injected_paths == (".devin/prompts/worker.md", WRITER_MARKER_FILENAME)
+    assert config.dispatch.injected_paths == (
+        ".devin/prompts/worker.md",
+        WRITER_MARKER_FILENAME,
+        WORKER_OUTCOME_FILENAME,
+    )
 
 
 def test_load_config_review_dispatch_defaults() -> None:

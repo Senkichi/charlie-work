@@ -3321,6 +3321,83 @@ def test_inspect_worktree_state_partial_with_worker_changes_and_injected(tmp_pat
     remove_worktree(repo, info.path, branch="agent/issue-381")
 
 
+def test_worker_authored_dirty_ignores_worker_outcome_marker(tmp_path: Path) -> None:
+    """Issue #989: ``.worker-outcome.json`` is protocol scaffolding, not worker work.
+
+    It is written on the one path where the worker pushed a branch but could not open
+    a PR, so treating it as worker-authored made every such worktree permanently
+    ineligible for ``clean_worktrees`` -- including after the salvage path opened the
+    PR and it merged.
+
+    Goes through ``DispatchConfig``'s real ``injected_paths`` rather than passing the
+    filename in by hand: the property under test is that the shipped configuration
+    excludes it, which a hand-passed tuple would assert nothing about.
+    """
+    from charlie_work.config import DispatchConfig, WORKER_OUTCOME_FILENAME
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / WORKER_OUTCOME_FILENAME).write_text(
+        '{"push_succeeded": true, "pr_created": false, "error": "gh unauthenticated"}',
+        encoding="utf-8",
+    )
+
+    assert _worker_authored_dirty(repo_root, DispatchConfig().injected_paths) is False
+
+
+def test_worker_authored_dirty_still_flags_work_beside_worker_outcome_marker(
+    tmp_path: Path,
+) -> None:
+    """Issue #989 negative control: excluding the marker must not excuse its neighbours.
+
+    Without this, a fix that over-broadly reported every worktree clean would pass the
+    test above and silently strand real work.
+    """
+    from charlie_work.config import DispatchConfig, WORKER_OUTCOME_FILENAME
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / WORKER_OUTCOME_FILENAME).write_text(
+        '{"push_succeeded": true, "pr_created": false, "error": "gh unauthenticated"}',
+        encoding="utf-8",
+    )
+    (repo_root / "worker_authored.py").write_text("# real work\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, DispatchConfig().injected_paths) is True
+
+
+def test_worker_outcome_filename_matches_the_prompt_contract() -> None:
+    """Issue #989: the constant and the prompt that tells workers what to write must agree.
+
+    ``push_pr_outcome.md`` names the file literally, so a rename of the constant that
+    missed the prompt would leave workers writing a name nothing reads -- and the
+    failure is silent, because a missing outcome file is indistinguishable from a
+    worker that never hit the unauthenticated path.
+    """
+    from charlie_work.config import WORKER_OUTCOME_FILENAME
+
+    prompt = (
+        Path(worktree_module.__file__).parent
+        / "prompts"
+        / "worker_sections"
+        / "push_pr_outcome.md"
+    ).read_text(encoding="utf-8")
+
+    assert WORKER_OUTCOME_FILENAME in prompt
+
+
+def test_worker_outcome_filename_is_re_exported_from_worktree() -> None:
+    """Issue #989: the constant moved to ``config`` to break a circular import.
+
+    ``worktree.WORKER_OUTCOME_FILENAME`` stays valid for existing importers, and must
+    remain the same object -- two independent string literals would drift apart
+    silently, which is the bug this move exists to prevent.
+    """
+    from charlie_work.config import WORKER_OUTCOME_FILENAME as CONFIG_NAME
+
+    assert worktree_module.WORKER_OUTCOME_FILENAME is CONFIG_NAME
+
+
 def test_worker_authored_dirty_ignores_custom_override_path(tmp_path: Path) -> None:
     """Issue #381: a custom injected_paths override excludes the configured path."""
     repo_root = tmp_path / "repo"
