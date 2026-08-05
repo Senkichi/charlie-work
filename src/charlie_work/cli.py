@@ -57,17 +57,22 @@ from ci_fleet.charlie_work_adapter import (
 
 # Not part of the charlie_work_adapter migration surface (issue #909's
 # reporter is a new consumer, not one of the four already-migrated ones), so
-# these come straight from ci_fleet, same as charlie_work_adapter itself does
-# above -- there is no rule against a direct ci_fleet import, only against
-# ci_fleet importing back out through the adapter (see that module's
-# docstring on the one-way boundary).
-from ci_fleet.diff_journal import read_all as read_shadow_journal
-from ci_fleet.shadow_gate import (
-    REQUIRED_CALENDAR_DAYS,
-    REQUIRED_STREAK,
-    evaluate as evaluate_shadow_gate,
-)
-from ci_fleet.shadow_pass import journal_path as shadow_journal_path
+# NOTE: ci_fleet's shadow/rollback cluster (diff_journal, shadow_gate,
+# shadow_pass) is deliberately NOT imported here. Those modules exist only to
+# serve `charlie runners shadow-status`, and ci_fleet is retiring them as the
+# legacy-planner rollback path closes. Imported at module scope, the deletion
+# of any one of them takes down the entire CLI -- including
+# `charlie runners allocate` and `fleet supervise`, whose entry points import
+# this module. That is not hypothetical: it happened on main (issue #929),
+# and CI cannot see it, because ci_fleet is an editable path dependency whose
+# working tree is live here while CI resolves the committed tree.
+#
+# They are imported inside run_runners_shadow_status instead, so a retired
+# module breaks exactly the one read-only command that reports on it.
+# There is no rule against a direct ci_fleet import (only against ci_fleet
+# importing back out through the adapter -- see that module's docstring on
+# the one-way boundary); the confinement here is about blast radius, not
+# layering.
 from .worktree import clean_worktrees
 from .workflow import CommandResult, OrchestratorApp
 
@@ -1179,6 +1184,23 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
     been zero disagreements to adjudicate -- it does not mean the adjudication
     path has ever been exercised, and this command does not claim it does.
     """
+    # Imported here, not at module scope, on purpose -- see the note by the
+    # ci_fleet imports at the top of this file. This command is the only
+    # consumer of ci_fleet's shadow/rollback cluster, and that cluster is
+    # being retired; confining the import confines the failure to this
+    # command instead of taking down every other `charlie` subcommand.
+    # Deliberately NOT wrapped in try/except ImportError: a retired module
+    # should fail loudly here, where the traceback names the missing module,
+    # rather than being bound to None and surfacing later as an
+    # AttributeError with the cause erased.
+    from ci_fleet.diff_journal import read_all as read_shadow_journal
+    from ci_fleet.shadow_gate import (
+        REQUIRED_CALENDAR_DAYS,
+        REQUIRED_STREAK,
+        evaluate as evaluate_shadow_gate,
+    )
+    from ci_fleet.shadow_pass import journal_path as shadow_journal_path
+
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
