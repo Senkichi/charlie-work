@@ -42,25 +42,47 @@ def _close_db_after_test(tmp_path: Path) -> None:
     close_db(tmp_path / "nested" / "state.json")
 
 
-def _run_verify_events(state_path: Path) -> tuple[int | None, ModuleType | None]:
+def _run_verify_events(
+    state_path: Path, script_path: Path = _SCRIPT_PATH
+) -> tuple[int | None, ModuleType | None]:
     """Execute scripts/verify_events.py as if invoked as ``verify_events.py <state_path>``.
+
+    ``script_path`` defaults to the real ``scripts/verify_events.py`` but can
+    be overridden (see ``test_loader_registers_module_before_exec_module``
+    below) to load a synthetic script through the identical recipe without
+    touching the production file.
 
     Returns ``(exit_code, module)``. ``exit_code`` is ``None`` when the
     script ran to completion without calling ``sys.exit`` (the PASSED
     path); otherwise it is the code passed to ``sys.exit``. Output goes to
     the real stdout/stderr, so callers should wrap this in ``capsys``.
+
+    The module is registered in ``sys.modules`` before ``exec_module`` runs
+    (issue #1023): ``@dataclass`` resolves string annotations produced by
+    ``from __future__ import annotations`` through ``sys.modules[cls.__module__]``
+    during class creation, so an unregistered module makes class creation
+    raise ``AttributeError`` for any future dataclass added to the loaded
+    script. The registration is popped in ``finally`` because, unlike this
+    repo's other script loaders, this one reloads the module fresh on every
+    call under the same module name.
     """
     argv_backup = sys.argv
     sys.argv = ["verify_events.py", str(state_path)]
-    spec = importlib.util.spec_from_file_location("verify_events_under_test", _SCRIPT_PATH)
+    modules_backup = sys.modules.get("verify_events_under_test")
+    spec = importlib.util.spec_from_file_location("verify_events_under_test", script_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules["verify_events_under_test"] = module
     try:
         spec.loader.exec_module(module)
         return None, module
     except SystemExit as exc:
         return exc.code, module
     finally:
+        if modules_backup is None:
+            sys.modules.pop("verify_events_under_test", None)
+        else:
+            sys.modules["verify_events_under_test"] = modules_backup
         sys.argv = argv_backup
 
 
@@ -168,3 +190,36 @@ def test_passes_with_recorded_loop_pass_but_no_events(
     assert code is None
     assert "=== Verification PASSED ===" in captured.out
     assert "Loop passes recorded: 1" in captured.out
+
+
+def test_loader_registers_module_before_exec_module(tmp_path: Path) -> None:
+    """Regression test for #1023.
+
+    scripts/verify_events.py has zero @dataclass definitions today, so the
+    real script can't exercise this. Instead this loads a synthetic script,
+    through the exact same _run_verify_events recipe, that carries the
+    trigger pair CLAUDE.md mandates for config/value-object types: a frozen
+    dataclass plus ``from __future__ import annotations``. If the loader
+    doesn't register the module in sys.modules before exec_module, class
+    creation dies with ``AttributeError: 'NoneType' object has no attribute
+    '__dict__'`` while resolving the dataclass's string annotations -- a
+    collection-time failure, not a test-body failure.
+    """
+    synthetic_script = tmp_path / "synthetic_dataclass_script.py"
+    synthetic_script.write_text(
+        "from __future__ import annotations\n"
+        "from dataclasses import dataclass\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class RegressionProbe:\n"
+        "    value: int\n"
+    )
+    state_path = tmp_path / "state.json"
+
+    code, module = _run_verify_events(state_path, script_path=synthetic_script)
+
+    assert code is None
+    assert module is not None
+    probe = module.RegressionProbe(value=1)
+    assert probe.value == 1
