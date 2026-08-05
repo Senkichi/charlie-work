@@ -1,0 +1,14 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "uv run --no-sync python .claude/hooks/merge_check.py",
+          "timeout": 30
+        }
+      ]
+    }
+  ]
+}
