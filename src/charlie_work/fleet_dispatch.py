@@ -445,6 +445,47 @@ def _run_fleet_allocation_prologue(
         )
         return events
 
+    if result.skipped:
+        # Issue #958: the delegated pass (run_allocation_pass, not the local
+        # pre-flight checks above) can decline without raising an error —
+        # AllocationPassResult.skipped was going unread here. Pre-fix this
+        # branch did not exist at all, so control fell through to the
+        # started/parked/notes check below: with notes present (both current
+        # ci_fleet skip branches populate them) the decline was misfiled as a
+        # healthy no-op "runner_allocation" event — which the digest below
+        # deliberately drops as noise — and with no notes it produced nothing.
+        # Either way the decline reached neither the notify digest nor
+        # events.db.
+        #
+        # AllocationPassResult carries no dedicated reason field (that lives
+        # only in the state file the pass writes), but both current ci_fleet
+        # skip branches populate `notes` with the reason, so surface that
+        # instead of re-reading the state file we would just race. Falls back
+        # to a generic reason if a future ci_fleet branch ever returns
+        # skipped=True with empty notes, so a decline is never silent purely
+        # because notes happened to be empty.
+        reason = (
+            "; ".join(result.notes)
+            if result.notes
+            else (
+                "delegated allocation pass declined (reason not exposed on AllocationPassResult)"
+            )
+        )
+        logger.info("Fleet allocation prologue: skipped - %s", reason)
+        if anchor_state is not None:
+            # Durable record in events.db, not just the in-memory digest that
+            # feeds notify sinks — mirrors _record_lane_failure_event's
+            # attention-event + log_event pairing just above. anchor_state is
+            # only known once run_allocation_pass has actually been called
+            # (this branch), unlike the earlier pre-flight skips, which
+            # decline before an anchor is resolved.
+            log_event(
+                anchor_state,
+                "runner_allocation_skipped",
+                {"reason": reason, "source": UNATTENDED_ALLOCATION_SOURCE, "dry_run": dry_run},
+            )
+        return skipped(reason)
+
     # Report the inputs alongside the outcome: "started=0 parked=0" is the correct
     # result for a converged host *and* for one pointed at the wrong managed_root
     # or running under a budget the operator did not intend. Without the budget and

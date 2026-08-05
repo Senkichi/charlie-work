@@ -4022,6 +4022,116 @@ def test_allocation_prologue_surfaces_errors_and_failed_slots(tmp_path: Path) ->
     assert events[0]["action"] == "park"
 
 
+def test_allocation_prologue_records_a_delegated_skip(tmp_path: Path) -> None:
+    """Issue #958: ``run_allocation_pass`` declining must reach the digest
+    and events.db.
+
+    Pre-fix, this branch did not exist: control fell through to the
+    started/parked/notes check below. Both current ci_fleet skip branches
+    populate ``notes``, so a clean decline (``skipped=True``, ``error=None``)
+    was misfiled as a healthy no-op ``runner_allocation`` event -- which the
+    digest deliberately drops as noise -- so it reached neither the notify
+    digest nor events.db. It must now surface as a durable
+    ``runner_allocation_skipped`` event in both places instead.
+    """
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    state_dir = repo / ".var"
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(state_dir)}},
+    )
+
+    declined = AllocationPassResult(
+        ok=True,
+        skipped=True,
+        notes=("no configured runners found under C:/actions-runners",),
+    )
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=declined),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert events == [
+        {
+            "repo_key": "fleet",
+            "type": "runner_allocation_skipped",
+            "reason": "no configured runners found under C:/actions-runners",
+        }
+    ]
+
+    # And a genuine events.db row, not just the in-memory digest -- this is
+    # the actual durable record the issue's evidence section was about.
+    state_path = layout.state_file_path(state_dir)
+    rows = query_events(state_path, kind="runner_allocation_skipped")
+    assert len(rows) == 1
+    assert rows[0]["payload"]["reason"] == "no configured runners found under C:/actions-runners"
+    assert rows[0]["payload"]["dry_run"] is False
+    assert rows[0]["level"] == "warning"
+
+
+def test_allocation_prologue_records_a_delegated_skip_with_no_notes(tmp_path: Path) -> None:
+    """A delegated skip with no notes at all must still leave a trace.
+
+    ``AllocationPassResult`` carries no dedicated reason field, so if a future
+    ci_fleet skip branch ever returns ``skipped=True`` with empty notes, the
+    digest must still record that the pass declined rather than silently
+    dropping it the way the pre-fix code did for every delegated skip.
+    """
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(repo / ".var")}},
+    )
+
+    declined = AllocationPassResult(ok=True, skipped=True)
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=declined),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert [event["type"] for event in events] == ["runner_allocation_skipped"]
+    assert "not exposed" in events[0]["reason"]
+
+
+def test_allocation_prologue_delegated_skip_tolerates_no_anchor_state(tmp_path: Path) -> None:
+    """A registry entry with no recorded ``state_dir`` must not crash.
+
+    ``anchor_state`` is ``None`` whenever the anchor repo's registry entry has
+    no ``state_dir`` on file yet (e.g. its very first pass). The digest event
+    must still be recorded even though there is nowhere to durably log the
+    events.db row for this pass.
+    """
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo)}},  # no state_dir
+    )
+
+    declined = AllocationPassResult(ok=True, skipped=True, notes=("declined",))
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=declined),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert [event["type"] for event in events] == ["runner_allocation_skipped"]
+    assert events[0]["reason"] == "declined"
+
+
 def test_allocation_prologue_warns_when_the_config_lacks_the_section(
     tmp_path: Path, caplog: Any
 ) -> None:
