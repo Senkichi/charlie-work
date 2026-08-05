@@ -15,10 +15,11 @@ ref-validation failure paths are exercised against actual git behavior.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from test_charlie_work import _init_git_repo
-from test_worktree import _git
+from test_worktree import _clone_repo, _git
 
 from charlie_work.janitor import _TESTS_OR_RATIONALE_RE
 from charlie_work.worktree import _SALVAGE_LOG_LIMIT, summarize_branch_work
@@ -247,6 +248,60 @@ def test_open_salvage_pr_with_empty_base_ref_still_derives_summary(tmp_path: Pat
     assert "tests/test_thing.py" in body
     # And the whole point: the real gate must accept it.
     assert _TESTS_OR_RATIONALE_RE.search(body) is not None
+
+
+def test_remote_only_branch_still_derives_summary(tmp_path: Path) -> None:
+    """A branch that exists ONLY as ``origin/<branch>`` must still be resolved.
+
+    ``require_valid_ref_name`` checks NAME FORMAT only -- it never asks git
+    whether the name resolves in ``repo_root``. The orphaned-branch salvage
+    lane (``_open_pr_for_orphaned_branch``) triggers on evidence that creates
+    NO local ref at all -- a durable ``reported_push`` record or an
+    ``ahead_count`` from ``git ls-remote`` -- so the branch routinely exists
+    only as a remote-tracking ref. The pre-fix code fed the bare branch name
+    straight into ``git log``/``git diff``, which exits 128 against a name
+    with no local ref, collapsing the summary to "" and falling back to
+    boilerplate -- the exact defect this module exists to fix, reached
+    through the other operand.
+    """
+    origin_root = tmp_path / "origin"
+    _init_git_repo(origin_root)
+    _git(origin_root, "checkout", "-b", "feature")
+    _commit_file(origin_root, "src/thing.py", "x = 1\n", "feat: remote-only work")
+    # Clone follows origin's checked-out HEAD, so origin must be back on
+    # "main" before cloning -- otherwise the clone would check out "feature"
+    # itself, materializing exactly the local ref this test must NOT have.
+    _git(origin_root, "checkout", "main")
+
+    repo_root = tmp_path / "repo"
+    _clone_repo(origin_root, repo_root)
+    # The clone checks out main; fetch brings the feature branch in only as
+    # origin/feature, never creating a local "feature" branch.
+    _git(repo_root, "fetch", "origin", "feature")
+
+    # Precondition, asserted explicitly: "feature" must NOT resolve locally
+    # and "origin/feature" must. Otherwise this test would prove nothing about
+    # the remote-only path -- if git ever starts materializing a local branch
+    # on fetch, this assertion fails loudly instead of the test silently
+    # passing for the wrong reason.
+    local_probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "feature"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert local_probe.returncode != 0
+    remote_probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "origin/feature"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert remote_probe.returncode == 0
+
+    summary = summarize_branch_work(repo_root, "feature", "main", test_path_globs=_TEST_GLOBS)
+
+    assert "feat: remote-only work" in summary
 
 
 def test_diff_failure_reports_absence_of_evidence_not_a_zero(tmp_path: Path) -> None:
