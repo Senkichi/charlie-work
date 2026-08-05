@@ -2886,18 +2886,20 @@ def _detect_and_handle_stalled_reviews(
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
                 }
+                event_payload = {
+                    "pr_number": w.issue_number,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                    "reason": "provider_throttled_turn_limit_counted",
+                    "throttled_until": throttled_until,
+                    "backoff_suppressed": backoff_suppressed,
+                }
                 state = append_event(
                     state,
                     "review_dispatch_stalled",
-                    {
-                        "pr_number": w.issue_number,
-                        "pid": w.pid,
-                        "started_at": w.started_at,
-                        "reason": "provider_throttled_turn_limit_counted",
-                        "throttled_until": throttled_until,
-                        "backoff_suppressed": backoff_suppressed,
-                    },
+                    event_payload,
                     state_path=state_file,
+                    level=_classify_review_dispatch_stalled_level(event_payload),
                 )
                 changed = True
                 stalled.append(
@@ -2905,7 +2907,7 @@ def _detect_and_handle_stalled_reviews(
                         "pr": w.issue_number,
                         "pid": w.pid,
                         "started_at": w.started_at,
-                        "reason": "provider_throttled_turn_limit_counted",
+                        "reason": event_payload["reason"],
                     }
                 )
                 remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
@@ -2923,18 +2925,20 @@ def _detect_and_handle_stalled_reviews(
             if attempt_count > 0:
                 rolled_back["review_dispatch_attempt_count"] = attempt_count - 1
             state["prs"][pr_key] = rolled_back
+            event_payload = {
+                "pr_number": w.issue_number,
+                "pid": w.pid,
+                "started_at": w.started_at,
+                "reason": "provider_throttled",
+                "throttled_until": throttled_until,
+                "backoff_suppressed": backoff_suppressed,
+            }
             state = append_event(
                 state,
                 "review_dispatch_stalled",
-                {
-                    "pr_number": w.issue_number,
-                    "pid": w.pid,
-                    "started_at": w.started_at,
-                    "reason": "provider_throttled",
-                    "throttled_until": throttled_until,
-                    "backoff_suppressed": backoff_suppressed,
-                },
+                event_payload,
                 state_path=state_file,
+                level=_classify_review_dispatch_stalled_level(event_payload),
             )
             changed = True
             stalled.append(
@@ -2942,7 +2946,7 @@ def _detect_and_handle_stalled_reviews(
                     "pr": w.issue_number,
                     "pid": w.pid,
                     "started_at": w.started_at,
-                    "reason": "provider_throttled",
+                    "reason": event_payload["reason"],
                 }
             )
             remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
@@ -3351,6 +3355,19 @@ def _reap_orphaned_review_checkouts(
     return reaped
 
 
+def _classify_review_dispatch_stalled_level(payload: dict[str, Any]) -> str | None:
+    """Return ``warning`` if a ``review_dispatch_stalled`` payload is a throttle reason.
+
+    Genuine stalls (no ``reason`` key, or a non-throttle ``status``/``reason``
+    value) return ``None`` so the event falls back to the registry's ``error``
+    default. This centralizes the "classify by reason" decision in one place.
+    """
+    reason = payload.get("reason")
+    if isinstance(reason, str) and reason.startswith("provider_throttled"):
+        return "warning"
+    return None
+
+
 def _append_sweep_events(
     state: dict[str, Any],
     sweep_events: list[tuple[str, dict[str, Any]]],
@@ -3370,9 +3387,17 @@ def _append_sweep_events(
         grouped.setdefault(kind, []).append(payload)
 
     for kind, payloads in grouped.items():
+        if kind == "review_dispatch_stalled":
+            level = (
+                "warning"
+                if all(_classify_review_dispatch_stalled_level(p) == "warning" for p in payloads)
+                else None
+            )
+        else:
+            level = None
         if len(payloads) == 1:
             state = append_event(
-                state, kind, payloads[0], max_size=max_size, state_path=state_file
+                state, kind, payloads[0], max_size=max_size, state_path=state_file, level=level
             )
         else:
             numbers: list[int] = []
@@ -3396,6 +3421,7 @@ def _append_sweep_events(
                 },
                 max_size=max_size,
                 state_path=state_file,
+                level=level,
             )
     return state
 
