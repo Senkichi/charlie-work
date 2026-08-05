@@ -17593,7 +17593,7 @@ class OrchestratorApp:
         if merged_prs is None:
             try:
                 merged_prs = self.gh.merged_pr_list()
-            except GitHubError:
+            except GitHubError as exc:
                 # No list means nothing observed, not "nothing wrong" — return
                 # empty without arming, so a transient gh failure on the very
                 # first pass cannot bake an empty baseline and permanently
@@ -17607,6 +17607,14 @@ class OrchestratorApp:
                 # longer arms an empty baseline silently; it is reported here
                 # as a raising failure and the next pass re-arms from real
                 # data.
+                #
+                # Failing open is correct; failing open *silently* is not. Record
+                # that the control did not run (issue #937) — without this the
+                # pass reports ok=True and is byte-identical in every stored
+                # artifact to a pass where the tripwire ran and found nothing,
+                # discarding the very distinction #633 created upstream when it
+                # made merged_pr_list() raise instead of coercing to [].
+                self._record_unauthorized_merge_skip(exc)
                 return []
 
         for pr in merged_prs:
@@ -17795,6 +17803,56 @@ class OrchestratorApp:
             ", ".join(f"#{n}" for n in pre_existing_now) or "none",
         )
         return []
+
+    def _record_unauthorized_merge_skip(self, exc: Exception) -> None:
+        """Record that the unauthorized-merge tripwire did not run this pass (issue #937).
+
+        ``_detect_unauthorized_merges`` fails open on a ``GitHubError``: it returns
+        ``[]`` without arming, which is the right call — an unusable response must
+        never bake an empty baseline. But returning ``[]`` silently makes a blinded
+        pass byte-identical to a clean one in every stored artifact, discarding the
+        distinction ``merged_pr_list`` was deliberately changed to create (#633).
+
+        Unlike ``unauthorized_merge_detected``, this fires **once per pass**, not
+        once per PR, and that difference is deliberate rather than an inconsistency.
+        A finding is one fact that stays true across passes, so repeating it is
+        noise. A skipped check is a *distinct occurrence each time*: two blinded
+        passes are two windows in which an unauthorized merge could have landed
+        unseen, and collapsing them would destroy exactly the count that makes the
+        gap measurable.
+
+        Classified ``warning``, not ``error``: nothing is broken and no finding is
+        being suppressed — a control simply did not run. That matches
+        ``session_rate_limit_deferred`` / ``review_quota_exhausted`` (handled
+        degradations) rather than the error tier, which is reserved for things
+        needing triage.
+
+        Best-effort by construction: this is the reporting path for a failure that
+        has already happened, so it must never turn a degraded pass into a crashed
+        one.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+        reason = str(exc) or exc.__class__.__name__
+        logger.warning(
+            "unauthorized-merge tripwire did not run this pass: %s "
+            "(failing open; no findings will be reported until gh recovers)",
+            reason,
+        )
+        if self.dry_run:
+            return
+        try:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state = self._record_event(
+                    state,
+                    "unauthorized_merge_check_skipped",
+                    {"reason": reason, "error_type": exc.__class__.__name__},
+                )
+                save_state(self.paths.state_file, state)
+        except (OSError, ValueError) as write_exc:  # pragma: no cover - defensive
+            logger.warning("could not record unauthorized_merge_check_skipped: %s", write_exc)
 
     def _announce_unauthorized_merges(self, reported: list[dict[str, Any]]) -> None:
         """Emit ``unauthorized_merge_detected`` once per PR, the first time it is reported.
