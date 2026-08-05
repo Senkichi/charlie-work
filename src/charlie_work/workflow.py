@@ -13638,7 +13638,11 @@ class OrchestratorApp:
         return "\n".join(lines)
 
     def reconcile(
-        self, *, fix: bool = False, skip_dead_session_sweep: bool = False
+        self,
+        *,
+        fix: bool = False,
+        skip_dead_session_sweep: bool = False,
+        dry_run: bool | None = None,
     ) -> CommandResult:
         """Detect (and optionally repair) drift between GitHub reality and the
         orchestrator's labels/state — e.g. a PR merged by hand outside
@@ -13660,8 +13664,10 @@ class OrchestratorApp:
         directly; re-entering this method would always fail to reacquire the
         same non-reentrant lock and silently no-op (merge-lane-recovery D-8a).
         """
+        if dry_run is None:
+            dry_run = getattr(self, "dry_run", False)
         supervisor_lock = None
-        if fix:
+        if fix and not dry_run:
             supervisor_lock = try_acquire_byte_range_lock(
                 layout.supervisor_lock_path(self.paths.root)
             )
@@ -13672,13 +13678,21 @@ class OrchestratorApp:
                     {"skipped": True, "reason": "supervisor_lock_held"},
                 )
         try:
-            return self._reconcile_locked(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
+            return self._reconcile_locked(
+                fix=fix,
+                skip_dead_session_sweep=skip_dead_session_sweep,
+                dry_run=dry_run,
+            )
         finally:
             if supervisor_lock is not None:
                 supervisor_lock.release()
 
     def _reconcile_locked(
-        self, *, fix: bool = False, skip_dead_session_sweep: bool = False
+        self,
+        *,
+        fix: bool = False,
+        skip_dead_session_sweep: bool = False,
+        dry_run: bool = False,
     ) -> CommandResult:
         """Run drift detection (and optional repair) against GitHub/state.
 
@@ -13703,18 +13717,19 @@ class OrchestratorApp:
                 threshold = self.config.runtime.graphql_rate_limit_threshold
                 sufficient, remaining, reset_at = self.gh.check_graphql_rate_limit(threshold)
                 if not sufficient:
-                    state = append_event(
-                        state,
-                        "graphql_rate_limit_deferred",
-                        {
-                            "remaining": remaining,
-                            "reset": reset_at,
-                            "threshold": threshold,
-                            "phase": "reconcile",
-                        },
-                        state_path=self.paths.state_file,
-                    )
-                    save_state(self.paths.state_file, state)
+                    if not dry_run:
+                        state = append_event(
+                            state,
+                            "graphql_rate_limit_deferred",
+                            {
+                                "remaining": remaining,
+                                "reset": reset_at,
+                                "threshold": threshold,
+                                "phase": "reconcile",
+                            },
+                            state_path=self.paths.state_file,
+                        )
+                        save_state(self.paths.state_file, state)
                     return CommandResult(
                         True,
                         "reconcile deferred: GraphQL rate limit below threshold",
@@ -13746,7 +13761,7 @@ class OrchestratorApp:
                     )
                     fixed = False
                     post_fix_drift: list[DriftItem] = []
-                    if fix and drift:
+                    if fix and not dry_run and drift:
                         new_state = apply_drift_fixes(
                             self.gh,
                             state,
@@ -13754,6 +13769,7 @@ class OrchestratorApp:
                             self.config,
                             repo_root=self.repo_root,
                             state_path=self.paths.state_file,
+                            dry_run=dry_run,
                         )
                         save_state(self.paths.state_file, new_state)
                         # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
@@ -13777,20 +13793,23 @@ class OrchestratorApp:
                             )
                         )
                         fixed = len(post_fix_drift) == 0
+                    elif fix and dry_run and drift:
+                        post_fix_drift = drift
                 except GraphQLBudgetError as exc:
                     # Defensive: detect_drift re-checks the budget and may raise.
-                    new_state = self._record_event(
-                        new_state,
-                        "reconcile_pass_deferred",
-                        {
-                            "remaining": exc.remaining,
-                            "reset": exc.reset_at,
-                            "threshold": exc.threshold,
-                            "fix": fix,
-                            "deferred_reason": "graphql_rate_limit",
-                        },
-                    )
-                    save_state(self.paths.state_file, new_state)
+                    if not dry_run:
+                        new_state = self._record_event(
+                            new_state,
+                            "reconcile_pass_deferred",
+                            {
+                                "remaining": exc.remaining,
+                                "reset": exc.reset_at,
+                                "threshold": exc.threshold,
+                                "fix": fix,
+                                "deferred_reason": "graphql_rate_limit",
+                            },
+                        )
+                        save_state(self.paths.state_file, new_state)
                     return CommandResult(
                         True,
                         "reconcile deferred: GraphQL rate limit below threshold",
@@ -13800,20 +13819,22 @@ class OrchestratorApp:
                             "graphql_remaining": exc.remaining,
                             "graphql_reset": exc.reset_at,
                             "graphql_threshold": exc.threshold,
-                            "reconcile_pass_event_recorded": True,
+                            "reconcile_pass_event_recorded": not dry_run,
                         },
                     )
             message = f"found {len(drift)} drift item(s)"
             if fixed:
                 message += " — fixed"
             elif drift:
-                if fix and post_fix_drift:
+                if dry_run:
+                    message += " (dry-run; no changes applied)"
+                elif fix and post_fix_drift:
                     message += f" — partially fixed — {len(post_fix_drift)} item(s) remain"
                 else:
                     message += " (read-only; pass --fix to repair)"
             # ok=False when drift is present and not fixed: scripts and CI can gate
             # on exit code to detect unresolved drift, matching how `doctor` gates.
-            ok = not drift or fixed
+            ok = not drift or fixed or dry_run
             return CommandResult(
                 ok,
                 message,
@@ -15958,7 +15979,11 @@ class OrchestratorApp:
         # docstring -- reconcile() would re-acquire the supervisor lock that
         # loop()'s caller already holds and silently no-op every pass.
         try:
-            result = self._reconcile_locked(fix=True, skip_dead_session_sweep=True)
+            result = self._reconcile_locked(
+                fix=True,
+                skip_dead_session_sweep=True,
+                dry_run=self.dry_run,
+            )
         except Exception as exc:  # noqa: BLE001 - containment is deliberate; see docstring
             with state_lock(state_file):
                 state = load_state(state_file)

@@ -30837,10 +30837,17 @@ def test_maybe_reconcile_drift_runs_and_arms_schedule_when_due(tmp_path: Path) -
     calls: list[tuple[bool, bool]] = []
 
     def _counting_reconcile_locked(
-        *, fix: bool = False, skip_dead_session_sweep: bool = False
+        *,
+        fix: bool = False,
+        skip_dead_session_sweep: bool = False,
+        dry_run: bool = False,
     ) -> CommandResult:
         calls.append((fix, skip_dead_session_sweep))
-        return original_reconcile_locked(fix=fix, skip_dead_session_sweep=skip_dead_session_sweep)
+        return original_reconcile_locked(
+            fix=fix,
+            skip_dead_session_sweep=skip_dead_session_sweep,
+            dry_run=dry_run,
+        )
 
     # frozen_now (issue #828) injected so the schedule assertion below is
     # exact instead of racing _reconcile_locked's own duration (or a CI

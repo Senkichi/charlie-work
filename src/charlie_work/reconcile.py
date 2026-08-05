@@ -1774,6 +1774,7 @@ def apply_fixes(
     *,
     repo_root: Path | None = None,
     state_path: Path | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Apply the structured fixes for each drift item and return a NEW state dict.
 
@@ -1826,22 +1827,25 @@ def apply_fixes(
                     new_pr_state["issue_number"] = item.issue_number
                 new_prs[pr_key] = new_pr_state
 
-                checkout_removed = False
                 if repo_root is not None:
                     reviews_dir = resolved_layout(config, repo_root).reviews_dir
-                    checkout_removed = remove_review_checkout(
-                        repo_root, item.pr_number, reviews_dir=reviews_dir
-                    )
-                checkout_action = (
-                    (
-                        f"remove review checkout for PR #{item.pr_number}: "
-                        f"{'ok' if checkout_removed else 'failed'}"
-                    )
-                    if repo_root is not None
-                    else (
+                    if dry_run:
+                        checkout_action = (
+                            f"remove review checkout for PR #{item.pr_number}: "
+                            "would remove (dry-run)"
+                        )
+                    else:
+                        checkout_removed = remove_review_checkout(
+                            repo_root, item.pr_number, reviews_dir=reviews_dir
+                        )
+                        checkout_action = (
+                            f"remove review checkout for PR #{item.pr_number}: "
+                            f"{'ok' if checkout_removed else 'failed'}"
+                        )
+                else:
+                    checkout_action = (
                         f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
                     )
-                )
                 fix_actions = list(item.fix_actions) + [
                     checkout_action,
                     f"clear review-dispatch fields for prs[{item.pr_number}]",
@@ -1887,8 +1891,22 @@ def apply_fixes(
                     new_prs[pr_key] = without_review_dispatch_claim(new_prs[pr_key])
                 if repo_root is not None:
                     reviews_dir = resolved_layout(config, repo_root).reviews_dir
-                    checkout_removed = remove_review_checkout(
-                        repo_root, item.pr_number, reviews_dir=reviews_dir
+                    if dry_run:
+                        checkout_action = (
+                            f"remove review checkout for PR #{item.pr_number}: "
+                            "would remove (dry-run)"
+                        )
+                    else:
+                        checkout_removed = remove_review_checkout(
+                            repo_root, item.pr_number, reviews_dir=reviews_dir
+                        )
+                        checkout_action = (
+                            f"remove review checkout for PR #{item.pr_number}: "
+                            f"{'ok' if checkout_removed else 'failed'}"
+                        )
+                else:
+                    checkout_action = (
+                        f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
                     )
             if item.issue_number is not None:
                 label_ok = True
@@ -1898,16 +1916,6 @@ def apply_fixes(
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
                 if item.pr_number is not None:
-                    checkout_action = (
-                        (
-                            f"remove review checkout for PR #{item.pr_number}: "
-                            f"{'ok' if checkout_removed else 'failed'}"
-                        )
-                        if repo_root is not None
-                        else (
-                            f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
-                        )
-                    )
                     fix_actions.extend(
                         [
                             checkout_action,
@@ -2169,7 +2177,10 @@ def apply_fixes(
                 salvage_error = "repo_root not available"
                 pr_number = None
                 if repo_root is not None:
-                    push_ok, push_error = push_branch(repo_root, item.branch)
+                    if dry_run:
+                        push_ok, push_error = False, "dry-run: push skipped"
+                    else:
+                        push_ok, push_error = push_branch(repo_root, item.branch)
                     if push_ok:
                         pr_create = getattr(gh, "pr_create", None)
                         if pr_create is not None:
@@ -2264,17 +2275,18 @@ def apply_fixes(
                         add_labels=item.add_labels,
                     )
 
-        new_state = append_event(
-            new_state,
-            "reconcile",
-            {
-                "kind": item.kind,
-                "issue_number": item.issue_number,
-                "pr_number": item.pr_number,
-                "fix_actions": list(item.fix_actions),
-                "detail": item.detail,
-            },
-            state_path=state_path,
-        )
+        if not dry_run:
+            new_state = append_event(
+                new_state,
+                "reconcile",
+                {
+                    "kind": item.kind,
+                    "issue_number": item.issue_number,
+                    "pr_number": item.pr_number,
+                    "fix_actions": list(item.fix_actions),
+                    "detail": item.detail,
+                },
+                state_path=state_path,
+            )
 
     return new_state
