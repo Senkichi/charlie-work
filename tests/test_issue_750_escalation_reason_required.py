@@ -48,11 +48,30 @@ def test_record_review_event_payload_includes_issue_number(tmp_path: Path) -> No
 
 
 def test_escalated_status_literal_is_only_in_helper() -> None:
-    """Every dict literal that sets ``status: "escalated"`` on an issue/PR
-    record must live inside the ``_escalate_issue`` helper.
+    """Every hand-rolled ``status = "escalated"`` write must live inside the
+    ``_escalate_issue`` helper.
 
     This is the structural backstop that prevents a future call site from
     hand-rolling a status="escalated" write without ``escalation_reason``.
+
+    Two syntactic forms count as hand-rolling, because both are unambiguous
+    and both occur in this file's own history:
+
+    * a dict literal ``{"status": "escalated", ...}``
+    * a subscript assignment ``record["status"] = "escalated"``
+
+    Checking only the first form is not enough. After the #750 consolidation
+    every escalating call site goes through the helper, which assigns from its
+    ``status`` *parameter* rather than from a literal -- so zero dict literals
+    remain and a literal-only check passes trivially, including if the helper
+    were deleted and its call sites reverted to subscript assignment. The
+    anti-vacuity assertion below anchors the guard against exactly that.
+
+    A third form -- ``status = "escalated"`` bound to a local, then assigned as
+    ``record["status"] = status`` -- is deliberately *not* flagged. It is
+    control-flow dependent (the same local carries "dispatch_failed" on the
+    other branch), so it cannot be judged syntactically without false
+    positives.
     """
     source = SRC_WORKFLOW.read_text(encoding="utf-8")
     tree = ast.parse(source, filename=str(SRC_WORKFLOW))
@@ -80,21 +99,60 @@ def test_escalated_status_literal_is_only_in_helper() -> None:
 
     violations: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Dict):
-            continue
-        for key, value in zip(node.keys, node.values, strict=True):
-            if (
-                isinstance(key, ast.Constant)
-                and key.value == "status"
-                and isinstance(value, ast.Constant)
-                and value.value == "escalated"
-                and not _is_in_helper(node)
-            ):
-                violations.append(f"line {getattr(node, 'lineno', '?')}")
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=True):
+                if (
+                    isinstance(key, ast.Constant)
+                    and key.value == "status"
+                    and isinstance(value, ast.Constant)
+                    and value.value == "escalated"
+                    and not _is_in_helper(node)
+                ):
+                    violations.append(f"dict literal at line {getattr(node, 'lineno', '?')}")
+        elif isinstance(node, ast.Assign):
+            if not (isinstance(node.value, ast.Constant) and node.value.value == "escalated"):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == "status"
+                    and not _is_in_helper(node)
+                ):
+                    violations.append(f"subscript assign at line {getattr(node, 'lineno', '?')}")
 
     assert not violations, (
-        "Found status='escalated' dict literal(s) outside _escalate_issue: "
-        + ", ".join(violations)
+        "Found status='escalated' write(s) outside _escalate_issue: " + ", ".join(violations)
+    )
+
+    # Anti-vacuity anchor. The scan above legitimately finds nothing once every
+    # call site routes through the helper, so an empty result is not by itself
+    # evidence that the invariant holds -- it is equally consistent with the
+    # helper having been removed. Assert the subject of the invariant still
+    # exists and still owns the escalated status.
+    helper = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "_escalate_issue"
+        ),
+        None,
+    )
+    assert helper is not None, "_escalate_issue helper is gone; this guard would pass vacuously"
+
+    kwonly = dict(zip(helper.args.kwonlyargs, helper.args.kw_defaults, strict=True))
+    status_default = next(
+        (default for arg, default in kwonly.items() if arg.arg == "status"),
+        None,
+    )
+    assert isinstance(status_default, ast.Constant) and status_default.value == "escalated", (
+        "_escalate_issue no longer defaults status to 'escalated'; the guard above "
+        "would no longer be checking the escalation path"
+    )
+    assert any(arg.arg == "reason" for arg in helper.args.kwonlyargs), (
+        "_escalate_issue no longer takes a keyword-only 'reason'; "
+        "status='escalated' without a reason is representable again"
     )
 
 
