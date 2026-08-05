@@ -12,11 +12,13 @@ unlinked (never the target it points at) before the worktree is removed.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
 import shutil
 import stat
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -2883,6 +2885,120 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
         if current_branch.ok and current_branch.stdout.strip():
             return current_branch.stdout.strip()
     return "main"
+
+
+# Cap on commit subjects rendered into a salvage body. A runaway branch should
+# not paste hundreds of lines into a PR description; the count is reported so
+# the elision is visible rather than silent.
+_SALVAGE_LOG_LIMIT = 20
+
+
+def summarize_branch_work(
+    repo_root: Path,
+    branch: str,
+    base_ref: str,
+    *,
+    test_path_globs: Sequence[str] = (),
+) -> str:
+    """Render the worker's own evidence about ``branch`` for a salvage PR body.
+
+    A salvage PR is opened by the orchestrator, not by the worker that did the
+    work, so there is no author-written body to carry the change's rationale.
+    The janitor's body gate (``review.require_tests_or_rationale``) still
+    applies to it, so a fixed boilerplate body can never pass: every salvage
+    PR would fail a gate on text the orchestrator itself wrote.
+
+    The honest input is the worker's own commit subjects plus the test files
+    the branch touched, and this renders those verbatim rather than injecting
+    the gate's keywords.
+
+    Be precise about how strong that is, because it is easy to overclaim. The
+    only case this still fails is a branch with **no commits** ahead of base:
+    that returns ``""``, leaving boilerplate that cannot match, so the gate
+    keeps a real failure mode. A branch that *does* have commits will pass,
+    including one whose commits are all "wip" and which touched no tests --
+    the ``## Tests`` heading alone satisfies the regex. That is accepted
+    deliberately, not overlooked:
+
+    - The body gate's job is "does this PR carry the author's rationale", and
+      the full commit log is that rationale. For a salvage PR it is the only
+      authored text that exists.
+    - Whether a change carries *enough* tests is ``test_adequacy``'s job, and
+      it already routes product-code-without-tests to rework and has a real
+      exemption mechanism (``Test-exempt:``). Re-litigating that here would
+      enforce one rule in two places and give the second copy no way to be
+      exempted.
+
+    ``test_path_globs`` should come from ``config.test_adequacy.test_path_globs``
+    so test-file classification has one definition repo-wide (janitor reuses
+    the same globs even when ``test_adequacy`` is disabled).
+
+    Returns a markdown block, or ``""`` when the branch history cannot be read.
+    A git failure is reported as *no evidence*, never as fabricated evidence.
+    """
+    try:
+        safe_branch = require_valid_ref_name(branch, context="summarize_branch_work branch")
+        safe_base = require_valid_rev(base_ref, context="summarize_branch_work base_ref")
+    except ValueError:
+        return ""
+
+    # Two dots for log, three for diff -- deliberately different operators.
+    # ``git log A...B`` is the SYMMETRIC difference and would list commits made
+    # on the base branch since it forked, attributing unrelated work to this
+    # worker. ``A..B`` is "on B, not on A". ``git diff A...B`` conversely means
+    # "changes B introduced since the merge-base", which is the one that
+    # ignores base-branch drift.
+    log_range = f"{safe_base}..{safe_branch}"
+    diff_range = f"{safe_base}...{safe_branch}"
+
+    log = run_captured(
+        ["git", "log", "--no-merges", "--format=%s", log_range],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not log.ok:
+        return ""
+
+    subjects = [line.strip() for line in log.stdout.splitlines() if line.strip()]
+
+    names = run_captured(
+        ["git", "diff", "--name-only", diff_range],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    changed = (
+        [line.strip() for line in names.stdout.splitlines() if line.strip()] if names.ok else []
+    )
+    test_files = [
+        name for name in changed if any(fnmatch.fnmatch(name, glob) for glob in test_path_globs)
+    ]
+
+    if not subjects:
+        # The commit log IS the worker's rationale. With no commits there is
+        # nothing honest to report, and any phrasing of "no tests were changed"
+        # would still contain the gate's keywords -- passing a body that says
+        # nothing. Return nothing instead, so the janitor gate keeps a real
+        # failure mode and routes the PR to rework.
+        return ""
+
+    shown = subjects[:_SALVAGE_LOG_LIMIT]
+    lines = "\n".join(f"- {subject}" for subject in shown)
+    if len(subjects) > len(shown):
+        lines += f"\n- ... and {len(subjects) - len(shown)} more commit(s)"
+    sections = [f"## Worker's commit log\n\n{lines}"]
+
+    if test_files:
+        listed = "\n".join(f"- `{name}`" for name in test_files)
+        sections.append(
+            f"## Tests\n\nThe branch changed {len(test_files)} test file(s):\n\n{listed}"
+        )
+    else:
+        sections.append(
+            f"## Tests\n\nThe branch changed no test files ({len(changed)} file(s) "
+            "changed in total). `test_adequacy` gates that separately."
+        )
+
+    return "\n\n".join(sections)
 
 
 def _list_worktrees_porcelain(repo_root: Path) -> tuple[list[dict], str | None]:
