@@ -102,6 +102,118 @@ def test_update_supervisor_heartbeat_preserves_started_and_updates_beat(
     assert hb["exited_at"] is None
 
 
+def test_update_supervisor_heartbeat_skips_write_when_file_corrupt(
+    tmp_path: Path,
+    caplog: Any,
+) -> None:
+    """A corrupt-but-present heartbeat must not be overwritten with a partial record.
+
+    Regression test for issue #976: ``_read_heartbeat(path) or {}`` used to
+    collapse "unreadable" into "start from empty", so the next
+    ``update_supervisor_heartbeat`` call silently wrote a record containing
+    only ``last_beat_at`` / ``pass_number`` — dropping ``pid`` / ``started_at``
+    / ``exited_at`` / ``exit_code`` that the docstring promises to preserve.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True)
+    heartbeat_path = _heartbeat_file(fleet_dir)
+    heartbeat_path.write_text("{not json", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="charlie_work.supervisor_lifecycle"):
+        update_supervisor_heartbeat(str(fleet_dir), pass_number=4, last_beat_at=BEAT_AT)
+
+    # The corrupt file is left untouched rather than replaced with a
+    # less-complete (but validly-parsing) record.
+    assert heartbeat_path.read_text(encoding="utf-8") == "{not json"
+    assert "unreadable" in caplog.text
+    # The warning must name *why* it was unreadable. A transient lock
+    # (OSError) and genuinely corrupt JSON (JSONDecodeError) call for
+    # opposite responses, and by the time an operator inspects the file a
+    # transient cause has healed -- so a warning without the cause is
+    # unactionable exactly in the case where the cause mattered most.
+    assert "JSONDecodeError" in caplog.text
+
+
+def test_heartbeat_read_for_merge_warns_with_cause_when_not_an_object(
+    tmp_path: Path,
+    caplog: Any,
+) -> None:
+    """Valid JSON that is not an object is also "unreadable", and says so.
+
+    ``json.loads("[]")`` raises nothing, so this path never reaches the
+    exception handler -- it used to return ``None`` silently, producing a
+    skipped write with no log line at all.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True)
+    heartbeat_path = _heartbeat_file(fleet_dir)
+    heartbeat_path.write_text("[]", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="charlie_work.supervisor_lifecycle"):
+        update_supervisor_heartbeat(str(fleet_dir), pass_number=4, last_beat_at=BEAT_AT)
+
+    assert heartbeat_path.read_text(encoding="utf-8") == "[]"
+    assert "not a JSON object" in caplog.text
+    assert "list" in caplog.text
+
+
+def test_update_supervisor_heartbeat_starts_fresh_when_file_missing(
+    tmp_path: Path,
+) -> None:
+    """Missing file (legitimate first write) is unaffected by the corrupt-file fix."""
+    fleet_dir = str(tmp_path / "fleet")
+    update_supervisor_heartbeat(fleet_dir, pass_number=0, last_beat_at=BEAT_AT)
+
+    hb = json.loads(_heartbeat_file(tmp_path / "fleet").read_text(encoding="utf-8"))
+    assert hb["last_beat_at"] == BEAT_AT
+    assert hb["pass_number"] == 0
+
+
+def test_record_supervisor_exit_skips_stamp_when_heartbeat_corrupt(
+    tmp_path: Path,
+    caplog: Any,
+) -> None:
+    """Same partial-write defect at the ``record_supervisor_exit`` call site (issue #976)."""
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True)
+    heartbeat_path = _heartbeat_file(fleet_dir)
+    heartbeat_path.write_text("{not json", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="charlie_work.supervisor_lifecycle"):
+        payload = record_supervisor_exit(
+            str(fleet_dir), exit_code=0, passes=1, started_at=STARTED_AT, reason="completed"
+        )
+
+    assert payload["exit_code"] == 0  # the event payload is still emitted
+    assert heartbeat_path.read_text(encoding="utf-8") == "{not json"
+    assert "unreadable" in caplog.text
+
+
+def test_reader_tolerates_a_preexisting_partial_record(tmp_path: Path) -> None:
+    """A partial record already on disk (from before this fix) must not crash readers.
+
+    Existing readers use ``dict.get()`` for every optional field, so a
+    record missing keys behaves identically to one where those keys are
+    explicitly ``None`` — no reader-side change was required for this fix.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True)
+    heartbeat_path = _heartbeat_file(fleet_dir)
+    # Simulates a record already damaged by the pre-fix bug: only the two
+    # fields update_supervisor_heartbeat always writes are present.
+    heartbeat_path.write_text(
+        json.dumps({"last_beat_at": BEAT_AT, "pass_number": 4}), encoding="utf-8"
+    )
+
+    prior = detect_prior_abnormal_exit(str(fleet_dir))
+    assert prior is not None
+    assert prior["prior_pid"] is None
+    assert prior["prior_started_at"] is None
+    assert prior["prior_last_beat_at"] == BEAT_AT
+    assert prior["prior_pass_number"] == 4
+    assert prior["uptime_seconds"] is None  # no started_at to compute uptime from
+
+
 def test_detect_prior_abnormal_exit_none_when_no_heartbeat(tmp_path: Path) -> None:
     assert detect_prior_abnormal_exit(str(tmp_path / "fleet")) is None
 
