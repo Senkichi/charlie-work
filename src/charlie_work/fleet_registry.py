@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import layout
-from .config import DEFAULT_CONFIG_FILENAME
+from .config import DEFAULT_CONFIG_FILENAME, load_config
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError, GitHubLike
@@ -205,14 +205,33 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        # NOTE: reconstructs the *default* layout and ignores a per-repo
-        # ``devin.sessions_dir`` override (deferred behavioral fix). A repo that
-        # overrides ``sessions_dir`` is silently skipped from this fleet-wide
-        # concurrency count, which fails open toward over-dispatch rather than
-        # under-dispatch.
-        sessions_dir = layout.sessions_dir_default(state_dir)
+        # Resolve sessions_dir from the repo's own config + the layout module.
+        # The registry's state_dir is the actual resolved state root; the repo's
+        # config owns any devin.sessions_dir override, and layout provides the
+        # default. This makes the "missing because layout drifted" case
+        # structurally impossible instead of something to detect after the fact.
+        config_path = Path(entry.get("config_path", ""))
+        try:
+            repo_config = load_config(config_path if config_path.exists() else None)
+        except Exception as exc:  # noqa: BLE001 - containment is deliberate
+            logger.warning(
+                f"Skipping fleet live-count for {name_with_owner}: "
+                f"failed to load repo config {config_path}: {exc}"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+        sessions_dir = layout.resolve_state_child(
+            repo_config.devin.sessions_dir,
+            repo_root=repo_root,
+            default=layout.sessions_dir_default(state_dir),
+        )
         if not sessions_dir.exists():
-            # No sessions dir means no live sessions for this repo
+            logger.warning(
+                f"Skipping fleet live-count for {name_with_owner}: "
+                f"sessions_dir {sessions_dir} does not exist"
+            )
+            skipped_repos.append(name_with_owner)
             continue
 
         # Count live workers using adapter-agnostic iter_workers
