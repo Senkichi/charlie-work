@@ -598,8 +598,17 @@ def _escalate_issue(
     lane-specific fields (attempt counters, dispatch claim state, etc.). The
     helper overwrites ``number``, ``issue_number``, ``status``, and
     ``escalation_reason`` on the PR, and ``number``, ``status``,
-    ``escalation_reason``, ``reason_class``, and ``merge_alert`` on the issue,
-    so a caller cannot accidentally omit the required reason.
+    ``escalation_reason``, ``reason_class``, ``merge_alert``, and
+    ``terminal_since`` on the issue, so a caller cannot accidentally omit the
+    required reason.
+
+    ``terminal_since`` (issue #947) records when this issue most recently
+    entered a terminal state via this helper, so a periodic sweep can alert
+    on an issue parked in ``agent:human-needed`` past a configurable age
+    instead of that state being silently invisible. It is unconditionally
+    refreshed on every call (not just the first): a re-escalation after a
+    de-escalation is a fresh terminal episode, not a continuation of the old
+    one.
     """
     state.setdefault("issues", {})
     state.setdefault("prs", {})
@@ -613,6 +622,7 @@ def _escalate_issue(
             "escalation_reason": reason,
             "reason_class": escalation_reason_class(reason_class),
             "merge_alert": "OK",
+            "terminal_since": utc_now(),
         }
         if issue_extra:
             issue_entry.update(issue_extra)
@@ -623,6 +633,7 @@ def _escalate_issue(
         issue_entry["escalation_reason"] = reason
         issue_entry["reason_class"] = escalation_reason_class(reason_class)
         issue_entry["merge_alert"] = "OK"
+        issue_entry["terminal_since"] = utc_now()
         state["issues"][issue_key] = issue_entry
 
     if pr_number is not None:
@@ -13500,6 +13511,7 @@ class OrchestratorApp:
                             self.config,
                             repo_root=self.repo_root,
                             skip_dead_session_sweep=skip_dead_session_sweep,
+                            state_path=self.paths.state_file,
                         )
                         + detect_aviator_stale_blocked(
                             self.gh, self.config, repo_root=self.repo_root
@@ -13531,6 +13543,7 @@ class OrchestratorApp:
                                 self.config,
                                 repo_root=self.repo_root,
                                 skip_dead_session_sweep=skip_dead_session_sweep,
+                                state_path=self.paths.state_file,
                             )
                             + detect_aviator_stale_blocked(
                                 self.gh, self.config, repo_root=self.repo_root

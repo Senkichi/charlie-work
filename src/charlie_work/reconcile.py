@@ -38,10 +38,13 @@ from .github import (
     label_names,
     linked_issue_number,
 )
+from .instrumentation import query_events
 from .labels import TransitionOutcome, transition
 from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
 from .state import (
+    DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
+    ESCALATION_REASON_CLASS_BY_EVENT_KIND,
     ORCHESTRATOR_OWNED_ISSUE_STATUSES,
     PASSIVE_OPEN_STATUS,
     append_event,
@@ -564,12 +567,19 @@ def detect_drift(
     *,
     repo_root: Path | None = None,
     skip_dead_session_sweep: bool = False,
+    state_path: Path | None = None,
+    now: datetime | None = None,
 ) -> list[DriftItem]:
     """Read-only comparison of GitHub reality against ``state``.
 
     Issues exactly two ``gh.run`` list queries (all PRs, all issues) and
     performs every drift check against those two in-memory snapshots — no
-    per-item ``gh`` calls.
+    per-item ``gh`` calls. ``state_path``, if given, additionally allows the
+    stale-``human_needed`` check (issue #947, below) to fall back to
+    ``events.db`` for issues escalated before that check shipped; passing
+    ``None`` (the default, and what every pre-#947 caller/test still passes)
+    simply narrows that one check to its state.json-only tiers, not a fourth
+    ``gh.run`` call.
 
     If ``repo_root`` is provided, also checks for dead sessions and classifies
     their failures to update the provider throttle state.
@@ -601,6 +611,7 @@ def detect_drift(
     sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold)
     if not sufficient:
         raise GraphQLBudgetError(remaining, reset_at, threshold)
+    now = now if now is not None else datetime.now(UTC)
 
     labels_cfg = config.labels
     prs = _fetch_prs(gh)
@@ -1205,6 +1216,85 @@ def detect_drift(
         # `charlie unescalate` re-enters the machine.
         tracked_entry = state.get("issues", {}).get(str(issue_number))
         tracked_status = tracked_entry.get("status") if isinstance(tracked_entry, dict) else None
+
+        # Issue #947: ``agent:human-needed`` is a forced terminal state with
+        # no other alerting -- an issue parked there (e.g. #894) is silently
+        # invisible until an operator happens to look. Gated on the GitHub
+        # label itself (not ``tracked_status``) so it fires uniformly for
+        # every path that can apply the label (``escalated``, ``blocked``,
+        # ``redispatch_escalated``, ``merged_pr_mention_flagged``, or a
+        # manual add with no state.json entry at all), and placed before the
+        # ``tracked_status == "escalated"`` branch below because that branch
+        # unconditionally ``continue``s -- inserting after it would silently
+        # skip the common case.
+        #
+        # Age is resolved with a 3-tier fallback so a legacy escalation
+        # (predating this check) still gets a real age instead of
+        # masquerading as fresh:
+        #   1. ``terminal_since`` -- stamped by ``_escalate_issue`` on every
+        #      escalated/blocked transition going forward.
+        #   2. ``merged_pr_mention_flagged_at`` -- the one other durable
+        #      local timestamp a human_needed transition can carry (issue
+        #      #203); that path does not go through ``_escalate_issue``.
+        #   3. The most recent escalation-transition event in ``events.db``
+        #      for this issue, using the same CI-verified exhaustive kind
+        #      registry ``_backfill_missing_reason_classes`` already relies
+        #      on (``test_escalation_event_kind_mapping_is_complete`` in
+        #      test_deescalation.py) -- covers issues escalated before this
+        #      check shipped, e.g. #894.
+        # No timestamp found in any tier reports immediately as "never
+        # observed" rather than defaulting to fresh: silently treating
+        # unknown age as healthy is exactly the failure mode
+        # ``classify_backlog_reachability``'s ``observed: False`` return
+        # exists to avoid.
+        if labels_cfg.human_needed in issue_labels and _issue_state(issue) == "OPEN":
+            since_raw: str | None = None
+            if isinstance(tracked_entry, dict):
+                since_raw = tracked_entry.get("terminal_since") or tracked_entry.get(
+                    "merged_pr_mention_flagged_at"
+                )
+            if not since_raw and state_path is not None:
+                events = query_events(state_path, issue_number=issue_number)
+                escalation_kinds = (
+                    frozenset(ESCALATION_REASON_CLASS_BY_EVENT_KIND)
+                    | DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS
+                )
+                escalation_events = [e for e in events if e.get("kind") in escalation_kinds]
+                if escalation_events:
+                    since_raw = escalation_events[-1]["ts"]
+
+            age_days: float | None = None
+            if since_raw:
+                try:
+                    since_dt = datetime.fromisoformat(str(since_raw).replace("Z", "+00:00"))
+                    age_days = (now - since_dt).total_seconds() / 86400.0
+                except (ValueError, TypeError):
+                    # A malformed/naive timestamp must never crash a
+                    # read-only drift pass -- fall back to "never observed"
+                    # (age_days stays None) the same as no timestamp at all.
+                    age_days = None
+
+            threshold_days = config.reconcile_pass.terminal_state_alert_days
+            if age_days is None or age_days >= threshold_days:
+                detail = (
+                    f"issue #{issue_number} has been parked in "
+                    f"'{labels_cfg.human_needed}' for {age_days:.1f} day(s)"
+                    if age_days is not None
+                    else (
+                        f"issue #{issue_number} carries '{labels_cfg.human_needed}' with no "
+                        "recorded escalation timestamp (age never observed)"
+                    )
+                )
+                drift.append(
+                    DriftItem(
+                        kind="terminal_state_stale",
+                        issue_number=issue_number,
+                        pr_number=None,
+                        detail=detail,
+                        fix_actions=(),
+                    )
+                )
+
         if tracked_status == "escalated" and _issue_state(issue) == "OPEN":
             needs_human_needed = labels_cfg.human_needed not in issue_labels
             if needs_human_needed or active_present:

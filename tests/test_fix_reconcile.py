@@ -446,16 +446,30 @@ def test_escalated_status_with_stale_active_label_strips_it() -> None:
     full_drift = detect_drift(gh, state, config)
     issue_40_items = [item for item in full_drift if item.issue_number == 40]
 
-    assert len(issue_40_items) == 1
-    item = issue_40_items[0]
-    assert item.kind == "escalated_labels_converged"
+    # Issue #947: any OPEN issue carrying `human_needed` also gets a
+    # `terminal_state_stale` alert (age unknown -> "never observed" here,
+    # since no state_path/timestamp is supplied) alongside whatever
+    # label-convergence drift this test is actually pinning. Assert the
+    # convergence item specifically rather than the raw count.
+    convergence_items = [
+        item for item in issue_40_items if item.kind == "escalated_labels_converged"
+    ]
+    assert len(convergence_items) == 1
+    item = convergence_items[0]
     assert item.add_labels == ()
     assert item.remove_labels == (config.labels.needs_rework,)
+    assert {item.kind for item in issue_40_items} == {
+        "escalated_labels_converged",
+        "terminal_state_stale",
+    }
 
 
 def test_escalated_status_with_correct_labels_is_no_drift() -> None:
     """An escalated issue whose labels already reflect it (human_needed, no
-    actives) must produce zero drift -- the convergence check is idempotent.
+    actives) must produce zero *label-convergence* drift -- the convergence
+    check is idempotent. Issue #947's orthogonal `terminal_state_stale` alert
+    still fires (age never observed, no timestamp seeded here) -- that is
+    the intended new behavior, not label-convergence drift re-appearing.
     """
     config = OrchestratorConfig()
     gh = FakeGitHub(
@@ -466,7 +480,8 @@ def test_escalated_status_with_correct_labels_is_no_drift() -> None:
     state["issues"]["40"] = {"number": 40, "status": "escalated"}
 
     full_drift = detect_drift(gh, state, config)
-    assert [item for item in full_drift if item.issue_number == 40] == []
+    issue_40_kinds = {item.kind for item in full_drift if item.issue_number == 40}
+    assert issue_40_kinds == {"terminal_state_stale"}
 
 
 def test_no_open_pr_repair_skips_terminal_labeled_issue() -> None:
@@ -489,7 +504,10 @@ def test_no_open_pr_repair_skips_terminal_labeled_issue() -> None:
     full_drift = detect_drift(gh, state, config)
     kinds = {item.kind for item in full_drift if item.issue_number == 41}
     assert "issue_active_label_no_open_pr" not in kinds
-    assert kinds == {"done_label_with_active_labels"}
+    # Issue #947: terminal_state_stale also fires alongside the
+    # terminal+active contradiction repair -- both are legitimate, orthogonal
+    # findings for the same issue.
+    assert kinds == {"done_label_with_active_labels", "terminal_state_stale"}
 
 
 def test_valid_issue_statuses_covers_every_assigned_status_literal() -> None:
