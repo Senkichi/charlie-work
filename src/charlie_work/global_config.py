@@ -226,10 +226,10 @@ def load_layered_config(
         # merged_data before validation ever saw the name, so a typo'd section
         # with no body was silently accepted here while load_config (which
         # checks raw key presence, not truthiness) rejected the identical
-        # file. Keeping the name (with its coerced-empty value) lets the
-        # existing round-trip through load_config raise "unknown config
-        # section(s)" exactly as it does for a non-empty bogus section, and
-        # keeps the #665 discarded-global-layer rescue below in play for it.
+        # file. Keeping the name (with its coerced-empty value) lets
+        # build_config_from_data raise "unknown config section(s)" exactly
+        # as it does for a non-empty bogus section, and keeps the #665
+        # discarded-global-layer rescue below in play for it.
         if merged_section or section not in known_sections:
             merged_data[section] = merged_section
 

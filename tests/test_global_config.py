@@ -25,10 +25,13 @@ are not duplicated here.
 
 from __future__ import annotations
 
+import ast
 import tempfile
 from pathlib import Path
 
-from charlie_work.config import OrchestratorConfig, load_config
+import yaml
+
+from charlie_work.config import OrchestratorConfig, build_config_from_data, load_config
 from charlie_work.global_config import load_layered_config
 
 
@@ -149,8 +152,96 @@ def test_global_config_module_does_not_use_tempfile() -> None:
     """Structural pin for the fix: the merge must not round-trip through disk
     at all, not merely clean up after itself. Guards against a regression
     that re-introduces ``tempfile.NamedTemporaryFile`` with cleanup that
-    happens to work in tests but still costs the write+read on every call."""
+    happens to work in tests but still costs the write+read on every call.
+
+    Checked via the AST's import nodes rather than a substring search on the
+    source text: a substring check on the literal word "tempfile" would trip
+    on any future comment that mentions it -- e.g. one explaining *why* the
+    module no longer uses it, exactly like the docstring on the test above
+    this one, or the historical-context comments this fix itself added."""
     import charlie_work.global_config as global_config_module
 
     source = Path(global_config_module.__file__).read_text(encoding="utf-8")
-    assert "tempfile" not in source
+    tree = ast.parse(source)
+    imported_names = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    assert "tempfile" not in imported_names
+
+
+# ---------------------------------------------------------------------------
+# Differential pin for the extraction itself: build_config_from_data (dict ->
+# OrchestratorConfig, no path) must resolve identically to load_config (path
+# -> dict -> OrchestratorConfig) on the same data, across the sections whose
+# validation does real coercion work rather than a plain pass-through. This
+# is the test that would catch the extraction itself going wrong -- the
+# semantics tests above pass against both the old and new implementation, so
+# on their own they don't pin the dict-in / dict-out step that #704 added.
+# ---------------------------------------------------------------------------
+
+
+def test_build_config_from_data_matches_load_config_on_disk(tmp_path: Path) -> None:
+    data = {
+        "api_worker": {
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "ANTHROPIC_API_KEY",
+                    "model": "claude-sonnet",
+                    "input_usd_per_mtok": 3.0,
+                    "output_usd_per_mtok": 15.0,
+                },
+            },
+            "budget": {"max_usd_per_session": 2.5},
+        },
+        "dispatch": {
+            "default_limit": 5,
+            "materialize_dirs": ["a", "b"],
+            "injected_paths": ["x/y", "z"],
+        },
+        "post_mortem": {"signature_rules": [{"pattern": "OOM", "kind": "oom"}]},
+    }
+    path = tmp_path / "orchestrator.config.yaml"
+    path.write_text(yaml.dump(data), encoding="utf-8")
+
+    from_dict = build_config_from_data(data)
+    from_disk = load_config(path)
+
+    # sources is compare=False on the dataclass, so this equality is exactly
+    # the "same config" check the callers rely on -- provenance aside.
+    assert from_dict == from_disk
+
+
+def test_build_config_from_data_does_not_mutate_its_input(tmp_path: Path) -> None:
+    """build_config_from_data must not mutate the dict it's handed: unlike
+    the old load_config, which always saw a dict it had just parsed itself
+    and owned exclusively, load_layered_config now hands this function a
+    dict it built and may reuse. The original load_config body mutates
+    nested sections in place via `_section()`; this pins the deepcopy added
+    to guard against that becoming an observable side effect on a
+    caller-owned dict."""
+    data = {
+        "api_worker": {
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "ANTHROPIC_API_KEY",
+                    "model": "claude-sonnet",
+                    "input_usd_per_mtok": 3.0,
+                    "output_usd_per_mtok": 15.0,
+                },
+            },
+            "budget": {"max_usd_per_session": 1.0},
+        },
+        "dispatch": {"default_limit": 5},
+    }
+    import copy
+
+    before = copy.deepcopy(data)
+
+    build_config_from_data(data)
+
+    assert data == before

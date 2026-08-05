@@ -148,9 +148,13 @@ def test_layered_records_both_layers_in_merge_order(tmp_path: pathlib.Path) -> N
 
 
 def test_layered_never_reports_the_internal_temp_file(tmp_path: pathlib.Path) -> None:
-    """The merge round-trips through a NamedTemporaryFile to reuse validation.
-    That path is deleted before the call returns, so leaking it as provenance
-    would name a file the operator cannot open -- worse than reporting none."""
+    """Historically (pre-#704) the merge round-tripped through a
+    NamedTemporaryFile to reuse validation, and that path was deleted before
+    the call returned -- so leaking it as provenance would have named a file
+    the operator cannot open, worse than reporting none. #704 removed the
+    temp file entirely (the merge is now built in memory), which makes this
+    pin trivially satisfied by construction; it stays as a regression guard
+    against a future reintroduction of a file-backed merge step."""
     fleet = tmp_path / "fleet"
     fleet.mkdir()
     (fleet / "config.yaml").write_text("dispatch:\n  default_limit: 9\n", encoding="utf-8")
@@ -222,7 +226,8 @@ def test_discarded_global_layer_rescue_reaches_an_empty_bodied_bogus_section(
     accepted instead of being detected-then-discarded. Guards against a fix
     for #962 that makes empty-bodied unknown sections raise but bypasses the
     #665 rescue path in the process (e.g. by validating before the merge
-    instead of feeding load_config's existing round-trip)."""
+    instead of feeding the merged dict to build_config_from_data, which is
+    what actually raises "unknown config section(s)" post-#704)."""
     fleet = tmp_path / "fleet"
     fleet.mkdir()
     (fleet / "config.yaml").write_text("not_a_real_section: {}\n", encoding="utf-8")
@@ -302,10 +307,11 @@ def test_layered_still_drops_a_known_section_with_an_empty_body(
 ) -> None:
     """Pin for a cell #962 must *not* change: a known section (`dispatch`)
     with an empty body in the global layer is still dropped from the merged
-    dict rather than round-tripped through load_config. This is safe only
-    because load_config's own `_section()` defaults an absent-but-known
-    section identically to a present-but-empty one -- so dropping it changes
-    nothing observable, unlike the unknown-section case above."""
+    dict rather than passed through to build_config_from_data. This is safe
+    only because build_config_from_data's own `_section()` defaults an
+    absent-but-known section identically to a present-but-empty one -- so
+    dropping it changes nothing observable, unlike the unknown-section case
+    above."""
     fleet = tmp_path / "fleet"
     fleet.mkdir()
     (fleet / "config.yaml").write_text("dispatch: {}\n", encoding="utf-8")
