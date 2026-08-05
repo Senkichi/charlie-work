@@ -3282,6 +3282,101 @@ def _append_sweep_events(
     return state
 
 
+def classify_backlog_reachability(
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    operator_claimed: set[int] | None = None,
+    *,
+    ready_open_count: int | None = None,
+) -> dict[str, Any]:
+    """Issue #944: observe the *unfiltered* open backlog and record why nothing dispatched.
+
+    The dispatch path (``_dispatch_impl``) sources candidates from
+    ``issue_list(labels=[ready], state="all")`` -- filtered *at the source*. An
+    issue without ``automated-ready`` is therefore not rejected by
+    ``_is_dispatchable``; it is never **fetched**. No counter, event field, or
+    status line placed downstream of that query can distinguish "no work
+    exists" from "the entire backlog is unreachable", because by then the
+    unreachable issues have been filtered out of existence.
+
+    That gap hid a four-day total dispatch stall (2026-07-31 -> 2026-08-05):
+    87 open issues, 0 dispatchable, while every pass reported ``ok=1`` and every
+    ``dispatch`` event carried ``issue_numbers: []``. A content-empty stream
+    defeats content-keyed alerting exactly as silence does.
+
+    This runs one *unfiltered* ``issue_list(state="open")`` and bins every open
+    issue by the first ``_is_dispatchable`` arm that rejects it, so a zero
+    dispatch count comes with a reason rather than an absence.
+
+    **An empty fetch is reported as ``observed: False``, never as an empty
+    backlog.** ``GitHubClient._list_json`` returns ``[]`` both when the repo
+    genuinely has no open issues and when the underlying ``gh`` call fails
+    (``run()`` returning a non-list is coerced to ``[]``). Reporting that as
+    ``open_total: 0, dispatchable: 0`` would read as "nothing to do, all
+    healthy" -- reintroducing the exact failure this function exists to
+    detect, one layer up. Callers must treat ``observed: False`` as "unknown",
+    not as "empty".
+
+    ``ready_open_count`` is an optional cross-check: the unfiltered open list
+    must be a superset of the ready-labelled open issues the caller already
+    fetched. If it is not, the unfiltered fetch is unreliable and
+    ``consistent`` is False.
+    """
+    reachability: dict[str, Any] = {
+        "observed": False,
+        "consistent": True,
+        "open_total": 0,
+        "dispatchable": 0,
+        "missing_ready": 0,
+        "terminal_label": 0,
+        "active_label": 0,
+        "operator_claimed": 0,
+        "unreachable_examples": {},
+    }
+
+    issues = gh.issue_list(state="open")
+    if not issues:
+        # Ambiguous by construction -- see the docstring. Say nothing rather
+        # than say "empty".
+        return reachability
+
+    claimed = operator_claimed or set()
+    ready_seen = 0
+    examples: dict[str, list[int]] = {}
+    for issue in issues:
+        number = issue.get("number")
+        if number is None:
+            continue
+        number = int(number)
+        names = label_names(issue)
+        if config.labels.ready not in names:
+            reason = "missing_ready"
+        else:
+            ready_seen += 1
+            if names & config.labels.terminal:
+                reason = "terminal_label"
+            elif names & config.labels.active:
+                reason = "active_label"
+            elif number in claimed:
+                reason = "operator_claimed"
+            else:
+                reason = "dispatchable"
+        reachability[reason] += 1
+        if reason != "dispatchable":
+            bucket = examples.setdefault(reason, [])
+            if len(bucket) < 5:
+                bucket.append(number)
+
+    reachability["observed"] = True
+    reachability["open_total"] = len(issues)
+    reachability["unreachable_examples"] = {k: sorted(v) for k, v in sorted(examples.items())}
+    if ready_open_count is not None and ready_seen < ready_open_count:
+        # The unfiltered list is missing issues the caller already saw with the
+        # ready label, so it cannot be a superset -- the fetch is unreliable.
+        reachability["consistent"] = False
+    return reachability
+
+
 def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
@@ -6024,6 +6119,16 @@ class OrchestratorApp:
             "workers": workers,
             "operator_claimed": sorted(operator_claimed),
             "stale_claims": sorted(stale_claims),
+            # Issue #944: ready_issue_count above is the ready-FILTERED count,
+            # so "0 ready issues" and "0 issues at all" print identically. This
+            # is the unfiltered view: how big the backlog really is and which
+            # gate is rejecting it.
+            "backlog_reachability": classify_backlog_reachability(
+                self.gh,
+                self.config,
+                operator_claimed,
+                ready_open_count=len(issues),
+            ),
         }
 
         # Add runners section if feature is enabled and observation succeeded
@@ -6600,6 +6705,20 @@ class OrchestratorApp:
             issues = ready_issues
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
         operator_claimed_ready: list[int] = []
+
+        # Issue #944: observe the UNFILTERED backlog alongside the filtered
+        # candidate query above. This does not participate in selection and
+        # must not change dispatch behaviour -- it exists so that a zero
+        # dispatch count carries a reason. Done here, outside the state lock,
+        # because it is network I/O.
+        backlog_reachability = classify_backlog_reachability(
+            self.gh,
+            self.config,
+            operator_claimed_issues(load_state_locked(self.paths.state_file)),
+            ready_open_count=sum(
+                1 for issue in issues if str(issue.get("state") or "OPEN").upper() == "OPEN"
+            ),
+        )
 
         # Gather sessions_dir for stall detection and live worker counting
         sessions_dir = self._layout.sessions_dir
@@ -7670,6 +7789,10 @@ class OrchestratorApp:
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
                     "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
                     "failures": dispatch_failure_map,
+                    # Issue #944: why zero, when it is zero. Every other field
+                    # here describes issues the ready-filtered query returned;
+                    # this one describes the backlog that query cannot see.
+                    "backlog_reachability": backlog_reachability,
                 },
                 state_path=self.paths.state_file,
             )
