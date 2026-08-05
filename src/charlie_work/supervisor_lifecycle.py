@@ -84,6 +84,34 @@ def _read_heartbeat(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _read_heartbeat_for_merge(path: Path) -> dict[str, Any] | None:
+    """Read the heartbeat for a merge-in-place update (refresh or exit-stamp).
+
+    Distinguishes "no prior file" from "file present but unreadable" —
+    a distinction :func:`_read_heartbeat` deliberately collapses for its
+    read-only/conservative callers (:func:`read_supervisor_heartbeat`,
+    :func:`detect_prior_abnormal_exit`), where "assume nothing happened" is
+    correct.
+
+    A merge-in-place caller cannot use that collapse: treating "unreadable"
+    the same as "missing" means starting from ``{}`` and writing back only
+    the fields it knows about, silently discarding every other field the
+    existing record held. So this returns:
+
+    - ``{}`` when the file does not exist — a legitimate first write.
+    - the parsed dict when the file is present and readable.
+    - ``None`` when the file is present but corrupt/unreadable/non-dict —
+      the caller must not overwrite it with a less-complete record.
+    """
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _write_heartbeat(path: Path, payload: dict[str, Any]) -> None:
     """Atomically persist the heartbeat sidecar (temp-file + ``replace()``)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,12 +211,21 @@ def update_supervisor_heartbeat(
     Called at the top of every supervisor loop iteration so the
     freshness signal stays tight (at most one ``poll_interval_seconds``
     old on a live supervisor). Preserves ``started_at`` / ``pid`` /
-    ``exited_at`` / ``exit_code`` from the existing file. Best-effort:
-    a write failure is logged and swallowed so a disk hiccup does not
-    abort the pass.
+    ``exited_at`` / ``exit_code`` from the existing file when it is
+    readable. If the file is present but corrupt/unreadable, the update
+    is skipped (and logged) rather than overwriting it with a record
+    that drops those fields. Best-effort: a write failure is logged and
+    swallowed so a disk hiccup does not abort the pass.
     """
     path = supervisor_heartbeat_path(fleet_dir_override)
-    existing = _read_heartbeat(path) or {}
+    existing = _read_heartbeat_for_merge(path)
+    if existing is None:
+        logger.warning(
+            "Supervisor heartbeat at %s exists but is unreadable; skipping "
+            "refresh to avoid overwriting it with an incomplete record",
+            path,
+        )
+        return
     existing.update(
         {
             "last_beat_at": last_beat_at,
@@ -292,7 +329,14 @@ def record_supervisor_exit(
         "reason": reason,
     }
     log_event(path, SUPERVISOR_EXITED, payload, repo=_FLEET_REPO)
-    existing = _read_heartbeat(path) or {}
+    existing = _read_heartbeat_for_merge(path)
+    if existing is None:
+        logger.warning(
+            "Supervisor heartbeat at %s exists but is unreadable; skipping "
+            "exit stamp to avoid overwriting it with an incomplete record",
+            path,
+        )
+        return payload
     existing.update({"exited_at": exited_at, "exit_code": exit_code})
     try:
         _write_heartbeat(path, existing)
