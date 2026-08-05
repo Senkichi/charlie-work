@@ -34039,7 +34039,9 @@ def test_review_test_adequacy_pass_proceeds_to_packet(tmp_path: Path, monkeypatc
 # Fleet status tests
 
 
-def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> None:
+def test_fleet_status_aggregates_multiple_repos(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, autospec
+) -> None:
     """Test that fleet status aggregates status from multiple repos."""
     # Set up fleet directory override
     fleet_override = str(tmp_path / "fleet")
@@ -34096,27 +34098,17 @@ def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> 
     # Mock GitHub to return empty issue/PR lists
     from charlie_work.github import GitHub
 
-    def mock_issue_list(self, labels=None, state=None):
-        # Mirrors github.GitHub.issue_list exactly. This double previously
-        # took a required positional `label`, so it raised TypeError the
-        # moment a caller used the real interface's `state=` kwarg with no
-        # labels -- the unfiltered backlog query added in issue #944.
-        return []
-
-    def mock_pr_list(self):
-        return []
-
-    def mock_get_github_issue_dependencies(gh, issue_number):
-        return [], []
-
-    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
-    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
-    monkeypatch.setattr(
-        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    autospec(monkeypatch, GitHub, "issue_list", return_value=[])
+    autospec(monkeypatch, GitHub, "pr_list", return_value=[])
+    autospec(
+        monkeypatch,
+        github_module,
+        "get_github_issue_dependencies",
+        return_value=[],
     )
     # run_fleet_status creates a real GitHub instance; the field-list probe
     # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
-    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
+    autospec(monkeypatch, GitHub, "validate_field_lists", return_value=None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -34131,7 +34123,9 @@ def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> 
     assert result.data["errors"] == []
 
 
-def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
+def test_fleet_status_isolates_broken_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, autospec
+) -> None:
     """Test that fleet status isolates errors from broken repos."""
     # Set up fleet directory override
     fleet_override = str(tmp_path / "fleet")
@@ -34177,27 +34171,17 @@ def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
     # Mock GitHub to return empty issue/PR lists
     from charlie_work.github import GitHub
 
-    def mock_issue_list(self, labels=None, state=None):
-        # Mirrors github.GitHub.issue_list exactly. This double previously
-        # took a required positional `label`, so it raised TypeError the
-        # moment a caller used the real interface's `state=` kwarg with no
-        # labels -- the unfiltered backlog query added in issue #944.
-        return []
-
-    def mock_pr_list(self):
-        return []
-
-    def mock_get_github_issue_dependencies(gh, issue_number):
-        return [], []
-
-    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
-    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
-    monkeypatch.setattr(
-        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    autospec(monkeypatch, GitHub, "issue_list", return_value=[])
+    autospec(monkeypatch, GitHub, "pr_list", return_value=[])
+    autospec(
+        monkeypatch,
+        github_module,
+        "get_github_issue_dependencies",
+        return_value=[],
     )
     # run_fleet_status creates a real GitHub instance; the field-list probe
     # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
-    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
+    autospec(monkeypatch, GitHub, "validate_field_lists", return_value=None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -34213,7 +34197,9 @@ def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
     assert "does not exist" in result.data["errors"][0]["error"]
 
 
-def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
+def test_fleet_status_never_mutates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, autospec
+) -> None:
     """Test that fleet status never mutates GitHub labels or state."""
     # Set up fleet directory override
     fleet_override = str(tmp_path / "fleet")
@@ -34269,10 +34255,6 @@ def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
         return ""
 
     def mock_issue_list(self, labels=None, state=None):
-        # Mirrors github.GitHub.issue_list exactly. This double previously
-        # took a required positional `label`, so it raised TypeError the
-        # moment a caller used the real interface's `state=` kwarg with no
-        # labels -- the unfiltered backlog query added in issue #944.
         # The unfiltered call must return a SUPERSET of the ready-filtered
         # one -- that relation is what the classifier cross-checks.
         name = labels[0] if isinstance(labels, (list, tuple)) and labels else labels
@@ -34280,21 +34262,18 @@ def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
             name = OrchestratorConfig().labels.ready
         return [{"number": 123, "title": "Test issue", "labels": [{"name": name}]}]
 
-    def mock_pr_list(self):
-        return []
-
-    def mock_get_github_issue_dependencies(gh, issue_number):
-        return [], []
-
-    monkeypatch.setattr(GitHub, "run", mock_run)
-    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
-    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
-    monkeypatch.setattr(
-        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    autospec(monkeypatch, GitHub, "run", side_effect=mock_run)
+    autospec(monkeypatch, GitHub, "issue_list", side_effect=mock_issue_list)
+    autospec(monkeypatch, GitHub, "pr_list", return_value=[])
+    autospec(
+        monkeypatch,
+        github_module,
+        "get_github_issue_dependencies",
+        return_value=[],
     )
     # run_fleet_status creates a real GitHub instance; the field-list probe
     # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
-    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
+    autospec(monkeypatch, GitHub, "validate_field_lists", return_value=None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -34315,7 +34294,9 @@ def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
     assert final_state == initial_state
 
 
-def test_fleet_status_json_output_shape(tmp_path: Path, monkeypatch) -> None:
+def test_fleet_status_json_output_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, autospec
+) -> None:
     """Test that fleet status --json produces the correct output shape."""
     from io import StringIO
 
@@ -34355,27 +34336,17 @@ def test_fleet_status_json_output_shape(tmp_path: Path, monkeypatch) -> None:
     # Mock GitHub to return empty issue/PR lists
     from charlie_work.github import GitHub
 
-    def mock_issue_list(self, labels=None, state=None):
-        # Mirrors github.GitHub.issue_list exactly. This double previously
-        # took a required positional `label`, so it raised TypeError the
-        # moment a caller used the real interface's `state=` kwarg with no
-        # labels -- the unfiltered backlog query added in issue #944.
-        return []
-
-    def mock_pr_list(self):
-        return []
-
-    def mock_get_github_issue_dependencies(gh, issue_number):
-        return [], []
-
-    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
-    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
-    monkeypatch.setattr(
-        "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
+    autospec(monkeypatch, GitHub, "issue_list", return_value=[])
+    autospec(monkeypatch, GitHub, "pr_list", return_value=[])
+    autospec(
+        monkeypatch,
+        github_module,
+        "get_github_issue_dependencies",
+        return_value=[],
     )
     # run_fleet_status creates a real GitHub instance; the field-list probe
     # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
-    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
+    autospec(monkeypatch, GitHub, "validate_field_lists", return_value=None)
 
     # Capture stdout
     fake_stdout = StringIO()
