@@ -712,6 +712,7 @@ def append_event(
     *,
     state_path: Path | None = None,
     repo: str | None = None,
+    level: str | None = None,
 ) -> dict[str, Any]:
     """Return a new state dict with the event appended; do not mutate ``data``.
 
@@ -725,6 +726,10 @@ def append_event(
     This dual-write preserves the complete audit history beyond the bounded
     convenience cap in ``state.json``'s ``events`` array. The write is
     best-effort — instrumentation never breaks the core workflow.
+
+    ``level`` is forwarded to ``log_event`` when ``state_path`` is given so
+    emit sites can declare a level explicitly rather than relying on the
+    central registry.
     """
     if max_size is None:
         max_size = EVENT_RING_SIZE
@@ -735,7 +740,7 @@ def append_event(
     if state_path is not None:
         from .instrumentation import log_event
 
-        log_event(state_path, kind, payload, repo=repo)
+        log_event(state_path, kind, payload, repo=repo, level=level)
     return {**data, "events": events}
 
 
