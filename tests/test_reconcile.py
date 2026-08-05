@@ -33,7 +33,7 @@ from charlie_work.reconcile import (
     detect_drift,
     detect_mergequeue_not_approved,
 )
-from charlie_work.state import empty_state, is_claim_stale, load_state
+from charlie_work.state import PASSIVE_OPEN_STATUS, empty_state, is_claim_stale, load_state
 from charlie_work.worktree import create_worktree
 from charlie_work.workflow import OrchestratorApp
 
@@ -845,6 +845,161 @@ def test_detect_drift_snapshot_not_truncated_finalizes_closed_issues() -> None:
     closed_items = [item for item in drift if item.kind == "state_active_status_issue_closed"]
     assert len(closed_items) == 1
     assert closed_items[0].issue_number == closed_issue_number
+
+
+def test_detect_drift_issue_status_normalized_skips_under_incomplete_pr_snapshot() -> None:
+    """Issue #859: PR-side counterpart of issue #789 (twelve lines above it in
+    detect_drift).
+
+    ``open_prs_by_issue`` is built from the same ``prs`` snapshot
+    ``pr_snapshot_incomplete`` already tracks as possibly missing pages. If an
+    issue's genuinely open PR fell off that page, ``open_prs_by_issue.get(...)``
+    returns nothing even though a PR exists, and the old code fell through to
+    ``target_status = None`` -- silently normalizing a real, live issue's
+    status to the untracked baseline with no warning. This is the regression
+    test for that: it must fail on the pre-fix code and pass on the fix.
+    """
+    config = OrchestratorConfig()
+    target_issue_number = 1
+    # The issue itself is well inside the issue snapshot and genuinely OPEN;
+    # only the PR snapshot is the one under test.
+    issues = [_issue(target_issue_number, [])]
+    # Exactly _LIST_LIMIT PRs, none linked to target_issue_number: the PR
+    # snapshot is provably incomplete, and this issue's real open PR (which
+    # exists on GitHub) simply isn't on this page.
+    prs = [
+        _pr(i, "OPEN", head_ref=f"agent/issue-{i + 100000}-x")
+        for i in range(1, reconcile_list_limit + 1)
+    ]
+    gh = FakeGitHub(prs=prs, issues=issues)
+    state = empty_state()
+    state["issues"][str(target_issue_number)] = {
+        "number": target_issue_number,
+        # "closed" is the reachable value outside ORCHESTRATOR_OWNED_ISSUE_STATUSES
+        # (a stale value from a GitHub reopen, per issue #859's own example).
+        "status": "closed",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    bad = [
+        item
+        for item in drift
+        if item.kind == "issue_status_normalized"
+        and item.issue_number == target_issue_number
+        and item.new_status is None
+    ]
+    assert bad == []
+
+
+def test_detect_drift_issue_status_normalized_none_still_fires_when_pr_snapshot_complete() -> None:
+    """Discriminator: under a COMPLETE PR snapshot, a genuinely absent open PR
+    still normalizes the stale status to None.
+
+    Proves the #859 guard is not an over-broad kill switch on
+    ``issue_status_normalized``'s None outcome -- it only defers the
+    normalization when the snapshot can't support the "no open PR"
+    conclusion, not always.
+    """
+    config = OrchestratorConfig()
+    target_issue_number = 1
+    issues = [_issue(target_issue_number, [])]
+    # Well under _LIST_LIMIT: the PR snapshot is complete.
+    prs = [_pr(2, "OPEN", head_ref="agent/issue-99999-x")]
+    gh = FakeGitHub(prs=prs, issues=issues)
+    state = empty_state()
+    state["issues"][str(target_issue_number)] = {
+        "number": target_issue_number,
+        "status": "closed",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [
+        item
+        for item in drift
+        if item.kind == "issue_status_normalized"
+        and item.issue_number == target_issue_number
+        and item.new_status is None
+    ]
+    assert len(matches) == 1
+
+
+def test_detect_drift_issue_status_normalized_closed_wins_despite_incomplete_pr_snapshot() -> None:
+    """CLOSED-on-GitHub still wins first, even under an incomplete PR snapshot.
+
+    ``target_status = "closed"`` is derived from ``_issue_state(issue)``, not
+    from the PR snapshot at all, so the #859 guard (which only applies to the
+    would-be-None branch) must never intercept it.
+    """
+    config = OrchestratorConfig()
+    target_issue_number = 1
+    issues = [_issue(target_issue_number, [], state="CLOSED")]
+    prs = [
+        _pr(i, "OPEN", head_ref=f"agent/issue-{i + 100000}-x")
+        for i in range(1, reconcile_list_limit + 1)
+    ]
+    gh = FakeGitHub(prs=prs, issues=issues)
+    state = empty_state()
+    state["issues"][str(target_issue_number)] = {
+        "number": target_issue_number,
+        # Not in VALID_ISSUE_STATUSES at all, and not "closed" either, so a
+        # real transition to "closed" is expected regardless of PR truncation.
+        "status": "garbage-value",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [
+        item
+        for item in drift
+        if item.kind == "issue_status_normalized" and item.issue_number == target_issue_number
+    ]
+    assert len(matches) == 1
+    assert matches[0].new_status == "closed"
+
+
+def test_detect_drift_issue_status_normalized_open_pr_wins_despite_incomplete_pr_snapshot() -> (
+    None
+):
+    """A positively-observed open PR still normalizes to PASSIVE_OPEN_STATUS
+    even under an incomplete PR snapshot.
+
+    The #859 guard only intercepts the would-be-None branch; a PR that IS
+    present in the (still-incomplete) snapshot is a positive observation, not
+    an absence, so it must keep winning.
+
+    The issue already carries the ``pr_open`` label (not an active label
+    outside {pr_open, reviewing}, and not missing pr_open either) so the
+    earlier ``issue_active_label_with_open_pr`` self-heal sweep -- which also
+    reacts to an issue with an open PR -- does not fire first and mark this
+    issue as already repaired; this test is isolating the later
+    ``issue_status_normalized`` sweep specifically.
+    """
+    config = OrchestratorConfig()
+    target_issue_number = 1
+    issues = [_issue(target_issue_number, [config.labels.pr_open])]
+    prs = [_pr(1, "OPEN", head_ref=f"agent/issue-{target_issue_number}-x")]
+    prs += [
+        _pr(i, "OPEN", head_ref=f"agent/issue-{i + 100000}-x")
+        for i in range(2, reconcile_list_limit + 1)
+    ]
+    gh = FakeGitHub(prs=prs, issues=issues)
+    state = empty_state()
+    state["issues"][str(target_issue_number)] = {
+        "number": target_issue_number,
+        "status": "closed",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [
+        item
+        for item in drift
+        if item.kind == "issue_status_normalized" and item.issue_number == target_issue_number
+    ]
+    assert len(matches) == 1
+    assert matches[0].new_status == PASSIVE_OPEN_STATUS
 
 
 def test_apply_fixes_snapshot_truncated_emits_reconcile_event() -> None:

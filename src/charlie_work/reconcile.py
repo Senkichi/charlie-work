@@ -1467,6 +1467,28 @@ def detect_drift(
             target_status: str | None = "closed"
         elif open_prs_by_issue.get(issue_number):
             target_status = PASSIVE_OPEN_STATUS
+        elif pr_snapshot_incomplete:
+            # Issue #859, the PR-side counterpart of issue #789 twelve lines
+            # above: open_prs_by_issue is built from `prs`, the very snapshot
+            # pr_snapshot_incomplete already tracks as possibly missing pages.
+            # A negative answer from an incomplete snapshot ("no open PR found
+            # for this issue") is not evidence the PR doesn't exist -- it may
+            # simply have fallen off the page, same as #789's issue-side
+            # reasoning: "the snapshot cannot support any conclusion about an
+            # issue it doesn't contain -- absence here is an unanswered query,
+            # not evidence the issue is gone". Falling through to
+            # `target_status = None` here would normalize a real open PR's
+            # issue down to the untracked baseline with no warning.
+            #
+            # `target_status = None` is also the correct, legitimate outcome
+            # for an issue that is genuinely open with no PRs at all -- under
+            # an incomplete snapshot the two cases are indistinguishable, so
+            # skipping here means some genuine None-normalizations are
+            # deferred to a later pass (once the snapshot is complete) rather
+            # than applied now. That's the right tradeoff: a deferred
+            # normalization is recoverable next pass, a wrongly-nulled status
+            # is silent data loss with nothing in the drift log to explain it.
+            continue
         else:
             target_status = None
         if target_status == current_status:
