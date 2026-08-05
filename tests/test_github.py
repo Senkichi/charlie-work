@@ -367,6 +367,41 @@ def test_run_read_command_timeout_allow_failure_terminal_returns_124(
     assert call_count == 2
 
 
+def test_run_file_not_found_raises_github_error(monkeypatch, tmp_path: Path) -> None:
+    """Pre-existing behavior unchanged by the timeout fix: a missing `gh`
+    binary raises GitHubError, not GitHubError-via-timeout-path."""
+
+    def fake_run(cmd, *args, **kwargs):
+        raise FileNotFoundError("gh not found")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    with pytest.raises(github_module.GitHubError, match="not installed"):
+        gh.run(_issue_list_args(), json_output=True)
+
+
+def test_run_file_not_found_allow_failure_returns_error_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Pre-existing behavior unchanged: allow_failure=True on a missing `gh`
+    binary returns a structured error result with returncode=0 (distinct from
+    the timeout path's returncode=124)."""
+
+    def fake_run(cmd, *args, **kwargs):
+        raise FileNotFoundError("gh not found")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path)
+    result = gh.run(_issue_list_args(), json_output=True, allow_failure=True)
+
+    assert isinstance(result, github_module.GitHubRunResult)
+    assert result.ok is False
+    assert result.returncode == 0
+    assert "not installed" in (result.error or "")
+
+
 def test_run_passes_configured_gh_timeout_seconds_to_subprocess_run(
     monkeypatch, tmp_path: Path
 ) -> None:

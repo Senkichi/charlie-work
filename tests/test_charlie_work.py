@@ -2739,21 +2739,27 @@ def test_validate_field_lists_fails_on_unsupported_field(monkeypatch, tmp_path: 
 def test_validate_field_lists_timeout_raises_config_error(monkeypatch, tmp_path: Path) -> None:
     """A hung `gh` probe during startup field-list validation surfaces as
     ConfigError rather than blocking boot forever. This probe runs once and
-    is not retried."""
+    is not retried, and it is bound by the configured gh_timeout_seconds."""
     call_count = 0
+    captured_timeouts: list[float] = []
 
     def fake_run(cmd, *args, **kwargs):
         nonlocal call_count
         call_count += 1
+        captured_timeouts.append(kwargs.get("timeout"))
         raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_timeout_seconds=45.0))
     with pytest.raises(ConfigError, match="timed out"):
-        github_module.GitHub(tmp_path).validate_field_lists()
+        gh.validate_field_lists()
 
     # Fails fast on the first field list probed, not after trying all 10.
     assert call_count == 1
+    # The timeout= kwarg passed to subprocess.run came from the configured
+    # gh_timeout_seconds, not a hardcoded value.
+    assert captured_timeouts == [45.0]
 
 
 def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> None:
