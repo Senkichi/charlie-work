@@ -73,6 +73,22 @@ DISPATCH_THROTTLE_MAX_MINUTES = 30
 MIN_BEAT_INTERVAL_MINUTES = 10
 CHARLIE_STATUS_TIMEOUT_SECONDS = 60
 
+# Supervisor heartbeat freshness (issue #627). The supervisor writes
+# supervisor-heartbeat.json at the top of every loop iteration. On a live
+# supervisor ``last_beat_at`` is at most one ``max_pass_runtime_seconds``
+# (plus the post-pass sleep) old; a stale
+# heartbeat means the supervisor is down — killed (no ``exited_at``) or
+# cleanly stopped but not restarted by the watchdog (``exited_at`` set).
+# The stale threshold is a multiplier on ``max_pass_runtime_seconds``
+# recorded in the heartbeat itself, so it derives from the config knob that
+# actually bounds a single pass's wall-clock runtime. The multiplier covers
+# a full pass duration plus the post-pass cooldown/poll sleep with margin.
+# Older heartbeats that lack ``max_pass_runtime_seconds`` fall back to
+# ``full_pass_interval_seconds`` (the pre-fix behavior) for transition safety.
+SUPERVISOR_HEARTBEAT_FILENAME = "supervisor-heartbeat.json"
+SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = 2
+SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
+
 # check_stale_open_issue_mentions (issue #902): two bulk API sources plus one
 # free local one, per the issue's "API economy matters" constraint -- never a
 # gh call per candidate issue. STALE_MENTION_PR_LOOKBACK_LIMIT bounds the
@@ -1488,6 +1504,92 @@ def check_runners(report: Report) -> None:
         report.ok(check, facts)
 
 
+def check_supervisor_heartbeat(report: Report) -> None:
+    """Flag a stale or absent fleet supervisor heartbeat (issue #627).
+
+    The supervisor writes ``supervisor-heartbeat.json`` in the fleet dir every
+    loop iteration. A stale ``last_beat_at`` means the supervisor is not making
+    progress — either killed (``exited_at`` null, no clean exit recorded) or
+    cleanly stopped but not restarted by the watchdog (``exited_at`` set, the
+    2026-07-25 18:24 UTC outage shape where the watchdog task was disabled).
+
+    This is the independent detector that catches both shapes: a killed
+    supervisor leaves the heartbeat stale with no ``exited_at``, and a
+    supervisor whose launcher was also killed leaves no marker at all — the
+    heartbeat file's age is the only remaining signal. The stale threshold
+    derives from ``max_pass_runtime_seconds`` recorded in the heartbeat
+    itself (the config knob that bounds a single pass's wall-clock runtime),
+    falling back to ``full_pass_interval_seconds`` for older heartbeats.
+    """
+    check = "supervisor-heartbeat"
+    path = fleet_dir() / SUPERVISOR_HEARTBEAT_FILENAME
+    if not path.exists():
+        report.anom(
+            check,
+            f"no {SUPERVISOR_HEARTBEAT_FILENAME} found under {fleet_dir()} "
+            "(supervisor has never started, or the heartbeat was wiped)",
+        )
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        report.anom(check, f"{SUPERVISOR_HEARTBEAT_FILENAME} unreadable: {exc}")
+        return
+    if not isinstance(data, dict):
+        report.anom(check, f"{SUPERVISOR_HEARTBEAT_FILENAME} malformed (not a JSON object)")
+        return
+
+    last_beat = parse_iso(data.get("last_beat_at"))
+    if last_beat is None:
+        report.anom(check, f"{SUPERVISOR_HEARTBEAT_FILENAME} has no parseable last_beat_at")
+        return
+
+    now = datetime.now(timezone.utc)
+    age_min = (now - last_beat).total_seconds() / 60.0
+    exited_at = data.get("exited_at")
+    try:
+        raw_timeout = data.get("max_pass_runtime_seconds")
+        pass_timeout = int(raw_timeout) if raw_timeout is not None else None
+    except (TypeError, ValueError):
+        pass_timeout = None
+    if pass_timeout is None or pass_timeout <= 0:
+        try:
+            raw_interval = data.get("full_pass_interval_seconds")
+            pass_timeout = (
+                int(raw_interval)
+                if raw_interval is not None
+                else SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
+            )
+        except (TypeError, ValueError):
+            pass_timeout = SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
+    stale_threshold_min = (SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER * pass_timeout) / 60.0
+
+    pid = data.get("pid")
+    facts = (
+        f"last_beat={round(age_min)}m ago pid={pid} exited_at={exited_at} "
+        f"pass_timeout={pass_timeout}s"
+    )
+
+    if age_min <= stale_threshold_min:
+        report.ok(check, facts)
+        return
+
+    if exited_at is not None:
+        report.anom(
+            check,
+            f"supervisor exited cleanly at {exited_at} but has not restarted in "
+            f"{round(age_min)}m (threshold={round(stale_threshold_min)}m) — the "
+            f"watchdog may be disabled ({facts})",
+        )
+    else:
+        report.anom(
+            check,
+            f"supervisor heartbeat stale: last beat {round(age_min)}m ago with no "
+            f"clean exit (threshold={round(stale_threshold_min)}m) — likely killed "
+            f"or hung ({facts})",
+        )
+
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -1553,6 +1655,7 @@ def main() -> int:
         report.anom("github-rate", "no repos registered, cannot resolve a cwd for gh")
 
     check_runners(report)
+    check_supervisor_heartbeat(report)
 
     save_state(new_state)
 

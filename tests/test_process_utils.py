@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -245,6 +247,52 @@ def test_kill_process_tree_own_group_guard_posix() -> None:
     assert killed == []
 
 
+def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
+    """kill_process_tree returns empty without invoking the platform kill when the target PID is the caller.
+
+    The fleet supervisor reaps stalled workers from within its own process
+    image, so a ``kill_process_tree(os.getpid())`` call (e.g. from a
+    recycled-PID or bogus-caller case) would terminate it silently. The
+    explicit PID self-exemption guard must win even if the process-group
+    guard would also block, because a target PID matching the supervisor is
+    unambiguous.
+    """
+    own_pid = 424242
+    monkeypatch.setattr("os.getpid", lambda: own_pid, raising=False)
+
+    # Make the process-group guard think the target is in a different group so
+    # the only thing preventing self-termination is the explicit PID guard.
+    def fake_getpgid(pid: int) -> int:
+        return 100 if pid == own_pid else 200
+
+    # Add these on the process_utils os module even if the host os module does
+    # not provide them (e.g. Windows), because we force the POSIX branch below.
+    monkeypatch.setattr("charlie_work.process_utils.os.getpgid", fake_getpgid, raising=False)
+
+    # Avoid querying the real system for children of a non-existent PID.
+    monkeypatch.setattr("charlie_work.process_utils._enumerate_child_pids", lambda _pid: [])
+
+    kill_attempts: list[Any] = []
+
+    def fake_subprocess_run(cmd, **kwargs):
+        kill_attempts.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        kill_attempts.append((pgid, sig))
+
+    monkeypatch.setattr("charlie_work.process_utils.os.killpg", fake_killpg, raising=False)
+
+    # Force the POSIX branch so both platform kill paths are gated by the guard.
+    monkeypatch.setattr("charlie_work.process_utils.os.name", "posix")
+
+    killed = kill_process_tree(own_pid)
+    assert killed == []
+    assert kill_attempts == []
+
+
 def test_kill_process_tree_enumerates_children() -> None:
     """Test that kill_process_tree enumerates and includes child PIDs."""
     # Spawn a real parent process that will spawn a child
@@ -252,18 +300,31 @@ def test_kill_process_tree_enumerates_children() -> None:
     # The parent imports ``sys`` before referencing ``sys.executable``; without it
     # the parent crashes with NameError before spawning the child, and the test
     # silently no-ops via the empty-children skip path (a false positive).
+    #
+    # The sleeps must outlast the enumeration deadline below by a wide margin.
+    # They previously matched it exactly (both 10s), so under full-suite CPU
+    # contention a child that took several seconds to become visible left the
+    # parent with almost no lifetime remaining: it exited between the retry
+    # loop and ``kill_process_tree``, ``taskkill`` found nothing to kill, and
+    # the test failed on an empty ``killed`` list rather than skipping. Both
+    # processes are terminated explicitly below and in ``finally``, so a long
+    # sleep costs nothing -- nothing here waits for them to expire on their own.
     parent_proc = subprocess.Popen(
         [
             sys.executable,
             "-c",
             "import subprocess, sys, time; "
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']); "
-            "time.sleep(10)",
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+            "time.sleep(120)",
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=(os.name != "nt"),
     )
+
+    # Bound outside the ``try`` so the ``finally`` cleanup can always read it,
+    # including when a skip fires before the retry loop assigns it.
+    child_pids: list[int] = []
 
     try:
         import time
@@ -278,7 +339,6 @@ def test_kill_process_tree_enumerates_children() -> None:
         # child was spawned / enumeration failed" (skip), avoiding a spurious
         # assertion failure on unrelated PRs. See issue #608.
         deadline = time.monotonic() + 10.0
-        child_pids: list[int] = []
         while time.monotonic() < deadline:
             if parent_proc.poll() is not None:
                 pytest.skip(f"parent process {parent_proc.pid} exited before spawning a child")
@@ -291,6 +351,19 @@ def test_kill_process_tree_enumerates_children() -> None:
             pytest.skip(
                 f"no child of parent {parent_proc.pid} became visible within "
                 f"the deadline; enumeration may have failed under load"
+            )
+
+        # Re-check liveness immediately before the kill. The retry loop above
+        # only proves the parent was alive when enumeration started; a parent
+        # that died in between leaves nothing for the platform kill to find and
+        # returns an empty list, which would fail the assertion below for a
+        # reason that has nothing to do with child enumeration. Skipping here
+        # keeps that failure mode legible instead of surfacing as
+        # ``assert <pid> in []``.
+        if parent_proc.poll() is not None:
+            pytest.skip(
+                f"parent process {parent_proc.pid} exited between enumeration and kill; "
+                f"cannot assert on the killed set"
             )
 
         # Kill the parent process tree
@@ -307,6 +380,18 @@ def test_kill_process_tree_enumerates_children() -> None:
         if parent_proc.poll() is None:
             parent_proc.terminate()
             parent_proc.wait()
+
+        # ``parent_proc.terminate()`` does not reap the grandchild, and the
+        # sleeps are long enough now that a skipped run would otherwise leave
+        # it resident on the runner for two minutes. Reap any child the
+        # enumeration found; on the assertion path they are already dead, so
+        # this is a no-op there. Best-effort by design -- a failure to clean up
+        # a stray sleep must not mask the test's own result.
+        for stray_pid in child_pids:
+            try:
+                os.kill(stray_pid, signal.SIGTERM)
+            except OSError:
+                pass
 
 
 def test_is_session_stalled_custom_terminal_markers(tmp_path: Path) -> None:

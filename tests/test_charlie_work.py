@@ -33624,6 +33624,11 @@ def test_cli_build_app_registers_repo(tmp_path: Path, monkeypatch: pytest.Monkey
         def name_with_owner(self) -> str:
             return "owner/repo"
 
+        def validate_field_lists(self) -> None:
+            # build_app is an integration test for fleet.json registration; the
+            # gh --json field-list probe needs no real GitHub CLI here.
+            pass
+
     # Monkeypatch GitHub to use our fake
     def fake_github(
         repo_root: Path, dry_run: bool = False, runtime: object | None = None
@@ -34109,6 +34114,9 @@ def test_fleet_status_aggregates_multiple_repos(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr(
         "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
     )
+    # run_fleet_status creates a real GitHub instance; the field-list probe
+    # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -34187,6 +34195,9 @@ def test_fleet_status_isolates_broken_repo(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
     )
+    # run_fleet_status creates a real GitHub instance; the field-list probe
+    # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -34281,6 +34292,9 @@ def test_fleet_status_never_mutates(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
     )
+    # run_fleet_status creates a real GitHub instance; the field-list probe
+    # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     # Run fleet status
     args = cli.build_parser().parse_args(["fleet", "status"])
@@ -34359,6 +34373,9 @@ def test_fleet_status_json_output_shape(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         "charlie_work.github.get_github_issue_dependencies", mock_get_github_issue_dependencies
     )
+    # run_fleet_status creates a real GitHub instance; the field-list probe
+    # needs a real ``gh`` CLI, so short-circuit it for these unit tests.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     # Capture stdout
     fake_stdout = StringIO()
@@ -34479,6 +34496,9 @@ def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monke
         ]
 
     monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)
+    # run_fleet_review_queue creates a real GitHub instance; short-circuit the
+    # field-list probe, which would otherwise require an authenticated ``gh`` CLI.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
 
     args = cli.build_parser().parse_args(["fleet", "review-queue"])
     result = cli.run_fleet_review_queue(args)
@@ -36359,6 +36379,7 @@ def test_supervisor_config_defaults() -> None:
     assert config.supervisor.full_pass_interval_seconds == 300
     assert config.supervisor.active_cooldown_seconds == 30
     assert config.supervisor.max_runtime_minutes == 0
+    assert config.supervisor.max_pass_runtime_seconds == 1800
     assert config.supervisor.self_deploy_failure_alarm == 3
     assert config.supervisor.zero_pass_alarm == 3
 
@@ -36373,6 +36394,7 @@ supervisor:
   full_pass_interval_seconds: 120
   active_cooldown_seconds: 15
   max_runtime_minutes: 60
+  max_pass_runtime_seconds: 900
   self_deploy_failure_alarm: 5
   zero_pass_alarm: 7
 """
@@ -36382,6 +36404,7 @@ supervisor:
     assert config.supervisor.full_pass_interval_seconds == 120
     assert config.supervisor.active_cooldown_seconds == 15
     assert config.supervisor.max_runtime_minutes == 60
+    assert config.supervisor.max_pass_runtime_seconds == 900
     assert config.supervisor.self_deploy_failure_alarm == 5
     assert config.supervisor.zero_pass_alarm == 7
 

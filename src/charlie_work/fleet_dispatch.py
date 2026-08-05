@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -50,6 +51,14 @@ from .supervise_loop import (
     EXIT_RESTART_REQUESTED,
     SuperviseLoopResult,
     run_supervise_relaunch_loop,
+)
+from .supervisor_lifecycle import (
+    detect_prior_abnormal_exit,
+    is_exit_alertable,
+    record_prior_abnormal_exit,
+    record_supervisor_exit,
+    record_supervisor_started,
+    update_supervisor_heartbeat,
 )
 from .workflow import CommandResult, OrchestratorApp
 
@@ -1076,16 +1085,25 @@ def _emit_fleet_transition(
     notify_config: Any,
     entry: AttentionEntry,
     fleet_dir_override: str | None,
+    *,
+    persistent: bool = True,
 ) -> None:
-    """Emit a single fleet attention entry as a digest, deduped across passes.
+    """Emit a single fleet attention entry as a digest.
 
-    Wraps the stateful ``_filter_fleet_health_transitions`` so a persistent
-    condition (e.g. a recurring self-deploy ERROR) does not re-fire with
-    ``previous_health: null`` every supervisor pass (issue #554). Only emits
-    when the entry represents a real transition vs the persisted baseline.
+    By default this wraps ``_filter_fleet_health_transitions`` so a
+    persistent condition (e.g. a recurring self-deploy ERROR) does not
+    re-fire with ``previous_health: null`` every supervisor pass (issue #554).
+    Only emits when the entry represents a real transition vs the persisted
+    baseline.
+
+    Set ``persistent=False`` for occurrence-style events (e.g. supervisor
+    lifecycle kills) that must alert every time instead of being deduped.
     """
     state_file = _fleet_health_state_path(fleet_dir_override)
-    filtered = _filter_fleet_health_transitions([entry], state_file)
+    persistent_mask = [persistent] if persistent is not None else None
+    filtered = _filter_fleet_health_transitions(
+        [entry], state_file, persistent_mask=persistent_mask
+    )
     if not filtered:
         return
     digest = AttentionDigest(
@@ -1812,6 +1830,60 @@ def run_fleet_supervise(
     last_full_pass_at = start_time - full_pass_interval
     snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
 
+    # Supervisor lifecycle instrumentation (issue #627): record started/exited
+    # events to the fleet-level events.db and maintain a heartbeat sidecar so
+    # a killed supervisor (TerminateProcess, exit=-1) leaves a diagnosable gap
+    # instead of only a launcher text marker. Acquiring the lock proves any
+    # prior supervisor is gone, so a stale heartbeat with no ``exited_at`` here
+    # means the prior one was killed — emit a retroactive supervisor_exited and
+    # alert on it before this supervisor records its own start.
+    notify_config = getattr(global_config, "notify", None)
+    prior = detect_prior_abnormal_exit(fleet_dir_override)
+    if prior is not None:
+        record_prior_abnormal_exit(fleet_dir_override, prior)
+        print(
+            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] supervisor: prior "
+            f"supervisor terminated without an exit event (last beat "
+            f"{prior.get('prior_last_beat_at')}); recorded retroactive "
+            f"supervisor_exited",
+            flush=True,
+        )
+        if notify_config is not None and getattr(notify_config, "enabled", False):
+            _emit_fleet_transition(
+                notify_config,
+                AttentionEntry(
+                    issue_number=-1,
+                    adapter_kind="fleet-supervisor",
+                    health="ERROR",
+                    previous_health=None,
+                    last_log_line=(
+                        f"prior supervisor terminated without an exit event "
+                        f"(last beat {prior.get('prior_last_beat_at')})"
+                    ),
+                    pid=prior.get("prior_pid"),
+                ),
+                fleet_dir_override,
+                persistent=False,
+            )
+
+    started_at_iso = utc_now()
+    record_supervisor_started(
+        fleet_dir_override,
+        pid=os.getpid(),
+        started_at=started_at_iso,
+        full_pass_interval_seconds=full_pass_interval,
+        max_pass_runtime_seconds=cfg.max_pass_runtime_seconds,
+    )
+
+    # Exit tracking: ``_exit_code`` is 0 for every in-control clean exit (drain,
+    # max_runtime, max_passes, HEAD-drift restart, self-deploy restart,
+    # KeyboardInterrupt) and 1 for an uncaught exception. ``_exit_reason`` names
+    # the branch. Both are consumed by the ``finally`` below to emit
+    # ``supervisor_exited``. A TerminateProcess kill skips ``finally`` entirely,
+    # leaving the heartbeat's ``exited_at`` null for the next start to detect.
+    _exit_code = 0
+    _exit_reason = "completed"
+
     # Capture the HEAD SHA at process startup so we can detect drift caused
     # by an external actor (operator pull, another process) between passes.
     # self_deploy only reports from_sha/to_sha for pulls *it* performed; a
@@ -1824,13 +1896,25 @@ def run_fleet_supervise(
     try:
         while True:
             now = clock()
+            # Refresh the heartbeat at the top of every iteration so the
+            # freshness signal stays at most one ``max_pass_runtime_seconds``
+            # (plus the post-pass sleep) old on a live supervisor (issue #627).
+            # A killed supervisor stops updating it, which is exactly the gap
+            # the heartbeat check detects.
+            update_supervisor_heartbeat(
+                fleet_dir_override,
+                pass_number=pass_number,
+                last_beat_at=utc_now(),
+            )
             if cfg.max_runtime_minutes is not None and cfg.max_runtime_minutes > 0:
                 elapsed_minutes = (now - start_time) / 60.0
                 if elapsed_minutes >= cfg.max_runtime_minutes:
                     exit_reason = "max_runtime"
+                    _exit_reason = "max_runtime"
                     break
             if max_passes is not None and pass_number >= max_passes:
                 exit_reason = "max_passes"
+                _exit_reason = "max_passes"
                 break
 
             new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
@@ -1928,6 +2012,7 @@ def run_fleet_supervise(
                     flush=True,
                 )
                 exit_reason = "self_deploy"
+                _exit_reason = "self_deploy_head_moved"
                 break
 
             # Independent drift check: even when self_deploy reports "already
@@ -1948,6 +2033,7 @@ def run_fleet_supervise(
                     flush=True,
                 )
                 exit_reason = "head_drift"
+                _exit_reason = "head_drift_restart"
                 break
 
             pass_result = fleet_loop(
@@ -2067,10 +2153,13 @@ def run_fleet_supervise(
                 streak_exc,
             )
     except KeyboardInterrupt:
+        _exit_reason = "keyboard_interrupt"
         # An operator stop must never relaunch. Named rather than left unset so
         # the exit event distinguishes it from a break site that forgot a reason.
         exit_reason = "interrupted"
     except Exception as exc:
+        _exit_code = 1
+        _exit_reason = "exception"
         elapsed_s = clock() - start_time
         # Defence in depth behind the contained streak call above: if any future
         # post-break statement raises, an already-set restarting reason must
@@ -2092,6 +2181,41 @@ def run_fleet_supervise(
         )
     finally:
         lock.release()
+        # Record supervisor_exited for every in-control exit (issue #627). A
+        # TerminateProcess kill never reaches here — that is the gap the next
+        # start's detect_prior_abnormal_exit recovers. Best-effort: wrapped so
+        # an instrumentation failure cannot break the exit path.
+        try:
+            record_supervisor_exit(
+                fleet_dir_override,
+                exit_code=_exit_code,
+                passes=pass_number,
+                started_at=started_at_iso,
+                reason=_exit_reason,
+            )
+            if (
+                is_exit_alertable(_exit_code)
+                and notify_config is not None
+                and getattr(notify_config, "enabled", False)
+            ):
+                _emit_fleet_transition(
+                    notify_config,
+                    AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="fleet-supervisor",
+                        health="ERROR",
+                        previous_health=None,
+                        last_log_line=(
+                            f"supervisor exited abnormally (exit_code={_exit_code}, "
+                            f"reason={_exit_reason}, passes={pass_number})"
+                        ),
+                        pid=os.getpid(),
+                    ),
+                    fleet_dir_override,
+                    persistent=False,
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("supervisor exit instrumentation failed: %s", exc)
 
     elapsed_s = clock() - start_time
     elapsed_str = str(datetime.timedelta(seconds=int(elapsed_s)))

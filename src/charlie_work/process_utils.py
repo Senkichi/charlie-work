@@ -529,6 +529,22 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     if pid <= 0:
         return killed_pids
 
+    # Defense-in-depth (issue #627): never kill the calling process. The fleet
+    # supervisor reaps stalled workers from within its own process image, so
+    # ``os.getpid()`` here IS the supervisor. A tree walk or ``killpg`` that
+    # reached the supervisor would terminate it silently (exit=-1, no event, no
+    # alert) — exactly the #627 failure shape. Exempt it explicitly by PID
+    # rather than by name matching: process names are toothpick-brittle (every
+    # binary rename breaks them) and #608 shows child enumeration is
+    # untrustworthy under load. On Windows ``taskkill /T /PID`` only kills
+    # descendants so the supervisor (an ancestor) is already safe, but this
+    # guard also covers a recycled-PID or bogus-caller case where ``pid``
+    # passed in is the supervisor itself. On POSIX the existing
+    # ``pgid == os.getpgid(0)`` guard covers the process-group shape; this PID
+    # guard covers the direct case.
+    if pid == os.getpid():
+        return killed_pids
+
     # Re-verify process identity via start time if provided
     if expected_start_time is not None:
         current_start_time = get_process_start_time(pid)
