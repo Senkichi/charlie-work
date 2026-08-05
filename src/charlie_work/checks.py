@@ -33,6 +33,7 @@ class _CheckClassification(Enum):
     Each call site maps these values to its own output shape:
     ``summarize_checks`` aggregates them into ``CheckSummary`` buckets;
     ``_is_failing_run`` returns ``True`` only for ``FAIL``;
+    ``_is_infra_run`` returns ``True`` for ``CANCELLED`` or ``INFRA``;
     ``_non_required_check_findings`` in ``workflow.py`` reports ``CANCELLED``
     separately and treats ``INFRA`` as a failure in the informational context.
     """
@@ -312,12 +313,18 @@ def _is_failing_run(check: dict[str, Any]) -> bool:
 def _is_infra_run(check: dict[str, Any]) -> bool:
     """Return True if a single check run represents an infrastructure failure.
 
-    The counterpart to `_is_failing_run`: CANCELLED, INFRA_FAILURE, and
-    TIMED_OUT are infra conditions, not code failures (see the matching
-    branches in `summarize_checks`'s per-run loop above).
+    The counterpart to `_is_failing_run`: `_CheckClassification.CANCELLED`
+    and `_CheckClassification.INFRA` are infra conditions, not code failures.
+    Routes through `_classify_check_run` -- the same shared classifier
+    `summarize_checks` uses to populate `CheckSummary.infra_failed` -- so a
+    run whose `bucket` resolves it to PASS/PENDING before `state` is ever
+    consulted (issue #985) is no longer misclassified as infra here while
+    the aggregator already treats it as passing/pending.
     """
-    state = str(check.get("state") or "").upper()
-    return state in {"CANCELLED", "INFRA_FAILURE", "TIMED_OUT"}
+    return _classify_check_run(check) in {
+        _CheckClassification.CANCELLED,
+        _CheckClassification.INFRA,
+    }
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,10 @@ import pytest
 from charlie_work.checks import (
     CheckDebounceResult,
     InfraRerunResult,
+    _CheckClassification,
+    _classify_check_run,
     _is_failing_run,
+    _is_infra_run,
     _run_id_from_link,
     classify_check_failures,
     classify_infra_failures,
@@ -397,29 +400,117 @@ def test_all_three_call_sites_agree_skipped_and_neutral_are_not_failures(
 
 
 @pytest.mark.parametrize(
-    "state,summary_bucket,is_failing,non_required_failing,non_required_cancelled",
+    "state,summary_bucket,is_failing,is_infra,non_required_failing,non_required_cancelled",
     [
-        ("SUCCESS", "passed", False, (), ()),
-        ("PENDING", "pending", False, (), ()),
-        ("FAILURE", "failed", True, ("Check",), ()),
-        ("CANCELLED", "infra_failed", False, (), ("Check",)),
-        ("INFRA_FAILURE", "infra_failed", False, ("Check",), ()),
-        ("TIMED_OUT", "infra_failed", False, ("Check",), ()),
+        ("SUCCESS", "passed", False, False, (), ()),
+        ("PENDING", "pending", False, False, (), ()),
+        ("FAILURE", "failed", True, False, ("Check",), ()),
+        ("CANCELLED", "infra_failed", False, True, (), ("Check",)),
+        ("INFRA_FAILURE", "infra_failed", False, True, ("Check",), ()),
+        ("TIMED_OUT", "infra_failed", False, True, ("Check",), ()),
     ],
 )
 def test_known_check_states_classify_consistently(
     state: str,
     summary_bucket: str,
     is_failing: bool,
+    is_infra: bool,
     non_required_failing: tuple[str, ...],
     non_required_cancelled: tuple[str, ...],
 ) -> None:
-    """Existing state classifications must be unchanged at all three call sites
-    after the SKIPPED/NEUTRAL carve-out is moved to a shared helper."""
+    """Existing state classifications must be unchanged at all four call sites
+    (``summarize_checks``, ``_is_failing_run``, ``_is_infra_run``,
+    ``_non_required_check_findings``) after the SKIPPED/NEUTRAL carve-out is
+    moved to a shared helper (issue #850) and after ``_is_infra_run`` is
+    collapsed onto the same helper (issue #985)."""
     check = {"name": "Check", "state": state}
     summary = summarize_checks([check], ("Check",))
     assert getattr(summary, summary_bucket) == ("Check",)
     assert _is_failing_run(check) is is_failing
+    assert _is_infra_run(check) is is_infra
     failing, cancelled = _non_required_check_findings([check], ("Other",))
     assert failing == non_required_failing
     assert cancelled == non_required_cancelled
+
+
+def test_is_infra_run_and_is_failing_run_mutually_exclusive() -> None:
+    """Documents the counterpart relationship `_is_infra_run`'s docstring
+    claims: no single check run is ever both a code failure and an infra
+    failure. This holds even on the pre-#985 implementation (both read
+    `state` and CANCELLED/INFRA_FAILURE/TIMED_OUT don't overlap FAILURE), so
+    it is not on its own a regression guard for #985 -- see
+    `test_is_infra_run_defers_to_bucket_over_terminal_state` for the case
+    that actually discriminates the fix."""
+    for state in ("SUCCESS", "PENDING", "FAILURE", "CANCELLED", "INFRA_FAILURE", "TIMED_OUT"):
+        check = {"name": "Check", "state": state}
+        assert not (_is_infra_run(check) and _is_failing_run(check))
+
+
+def test_is_infra_run_defers_to_bucket_over_terminal_state() -> None:
+    """The disagreement case from issue #985: `_classify_check_run` resolves
+    `bucket == "pass"`/`"pending"` *before* it ever looks at a terminal
+    `state`, so a run carrying a terminal state alongside a pass/pending
+    bucket is PASS/PENDING, not infra. The pre-#985 `_is_infra_run` read only
+    `state` and would have returned True here -- this is the input on which
+    the two implementations disagreed."""
+    assert _is_infra_run({"name": "x", "state": "CANCELLED", "bucket": "pass"}) is False
+    assert _is_infra_run({"name": "x", "state": "INFRA_FAILURE", "bucket": "pending"}) is False
+    # Sanity check on the classifier itself: the same input resolves to PASS,
+    # not to CANCELLED/INFRA -- that's *why* _is_infra_run must return False.
+    assert (
+        _classify_check_run({"state": "CANCELLED", "bucket": "pass"}) == _CheckClassification.PASS
+    )
+    assert (
+        _classify_check_run({"state": "INFRA_FAILURE", "bucket": "pending"})
+        == _CheckClassification.PENDING
+    )
+
+
+def test_classify_infra_failures_excludes_run_whose_bucket_overrides_terminal_state() -> None:
+    """Caller-level pin: two runs share one required name. One is a genuine
+    infra failure; the other carries a terminal `state` but `bucket == "pass"`
+    (the disagreement input). Before #985's fix, `_is_infra_run` read only
+    `state` and both run ids were queued for rerun; after the fix, only the
+    genuinely infra run id is."""
+    checks = [
+        {"name": "Tests passed", "state": "INFRA_FAILURE", "link": _link(100, 1)},
+        {"name": "Tests passed", "state": "CANCELLED", "bucket": "pass", "link": _link(200, 1)},
+        {"name": "Lint & Format", "bucket": "pass"},
+    ]
+    # The aggregator (summarize_checks -> _classify_check_run) already treats
+    # the second run as PASS, so the name is still correctly infra_failed
+    # (driven by the first run) rather than fully passing.
+    summary = summarize_checks(checks, REQUIRED)
+    assert summary.infra_failed == ("Tests passed",)
+
+    result = classify_infra_failures(checks, REQUIRED, pr_state=None, head_sha="sha-1")
+    assert result.rerun_run_ids == (100,)
+    assert result.infra_rerun_attempts == {"sha-1": {"Tests passed": {"100": 1}}}
+
+
+def test_is_infra_run_delegates_to_classify_check_run() -> None:
+    """Guard against re-duplication: `_is_infra_run` must call the shared
+    `_classify_check_run` helper rather than re-inlining its own copy of the
+    terminal-state check (the exact regression this test's issue, #985, was
+    filed against). Matches the `inspect.getsource` delegation-guard pattern
+    used elsewhere in this repo (see
+    `test_dispatch_rework_reaps_unconditionally_when_max_concurrent_zero`)."""
+    import inspect
+
+    from charlie_work import checks as checks_module
+
+    source = inspect.getsource(checks_module._is_infra_run)
+    assert "_classify_check_run" in source, (
+        "_is_infra_run must delegate to _classify_check_run, not reimplement it"
+    )
+    # Matching only what's forbidden fails open (a rewritten literal check
+    # would still pass a substring search for "_classify_check_run" if that
+    # name merely appeared in a comment) -- so also assert the raw
+    # GitHub-state literals the pre-#985 body hardcoded (distinct from the
+    # legitimate `_CheckClassification.CANCELLED`/`.INFRA` enum references
+    # the fixed body uses) are gone.
+    for literal in ("INFRA_FAILURE", "TIMED_OUT", '"CANCELLED"', "'CANCELLED'"):
+        assert literal not in source, (
+            f"_is_infra_run must not re-inline the {literal!r} state literal; "
+            "route through _CheckClassification instead"
+        )
