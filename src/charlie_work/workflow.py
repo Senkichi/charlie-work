@@ -16602,7 +16602,15 @@ class OrchestratorApp:
                             payload,
                         )
                         save_state(self.paths.state_file, event_state)
-                except (OSError, ValueError) as write_exc:
+                except (OSError, ValueError, StateLockBusy) as write_exc:
+                    # StateLockBusy is a RuntimeError, so it is not covered by the
+                    # two above. Without it here the *diagnostic* write can abort
+                    # the pass it was only meant to describe: it would propagate to
+                    # dispatch_rework's own `except StateLockBusy`, which defers the
+                    # whole call and discards the legitimate candidates already
+                    # scanned. #939 asked for observation without a control-flow
+                    # change; letting a best-effort write decide the pass outcome
+                    # is exactly the control-flow change it ruled out.
                     logger.warning("could not record rework_issue_fetch_skipped: %s", write_exc)
 
         rework_limit = limit if limit is not None else self.config.dispatch.default_limit
@@ -18287,7 +18295,12 @@ class OrchestratorApp:
                     {"reason": reason, "error_type": exc.__class__.__name__},
                 )
                 save_state(self.paths.state_file, state)
-        except (OSError, ValueError) as write_exc:  # pragma: no cover - defensive
+        except (OSError, ValueError, StateLockBusy) as write_exc:  # pragma: no cover
+            # StateLockBusy is a RuntimeError and so escapes the other two. This
+            # handler's whole promise is that recording a degraded pass never
+            # crashes it; contention on the state lock is the single most likely
+            # reason this write fails, so omitting it left the promise unmet in
+            # exactly its expected case.
             logger.warning("could not record unauthorized_merge_check_skipped: %s", write_exc)
 
     def _announce_unauthorized_merges(self, reported: list[dict[str, Any]]) -> None:
