@@ -1,15 +1,17 @@
-"""Tests for the advisory PreToolUse hook that wires ``charlie merge-check``.
+"""Tests for the enforcing PreToolUse hook that wires ``charlie merge-check``.
 
 Issue #894. The hook lives in ``.claude/hooks/merge_check.py`` and is registered
 in ``.claude/settings.json``. It runs on every Bash tool call, but only acts on
 ``gh pr merge`` commands for PRs whose head branch matches the configured worker
-prefix. The hook is advisory: it always emits ``permissionDecision: allow`` and
-surfaces the ``merge-check`` verdict in ``systemMessage``.
+prefix. For worker PRs the hook enforces ``merge-check``: an unauthorized PR is
+denied. Infrastructure failures are fail-open and allowed with a note.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -31,8 +33,8 @@ def _run_hook(
 ) -> tuple[int, str, str]:
     """Run the hook script with the given stdin and environment.
 
-    Returns ``(returncode, stdout, stderr)``. The hook is always expected to
-    exit 0 because it is advisory-only.
+    Returns ``(returncode, stdout, stderr)``. The hook always exits 0; the
+    ``permissionDecision`` field inside the JSON output carries the verdict.
     """
     full_env = {**os.environ, **(env or {})}
     if project_dir is not None:
@@ -75,7 +77,8 @@ def _make_fake_charlie(
         f"reason = {reason!r}\n"
         "msg = f'PR #{pr}: ' + ('approved at head' if ok else 'not authorized')\n"
         "data = {'authorized': ok, 'reason': reason}\n"
-        "print(json.dumps({'ok': ok, 'message': msg, 'data': data}))\n",
+        "payload = {'ok': ok, 'message': msg, 'data': data}\n"
+        "print(json.dumps(payload, indent=2, sort_keys=True, default=str))\n",
         encoding="utf-8",
     )
     return script
@@ -185,7 +188,7 @@ def test_hook_uses_config_branch_prefix(tmp_path: Path, base_env: dict[str, str]
 
 
 def test_hook_surfaces_unauthorized_worker_pr(tmp_path: Path, base_env: dict[str, str]) -> None:
-    """A worker PR that fails ``merge-check`` is surfaced but still allowed."""
+    """A worker PR that fails ``merge-check`` is denied."""
     gh = _make_fake_gh(tmp_path, "agent/issue-593-fix")
     charlie = _make_fake_charlie(tmp_path, ok=False, reason="no_decision")
     env = {**base_env, "GH_BIN": str(gh), "CHARLIE_BIN": str(charlie)}
@@ -198,10 +201,11 @@ def test_hook_surfaces_unauthorized_worker_pr(tmp_path: Path, base_env: dict[str
     )
     assert output[0] == 0
     result = _parse_hook_output(output[1])
-    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
     msg = result.get("systemMessage", "")
     assert "NOT authorized" in msg
     assert "no_decision" in msg
+    assert result["hookSpecificOutput"].get("permissionDecisionReason") == msg
 
 
 def test_hook_surfaces_authorized_worker_pr(tmp_path: Path, base_env: dict[str, str]) -> None:
@@ -231,7 +235,7 @@ def test_hook_allows_unparseable_pr_number() -> None:
 
 
 def test_hook_allows_when_gh_fails(tmp_path: Path, base_env: dict[str, str]) -> None:
-    """If ``gh pr view`` fails, the hook is fail-open at the advisory level."""
+    """If ``gh pr view`` fails, the hook is fail-open."""
     script = tmp_path / "fake_gh_fail.py"
     script.write_text(
         "import sys\nprint('no such pull request', file=sys.stderr)\nsys.exit(1)\n",
@@ -246,3 +250,91 @@ def test_hook_allows_when_gh_fails(tmp_path: Path, base_env: dict[str, str]) -> 
     result = _parse_hook_output(output[1])
     assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
     assert "could not read" in (result.get("systemMessage") or "").lower()
+
+
+def test_hook_allows_when_merge_check_cannot_be_parsed(
+    tmp_path: Path, base_env: dict[str, str]
+) -> None:
+    """If the merge-check preflight produces no usable JSON, the hook fails open."""
+    gh = _make_fake_gh(tmp_path, "agent/issue-123-fix")
+    bad_charlie = tmp_path / "bad_charlie.py"
+    bad_charlie.write_text("print('not json')", encoding="utf-8")
+    env = {**base_env, "GH_BIN": str(gh), "CHARLIE_BIN": str(bad_charlie)}
+    output = _run_hook(
+        {"tool_name": "Bash", "tool_input": {"command": "gh pr merge 123"}},
+        env=env,
+    )
+    assert output[0] == 0
+    result = _parse_hook_output(output[1])
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert "could not run merge-check" in (result.get("systemMessage") or "").lower()
+
+
+def test_hook_parses_real_merge_check_json_output(tmp_path: Path, monkeypatch, capsys) -> None:
+    """The real ``charlie --json merge-check`` output is a single pretty-printed JSON doc.
+
+    The hook parser must consume the whole stdout as one document, not scan
+    lines, because ``print_result`` emits ``indent=2`` multi-line JSON. This
+    test runs the real CLI, captures its stdout, and feeds that output through
+    the hook's merge-check parser.
+    """
+    from charlie_work import cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    pr_dir = repo / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+
+    class FakeGitHub:
+        def __init__(self, *, repo_root=None, dry_run=False, runtime=None, **kwargs):
+            self.repo_root = repo_root
+            self.dry_run = dry_run
+
+        def pr_view(self, number: int):
+            return {
+                "number": number,
+                "headRefName": "agent/issue-456-fix",
+                "headRefOid": "sha-abc123",
+                "state": "OPEN",
+            }
+
+        def name_with_owner(self):
+            return "owner/repo"
+
+    monkeypatch.setattr(cli, "GitHub", FakeGitHub)
+
+    returncode = cli.main(["--json", "--repo", str(repo), "merge-check", "456"])
+    assert returncode == 0
+
+    cli_stdout = capsys.readouterr().out
+    assert json.loads(cli_stdout)
+
+    # Replay the captured CLI output through the hook parser. This is exactly
+    # the shape the real ``charlie merge-check --json`` writes to stdout.
+    replay = tmp_path / "replay_charlie_stdout.py"
+    replay.write_text(f"import sys\nsys.stdout.write({cli_stdout!r})\n", encoding="utf-8")
+    monkeypatch.setenv("CHARLIE_BIN", str(replay))
+
+    spec = importlib.util.spec_from_file_location("merge_check", HOOK_SCRIPT)
+    merge_check_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(merge_check_module)  # type: ignore[union-attr]
+    try:
+        verdict = merge_check_module._run_merge_check(456, repo)
+    finally:
+        # ``configure_logging`` opens a log file in the fleet dir; close it so
+        # pytest's temp-path cleanup can remove the directory on Windows.
+        logging.shutdown()
+
+    assert verdict["ok"] is True
+    assert verdict["data"]["authorized"] is True
+    assert verdict["data"]["reason"] == "approved_at_head"

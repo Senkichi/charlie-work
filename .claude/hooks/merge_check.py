@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Advisory PreToolUse hook for raw ``gh pr merge``.
+"""Enforcing PreToolUse hook for raw ``gh pr merge``.
 
 Issue #894. ``charlie merge-check <pr>`` exists and enforces the same
 approved-at-head invariant as the ``ship-it`` and Aviator re-queue paths, but
 nothing called it. This hook is the consumer: it runs the preflight for worker
-PRs and surfaces the verdict in the session transcript without blocking.
+PRs and denies the tool call when the PR is not authorized at its current head.
 
-Scope is intentionally narrow. The hook only fires on ``gh pr merge`` Bash
-tool calls, and only consults ``merge-check`` when the PR's head branch starts
-with ``dispatch.branch_prefix``. Orchestrator PRs on ``fix/*`` (or any other
-non-worker branch) bypass the check, matching the tripwire's existing scoping.
+The hook only fires on ``gh pr merge`` Bash tool calls, and only consults
+``merge-check`` when the PR's head branch starts with ``dispatch.branch_prefix``.
+Orchestrator PRs on ``fix/*`` (or any other non-worker branch) bypass the check,
+matching the tripwire's existing scoping.
 """
 
 from __future__ import annotations
@@ -148,33 +148,56 @@ def _gh_pr_view(pr_number: int, repo_root: Path) -> dict[str, object]:
 def _run_merge_check(pr_number: int, repo_root: Path) -> dict[str, object]:
     """Call ``charlie merge-check --json <pr>`` and return the parsed result.
 
-    Even on a non-zero exit, ``charlie`` writes JSON to stdout, so we parse it.
+    ``charlie`` prints the result as a single pretty-printed JSON document
+    (``print_result`` emits ``indent=2``). The hook must parse the whole stdout
+    as one document, not scan lines, because every indented line is not itself
+    valid JSON.
+
+    If the subprocess produces no parseable JSON, this raises so the caller can
+    fail open. A successful ``merge-check`` run always writes valid JSON even
+    when it returns ``ok=False``.
     """
     base = _charlie_bin(repo_root)
     cmd = base + ["--json", "merge-check", str(pr_number)]
     result = _run_command(cmd, repo_root)
-    for line in reversed(result.stdout.splitlines()):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            return json.loads(line)
-        except json.JSONDecodeError:
-            continue
-    return {"ok": False, "message": "merge-check produced no JSON", "data": {}}
+    stdout = result.stdout.strip()
+    if not stdout:
+        raise RuntimeError("merge-check produced no stdout")
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"merge-check stdout is not valid JSON: {exc}") from exc
 
 
 def _allow(message: str | None = None) -> None:
     """Emit an ``allow`` PreToolUse hook decision and exit.
 
-    This hook is advisory-only: it never blocks. ``systemMessage`` carries the
-    ``merge-check`` verdict so the agent sees it in the transcript.
+    The hook allows the tool call. ``systemMessage`` carries the ``merge-check``
+    verdict so the agent sees it in the transcript.
     """
     payload: dict[str, object] = {
         "hookSpecificOutput": {"permissionDecision": "allow"},
     }
     if message:
         payload["systemMessage"] = message
+    print(json.dumps(payload))
+    sys.exit(0)
+
+
+def _deny(message: str) -> None:
+    """Emit a ``deny`` PreToolUse hook decision and exit.
+
+    The PR is a worker PR and the merge-check preflight refused authorization.
+    The hook blocks the raw ``gh pr merge`` and surfaces the reason.
+    """
+    payload: dict[str, object] = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": message,
+        },
+        "systemMessage": message,
+    }
     print(json.dumps(payload))
     sys.exit(0)
 
@@ -215,17 +238,22 @@ def main() -> None:
             f"prefix {prefix!r}; skipping authorization check"
         )
 
-    verdict = _run_merge_check(pr_number, repo_root)
+    try:
+        verdict = _run_merge_check(pr_number, repo_root)
+    except Exception as exc:
+        _allow(
+            f"merge-check hook: could not run merge-check for PR #{pr_number} ({exc}); allowing"
+        )
+
     if not verdict.get("ok"):
         reason = verdict.get("data", {}).get("reason") or verdict.get("message", "unknown")
         message = (
             f"merge-check hook: PR #{pr_number} is NOT authorized at head (reason: {reason}). "
             f"Verdict: {verdict.get('message')}"
         )
-    else:
-        message = f"merge-check hook: PR #{pr_number} is authorized at current head."
+        _deny(message)
 
-    _allow(message)
+    _allow(f"merge-check hook: PR #{pr_number} is authorized at current head.")
 
 
 if __name__ == "__main__":
