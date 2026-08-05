@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -1445,16 +1446,30 @@ def known_config_sections() -> frozenset[str]:
     )
 
 
-def load_config(path: Path | None = None) -> OrchestratorConfig:
-    # One binding for both the read and the provenance it produces. Deriving
-    # ``sources`` from a *second* ``path.exists()`` call would let the two
-    # disagree if the file is created or removed between them, which is exactly
-    # the class of lie this field exists to prevent.
-    source_path = path if path is not None and path.exists() else None
-    raw = (
-        yaml.safe_load(source_path.read_text(encoding="utf-8")) if source_path is not None else {}
-    )
-    data = raw if isinstance(raw, dict) else {}
+def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
+    """Validate an in-memory raw-YAML dict and build the ``OrchestratorConfig``.
+
+    This is the shared validation core behind both config entry points:
+    ``load_config`` reads a single file into a dict and calls this, and
+    ``global_config.load_layered_config`` calls this directly on its merged
+    dict -- no intermediate file, so the layered merge never touches disk
+    (issue #704).
+
+    ``sources`` is deliberately left at its dataclass default (``()``): a
+    bare dict carries no path, so provenance is the caller's job. Both
+    callers apply their own ``sources`` via ``dataclasses.replace`` on the
+    value this returns.
+    """
+    # Section-processing below mutates the per-section sub-dicts in place
+    # (e.g. coercing a YAML list to a tuple) -- that was always harmless when
+    # this logic lived inline in ``load_config``, because its ``data`` was a
+    # freshly-parsed dict nobody else held a reference to. Now that a caller
+    # (``load_layered_config``) can hand in a dict it built and does not
+    # discard, mutating it in place would be a new, surprising side effect on
+    # the caller's object -- exactly what CLAUDE.md's immutability rule
+    # forbids. A deep copy keeps this function's contract "reads a dict, does
+    # not touch it" regardless of what future callers do with their copy.
+    data = copy.deepcopy(data)
     # Validate top-level keys before processing sections.
     known_sections = known_config_sections()
     unknown = sorted(set(data) - known_sections)
@@ -2589,6 +2604,25 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         runner_allocation=runner_allocation,
         supervisor=supervisor,
         post_mortem=post_mortem,
+        # ``sources`` is left at its dataclass default here -- this function
+        # only ever sees a dict, never a path. ``load_config`` below (and
+        # ``load_layered_config``) are the ones that know what path(s) the
+        # data came from, and they attach that provenance with ``replace``.
+    )
+
+
+def load_config(path: Path | None = None) -> OrchestratorConfig:
+    # One binding for both the read and the provenance it produces. Deriving
+    # ``sources`` from a *second* ``path.exists()`` call would let the two
+    # disagree if the file is created or removed between them, which is exactly
+    # the class of lie this field exists to prevent.
+    source_path = path if path is not None and path.exists() else None
+    raw = (
+        yaml.safe_load(source_path.read_text(encoding="utf-8")) if source_path is not None else {}
+    )
+    data = raw if isinstance(raw, dict) else {}
+    return replace(
+        build_config_from_data(data),
         # ``path`` as given, not ``resolve()``d: this is the string the caller
         # passed and the one the layered-config log lines print, so the two are
         # directly comparable, and resolve() can raise on paths exists() already
