@@ -1352,6 +1352,32 @@ class OrchestratorConfig:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
 
+    # Provenance, not values (issue #943). Paths of the config files that were
+    # actually read to produce this value, in merge order (global layer first,
+    # per-repo last). An empty tuple means *nothing was read* and every section
+    # below is a dataclass default.
+    #
+    # Why this belongs on the value rather than only in a log line: a resolved
+    # config records what a section *became*, never whether the file that
+    # declares it was read, so `load_config()` with no path returns something
+    # indistinguishable from a fully-configured fleet whose features happen to
+    # be switched off. That ambiguity is the #590 diagnosis cost and it is what
+    # `global_config.load_layered_config` already logs about but could not
+    # hand to a caller.
+    #
+    # ``metadata={"provenance": True}`` is load-bearing: `load_config` derives
+    # the set of valid YAML section names from `fields(OrchestratorConfig)`, so
+    # without the marker a config file could declare `sources:` and assert its
+    # own provenance -- a field whose entire purpose is to be trustworthy would
+    # become the one field an untrusted input can forge. The marker is read
+    # there rather than a hard-coded name so a second provenance field cannot
+    # be added without inheriting the exclusion.
+    #
+    # ``compare=False`` because provenance is metadata about how a value was
+    # obtained, not part of the value: two configs with identical sections are
+    # the same config whether they came from one file, two, or none.
+    sources: tuple[str, ...] = field(default=(), compare=False, metadata={"provenance": True})
+
 
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
     """Resolve the config file: an explicit path wins; otherwise the consumer
@@ -1383,10 +1409,22 @@ def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
 
 
 def load_config(path: Path | None = None) -> OrchestratorConfig:
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path and path.exists() else {}
+    # One binding for both the read and the provenance it produces. Deriving
+    # ``sources`` from a *second* ``path.exists()`` call would let the two
+    # disagree if the file is created or removed between them, which is exactly
+    # the class of lie this field exists to prevent.
+    source_path = path if path is not None and path.exists() else None
+    raw = (
+        yaml.safe_load(source_path.read_text(encoding="utf-8")) if source_path is not None else {}
+    )
     data = raw if isinstance(raw, dict) else {}
-    # Validate top-level keys before processing sections
-    known_sections = {f.name for f in fields(OrchestratorConfig)}
+    # Validate top-level keys before processing sections. Provenance fields are
+    # excluded so a config file cannot declare where it came from (see
+    # OrchestratorConfig.sources); the exclusion is derived from the field
+    # metadata rather than a name so it cannot be forgotten for a future one.
+    known_sections = {
+        f.name for f in fields(OrchestratorConfig) if not f.metadata.get("provenance")
+    }
     unknown = sorted(set(data) - known_sections)
     if unknown:
         raise ConfigError(
@@ -2504,4 +2542,9 @@ def load_config(path: Path | None = None) -> OrchestratorConfig:
         runner_allocation=runner_allocation,
         supervisor=supervisor,
         post_mortem=post_mortem,
+        # ``path`` as given, not ``resolve()``d: this is the string the caller
+        # passed and the one the layered-config log lines print, so the two are
+        # directly comparable, and resolve() can raise on paths exists() already
+        # tolerated.
+        sources=(str(source_path),) if source_path is not None else (),
     )
