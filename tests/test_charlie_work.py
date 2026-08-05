@@ -28086,7 +28086,7 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     no capacity axis at all. Both defects are exercised here on the automatic
     path, which the existing ``--issues``-only governor tests do not cover.
 
-    Three scenarios, each pinning a distinct acceptance criterion:
+    Four scenarios, each pinning a distinct acceptance criterion:
 
     1. Repo-cap clamp with 8 candidates -- proves truncation
        (``_MAX_DEFERRED_CONCURRENCY_EXAMPLES=5``) actually engages, and that
@@ -28103,6 +28103,14 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
        ``available_slots`` -- is the field that states the effective limit
        was zero, and that ``fleet_concurrency_limit``/``fleet_live_session_count``
        are present to identify which cap bound.
+    4. The ``--issues`` path with 7 explicitly-requested issues, all
+       deferred -- proves ``_build_failure_map`` receives the FULL deferred
+       list (all 7 keys in ``failures``), not the truncated 5-item list that
+       reaches the persisted event/``CommandResult.data`` fields. Pins a
+       regression an earlier version of this fix introduced: truncating
+       ``deferred_by_concurrency`` inside ``_select_dispatch_candidates``
+       itself (rather than at each payload call site) silently dropped
+       ``failures`` entries for the 6th+ deferred issue.
     """
 
     def mock_count_live_one(sessions_dir, state_file=None):
@@ -28149,15 +28157,21 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     assert result.data["available_slots"] == 0
 
     # Defect 2: the automatic path must populate deferred_by_concurrency, not
-    # report it as unconditionally empty. Truncated to the first 5 by number,
-    # with the untruncated total carried separately.
+    # report it as unconditionally empty. Truncated to the first 5 by number
+    # for the persisted/data field, with the untruncated total carried
+    # separately.
     assert result.data["deferred_by_concurrency"] == [201, 202, 203, 204, 205]
     assert result.data["deferred_by_concurrency_count"] == 8
-    # The bounded failures map mirrors the truncated list exactly -- it must
-    # not independently carry all 8 (that would defeat the truncation and
-    # would also desync from _extract_attention_events' exclusion set, which
-    # cross-references this same deferred_by_concurrency field).
-    assert sorted(result.data["failures"].keys()) == [201, 202, 203, 204, 205]
+    # The failures map must cover every deferred issue (all 8), not just the
+    # 5 that made it into the truncated display field -- _build_failure_map
+    # is fed the FULL deferred list (a review-caught regression: an earlier
+    # version of this fix truncated before _build_failure_map, silently
+    # dropping failures entries for the 6th+ deferred issue). This is a
+    # superset of _extract_attention_events' exclusion set (built from the
+    # truncated deferred_by_concurrency event field), so no issue in the
+    # truncated set is ever double-reported as a launch-failure "error" --
+    # see scenario 4 for the dedicated full-vs-truncated pin.
+    assert sorted(result.data["failures"].keys()) == [201, 202, 203, 204, 205, 206, 207, 208]
 
     # Defect 1: the persisted event -- not just the transient CommandResult.data
     # -- must carry the governor's decision.
@@ -28242,6 +28256,43 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
         "fleet_concurrency_limit": 3,
         "fleet_live_session_count": 3,
     }
+
+    # --- Scenario 4: --issues path, >5 deferred (review regression pin) ---
+    # _build_failure_map must see every deferred issue, not just the
+    # truncated event examples. An earlier version of this fix truncated
+    # deferred_by_concurrency inside _select_dispatch_candidates before
+    # returning it, so `failures` silently lost entries for the 6th+
+    # deferred issue -- a regression specifically on the --issues path,
+    # which passed the complete (untruncated) list on origin/main before
+    # #1005 touched this function at all. Caught in review before merge.
+    issues_tmp_path = tmp_path / "issues_path"
+    issues_paths = runtime_paths(issues_tmp_path, config.runtime.state_dir)
+    issues_gh = SaturatedGitHub(7)
+    issues_app = OrchestratorApp(issues_tmp_path, issues_paths, config, issues_gh)
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
+
+    issues_result = issues_app.dispatch(only_issues="201,202,203,204,205,206,207")
+
+    assert issues_result.ok is True
+    assert issues_result.data["selected_count"] == 0
+    assert issues_result.data["deferred_by_concurrency"] == [201, 202, 203, 204, 205]
+    assert issues_result.data["deferred_by_concurrency_count"] == 7
+    # All 7 deferred issues keep a failures entry -- not just the 5 that made
+    # it into the truncated event/data field.
+    assert sorted(issues_result.data["failures"].keys()) == [
+        201,
+        202,
+        203,
+        204,
+        205,
+        206,
+        207,
+    ]
+
+    issues_events = query_events(issues_paths.state_file, kind="dispatch")
+    issues_payload = issues_events[-1]["payload"]
+    assert issues_payload["deferred_by_concurrency"] == [201, 202, 203, 204, 205]
+    assert issues_payload["deferred_by_concurrency_count"] == 7
 
 
 def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypatch) -> None:

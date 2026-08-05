@@ -364,6 +364,18 @@ def _recent_dispatch_failed_attempts(
     return recent
 
 
+# No leading underscore: this is a deliberate cross-module wire contract
+# with fleet_dispatch._add_launch_failures, which matches this prefix to
+# exclude concurrency-deferred issues from launch-failure attention events.
+# Matching the reason string (rather than cross-referencing the
+# `deferred_by_concurrency` list) is deliberate: that list is truncated to
+# _MAX_DEFERRED_CONCURRENCY_EXAMPLES entries in the persisted payload
+# (issue #1005), but this `failures` map is not -- a set-membership check
+# against the truncated list would silently re-report the 6th+ deferred
+# issue as a genuine launch failure.
+DEFERRED_BY_CONCURRENCY_REASON_PREFIX = "deferred by concurrency cap"
+
+
 def _build_failure_map(
     dispatch_results: Sequence[SessionDispatchResult],
     failed_issue_numbers: Iterable[int],
@@ -373,7 +385,9 @@ def _build_failure_map(
 ) -> dict[int, str]:
     failures: dict[int, str] = {}
     for issue_number in deferred_by_concurrency:
-        failures[issue_number] = _truncate_reason(f"deferred by concurrency cap (limit: {limit})")
+        failures[issue_number] = _truncate_reason(
+            f"{DEFERRED_BY_CONCURRENCY_REASON_PREFIX} (limit: {limit})"
+        )
     for result in dispatch_results:
         if result.issue_number in failed_issue_numbers:
             failures[result.issue_number] = _truncate_reason(_dispatch_failure_reason(result))
@@ -925,14 +939,25 @@ def _select_dispatch_candidates(
 
     Returns:
         Tuple of (selected, skipped_issue_numbers, deferred_by_concurrency,
-        deferred_by_concurrency_count). ``deferred_by_concurrency`` is every
-        ordered candidate that was not selected -- populated on both the
-        ``only_issues`` path and the automatic path (issue #1005; the
-        automatic path used to report this unconditionally as ``[]``, making
-        a saturated governor indistinguishable from an empty backlog) --
-        truncated to ``_MAX_DEFERRED_CONCURRENCY_EXAMPLES`` entries so a
-        standing clamp cannot re-emit the full candidate list every pass.
-        ``deferred_by_concurrency_count`` is the untruncated count.
+        deferred_by_concurrency_count). ``deferred_by_concurrency`` is the
+        FULL, untruncated list of every ordered candidate that was not
+        selected -- populated on both the ``only_issues`` path and the
+        automatic path (issue #1005; the automatic path used to report this
+        unconditionally as ``[]``, making a saturated governor
+        indistinguishable from an empty backlog).
+        ``deferred_by_concurrency_count`` is ``len(deferred_by_concurrency)``,
+        returned explicitly so callers don't have to re-derive it.
+
+        Callers that persist this into a durable payload (a ``dispatch``
+        event or ``CommandResult.data``) MUST truncate it themselves to
+        ``_MAX_DEFERRED_CONCURRENCY_EXAMPLES`` entries before writing it --
+        otherwise a standing clamp re-emits the full candidate list every
+        pass. But the FULL list must still reach ``_build_failure_map``: a
+        prior version of this fix truncated before returning, which silently
+        dropped ``failures`` map entries for the 6th+ deferred issue on the
+        ``only_issues`` path (a regression vs. pre-#1005 behavior, caught in
+        review). Truncate at the payload call site, never inside this
+        function.
     """
     if only_issues:
         wanted = parse_issue_numbers(only_issues)
@@ -975,11 +1000,10 @@ def _select_dispatch_candidates(
     # an --issues number GitHub never returned, are already counted in
     # ``skipped_issue_numbers``, not here.)
     selected_numbers = {int(issue["number"]) for issue in selected}
-    deferred_by_concurrency_full = [
+    deferred_by_concurrency = [
         int(issue["number"]) for issue in ordered if int(issue["number"]) not in selected_numbers
     ]
-    deferred_by_concurrency_count = len(deferred_by_concurrency_full)
-    deferred_by_concurrency = deferred_by_concurrency_full[:_MAX_DEFERRED_CONCURRENCY_EXAMPLES]
+    deferred_by_concurrency_count = len(deferred_by_concurrency)
 
     return selected, skipped_issue_numbers, deferred_by_concurrency, deferred_by_concurrency_count
 
@@ -7554,7 +7578,7 @@ class OrchestratorApp:
             (
                 selected,
                 skipped_issue_numbers,
-                deferred_by_concurrency,
+                deferred_by_concurrency_full,
                 deferred_by_concurrency_count,
             ) = _select_dispatch_candidates(
                 candidates,
@@ -7563,6 +7587,14 @@ class OrchestratorApp:
                 self._branch_name,
                 only_issues=only_issues,
             )
+            # Issue #1005 review: this dry-run branch never persists an event
+            # or calls _build_failure_map, but truncate for display parity
+            # with the real-dispatch payload below -- keep the untruncated
+            # list around under its own name so nothing downstream mistakes
+            # it for complete.
+            deferred_by_concurrency = deferred_by_concurrency_full[
+                :_MAX_DEFERRED_CONCURRENCY_EXAMPLES
+            ]
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
 
             # Compute would-be SessionRequests without state mutation
@@ -8017,7 +8049,7 @@ class OrchestratorApp:
             (
                 selected,
                 skipped_issue_numbers,
-                deferred_by_concurrency,
+                deferred_by_concurrency_full,
                 deferred_by_concurrency_count,
             ) = _select_dispatch_candidates(
                 candidates,
@@ -8026,6 +8058,16 @@ class OrchestratorApp:
                 self._branch_name,
                 only_issues=only_issues,
             )
+            # Issue #1005 review: _build_failure_map must see every deferred
+            # issue (deferred_by_concurrency_full) so each one keeps its
+            # per-issue "failures" entry -- only the persisted event and
+            # CommandResult.data payloads truncate, via
+            # deferred_by_concurrency below. Truncating before
+            # _build_failure_map silently dropped failures entries for the
+            # 6th+ deferred issue; caught in review before merge.
+            deferred_by_concurrency = deferred_by_concurrency_full[
+                :_MAX_DEFERRED_CONCURRENCY_EXAMPLES
+            ]
             selected_issue_numbers = [int(issue["number"]) for issue in selected]
             # Capture previous entries for recovery detection BEFORE overwriting status
             # Issue #81: we need to know if an issue was previously "dispatched" on the same branch
@@ -8450,7 +8492,7 @@ class OrchestratorApp:
             dispatch_failure_map = _build_failure_map(
                 dispatch_results,
                 failed_issue_numbers,
-                deferred_by_concurrency,
+                deferred_by_concurrency_full,
                 dispatch_limit,
                 extra_failures=label_error_failures,
             )
