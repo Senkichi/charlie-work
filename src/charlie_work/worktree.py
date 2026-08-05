@@ -289,6 +289,29 @@ def _write_json_atomic(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
+WORKER_OUTCOME_FILENAME = ".worker-outcome.json"
+
+
+def read_worker_outcome(worktree_path: Path) -> dict[str, Any] | None:
+    """Read a worker's structured outcome file if present and well-formed.
+
+    Workers write this file (per ``$section_push_pr_outcome``) when they
+    successfully push a branch but cannot open a PR because ``gh`` is
+    unauthenticated. The orchestrator reads it both from the worktree and,
+    when the terminal-status watcher copies it, from durable terminal status.
+    """
+    path = worktree_path / WORKER_OUTCOME_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def write_worktree_marker(
     worktree_path: Path, pid: int, session_id: str, kind: str = "worker"
 ) -> None:
@@ -538,6 +561,92 @@ def _remote_branch_exists(repo_root: Path, branch: str) -> bool | None:
         return True
     # Branch does not exist (exit 0 with empty stdout)
     return False
+
+
+def _remote_branch_head_sha(repo_root: Path, branch: str) -> str | None:
+    """Return the commit SHA for ``origin/{branch}`` if it exists, else None.
+
+    A probe failure is also returned as ``None``; call ``_remote_branch_exists``
+    if you need to distinguish a missing ref from a broken remote.
+    """
+    result = _run_remote_captured(
+        ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+        cwd=repo_root,
+    )
+    if not result.ok:
+        return None
+    stdout = result.stdout.strip()
+    if not stdout:
+        return None
+    # ls-remote output: "<sha>\trefs/heads/<name>"
+    return stdout.split()[0]
+
+
+def remote_branch_ahead_count(
+    repo_root: Path, branch: str, base_ref: str = ""
+) -> tuple[int | None, str | None]:
+    """Return how many commits ``origin/{branch}`` is ahead of its base branch.
+
+    Returns ``(ahead_count, error)``. ``ahead_count`` is ``None`` when the branch
+    does not exist on origin, the base cannot be resolved, or git fails. A
+    returned count of ``0`` means the branch points at the base or is behind it
+    (no commits unique to the branch).
+    """
+    head_sha = _remote_branch_head_sha(repo_root, branch)
+    if head_sha is None:
+        return None, f"remote branch {branch} does not exist or probe failed"
+
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+    base_ref_local = f"origin/{base_branch}"
+    base_result = run_captured(
+        ["git", "rev-parse", "--verify", base_ref_local],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not base_result.ok:
+        # Try a fetch to refresh the tracking ref before giving up.
+        fetch_result = run_captured(
+            ["git", "fetch", "origin", base_branch],
+            cwd=repo_root,
+            timeout_seconds=_REMOTE_TIMEOUT_SECONDS,
+        )
+        if not fetch_result.ok:
+            return None, (
+                f"base branch {base_branch!r} not resolvable: "
+                f"{base_result.error or base_result.stderr}"
+            )
+        base_result = run_captured(
+            ["git", "rev-parse", "--verify", base_ref_local],
+            cwd=repo_root,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not base_result.ok:
+            return None, (
+                f"base branch {base_branch!r} not resolvable after fetch: "
+                f"{base_result.error or base_result.stderr}"
+            )
+    base_sha = base_result.stdout.strip()
+
+    merge_base_result = run_captured(
+        ["git", "merge-base", base_sha, head_sha],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not merge_base_result.ok:
+        return None, f"merge-base failed: {merge_base_result.error or merge_base_result.stderr}"
+    merge_base = merge_base_result.stdout.strip()
+
+    count_result = run_captured(
+        ["git", "rev-list", "--count", f"{merge_base}..{head_sha}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not count_result.ok:
+        return None, f"rev-list failed: {count_result.error or count_result.stderr}"
+    try:
+        return int(count_result.stdout.strip()), None
+    except ValueError:
+        return None, f"rev-list returned non-integer: {count_result.stdout!r}"
 
 
 def _object_exists(repo_root: Path, sha: str) -> bool:
