@@ -6163,10 +6163,17 @@ def _open_salvage_pr(
     # commit log instead of injecting the gate's keywords -- a branch with no
     # commits still yields no summary, and still correctly fails.
     body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
+    # Pass the RESOLVED base branch, not the raw ``base_ref``. The orphaned-branch
+    # lane (``_open_pr_for_orphaned_branch``) sources ``base_ref`` straight from
+    # ``config.dispatch.base_ref``, whose default is ``""`` and which the live
+    # config leaves unset -- so production reaches here with the empty sentinel.
+    # ``require_valid_rev("")`` raises, ``summarize_branch_work`` returns "", and
+    # the body falls back to boilerplate that cannot pass the janitor gate: the
+    # exact defect this code exists to fix, on the lane that hits it most.
     summary = summarize_branch_work(
         repo_root,
         branch,
-        base_ref,
+        base_branch,
         test_path_globs=config.test_adequacy.test_path_globs,
     )
     if summary:

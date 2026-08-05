@@ -2966,12 +2966,21 @@ def summarize_branch_work(
         cwd=repo_root,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
-    changed = (
-        [line.strip() for line in names.stdout.splitlines() if line.strip()] if names.ok else []
+    # ``None`` means "the diff never produced an answer", which is NOT the same
+    # as "the diff produced an empty answer". Collapsing the two lets a failed
+    # ``git diff`` render as "changed no test files (0 file(s) changed in
+    # total)" -- a factual claim manufactured from a command that failed, which
+    # is precisely the fabricated evidence this function's contract forbids.
+    # ``git log`` and ``git diff`` genuinely diverge here: on a branch with no
+    # merge base the log succeeds and the diff exits 128.
+    changed: list[str] | None = (
+        [line.strip() for line in names.stdout.splitlines() if line.strip()] if names.ok else None
     )
-    test_files = [
-        name for name in changed if any(fnmatch.fnmatch(name, glob) for glob in test_path_globs)
-    ]
+    test_files = (
+        [name for name in changed if any(fnmatch.fnmatch(name, glob) for glob in test_path_globs)]
+        if changed is not None
+        else []
+    )
 
     if not subjects:
         # The commit log IS the worker's rationale. With no commits there is
@@ -2987,7 +2996,18 @@ def summarize_branch_work(
         lines += f"\n- ... and {len(subjects) - len(shown)} more commit(s)"
     sections = [f"## Worker's commit log\n\n{lines}"]
 
-    if test_files:
+    if changed is None:
+        # Report the absence of evidence as an absence, not as a zero. This
+        # deliberately does NOT change whether the gate passes: the ``## Tests``
+        # heading already satisfies the regex on its own, which the contract
+        # above accepts on purpose for any branch that has commits. The defect
+        # being fixed is the false factual claim, not the gate outcome.
+        sections.append(
+            "## Tests\n\nThe set of changed files could not be determined "
+            "(`git diff` failed), so this PR asserts nothing about which files "
+            "it touched. `test_adequacy` gates that separately."
+        )
+    elif test_files:
         listed = "\n".join(f"- `{name}`" for name in test_files)
         sections.append(
             f"## Tests\n\nThe branch changed {len(test_files)} test file(s):\n\n{listed}"

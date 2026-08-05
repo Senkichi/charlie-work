@@ -187,3 +187,92 @@ def test_salvage_log_limit_elides_and_reports_remainder(tmp_path: Path) -> None:
         assert f"- chore: commit number {i}" not in summary_lines
 
     assert f"... and {total - _SALVAGE_LOG_LIMIT} more commit(s)" in summary
+
+
+# --- Regression tests for the two defects found reviewing the original fix ---
+#
+# The first version of this feature was merged and did NOT work on the
+# production path. Both tests below are mutation-verified: each fails against
+# the pre-fix code and passes after it.
+
+
+def test_open_salvage_pr_with_empty_base_ref_still_derives_summary(tmp_path: Path) -> None:
+    """``base_ref=""`` is the PRODUCTION default, and it must still yield a summary.
+
+    ``_open_pr_for_orphaned_branch`` sources ``base_ref`` from
+    ``config.dispatch.base_ref``, whose default is ``""`` and which the live
+    config leaves unset. The original fix passed that raw value into
+    ``summarize_branch_work``, where ``require_valid_rev("")`` raises and the
+    function returns ``""`` -- so the body fell back to boilerplate that cannot
+    pass the janitor gate, on the lane that hits this code most often.
+
+    Every other test in this file (and in test_issue_956.py) hardcodes
+    ``base_ref="main"``, which is exactly why the defect shipped.
+    """
+    from test_issue_956 import _SalvageTestGitHub, _salvage_labels
+
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.workflow import _open_salvage_pr
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    _git(repo_root, "checkout", "-b", "agent/issue-999")
+    _commit_file(
+        repo_root, "tests/test_thing.py", "def test_x():\n    pass\n", "test: cover thing"
+    )
+
+    config = OrchestratorConfig()
+    active_labels, issue_labels = _salvage_labels(config)
+    gh = _SalvageTestGitHub(repo_root=repo_root)
+
+    pr_number, error = _open_salvage_pr(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch="agent/issue-999",
+        base_ref="",  # the production default, NOT "main"
+        issue_number=999,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        issue_title="Something salvaged",
+        source_description="completed-but-unpublished worker worktree",
+    )
+
+    assert pr_number is not None
+    assert error is None
+    body = gh.prs_created[0]["body"]
+
+    # The worker's own evidence must be present, not just the boilerplate.
+    assert "test: cover thing" in body
+    assert "tests/test_thing.py" in body
+    # And the whole point: the real gate must accept it.
+    assert _TESTS_OR_RATIONALE_RE.search(body) is not None
+
+
+def test_diff_failure_reports_absence_of_evidence_not_a_zero(tmp_path: Path) -> None:
+    """A failed ``git diff`` must not be rendered as "changed no test files (0 ...)".
+
+    ``git log`` and ``git diff`` genuinely diverge: on a branch with no merge
+    base the log succeeds while ``git diff base...branch`` exits 128 with
+    "no merge base". The original code collapsed ``names.ok is False`` into an
+    empty list, so the body asserted a file count derived from a command that
+    never produced one -- fabricated evidence, which this function's own
+    docstring forbids.
+    """
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    # An orphan branch shares no history with main, so there is no merge base.
+    _git(repo_root, "checkout", "--orphan", "feature")
+    _commit_file(repo_root, "src/thing.py", "x = 1\n", "feat: orphan work")
+
+    summary = summarize_branch_work(repo_root, "feature", "main", test_path_globs=_TEST_GLOBS)
+
+    # Precondition: the log half must have succeeded, or this test proves nothing
+    # about the diff half. (A negative result here would otherwise be consistent
+    # with "the whole function bailed early", which is a different code path.)
+    assert "feat: orphan work" in summary
+
+    # The actual assertion: no manufactured file count.
+    assert "changed no test files" not in summary
+    assert "0 file(s)" not in summary
+    assert "could not be determined" in summary
