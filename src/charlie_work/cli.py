@@ -57,10 +57,12 @@ from ci_fleet.charlie_work_adapter import (
 
 # Not part of the charlie_work_adapter migration surface (issue #909's
 # reporter is a new consumer, not one of the four already-migrated ones), so
-# NOTE: ci_fleet's shadow/rollback cluster (diff_journal, shadow_gate,
-# shadow_pass) is deliberately NOT imported here. Those modules exist only to
-# serve `charlie runners shadow-status`, and ci_fleet is retiring them as the
-# legacy-planner rollback path closes. Imported at module scope, the deletion
+# NOTE: ci_fleet's shadow/rollback cluster (diff_journal, shadow_gate) is
+# deliberately NOT imported here. Those modules exist only to serve
+# `charlie runners shadow-status`, and ci_fleet is retiring them as the
+# legacy-planner rollback path closes. A third member, shadow_pass, has
+# already been deleted upstream -- the retirement is in progress, not
+# hypothetical. Imported at module scope, the deletion
 # of any one of them takes down the entire CLI -- including
 # `charlie runners allocate` and `fleet supervise`, whose entry points import
 # this module. That is not hypothetical: it happened on main (issue #929),
@@ -1193,28 +1195,15 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
     # should fail loudly here, where the traceback names the missing module,
     # rather than being bound to None and surfacing later as an
     # AttributeError with the cause erased.
-    from ci_fleet.diff_journal import read_all as read_shadow_journal
+    from ci_fleet.diff_journal import (
+        journal_path as shadow_journal_path,
+        read_all as read_shadow_journal,
+    )
     from ci_fleet.shadow_gate import (
         REQUIRED_CALENDAR_DAYS,
         REQUIRED_STREAK,
         evaluate as evaluate_shadow_gate,
     )
-
-    # TRANSITIONAL, remove once ci_runners' step A is on their main.
-    # ci_fleet is moving journal_path from shadow_pass (being deleted) into
-    # diff_journal (surviving). Our CI clones ci_runners' *main*, not a pinned
-    # SHA, so there is no instant at which one spelling is correct everywhere:
-    # before their push only shadow_pass resolves, after it only diff_journal
-    # does. Accepting both is what removes the deadlock -- otherwise the
-    # repoint cannot go green until they push, and their push reddens every
-    # charlie-work PR until the repoint merges.
-    #
-    # Narrow on purpose: it falls back to one specific module for one symbol,
-    # and if BOTH are gone it raises rather than degrading to None.
-    try:
-        from ci_fleet.diff_journal import journal_path as shadow_journal_path
-    except ImportError:
-        from ci_fleet.shadow_pass import journal_path as shadow_journal_path
 
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
