@@ -8085,7 +8085,11 @@ class OrchestratorApp:
                             reason_class="mechanical",
                             issue_extra=entry,
                         )
-                        entry = state["issues"][str(request.issue_number)]
+                        # Re-read the escalation fields _escalate_issue merged in,
+                        # but keep ``entry`` a decoupled copy: the mutations below
+                        # must not reach state until the single atomic write at the
+                        # end of this block.
+                        entry = dict(state["issues"][str(request.issue_number)])
                     else:
                         status = "dispatch_failed"
                         dispatched_at = None

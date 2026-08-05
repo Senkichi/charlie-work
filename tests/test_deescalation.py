@@ -649,20 +649,46 @@ def _escalation_event_kinds_from_workflow() -> set[str]:
             node = parents.get(node)
         return node
 
-    # Identify functions that assign a reason_class. This filters out
-    # diagnostics-only events like ``janitor_gate`` that merely observe an
-    # already-escalated PR without performing an escalation transition.
-    def _uses_reason_class(func: ast.AST) -> bool:
+    def _called_names(func: ast.AST) -> set[str]:
+        names: set[str] = set()
         for node in ast.walk(func):
-            if isinstance(node, ast.Call):
-                name: str | None = None
-                if isinstance(node.func, ast.Name):
-                    name = node.func.id
-                elif isinstance(node.func, ast.Attribute):
-                    name = node.func.attr
-                if name in ("escalation_reason_class", "set_escalation"):
-                    return True
-        return False
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                names.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                names.add(node.func.attr)
+        return names
+
+    calls_by_func: dict[ast.AST, set[str]] = {}
+    calls_by_name: dict[str, set[str]] = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        called = _called_names(func)
+        calls_by_func[func] = called
+        calls_by_name.setdefault(func.name, set()).update(called)
+
+    # Derive the set of escalation-performing callables from the source itself
+    # instead of hard-coding names. Start from the two primitives that own the
+    # escalation fields, then repeatedly absorb any function that calls a known
+    # escalator, until the set stops growing. Extracting escalation behind a new
+    # helper (as ``_escalate_issue`` did) is then picked up automatically; a
+    # hard-coded name list would silently stop discovering the kinds those call
+    # sites emit, and the test would pass while covering less.
+    escalators = {"escalation_reason_class", "set_escalation"}
+    while True:
+        grown = {
+            name for name, called in calls_by_name.items() if called & escalators
+        } - escalators
+        if not grown:
+            break
+        escalators |= grown
+
+    # Identify functions that perform an escalation transition. This filters out
+    # diagnostics-only events that merely observe an already-escalated PR.
+    def _performs_escalation(func: ast.AST) -> bool:
+        return bool(calls_by_func.get(func, _called_names(func)) & escalators)
 
     # First pass: collect local dict-literal assignments per function.
     func_dicts: dict[ast.AST, dict[str, set[str]]] = {}
@@ -694,7 +720,7 @@ def _escalation_event_kinds_from_workflow() -> set[str]:
         func = _enclosing_function(call)
         if func is None or not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        if not _uses_reason_class(func):
+        if not _performs_escalation(func):
             continue
 
         payload_node = _call_arg(call, 2, "payload")
