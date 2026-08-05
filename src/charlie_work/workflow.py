@@ -115,6 +115,7 @@ from .worktree import (
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
+    summarize_branch_work,
     worktree_path_for_branch,
     write_worktree_marker,
 )
@@ -4167,10 +4168,17 @@ def _detect_and_handle_orphaned_workers(
                 candidate = pushed_branch_candidates.get(issue_number)
                 if candidate is not None:
                     details = no_pr_issue_details.get(issue_number, {})
+                    # ``getattr(gh, "repo_root", None)`` is not statically typed,
+                    # so it could in principle be any non-``Path`` value. Narrow
+                    # it to ``Path | None`` before passing it to the salvage
+                    # helper; ``None`` is a value the helper already handles by
+                    # returning an error, which preserves the existing drift/hold
+                    # behavior for no-repo-root orphans.
+                    salvage_repo_root = repo_root if isinstance(repo_root, Path) else None
                     pr_number, pr_error = _open_pr_for_orphaned_branch(
                         gh=gh,
                         config=config,
-                        repo_root=repo_root,
+                        repo_root=salvage_repo_root,
                         branch=candidate["branch"],
                         base_ref=config.dispatch.base_ref,
                         issue_number=issue_number,
@@ -5948,7 +5956,11 @@ def _classify_dead_sessions_and_update_throttle_state(
                         or len(redispatch_at) > config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review instead of relabeling to ready
-                        reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        reason = (
+                            failure_kind
+                            if terminal_failure and failure_kind is not None
+                            else "redispatch_cap_exceeded"
+                        )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
                         state = _escalate_issue(
@@ -6106,7 +6118,21 @@ def _open_salvage_pr(
         if issue_title
         else f"Salvaged work for issue #{issue_number}"
     )
+    # The body must satisfy the same janitor gate as a worker-authored one
+    # (`review.require_tests_or_rationale`). A fixed boilerplate string cannot:
+    # it carries no rationale token, so every salvage PR failed a gate on text
+    # the orchestrator itself wrote. Derive the rationale from the worker's own
+    # commit log instead of injecting the gate's keywords -- a branch with no
+    # commits still yields no summary, and still correctly fails.
     body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
+    summary = summarize_branch_work(
+        repo_root,
+        branch,
+        base_ref,
+        test_path_globs=config.test_adequacy.test_path_globs,
+    )
+    if summary:
+        body = f"{body}\n\n{summary}"
 
     pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
     if pr_number is None:
@@ -8377,7 +8403,11 @@ class OrchestratorApp:
                             request.issue_number,
                             reason=(
                                 failed_result.failure_kind
-                                if terminal_failure and failed_result is not None
+                                if (
+                                    terminal_failure
+                                    and failed_result is not None
+                                    and failed_result.failure_kind is not None
+                                )
                                 else "dispatch_failed_cap_exceeded"
                             ),
                             reason_class="mechanical",

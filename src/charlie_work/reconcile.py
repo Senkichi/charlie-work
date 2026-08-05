@@ -58,6 +58,7 @@ from .worktree import (
     push_branch,
     remove_review_checkout,
     resolve_base_branch_name,
+    summarize_branch_work,
 )
 
 logger = logging.getLogger(__name__)
@@ -2180,15 +2181,28 @@ def apply_fixes(
                     if push_ok:
                         pr_create = getattr(gh, "pr_create", None)
                         if pr_create is not None:
+                            # Same janitor body gate as a worker-authored PR --
+                            # boilerplate alone can never satisfy it. Derive the
+                            # rationale from the worker's own commit log rather
+                            # than injecting the gate's keywords.
+                            salvage_body = (
+                                f"Closes #{item.issue_number}\n\n"
+                                "Salvaged by the orchestrator from a completed-but-unpublished "
+                                "worker worktree."
+                            )
+                            branch_summary = summarize_branch_work(
+                                repo_root,
+                                item.branch,
+                                item.base_branch,
+                                test_path_globs=config.test_adequacy.test_path_globs,
+                            )
+                            if branch_summary:
+                                salvage_body = f"{salvage_body}\n\n{branch_summary}"
                             pr_number = pr_create(
                                 head=item.branch,
                                 base=item.base_branch,
                                 title=f"Salvaged work for issue #{item.issue_number}",
-                                body=(
-                                    f"Closes #{item.issue_number}\n\n"
-                                    "Salvaged by the orchestrator from a completed-but-unpublished "
-                                    "worker worktree."
-                                ),
+                                body=salvage_body,
                             )
                         if pr_number is not None:
                             salvage_ok = True
