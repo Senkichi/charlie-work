@@ -848,25 +848,38 @@ def test_detect_drift_snapshot_not_truncated_finalizes_closed_issues() -> None:
 
 
 def test_detect_drift_issue_status_normalized_skips_under_incomplete_pr_snapshot() -> None:
-    """Issue #859: PR-side counterpart of issue #789 (twelve lines above it in
-    detect_drift).
+    """Issue #859: PR-side counterpart of issue #789 (a few lines above it in
+    detect_drift) -- reworked per PR #972 review to a PER-ITEM condition.
 
-    ``open_prs_by_issue`` is built from the same ``prs`` snapshot
-    ``pr_snapshot_incomplete`` already tracks as possibly missing pages. If an
+    ``open_prs_by_issue`` is built from the same ``prs`` snapshot that can be
+    provably incomplete once total PR count hits ``_LIST_LIMIT``. If an
     issue's genuinely open PR fell off that page, ``open_prs_by_issue.get(...)``
-    returns nothing even though a PR exists, and the old code fell through to
-    ``target_status = None`` -- silently normalizing a real, live issue's
-    status to the untracked baseline with no warning. This is the regression
-    test for that: it must fail on the pre-fix code and pass on the fix.
+    returns nothing even though a PR exists, and the pre-#859 code fell
+    through to ``target_status = None`` -- silently normalizing a real, live
+    issue's status to the untracked baseline with no warning.
+
+    The fix does NOT gate on the global ``pr_snapshot_incomplete`` flag (an
+    earlier version of this PR did, and was rejected in review: under
+    ``--state all`` that flag is monotonic, so once the repo permanently
+    crosses ``_LIST_LIMIT`` PRs it would disable this sweep repo-wide,
+    forever -- reproducing the exact #857/#860 failure mode this repo already
+    fixed once). Instead it uses issue-specific evidence: state.json's own PR
+    record (``state["prs"]``) says this issue has a still-open PR (status not
+    yet "closed"/"merged") whose PR number is entirely absent from this
+    pass's ``prs`` snapshot. That is this test's setup below. This is the
+    regression test for the original bug: it must fail on the pre-#859 code
+    and pass on the fix.
     """
     config = OrchestratorConfig()
     target_issue_number = 1
+    tracked_pr_number = 999999  # deliberately outside the PR snapshot below
     # The issue itself is well inside the issue snapshot and genuinely OPEN;
     # only the PR snapshot is the one under test.
     issues = [_issue(target_issue_number, [])]
-    # Exactly _LIST_LIMIT PRs, none linked to target_issue_number: the PR
-    # snapshot is provably incomplete, and this issue's real open PR (which
-    # exists on GitHub) simply isn't on this page.
+    # Exactly _LIST_LIMIT PRs, none linked to target_issue_number and none
+    # numbered tracked_pr_number: the PR snapshot is provably incomplete, and
+    # this issue's real open PR (which state.json tracks and which exists on
+    # GitHub) simply isn't on this page.
     prs = [
         _pr(i, "OPEN", head_ref=f"agent/issue-{i + 100000}-x")
         for i in range(1, reconcile_list_limit + 1)
@@ -879,6 +892,14 @@ def test_detect_drift_issue_status_normalized_skips_under_incomplete_pr_snapshot
         # (a stale value from a GitHub reopen, per issue #859's own example).
         "status": "closed",
     }
+    # state.json's own record: this issue has a still-open tracked PR that
+    # happens to be absent from the `prs` snapshot fetched above. This is the
+    # issue-specific evidence the per-item guard requires.
+    state["prs"][str(tracked_pr_number)] = {
+        "number": tracked_pr_number,
+        "issue_number": target_issue_number,
+        "status": "reviewing",
+    }
 
     drift = detect_drift(gh, state, config)
 
@@ -890,6 +911,74 @@ def test_detect_drift_issue_status_normalized_skips_under_incomplete_pr_snapshot
         and item.new_status is None
     ]
     assert bad == []
+
+    # Requirement from PR #972 review comment 4: the deferral must be named
+    # in the drift log, not silent.
+    deferred = [
+        item
+        for item in drift
+        if item.kind == "snapshot_truncated" and "issue_status_normalized deferred" in item.detail
+    ]
+    assert len(deferred) == 1
+    assert str(target_issue_number) in deferred[0].detail
+
+
+def test_detect_drift_issue_status_normalized_none_still_fires_with_no_tracked_pr_anywhere() -> (
+    None
+):
+    """Issue #859 review comment 2/3: proves the fix is NOT a repo-wide kill
+    switch once the PR snapshot is incomplete.
+
+    Same incomplete-PR-snapshot setup as the regression test above, but this
+    issue has no PR anywhere -- not in the GitHub snapshot, and not tracked in
+    state.json either. There is no issue-specific evidence to distrust the
+    negative answer, so ``target_status = None`` must still fire exactly as
+    it did before #859, even while the global snapshot is provably
+    incomplete. Without this test, a broad guard keyed on the global
+    ``pr_snapshot_incomplete`` flag (the shape rejected in review) would pass
+    every other test in this module while silently disabling
+    ``issue_status_normalized`` for the entire repo once PR count crosses
+    ``_LIST_LIMIT`` -- exactly the #857/#860 regression this rework exists to
+    avoid reintroducing.
+    """
+    config = OrchestratorConfig()
+    target_issue_number = 1
+    issues = [_issue(target_issue_number, [])]
+    # Exactly _LIST_LIMIT PRs, none linked to target_issue_number: the PR
+    # snapshot is provably incomplete (same global condition as the
+    # regression test), but state.json tracks NO PR for this issue at all.
+    prs = [
+        _pr(i, "OPEN", head_ref=f"agent/issue-{i + 100000}-x")
+        for i in range(1, reconcile_list_limit + 1)
+    ]
+    gh = FakeGitHub(prs=prs, issues=issues)
+    state = empty_state()
+    state["issues"][str(target_issue_number)] = {
+        "number": target_issue_number,
+        "status": "closed",
+    }
+    # No state["prs"] entry for this issue at all -- state.json has zero
+    # opinion about a PR existing for it.
+
+    drift = detect_drift(gh, state, config)
+
+    matches = [
+        item
+        for item in drift
+        if item.kind == "issue_status_normalized"
+        and item.issue_number == target_issue_number
+        and item.new_status is None
+    ]
+    assert len(matches) == 1
+
+    # And the per-item deferral warning must NOT claim this issue was
+    # deferred, since it wasn't.
+    deferred = [
+        item
+        for item in drift
+        if item.kind == "snapshot_truncated" and "issue_status_normalized deferred" in item.detail
+    ]
+    assert deferred == []
 
 
 def test_detect_drift_issue_status_normalized_none_still_fires_when_pr_snapshot_complete() -> None:
