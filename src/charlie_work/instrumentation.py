@@ -160,6 +160,17 @@ _ERROR_KINDS = frozenset(
         # self_deploy_alarm above: reachable via query_events(level="error")
         # without any new query infrastructure.
         "supervisor_zero_pass_alarm",
+        # Issue #933: the #502/#673 unauthorized-merge tripwire fired and pinned
+        # ok=False on every pass for 21 consecutive passes, while a session
+        # reading query_events(level="error") reported "0 errors since restart"
+        # -- nothing on the finding path had ever set a non-info level. The
+        # paired "unauthorized_merge_acknowledged" and
+        # "unauthorized_merge_baseline_armed" events stay "info": a triaged
+        # finding and a suppressed backlog are bookkeeping, whereas an
+        # unacknowledged uncovered merge is the alarm the control exists to
+        # raise. Fires once per PR, not once per pass -- see
+        # workflow.UNAUTHORIZED_MERGE_DETECTED_KEY.
+        "unauthorized_merge_detected",
     }
 )
 _WARNING_KINDS = frozenset(
