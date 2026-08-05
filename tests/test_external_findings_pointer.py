@@ -36,6 +36,31 @@ _POINTER_PHRASE = "Read the PR's review comments and review threads on GitHub be
 # --------------------------------------------------------------------------
 
 
+def test_external_findings_tier_renders_list_and_pointer() -> None:
+    """Issue #950: when findings are folded in from the PR itself,
+    ``findings_channel == "external"`` renders the itemized tier with an
+    external-aware intro and the pointer still appended."""
+    decision = {
+        "decision": "request_changes",
+        "summary": "The retry wrapper swallows the exception type.",
+        "required_changes": [
+            "add a regression test",
+            "fix the null check in parse()",
+        ],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "## Required changes" in section
+    assert "verified findings posted on the PR itself" in section
+    assert "- add a regression test" in section
+    assert "- fix the null check in parse()" in section
+    assert _POINTER_HEADER in section
+    assert section.count(_POINTER_HEADER) == 1
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section
+
+
 def test_list_tier_contains_pointer_and_keeps_all_items() -> None:
     """Tier 1 (enumerated ``required_changes``): the pointer is appended and
     every structured item still renders -- additive, not a replacement."""

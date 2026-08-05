@@ -1,0 +1,23 @@
+[
+  {
+    "body": "",
+    "user": {
+      "login": "sergiou87",
+      "type": "User"
+    }
+  },
+  {
+    "body": "I've opened https://github.com/cli/cli/pull/14076 with some suggestions for an acceptance test and an error message wording improvement. A little bit vibey but shows what I mean. I'll leave it to you to decide what you want to do with this PR. Feel free to push to the branch, or take the commits to yours, or not.",
+    "user": {
+      "login": "williammartin",
+      "type": "User"
+    }
+  },
+  {
+    "body": "## Pull request overview\n\nThis PR improves the `gh repo sync` user experience when the target branch is checked out in a different Git worktree by detecting that state up front and returning a curated, actionable error message.",
+    "user": {
+      "login": "copilot-pull-request-reviewer[bot]",
+      "type": "Bot"
+    }
+  }
+]

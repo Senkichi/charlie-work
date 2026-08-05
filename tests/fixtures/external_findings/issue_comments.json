@@ -1,0 +1,16 @@
+[
+  {
+    "body": "> this PR implements the interactive PR list we had in the original `cli-test` repo.\n>\n> caveats:\n> - doesn't visually split out PRs\n> - doesn't explain what the contents of the list are\n> - doesn't support closing because i need to remember how to do mutations with graphql\n>\n> it's not ideal but it's something\n",
+    "user": {
+      "login": "Vadim0695",
+      "type": "User"
+    }
+  },
+  {
+    "body": "**Recommendation: Merge, Confidence: Medium**\n\nThis bump spans four upstream releases (v0.83.5 through v0.84.2), all of which are action-script syncs from the gh-aw internal tool.\n",
+    "user": {
+      "login": "cli-triage[bot]",
+      "type": "Bot"
+    }
+  }
+]

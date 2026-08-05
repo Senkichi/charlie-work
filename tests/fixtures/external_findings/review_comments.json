@@ -1,0 +1,16 @@
+[
+  {
+    "body": "Started writing this whole test to reproduce the problem, where an error wasn't thrown in this scenario. But now using `git branch --force -- …`, the user gets an error.",
+    "user": {
+      "login": "sergiou87",
+      "type": "User"
+    }
+  },
+  {
+    "body": "runGit shells out with exec.Command(\"git\"), which bypasses the repo's git.Client wrapper. Consider switching this helper to use &git.Client{RepoDir: repoDir}.Command(...).",
+    "user": {
+      "login": "Copilot",
+      "type": "Bot"
+    }
+  }
+]

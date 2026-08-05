@@ -54,6 +54,9 @@ class _FakeGitHub:
     def pr_diff(self, number: int) -> str:
         return "diff content"
 
+    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
+        return [] if json_output else ""
+
     def add_issue_label(self, number: int, label: str) -> bool:
         return True
 

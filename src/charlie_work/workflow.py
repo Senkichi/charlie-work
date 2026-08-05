@@ -4711,6 +4711,132 @@ def _required_changes_from_checks(
     return required_changes
 
 
+ORCHESTRATOR_COMMENT_MARKER = "<!-- charlie-work:orchestrator-generated -->"
+"""Provenance marker stamped into every PR comment the orchestrator writes.
+
+Issue #950's external-findings ingestion cannot use author identity to tell its
+own output apart from a human's: the orchestrator authenticates with a *user*
+token, so ``gh api user`` reports ``type=User`` and its comments are
+indistinguishable from genuine review comments by the same person. Filtering on
+the login would suppress exactly the human findings the feature exists to
+capture.
+
+So provenance travels in the body instead. ``_comment_pr`` stamps this marker;
+``_is_orchestrator_comment`` skips anything carrying it. An HTML comment is
+invisible in rendered markdown, so the posted comment is unchanged for readers.
+
+Note this covers only comments written by *this* process. A worker's own rework
+reply is machine-generated too and is not stamped here -- see the follow-up
+issue referenced in ``_collect_external_findings``.
+"""
+
+
+def _is_orchestrator_comment(item: dict[str, Any]) -> bool:
+    """Return True if a comment body *begins* with the orchestrator's provenance marker.
+
+    Deliberately a prefix test, not a substring test. ``_comment_pr`` writes the
+    marker as the literal first line, so a prefix check catches every comment this
+    process posts -- and a substring check would catch strictly more than that, in
+    the one direction that costs real findings.
+
+    The extra case a substring check would swallow: GitHub's "Quote reply" inserts
+    the *raw markdown* of the quoted comment, HTML comments included, as a
+    blockquote above the reply. Quote-replying to one of our ``request_changes``
+    comments is a natural way for a human to respond point by point, and the
+    resulting body contains the marker without starting with it. Under a substring
+    test that whole comment -- quote plus whatever new finding the human wrote
+    below it -- is dropped from ``required_changes`` silently.
+
+    Dropping a genuine human finding is worse than ingesting one of our own
+    comments, so this predicate is written to fail toward ingestion.
+    """
+    body = item.get("body")
+    return isinstance(body, str) and body.lstrip().startswith(ORCHESTRATOR_COMMENT_MARKER)
+
+
+def _is_bot_comment(item: dict[str, Any]) -> bool:
+    """Return True if a comment/review author is a GitHub App/bot account.
+
+    Uses the API-supplied ``user.type``/``author.type`` or ``author.is_bot``
+    discriminator. Does not rely on a hardcoded login list.
+
+    This catches genuine GitHub Apps (Aviator, dependabot, ...) but *not* the
+    orchestrator itself, which posts under a user token -- see
+    ``ORCHESTRATOR_COMMENT_MARKER``.
+    """
+    user = item.get("user")
+    if isinstance(user, dict) and user.get("type") == "Bot":
+        return True
+    author = item.get("author")
+    if isinstance(author, dict):
+        if author.get("type") == "Bot" or author.get("is_bot") is True:
+            return True
+    return False
+
+
+def _gh_api_list(gh: GitHubLike, path: str) -> list[dict[str, Any]]:
+    """Call ``gh api --paginate <path>`` and return a list, swallowing errors."""
+    result = gh.run(
+        ["api", "--paginate", path],
+        json_output=True,
+        allow_failure=True,
+    )
+    if isinstance(result, GitHubRunResult):
+        if not result.ok or not isinstance(result.value, list):
+            return []
+        return result.value
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    return []
+
+
+def _collect_external_findings(gh: GitHubLike, pr_number: int) -> list[str]:
+    """Collect non-bot human feedback from the three external PR surfaces.
+
+    Fetches issue-level comments, review bodies, and inline review comments.
+    Returns a flat list of markdown bodies ready to be folded into
+    ``review-decision.json`` at record time.
+
+    Two provenance filters apply, and they are deliberately different in kind:
+
+    * **Bots** are excluded by author (``user.type == "Bot"``) -- GitHub Apps
+      such as Aviator have their own identity, so identity is a sound
+      discriminator for them.
+    * **The orchestrator's own comments** are excluded by *body marker*, not by
+      author. The orchestrator posts through a user token, so its comments are
+      indistinguishable by identity from a genuine human review by the same
+      person, and filtering on that login would drop exactly the findings #950
+      exists to ingest. See ``ORCHESTRATOR_COMMENT_MARKER``.
+
+    Known gap: a worker's own rework reply ("Reworked in <sha>, here is what I
+    changed") is machine-generated but posted through the worker's path, so it
+    carries no marker and is still ingested -- it would be presented back to
+    the worker as a required change. Tracked separately; fixing it needs either
+    a marker on the worker side or a cutoff at ``reviewed_head_sha``.
+    """
+    bodies: list[str] = []
+    owner_repo = "{owner}/{repo}"
+
+    surfaces = (
+        # A PR is also an issue, so issue-level comments live here.
+        f"repos/{owner_repo}/issues/{pr_number}/comments",
+        # Top-level PR review bodies.
+        f"repos/{owner_repo}/pulls/{pr_number}/reviews",
+        # Inline review comments on specific diff lines.
+        f"repos/{owner_repo}/pulls/{pr_number}/comments",
+    )
+
+    for path in surfaces:
+        for item in _gh_api_list(gh, path):
+            if _is_bot_comment(item) or _is_orchestrator_comment(item):
+                continue
+            body = (item.get("body") or "").strip()
+            if body:
+                bodies.append(body)
+
+    return bodies
+
+
 _EXTERNAL_FINDINGS_POINTER = (
     "## Also required: findings posted on the PR itself\n"
     "\n"
@@ -4784,16 +4910,28 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     own tier-2 fallback) or ``"vacuous"`` (nothing was derivable -- neither
     an itemized list nor a usable summary -- e.g. the historical
     cross-family placeholder, ``cross_family.LEGACY_VACUOUS_SUMMARY``, which
-    is genuinely non-blank text but carries no reviewer content). Verdicts
-    carrying either marker are handled explicitly, before the shape-based
-    tiers below: ``"vacuous"`` always renders tier 3 (a non-blank-but-
-    content-free summary is strictly worse than an empty one -- rendering
-    it as tier 2 would silently present it as real findings), and
-    ``"derived"`` always renders tier 2 verbatim rather than falling into
-    tier 1's bullet list (a single derived item wrapped as a one-item bullet
-    would otherwise dump an entire multi-paragraph summary onto one line).
-    Verdicts with no marker at all -- every record written before this
-    fix -- fall through unchanged to the original shape-based tiers.
+    is genuinely non-blank text but carries no reviewer content).
+
+    Issue #950: when the PR itself carries verified human or peer-agent
+    findings (issue comments, review bodies, inline review threads),
+    ``record_review`` folds them into ``required_changes`` and sets
+    ``findings_channel`` to ``"external"``. Verdicts carrying the
+    ``"external"`` marker render as the itemized tier below, but with a
+    description that makes clear the list mixes internal reviewer findings
+    and external PR comments. The ``"external"`` marker is checked before
+    the shape-based tiers so an entirely-external verdict is not mis-binned
+    as ``"derived"``/``"vacuous"``.
+
+    Verdicts carrying the ``"vacuous"`` or ``"derived"`` markers are
+    handled explicitly, before the shape-based tiers below:
+    ``"vacuous"`` always renders tier 3 (a non-blank-but-content-free
+    summary is strictly worse than an empty one -- rendering it as tier 2
+    would silently present it as real findings), and ``"derived"`` always
+    renders tier 2 verbatim rather than falling into tier 1's bullet list
+    (a single derived item wrapped as a one-item bullet would otherwise dump
+    an entire multi-paragraph summary onto one line). Verdicts with no
+    marker at all -- every record written before this fix -- fall through
+    unchanged to the original shape-based tiers.
 
     Rendered for ``request_changes`` and, defensively, ``blocked`` verdicts
     (routing to rework via the decision-agnostic janitor gates -- merge
@@ -4878,12 +5016,22 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and changes:
+        if findings_channel == "external":
+            intro = (
+                "Address every item below. These include the reviewer's "
+                "own findings and verified findings posted on the PR itself as "
+                "comments, review bodies, or inline review threads."
+            )
+        else:
+            intro = (
+                "Address every item below. These are the reviewer's structured "
+                "findings — the authoritative list of what must change before this "
+                "PR can be approved."
+            )
         lines = [
             "## Required changes",
             "",
-            "Address every item below. These are the reviewer's structured "
-            "findings — the authoritative list of what must change before this "
-            "PR can be approved.",
+            intro,
             "",
         ]
         lines.extend(f"- {defang_closing_keywords(change)}" for change in changes)
@@ -11133,6 +11281,20 @@ class OrchestratorApp:
 
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
+
+        # Issue #950: fold non-bot findings from the PR's own external review
+        # surfaces into the verdict at write time. This is a live fetch at
+        # record_review time, not at render time, so _render_rework_prompt stays
+        # a pure function of the durable verdict file.
+        if decision in {"request_changes", "blocked"}:
+            external_findings = _collect_external_findings(self.gh, pr_number)
+            if external_findings:
+                if findings_channel == "vacuous":
+                    effective_required_changes = list(external_findings)
+                else:
+                    effective_required_changes.extend(external_findings)
+                findings_channel = "external"
+
         # reviewed_head_sha/reviewed_patch_id must reflect the packet the reviewer
         # actually read (review()'s pr.json/diff.patch), not a fresh fetch made
         # here at verdict time: a commit landing between packet generation and
@@ -18862,9 +19024,17 @@ class OrchestratorApp:
             return None
 
     def _comment_pr(self, pr_number: int, summary: str) -> None:
+        """Post a comment on ``pr_number``, stamped with the orchestrator's marker.
+
+        The marker is what lets #950's external-findings ingestion recognise this
+        comment as its own output rather than a human finding -- author identity
+        cannot make that distinction, because the orchestrator posts under a user
+        token. Stamping happens here, at the single point every orchestrator
+        comment passes through, so no call site can forget it.
+        """
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         body_path = pr_dir / "review-comment.md"
-        body_path.write_text(summary, encoding="utf-8")
+        body_path.write_text(f"{ORCHESTRATOR_COMMENT_MARKER}\n{summary}", encoding="utf-8")
         self.gh.pr_comment(pr_number, body_path)
 
     def _summarize_issue(self, issue: dict[str, Any]) -> dict[str, Any]:
