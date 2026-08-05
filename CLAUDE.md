@@ -100,13 +100,21 @@ adapter:
   deliberately rejects that, and said so before this file did. Shape bounds how
   *deep* discovery reaches, not *which directory* an entry names.
 
+  **Never weaken or remove that containment check, and never replace it with filtering
+  entry names.** Name filtering is the wrong fix — it is what the resolved-path check
+  exists instead of, because a name tells you nothing about where a reparse point
+  actually lands. The check at `runner_slots.py` is the thing standing between
+  reallocation and `C:\actions-runner`.
+
   What the containment check does **not** do is validate its own anchor.
   `managed_root` is config-derived (`allocation.managed_root or
   managed_root_fallback`) and config comes from the tree, so under a wrong tree every
   entry beneath the wrong root is contained *by construction*. The guard cannot fail;
   it answers a question whose subject was already substituted. Containment is relative
-  to its anchor, so anything asserting **which** checkout and config are live has to
-  run upstream of it, not beside it — a second containment check adds nothing.
+  to its anchor, so anything asserting **which** checkout and config are live belongs
+  upstream of the containment check — **in addition to it, never instead of it.** Do
+  not read this paragraph as a reason to drop a containment check; adding the upstream
+  assertion is the change, removing anything is not.
 
 `charlie runners allocate` is also the *only* thing allowed to decide which
 listeners run. Operator scripts and post-reboot procedures must delegate to it
