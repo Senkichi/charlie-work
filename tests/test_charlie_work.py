@@ -17805,6 +17805,56 @@ def test_dispatch_rework_failure_reason_in_event_payload(tmp_path: Path) -> None
     assert result.data["failures"][123] == payload["failures"]["123"]
 
 
+def test_dispatch_rework_event_indexes_pr_number(tmp_path: Path) -> None:
+    """Issue #770: dispatch_rework events must populate the indexed pr_number column.
+
+    The payload must carry an explicit ``pr_number`` (mirroring ``rework_already_pushed``)
+    so the SQLite-backed event log indexes it; without it, ``query_events(pr_number=...)``
+    silently returns empty for rework dispatches.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+
+    events = query_events(paths.state_file, kind="dispatch_rework")
+    assert len(events) == 1
+    assert events[0]["pr_number"] == 456
+    assert events[0]["payload"]["pr_number"] == 456
+
+
 def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> None:
     """Issue #515: repeated failed rework-dispatch attempts must count toward the
     redispatch cap and escalate instead of retrying forever.

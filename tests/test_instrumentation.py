@@ -261,6 +261,29 @@ def test_singular_key_preferred_over_plural(tmp_path: Path) -> None:
     assert events[0]["issue_number"] == 101
 
 
+def test_dispatch_rework_payload_pr_number_indexes(tmp_path: Path) -> None:
+    """Issue #770: a ``pr_number`` key in a ``dispatch_rework`` payload must populate the indexed column.
+
+    This is the schema-level guard: the caller supplies ``pr_number`` and the
+    instrumentation layer copies it to the ``pr_number`` SQLite column. Without
+    this, ``query_events(pr_number=...)`` silently returns empty for the kind.
+    """
+    state_path = tmp_path / "state.json"
+    log_event(
+        state_path,
+        "dispatch_rework",
+        {
+            "pr_number": 456,
+            "issue_numbers": [123],
+            "failed_issue_numbers": [],
+        },
+    )
+
+    events = read_event_log(state_path)
+    assert events[0]["pr_number"] == 456
+    assert events[0]["payload"]["pr_number"] == 456
+
+
 def test_plural_extraction_query_events_filter(tmp_path: Path) -> None:
     """Issue #553 core symptom: events with plural refs must be findable by PR/issue."""
     state_path = tmp_path / "state.json"
