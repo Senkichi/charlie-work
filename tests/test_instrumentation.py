@@ -1011,19 +1011,41 @@ def _resolve_literal(
     local_assigns: dict[str, list[ast.expr]],
     module_constants: dict[str, set[str]],
     local_params: frozenset[str] = frozenset(),
-) -> set[str]:
+) -> set[str] | None:
     """Best-effort resolution of ``node`` to the finite set of strings it can be.
 
-    Returns the empty set when ``node`` cannot be proven to reduce to a
-    literal set. Callers MUST treat an empty result as *unresolved*, not as
-    "this site contributes no kinds" -- conflating the two is the #995 bug.
+    Returns ``None`` when ``node`` cannot be proven to reduce to a literal set
+    of strings -- including when it provably reduces to something that is
+    *not* a string (e.g. a bare ``None`` constant), or when any branch of a
+    multi-branch expression (an ``IfExp``, or multiple assignments to the same
+    local name) is itself unresolvable. Callers MUST check ``is None``, never
+    falsiness: ``None`` and ``set()`` are different signals, and conflating
+    "unresolvable" with "resolved to nothing" is the #995/#1029 bug shape --
+    #995 for ``kind``, #1029 for ``level`` (a ``level="x" if cond else None``
+    site unioned the ``None`` branch away and was wrongly treated as
+    self-classifying). Every exit point is also guaranteed to never return a
+    resolved-but-empty set: ``set().issubset(_VALID_LEVELS)`` is ``True``, so
+    an empty set handed to an ``is not None`` consumer would silently
+    re-open the same fail-open bug one level up. This is enforced here (see
+    the ``or None`` coercions below) rather than left as an invariant callers
+    must trust -- a future branch added to this function only needs to avoid
+    returning ``set()`` on its own exit, not reason about every consumer.
     """
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return {node.value}
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            return {node.value}
+        # Any other constant (None, an int, a bool, ...) is provably not a
+        # string literal -- not merely unrecognised syntax. This is what lets
+        # `level="warning" if cond else None` fail closed: the `None` branch
+        # resolves to `None` (unresolvable) instead of silently contributing
+        # the empty set that a union would then discard.
+        return None
     if isinstance(node, ast.IfExp):
-        return _resolve_literal(
-            node.body, local_assigns, module_constants, local_params
-        ) | _resolve_literal(node.orelse, local_assigns, module_constants, local_params)
+        body = _resolve_literal(node.body, local_assigns, module_constants, local_params)
+        orelse = _resolve_literal(node.orelse, local_assigns, module_constants, local_params)
+        if body is None or orelse is None:
+            return None
+        return body | orelse
     if isinstance(node, ast.JoinedStr):
         # An f-string resolves only if every interpolated part resolves (no
         # format spec, no conversion beyond the str-identity ``!s``); the
@@ -1044,14 +1066,22 @@ def _resolve_literal(
                 resolved = _resolve_literal(
                     value.value, local_assigns, module_constants, local_params
                 )
-                if resolved:
+                if resolved is not None:
                     parts.append(resolved)
                     continue
-            return set()
+            return None
         combined = {""}
         for part in parts:
             combined = {prefix + suffix for prefix in combined for suffix in part}
-        return combined
+        # Every `parts` entry is proven non-empty above (Constant str is a
+        # singleton; a FormattedValue only appends when `resolved is not
+        # None`, and _resolve_literal never itself returns an empty set --
+        # see the `or None` guards below), so `combined` cannot legitimately
+        # come out empty. Coerce defensively anyway: `_resolve_literal` must
+        # never hand a resolved-but-empty set to a caller that branches on
+        # `is not None`, since `set().issubset(_VALID_LEVELS)` is True and an
+        # empty set would silently re-open the #1029 fail-open one level up.
+        return combined or None
     if isinstance(node, ast.Name):
         if node.id in local_params:
             # A function parameter is caller-controlled. A local reassignment
@@ -1061,19 +1091,31 @@ def _resolve_literal(
             # still be the one that flows through on some path. Treat
             # conservatively as unresolved rather than trusting a partial
             # local reassignment over the parameter's own (unknown) value.
-            return set()
+            return None
         if node.id in local_assigns:
             values: set[str] = set()
             for value_node in local_assigns[node.id]:
-                values |= _resolve_literal(
+                resolved = _resolve_literal(
                     value_node, local_assigns, module_constants, local_params
                 )
-            if values:
-                return values
+                if resolved is None:
+                    # One reassignment on this name is unresolvable -- some
+                    # path through the function could carry that value to the
+                    # emit call, so the name as a whole is unresolvable too,
+                    # same as an IfExp branch that doesn't resolve.
+                    return None
+                values |= resolved
+            # Same empty-set guard as the JoinedStr exit above: `values`
+            # should be non-empty by construction (every resolved branch is
+            # itself non-empty, and `local_assigns[node.id]` is never an
+            # empty list -- `_collect_local_assignments` only creates the key
+            # when appending a value), but the guarantee must live at this
+            # producer boundary, not be assumed by every consumer.
+            return values or None
         if node.id in module_constants:
             return module_constants[node.id]
-        return set()
-    return set()
+        return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -1116,7 +1158,7 @@ def _has_explicit_level(
         if kw.arg != "level":
             continue
         resolved = _resolve_literal(kw.value, local_assigns, module_constants, local_params)
-        if resolved and resolved.issubset(_VALID_LEVELS):
+        if resolved is not None and resolved.issubset(_VALID_LEVELS):
             return True
     return False
 
@@ -1168,7 +1210,7 @@ def _record_kind_site(
         )
         return
     resolved = _resolve_literal(kind_node, local_assigns, module_constants, local_params)
-    if resolved:
+    if resolved is not None:
         used.update(resolved)
         return
     unresolved.append(
@@ -1263,11 +1305,23 @@ def _scan_tree(tree: ast.Module, rel_path: str) -> tuple[set[str], list[_Unresol
     module_local = _collect_local_assignments(tree)
     module_constants: dict[str, set[str]] = {}
     for name, value_nodes in module_local.items():
-        resolved: set[str] = set()
+        # A module-level name assigned more than once (e.g. reassigned under
+        # an `if`) is only a "constant" -- resolvable at every reference site
+        # -- if *every* assignment resolves. One unresolvable assignment (a
+        # function call, an unknown name, ...) means some path could carry an
+        # unproven value, so `parts` is reset and abandoned rather than
+        # unioning in only the assignments that happened to resolve: that
+        # would silently drop the unresolvable branch the same way `None`
+        # was dropped from a `level=` union (#1029).
+        parts: list[set[str]] = []
         for value_node in value_nodes:
-            resolved |= _resolve_literal(value_node, module_local, {}, frozenset())
-        if resolved:
-            module_constants[name] = resolved
+            part = _resolve_literal(value_node, module_local, {}, frozenset())
+            if part is None:
+                parts = []
+                break
+            parts.append(part)
+        if parts:
+            module_constants[name] = set().union(*parts)
     _scan_node(
         tree, module_constants, module_local, frozenset(), "<module>", rel_path, used, unresolved
     )
@@ -1452,18 +1506,18 @@ def test_self_deploy_event_kind_only_returns_registered_kinds() -> None:
     assert _self_deploy_event_kind(skipped) == "self_deploy_skipped"
 
 
-def test_sweep_event_append_kinds_are_registered() -> None:
-    """#995: independently verify the claim behind the two `_append_sweep_events` entries.
+def _scan_sweep_append_kinds(root: Path) -> tuple[set[str], list[str]]:
+    """Scan every ``*.py`` under ``root`` for ``sweep_events.append((kind, payload))``
+    call sites; return (resolved literal kinds, unresolvable-element descriptions).
 
-    `_append_sweep_events`'s `kind` loop variable is allow-listed above
-    because the real literal is chosen at each `sweep_events.append((kind,
-    payload))` call site, not in the loop. This scans for exactly those call
-    sites directly and checks every literal they contribute against the
-    registry, so that claim is enforced rather than trusted.
+    Factored out of ``test_sweep_event_append_kinds_are_registered`` so the
+    fail-closed behavior on an unresolvable kind element (#1029) can be
+    exercised directly against a synthetic tree, the same way
+    ``_scan_event_kinds`` is factored out for the main scanner.
     """
-    src_root = Path(__file__).parents[1] / "src" / "charlie_work"
     found: set[str] = set()
-    for path in sorted(src_root.rglob("*.py")):
+    unresolved: list[str] = []
+    for path in sorted(root.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if not (
@@ -1478,11 +1532,97 @@ def test_sweep_event_append_kinds_are_registered() -> None:
                 continue
             arg = node.args[0]
             if isinstance(arg, ast.Tuple) and arg.elts:
-                found |= _resolve_literal(arg.elts[0], {}, {})
+                resolved = _resolve_literal(arg.elts[0], {}, {})
+                if resolved is None:
+                    # #1029: this scan's whole premise is that every literal
+                    # at a `sweep_events.append((kind, payload))` site is
+                    # registered -- an element the resolver can't prove a
+                    # literal for undermines that premise and must surface,
+                    # not silently contribute nothing to `found` (the same
+                    # union-with-empty-set fail-open the `level=` bug had).
+                    unresolved.append(
+                        f"{path.relative_to(root).as_posix()}:{node.lineno}: "
+                        f"{ast.unparse(arg.elts[0])}"
+                    )
+                    continue
+                found |= resolved
+    return found, unresolved
 
+
+def test_sweep_event_append_kinds_are_registered() -> None:
+    """#995: independently verify the claim behind the two `_append_sweep_events` entries.
+
+    `_append_sweep_events`'s `kind` loop variable is allow-listed above
+    because the real literal is chosen at each `sweep_events.append((kind,
+    payload))` call site, not in the loop. This scans for exactly those call
+    sites directly and checks every literal they contribute against the
+    registry, so that claim is enforced rather than trusted.
+    """
+    src_root = Path(__file__).parents[1] / "src" / "charlie_work"
+    found, unresolved = _scan_sweep_append_kinds(src_root)
+
+    assert not unresolved, (
+        "sweep_events.append((kind, payload)) site(s) with an unresolvable "
+        "kind element -- make it a literal or trace it manually: " + "; ".join(unresolved)
+    )
     assert found, "expected at least one sweep_events.append((kind, payload)) call site"
     unregistered = {k for k in found if not _known_level(k)}
     assert not unregistered, f"unregistered sweep_events kinds: {sorted(unregistered)}"
+
+
+def test_sweep_append_kind_scan_flags_unresolvable_element_not_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    """#1029 (sweep-kind direction): an unresolvable ``sweep_events.append((kind,
+    payload))`` element must surface as unresolved, not vanish from ``found``
+    via ``found |= _resolve_literal(...)`` unioning in an empty result.
+
+    Asserts on the observable consequence -- the site is flagged -- rather
+    than on ``found`` being empty, since an empty ``found`` is also what a
+    correctly-behaving scan produces when nothing resolves; only the
+    unresolved list distinguishes "silently dropped" from "surfaced".
+    """
+    (tmp_path / "fixture.py").write_text(
+        "def _append(kind_choice):\n    sweep_events.append((kind_choice(), {'x': 1}))\n",
+        encoding="utf-8",
+    )
+    found, unresolved = _scan_sweep_append_kinds(tmp_path)
+    assert not found
+    assert unresolved, "unresolvable sweep_events.append kind element was silently dropped"
+    assert "kind_choice()" in unresolved[0]
+
+
+def test_scanner_module_constant_with_unresolvable_value_not_silently_dropped() -> None:
+    """#1029 (module-constant direction): a module-level name reassigned on
+    two branches -- one a string literal, one unresolvable (a function call)
+    -- must not be treated as resolved to just the literal branch.
+
+    A single-assignment unresolvable constant doesn't discriminate this bug:
+    an empty accumulator unioned with one unresolvable ``None``/empty result
+    stays empty either way. The bug only shows up with a *mix*, exactly like
+    ``level="warning" if cond else None`` -- the old code's
+    ``resolved |= _resolve_literal(...) or set()`` would union in the
+    resolvable branch (``{"kind_a"}``) and silently drop the unresolvable one,
+    ending up "resolved" to ``{"kind_a"}`` when the true value could be
+    anything ``_compute_kind()`` returns. Asserts the emit site is flagged
+    *unresolved* -- not merely that ``"kind_a"`` is absent from ``used``,
+    since that alone doesn't distinguish "silently dropped" (buggy: `used` is
+    `{"kind_a"}`, non-empty) from "correctly surfaced" (fixed: `used` is
+    empty because `unresolved` is used instead).
+    """
+    source = (
+        "if _flag():\n"
+        "    KIND = 'kind_a'\n"
+        "else:\n"
+        "    KIND = _compute_kind()\n\n\n"
+        "def emit():\n    log_event(state_path, KIND, {})\n"
+    )
+    tree = ast.parse(source)
+    used, unresolved = _scan_tree(tree, "fixture.py")
+    assert not used, f"expected no resolvable kinds (one branch is unresolvable), got {used}"
+    assert unresolved, (
+        "module constant with a mixed resolvable/unresolvable value was dropped (#1029)"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1601,6 +1741,75 @@ def test_scanner_accepts_explicit_level_without_requiring_kind_resolution() -> N
     used, unresolved = _scan_tree(tree, "fixture.py")
     assert not used
     assert not unresolved
+
+
+def _call_node_for(source: str) -> tuple[ast.Call, dict[str, list[ast.expr]], frozenset[str]]:
+    """Parse ``source``, return the single ``log_event`` ``Call`` node plus its
+    enclosing function's local assignments and parameter names.
+
+    Test helper for exercising ``_has_explicit_level`` directly, without going
+    through the full ``_scan_tree`` walk.
+    """
+    tree = ast.parse(source)
+    func = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+    call = next(
+        n for n in ast.walk(func) if isinstance(n, ast.Call) and _emit_func_name(n) == "log_event"
+    )
+    return call, _collect_local_assignments(func), _collect_param_names(func)
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        pytest.param(
+            "def emit():\n    log_event(state_path, 'k', {}, level='warning')\n",
+            True,
+            id="literal-str-only",
+        ),
+        pytest.param(
+            "def emit(cond):\n"
+            "    log_event(state_path, 'k', {}, level='warning' if cond else None)\n",
+            False,
+            id="str-or-none-conditional",
+        ),
+        pytest.param(
+            "def emit():\n    log_event(state_path, 'k', {}, level=None)\n",
+            False,
+            id="plain-none",
+        ),
+        pytest.param(
+            "def emit():\n    log_event(state_path, 'k', {}, level=_compute_level())\n",
+            False,
+            id="call-node",
+        ),
+        pytest.param(
+            "def emit(lvl):\n    log_event(state_path, 'k', {}, level=lvl)\n",
+            False,
+            id="name-variable",
+        ),
+    ],
+)
+def test_has_explicit_level_fails_closed_on_none_admitting_expressions(
+    source: str, expected: bool
+) -> None:
+    """#1029: a ``level=`` expression that can be ``None`` on some branch must
+    not exempt the site from kind-registry verification.
+
+    ``None`` is the documented "fall back to ``_LEVEL_BY_KIND``" signal (see
+    ``instrumentation.log_event``), so a site whose level is conditionally
+    ``None`` -- e.g. ``level="warning" if cond else None`` -- is still
+    registry-dependent on the ``None`` path. Before this fix, ``_resolve_literal``
+    unioned away the ``None`` branch (it only collects string constants) and
+    ``_has_explicit_level`` saw only ``{"warning"}``, wrongly exempting the site.
+
+    ``literal-str-only`` is the positive control: it must stay ``True`` so this
+    test cannot pass merely because the helper started returning ``False``
+    unconditionally. ``call-node`` and ``name-variable`` guard the same
+    fail-closed behavior for expression shapes the resolver cannot statically
+    reduce at all.
+    """
+    call, local_assigns, local_params = _call_node_for(source)
+    assert _has_explicit_level(call, local_assigns, {}, local_params) is expected
 
 
 def test_issue_910_active_kinds_are_error_or_warning(tmp_path: Path) -> None:
