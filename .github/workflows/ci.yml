@@ -57,11 +57,21 @@ jobs:
       # refuses a path: outside the workspace, and the location is fixed by the
       # relative path recorded in uv.lock.
       #
-      # Tracks ci_runners' main rather than a pinned SHA. That is deliberate
-      # while the extraction is in flight: the lock records the editable path,
-      # not a revision, so a pin here would be a second source of truth that
-      # silently disagrees with it. Revisit when ci_fleet is published as a
-      # versioned dependency.
+      # Tracks ci_runners' main rather than a pinned SHA. Deliberate, but NOT
+      # for the reason this comment used to give -- it claimed the lock would
+      # disagree with a pin, and uv.lock records
+      # `source = { editable = "../ci_runners" }` with no revision anywhere in
+      # the entry, so there is nothing here for a pin to contradict (see #954).
+      #
+      # The real reason: production does not run a revision. The live
+      # supervisor imports ci_fleet through an editable .pth that prepends
+      # ..\ci_runners\src to sys.path, so it executes whatever is SAVED in that
+      # working tree -- committed or not. Pinning a SHA here would buy a
+      # reproducible CI at the cost of validating a ci_fleet that production
+      # demonstrably does not run, which is the more expensive of the two.
+      #
+      # Revisit when ci_fleet ships as a versioned dependency: at that point CI
+      # and the supervisor resolve the same artifact and a pin costs nothing.
       - name: Check out ci_runners as a sibling
         shell: powershell
         env:
@@ -207,11 +217,21 @@ jobs:
       # refuses a path: outside the workspace, and the location is fixed by the
       # relative path recorded in uv.lock.
       #
-      # Tracks ci_runners' main rather than a pinned SHA. That is deliberate
-      # while the extraction is in flight: the lock records the editable path,
-      # not a revision, so a pin here would be a second source of truth that
-      # silently disagrees with it. Revisit when ci_fleet is published as a
-      # versioned dependency.
+      # Tracks ci_runners' main rather than a pinned SHA. Deliberate, but NOT
+      # for the reason this comment used to give -- it claimed the lock would
+      # disagree with a pin, and uv.lock records
+      # `source = { editable = "../ci_runners" }` with no revision anywhere in
+      # the entry, so there is nothing here for a pin to contradict (see #954).
+      #
+      # The real reason: production does not run a revision. The live
+      # supervisor imports ci_fleet through an editable .pth that prepends
+      # ..\ci_runners\src to sys.path, so it executes whatever is SAVED in that
+      # working tree -- committed or not. Pinning a SHA here would buy a
+      # reproducible CI at the cost of validating a ci_fleet that production
+      # demonstrably does not run, which is the more expensive of the two.
+      #
+      # Revisit when ci_fleet ships as a versioned dependency: at that point CI
+      # and the supervisor resolve the same artifact and a pin costs nothing.
       - name: Check out ci_runners as a sibling
         shell: powershell
         env:
