@@ -70,7 +70,8 @@ import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Generator
+from types import MappingProxyType
+from typing import Any, Generator, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,11 @@ _correlation_local = threading.local()
 _db_locks: dict[str, threading.Lock] = {}
 _db_connections: dict[str, sqlite3.Connection] = {}
 _db_init_lock = threading.Lock()
+
+# Tracks unknown event kinds we have already warned about once. A one-time
+# warning preserves the best-effort contract (log_event never raises) while
+# still making unregistered kinds visible in the logs.
+_unknown_kind_warned: set[str] = set()
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS events (
@@ -116,139 +122,159 @@ CREATE TABLE IF NOT EXISTS loop_passes (
 );
 """
 
-# Event kinds that are considered errors or warnings for the ``level`` column.
-_ERROR_KINDS = frozenset(
+# Event kind to ``level`` column mapping. This is the single source of truth
+# for event-level classification; the old ``_ERROR_KINDS`` / ``_WARNING_KINDS``
+# allow-lists are derived from it below for compatibility.
+#
+# A kind not present in this registry is classified as ``"info"`` with a
+# warning, so the instrumentation layer stays best-effort and never breaks a
+# caller. New kinds are caught instead by the static test that requires every
+# literal kind passed to ``log_event`` / ``append_event`` / ``_record_event`` in
+# this package to be registered.
+_LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
     {
-        "github_error",
-        "github_not_found_error",
-        "intake_failed",
-        "session_stalled",
-        "session_failed_escalated",
-        "session_failed_relabeled",
-        "session_salvaged",
-        "review_dispatch_stalled",
-        "review_checkout_removal_failed",
-        "dispatch_failed",
-        "orphan_processes_killed",
-        "orphaned_worker_routed_to_review",
-        "pre_review_rework_routed",
-        "rework_requeued",
-        "merge_blocked",
-        "merge_failed",
-        "spec_review_failed",
-        "operator_claim_failed",
-        # #6-G: a per-repo fleet-pass iteration failed before (or during)
-        # config load / app.loop() — see fleet_dispatch.py's per-repo
-        # except Exception boundary. Classified as an error so it is
-        # reachable through query_events(level="error") without any new
-        # query infrastructure.
-        "fleet_pass_config_error",
-        # Issue #817 items 4-5: self_deploy failed this pass (venv repair,
-        # pull, HEAD read, diff, or uv sync), or a consecutive-failure streak
-        # just crossed the escalation threshold. Both are reachable via
-        # query_events(level="error") for the same reason as
-        # fleet_pass_config_error above -- deploy status was previously the
-        # least observable thing in the system (121 consecutive failures,
-        # zero events.db rows).
-        "self_deploy_failed",
-        "self_deploy_alarm",
-        # Issue #829: an issue whose every open blocker is itself dead
-        # (escalated, or its tracked PR is escalated/janitor_blocked) can
-        # never unblock through any automated path. ``dispatch_skip_blocked``
-        # already skips the issue every pass; this event fires once on the
-        # transition into the all-dead state and makes no GitHub label
-        # change, so the ``level`` column is the only consumer surface.
-        # Classified as an error so it is reachable through
-        # query_events(level="error") without any new query infrastructure.
-        "dispatch_blocked_chain_dead",
-        # Issue #855 (the general shape behind #851): a fleet-supervisor
-        # cycle completed with zero repo passes, despite at least one repo
-        # being configured, N times in a row -- exit code 0 every cycle, so
-        # this is the only signal that distinguishes the outage from a
-        # healthy fleet. Classified as an error for the same reason as
-        # self_deploy_alarm above: reachable via query_events(level="error")
-        # without any new query infrastructure.
-        "supervisor_zero_pass_alarm",
-        # Issue #933: the #502/#673 unauthorized-merge tripwire fired and pinned
-        # ok=False on every pass for 21 consecutive passes, while a session
-        # reading query_events(level="error") reported "0 errors since restart"
-        # -- nothing on the finding path had ever set a non-info level. The
-        # paired "unauthorized_merge_acknowledged" and
-        # "unauthorized_merge_baseline_armed" events stay "info": a triaged
-        # finding and a suppressed backlog are bookkeeping, whereas an
-        # unacknowledged uncovered merge is the alarm the control exists to
-        # raise. Fires once per PR, not once per pass -- see
-        # workflow.UNAUTHORIZED_MERGE_DETECTED_KEY.
-        "unauthorized_merge_detected",
+        # -----------------------------------------------------------------
+        # error-level kinds: conditions that ended a lane or lost work
+        # -----------------------------------------------------------------
+        "cross_family_verdict_abandoned": "error",
+        "dispatch_blocked_chain_dead": "error",
+        "dispatch_failed": "error",
+        "fleet_pass_config_error": "error",
+        "github_error": "error",
+        "github_not_found_error": "error",
+        "infra_rerun_escalated": "error",
+        "intake_failed": "error",
+        "janitor_rework_cycle_failed": "error",
+        "janitor_rework_escalated": "error",
+        "merge_blocked": "error",
+        "merge_deferred_stale_base_alarm": "error",
+        "merge_failed": "error",
+        "merge_failed_attempt_alarm": "error",
+        "operator_claim_failed": "error",
+        "orphan_processes_killed": "error",
+        "orphaned_worker_routed_to_review": "error",
+        "pre_review_rework_routed": "error",
+        "reconcile_pass_failed": "error",
+        "rescue_review_escalated": "error",
+        "review_checkout_removal_failed": "error",
+        "review_dispatch_escalated": "error",
+        "review_dispatch_stalled": "error",
+        "review_verdict_missed": "error",
+        "rework_requeued": "error",
+        "self_deploy_alarm": "error",
+        "self_deploy_failed": "error",
+        "session_failed_escalated": "error",
+        "session_failed_relabeled": "error",
+        "session_salvaged": "error",
+        "session_stalled": "error",
+        "spec_review_failed": "error",
+        "supervisor_zero_pass_alarm": "error",
+        "unauthorized_merge_detected": "error",
+        # -----------------------------------------------------------------
+        # warning-level kinds: handled-but-notable conditions
+        # -----------------------------------------------------------------
+        "cross_family_verdict_unparseable": "warning",
+        "deescalation_cap_exhausted": "warning",
+        "dispatch_merged_pr_mention_flagged": "warning",
+        "dispatch_merged_pr_references_closed": "warning",
+        "dispatch_skip_blocked": "warning",
+        "dispatch_skip_operator_claimed": "warning",
+        "dispatch_stale": "warning",
+        "draft_pr_blocked": "warning",
+        "draft_pr_ready_failed": "warning",
+        "draft_pr_ready_held": "warning",
+        "flake_rerun_failed": "warning",
+        "graphql_rate_limit_deferred": "warning",
+        "infra_rerun_failed": "warning",
+        "janitor_rework_stalled": "warning",
+        "main_ci_reclaim_failed": "warning",
+        "quota_probe_failed": "warning",
+        "required_changes_vacuous": "warning",
+        "review_dispatch_lifecycle_reaped": "warning",
+        "review_packet_template_stale": "warning",
+        "review_quota_exhausted": "warning",
+        "rework_issue_fetch_skipped": "warning",
+        "runner_allocation_refused": "warning",
+        "runner_capacity_starved": "warning",
+        "session_budget_exceeded": "warning",
+        "session_exited": "warning",
+        "session_rate_limit_deferred": "warning",
+        "supervise_relaunch_cap_reached": "warning",
+        "unauthorized_merge_check_skipped": "warning",
+        "worktree_foreign_writer": "warning",
+        # -----------------------------------------------------------------
+        # info-level kinds: routine bookkeeping, success, recovery, and
+        # other ordinary lifecycle events
+        # -----------------------------------------------------------------
+        "check_failure_rework_requested": "info",
+        "closed_unmerged_pr_state_converged": "info",
+        "containment_check": "info",
+        "cross_pr_revert_rework_requested": "info",
+        "deescalation_cleared": "info",
+        "deescalation_pass_completed": "info",
+        "deescalation_reason_class_backfilled": "info",
+        "dispatch": "info",
+        "dispatch_closed_unmerged_ready_stripped": "info",
+        "dispatch_rework": "info",
+        "draft_pr_ready_triggered": "info",
+        "escalated_label_repaired": "info",
+        "finalize_externally_merged": "info",
+        "flake_rerun_triggered": "info",
+        "fleet_canary": "info",
+        "fleet_job_observations": "info",
+        "head_moved": "info",
+        "infra_rerun_triggered": "info",
+        "intake": "info",
+        "intake_prose_only_deps": "info",
+        "janitor_gate": "info",
+        "live_worker_redispatch_averted": "info",
+        "loop_completed": "info",
+        "loop_started": "info",
+        "main_ci_reclaim_cancelled": "info",
+        "merge_conflict_rework_requested": "info",
+        "merge_deferred_stale_base": "info",
+        "merge_ready": "info",
+        "no_op_rework_repair_requested": "info",
+        "operator_claim": "info",
+        "operator_claim_released": "info",
+        "orphaned_worker_drift": "info",
+        "orphaned_worker_opened_pr": "info",
+        "orphaned_worker_recovered": "info",
+        "quota_probe_succeeded": "info",
+        "readiness_no_ci_rework_requested": "info",
+        "reconcile": "info",
+        "reconcile_pass_completed": "info",
+        "reconcile_pass_deferred": "info",
+        "reconcile_pass_skipped": "info",
+        "record_review": "info",
+        "rescue_dispatched": "info",
+        "review_dispatch": "info",
+        "review_dispatch_claim": "info",
+        "review_packet": "info",
+        "rework_already_pushed": "info",
+        "rework_brief_regenerated": "info",
+        "runner_allocation": "info",
+        "runner_capacity_recovered": "info",
+        "self_deploy_skipped": "info",
+        "self_deploy_succeeded": "info",
+        "spec_review": "info",
+        "stranded_request_changes_rework_requested": "info",
+        "supervisor_exited": "info",
+        "supervisor_started": "info",
+        "unauthorized_merge_acknowledged": "info",
+        "unauthorized_merge_baseline_armed": "info",
+        "unescalate": "info",
+        "verdict_carried_forward_clean_rebase": "info",
+        "verdict_carried_forward_line_content": "info",
+        "verdict_carried_forward_verified_sync": "info",
+        "worktrees_reclaimed": "info",
     }
 )
-_WARNING_KINDS = frozenset(
-    {
-        "dispatch_skip_blocked",
-        "dispatch_skip_operator_claimed",
-        "dispatch_merged_pr_references_closed",
-        "dispatch_merged_pr_mention_flagged",
-        "review_dispatch_lifecycle_reaped",
-        "session_rate_limit_deferred",
-        # Issue #937: the #502/#673 unauthorized-merge tripwire failed open on a
-        # GitHubError, so the control did not run for that pass. Warning, not
-        # error: nothing is broken and no finding is being suppressed -- a check
-        # simply did not happen, which is a handled degradation like the two
-        # above. The paired "unauthorized_merge_detected" stays error, because
-        # that one *is* an uncovered merge awaiting triage.
-        "unauthorized_merge_check_skipped",
-        # Issue #939: a ``gh.issue_view`` failure during the rework-dispatch
-        # candidate scan is a handled degradation (the issue stays queued and
-        # is retried next pass), not an error.
-        "rework_issue_fetch_skipped",
-        # Issue #873: the watchdog reaped a worker whose process was already
-        # gone (WorkerHealth.DEAD). Split out of "session_stalled", which stays
-        # an error and now means only the live-but-hung case. A vanished
-        # process is also the normal terminal state of every worker that
-        # finished and exited, so error level reported successful completions
-        # as faults once #864/#866 gave error-level events their first
-        # consumer. Warning rather than info because liveness alone does not
-        # distinguish a clean exit from a crash -- the reap is still worth
-        # surfacing, it is just not evidence of a fault. The paired
-        # "session_stalled" (error) fires for WorkerHealth.STALLED instead.
-        "session_exited",
-        # Issue #612: a quota-dead reviewer session is a handled backoff
-        # (the fleet defers and probes), not a crash — warning, like the
-        # analogous session_rate_limit_deferred. Distinct from the per-PR
-        # review_dispatch_stalled (error) that fires alongside it.
-        "review_quota_exhausted",
-        # Issue #799: demand exceeding registered capacity while the host has
-        # spare budget is actionable (provision more runners for the repo),
-        # not a crash — warning, so it is reachable via
-        # query_events(level="warning") alongside the other handled-but-
-        # actionable backoff kinds above. The paired "runner_capacity_recovered"
-        # event stays at the default "info" level.
-        "runner_capacity_starved",
-        # Issue #818: a draft PR is a park that would otherwise be invisible
-        # without a manual `gh pr list` sweep -- warning, so both the failed
-        # un-draft attempt and a mixed draft+other-failure block are reachable
-        # via query_events(level="warning") distinct from routine
-        # janitor_gate bookkeeping (which stays "info"). The paired
-        # "draft_pr_ready_triggered" success event stays at the default
-        # "info" level, matching "flake_rerun_triggered".
-        "draft_pr_ready_failed",
-        "draft_pr_blocked",
-        # Issue #820: an operator merge-hold (or an unavailable hold check,
-        # which fails safe the same way) suppresses the #818 auto-ready
-        # actuator. Grouped as a warning alongside its two siblings above --
-        # even though the hold itself may be a deliberate operator action,
-        # not an error -- so all three "why is this draft PR not moving"
-        # signals are reachable together via query_events(level="warning")
-        # rather than the deliberate-park case being invisible next to the
-        # other two.
-        "draft_pr_ready_held",
-        # Issue #946: the dispatch-cadence staleness detector fires when a
-        # non-empty backlog has gone longer than ``dispatch_staleness_minutes``
-        # without a non-empty ``dispatch`` event. Warning, not error: the fleet
-        # may be intentionally paused and the backlog may be non-dispatchable.
-        "dispatch_stale",
-    }
-)
+
+# Compatibility shims derived from the registry. Existing code and comments
+# that refer to ``_ERROR_KINDS`` / ``_WARNING_KINDS`` continue to work.
+_ERROR_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "error"})
+_WARNING_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "warning"})
 
 
 def _now_iso() -> str:
@@ -294,11 +320,21 @@ def _jsonl_path(state_path: Path) -> Path:
 
 
 def _classify_level(kind: str) -> str:
-    """Classify an event kind into a log level for the ``level`` column."""
-    if kind in _ERROR_KINDS:
-        return "error"
-    if kind in _WARNING_KINDS:
-        return "warning"
+    """Classify an event kind into a log level for the ``level`` column.
+
+    The registry is the source of truth. Kinds produced by the sweep
+    aggregator (``{base}_sweep``) inherit the level of the base kind. Any
+    still-unknown kind defaults to ``"info"`` so the instrumentation layer
+    never breaks a caller; the test suite's
+    ``test_event_kind_registry_exhaustive`` is the enforcement point that
+    requires new kinds to be registered.
+    """
+    if kind in _LEVEL_BY_KIND:
+        return _LEVEL_BY_KIND[kind]
+    if kind.endswith("_sweep"):
+        base = kind[: -len("_sweep")]
+        if base in _LEVEL_BY_KIND:
+            return _LEVEL_BY_KIND[base]
     return "info"
 
 
@@ -580,6 +616,7 @@ def log_event(
     *,
     repo: str | None = None,
     correlation_id: str | None = None,
+    level: str | None = None,
 ) -> None:
     """Append a single structured event to the SQLite event log.
 
@@ -595,12 +632,32 @@ def log_event(
         repo: Optional repo name for cross-repo fleet correlation.
         correlation_id: Optional correlation ID. If not provided, the
             current thread-local correlation ID is used (may be None).
+        level: Optional explicit level (``"info"``, ``"warning"``,
+            ``"error"``). When omitted, the level is looked up in
+            ``_LEVEL_BY_KIND``. This lets new call sites declare their level
+            at the emission point without editing the registry.
     """
     cid = correlation_id or current_correlation_id()
     ts = _now_iso()
     payload_json = json.dumps(payload, sort_keys=True, default=str)
     pr_num, issue_num = _extract_payload_refs(payload)
-    level = _classify_level(kind)
+    if level is None:
+        level = _classify_level(kind)
+        if kind not in _LEVEL_BY_KIND and not (
+            kind.endswith("_sweep") and kind[: -len("_sweep")] in _LEVEL_BY_KIND
+        ):
+            if kind not in _unknown_kind_warned:
+                _unknown_kind_warned.add(kind)
+                logger.warning(
+                    "Unknown event kind %r: defaulting to 'info'. "
+                    "Register it in _LEVEL_BY_KIND or pass level= explicitly.",
+                    kind,
+                )
+    elif level not in ("info", "warning", "error"):
+        # Invalid explicit level is a programming mistake; fall back to the
+        # registry rather than write a garbage level.
+        logger.warning("Invalid level %r for kind %r; using registry/default", level, kind)
+        level = _classify_level(kind)
 
     conn = _get_db(state_path)
     if conn is None:

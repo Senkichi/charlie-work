@@ -6223,7 +6223,12 @@ class OrchestratorApp:
         return render_prompt(template_name, values, search_dirs=self.prompt_dirs)
 
     def _record_event(
-        self, state: dict[str, Any], kind: str, payload: dict[str, Any]
+        self,
+        state: dict[str, Any],
+        kind: str,
+        payload: dict[str, Any],
+        *,
+        level: str | None = None,
     ) -> dict[str, Any]:
         """Append an event to state.json and the unlimited events.jsonl log.
 
@@ -6232,6 +6237,9 @@ class OrchestratorApp:
         the repo name so every event is dual-written: once to the 200-entry
         convenience cache in ``state.json`` and once to the append-only
         ``events.jsonl`` audit log.
+
+        ``level`` is forwarded to ``append_event`` so the emit site can declare
+        the level explicitly instead of relying on the central registry.
         """
         return append_event(
             state,
@@ -6239,6 +6247,7 @@ class OrchestratorApp:
             payload,
             state_path=self.paths.state_file,
             repo=self.repo_root.name,
+            level=level,
         )
 
     def _resolve(self, value: str) -> Path:

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import ast
+import importlib.util
 import json
 from pathlib import Path
 
 import pytest
 
 from charlie_work.instrumentation import (
+    _LEVEL_BY_KIND,
     close_db,
     correlation_context,
     current_correlation_id,
@@ -929,3 +932,152 @@ def test_jsonl_migration_malformed_tolerance_preserved(tmp_path: Path) -> None:
     # File renamed despite the malformed line.
     assert not jsonl_path.exists()
     assert (state_path.parent / "events.jsonl.migrated").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #910: event-level registry must cover all in-repo emit sites
+# ---------------------------------------------------------------------------
+
+
+def _literal_strings(node: ast.expr) -> set[str]:
+    """Extract every string-constant branch from an expression."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return {node.value}
+    if isinstance(node, ast.IfExp):
+        return _literal_strings(node.body) | _literal_strings(node.orelse)
+    return set()
+
+
+def _event_kind_usage_from_ast(tree: ast.Module) -> set[str]:
+    """Return all literal event-kind strings used in emit or wrapper calls."""
+    kinds: set[str] = set()
+    _EMIT_FUNCS = {"log_event", "append_event", "_record_event"}
+    _WRAPPER_FUNCS = {"_route_to_rework"}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        func_name: str | None = None
+        if isinstance(node.func, ast.Name) and node.func.id in _EMIT_FUNCS | _WRAPPER_FUNCS:
+            func_name = node.func.id
+        elif (
+            isinstance(node.func, ast.Attribute) and node.func.attr in _EMIT_FUNCS | _WRAPPER_FUNCS
+        ):
+            func_name = node.func.attr
+
+        if func_name in _EMIT_FUNCS and len(node.args) >= 2:
+            kinds.update(_literal_strings(node.args[1]))
+
+        if func_name == "_route_to_rework" and len(node.args) >= 5:
+            kinds.update(_literal_strings(node.args[4]))
+
+    # Also collect strings assigned to a local named ``event_kind`` that is
+    # later passed to an emit function as a variable (e.g. session_exited).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "event_kind" for target in node.targets
+        ):
+            kinds.update(_literal_strings(node.value))
+
+    return kinds
+
+
+def _scan_event_kinds(root: Path) -> set[str]:
+    """Walk every Python file under ``root`` and collect literal event kinds."""
+    kinds: set[str] = set()
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(text, filename=str(path))
+        except SyntaxError:
+            continue
+        kinds.update(_event_kind_usage_from_ast(tree))
+    return kinds
+
+
+def _known_level(kind: str) -> bool:
+    """Return True if ``kind`` is in the registry or is a registered sweep."""
+    if kind in _LEVEL_BY_KIND:
+        return True
+    if kind.endswith("_sweep") and kind[: -len("_sweep")] in _LEVEL_BY_KIND:
+        return True
+    return False
+
+
+def test_event_kind_registry_exhaustive() -> None:
+    """#910: every literal event kind in this package must be registered.
+
+    The registry is the single source of truth for ``level`` classification.
+    A static test is the enforcement point: new call sites cannot introduce an
+    unregistered kind without this test failing. Unknown kinds still default to
+    ``"info"`` at runtime to preserve the best-effort instrumentation contract.
+    """
+    src_root = Path(__file__).parents[1] / "src" / "charlie_work"
+    used = _scan_event_kinds(src_root)
+
+    # ci_fleet is a separate package, but it logs through this package's sink.
+    # If its source is available, include its literal kinds as well.
+    spec = importlib.util.find_spec("ci_fleet")
+    if spec is not None and spec.origin:
+        ci_root = Path(spec.origin).parent
+        used |= _scan_event_kinds(ci_root)
+
+    unregistered = {k for k in used if not _known_level(k)}
+    assert not unregistered, f"unregistered event kinds: {sorted(unregistered)}"
+
+
+def test_issue_910_active_kinds_are_error_or_warning(tmp_path: Path) -> None:
+    """#910: the 11 production-missed active kinds are now classified.
+
+    The table from the issue body; two rows (review_dispatch_escalated and
+    review_verdict_missed) were also discussed in the co-occurrence comment,
+    which did not change their enrollment in the error stream. Their levels are
+    the same as the issue's proposed table.
+    """
+    expected = {
+        "review_verdict_missed": "error",
+        "review_dispatch_escalated": "error",
+        "merge_failed_attempt_alarm": "error",
+        "cross_family_verdict_abandoned": "error",
+        "dispatch_blocked_chain_dead": "error",
+        "flake_rerun_failed": "warning",
+        "quota_probe_failed": "warning",
+        "janitor_rework_escalated": "error",
+        "merge_deferred_stale_base_alarm": "error",
+        "janitor_rework_stalled": "warning",
+        "supervise_relaunch_cap_reached": "warning",
+    }
+    for kind, level in expected.items():
+        assert _LEVEL_BY_KIND[kind] == level, f"{kind} should be {level!r}"
+
+
+def test_issue_910_latent_kinds_are_classified(tmp_path: Path) -> None:
+    """#910: the additional unclassified but zero-event kinds are enrolled."""
+    expected = {
+        "infra_rerun_failed": "warning",
+        "infra_rerun_escalated": "error",
+        "reconcile_pass_failed": "error",
+        "session_budget_exceeded": "warning",
+        "deescalation_cap_exhausted": "warning",
+        "required_changes_vacuous": "warning",
+        "rescue_review_escalated": "error",
+        "janitor_rework_cycle_failed": "error",
+        "worktree_foreign_writer": "warning",
+    }
+    for kind, level in expected.items():
+        assert _LEVEL_BY_KIND[kind] == level, f"{kind} should be {level!r}"
+
+
+def test_sweep_inherits_base_level(tmp_path: Path) -> None:
+    """Sweep-aggregated kinds (``{base}_sweep``) inherit the base kind's level."""
+    state_path = tmp_path / "state.json"
+    log_event(state_path, "review_dispatch_stalled_sweep", {"count": 3})
+    log_event(state_path, "orphaned_worker_drift_sweep", {"count": 5})
+    log_event(state_path, "unknown_kind_sweep", {"count": 1})
+
+    events = read_event_log(state_path)
+    levels = {e["kind"]: e["level"] for e in events}
+    assert levels["review_dispatch_stalled_sweep"] == "error"
+    assert levels["orphaned_worker_drift_sweep"] == "info"
+    assert levels["unknown_kind_sweep"] == "info"
