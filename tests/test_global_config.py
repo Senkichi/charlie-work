@@ -1,0 +1,285 @@
+"""Tests for the layered-config merge itself (issue #704).
+
+``load_layered_config`` used to reuse ``load_config``'s validation logic by
+writing the merged dict to a real temp file and reading it straight back
+(``tempfile.NamedTemporaryFile(delete=False)``). That cost a filesystem
+write+read on every config load, left a temp file that had to be cleaned up,
+and added failure modes (disk full, permissions, temp-file creation) that
+have nothing to do with config merging.
+
+The fix extracts the validation core into ``build_config_from_data`` (a
+``dict -> OrchestratorConfig`` helper with no path involved) and has both
+``load_config`` (path -> dict -> helper) and ``load_layered_config`` (merged
+dict -> helper) call it directly, in memory.
+
+The risk of this refactor is entirely in the merge semantics: a test that
+only checks "the call succeeds" would pass against a version that silently
+drops a layer -- the exact failure shape this repo has already been bitten by
+(#590, #623). So the tests below pin actual values across precedence,
+partial nested overrides, and missing layers, not just successful returns.
+Sections below marked with a leading comment are new pins that did not exist
+before this issue; the deep-merge (api_worker) and shallow-replace
+(claude_code.worker_env) cases already have coverage in test_config.py and
+are not duplicated here.
+"""
+
+from __future__ import annotations
+
+import ast
+import tempfile
+from pathlib import Path
+
+import yaml
+
+from charlie_work.config import OrchestratorConfig, build_config_from_data, load_config
+from charlie_work.global_config import load_layered_config
+
+
+def _write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Precedence: repo wins on an overlapping key, in a *shallow* (non-api_worker)
+# section. This also pins that the repo's section *replaces* the global
+# section wholesale rather than merging key-by-key -- only api_worker gets
+# the deep merge.
+# ---------------------------------------------------------------------------
+
+
+def test_repo_overrides_global_on_overlapping_key(tmp_path: Path) -> None:
+    fleet = tmp_path / "fleet"
+    global_path = _write(
+        fleet / "config.yaml",
+        "dispatch:\n  default_limit: 9\n  order: oldest\n",
+    )
+    repo_root = tmp_path / "repo"
+    repo_path = _write(repo_root / "orchestrator.config.yaml", "dispatch:\n  default_limit: 3\n")
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    assert config.dispatch.default_limit == 3
+    # Shallow replace: the repo's `dispatch` section fully replaces the
+    # global one, so `order` reverts to the dataclass default instead of
+    # inheriting "oldest" from the global layer -- that inheritance only
+    # happens for api_worker's deep merge.
+    assert config.dispatch.order == OrchestratorConfig().dispatch.order
+    assert config.sources == (str(global_path), str(repo_path))
+
+
+# ---------------------------------------------------------------------------
+# Missing per-repo layer: global-only values must flow through to the
+# resolved config, not just be reflected in `sources`.
+# ---------------------------------------------------------------------------
+
+
+def test_global_only_layer_value_flows_through(tmp_path: Path) -> None:
+    fleet = tmp_path / "fleet"
+    global_path = _write(fleet / "config.yaml", "dispatch:\n  default_limit: 42\n")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    assert config.dispatch.default_limit == 42
+    assert config.sources == (str(global_path),)
+
+
+# ---------------------------------------------------------------------------
+# Missing global layer: repo-only values must flow through unchanged, same
+# as load_config on the repo file alone.
+# ---------------------------------------------------------------------------
+
+
+def test_repo_only_layer_value_flows_through(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_path = _write(repo_root / "orchestrator.config.yaml", "dispatch:\n  default_limit: 7\n")
+
+    config = load_layered_config(
+        repo_root, None, fleet_dir_override=str(tmp_path / "no-such-fleet-dir")
+    )
+
+    assert config.dispatch.default_limit == 7
+    assert config == load_config(repo_path)
+    assert config.sources == (str(repo_path),)
+
+
+# ---------------------------------------------------------------------------
+# No layers at all: pure dataclass defaults, matching load_config() with no
+# path.
+# ---------------------------------------------------------------------------
+
+
+def test_no_layers_matches_bare_defaults(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    config = load_layered_config(
+        repo_root, None, fleet_dir_override=str(tmp_path / "no-such-fleet-dir")
+    )
+
+    assert config == OrchestratorConfig()
+    assert config.sources == ()
+
+
+# ---------------------------------------------------------------------------
+# The fix itself: no temp file is created, and the previous NamedTemporaryFile
+# indirection is gone from the module. These are the two assertions that
+# specifically distinguish the new implementation from the old one -- they
+# fail against the pre-#704 tempfile-based implementation and pass against
+# this one.
+# ---------------------------------------------------------------------------
+
+
+def test_layered_merge_leaves_no_temp_file(tmp_path: Path) -> None:
+    fleet = tmp_path / "fleet"
+    _write(fleet / "config.yaml", "dispatch:\n  default_limit: 9\n")
+    repo_root = tmp_path / "repo"
+    _write(repo_root / "orchestrator.config.yaml", "review:\n  require_issue_link: true\n")
+
+    tmp_dir = Path(tempfile.gettempdir())
+    before = {p.name for p in tmp_dir.glob("*.yaml")}
+
+    load_layered_config(repo_root, None, fleet_dir_override=str(fleet))
+
+    after = {p.name for p in tmp_dir.glob("*.yaml")}
+    assert after == before, f"layered config load leaked temp file(s): {after - before}"
+
+
+def _imported_module_names(source: str) -> set[str]:
+    """Collect every module name ``source`` imports, in either import form.
+
+    ``ast.ImportFrom`` carries the module name on ``node.module``, NOT on its
+    aliases: for ``from tempfile import NamedTemporaryFile`` the only alias is
+    ``NamedTemporaryFile``, and the string "tempfile" appears nowhere in
+    ``node.names``. A collection that reads only ``alias.name`` therefore
+    passes on exactly the import form it is meant to forbid -- while still
+    listing ``ast.ImportFrom`` in its isinstance check, which makes it read as
+    though both forms were covered. ``ast.walk`` visits nested nodes, so a
+    function-local import is caught the same way.
+    """
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+    return names
+
+
+def test_imported_module_names_detects_every_import_form() -> None:
+    """Positive control for the guard below.
+
+    Without this, the guard's own blind spots are invisible: an assertion that
+    "tempfile" is absent passes both when the module is clean and when the
+    detector cannot see the import at all. Each form here is one a regression
+    could plausibly take.
+    """
+    for snippet in (
+        "import tempfile",
+        "import tempfile as tf",
+        "from tempfile import NamedTemporaryFile",
+        "def f():\n    import tempfile\n",
+        "def f():\n    from tempfile import mkstemp\n",
+    ):
+        assert "tempfile" in _imported_module_names(snippet), (
+            f"detector blind to this import form, so the guard below would "
+            f"pass against it: {snippet!r}"
+        )
+    # Negative half: the detector must not fire on prose mentioning the word,
+    # which is the whole reason this is an AST check and not a substring scan.
+    assert "tempfile" not in _imported_module_names('"""explains why tempfile is gone."""')
+
+
+def test_global_config_module_does_not_use_tempfile() -> None:
+    """Structural pin for the fix: the merge must not round-trip through disk
+    at all, not merely clean up after itself. Guards against a regression
+    that re-introduces ``tempfile.NamedTemporaryFile`` with cleanup that
+    happens to work in tests but still costs the write+read on every call.
+
+    Checked via the AST's import nodes rather than a substring search on the
+    source text: a substring check on the literal word "tempfile" would trip
+    on any future comment that mentions it -- e.g. one explaining *why* the
+    module no longer uses it, exactly like the docstring on the test above
+    this one, or the historical-context comments this fix itself added."""
+    import charlie_work.global_config as global_config_module
+
+    source = Path(global_config_module.__file__).read_text(encoding="utf-8")
+    assert "tempfile" not in _imported_module_names(source)
+
+
+# ---------------------------------------------------------------------------
+# Differential pin for the extraction itself: build_config_from_data (dict ->
+# OrchestratorConfig, no path) must resolve identically to load_config (path
+# -> dict -> OrchestratorConfig) on the same data, across the sections whose
+# validation does real coercion work rather than a plain pass-through. This
+# is the test that would catch the extraction itself going wrong -- the
+# semantics tests above pass against both the old and new implementation, so
+# on their own they don't pin the dict-in / dict-out step that #704 added.
+# ---------------------------------------------------------------------------
+
+
+def test_build_config_from_data_matches_load_config_on_disk(tmp_path: Path) -> None:
+    data = {
+        "api_worker": {
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "ANTHROPIC_API_KEY",
+                    "model": "claude-sonnet",
+                    "input_usd_per_mtok": 3.0,
+                    "output_usd_per_mtok": 15.0,
+                },
+            },
+            "budget": {"max_usd_per_session": 2.5},
+        },
+        "dispatch": {
+            "default_limit": 5,
+            "materialize_dirs": ["a", "b"],
+            "injected_paths": ["x/y", "z"],
+        },
+        "post_mortem": {"signature_rules": [{"pattern": "OOM", "kind": "oom"}]},
+    }
+    path = tmp_path / "orchestrator.config.yaml"
+    path.write_text(yaml.dump(data), encoding="utf-8")
+
+    from_dict = build_config_from_data(data)
+    from_disk = load_config(path)
+
+    # sources is compare=False on the dataclass, so this equality is exactly
+    # the "same config" check the callers rely on -- provenance aside.
+    assert from_dict == from_disk
+
+
+def test_build_config_from_data_does_not_mutate_its_input(tmp_path: Path) -> None:
+    """build_config_from_data must not mutate the dict it's handed: unlike
+    the old load_config, which always saw a dict it had just parsed itself
+    and owned exclusively, load_layered_config now hands this function a
+    dict it built and may reuse. The original load_config body mutates
+    nested sections in place via `_section()`; this pins the deepcopy added
+    to guard against that becoming an observable side effect on a
+    caller-owned dict."""
+    data = {
+        "api_worker": {
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_env": "ANTHROPIC_API_KEY",
+                    "model": "claude-sonnet",
+                    "input_usd_per_mtok": 3.0,
+                    "output_usd_per_mtok": 15.0,
+                },
+            },
+            "budget": {"max_usd_per_session": 1.0},
+        },
+        "dispatch": {"default_limit": 5},
+    }
+    import copy
+
+    before = copy.deepcopy(data)
+
+    build_config_from_data(data)
+
+    assert data == before

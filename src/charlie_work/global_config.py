@@ -10,6 +10,7 @@ import yaml
 from .config import (
     ConfigError,
     OrchestratorConfig,
+    build_config_from_data,
     find_config_path,
     known_config_sections,
     load_config,
@@ -225,10 +226,10 @@ def load_layered_config(
         # merged_data before validation ever saw the name, so a typo'd section
         # with no body was silently accepted here while load_config (which
         # checks raw key presence, not truthiness) rejected the identical
-        # file. Keeping the name (with its coerced-empty value) lets the
-        # existing round-trip through load_config raise "unknown config
-        # section(s)" exactly as it does for a non-empty bogus section, and
-        # keeps the #665 discarded-global-layer rescue below in play for it.
+        # file. Keeping the name (with its coerced-empty value) lets
+        # build_config_from_data raise "unknown config section(s)" exactly
+        # as it does for a non-empty bogus section, and keeps the #665
+        # discarded-global-layer rescue below in play for it.
         if merged_section or section not in known_sections:
             merged_data[section] = merged_section
 
@@ -240,51 +241,41 @@ def load_layered_config(
     if not merged_data:
         return replace(load_config(repo_config_path), sources=layer_sources)
 
-    # Use the existing load_config logic by writing a merged dict to a temp file
-    # This ensures we reuse all validation logic (unknown keys, type checks, etc.)
-    # without duplicating it here.
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", delete=False, encoding="utf-8"
-    ) as tmp:
-        yaml.dump(merged_data, tmp)
-        tmp_path = Path(tmp.name)
-
+    # Build the merged config in memory. This reuses load_config's exact
+    # section-validation logic (unknown keys, type checks, etc.) via
+    # build_config_from_data -- the shared helper extracted from load_config
+    # that takes a raw dict instead of a path -- so the two entry points
+    # cannot drift apart, but neither performs a filesystem round-trip to get
+    # there (issue #704: the previous implementation wrote merged_data to a
+    # NamedTemporaryFile and read it straight back through load_config, which
+    # cost a write+read on every config load and left a temp file to clean
+    # up).
     try:
-        try:
-            # The merged dict round-trips through a temp file to reuse the
-            # validation logic, so load_config records *that* file as the
-            # source. It is deleted in the finally below and names nothing an
-            # operator could open -- overwrite it with the real layers.
-            return replace(load_config(tmp_path), sources=layer_sources)
-        except ConfigError:
-            # A present-but-invalid global layer (e.g. an unknown key) makes
-            # the merged load raise, and callers (fleet_dispatch) catch
-            # ConfigError and skip the repo -- silently discarding a *valid*
-            # per-repo config. That is the #623 failure shape (host-wide knobs
-            # silently disabled) via a different trigger (issue #665). When a
-            # per-repo config exists, retry with it alone so the global layer's
-            # breakage does not take the per-repo config down with it. With no
-            # per-repo config to rescue, propagate the original error --
-            # silently defaulting would itself reproduce the #623 shape.
-            if not global_exists or not repo_data:
-                raise
-            # Provenance is the per-repo file alone, deliberately: the global
-            # layer was *discarded*, so listing it would claim a contribution
-            # that was rolled back. This is the case the field earns its keep
-            # on -- the warning below scrolls away, the value does not.
-            repo_only = replace(load_config(repo_config_path), sources=(str(repo_config_path),))
-            logger.warning(
-                "Layered config: merged load failed validation; the global "
-                "layer was discarded and the per-repo config used alone. "
-                "global path=%s",
-                global_config_path,
-            )
-            return repo_only
-    finally:
-        # Clean up the temp file
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
+        # build_config_from_data leaves ``sources`` at its dataclass default
+        # (it only ever sees a dict); attach the real layer provenance here,
+        # the same way load_config attaches a single path's provenance.
+        return replace(build_config_from_data(merged_data), sources=layer_sources)
+    except ConfigError:
+        # A present-but-invalid global layer (e.g. an unknown key) makes
+        # the merged load raise, and callers (fleet_dispatch) catch
+        # ConfigError and skip the repo -- silently discarding a *valid*
+        # per-repo config. That is the #623 failure shape (host-wide knobs
+        # silently disabled) via a different trigger (issue #665). When a
+        # per-repo config exists, retry with it alone so the global layer's
+        # breakage does not take the per-repo config down with it. With no
+        # per-repo config to rescue, propagate the original error --
+        # silently defaulting would itself reproduce the #623 shape.
+        if not global_exists or not repo_data:
+            raise
+        # Provenance is the per-repo file alone, deliberately: the global
+        # layer was *discarded*, so listing it would claim a contribution
+        # that was rolled back. This is the case the field earns its keep
+        # on -- the warning below scrolls away, the value does not.
+        repo_only = replace(load_config(repo_config_path), sources=(str(repo_config_path),))
+        logger.warning(
+            "Layered config: merged load failed validation; the global "
+            "layer was discarded and the per-repo config used alone. "
+            "global path=%s",
+            global_config_path,
+        )
+        return repo_only
