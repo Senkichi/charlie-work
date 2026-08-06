@@ -19485,6 +19485,13 @@ class OrchestratorApp:
         to decide whether to re-run, switch model, or waive the gate.
         """
         max_attempts = max(0, int(self.config.cross_family.max_regen_attempts))
+        # --dry-run must not perform state.json writes or live GitHub label
+        # mutations (review finding on PR #670). Reporting "budget spent" is the
+        # non-mutating answer, and it also keeps a dry run from spending a real
+        # 600s model call.
+        if self.dry_run:
+            return False
+        escalated_now = False
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -19543,7 +19550,44 @@ class OrchestratorApp:
                 },
             )
             save_state(self.paths.state_file, state)
-            return False
+            escalated_now = True
+
+        # Apply the human-needed label edge OUTSIDE the state lock --
+        # transition() makes GitHub API calls. _escalate_issue writes state
+        # only; without this the PR sits escalated in state.json and invisible
+        # on GitHub, which is the exact defect #586 fixed for the sibling call
+        # site (pr-lifecycle.md: PRs 548/540/531 live escalated-without-label).
+        # #586's self-heal sweep lives in dispatch_reviews, so it does not cover
+        # this call site when review dispatch is disabled -- the edge has to be
+        # applied here rather than delegated to that sweep. label_error is still
+        # recorded in the shape that sweep consumes, so a transition that fails
+        # here is retried there rather than being lost.
+        #
+        # The `issue_number is not None` arm is not a defensive nicety: per
+        # _escalate_issue's contract the issue may be unresolvable (cross-repo
+        # or fork PR), in which case only the PR record was escalated and there
+        # is no issue to carry the label. Do not "fix" that by inventing a label
+        # target -- the PR record is the surface for that case.
+        if escalated_now and issue_number is not None:
+            result = transition(self.gh, self.config.labels, int(issue_number), "escalated")
+            label_error: dict[str, Any] | None = None
+            if result.outcome != TransitionOutcome.APPLIED:
+                label_error = {
+                    "edge": "escalated",
+                    "outcome": result.outcome.value,
+                    "add_failures": result.add_failures,
+                    "remove_failures": result.remove_failures,
+                }
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                entry = state["issues"].get(str(issue_number), {})
+                state["issues"][str(issue_number)] = {
+                    **(entry if isinstance(entry, dict) else {}),
+                    "number": int(issue_number),
+                    "label_error": label_error,
+                }
+                save_state(self.paths.state_file, state)
+        return False
 
     def _review_template_sha(self) -> str:
         """SHA-256 digest of the resolved review template + referenced section

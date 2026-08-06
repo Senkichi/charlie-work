@@ -99,6 +99,7 @@ def _make_app(
     cross_family_enabled: bool = True,
     max_regen_attempts: int = 2,
     auto_verdict: bool = True,
+    dry_run: bool = False,
 ) -> OrchestratorApp:
     """Mirror of test_charlie_work._make_loop_app, but with cross-family ON.
 
@@ -117,7 +118,7 @@ def _make_app(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
 
 
 def _plant_packet(
@@ -195,6 +196,17 @@ def _stub_model(monkeypatch: pytest.MonkeyPatch, *, writes: str | None) -> list[
 
     monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", fake_run)
     return calls
+
+
+def _labels_added(app: OrchestratorApp) -> list[tuple[int, str]]:
+    """The FakeGitHub's recorded ``(issue, label)`` additions.
+
+    ``app.gh`` is declared as the ``GitHubLike`` protocol, which has no
+    ``labels_added`` -- that is test-double bookkeeping, not part of the
+    interface. Narrowed here once rather than per-assertion.
+    """
+    gh: Any = app.gh
+    return gh.labels_added
 
 
 def _events(app: OrchestratorApp, kind: str) -> list[dict[str, Any]]:
@@ -373,9 +385,100 @@ def test_regeneration_is_bounded_and_escalates_to_a_human(
     # the indefinite silent wait this fix exists to make unreachable.
     assert issue.get("reason_class") == "judgment"
 
+    # AC-4: the escalation must reach a CONSUMER, not just state.json.
+    # _escalate_issue writes state only -- it applies no label itself. If
+    # nothing downstream turned status="escalated" into the human_needed label,
+    # this would be a signal nobody receives: invisible on GitHub, and the
+    # RUNBOOK's "lands on agent:human-needed" would be false.
+    assert (123, app.config.labels.human_needed) in _labels_added(app)
+
     # AC-2: no verdict was recorded against the unconfirmed head.
     decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
     assert decision["decision"] != "approved"
+
+
+def test_pr_blocked_upstream_of_cross_family_still_terminates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound must also terminate when regeneration can never even run.
+
+    This is the shape PR #1073 actually has in production: it is janitor-blocked,
+    so ``review()`` returns on the janitor gate and never reaches the
+    cross-family pass at all. The model is therefore never invoked and the report
+    can never improve, no matter how many passes run.
+
+    The previous test's bound is spent by a model that runs and fails; this one
+    is spent by a model that never runs. Without a bound this PR would re-enter
+    ``review()`` on literally every pass forever -- the same unbounded-work
+    failure, reached by a different route. The escalation reason stays literally
+    accurate: the report is unusable, which is observed, rather than naming a
+    cause that was inferred.
+    """
+    pr = _pr456(HEAD)
+    # Drop the tests/rationale mention -> janitor gate blocks review() early.
+    pr["body"] = "Closes #123"
+    app = _make_app(tmp_path, prs=[pr], max_regen_attempts=2)
+    pr_dir = _plant_packet(app, tmp_path, 456, head_sha=HEAD, report_text=_UNAVAILABLE_STUB)
+    model_calls = _stub_model(monkeypatch, writes=_good_report(HEAD))
+
+    for _ in range(5):
+        app.loop(limit=0)
+
+    assert model_calls == [], "review() never reaches the cross-family pass here"
+
+    # Escalated once and stayed put -- passes 4 and 5 must add nothing.
+    exhausted = _events(app, "cross_family_report_regen_exhausted")
+    assert [e.get("pr_number") for e in exhausted] == [456]
+    assert len(_events(app, "cross_family_report_regen_forced")) == 2
+
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert (123, app.config.labels.human_needed) in _labels_added(app)
+    # The label edge is applied once, not re-applied on every later pass.
+    assert _labels_added(app).count((123, app.config.labels.human_needed)) == 1
+    assert state["issues"]["123"]["label_error"] is None
+    decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert decision["decision"] != "approved"
+
+
+def test_dry_run_claims_nothing_and_fires_no_label_edit(tmp_path: Path) -> None:
+    """``--dry-run`` must not write ``state.json`` or edit a live label.
+
+    Exercised against the ESCALATION branch (``max_regen_attempts=0``) rather
+    than the claim branch, because escalation is the branch that reaches
+    GitHub. A dry-run gate proven only on the claim branch would leave the
+    label edit -- the part that mutates something outside this process --
+    untested.
+
+    Carries its own positive control. "Nothing was written" is equally
+    consistent with "the gate works" and with "the call never reached the
+    mutating code", so the identical call is made on a live app first and
+    asserted to write state AND add the label. Without that control this test
+    would still pass if the escalation branch were deleted outright.
+    """
+    (tmp_path / "live").mkdir()
+    (tmp_path / "dry").mkdir()
+
+    live = _make_app(tmp_path / "live", prs=[_pr456(HEAD)], max_regen_attempts=0)
+    assert (
+        live._claim_cross_family_regen_attempt(
+            pr_number=456, issue_number=123, head_sha=HEAD, report_head=None
+        )
+        is False
+    )
+    # Control: this exact call really does reach the mutating code.
+    assert live.paths.state_file.exists()
+    assert (123, live.config.labels.human_needed) in _labels_added(live)
+
+    dry = _make_app(tmp_path / "dry", prs=[_pr456(HEAD)], max_regen_attempts=0, dry_run=True)
+    assert (
+        dry._claim_cross_family_regen_attempt(
+            pr_number=456, issue_number=123, head_sha=HEAD, report_head=None
+        )
+        is False
+    )
+    assert not dry.paths.state_file.exists()
+    assert _labels_added(dry) == []
 
 
 def test_regen_budget_resets_when_the_head_moves(
