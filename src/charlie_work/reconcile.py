@@ -104,6 +104,13 @@ class DriftItem:
 # Deliberate exclusions: "closed" (already terminal), "approved"/"blocked"
 # (finalization of closed approved/blocked issues is owned by the merged-PR
 # finalization flow, pre-existing behavior).
+# Issue #1066: membership here does NOT mean uniform treatment across every
+# sweep that consumes this set. closed_unmerged_pr_issue_state_converged
+# excludes "escalated" via DORMANT_CONVERGENCE_EXCLUDED_STATUSES (defined
+# below) because that sweep drops the status key entirely rather than
+# converging to a terminal value; "escalated" stays in this set because
+# state_active_status_issue_closed and the coverage invariant above still
+# need it here.
 ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
     {
         "dispatched",
@@ -124,6 +131,22 @@ ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
         "escalated",
     }
 )
+
+# Issue #1066: the subset of ACTIVE_STATE_STATUSES that is a human-owned
+# terminal disposition rather than orchestrator work-in-flight -- currently
+# just "escalated". A repair sweep that converges a stale ACTIVE_STATE_STATUSES
+# entry to the dormant baseline (dropping the status key entirely, as opposed
+# to state_active_status_issue_closed's convergence to the terminal "closed"
+# value) must exclude this set: silently dropping "escalated" detaches the
+# issue's state from its still-live agent:human-needed label with no repair
+# path back into the human queue, since nothing else is watching a
+# status-less issue for that label. reconcile.py's own
+# ORCHESTRATOR_OWNED_ISSUE_STATUSES import is NOT the right predicate for
+# this -- ACTIVE_STATE_STATUSES is entirely a subset of it (both share every
+# member except "approved"/"blocked"/"closed", none of which are ever in
+# ACTIVE_STATE_STATUSES), so gating on it here would make the affected drift
+# kind permanently unreachable rather than narrowly excluding "escalated".
+DORMANT_CONVERGENCE_EXCLUDED_STATUSES: frozenset[str] = frozenset({"escalated"})
 
 
 def _issue_state(issue: dict[str, Any] | None) -> str:
@@ -767,7 +790,7 @@ def detect_drift(
             # issue's state status away from any ACTIVE_STATE_STATUS when
             # its PR is closed-unmerged and the GitHub issue itself is
             # still OPEN. Without this, an issue stuck in
-            # "rework_requested" (or "reviewing", "escalated", ...) is
+            # "rework_requested" (or "reviewing", "dispatched", ...) is
             # selected by dispatch_rework's state-driven candidate scan
             # every loop pass, which calls gh.issue_view() on it before
             # any open-PR filtering -- a permanent per-pass GitHub fetch
@@ -784,10 +807,25 @@ def detect_drift(
             # a human re-arms it. The linked issue's label disposition
             # remains owned by closed_unmerged_pr_active_labels; the two
             # are independent and may both fire for the same PR.
+            #
+            # Issue #1066: "escalated" is excluded via
+            # DORMANT_CONVERGENCE_EXCLUDED_STATUSES. Unlike the other
+            # ACTIVE_STATE_STATUSES members, "escalated" is not orchestrator
+            # work-in-flight that should be reset to dormant when its PR dies
+            # -- it is a human-owned terminal disposition, and the issue's
+            # agent:human-needed label stays live regardless of what happens
+            # to this PR. Dropping the status key here would silently detach
+            # the state entry from that still-live label with no automated
+            # path back into the human queue (fired in production: issue
+            # #894 via PR #948). Leaving "escalated" status in place does not
+            # make this issue a rework candidate: dispatch_rework's candidate
+            # filter is status == "rework_requested" specifically (not
+            # general ACTIVE_STATE_STATUSES membership), so this exclusion
+            # does not reintroduce that path's per-pass gh.issue_view() cost.
             if issue is not None and _issue_state(issue) == "OPEN" and issue_number is not None:
                 issue_entry = state.get("issues", {}).get(str(issue_number))
                 issue_status = issue_entry.get("status") if isinstance(issue_entry, dict) else None
-                if issue_status in ACTIVE_STATE_STATUSES:
+                if issue_status in ACTIVE_STATE_STATUSES - DORMANT_CONVERGENCE_EXCLUDED_STATUSES:
                     drift.append(
                         DriftItem(
                             kind="closed_unmerged_pr_issue_state_converged",
@@ -1968,6 +2006,10 @@ def apply_fixes(
             # state status, converging to the dormant baseline (no status
             # key) that issue_status_normalized also uses for a
             # never-dispatched issue. Other fields are preserved.
+            # Issue #1066: detect_drift never emits this kind for an
+            # "escalated" issue status (DORMANT_CONVERGENCE_EXCLUDED_STATUSES),
+            # so this branch cannot reach an escalated entry -- no
+            # apply-time guard is needed here, only at emission.
             if item.issue_number is not None:
                 issue_key = str(item.issue_number)
                 existing_issue = new_issues.get(issue_key, {})
