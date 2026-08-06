@@ -951,7 +951,20 @@ def close_db(state_path: Path) -> None:
 # wrong reason; the true one is a stronger argument for the same design.
 # ci_fleet carried the identical claim on its half of this seam
 # (runner_allocation_pass.py, observability.py) and corrected it in b20f3a4.
+#
+# The provenance anchor is the third seam and is installed here for the same
+# reason as the other two: ci_fleet cannot fetch it (the boundary is one-way),
+# so the provider has to hand it over. It is the one seam whose absence is
+# *reported* rather than silent -- ci_fleet accumulates a `no_anchor` streak and
+# escalates -- but only in ci_fleet's own logs and events, which nobody reads
+# until something else has already gone wrong. See ci_fleet_anchor for why the
+# declaration is read from pyproject.toml rather than from the install
+# artifacts it is supposed to be checking.
 from ci_fleet.observability import set_event_query, set_event_sink  # noqa: E402
+from ci_fleet.provenance import set_provenance_anchor  # noqa: E402
+
+from charlie_work.ci_fleet_anchor import declared_ci_fleet_root  # noqa: E402
 
 set_event_sink(log_event)
 set_event_query(query_events)
+set_provenance_anchor(declared_ci_fleet_root)

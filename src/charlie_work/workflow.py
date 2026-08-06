@@ -5606,11 +5606,8 @@ def _classify_dead_sessions_and_update_throttle_state(
     from .post_mortem import classify_and_record
     from .state import append_event, load_state, save_state, set_throttled_until, state_lock
     from .worker import (
-        _next_inconclusive_probe_deferred_count,
-        classify_worker_health,
+        is_worker_confirmed_dead,
         iter_workers,
-        real_activity_probe_for,
-        update_worker_log_stat,
     )
     from .worktree import WorktreeState
 
@@ -5744,63 +5741,17 @@ def _classify_dead_sessions_and_update_throttle_state(
             )
             continue
         if not w.is_alive():
-            # Update log stat fields for progress tracking (final update before classification)
-            update_worker_log_stat(sessions_dir, w)
-
-            # Issue #343: this lane used to treat "not w.is_alive()" as sufficient
-            # grounds to relabel the issue and reap the sidecar, bypassing the
-            # real-activity corroboration + inconclusive-probe deferral cap that
-            # classify_worker_health already enforces for the sibling stall/kill
-            # lane (_detect_and_handle_stalled_sessions, issues #280/#301/#307/#338).
-            # That let a fail-open reap remove the sidecar of a worker whose
-            # liveness signal was merely ambiguous (or transiently wrong) while the
-            # governor's dispatch cap (_count_live_sessions) counts live sidecars,
-            # not live processes -- a wrongly-reaped sidecar silently frees a slot
-            # for over-cap dispatch even though the underlying process may still be
-            # running. Route through the same single enforcement point here so a
-            # worker is only ever treated as DEAD -- and only ever loses its
-            # sidecar -- once classify_worker_health agrees, with the same
-            # escalation cap (max_inconclusive_probe_deferrals) guaranteeing a
-            # genuinely-dead worker behind a permanently-broken probe still gets
-            # reaped after N deferred passes (never an unconditional "never-reap").
-            #
-            # Issue #426: the launch-failure lane above handles ``pid is None``
-            # sidecars. Sidecars that carry a real (dead) pid *and* a stale
-            # ``error`` string (e.g. ``live_worker_redispatch_averted``) must not
-            # be invisible to the confirmed-dead lane. Removing the ``w.error is
-            # None`` gate lets classify_worker_health decide, with the same
-            # max_inconclusive_probe_deferrals cap, instead of leaving them stuck
-            # forever. The stall lane skips ``w.error is not None`` workers, so
-            # the dead lane must persist the Signal-1 counter for those workers
-            # even when loop() asks it not to double-write for ``w.error is None``
-            # workers.
-            if w.pid is not None:
-                probe = real_activity_probe_for(w, config, now_for_health)
-                health = classify_worker_health(w, config, now_for_health, probe)
-                # Issue #343 Finding 2: persist_inconclusive_probe_counter (see
-                # the docstring) lets loop() suppress this write when it just
-                # ran the sibling stall lane a moment earlier in the same pass
-                # -- that lane already persisted this exact counter for a
-                # not-alive worker, and writing it again here double-increments
-                # it. Every other caller (including every existing unit test)
-                # leaves this at its default True, so this lane remains fully
-                # self-sufficient when called on its own.
-                #
-                # Issue #426: the stall lane unconditionally skips
-                # ``w.error is not None`` workers, so for those sidecars this
-                # dead lane is the only writer of the counter. Persist it even
-                # when loop() passes False.
-                if persist_inconclusive_probe_counter or w.error is not None:
-                    new_deferred_count = _next_inconclusive_probe_deferred_count(w, probe, health)
-                    update_worker_log_stat(
-                        sessions_dir, w, inconclusive_probe_deferred_count=new_deferred_count
-                    )
-                if health is not WorkerHealth.DEAD:
-                    # Corroboration vetoed the DEAD verdict (fresh real-session
-                    # activity) or the probe was inconclusive and the deferral
-                    # cap has not yet been reached -- defer to next pass instead
-                    # of reaping a sidecar we cannot yet prove is safe to remove.
-                    continue
+            # Issue #755: the confirmed-dead decision (including the
+            # max_inconclusive_probe_deferrals grace period and counter) is now
+            # owned by a single helper shared with reconcile.detect_drift.
+            if not is_worker_confirmed_dead(
+                w,
+                config,
+                now_for_health,
+                sessions_dir,
+                persist_inconclusive_probe_counter=persist_inconclusive_probe_counter,
+            ):
+                continue
 
             # Inspect the worktree before deciding how to classify and relabel.
             # This is the single enforcement point for issue #252.
@@ -6174,10 +6125,17 @@ def _open_salvage_pr(
     # commit log instead of injecting the gate's keywords -- a branch with no
     # commits still yields no summary, and still correctly fails.
     body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
+    # Pass the RESOLVED base branch, not the raw ``base_ref``. The orphaned-branch
+    # lane (``_open_pr_for_orphaned_branch``) sources ``base_ref`` straight from
+    # ``config.dispatch.base_ref``, whose default is ``""`` and which the live
+    # config leaves unset -- so production reaches here with the empty sentinel.
+    # ``require_valid_rev("")`` raises, ``summarize_branch_work`` returns "", and
+    # the body falls back to boilerplate that cannot pass the janitor gate: the
+    # exact defect this code exists to fix, on the lane that hits it most.
     summary = summarize_branch_work(
         repo_root,
         branch,
-        base_ref,
+        base_branch,
         test_path_globs=config.test_adequacy.test_path_globs,
     )
     if summary:
@@ -6566,13 +6524,13 @@ class OrchestratorApp:
         *,
         level: str | None = None,
     ) -> dict[str, Any]:
-        """Append an event to state.json and the unlimited events.jsonl log.
+        """Append an event to state.json and the unlimited events.db log.
 
         This is the single instrumentation entry point for OrchestratorApp
         methods. It wraps ``append_event`` with ``self.paths.state_file`` and
-        the repo name so every event is dual-written: once to the 200-entry
-        convenience cache in ``state.json`` and once to the append-only
-        ``events.jsonl`` audit log.
+        the repo name so every event is dual-written: once to the bounded
+        convenience cache in ``state.json`` (``EVENT_RING_SIZE``, default 2000)
+        and once to the append-only ``events.db`` audit log.
 
         ``level`` is forwarded to ``append_event`` so the emit site can declare
         the level explicitly instead of relying on the central registry.

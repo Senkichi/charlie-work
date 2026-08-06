@@ -861,9 +861,9 @@ def detect_drift(
         from .post_mortem import classify_and_record
         from .worker import (
             _log_is_stalled_at_shim,
+            is_worker_confirmed_dead,
             iter_workers,
             real_activity_probe_for,
-            update_worker_log_stat,
         )
 
         sessions_dir = resolved_layout(config, repo_root).sessions_dir
@@ -966,10 +966,17 @@ def detect_drift(
                                     # Mark this issue as handled to avoid double-emission
                                     issues_handled_by_session_relabel.add(w.issue_number)
 
-                if not skip_dead_session_sweep and w.error is None and not w.is_alive():
-                    # Update log stat fields for progress tracking (final update before classification)
-                    update_worker_log_stat(sessions_dir, w)
-
+                if (
+                    not skip_dead_session_sweep
+                    and w.error is None
+                    and is_worker_confirmed_dead(
+                        w,
+                        config,
+                        now,
+                        sessions_dir,
+                        persist_inconclusive_probe_counter=True,
+                    )
+                ):
                     # Issue #252: inspect the worktree before deciding how to classify.
                     # This is the single enforcement point shared with workflow.py.
                     worktree_path = Path(w.worktree_path)
