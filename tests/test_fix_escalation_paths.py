@@ -33,6 +33,7 @@ from charlie_work.config import (
     ReviewDispatchConfig,
     RuntimeConfig,
 )
+from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp, _collect_escalated_label_subjects
@@ -740,6 +741,97 @@ def test_escalated_label_repair_defers_on_github_error(tmp_path: Path) -> None:
     assert events[0]["payload"]["errored"] == [123]
     assert events[0]["payload"]["issue_numbers"] == []
     assert events[0]["payload"]["failures"] == []
+
+
+def test_dispatch_reviews_keeps_its_state_lock_guard(tmp_path: Path, monkeypatch) -> None:
+    """``dispatch_reviews`` must convert ``StateLockBusy`` into a skipped result.
+
+    This exists because inserting ``_repair_escalated_labels`` immediately above
+    ``def dispatch_reviews`` silently STOLE its ``@_guard_state_lock`` decorator --
+    the new method landed between the decorator and the def it belonged to. Ruff
+    was clean and all 3716 tests passed, because nothing covered this guard: a
+    grep for ``StateLockBusy`` across ``tests/`` returns plenty of hits, and none
+    of them reach ``dispatch_reviews``.
+
+    The consequence was real in both directions. ``dispatch_reviews`` would have
+    raised out of a fleet pass instead of returning a skip on lock contention,
+    and ``_repair_escalated_labels`` -- which returns a plain dict embedded in
+    that payload -- would have returned a ``CommandResult`` instead whenever the
+    guard fired.
+
+    The lock is taken inside ``_repair_escalated_labels``, which now runs first,
+    so raising from ``state_lock`` exercises the propagation path end to end
+    rather than just the decorator in isolation.
+    """
+    from charlie_work import workflow as wf
+    from charlie_work.state import StateLockBusy
+
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _seed_escalated_pr(paths, 456, 123)
+
+    def busy_lock(*_args, **_kwargs):
+        raise StateLockBusy("simulated contention")
+
+    monkeypatch.setattr(wf, "state_lock", busy_lock)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert result.data["skipped"] is True
+    assert result.data["reason"] == "state_lock_busy"
+    # And nothing was mutated on the way out -- a skip is a skip.
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
+
+
+def test_escalated_label_repair_event_level_discriminates_errored_from_clean(
+    tmp_path: Path,
+) -> None:
+    """An unreachable-GitHub sweep records at ``warning``; a clean one stays ``info``.
+
+    ``level`` is the column an operator filters on -- ``query_events(level="warning")``
+    is how a problem is found without knowing which kind to look for. For an
+    all-errored pass this event is the *only* durable record (nothing is written to
+    state.json for those subjects), so emitting it at the registry's default
+    ``info`` would file the one signal that matters in the same bucket as every
+    routine pass.
+
+    Both halves are asserted in one test on purpose: "errored is warning" is
+    unfalsifiable on its own, because a hard-coded ``level="warning"`` would satisfy
+    it just as well. The clean-pass half is the control that proves the level is
+    actually derived from the payload.
+    """
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+
+    # --- half 1: the GitHub call raises -> warning
+    class RaisingGitHub(FakeGitHub):
+        def issue_view(self, number: int):
+            raise RuntimeError("transient GitHub failure")
+
+    errored_paths = runtime_paths(tmp_path / "errored", config.runtime.state_dir)
+    errored_app = OrchestratorApp(tmp_path / "errored", errored_paths, config, RaisingGitHub())
+    _seed_escalated_pr(errored_paths, 456, 123)
+    errored_app.dispatch_reviews()
+
+    errored_rows = query_events(errored_paths.state_file, kind="escalated_label_repaired")
+    assert len(errored_rows) == 1
+    assert errored_rows[0]["payload"]["errored"] == [123]
+    assert errored_rows[0]["level"] == "warning"
+
+    # --- half 2 (control): the same sweep, succeeding -> registry default
+    clean_gh = FakeGitHub()
+    clean_paths = runtime_paths(tmp_path / "clean", config.runtime.state_dir)
+    clean_app = OrchestratorApp(tmp_path / "clean", clean_paths, config, clean_gh)
+    _seed_escalated_pr(clean_paths, 456, 123)
+    clean_app.dispatch_reviews()
+
+    clean_rows = query_events(clean_paths.state_file, kind="escalated_label_repaired")
+    assert len(clean_rows) == 1
+    assert clean_rows[0]["payload"]["errored"] == []
+    assert clean_rows[0]["payload"]["issue_numbers"] == [123]
+    assert clean_rows[0]["level"] == "info"
 
 
 # --- _collect_escalated_label_subjects(): direct unit tests ---

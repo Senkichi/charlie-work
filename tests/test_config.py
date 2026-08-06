@@ -513,6 +513,30 @@ def test_load_config_event_ring_size_rejects_invalid(tmp_path: Path) -> None:
         load_config(config_file)
 
 
+def test_load_config_event_ring_size_rejects_bool(tmp_path: Path) -> None:
+    """``event_ring_size: true`` must be rejected, not silently used as 1.
+
+    ``bool`` is an ``int`` subclass, so the bare ``isinstance(x, int)`` this
+    validator used accepted YAML's ``true`` and let it through as ``1``. That
+    is worse than a hard failure: ``append_event`` truncates via
+    ``events[-1:]``, giving a one-entry ring that looks configured and drops
+    every event but the last, with nothing reporting it. The zero and negative
+    cases below already fail closed; this one failed *open*.
+
+    Regression-proved: reverting the guard to a bare ``isinstance(x, int)``
+    leaves the rest of this file green, so nothing else covers it.
+    """
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  event_ring_size: true
+""",
+    )
+    with pytest.raises(ConfigError, match="event_ring_size.*must be an int"):
+        load_config(config_file)
+
+
 def test_load_config_event_ring_size_rejects_zero(tmp_path: Path) -> None:
     """Issue #525: event_ring_size=0 is rejected — it would disable truncation.
 

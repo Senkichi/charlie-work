@@ -738,9 +738,13 @@ def _collect_escalated_label_subjects(
     *dispatch selection* happened to consider that pass. That is what made the
     sweep unreachable: candidate selection runs below the
     ``review_dispatch.enabled`` early return, and both deployed fleets run that
-    flag false, so the set was always empty and the sweep never had anything to
-    do. Deriving the subjects from ``state`` instead is the whole fix -- the
-    repair set must not depend on the dispatch lane being on.
+    flag false, so the set is empty and the sweep has nothing to do for as long
+    as the flag stays off -- which, measured at the time of the fix, was every
+    pass for ~8 days. (Not "never": ``escalated_label_repaired`` did fire once,
+    job-cannon 2026-07-28T21:36:56Z, repairing 10 issues. That single run is the
+    argument *for* the fix, not against it.) Deriving the subjects from ``state``
+    instead is the whole fix -- the repair set must not depend on the dispatch
+    lane being on.
 
     An escalated PR contributes its linked issue; an escalated issue contributes
     itself even when no PR points at it, because ``_escalate_issue`` and the
@@ -10566,7 +10570,11 @@ class OrchestratorApp:
             ),
         }
 
-    @_guard_state_lock
+    # Deliberately NOT @_guard_state_lock: that decorator returns a CommandResult
+    # on StateLockBusy, and this method returns a plain dict that gets embedded in
+    # dispatch_reviews' payload. Its only caller IS @_guard_state_lock-decorated,
+    # so a busy lock here propagates up and skips the whole pass -- which is the
+    # right granularity anyway.
     def _repair_escalated_labels(self) -> dict[str, Any]:
         """Re-apply the ``agent:human-needed`` edge for escalated issues that lack it.
 
@@ -10576,11 +10584,15 @@ class OrchestratorApp:
         ``state.json`` and invisible on GitHub, permanently excluded from dispatch
         with no human-visible signal that operator action is required.
 
-        Issue #1088 is that the sweep never ran. Its subject set was built inside
-        ``dispatch_reviews``' candidate-filter loop, below the
-        ``review_dispatch.enabled`` early return, and both deployed fleets run
-        that flag false -- so the set was always empty and the loop always a
-        no-op. Deriving the subjects from ``state`` (see
+        Issue #1088 is that the sweep is unreachable whenever review dispatch is
+        off. Its subject set was built inside ``dispatch_reviews``'
+        candidate-filter loop, below the ``review_dispatch.enabled`` early
+        return, and both deployed fleets run that flag false -- so the set is
+        empty and the loop a no-op for as long as the flag stays off, which at
+        the time of the fix was ~8 days and counting. It is not dead code in the
+        absolute sense: it fired once (job-cannon 2026-07-28) and repaired 10
+        issues, which is exactly why the inertness matters.
+        Deriving the subjects from ``state`` (see
         ``_collect_escalated_label_subjects``) is what makes the guarantee real,
         and this method is called *above* that early return.
 
@@ -10716,10 +10728,20 @@ class OrchestratorApp:
                 "escalated_label_repaired",
                 summary,
                 state_path=self.paths.state_file,
+                # A pass that repaired cleanly is routine, and the registry's
+                # default ("info") is right for it. A pass that could not reach
+                # GitHub, or whose transition() did not apply, is precisely what
+                # an operator filters for with query_events(level="warning") --
+                # and for an all-errored pass this event is the ONLY durable
+                # record, since nothing is written to state for those subjects.
+                # Leaving it at "info" would bury it among every routine pass.
+                # None falls back to the registry (log_event's contract).
+                level="warning" if (errored or summary["failures"]) else None,
             )
             save_state(self.paths.state_file, state)
         return summary
 
+    @_guard_state_lock
     def dispatch_reviews(
         self, limit: int | None = None, *, now: datetime | None = None
     ) -> CommandResult:
