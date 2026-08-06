@@ -18,7 +18,7 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -145,6 +145,27 @@ class WorktreeForeignWriterError(RuntimeError):
         )
 
 
+# How many lines of git's stderr to carry into a pre-merge failure message.
+# Enough for git's "untracked working tree files would be overwritten" header
+# plus the first few offending paths, without pasting a 200-line list into an
+# event payload.
+_PRE_MERGE_STDERR_LINES = 6
+
+
+def _first_lines(text: str | None, *, limit: int) -> str:
+    """Collapse the first ``limit`` non-blank lines of ``text`` onto one line."""
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    head = lines[:limit]
+    joined = " | ".join(head)
+    if len(lines) > limit:
+        joined += f" | (+{len(lines) - limit} more lines)"
+    return joined
+
+
 class ReworkBranchConflictError(RuntimeError):
     """Raised when a rework worktree's failed pre-merge cannot even be
     recovered from — ``git merge --abort`` itself failed, or a ``MERGE_HEAD``
@@ -169,12 +190,30 @@ class ReworkBranchConflictError(RuntimeError):
         base_ref: str,
         conflicted_paths: tuple[str, ...],
         stderr: str | None = None,
+        stage: str = "conflict",
     ) -> None:
         self.worktree_path = worktree_path
         self.branch = branch
         self.base_ref = base_ref
         self.conflicted_paths = conflicted_paths
         self.stderr = stderr
+        self.stage = stage
+        if stage == "pre_merge":
+            # The merge never began, so there is no conflict to describe and
+            # `conflicted_paths` is empty by construction. Naming the stage and
+            # carrying git's own stderr is the whole diagnostic value here: the
+            # message is what reaches the event payload via `str(exc)`, and a
+            # bare "conflicts with base ...; conflicted paths: (unknown)" sent
+            # a reader looking for a content conflict that does not exist.
+            detail = _first_lines(stderr, limit=_PRE_MERGE_STDERR_LINES) or "(no stderr captured)"
+            blocked = ", ".join(conflicted_paths) if conflicted_paths else "(none identified)"
+            super().__init__(
+                f"rework branch {branch!r} could not begin a merge with base "
+                f"{base_ref!r} (no MERGE_HEAD — this is a pre-merge failure, "
+                f"NOT a content conflict); blocking paths outside declared "
+                f"scaffolding: {blocked}; git said: {detail}"
+            )
+            return
         paths_str = ", ".join(conflicted_paths) if conflicted_paths else "(unknown)"
         super().__init__(
             f"rework branch {branch!r} conflicts with base {base_ref!r}; "
@@ -725,6 +764,8 @@ def _merge_update_rework_branch(
     worktree_path: Path,
     branch: str,
     base_ref: str,
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> ReworkMergeConflict | None:
     """Merge-update a checked-out rework branch onto the current base.
 
@@ -744,12 +785,26 @@ def _merge_update_rework_branch(
         None if the merge completed cleanly (including "already up to date").
         A ``ReworkMergeConflict`` describing the aborted merge otherwise.
 
+    ``injected_paths`` and ``materialize_dirs`` name the orchestrator's own
+    scaffolding. They are used only to clear a self-inflicted pre-merge
+    collision (see below); nothing outside them is ever removed.
+
     Raises:
-        ReworkBranchConflictError: only when recovery from the failed merge
-            itself fails — ``git merge --abort`` reports an error, or a
-            ``MERGE_HEAD`` is somehow still present afterward. This leaves the
-            worktree mid-merge and unusable, so it escalates instead of
-            handing a worker a broken workspace.
+        ReworkBranchConflictError: in two distinct situations, distinguished by
+            the exception's ``stage``.
+
+            ``stage="conflict"`` — a merge really was in progress and recovery
+            from it failed: ``git merge --abort`` reported an error AND a
+            ``MERGE_HEAD`` is still present. The worktree is mid-merge and
+            unusable, so this escalates instead of handing a worker a broken
+            workspace.
+
+            ``stage="pre_merge"`` — the merge never began (no ``MERGE_HEAD``),
+            and the reason could not be remediated. This is NOT a content
+            conflict; the branch may merge perfectly cleanly. The one cause
+            this function does remediate is an untracked copy of a
+            base-tracked file left in a reused worktree by a previous
+            attempt's scaffolding, which is cleared and the merge retried once.
         RuntimeError: if the base ref cannot be fetched or the merge command
             itself cannot be run.
     """
@@ -776,6 +831,75 @@ def _merge_update_rework_branch(
     if merge_result.ok:
         return None
 
+    # A failed `git merge` has three outcomes, not two, and only MERGE_HEAD
+    # separates them. Capture it BEFORE aborting, because `merge --abort`
+    # destroys the very state being asked about:
+    #
+    #   (a) merge started, conflicted, aborts cleanly  -> ReworkMergeConflict
+    #   (b) merge started, conflicted, abort fails     -> unrecoverable, raise
+    #   (c) merge never started at all                 -> not a conflict
+    #
+    # Case (c) is what an untracked-file collision produces: the merge is
+    # refused up front, so there is no MERGE_HEAD, `--diff-filter=U` is empty,
+    # and `merge --abort` exits 128 "There is no merge to abort". Keying the
+    # raise off `not abort_result.ok` read that failure as evidence of a broken
+    # mid-merge worktree when it means the exact opposite — the tree is clean
+    # and untouched. That misread laundered a self-inflicted scaffolding
+    # collision into `rework_branch_conflict`, which is a deterministic-
+    # escalation kind, so 17 branches were parked at `agent:human-needed` on
+    # first occurrence with no real conflict between any of them and the base.
+    if not _merge_head_present(worktree_path):
+        # Case (c). The common cause is orchestrator scaffolding left behind by
+        # a previous attempt on a reused worktree: materialization runs later in
+        # `create_worktree` than this merge, so on a fresh worktree these files
+        # do not exist yet, and on a reused one they are untracked copies of
+        # paths the base now tracks. Clear only those and retry once.
+        blocking = _untracked_paths_shadowing_ref(worktree_path, merge_base_ref)
+        undeclared = tuple(
+            path
+            for path in blocking
+            if not _declared_scaffolding_matcher(injected_paths, materialize_dirs)(path)
+        )
+        if (
+            blocking
+            and not undeclared
+            and _clear_declared_scaffolding_collisions(
+                worktree_path, blocking, injected_paths, materialize_dirs
+            )
+        ):
+            retry_result = run_captured(
+                ["git", "merge", "--no-edit", merge_base_ref],
+                cwd=worktree_path,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if retry_result.ok:
+                return None
+            if _merge_head_present(worktree_path):
+                # The retry got far enough to conflict for real. Fall through to
+                # the conflict path below so the worker is briefed to resolve it.
+                merge_result = retry_result
+            else:
+                raise ReworkBranchConflictError(
+                    worktree_path=worktree_path,
+                    branch=branch,
+                    base_ref=merge_base_ref,
+                    conflicted_paths=(),
+                    stderr=retry_result.stderr or retry_result.error,
+                    stage="pre_merge",
+                )
+        else:
+            # Either nothing identifiable is blocking, or something outside the
+            # declared scaffolding is. Escalating is correct — but say what it
+            # actually was instead of calling it a content conflict.
+            raise ReworkBranchConflictError(
+                worktree_path=worktree_path,
+                branch=branch,
+                base_ref=merge_base_ref,
+                conflicted_paths=undeclared,
+                stderr=merge_result.stderr or merge_result.error,
+                stage="pre_merge",
+            )
+
     # Read the unmerged paths while the merge is still in progress, then abort.
     diff_result = run_captured(
         ["git", "diff", "--name-only", "--diff-filter=U"],
@@ -792,14 +916,16 @@ def _merge_update_rework_branch(
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not abort_result.ok or _merge_head_present(worktree_path):
-        # Genuinely unrecoverable: the worktree may still be mid-merge. Escalate
-        # rather than handing a worker a broken workspace.
+        # Case (b): a merge genuinely was in progress and did not come back.
+        # The worktree may still be mid-merge, so escalate rather than handing a
+        # worker a broken workspace. Prefer the merge's own stderr — the abort's
+        # is about the abort, and the merge's is what explains the failure.
         raise ReworkBranchConflictError(
             worktree_path=worktree_path,
             branch=branch,
             base_ref=merge_base_ref,
             conflicted_paths=conflicted_paths,
-            stderr=abort_result.stderr or merge_result.stderr,
+            stderr=merge_result.stderr or abort_result.stderr,
         )
 
     base_sha_result = run_captured(
@@ -977,6 +1103,108 @@ def _parse_status_v2_paths(stdout: str) -> list[str]:
     return paths
 
 
+def _declared_scaffolding_matcher(
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
+) -> Callable[[str], bool]:
+    """Build a predicate matching worktree-relative paths the orchestrator
+    itself declares it writes (``injected_paths`` + ``materialize_dirs``).
+
+    Extracted so the dirty-check and the pre-merge collision cleanup share one
+    definition of "orchestrator scaffolding, not worker product". Two copies of
+    this rule that drift apart would let the cleanup delete something the dirty
+    check considers worker-authored — the one outcome that must never happen.
+    """
+    # Normalize the configured side too, so a Windows-style backslash override
+    # still matches git's forward-slash path reporting.
+    excluded = [
+        PurePosixPath(str(p).replace("\\", "/")) for p in (*injected_paths, *materialize_dirs)
+    ]
+
+    def _is_declared(raw_path: str) -> bool:
+        # Git may emit backslashes on Windows; normalize for comparison.
+        path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        return any(
+            path == excluded_path or excluded_path in path.parents for excluded_path in excluded
+        )
+
+    return _is_declared
+
+
+def _untracked_paths_shadowing_ref(worktree_path: Path, ref: str) -> tuple[str, ...]:
+    """Worktree-relative untracked paths that ``ref`` also tracks.
+
+    These are exactly the files ``git merge`` refuses to overwrite ("The
+    following untracked working tree files would be overwritten by merge").
+    Computed from git's own data — the untracked set intersected with the
+    target ref's tree — rather than by parsing that error text, which is
+    localized and has been reworded across git versions.
+
+    ``--exclude-standard`` is deliberate: ignored files are silently
+    overwritten by merge, so they never block one and must not be swept up
+    into a deletion set.
+    """
+    others = run_captured(
+        ["git", "-c", "core.quotePath=off", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    tracked = run_captured(
+        ["git", "-c", "core.quotePath=off", "ls-tree", "-r", "--name-only", "-z", ref],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not others.ok or not tracked.ok:
+        return ()
+    untracked_set = {p for p in others.stdout.split("\0") if p}
+    tracked_set = {p for p in tracked.stdout.split("\0") if p}
+    return tuple(sorted(untracked_set & tracked_set))
+
+
+def _clear_declared_scaffolding_collisions(
+    worktree_path: Path,
+    blocking_paths: tuple[str, ...],
+    injected_paths: tuple[str, ...],
+    materialize_dirs: tuple[str, ...],
+) -> bool:
+    """Remove orchestrator scaffolding that is blocking a pre-merge.
+
+    Returns True only if every blocking path was declared scaffolding AND the
+    removal succeeded. If anything outside the declared set is blocking, this
+    refuses outright and removes nothing — a partial cleanup that still fails
+    the merge would destroy files for no benefit.
+
+    Safe by three independent properties:
+
+    1. Only paths matching ``_declared_scaffolding_matcher`` are eligible —
+       the same predicate ``_worker_authored_dirty`` uses to decide a path is
+       not worker product. Everything removed here is re-materialized
+       unconditionally later in ``create_worktree``.
+    2. Removal goes through ``git clean``, which structurally cannot remove a
+       tracked file or a modified tracked file. A filesystem ``rmtree`` could.
+    3. Each path is containment-checked against the worktree on its *resolved*
+       form, and anything at or under ``.venv`` is refused regardless — that
+       link is a junction into the SHARED virtualenv on this host, so
+       following it would corrupt every worktree at once.
+    """
+    if not blocking_paths:
+        return False
+    is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
+    if not all(is_declared(path) for path in blocking_paths):
+        return False
+    for path in blocking_paths:
+        if PurePosixPath(path).parts[:1] == (".venv",):
+            return False
+        if not contains(worktree_path, worktree_path / path):
+            return False
+    result = run_captured(
+        ["git", "clean", "-f", "-d", "--", *blocking_paths],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
 def _worker_authored_dirty(
     worktree_path: Path,
     injected_paths: tuple[str, ...] = (),
@@ -1027,17 +1255,9 @@ def _worker_authored_dirty(
             f"worktree status probe failed; treating as dirty: {detail}"
         )
 
-    # Normalize the configured side too, so a Windows-style backslash override
-    # still matches git's forward-slash path reporting.
-    excluded = [
-        PurePosixPath(str(p).replace("\\", "/")) for p in (*injected_paths, *materialize_dirs)
-    ]
+    is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
     for raw_path in _parse_status_v2_paths(status_result.stdout):
-        # Git may emit backslashes on Windows; normalize for comparison.
-        path = PurePosixPath(str(raw_path).replace("\\", "/"))
-        if any(
-            path == excluded_path or excluded_path in path.parents for excluded_path in excluded
-        ):
+        if is_declared(raw_path):
             continue
         return True
     return False
@@ -2273,7 +2493,12 @@ def create_worktree(
                     )
             if recovery is None:
                 rework_conflict = _merge_update_rework_branch(
-                    repo_root, worktree_path, branch, resolved_base_ref
+                    repo_root,
+                    worktree_path,
+                    branch,
+                    resolved_base_ref,
+                    injected_paths,
+                    materialize_dirs,
                 )
             venv_link = worktree_path / ".venv"
             venv_junction: Path | None = None
@@ -2363,7 +2588,12 @@ def create_worktree(
                 )
             if recovery is None:
                 rework_conflict = _merge_update_rework_branch(
-                    repo_root, worktree_path, branch, resolved_base_ref
+                    repo_root,
+                    worktree_path,
+                    branch,
+                    resolved_base_ref,
+                    injected_paths,
+                    materialize_dirs,
                 )
     else:
         # Fresh dispatch: create new branch off base_ref
