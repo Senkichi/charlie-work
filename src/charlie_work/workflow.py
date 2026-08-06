@@ -9615,6 +9615,68 @@ class OrchestratorApp:
             checks, self.config.auto_merge.required_checks, pr_dir / "checks.json"
         )
 
+        # Issue #1036: compare-and-swap the head immediately before committing
+        # this packet's outputs (prompt + decision). ``pr`` was snapshotted
+        # once, at the top of this method, and everything since -- diff
+        # fetch, janitor, containment check, cross-family review -- can take
+        # minutes (385s observed in production). The stale-verdict reset a
+        # few lines below used to compare a recorded verdict's pinned head
+        # against that same build-start snapshot with `!=`, which is
+        # symmetric and has the wrong sign whenever the SNAPSHOT is the
+        # stale side: a verdict recorded mid-build at the genuinely current
+        # head was voided because it disagreed with an old snapshot, not
+        # because it was actually behind.
+        #
+        # A directional (ancestry) fix on the reset alone is not enough --
+        # verified against this same method's control flow: ``pr`` also
+        # feeds ``_build_prior_review_section`` and the ``review.md`` render
+        # below, so sparing only the reset would commit a current-head
+        # verdict next to a prompt describing an older diff, with nothing in
+        # state recording that mismatch. So this re-reads the live head and,
+        # if it no longer matches the snapshot (or can't be read at all --
+        # fail closed), discards the WHOLE packet: neither the prompt nor
+        # the decision reset is written, no label/status transition fires,
+        # and the existing verdict (if any) is left exactly as it was. The
+        # next pass rebuilds the packet against the then-current head. A
+        # verdict pinned to the (unchanged) live head is therefore never
+        # touched by this method in the same pass that would otherwise have
+        # voided it -- which is what "preserve a verdict pinned to a
+        # descendant of the snapshot" reduces to once the snapshot itself is
+        # kept fresh at commit time.
+        live_pr_for_commit = self.gh.pr_view(pr_number)
+        live_head_for_commit = (
+            live_pr_for_commit.get("headRefOid") if isinstance(live_pr_for_commit, dict) else None
+        )
+        snapshot_head_for_commit = pr.get("headRefOid")
+        if live_head_for_commit is None or live_head_for_commit != snapshot_head_for_commit:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state = self._record_event(
+                    state,
+                    "review_packet_discarded_head_moved",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "snapshot_head_sha": snapshot_head_for_commit,
+                        "live_head_sha": live_head_for_commit,
+                    },
+                    level="warning",
+                )
+                save_state(self.paths.state_file, state)
+            return CommandResult(
+                False,
+                f"PR #{pr_number}: head moved during packet build "
+                f"({snapshot_head_for_commit} -> {live_head_for_commit!r}); "
+                "discarding packet, will rebuild next pass",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "reason": "head_moved_during_build",
+                    "snapshot_head_sha": snapshot_head_for_commit,
+                    "live_head_sha": live_head_for_commit,
+                },
+            )
+
         # Single read of review-decision.json, BEFORE rendering: reused both to
         # build the round-2 $prior_review_section below and, after rendering,
         # by the stale-verdict reset a few lines down. Previously that reset
@@ -15231,7 +15293,7 @@ class OrchestratorApp:
         tier: str = "verified-sync",
         new_patch_id: str | None = None,
         new_signature: DiffContentSignature | None = None,
-    ) -> None:
+    ) -> bool:
         """Persist an updated review head for a PR whose branch was synced.
 
         Keeps the verdict valid when the branch was base-updated or rebased
@@ -15264,43 +15326,102 @@ class OrchestratorApp:
         auditable in the events log. Callers that previously recorded the
         event themselves must NOT do so anymore, or the transition would be
         double-counted.
+
+        Issue #1038: ``decision`` is the caller's copy, read before one or
+        more network round-trips (``pr_update_branch``, ``_verify_synced_head``,
+        ``_check_carry_forward``'s diff fetch). This used to write the whole
+        of ``review-decision.json`` from that copy, outside any lock, so a
+        verdict recorded on disk during the round-trips (e.g. an operator's
+        ``record_review`` landing a fresh ``request_changes``) was silently
+        replaced by the stale copy and re-pinned to the new head — an
+        approval could be resurrected over a contemporaneous rejection,
+        authorizing a merge that should not happen.
+
+        Now the on-disk decision is re-read inside the same ``state_lock``
+        that guards the ``state.json`` half of this transition (previously
+        the decision-file write sat entirely outside that lock), and the
+        write is refused unless the on-disk verdict's identity — its
+        ``decision`` value, plus ``reviewed_head_sha`` matching ``old_head``
+        when the caller supplied one — still matches what the caller
+        observed. Only the fields this function owns (``reviewed_head_sha``,
+        ``carry_forward_tier``, the patch-id/signature fields,
+        ``carried_forward_from``) are patched onto the on-disk copy;
+        ``decision``, ``summary``, and ``required_changes`` always come from
+        disk, never from the caller's stale parameter — this is a
+        read-modify-write, never a whole-dict replace.
+
+        Returns True if the carry-forward was applied, False if it was
+        skipped because the on-disk verdict had already changed underneath
+        it (an event is still recorded in that case so the skip is
+        greppable rather than silent).
         """
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
-        updated_decision = dict(decision)
-        updated_decision["reviewed_head_sha"] = new_head
-        updated_decision["carry_forward_tier"] = tier
-        if new_patch_id is not None:
-            updated_decision["reviewed_patch_id"] = new_patch_id
-        if new_signature is not None:
-            updated_decision["reviewed_changed_lines"] = list(new_signature.changed_lines)
-            updated_decision["reviewed_changed_files"] = sorted(new_signature.changed_files)
-            updated_decision["reviewed_has_binary"] = new_signature.has_binary
-        carried_forward: list[str] = list(updated_decision.get("carried_forward_from", []))
-        if old_head is not None and old_head != new_head and old_head not in carried_forward:
-            carried_forward.append(old_head)
-        updated_decision["carried_forward_from"] = carried_forward
-        self._write_json(decision_path, updated_decision)
-
-        if tier == "patch-id":
-            event_kind = "verdict_carried_forward_clean_rebase"
-        elif tier == "line-content":
-            event_kind = "verdict_carried_forward_line_content"
-        else:
-            event_kind = "verdict_carried_forward_verified_sync"
+        expected_decision_value = decision.get("decision")
 
         with state_lock(self.paths.state_file):
+            current_decision = self._review_decision(pr_number)
+            decision_changed = current_decision.get("decision") != expected_decision_value
+            head_changed = (
+                old_head is not None and current_decision.get("reviewed_head_sha") != old_head
+            )
+            if decision_changed or head_changed:
+                state = load_state(self.paths.state_file)
+                state = self._record_event(
+                    state,
+                    "verdict_carry_forward_skipped_stale",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "expected_decision": expected_decision_value,
+                        "expected_reviewed_head_sha": old_head,
+                        "on_disk_decision": current_decision.get("decision"),
+                        "on_disk_reviewed_head_sha": current_decision.get("reviewed_head_sha"),
+                        "attempted_new_head_sha": new_head,
+                        "carry_forward_tier": tier,
+                    },
+                    level="warning",
+                )
+                save_state(self.paths.state_file, state)
+                return False
+
+            updated_decision = dict(current_decision)
+            updated_decision["reviewed_head_sha"] = new_head
+            updated_decision["carry_forward_tier"] = tier
+            if new_patch_id is not None:
+                updated_decision["reviewed_patch_id"] = new_patch_id
+            if new_signature is not None:
+                updated_decision["reviewed_changed_lines"] = list(new_signature.changed_lines)
+                updated_decision["reviewed_changed_files"] = sorted(new_signature.changed_files)
+                updated_decision["reviewed_has_binary"] = new_signature.has_binary
+            carried_forward: list[str] = list(updated_decision.get("carried_forward_from", []))
+            if old_head is not None and old_head != new_head and old_head not in carried_forward:
+                carried_forward.append(old_head)
+            updated_decision["carried_forward_from"] = carried_forward
+            self._write_json(decision_path, updated_decision)
+
+            if tier == "patch-id":
+                event_kind = "verdict_carried_forward_clean_rebase"
+            elif tier == "line-content":
+                event_kind = "verdict_carried_forward_line_content"
+            else:
+                event_kind = "verdict_carried_forward_verified_sync"
+
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
             state["prs"][str(pr_number)] = {
                 **pr_state,
                 "number": pr_number,
-                "decision": pr_state.get("decision") or decision.get("decision") or "approved",
-                "status": pr_state.get("status") or decision.get("decision") or "approved",
+                "decision": pr_state.get("decision")
+                or updated_decision.get("decision")
+                or "approved",
+                "status": pr_state.get("status") or updated_decision.get("decision") or "approved",
                 "reviewed_head_sha": new_head,
                 "reviewed_patch_id": new_patch_id
                 if new_patch_id is not None
                 else (
-                    pr_state.get("reviewed_patch_id") or decision.get("reviewed_patch_id") or ""
+                    pr_state.get("reviewed_patch_id")
+                    or updated_decision.get("reviewed_patch_id")
+                    or ""
                 ),
                 "carry_forward_tier": tier,
                 "carried_forward_from": carried_forward,
@@ -15319,6 +15440,7 @@ class OrchestratorApp:
                 },
             )
             save_state(self.paths.state_file, state)
+        return True
 
     def _verify_synced_head(self, pr_number: int, old_head_sha: str | None) -> str | None:
         """Verify that the new head of a PR is a valid base-sync merge commit.
