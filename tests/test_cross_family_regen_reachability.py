@@ -39,7 +39,7 @@ from charlie_work.config import AutoMergeConfig, CrossFamilyConfig, Orchestrator
 from charlie_work.cross_family import _CAVEAT, CrossFamilyResult
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
-from charlie_work.state import load_state
+from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp
 
 # Reuse the shared FakeGitHub whose default PR #456 is janitor-green.
@@ -517,3 +517,119 @@ def test_regen_budget_resets_when_the_head_moves(
     record = state["prs"]["456"]["cross_family_regen"]
     assert record["head_sha"] == new_head
     assert record["attempts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The label edge has to survive a transition() failure (AC-4)
+#
+# Escalating writes state only; the agent:human-needed label is what a human
+# actually sees. #586 built a self-heal sweep for exactly this, but it lives in
+# dispatch_reviews BELOW the review_dispatch.enabled early return, and its input
+# set is built by the dispatch-selection loop that same return skips -- so with
+# review dispatch off (this fleet's configuration) it is unreachable, not merely
+# narrow. Without the retry below, one transient GitHub failure at escalation
+# time would leave the PR escalated-in-state and invisible on GitHub forever,
+# because the `record.get("escalated")` early return means the edge is never
+# revisited. That is the precise defect #586 existed to kill, reintroduced.
+# ---------------------------------------------------------------------------
+
+
+class _FlakyLabelGitHub(FakeGitHub):
+    """``add_issue_label`` fails the first ``fail_adds`` times, then succeeds."""
+
+    def __init__(self, fail_adds: int) -> None:
+        super().__init__()
+        self.remaining_failures = fail_adds
+
+    def add_issue_label(self, number: int, label: str) -> bool:
+        if self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            return False
+        return super().add_issue_label(number, label)
+
+
+def _escalating_app(tmp_path: Path, gh: FakeGitHub) -> OrchestratorApp:
+    """An app whose regen budget is already spent, so the call escalates."""
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=True, auto_verdict=True, max_regen_attempts=0),
+        auto_merge=AutoMergeConfig(required_checks=(), require_approved_review=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh.prs = [_pr456(HEAD)]
+    return OrchestratorApp(tmp_path, paths, config, gh)
+
+
+def _claim(app: OrchestratorApp) -> bool:
+    return app._claim_cross_family_regen_attempt(
+        pr_number=456, issue_number=123, head_sha=HEAD, report_head=None
+    )
+
+
+def _label_error(app: OrchestratorApp) -> Any:
+    """``label_error`` as persisted, distinguishing absent from None."""
+    entry = load_state(app.paths.state_file)["issues"].get("123", {})
+    return entry["label_error"] if "label_error" in entry else "ABSENT"
+
+
+def test_a_failed_label_edge_is_retried_on_the_next_pass(tmp_path: Path) -> None:
+    """A transition() failure must not make the escalation permanently invisible.
+
+    The first pass escalates and the label add fails. The second pass must
+    re-apply it -- even though there is nothing left to claim and the
+    ``escalated`` flag short-circuits the rest of the method.
+    """
+    app = _escalating_app(tmp_path, _FlakyLabelGitHub(fail_adds=1))
+
+    assert _claim(app) is False
+    human_needed = app.config.labels.human_needed
+    assert (123, human_needed) not in _labels_added(app)
+    assert isinstance(_label_error(app), dict), "a failed edge must be recorded as a dict"
+
+    # Second pass: nothing to claim, but the edge is still owed.
+    assert _claim(app) is False
+    assert (123, human_needed) in _labels_added(app)
+    assert _label_error(app) is None, "a verified edge must be recorded as None"
+
+
+def test_a_verified_label_edge_is_not_re_applied(tmp_path: Path) -> None:
+    """Steady state costs nothing: once verified, later passes make no label call.
+
+    This is the negative control for the retry above. Without it the retry
+    could be satisfied by re-applying the edge unconditionally on every pass,
+    which would hammer the GitHub API for every escalated PR forever.
+    """
+    app = _escalating_app(tmp_path, _FlakyLabelGitHub(fail_adds=0))
+    human_needed = app.config.labels.human_needed
+
+    assert _claim(app) is False
+    assert _labels_added(app).count((123, human_needed)) == 1
+    assert _label_error(app) is None
+
+    for _ in range(3):
+        assert _claim(app) is False
+    assert _labels_added(app).count((123, human_needed)) == 1, "re-applied a verified edge"
+
+
+def test_a_concurrent_unescalate_is_not_undone(tmp_path: Path) -> None:
+    """The retry must not resurrect an escalation a concurrent unescalate freed.
+
+    unescalate() clears ``label_error`` along with the status, so the
+    absent-key arm ("never attempted") would otherwise read that cleared state
+    as licence to re-apply agent:human-needed and silently undo the release.
+    """
+    app = _escalating_app(tmp_path, _FlakyLabelGitHub(fail_adds=1))
+    human_needed = app.config.labels.human_needed
+
+    assert _claim(app) is False
+    assert (123, human_needed) not in _labels_added(app)
+
+    # Simulate the concurrent unescalate: status cleared, label_error dropped.
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"] = {**state["prs"]["456"], "status": "reviewing"}
+    issue_entry = {**state["issues"].get("123", {}), "status": "reviewing"}
+    issue_entry.pop("label_error", None)
+    state["issues"]["123"] = issue_entry
+    save_state(app.paths.state_file, state)
+
+    assert _claim(app) is False
+    assert (123, human_needed) not in _labels_added(app), "re-escalated a released issue"
