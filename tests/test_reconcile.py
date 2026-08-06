@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -86,6 +87,16 @@ class FakeGitHub:
             return self._prs
         if args[:2] == ["issue", "list"]:
             return self._issues
+        if args[0] == "api" and "pulls?state=all" in args[1]:
+            url = args[1]
+            page_match = re.search(r"[?&]page=(\d+)", url)
+            page = int(page_match.group(1)) if page_match else 1
+            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
+            per_page = int(per_page_match.group(1)) if per_page_match else 100
+            start = (page - 1) * per_page
+            return self._prs[start : start + per_page]
+        if args[0] == "api":
+            return [] if json_output else ""
         raise AssertionError(f"unexpected gh.run call: {args}")
 
     def add_issue_label(self, number: int, label: str) -> bool:
@@ -118,6 +129,9 @@ class FakeGitHub:
             self._rate_limit_remaining,
             self._rate_limit_reset,
         )
+
+    def name_with_owner(self) -> str:
+        return "owner/test-repo"
 
 
 def _pr(
@@ -165,8 +179,9 @@ def test_detect_drift_makes_zero_mutating_calls() -> None:
 
     assert gh.labels_added == []
     assert gh.labels_removed == []
-    # Exactly one PR list query and one issue list query.
-    assert [call[:2] for call in gh.run_calls] == [["pr", "list"], ["issue", "list"]]
+    # PRs are now fetched via paginated REST; issues still use a single list query.
+    assert any(call[0] == "api" and "pulls?state=all" in call[1] for call in gh.run_calls)
+    assert any(call[:2] == ["issue", "list"] for call in gh.run_calls)
 
 
 def test_detect_drift_finds_merged_outside_orchestrator() -> None:
@@ -255,35 +270,32 @@ def test_detect_drift_finds_state_pr_missing_on_github() -> None:
     assert matches[0].issue_number == 5
 
 
-def test_detect_drift_pr_snapshot_truncated_still_skips_state_pr_missing_on_github(
+def test_detect_drift_pr_list_paginated_finds_state_pr_missing_on_github(
     caplog,
 ) -> None:
-    """Issue #857 acceptance criterion 2: state_pr_missing_on_github stays fully gated.
-
-    Unlike the issue-side sweeps (state_active_status_issue_closed,
-    issue_status_normalized), this sweep's per-item fix is NOT safe to run
-    against a partial snapshot: a false positive here reaches
-    ``new_prs.pop(...)`` in ``apply_fixes`` and erases ``decision`` /
-    ``reviewed_head_sha`` for an approved PR fleet-wide. Issue #857 deliberately
-    leaves this gate untouched -- pin that it still skips outright when the PR
-    snapshot is truncated, so a future refactor of the issue-side gate doesn't
-    accidentally also lift this one.
+    """Issue #762: the PR list is fetched via paginated REST and is complete,
+    so state_pr_missing_on_github is no longer gated on an artificial
+    ``_LIST_LIMIT`` snapshot cap. A tracked PR that is genuinely absent from the
+    complete snapshot must still be flagged.
     """
     caplog.set_level(logging.WARNING)
     config = OrchestratorConfig()
-    # Exactly _LIST_LIMIT PRs, none numbered 999: the PR snapshot is provably
-    # truncated AND PR #999 (tracked in state, "missing" on GitHub) fell off it.
-    prs = [_pr(i, "OPEN") for i in range(1, reconcile_list_limit + 1)]
+    # More than _LIST_LIMIT PRs, none numbered 999. With a single 500-item page
+    # the snapshot would be provably truncated, but the paginated fetch must now
+    # return all of them, so PR #999 (tracked in state, missing on GitHub) is
+    # unambiguously missing and must be reported.
+    prs = [_pr(i, "OPEN") for i in range(1, reconcile_list_limit + 101)]
     gh = FakeGitHub(prs=prs, issues=[])
     state = empty_state()
     state["prs"]["999"] = {"issue_number": 5, "status": "reviewing"}
 
     drift = detect_drift(gh, state, config)
 
-    assert [item for item in drift if item.kind == "state_pr_missing_on_github"] == []
-    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
-    assert len(truncated) == 1
-    assert "incomplete" in caplog.text.lower()
+    missing = [item for item in drift if item.kind == "state_pr_missing_on_github"]
+    assert len(missing) == 1
+    assert missing[0].pr_number == 999
+    assert not any(item.kind == "snapshot_truncated" and "PR" in item.detail for item in drift)
+    assert "incomplete" not in caplog.text.lower()
 
 
 def test_detect_drift_finds_issue_active_label_no_open_pr(tmp_path: Path) -> None:
