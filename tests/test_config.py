@@ -545,6 +545,78 @@ def test_load_config_event_ring_size_rejects_negative(tmp_path: Path) -> None:
         load_config(config_file)
 
 
+def test_runtime_config_gh_timeout_seconds_default() -> None:
+    """RuntimeConfig.gh_timeout_seconds defaults to 120.0 seconds."""
+    assert RuntimeConfig().gh_timeout_seconds == 120.0
+
+
+def test_load_config_gh_timeout_seconds_override(tmp_path: Path) -> None:
+    """runtime.gh_timeout_seconds is configurable from YAML and reaches
+    RuntimeConfig."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  gh_timeout_seconds: 45.5
+""",
+    )
+    config = load_config(config_file)
+    assert config.runtime.gh_timeout_seconds == 45.5
+
+
+def test_load_config_gh_timeout_seconds_rejects_zero(tmp_path: Path) -> None:
+    """gh_timeout_seconds=0 would time out instantly, failing every gh call."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  gh_timeout_seconds: 0
+""",
+    )
+    with pytest.raises(ConfigError, match="gh_timeout_seconds.*must be > 0"):
+        load_config(config_file)
+
+
+def test_load_config_gh_timeout_seconds_rejects_negative(tmp_path: Path) -> None:
+    """Negative gh_timeout_seconds is rejected."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  gh_timeout_seconds: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="gh_timeout_seconds.*must be > 0"):
+        load_config(config_file)
+
+
+def test_load_config_gh_timeout_seconds_rejects_bool(tmp_path: Path) -> None:
+    """A bool must not silently pass the `isinstance(x, (int, float))` check
+    (bool is an int subclass in Python)."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  gh_timeout_seconds: true
+""",
+    )
+    with pytest.raises(ConfigError, match="gh_timeout_seconds.*must be a number"):
+        load_config(config_file)
+
+
+def test_load_config_gh_timeout_seconds_rejects_non_number(tmp_path: Path) -> None:
+    """gh_timeout_seconds must be a number, not a string."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  gh_timeout_seconds: "120"
+""",
+    )
+    with pytest.raises(ConfigError, match="gh_timeout_seconds.*must be a number"):
+        load_config(config_file)
+
+
 def test_load_config_runtime_throttle_resume_margin_default() -> None:
     """RuntimeConfig.throttle_resume_margin_s defaults to 90 seconds."""
     from charlie_work.config import RuntimeConfig
