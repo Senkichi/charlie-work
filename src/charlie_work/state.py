@@ -742,7 +742,7 @@ def append_event(
     behavior they are validating.
 
     When ``state_path`` is provided, the event is also written to the
-    unlimited append-only ``events.jsonl`` log file alongside ``state.json``.
+    unlimited append-only ``events.db`` SQLite log alongside ``state.json``.
     This dual-write preserves the complete audit history beyond the bounded
     convenience cap in ``state.json``'s ``events`` array. The write is
     best-effort — instrumentation never breaks the core workflow.
