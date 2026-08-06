@@ -13,25 +13,19 @@ so it can never silently drift from what dispatch_rework actually checks.
 
 from __future__ import annotations
 
-import importlib.util
 import subprocess
-import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from _script_loader import load_script_module
 from charlie_work.workflow import _is_verdict_newer_than_brief
 
 
 def _load_backfill_script() -> ModuleType:
     path = Path(__file__).parent.parent / "scripts" / "backfill_stale_rework_briefs.py"
-    spec = importlib.util.spec_from_file_location("backfill_stale_rework_briefs", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["backfill_stale_rework_briefs"] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_script_module(path, "backfill_stale_rework_briefs")
 
 
 @pytest.fixture(scope="module")
