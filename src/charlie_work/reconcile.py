@@ -7,9 +7,9 @@ then permanently disagree with reality — e.g. ``agent:in-progress`` /
 ``agent:reviewing`` never clears because the label edge that would clear it
 (``labels.transition(..., "merged")``) never ran.
 
-``detect_drift`` is read-only: it fetches every PR via a paginated REST
-snapshot and one issue list query via ``gh.run``, and never calls a mutating
-GitHub method.
+``detect_drift`` is read-only: it fetches every PR and every issue via
+paginated REST snapshots through ``gh.run``, and never calls a mutating GitHub
+method.
 ``apply_fixes`` is the only function in this module that mutates GitHub, and
 it is never invoked implicitly — callers gate it behind an explicit
 ``--fix`` flag. It reuses ``labels.transition`` for the one drift
@@ -34,7 +34,6 @@ from .github import (
     GitHubLike,
     GraphQLBudgetError,
     _LIST_LIMIT,
-    RECONCILE_ISSUE_FIELDS,
     label_names,
     linked_issue_number,
 )
@@ -265,21 +264,65 @@ def _repo_slug(gh: GitHubLike) -> str:
         return "?"
 
 
+def _normalize_reconcile_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a REST ``issues`` response to the ``gh issue list --json`` shape.
+
+    ``gh issue list --json`` names the web URL ``url``; the REST endpoint names
+    the same URL ``html_url``. This function is idempotent: if the input
+    already carries ``url`` and no ``html_url`` it is returned unchanged.
+    """
+    if isinstance(issue, dict) and "html_url" in issue:
+        normalized = dict(issue)
+        normalized["url"] = normalized.pop("html_url")
+        return normalized
+    return issue
+
+
 def _fetch_issues(gh: GitHubLike) -> list[dict[str, Any]]:
-    return _fetch_snapshot(
-        gh,
-        [
-            "issue",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            str(_LIST_LIMIT),
-            "--json",
-            RECONCILE_ISSUE_FIELDS,
-        ],
-        what="issue",
-    )
+    """Fetch every issue via the REST ``issues`` endpoint, paging to exhaustion
+    and filtering out pull requests.
+
+    ``gh issue list --state all --limit 500`` was permanently capped at
+    ``_LIST_LIMIT`` (500). Once a repo crossed that limit the issue snapshot was
+    always provably incomplete, so any state-tracked issue outside the most
+    recent 500 became permanently unanswerable (issue #762). The REST
+    ``issues`` endpoint is paged and has no hard cap, so we walk it until a page
+    comes back with fewer items than requested. The endpoint returns both
+    issues and PRs; we drop PR-shaped entries so the issue snapshot contains
+    only real issues.
+    """
+    per_page = 100
+    all_issues: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        result = gh.run(
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/issues?state=all&per_page={per_page}&page={page}",
+            ],
+            json_output=True,
+        )
+        if not isinstance(result, list):
+            raise GitHubError(
+                f"reconcile: `gh api issues?state=all` returned {type(result).__name__}, not a list; "
+                f"refusing to treat an unreadable issue snapshot as an empty one "
+                "(that reading would drop every tracked issue from state.json)"
+            )
+        if not result:
+            break
+        for issue in result:
+            if not isinstance(issue, dict):
+                continue
+            # The REST ``issues`` endpoint returns both issues and PRs; ``gh
+            # issue list`` filters PRs client-side. Skip PR-shaped rows so they
+            # do not pollute the issue snapshot and duplicate the PR snapshot.
+            if issue.get("pull_request"):
+                continue
+            all_issues.append(_normalize_reconcile_issue(issue))
+        if len(result) < per_page:
+            break
+        page += 1
+    return all_issues
 
 
 # Aviator (job-cannon/charlie-work's merge-queue bot) owns these strings; they
@@ -689,14 +732,13 @@ def detect_drift(
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
-    # Issue #45: the `--state all` query is capped at _LIST_LIMIT. If it returns
-    # that many, the snapshot is provably incomplete for issues outside the
-    # page window. Issue #857: this flag no longer gates any sweep outright --
-    # state_active_status_issue_closed and issue_status_normalized (below) run
-    # against every issue that IS in the snapshot regardless of this flag, and
-    # fail safe per-item on the issues that aren't. This flag's only remaining
-    # consumer is the honesty warning emitted near the end of this function.
-    issue_snapshot_truncated = len(issues) >= _LIST_LIMIT
+    # Issue #762: issues are now fetched via a paginated REST ``issues``
+    # snapshot. The list is either complete (we stopped because GitHub returned
+    # an under-full page) or the fetch raised. It is no longer a fixed
+    # ``_LIST_LIMIT`` page, so the snapshot is not permanently incomplete.
+    # The per-item ``issue is None`` checks below already fail safe on any
+    # genuinely missing issue, and the warning remains defensive dead code.
+    issue_snapshot_truncated = False
     state_prs: dict[str, Any] = state.get("prs", {})
     # Issue #762: PRs are now fetched via a paginated REST ``pulls`` snapshot.
     # The list is either complete (we stopped because GitHub returned an
