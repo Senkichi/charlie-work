@@ -10292,9 +10292,26 @@ class OrchestratorApp:
                 continue
             # Skip stale reports: the head SHA in the report must match the
             # packet head SHA so we don't record a verdict for an old diff.
+            # Require BOTH shas on positive confirmation -- an indeterminate
+            # comparison (either side unknown) must not fall through to the
+            # permissive branch. That fail-open let an unverifiable head
+            # authorize a merge.
             report_head = extract_head_ref_oid(report_text)
             packet_head = candidate.get("packet_head_sha")
-            if report_head is not None and packet_head is not None and report_head != packet_head:
+            if report_head is None or packet_head is None:
+                # The skip this fix *adds*: neither the mismatch case below
+                # (already skipped before, and self-healing -- a head move
+                # regenerates the report) nor the malformed-verdict case
+                # (bounded by max_parse_failures). Nothing regenerates a
+                # report whose head is simply absent, so this PR can sit
+                # here every pass forever. Emit once so it is visible
+                # instead of silently stalling -- the exact failure shape
+                # this whole guard exists to stop being invisible.
+                self._note_cross_family_head_indeterminate(
+                    pr_number, candidate.get("issue"), report_head, packet_head
+                )
+                continue
+            if report_head != packet_head:
                 continue
             parsed = parse_cross_family_verdict(report_text)
             if parsed is None:
@@ -10323,6 +10340,54 @@ class OrchestratorApp:
                 }
             )
         return results
+
+    def _note_cross_family_head_indeterminate(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        report_head: str | None,
+        packet_head: str | None,
+    ) -> None:
+        """Record, once per PR, that the head-SHA guard could not adjudicate.
+
+        The guard skips when either side is unknown, which is correct -- an
+        unverifiable head must not authorize a merge. But that skip re-runs
+        every ``_record_cross_family_verdicts`` pass with the same inputs and
+        nothing regenerates the report, so without a signal the PR stalls in
+        ``reviewing`` invisibly. This is deliberately *not* bounded the way
+        ``max_parse_failures`` bounds the malformed path: that bound ends in a
+        caveated ``approved``, and approving on an unconfirmed head is exactly
+        the fail-open this guard closes. Visibility is the remedy here, not an
+        eventual auto-approve.
+
+        The durable ``cross_family_head_indeterminate`` marker keeps this to
+        one event per PR rather than one per loop pass, which would flush the
+        capped ``events`` ring in ``state.json``.
+        """
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            if pr_state.get("cross_family_head_indeterminate"):
+                return
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "cross_family_head_indeterminate": True,
+            }
+            state = self._record_event(
+                state,
+                "cross_family_verdict_head_indeterminate",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "report_head_sha": report_head,
+                    "packet_head_sha": packet_head,
+                    "reason": "report head SHA missing"
+                    if report_head is None
+                    else "packet head SHA missing",
+                },
+            )
+            save_state(self.paths.state_file, state)
 
     def _handle_malformed_cross_family_verdict(
         self,
