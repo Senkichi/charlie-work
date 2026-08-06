@@ -27,10 +27,15 @@ from typing import Any
 import pytest
 
 from charlie_work.adapters import SessionDispatchResult
-from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewDispatchConfig
+from charlie_work.config import (
+    DevinConfig,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+    RuntimeConfig,
+)
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
-from charlie_work.workflow import OrchestratorApp
+from charlie_work.workflow import OrchestratorApp, _collect_escalated_label_subjects
 
 from test_charlie_work import FakeGitHub
 
@@ -464,6 +469,337 @@ def test_dispatch_reviews_dry_run_no_mutation_for_escalated_pr(tmp_path: Path) -
     # no repair event appended).
     assert state_after["issues"]["123"] == state_before["issues"]["123"]
     assert _events(state_after, "escalated_label_repaired") == []
+
+
+# --- Issue #1088: escalated-label sweep reachability ---
+#
+# #586 built its self-heal subject set inside dispatch_reviews' candidate-
+# filter loop, which runs BELOW the review_dispatch.enabled early return. Both
+# deployed fleets run that flag false, so the set was always empty and the
+# sweep above (test_dispatch_reviews_self_heals_escalated_label_*) never had
+# anything to act on outside a test that forces enabled=True. The tests below
+# exercise the fix: _collect_escalated_label_subjects derives subjects from
+# state instead of dispatch candidates, and _repair_escalated_labels is called
+# from dispatch_reviews ABOVE the enabled gate.
+
+
+def _seed_many_escalated(paths, fake_gh: FakeGitHub, pairs: list[tuple[int, int]]) -> None:
+    """Seed several escalated PR+issue pairs (label_error absent) and register
+    each issue with the fake GitHub so ``issue_view`` resolves instead of
+    raising ``ValueError`` -- an unregistered issue would land in
+    ``_repair_escalated_labels``'s ``except Exception`` deferral branch and be
+    indistinguishable from a genuine transient GitHub failure, which is not
+    what these tests are about.
+    """
+    for pr_number, issue_number in pairs:
+        _seed_escalated_pr(paths, pr_number, issue_number)
+        fake_gh.issues.append(
+            {
+                "number": issue_number,
+                "title": f"issue {issue_number}",
+                "labels": [],
+                "state": "OPEN",
+            }
+        )
+
+
+def test_escalated_label_repair_runs_with_review_dispatch_disabled(tmp_path: Path) -> None:
+    """THE positive control for issue #1088.
+
+    Both deployed fleets (charlie-work and job-cannon) run
+    ``review_dispatch.enabled=False``. Before this fix, that flag gated
+    dispatch_reviews' early return BELOW the point where #586's self-heal
+    subject set was built -- so with dispatch disabled, the set was always
+    empty and the label was never re-applied, no matter how badly an escalated
+    issue needed it. This test is the one that distinguishes "the sweep ran"
+    from "the sweep does not exist": every other test in this module that
+    proves the self-heal *predicate* is correct
+    (test_dispatch_reviews_self_heals_escalated_label_*) does so with
+    ``enabled=True``, which was never the unreachable configuration. Flip
+    ``enabled`` here and, pre-fix, the label would never be applied.
+    """
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class SpyGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issue_view_calls: list[int] = []
+
+        def issue_view(self, number: int):
+            self.issue_view_calls.append(number)
+            return super().issue_view(number)
+
+    fake_gh = SpyGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _seed_escalated_pr(paths, 456, 123)  # label_error absent, status escalated
+
+    result = app.dispatch_reviews()
+
+    # Unambiguous proof the disabled early-return path is the one taken.
+    assert result.ok is True
+    assert result.data.get("disabled") is True
+    # The label was applied even though dispatch itself is off.
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert fake_gh.issue_view_calls == [123]
+    assert result.data["escalated_labels_repaired"]["issue_numbers"] == [123]
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["label_error"] is None
+    repair_events = _events(state, "escalated_label_repaired")
+    assert len(repair_events) == 1
+    assert repair_events[0]["payload"]["issue_numbers"] == [123]
+
+
+def test_escalated_label_repair_is_bounded_per_pass(tmp_path: Path) -> None:
+    """The per-pass cap defers the overflow rather than either starving forever
+    or blowing through the whole backlog in one pass. Five escalated subjects
+    against a cap of 2 must repair exactly 2 per pass, in ascending issue
+    order (the order ``_collect_escalated_label_subjects`` sorts by), and
+    convergence over repeated passes must actually drain the full backlog --
+    not just report a plausible-looking ``deferred`` count once.
+    """
+    pairs = [(601, 201), (602, 202), (603, 203), (604, 204), (605, 205)]
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=False),
+        runtime=RuntimeConfig(escalated_label_repair_max_per_pass=2),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _seed_many_escalated(paths, fake_gh, pairs)
+
+    repaired1 = app.dispatch_reviews().data["escalated_labels_repaired"]
+    assert repaired1["issue_numbers"] == [201, 202]
+    assert repaired1["deferred"] == 3
+
+    repaired2 = app.dispatch_reviews().data["escalated_labels_repaired"]
+    assert repaired2["issue_numbers"] == [203, 204]
+    assert repaired2["deferred"] == 1
+
+    repaired3 = app.dispatch_reviews().data["escalated_labels_repaired"]
+    assert repaired3["issue_numbers"] == [205]
+    assert repaired3["deferred"] == 0
+
+    # Convergence: every seeded subject is now verified, and a further pass
+    # finds nothing left to do -- the bound did not starve the tail.
+    state = load_state(paths.state_file)
+    for _, issue_number in pairs:
+        assert state["issues"][str(issue_number)]["label_error"] is None
+        assert (issue_number, config.labels.human_needed) in fake_gh.labels_added
+
+    repaired4 = app.dispatch_reviews().data["escalated_labels_repaired"]
+    assert repaired4 == {"issue_numbers": [], "failures": [], "errored": [], "deferred": 0}
+
+
+def test_escalated_label_repair_cap_zero_means_unlimited(tmp_path: Path) -> None:
+    """``escalated_label_repair_max_per_pass=0`` disables the cap (matching the
+    ``graphql_rate_limit_threshold`` "0 disables the guard" convention) --
+    all 5 seeded subjects must repair in a single pass, none deferred.
+    """
+    pairs = [(601, 201), (602, 202), (603, 203), (604, 204), (605, 205)]
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=False),
+        runtime=RuntimeConfig(escalated_label_repair_max_per_pass=0),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _seed_many_escalated(paths, fake_gh, pairs)
+
+    result = app.dispatch_reviews()
+
+    repaired = result.data["escalated_labels_repaired"]
+    assert repaired["issue_numbers"] == [201, 202, 203, 204, 205]
+    assert repaired["deferred"] == 0
+    for _, issue_number in pairs:
+        assert (issue_number, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_escalated_label_repair_skipped_under_dry_run(tmp_path: Path) -> None:
+    """``--dry-run`` must perform no live GitHub calls, label mutations, or
+    state.json writes for the repair sweep.
+
+    Carries its own positive control (pattern from
+    test_dry_run_claims_nothing_and_fires_no_label_edit in
+    test_cross_family_regen_reachability.py): "nothing happened" is equally
+    consistent with "the dry-run gate works" and with "the call never reached
+    the mutating code", so the identical seed and call is made against a
+    live (non-dry-run) app first and asserted to actually write.
+    """
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+
+    class SpyGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issue_view_calls: list[int] = []
+
+        def issue_view(self, number: int):
+            self.issue_view_calls.append(number)
+            return super().issue_view(number)
+
+    live_dir = tmp_path / "live"
+    live_dir.mkdir()
+    live_paths = runtime_paths(live_dir, config.runtime.state_dir)
+    live_gh = SpyGitHub()
+    live_app = OrchestratorApp(live_dir, live_paths, config, live_gh)
+    _seed_escalated_pr(live_paths, 456, 123)
+
+    live_result = live_app.dispatch_reviews()
+
+    # Control: this exact seed+call really does reach the mutating code.
+    assert (123, config.labels.human_needed) in live_gh.labels_added
+    assert live_gh.issue_view_calls == [123]
+    live_state = load_state(live_paths.state_file)
+    assert live_state["issues"]["123"]["label_error"] is None
+    assert len(_events(live_state, "escalated_label_repaired")) == 1
+    assert live_result.data["escalated_labels_repaired"]["issue_numbers"] == [123]
+
+    dry_dir = tmp_path / "dry"
+    dry_dir.mkdir()
+    dry_paths = runtime_paths(dry_dir, config.runtime.state_dir)
+    dry_gh = SpyGitHub()
+    dry_app = OrchestratorApp(dry_dir, dry_paths, config, dry_gh, dry_run=True)
+    _seed_escalated_pr(dry_paths, 456, 123)
+    state_before = load_state(dry_paths.state_file)
+
+    dry_result = dry_app.dispatch_reviews()
+
+    assert dry_gh.issue_view_calls == []
+    assert (123, config.labels.human_needed) not in dry_gh.labels_added
+    state_after = load_state(dry_paths.state_file)
+    assert state_after["issues"]["123"] == state_before["issues"]["123"]
+    assert _events(state_after, "escalated_label_repaired") == []
+    assert dry_result.data["escalated_labels_repaired"] == {
+        "issue_numbers": [],
+        "failures": [],
+        "errored": [],
+        "deferred": 0,
+    }
+
+
+def test_escalated_label_repair_defers_on_github_error(tmp_path: Path) -> None:
+    """A transient GitHub failure (issue_view raising) must not abort the pass
+    and must NOT write ``label_error`` -- writing anything (including a failure
+    dict) would still be progress recorded for a subject that was never actually
+    verified one way or the other; leaving the key absent is what makes it
+    eligible for retry on the very next pass rather than needing a separate
+    retry-vs-verified distinction.
+
+    But "nothing was written to state" must not also mean "nothing was
+    reported". Because the subject is deliberately invisible in state, the
+    ``escalated_label_repaired`` event is the ONLY durable record that it was
+    attempted at all -- so the event IS emitted, listing the subject under
+    ``errored`` and under nothing else. Without that, a fleet whose every
+    GitHub call fails on every pass emits a payload byte-identical to a healthy
+    idle fleet's, and the failure is undetectable from outside the process.
+    """
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class RaisingGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issue_view_calls: list[int] = []
+
+        def issue_view(self, number: int):
+            self.issue_view_calls.append(number)
+            raise RuntimeError("transient GitHub failure")
+
+    fake_gh = RaisingGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    _seed_escalated_pr(paths, 456, 123)  # label_error absent
+
+    result = app.dispatch_reviews()
+
+    # Positive control: the absence-of-mutation assertions below only mean
+    # something if the sweep actually reached this subject and hit the
+    # GitHub call before failing, rather than never collecting/attempting it.
+    assert fake_gh.issue_view_calls == [123]
+
+    assert result.ok is True
+    # The subject appears in `errored`, NOT in `issue_numbers`/`failures`.
+    # Before this was added the payload here was byte-identical to the
+    # nothing-to-do payload asserted in
+    # test_escalated_label_repair_cap_zero_means_unlimited's drained pass, so a
+    # fleet failing every subject on every pass reported exactly like a healthy
+    # idle one. `errored` is the discriminator, and this is the test that pins it.
+    assert result.data["escalated_labels_repaired"] == {
+        "issue_numbers": [],
+        "failures": [],
+        "errored": [123],
+        "deferred": 0,
+    }
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert "label_error" not in state["issues"]["123"]
+    # The event IS emitted -- see the docstring. It records the attempt without
+    # claiming a repair: `issue_numbers` stays empty (nothing was repaired) and
+    # the subject appears only under `errored`.
+    events = _events(state, "escalated_label_repaired")
+    assert len(events) == 1
+    assert events[0]["payload"]["errored"] == [123]
+    assert events[0]["payload"]["issue_numbers"] == []
+    assert events[0]["payload"]["failures"] == []
+
+
+# --- _collect_escalated_label_subjects(): direct unit tests ---
+
+
+def test_collect_escalated_label_subjects_pr_yields_pr_and_issue() -> None:
+    """An escalated PR contributes its linked issue, PR number included."""
+    state = {"prs": {"456": {"status": "escalated", "issue_number": 123}}, "issues": {}}
+    assert _collect_escalated_label_subjects(state) == [(456, 123)]
+
+
+def test_collect_escalated_label_subjects_issue_with_no_pr_yields_none_pr() -> None:
+    """An escalated issue with no PR (e.g. escalated by a path that never
+    produced a PR) contributes itself with ``pr_number=None``.
+    """
+    state = {"prs": {}, "issues": {"123": {"status": "escalated"}}}
+    assert _collect_escalated_label_subjects(state) == [(None, 123)]
+
+
+def test_collect_escalated_label_subjects_dedupes_prefers_pr_derived_pair() -> None:
+    """When a PR and its linked issue are both escalated, the pair is
+    deduplicated by issue number and the PR-derived pair wins -- one entry,
+    not two, and it carries the PR number rather than ``None``.
+    """
+    state = {
+        "prs": {"456": {"status": "escalated", "issue_number": 123}},
+        "issues": {"123": {"status": "escalated"}},
+    }
+    assert _collect_escalated_label_subjects(state) == [(456, 123)]
+
+
+def test_collect_escalated_label_subjects_ignores_non_escalated_records() -> None:
+    """Non-escalated PRs and issues contribute nothing."""
+    state = {
+        "prs": {"456": {"status": "pr_open", "issue_number": 123}},
+        "issues": {"123": {"status": "queued"}},
+    }
+    assert _collect_escalated_label_subjects(state) == []
+
+
+def test_collect_escalated_label_subjects_skips_malformed_entries_without_raising() -> None:
+    """Non-dict values, non-numeric keys, and missing ``issue_number`` are all
+    skipped rather than raising -- state.json is hand-editable and the sweep
+    must degrade gracefully on a malformed entry instead of taking down the
+    whole repair pass (and, with it, every OTHER valid subject in the batch).
+    """
+    state = {
+        "prs": {
+            "456": "not-a-dict",
+            "abc": {"status": "escalated", "issue_number": 123},  # non-numeric key
+            "789": {"status": "escalated"},  # missing issue_number
+            "999": {"status": "escalated", "issue_number": 321},  # valid
+        },
+        "issues": {
+            "111": "not-a-dict",
+            "xyz": {"status": "escalated"},  # non-numeric key
+            "222": {"status": "escalated"},  # valid, no PR
+        },
+    }
+    assert _collect_escalated_label_subjects(state) == [(None, 222), (999, 321)]
 
 
 # --- record_review(): escalated guard ---

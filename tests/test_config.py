@@ -545,6 +545,95 @@ def test_load_config_event_ring_size_rejects_negative(tmp_path: Path) -> None:
         load_config(config_file)
 
 
+def test_runtime_config_escalated_label_repair_max_per_pass_default() -> None:
+    """Issue #1088: RuntimeConfig.escalated_label_repair_max_per_pass defaults to 10."""
+    assert RuntimeConfig().escalated_label_repair_max_per_pass == 10
+
+
+def test_load_config_escalated_label_repair_max_per_pass_override(tmp_path: Path) -> None:
+    """Issue #1088: runtime.escalated_label_repair_max_per_pass is configurable
+    from YAML."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  escalated_label_repair_max_per_pass: 25
+""",
+    )
+    config = load_config(config_file)
+    assert config.runtime.escalated_label_repair_max_per_pass == 25
+
+
+def test_load_config_escalated_label_repair_max_per_pass_rejects_non_int(
+    tmp_path: Path,
+) -> None:
+    """Issue #1088: escalated_label_repair_max_per_pass must be an int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  escalated_label_repair_max_per_pass: "lots"
+""",
+    )
+    with pytest.raises(ConfigError, match="escalated_label_repair_max_per_pass.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_escalated_label_repair_max_per_pass_rejects_bool(
+    tmp_path: Path,
+) -> None:
+    """Issue #1088: ``bool`` is a subclass of ``int`` in Python, so a bare
+    ``isinstance(x, int)`` check would silently accept ``true``/``false`` as
+    1/0. The parser explicitly rejects bool -- this pins that it keeps doing
+    so (event_ring_size's validator right above does NOT have this guard, so
+    this is a genuine behavioral difference between the two knobs, not
+    incidental).
+    """
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  escalated_label_repair_max_per_pass: true
+""",
+    )
+    with pytest.raises(ConfigError, match="escalated_label_repair_max_per_pass.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_escalated_label_repair_max_per_pass_rejects_negative(
+    tmp_path: Path,
+) -> None:
+    """Issue #1088: negative escalated_label_repair_max_per_pass is rejected."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  escalated_label_repair_max_per_pass: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="escalated_label_repair_max_per_pass.*must be >= 0"):
+        load_config(config_file)
+
+
+def test_load_config_escalated_label_repair_max_per_pass_accepts_zero(
+    tmp_path: Path,
+) -> None:
+    """Issue #1088: 0 means unlimited (matching graphql_rate_limit_threshold's
+    "0 disables the guard" convention), so it must be accepted, not rejected --
+    unlike event_ring_size, which rejects 0 for the opposite reason (see
+    test_load_config_event_ring_size_rejects_zero above).
+    """
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """runtime:
+  escalated_label_repair_max_per_pass: 0
+""",
+    )
+    config = load_config(config_file)
+    assert config.runtime.escalated_label_repair_max_per_pass == 0
+
+
 def test_runtime_config_gh_timeout_seconds_default() -> None:
     """RuntimeConfig.gh_timeout_seconds defaults to 120.0 seconds."""
     assert RuntimeConfig().gh_timeout_seconds == 120.0

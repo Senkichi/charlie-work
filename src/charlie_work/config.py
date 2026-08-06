@@ -1974,7 +1974,11 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             )
     event_ring_size = runtime_data.get("event_ring_size")
     if event_ring_size is not None:
-        if not isinstance(event_ring_size, int):
+        # bool is an int subclass, so a bare isinstance(..., int) accepts
+        # `event_ring_size: true` and silently uses it as 1 -- a two-entry ring
+        # that looks configured. Reject it explicitly, matching
+        # escalated_label_repair_max_per_pass below.
+        if not isinstance(event_ring_size, int) or isinstance(event_ring_size, bool):
             raise ConfigError(
                 "config section 'runtime' key 'event_ring_size' must be an int, "
                 f"got {type(event_ring_size).__name__}"

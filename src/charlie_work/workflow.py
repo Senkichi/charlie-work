@@ -10599,7 +10599,12 @@ class OrchestratorApp:
           instead; subjects are visited in issue order so progress is monotonic
           rather than re-rolling the same head of the list.
         """
-        empty: dict[str, Any] = {"issue_numbers": [], "failures": [], "deferred": 0}
+        empty: dict[str, Any] = {
+            "issue_numbers": [],
+            "failures": [],
+            "errored": [],
+            "deferred": 0,
+        }
         # --dry-run must not perform live GitHub label mutations or state.json
         # writes (review finding on PR #670).
         if self.dry_run:
@@ -10622,6 +10627,11 @@ class OrchestratorApp:
             subjects = subjects[:cap]
 
         outcomes: list[tuple[int, dict[str, Any] | None]] = []
+        # Subjects whose GitHub call raised. Tracked separately from `failures`
+        # (a transition() that returned non-APPLIED) because they are a different
+        # operational state: nothing was written for them, so they retry next
+        # pass. They MUST still be reported -- see the summary construction below.
+        errored: list[int] = []
         for pr_number, issue_number in subjects:
             # Re-evaluate per item, immediately before touching GitHub, rather
             # than trusting the batch read above. #586 did this for a reason: a
@@ -10655,6 +10665,7 @@ class OrchestratorApp:
                     issue_number,
                     exc_info=True,
                 )
+                errored.append(int(issue_number))
                 continue
             if result.outcome == TransitionOutcome.APPLIED:
                 outcomes.append((int(issue_number), None))
@@ -10670,7 +10681,15 @@ class OrchestratorApp:
                         },
                     )
                 )
-        if not outcomes:
+        # `errored` gates this too, not just `outcomes`. If every subject's
+        # GitHub call raised, `outcomes` is empty -- and returning `empty` here
+        # would hand back {"issue_numbers": [], "failures": [], "deferred": 0},
+        # byte-identical to "there was nothing to repair", while emitting no
+        # event at all. An operator could then not tell a healthy quiet fleet
+        # from N subjects failing on every single pass, and events.db (the audit
+        # trail) would show nothing either. The logger.warning above is real but
+        # log-only; the reported summary has to carry it as well.
+        if not outcomes and not errored:
             return {**empty, "deferred": deferred}
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -10683,7 +10702,13 @@ class OrchestratorApp:
                 }
             summary = {
                 "issue_numbers": [i for i, _ in outcomes],
+                # transition() ran and did not fully apply -- label_error IS
+                # written for these, so they are diagnosable from state.
                 "failures": [i for i, e in outcomes if e is not None],
+                # The GitHub call raised -- nothing was written, so these retry
+                # next pass and are invisible in state. This list is the only
+                # durable record that they were attempted at all.
+                "errored": errored,
                 "deferred": deferred,
             }
             state = append_event(
