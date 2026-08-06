@@ -801,10 +801,13 @@ def _merge_update_rework_branch(
 
             ``stage="pre_merge"`` — the merge never began (no ``MERGE_HEAD``),
             and the reason could not be remediated. This is NOT a content
-            conflict; the branch may merge perfectly cleanly. The one cause
-            this function does remediate is an untracked copy of a
-            base-tracked file left in a reused worktree by a previous
-            attempt's scaffolding, which is cleared and the merge retried once.
+            conflict; the branch may merge perfectly cleanly. Two causes are
+            remediated, both being the orchestrator's own scaffolding colliding
+            with the incoming tree in a reused worktree, and both repaired
+            before a single retry: an *untracked* copy of a base-tracked file
+            (removed), and a *locally modified tracked* file the merge would
+            overwrite (restored from ``HEAD``). Anything else — or any blocker
+            outside the declared scaffolding — is left untouched and escalated.
         RuntimeError: if the base ref cannot be fetched or the merge command
             itself cannot be run.
     """
@@ -854,17 +857,34 @@ def _merge_update_rework_branch(
         # `create_worktree` than this merge, so on a fresh worktree these files
         # do not exist yet, and on a reused one they are untracked copies of
         # paths the base now tracks. Clear only those and retry once.
-        blocking = _untracked_paths_shadowing_ref(worktree_path, merge_base_ref)
+        #
+        # Scaffolding blocks a merge in two distinct ways and git reports them
+        # with two different messages, so both sets are collected before
+        # deciding anything. Repairing only the untracked half leaves a worktree
+        # that is *also* holding a modified tracked copy still blocked, and the
+        # retry then fails for a reason the first repair could never have
+        # addressed.
+        untracked_blocking = _untracked_paths_shadowing_ref(worktree_path, merge_base_ref)
+        modified_blocking = _modified_paths_overwritten_by_ref(worktree_path, merge_base_ref)
+        blocking = untracked_blocking + modified_blocking
         undeclared = tuple(
             path
             for path in blocking
             if not _declared_scaffolding_matcher(injected_paths, materialize_dirs)(path)
         )
+        # The declared/undeclared verdict is taken over the *union*: a single
+        # undeclared blocker in either class means nothing is repaired at all,
+        # because a partial repair that still fails the merge would destroy
+        # files for no benefit.
         if (
             blocking
             and not undeclared
-            and _clear_declared_scaffolding_collisions(
-                worktree_path, blocking, injected_paths, materialize_dirs
+            and _repair_declared_scaffolding_blockers(
+                worktree_path,
+                untracked_blocking,
+                modified_blocking,
+                injected_paths,
+                materialize_dirs,
             )
         ):
             retry_result = run_captured(
@@ -1161,6 +1181,70 @@ def _untracked_paths_shadowing_ref(worktree_path: Path, ref: str) -> tuple[str, 
     return tuple(sorted(untracked_set & tracked_set))
 
 
+def _modified_paths_overwritten_by_ref(worktree_path: Path, ref: str) -> tuple[str, ...]:
+    """Worktree-relative tracked paths that are locally modified *and* that
+    merging ``ref`` would change.
+
+    The second half of the same refusal ``_untracked_paths_shadowing_ref``
+    covers. Git declines to start a merge that would clobber local work, and it
+    does not care whether that work is an untracked file shadowing the incoming
+    tree or a modification to a file already tracked here ("Your local changes
+    to the following files would be overwritten by merge"). Both produce case
+    (c) — no ``MERGE_HEAD``, empty ``--diff-filter=U``, ``merge --abort`` exit
+    128 — so handling only the untracked half leaves the other half escalating.
+
+    Live example this exists for: the devin shim rewrites ``.devin/prompts/*``
+    in the worktree, and job-cannon's ``15dacbb6`` *deleted* those paths from
+    the base. Merging then wants to remove a locally modified file, which git
+    refuses. Every branch forked before that commit hits it.
+
+    The incoming side is computed against the merge base, not against ``ref``
+    directly: a path the *branch* changed and the base did not is not something
+    the merge touches, so it cannot block one and must not be restored.
+
+    ``--diff-filter=M`` keeps this to paths present in both ``HEAD`` and the
+    worktree, which are exactly the ones ``git checkout HEAD --`` can restore.
+    A staged addition or a local deletion is deliberately left out rather than
+    handed to a command that would fail on it — dropping it from the blocking
+    set escalates with a diagnosis instead of attempting a repair that cannot
+    work.
+    """
+    base_result = run_captured(
+        ["git", "merge-base", "HEAD", ref],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not base_result.ok:
+        return ()
+    merge_base = base_result.stdout.strip()
+    if not merge_base:
+        return ()
+    dirty = run_captured(
+        [
+            "git",
+            "-c",
+            "core.quotePath=off",
+            "diff",
+            "--name-only",
+            "--diff-filter=M",
+            "-z",
+            "HEAD",
+        ],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    incoming = run_captured(
+        ["git", "-c", "core.quotePath=off", "diff", "--name-only", "-z", merge_base, ref],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not dirty.ok or not incoming.ok:
+        return ()
+    dirty_set = {p for p in dirty.stdout.split("\0") if p}
+    incoming_set = {p for p in incoming.stdout.split("\0") if p}
+    return tuple(sorted(dirty_set & incoming_set))
+
+
 def _clear_declared_scaffolding_collisions(
     worktree_path: Path,
     blocking_paths: tuple[str, ...],
@@ -1187,6 +1271,31 @@ def _clear_declared_scaffolding_collisions(
        link is a junction into the SHARED virtualenv on this host, so
        following it would corrupt every worktree at once.
     """
+    if not _eligible_for_scaffolding_repair(
+        worktree_path, blocking_paths, injected_paths, materialize_dirs
+    ):
+        return False
+    result = run_captured(
+        ["git", "clean", "-f", "-d", "--", *blocking_paths],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
+def _eligible_for_scaffolding_repair(
+    worktree_path: Path,
+    blocking_paths: tuple[str, ...],
+    injected_paths: tuple[str, ...],
+    materialize_dirs: tuple[str, ...],
+) -> bool:
+    """The safety gate every scaffolding repair must pass before touching disk.
+
+    Shared by the untracked-removal and modified-restore paths for the same
+    reason ``_declared_scaffolding_matcher`` is shared with the dirty check: two
+    copies of a rule that decides what may be destroyed are two chances for them
+    to drift into disagreeing, and only one of those outcomes is recoverable.
+    """
     if not blocking_paths:
         return False
     is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
@@ -1197,12 +1306,71 @@ def _clear_declared_scaffolding_collisions(
             return False
         if not contains(worktree_path, worktree_path / path):
             return False
+    return True
+
+
+def _restore_declared_scaffolding_modifications(
+    worktree_path: Path,
+    blocking_paths: tuple[str, ...],
+    injected_paths: tuple[str, ...],
+    materialize_dirs: tuple[str, ...],
+) -> bool:
+    """Discard local modifications to orchestrator scaffolding blocking a merge.
+
+    The tracked-file counterpart of ``_clear_declared_scaffolding_collisions``,
+    gated by the identical eligibility check. Discarding these edits loses
+    nothing: every path here is one the orchestrator itself wrote and
+    re-materializes unconditionally later in ``create_worktree``, which is the
+    same premise that lets ``_worker_authored_dirty`` ignore them when deciding
+    whether a worktree holds real work.
+
+    ``git checkout HEAD --`` rather than ``git checkout --``: the latter
+    restores from the index, so a *staged* scaffolding edit would survive and
+    the retried merge would be blocked by the same path a second time.
+    """
+    if not _eligible_for_scaffolding_repair(
+        worktree_path, blocking_paths, injected_paths, materialize_dirs
+    ):
+        return False
     result = run_captured(
-        ["git", "clean", "-f", "-d", "--", *blocking_paths],
+        ["git", "checkout", "HEAD", "--", *blocking_paths],
         cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     return result.ok
+
+
+def _repair_declared_scaffolding_blockers(
+    worktree_path: Path,
+    untracked_blocking: tuple[str, ...],
+    modified_blocking: tuple[str, ...],
+    injected_paths: tuple[str, ...],
+    materialize_dirs: tuple[str, ...],
+) -> bool:
+    """Repair both classes of scaffolding blocker; True only if all of them were.
+
+    Each class is skipped when empty rather than treated as a failure — a
+    worktree blocked by only one class is the common case, and requiring both to
+    be non-empty would refuse to repair either.
+
+    A False return does not promise nothing was written: if the removal succeeds
+    and the restore then fails, the removed files stay removed. That is
+    deliberate and harmless — every path eligible here is re-materialized
+    unconditionally later in ``create_worktree`` — whereas rolling a partial
+    repair back would mean re-creating files from content this function never
+    had.
+    """
+    if not untracked_blocking and not modified_blocking:
+        return False
+    if untracked_blocking and not _clear_declared_scaffolding_collisions(
+        worktree_path, untracked_blocking, injected_paths, materialize_dirs
+    ):
+        return False
+    if modified_blocking and not _restore_declared_scaffolding_modifications(
+        worktree_path, modified_blocking, injected_paths, materialize_dirs
+    ):
+        return False
+    return True
 
 
 def _worker_authored_dirty(
