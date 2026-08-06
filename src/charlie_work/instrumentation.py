@@ -173,6 +173,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
+        "ci_fleet_worktree_dirty": "warning",
         "cross_family_verdict_unparseable": "warning",
         "deescalation_cap_exhausted": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
@@ -197,7 +198,6 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
         "runner_capacity_starved": "warning",
-        "ci_fleet_worktree_dirty": "warning",
         "session_budget_exceeded": "warning",
         "session_exited": "warning",
         "session_rate_limit_deferred": "warning",
