@@ -29,21 +29,23 @@ Allowed files: ``layout.py`` and ``config.py`` (config.py legitimately holds
 path *defaults* for its dataclasses; a follow-up PR replaces several of them
 with sentinels that defer to layout.py).
 
-The well-known name set for Rule 1 is derived from ``layout`` itself -- every
-``*_FILENAME`` constant, plus the explicitly-enforced ``_ENFORCED_DIRNAMES``
-tuple -- rather than hand-copied here. A hand-maintained duplicate list is
-exactly the brittleness this whole refactor exists to remove.
+The well-known name set for Rule 1 is derived from ``layout`` itself -- the
+explicitly-enforced ``_ENFORCED_FILENAMES`` tuple, plus the explicitly-enforced
+``_ENFORCED_DIRNAMES`` tuple -- rather than hand-copied here. A hand-maintained
+duplicate list is exactly the brittleness this whole refactor exists to remove.
 
 Note what Rule 1 deliberately does *not* cover: the generic per-repo
 subdirectory names (``issues``, ``prs``, ``logs``, ``dispatches``,
-``reviews``, ``notify``). Those are already exposed as members on
-``paths.RuntimePaths``, so the correct fix at a site spelling ``root / "prs"``
-is to use ``paths.prs`` -- not to swap the literal for ``layout.PRS_DIRNAME``,
-which adds an indirection while preventing nothing. Flagging them here would
-force an allowlist for every legitimate composition, which is precisely the
-hand-maintained list this test is supposed to eliminate. ``layout`` decides
-which names are enforced (via ``_ENFORCED_DIRNAMES``); this test only reads
-that decision.
+``reviews``, ``notify``) and the generic fleet filename ``config.yaml``.
+Those are already exposed as members on ``paths.RuntimePaths`` (or, for
+``config.yaml``, are too generic to match safely by exact string), so the
+correct fix at a site spelling ``root / "prs"`` is to use ``paths.prs`` -- not
+to swap the literal for ``layout.PRS_DIRNAME``, which adds an indirection while
+preventing nothing. Flagging them here would force an allowlist for every
+legitimate composition, which is precisely the hand-maintained list this test
+is supposed to eliminate. ``layout`` decides which names are enforced (via
+``_ENFORCED_FILENAMES`` and ``_ENFORCED_DIRNAMES``); this test only reads that
+decision.
 """
 
 from __future__ import annotations
@@ -77,22 +79,18 @@ def _well_known_path_names() -> frozenset[str]:
 
     Two sources, both read from ``layout`` so nothing is hand-copied here:
 
-    * every attribute whose name ends in ``_FILENAME`` -- a bare filename has
-      no owning ``RuntimePaths`` member, so re-spelling one is always a
-      divergence hazard;
+    * ``layout._ENFORCED_FILENAMES`` -- the filenames ``layout`` itself
+      declares dangerous to re-spell. Deliberately narrower than the full
+      ``*_FILENAME`` set: ``config.yaml`` is too generic to enforce safely by
+      exact string membership;
     * ``layout._ENFORCED_DIRNAMES`` -- the directory names ``layout`` itself
       declares dangerous to re-spell (``worktrees`` is the one that cost 74
       uncollected worktrees in production).
 
-    Directory names *not* in that tuple are intentionally absent; see the
-    module docstring for why enforcing them would require an allowlist.
+    Names *not* in those tuples are intentionally absent; see the module
+    docstring for why enforcing them would require an allowlist.
     """
-    names: set[str] = set()
-    for attr_name in dir(layout):
-        if attr_name.endswith("_FILENAME"):
-            value = getattr(layout, attr_name)
-            if isinstance(value, str):
-                names.add(value)
+    names: set[str] = set(layout._ENFORCED_FILENAMES)
     names.update(layout._ENFORCED_DIRNAMES)
     return frozenset(names)
 
@@ -295,6 +293,20 @@ def test_well_known_path_names_is_derived_and_nonempty() -> None:
     assert layout.SUPERVISOR_LOCK_FILENAME in WELL_KNOWN_PATH_NAMES
     assert layout.WORKTREES_DIRNAME in WELL_KNOWN_PATH_NAMES
     assert ".var" in WELL_KNOWN_PATH_NAMES
+
+
+def test_generic_fleet_config_filename_is_not_rule1_enforced() -> None:
+    """The bare filename ``config.yaml`` is too generic for exact-match Rule 1.
+
+    ``layout.GLOBAL_CONFIG_FILENAME`` (``config.yaml``) names the fleet-wide
+    config layer under ``fleet_dir()``. Because Rule 1 matches by exact string
+    membership, any unrelated ``some_dir / "config.yaml"`` elsewhere in the
+    package would be flagged. The right fix at such a site is not to import
+    ``layout.GLOBAL_CONFIG_FILENAME`` — that would falsely assert fleet-global
+    identity for a different file — so Rule 1 must not enforce this name.
+    """
+    assert layout.GLOBAL_CONFIG_FILENAME == "config.yaml"
+    assert layout.GLOBAL_CONFIG_FILENAME not in WELL_KNOWN_PATH_NAMES
 
 
 def test_generic_runtimepaths_dirnames_are_not_enforced() -> None:

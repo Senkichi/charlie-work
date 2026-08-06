@@ -642,6 +642,58 @@ def _next_inconclusive_probe_deferred_count(
     return 0
 
 
+def is_worker_confirmed_dead(
+    view: WorkerView,
+    config: OrchestratorConfig,
+    now: datetime,
+    sessions_dir: Path,
+    *,
+    persist_inconclusive_probe_counter: bool = True,
+) -> bool:
+    """Return True only when a worker session is confirmed dead.
+
+    This is the single enforcement point for "a session is dead only after N
+    inconclusive probes" (issue #755).  It owns the Signal-1 inconclusive-probe
+    deferral counter: it computes, increments, and persists the counter on the
+    sidecar when the caller asks for it.
+
+    * A worker whose process is alive is not dead.
+    * A worker with no recorded PID and a launch error is terminal by construction
+      (issue #266); it is confirmed dead without a probe.
+    * A worker with no recorded PID and no launch error has no process to probe,
+      so it is also confirmed dead without a grace period.
+    * A worker with a PID that is not alive is corroborated via
+      ``classify_worker_health`` and ``max_inconclusive_probe_deferrals``.
+      An inconclusive real-activity probe defers the verdict up to the cap;
+      a fresh or conclusive probe vetoes it.
+    """
+    if view.is_alive():
+        return False
+
+    # No recorded process (or a launch-failure sidecar) is not a liveness-probe
+    # failure; there is nothing to defer.
+    if view.pid is None or view.pid <= 0:
+        update_worker_log_stat(sessions_dir, view)
+        return True
+
+    probe = real_activity_probe_for(view, config, now)
+    health = classify_worker_health(view, config, now, probe)
+
+    # Issue #343 Finding 2 + #426: persist the deferral counter for this worker.
+    # The loop may ask us not to double-write for error-free workers because the
+    # stall lane already advanced the counter in the same pass, but sidecars with
+    # an error string have no other writer so their counter must always persist.
+    if persist_inconclusive_probe_counter or view.error is not None:
+        new_deferred_count = _next_inconclusive_probe_deferred_count(view, probe, health)
+        update_worker_log_stat(
+            sessions_dir,
+            view,
+            inconclusive_probe_deferred_count=new_deferred_count,
+        )
+
+    return health is WorkerHealth.DEAD
+
+
 def classify_worker_health(
     view: WorkerView,
     config: OrchestratorConfig,
