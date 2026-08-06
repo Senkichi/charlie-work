@@ -41,7 +41,7 @@ jobs:
     # avoids firing on ordinary contention. Sibling: job-cannon PR #1443.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false
@@ -195,13 +195,13 @@ jobs:
     # the broader grant regardless.
     # Once ANY explicit permissions: key is set, GitHub treats every
     # unlisted scope as none for this job, so contents: read (needed by
-    # actions/checkout@v4) must stay listed alongside pull-requests: read,
+    # actions/checkout@v5) must stay listed alongside pull-requests: read,
     # not just the newly-added scope alone.
     permissions:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: false

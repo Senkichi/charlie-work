@@ -37,6 +37,7 @@ from charlie_work.config import (
     NotifyConfig,
     OrchestratorConfig,
     PostMortemConfig,
+    ReconcilePassConfig,
     ReviewConfig,
     ReviewDispatchConfig,
     RuntimeConfig,
@@ -3405,6 +3406,24 @@ class FakeGitHub:
         m = re.search(r"/pulls/(\d+)/comments", joined)
         if m and "/reviews/" not in joined:
             return self.pr_external_review_comments.get(int(m.group(1)), [])
+        # Handle paginated PR list REST API calls from reconcile.py.
+        if args[0] == "api" and "pulls?state=all" in args[1]:
+            url = args[1]
+            page_match = re.search(r"[?&]page=(\d+)", url)
+            page = int(page_match.group(1)) if page_match else 1
+            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
+            per_page = int(per_page_match.group(1)) if per_page_match else 100
+            start = (page - 1) * per_page
+            return self.prs[start : start + per_page]
+        # Handle paginated issue list REST API calls from reconcile.py.
+        if args[0] == "api" and "issues?state=all" in args[1]:
+            url = args[1]
+            page_match = re.search(r"[?&]page=(\d+)", url)
+            page = int(page_match.group(1)) if page_match else 1
+            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
+            per_page = int(per_page_match.group(1)) if per_page_match else 100
+            start = (page - 1) * per_page
+            return self.issues[start : start + per_page]
         # Handle other API calls (for reconcile tests)
         if json_output:
             return []
@@ -15893,8 +15912,8 @@ def test_reconcile_exit_nonzero_when_drift_found_and_not_fixed(tmp_path: Path) -
             # Handle dependency API calls
             if "dependencies" in " ".join(arguments):
                 return [] if json_output else ""
-            # pr list: one open PR linked to issue 123
-            if arguments[:2] == ["pr", "list"]:
+            # paginated PR list from reconcile._fetch_prs
+            if arguments[0] == "api" and "pulls?state=all" in arguments[1]:
                 return [
                     {
                         "number": 456,
@@ -15908,8 +15927,8 @@ def test_reconcile_exit_nonzero_when_drift_found_and_not_fixed(tmp_path: Path) -
                         "isCrossRepository": False,
                     }
                 ]
-            # issue list: issue 123 still has agent:in-progress (drift)
-            if arguments[:2] == ["issue", "list"]:
+            # paginated issue list from reconcile._fetch_issues
+            if arguments[0] == "api" and "issues?state=all" in arguments[1]:
                 return [
                     {
                         "number": 123,
@@ -15964,9 +15983,9 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
             # Handle dependency API calls
             if "dependencies" in " ".join(arguments):
                 return [] if json_output else ""
-            if arguments[:2] == ["pr", "list"]:
+            if arguments[0] == "api" and "pulls?state=all" in arguments[1]:
                 return [self._pr]
-            if arguments[:2] == ["issue", "list"]:
+            if arguments[0] == "api" and "issues?state=all" in arguments[1]:
                 return [self._issue]
             return []
 
@@ -16041,9 +16060,9 @@ def test_reconcile_removes_mergequeue_label_via_full_stack(tmp_path: Path) -> No
         def run(self, arguments, *, json_output=False, allow_failure=False):
             if "dependencies" in " ".join(arguments):
                 return [] if json_output else ""
-            if arguments[:2] == ["pr", "list"]:
+            if arguments[0] == "api" and "pulls?state=all" in arguments[1]:
                 return [self._pr]
-            if arguments[:2] == ["issue", "list"]:
+            if arguments[0] == "api" and "issues?state=all" in arguments[1]:
                 return []
             return []
 
@@ -16088,9 +16107,9 @@ def test_reconcile_partial_fix_failure_reports_remaining_drift(tmp_path: Path) -
             # Handle dependency API calls
             if "dependencies" in " ".join(arguments):
                 return [] if json_output else ""
-            if arguments[:2] == ["pr", "list"]:
+            if arguments[0] == "api" and "pulls?state=all" in arguments[1]:
                 return []
-            if arguments[:2] == ["issue", "list"]:
+            if arguments[0] == "api" and "issues?state=all" in arguments[1]:
                 return [self._issue]
             return []
 
@@ -28735,6 +28754,12 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        # This test intentionally leaves issues in rework_requested with only the
+        # needs-rework label. The in-loop reconcile pass would otherwise see open PRs
+        # with a stale active label and self-heal the status to open_passive before
+        # dispatch_rework can run (issue #762 paginated issue snapshots now expose the
+        # fixture to real reconcile drift detection).
+        reconcile_pass=ReconcilePassConfig(enabled=False),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -30754,7 +30779,14 @@ def _reconcile_pass_app(
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
-    return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())
+    if gh is None:
+        gh = FakeGitHub()
+        # Wiring tests for _maybe_reconcile_drift expect a clean repo. The
+        # default FakeGitHub carries a sample issue/PR that now resolve through
+        # the paginated REST snapshots and would produce unrelated drift.
+        gh.issues = []
+        gh.prs = []
+    return OrchestratorApp(tmp_path, paths, config, gh)
 
 
 def test_loop_forwards_shared_now_to_cadence_gated_lanes(
