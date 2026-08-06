@@ -1807,9 +1807,21 @@ def _write_allocation_event(state_file: Path, *, source: str, actuating_planner:
 
 
 def _journal_record(
-    pass_id: str, *, agreed: bool, changes: list[Any] | None = None
+    pass_id: str,
+    *,
+    agreed: bool,
+    changes: list[Any] | None = None,
+    shadow_changes: list[Any] | None = None,
 ) -> dict[str, Any]:
-    """One diff-journal record, matching ci_fleet.diff_journal's write shape."""
+    """One diff-journal record, matching ci_fleet.diff_journal's write shape.
+
+    By default the shadow plan mirrors the live plan's changes so an
+    ``agreed=True`` record is internally consistent. ``shadow_changes`` can be
+    set independently to simulate a planner disagreement about the kind of
+    change a pass emits.
+    """
+    live_changes = changes or []
+    shadow = shadow_changes if shadow_changes is not None else list(live_changes)
     return {
         "pass_id": pass_id,
         "inputs": {},
@@ -1817,14 +1829,14 @@ def _journal_record(
             "budget": 1,
             "budget_reason": "test",
             "targets": [],
-            "changes": changes or [],
+            "changes": live_changes,
             "notes": [],
         },
         "shadow_plan": {
             "budget": 1,
             "budget_reason": "test",
             "targets": [],
-            "changes": [],
+            "changes": shadow,
             "notes": [],
         },
         "agreed": agreed,
@@ -2093,3 +2105,124 @@ def test_main_runners_shadow_status_renders_pending_planner_and_note_ordering(
         "advisor-flagged regression this test pins"
     )
     assert "compared 1 time(s)" in out
+
+
+def test_run_runners_shadow_status_by_action_counts_individual_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Per-action streak/total counts individual changes, not passes.
+
+    A single pass can emit several start decisions; each one exercises the
+    provisioning path. The split must expose that granularity, not collapse it
+    to one per pass.
+    """
+    _repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    starts = [
+        {"repo": "x/y", "runner": "r-1", "action": "start", "reason": "test"},
+        {"repo": "x/z", "runner": "r-2", "action": "start", "reason": "test"},
+    ]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=True, changes=park),
+            _journal_record("p2", agreed=True, changes=park),
+            _journal_record("p3", agreed=True, changes=park),
+            _journal_record("p4", agreed=True, changes=starts),
+            _journal_record("p5", agreed=True, changes=starts),
+        ],
+    )
+
+    result = cli.run_runners_shadow_status(args)
+
+    assert result.data["change_agreement_streak"] == {"streak": 5, "total": 5}
+    by_action = result.data["change_agreement_streak_by_action"]
+    assert by_action["park"] == {"streak": 3, "total": 3}
+    assert by_action["start"] == {"streak": 4, "total": 4}
+
+
+def test_run_runners_shadow_status_by_action_trailing_streak_per_action(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each action's streak breaks when a change of that action disagrees.
+
+    The trailing suffix of changed passes that all agreed is still one suffix,
+    but a pass that does not contain a given action does not extend that
+    action's trailing count, even if the overall streak continues.
+    """
+    _repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    start = [{"repo": "x/y", "runner": "r-1", "action": "start", "reason": "test"}]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=True, changes=park),
+            _journal_record("p2", agreed=True, changes=start),
+            _journal_record("p3", agreed=False, changes=start),
+            _journal_record("p4", agreed=True, changes=park),
+            _journal_record("p5", agreed=True, changes=park),
+        ],
+    )
+
+    result = cli.run_runners_shadow_status(args)
+
+    by_action = result.data["change_agreement_streak_by_action"]
+    assert by_action["park"] == {"streak": 2, "total": 3}
+    assert by_action["start"] == {"streak": 0, "total": 2}
+
+
+def test_run_runners_shadow_status_by_action_skips_disputed_action_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A record where the planners disagree about the action is not bucketed.
+
+    The live planner says ``start`` for a runner, the shadow says ``park`` for
+    the same runner. That disagreement is the finding, so the record must not
+    be counted toward either action's total or streak.
+    """
+    _repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    live_start = [{"repo": "x/y", "runner": "r-1", "action": "start", "reason": "test"}]
+    shadow_park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=False, changes=live_start, shadow_changes=shadow_park),
+            _journal_record("p2", agreed=True, changes=park),
+        ],
+    )
+
+    result = cli.run_runners_shadow_status(args)
+
+    assert result.data["change_agreement_streak"] == {"streak": 1, "total": 2}
+    by_action = result.data["change_agreement_streak_by_action"]
+    assert by_action["start"] == {"streak": 0, "total": 0}
+    assert by_action["park"] == {"streak": 1, "total": 1}
+
+
+def test_main_runners_shadow_status_renders_action_split_and_zero_note(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI renders each action with its streak and a note when 0/0."""
+    repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    state_file = _allocation_state_file(repo_root)
+    _write_allocation_event(state_file, source="prologue", actuating_planner="new")
+    park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=True, changes=[]),
+            _journal_record("p2", agreed=True, changes=park),
+        ],
+    )
+
+    exit_code = cli.main(["--fleet-dir", str(fleet_directory), "runners", "shadow-status"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Agreement streak (passes with a real change)" in out
+    assert "park:" in out
+    assert "start:" in out
+    assert "0/0" in out
+    assert "provisioning path" in out
+    assert "never compared" in out
