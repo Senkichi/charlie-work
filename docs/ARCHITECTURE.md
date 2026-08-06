@@ -194,7 +194,10 @@ sorted keys. Schema version pinned by `state.STATE_VERSION = 1`.
     {"at": "2026-07-02T18:05:00Z", "kind": "review_packet", "payload": {"pr_number": 123, "issue_number": 565, "cross_family_ok": true, "cross_family_reused": false}},
     {"at": "2026-07-02T18:10:00Z", "kind": "record_review", "payload": {"pr_number": 123, "decision": "approved"}},
     {"at": "2026-07-02T18:11:00Z", "kind": "merge_ready", "payload": {"pr_number": 123, "can_merge": true, "merged": true}}
-    // capped at the most recent 200 entries (append_event trims older ones)
+    // capped at state.DEFAULT_EVENT_RING_SIZE (2000) entries, overridable via
+    // runtime.event_ring_size — append_event trims older ones. Every event is
+    // also dual-written to the unlimited events.db; the ring is a recent view,
+    // the database is the audit trail.
   ]
 }
 ```
@@ -350,6 +353,22 @@ incidents actually happened — not scattered as defensive checks:
   an existing `cross-family-review.md` only if its first line does **not**
   contain `(UNAVAILABLE)` — a failed run's stub must not be treated as a
   permanent success on the next pass.
+- **Cross-family regeneration cap, per head SHA.** `loop()`'s same-head
+  packet skip treats an unusable cross-family report (an `(UNAVAILABLE)`
+  stub, or one carrying no head-SHA marker) as staleness and forces
+  `review()` to regenerate it — but only up to
+  `cross_family.max_regen_attempts` (default `2`) times for that PR's
+  *current* head SHA; a new push resets the count, since a new head has
+  never been tried. Bounded because regeneration runs the cross-family
+  model synchronously for up to `cross_family.timeout_seconds`; unbounded,
+  a model that is simply down would burn that timeout on every pass and
+  starve the other repo in the shared sequential loop (#1078). Past the
+  cap the issue escalates to `agent:human-needed`
+  (`reason="cross_family_report_unusable"`, `reason_class="judgment"`)
+  instead of being retried forever. This deliberately does **not** share
+  `max_parse_failures`' terminal shape — that cap ends in a caveated
+  `approved`; this one never does, because approving against a head that
+  was never positively confirmed is exactly the fail-open #1079 closed.
 - **Per-PR isolation in `loop()`.** Each PR's `review()`/`merge_ready()` call
   is wrapped in its own `try/except GitHubError`; one PR's merge conflict or
   `gh` failure is recorded in `errors` and does not abort the rest of the
