@@ -3425,6 +3425,285 @@ def test_build_fleet_attention_digest_maps_review_verdict_events() -> None:
     assert by_health["ERROR"].issue_number == 11
 
 
+def _repair_payload(
+    issue_numbers: list[int] | None = None,
+    failures: list[int] | None = None,
+    errored: list[int] | None = None,
+    deferred: int = 0,
+) -> dict[str, Any]:
+    """Build a payload shaped like ``OrchestratorApp._repair_escalated_labels()``.
+
+    Mirrors the real return shape (``workflow.py``'s ``_repair_escalated_labels``):
+    ``issue_numbers`` is every subject whose ``transition()`` ran (successes and
+    failures both), ``failures`` is the subset that did not fully apply, ``errored``
+    is disjoint from both (nothing was written for those), and ``deferred`` is a
+    plain count. Kept realistic rather than minimal so these tests exercise the
+    same key combinations production actually emits.
+    """
+    return {
+        "issue_numbers": issue_numbers or [],
+        "failures": failures or [],
+        "errored": errored or [],
+        "deferred": deferred,
+    }
+
+
+def test_extract_attention_events_escalated_label_repair_errored() -> None:
+    """Issue #1088: a subject whose GitHub call raised must surface in the digest.
+
+    ``errored`` is the only durable record that an escalated-label repair was
+    attempted and failed to reach GitHub -- state.json gets nothing written for
+    it, so events.db and this digest are the sole places an operator could ever
+    learn about it. This also serves as the positive control for the
+    success/deferred/steady-state tests below: it proves the collector CAN
+    produce an event from this payload shape before those tests assert it does
+    not.
+    """
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[501, 502])},
+    )
+
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert len(repair_events) == 1
+    assert repair_events[0]["issue_number"] == 501
+    assert repair_events[0]["repo_key"] == "owner/repo"
+
+
+def test_extract_attention_events_escalated_label_repair_failures() -> None:
+    """Issue #1088: a subject whose transition() ran but did not fully apply.
+
+    ``failures`` (label add/remove partially rejected by GitHub) is a distinct
+    operational state from ``errored`` (nothing written) -- both are things a
+    human eventually has to look at, so both must produce an entry. ``errored``
+    is empty here to isolate that ``failures`` alone is sufficient.
+    """
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(issue_numbers=[601], failures=[601])},
+    )
+
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert len(repair_events) == 1
+    assert repair_events[0]["issue_number"] == 601
+
+
+def test_extract_attention_events_escalated_label_repair_mixed_prefers_errored_anchor() -> None:
+    """Issue #1088: with both `errored` and `failures` populated, `errored` anchors.
+
+    A single real pass can produce both: one subject's ``issue_view``/``transition()``
+    call raises (-> ``errored``) while a *different* subject's ``transition()``
+    completes but doesn't fully apply (-> ``failures``). Every other test in this
+    file exercises a payload where one of the two lists is empty, so the collector's
+    ``(errored or failures)[0]`` choice is never actually exercised elsewhere --
+    it degrades to "return the only non-empty list" and would pass just as well
+    under a reversed `(failures or errored)[0]`. This pins the real tie-break: the
+    unreachable subject (nothing durable in state.json, so this digest is its only
+    record) anchors the entry over the diagnosable one (already recorded via
+    `label_error` in state.json).
+    """
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {
+            "escalated_labels_repaired": _repair_payload(
+                issue_numbers=[602], failures=[602], errored=[501]
+            )
+        },
+    )
+
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert len(repair_events) == 1
+    assert repair_events[0]["issue_number"] == 501
+    assert "1 unreachable" in repair_events[0]["error"]
+    assert "1 not applied" in repair_events[0]["error"]
+
+
+def test_extract_attention_events_escalated_label_repair_success_silent() -> None:
+    """Issue #1088: a fully successful repair must NOT produce an attention event.
+
+    Deliberate, per the collector's docstring: a self-healed success is not
+    something needing attention, and it is already durable in events.db via
+    the ``escalated_label_repaired`` state event. Flooding the digest with a
+    healthy sweep's output would bury the ``errored``/``failures`` signal this
+    whole feature exists to surface.
+    """
+    # Positive control: the same call shape, but with `errored` populated,
+    # must produce an event -- otherwise the "no event" assertion below is
+    # equally consistent with a broken test harness as with correct behavior.
+    control_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[701])},
+    )
+    control_events = _extract_attention_events("owner/repo", control_result)
+    assert len([e for e in control_events if e["type"] == "escalated_label_repair_error"]) == 1
+
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(issue_numbers=[701])},
+    )
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert repair_events == []
+
+
+def test_extract_attention_events_escalated_label_repair_deferred_silent() -> None:
+    """Issue #1088: subjects held back by the per-pass cap must NOT produce an event.
+
+    ``deferred`` counts subjects beyond ``escalated_label_repair_max_per_pass``;
+    the sweep converges over subsequent passes by design, so this is normal
+    steady-state progress, not a fault worth an operator's attention.
+    """
+    # Positive control -- same shape, `errored` populated, must fire.
+    control_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[801])},
+    )
+    control_events = _extract_attention_events("owner/repo", control_result)
+    assert len([e for e in control_events if e["type"] == "escalated_label_repair_error"]) == 1
+
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(deferred=3)},
+    )
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert repair_events == []
+
+
+def test_extract_attention_events_escalated_label_repair_steady_state_silent() -> None:
+    """Issue #1088: the idle steady state (nothing to repair at all) is silent.
+
+    This is the ``empty`` sentinel ``_repair_escalated_labels`` returns when
+    there were no escalated subjects needing repair -- the common case on a
+    healthy fleet. It must not manufacture a digest entry every single pass.
+    """
+    # Positive control -- same shape, `errored` populated, must fire.
+    control_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[901])},
+    )
+    control_events = _extract_attention_events("owner/repo", control_result)
+    assert len([e for e in control_events if e["type"] == "escalated_label_repair_error"]) == 1
+
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload()},
+    )
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert repair_events == []
+
+
+def test_extract_attention_events_nested_escalated_label_repair() -> None:
+    """Issue #1088: the key nested under ``dispatch_reviews`` (as loop() nests it).
+
+    ``dispatch_reviews()``'s own CommandResult carries ``escalated_labels_repaired``
+    at its top level; ``loop()`` nests that whole dict under a ``dispatch_reviews``
+    key in its own result. Mirrors
+    ``test_extract_attention_events_nested_review_verdicts`` -- if only the
+    top-level form were checked, every deployed fleet pass (which goes through
+    ``loop()``) would never surface this event at all.
+    """
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "dispatch_reviews": {
+                "escalated_labels_repaired": _repair_payload(errored=[801]),
+            },
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert len(repair_events) == 1
+    assert repair_events[0]["issue_number"] == 801
+
+
+def test_build_fleet_attention_digest_maps_escalated_label_repair_error() -> None:
+    """Issue #1088: the event survives the full digest-rendering pipeline as ERROR.
+
+    This is the property that matters most: it is not enough for the collector
+    to emit the right dict, since ``_build_fleet_attention_digest`` has an
+    explicit branch per event type and a generic fallback for anything else.
+    Issue #590 made that fallback render (instead of silently dropping)
+    unbranched types, keyed off an ``_error``-suffixed type name mapping to
+    ``health="ERROR"``. This test pins that ``escalated_label_repair_error``
+    actually rides that fallback through to a real ``AttentionEntry`` end to
+    end, rather than trusting the type-name convention by inspection.
+    """
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[901])},
+    )
+    events = _extract_attention_events("owner/repo", result)
+
+    digest = _build_fleet_attention_digest(events)
+
+    repair_entries = [e for e in digest.transitions if e.issue_number == 901]
+    assert len(repair_entries) == 1
+    entry = repair_entries[0]
+    assert entry.health == "ERROR"
+    assert entry.adapter_kind == "owner/repo"
+    assert "901" in (entry.last_log_line or "")
+
+
+def test_extract_attention_events_escalated_label_repair_malformed_input() -> None:
+    """Issue #1088: malformed ``escalated_labels_repaired`` shapes must not raise.
+
+    This payload comes from a per-repo ``CommandResult.data`` that ultimately
+    traces back to another process's JSON. A shape drift there (e.g. a future
+    refactor that changes ``errored`` from a list to a dict, or the whole key
+    to a bool) must degrade to "no event" in the fleet digest builder, not
+    crash the whole attention-extraction pass for every other repo in the
+    fleet loop.
+    """
+    not_a_dict_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": "not-a-dict"},
+    )
+    events_not_dict = _extract_attention_events("owner/repo", not_a_dict_result)
+    assert [e for e in events_not_dict if e["type"] == "escalated_label_repair_error"] == []
+
+    errored_not_list_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {
+            "escalated_labels_repaired": {
+                "issue_numbers": [],
+                "failures": [],
+                "errored": "901",
+                "deferred": 0,
+            }
+        },
+    )
+    events_bad_errored = _extract_attention_events("owner/repo", errored_not_list_result)
+    assert [e for e in events_bad_errored if e["type"] == "escalated_label_repair_error"] == []
+
+
 # ---------------------------------------------------------------------------
 # api-worker fleet report (issue #483)
 # ---------------------------------------------------------------------------
