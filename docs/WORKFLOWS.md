@@ -194,8 +194,17 @@ charlie why-charlie-hate --pr 123 --no-cross-family   # force off
 
 A non-empty successful report is **reused** on repeated `review()`/`loop()`
 passes over the same PR (no repeat model spend) — but a failed run's
-`(UNAVAILABLE)` stub is never reused; it retries on the next call
-(see [ARCHITECTURE.md](ARCHITECTURE.md#invariants)).
+`(UNAVAILABLE)` stub (or one missing its head-SHA marker) is never reused.
+`loop()` forces regeneration instead, bounded by
+`cross_family.max_regen_attempts` (default `2`) attempts **per head SHA** —
+a new push resets the budget, since a new head has never been tried.
+Setting it to `0` disables forced regeneration entirely, so an unusable
+report escalates on the first pass instead of being retried. Past the
+budget the issue escalates to `agent:human-needed` rather than retrying
+forever (see [ARCHITECTURE.md](ARCHITECTURE.md#invariants) and
+[RUNBOOK.md](RUNBOOK.md#handling-agenthuman-needed-escalations)). Manually
+running `charlie why-charlie-hate --pr <n>` calls `review()` directly and
+is not subject to that budget — it always attempts regeneration.
 
 ## Fleet dispatch loop
 
