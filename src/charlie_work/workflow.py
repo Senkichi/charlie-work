@@ -6125,10 +6125,17 @@ def _open_salvage_pr(
     # commit log instead of injecting the gate's keywords -- a branch with no
     # commits still yields no summary, and still correctly fails.
     body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
+    # Pass the RESOLVED base branch, not the raw ``base_ref``. The orphaned-branch
+    # lane (``_open_pr_for_orphaned_branch``) sources ``base_ref`` straight from
+    # ``config.dispatch.base_ref``, whose default is ``""`` and which the live
+    # config leaves unset -- so production reaches here with the empty sentinel.
+    # ``require_valid_rev("")`` raises, ``summarize_branch_work`` returns "", and
+    # the body falls back to boilerplate that cannot pass the janitor gate: the
+    # exact defect this code exists to fix, on the lane that hits it most.
     summary = summarize_branch_work(
         repo_root,
         branch,
-        base_ref,
+        base_branch,
         test_path_globs=config.test_adequacy.test_path_globs,
     )
     if summary:
@@ -6517,13 +6524,13 @@ class OrchestratorApp:
         *,
         level: str | None = None,
     ) -> dict[str, Any]:
-        """Append an event to state.json and the unlimited events.jsonl log.
+        """Append an event to state.json and the unlimited events.db log.
 
         This is the single instrumentation entry point for OrchestratorApp
         methods. It wraps ``append_event`` with ``self.paths.state_file`` and
-        the repo name so every event is dual-written: once to the 200-entry
-        convenience cache in ``state.json`` and once to the append-only
-        ``events.jsonl`` audit log.
+        the repo name so every event is dual-written: once to the bounded
+        convenience cache in ``state.json`` (``EVENT_RING_SIZE``, default 2000)
+        and once to the append-only ``events.db`` audit log.
 
         ``level`` is forwarded to ``append_event`` so the emit site can declare
         the level explicitly instead of relying on the central registry.
