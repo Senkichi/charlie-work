@@ -25,8 +25,8 @@ tmp.write_text(...)        # or json.dump + handle.write("\n")
 tmp.replace(path)          # atomic rename
 ```
 This is implemented in `state.save_state`, `adapters._write_json`,
-`devin_shell._write_json`, and `claude_code`. Never use a plain `open(path, "w")` for
-any file that another process may read.
+`devin_shell._write_json`, and `claude_code._write_json_atomic`. Never use a plain
+`open(path, "w")` for any file that another process may read.
 
 ### State lives in GitHub labels + state.json — never in chat memory
 Issue workflow state (`queued`, `in-progress`, `pr-open`, …) is stored as GitHub
@@ -34,16 +34,20 @@ labels on the issue and mirrored to `.var/charlie-work/state.json`. It is never
 inferred from conversation history or process memory.
 
 ### Instrumentation: events.db (SQLite) + correlation IDs
-Every event written to `state.json`'s capped `events` array (200 entries) is
-also dual-written to an unlimited append-only SQLite database (`events.db`)
-next to `state.json`. Use `self._record_event()` in `OrchestratorApp` methods
-(it passes `state_path` automatically). In standalone functions, pass
-`state_path=state_file` to `append_event()`. For events outside state-lock
+Every event written to `state.json`'s capped `events` array (default 2000
+entries — `state.DEFAULT_EVENT_RING_SIZE`, overridable via the
+`runtime.event_ring_size` config knob, which rebinds `state.EVENT_RING_SIZE`
+at orchestrator startup) is also dual-written to an unlimited append-only
+SQLite database (`events.db`) next to `state.json`. Use `self._record_event()`
+in `OrchestratorApp` methods (it passes `state_path` automatically). In
+standalone functions, pass `state_path=state_file` to `append_event()` (which
+lives in `state.py`, not `instrumentation.py`). For events outside state-lock
 contexts (e.g. loop-level errors), call `log_event()` directly from
 `instrumentation.py`.
 
 The `events` table has indexed columns for `kind`, `ts`, `correlation_id`,
-`pr_number`, `issue_number`, and `level` (auto-classified info/warning/error).
+`pr_number`, and `issue_number`, plus an unindexed `level` column
+(auto-classified info/warning/error).
 Use `query_events()` for structured filtering or `event_counts_by_kind()` for
 quick aggregation summaries. A `loop_passes` table records per-pass metadata.
 
@@ -58,12 +62,14 @@ All label strings must be read from a `LabelConfig` instance (default fields in
 business logic — use `config.labels.queued`, `config.labels.in_progress`, etc.
 
 ### Runner slots move by start/park — never by re-registration
-**The implementation lives in `ci_fleet`, not here.** Since #869 (2026-08-01) every
-runner/fleet consumer in this repo resolves `run_allocation_pass`, `runner_slots`,
-and `runners` from `ci_fleet.charlie_work_adapter`. The identically-named modules
+**The implementation lives in `ci_fleet`, not here.** Since #869 (merged 2026-08-01)
+every runner/fleet consumer in this repo goes through `ci_fleet.charlie_work_adapter`,
+which re-exports the allocation, slot, and provisioning surface (`run_allocation_pass`
+from `ci_fleet.runner_allocation_pass`, plus the helpers it pulls from
+`ci_fleet.runner_slots` and `ci_fleet.runners`). The identically-named modules
 that used to shadow them under `src/charlie_work/` were a dormant island with no
-importer in `src/`, retained only as a rollback path; #921 deleted them once that
-window closed. A surviving reference to `charlie_work.runners` or
+importer in `src/`, retained only as a rollback path; issue #921 (PR #928) deleted
+them once that window closed. A surviving reference to `charlie_work.runners` or
 `charlie_work.runner_allocation` is therefore a stale name, not a second
 implementation — it will `ImportError`, not silently diverge.
 `tests/test_dormant_fleet_marking.py` still runs and is not vacuous: it derives the
@@ -90,7 +96,8 @@ adapter:
 - **Never traverse outside `managed_root` — and never assume `managed_root` is
   itself right.** `discover_runner_instances` walks exactly the configured root,
   non-recursively, and then enforces containment on each entry's *resolved* path
-  (`ci_fleet/runner_slots.py`, `contains()` → resolve both sides, then
+  (enforced at `ci_fleet/runner_slots.py` via `contains()`, implemented in
+  `ci_fleet/_vendor/safe_path.py` → resolve both sides, then equality or
   `is_relative_to`). That defeats a junction, which a non-recursive walk alone does
   not: a junction under `managed_root` hands back a tree somewhere else entirely.
   This host has an unrelated runner *service* at `C:\actions-runner` that must never
@@ -121,13 +128,17 @@ listeners run. Operator scripts and post-reboot procedures must delegate to it
 rather than starting every runner directly — a second controller silently undoes
 parking and burns a full `demand_idle_samples` hysteresis window reconverging.
 
-The `runner_allocation` **config section** (`config.RunnerAllocationConfig`, and the
-cross-section floor check against `runner_scaling` in `config.py`) stays in this repo
-regardless — `ci_fleet` reads that knob. It shared a name with the deleted module and
-was deliberately **not** part of #921. That deletion makes the trap sharper, not
-softer: the module is gone, so a later reader who greps `runner_allocation`, finds
-only this config section, and concludes it is the island's last remnant would
-silently disable allocation. It is live config, not residue.
+The `runner_allocation` **config section** stays in this repo regardless — `ci_fleet`
+reads that knob. The `RunnerAllocationConfig` *class* is no longer defined here: since
+the extraction, `config.py` re-exports it (and `RunnerScalingConfig`) from
+`ci_fleet.config` under a deliberate `noqa: F401`, guarded by
+`tests/test_ci_fleet_seams.py`. What is genuinely local is the section *parsing* and
+the cross-section floor check against `runner_scaling`. It shared a name with the
+deleted module and was deliberately **not** part of #921. That deletion makes the
+trap sharper, not softer: the module is gone, so a later reader who greps
+`runner_allocation`, finds only this config section, and concludes it is the
+island's last remnant would silently disable allocation. It is live config, not
+residue.
 
 ### `EXIT_RESTART_REQUESTED` is a cross-version wire contract — never change it
 `supervise_loop.EXIT_RESTART_REQUESTED` (3) is how the `fleet supervise-loop`

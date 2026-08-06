@@ -6524,13 +6524,13 @@ class OrchestratorApp:
         *,
         level: str | None = None,
     ) -> dict[str, Any]:
-        """Append an event to state.json and the unlimited events.jsonl log.
+        """Append an event to state.json and the unlimited events.db log.
 
         This is the single instrumentation entry point for OrchestratorApp
         methods. It wraps ``append_event`` with ``self.paths.state_file`` and
-        the repo name so every event is dual-written: once to the 200-entry
-        convenience cache in ``state.json`` and once to the append-only
-        ``events.jsonl`` audit log.
+        the repo name so every event is dual-written: once to the bounded
+        convenience cache in ``state.json`` (``EVENT_RING_SIZE``, default 2000)
+        and once to the append-only ``events.db`` audit log.
 
         ``level`` is forwarded to ``append_event`` so the emit site can declare
         the level explicitly instead of relying on the central registry.
