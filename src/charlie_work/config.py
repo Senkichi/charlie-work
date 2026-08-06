@@ -717,6 +717,14 @@ class RuntimeConfig:
     # a frozen value object with no mutable state.
     gh_max_retries: int = 3
     gh_retry_base_seconds: float = 1.0
+    # Wall-clock ceiling on a single `gh` invocation. Without it a hung gh
+    # process blocks the orchestrator loop pass forever: the pass never
+    # completes, the supervisor's staleness watchdog eventually kills the
+    # child, and every PR waiting on merge_ready stalls until a human
+    # intervenes (observed 2026-08-05, loop pass 0636dca635de). Retries do not
+    # help a call that never returns — only a timeout converts the hang into a
+    # failure the existing retry/next-pass machinery can absorb.
+    gh_timeout_seconds: float = 120.0
     # Pre-emptive GraphQL rate-limit guard. Before starting quota-heavy phases
     # (mop-up sweeps, merged-PR listings), GitHub.check_graphql_rate_limit()
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
@@ -1909,6 +1917,23 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'runtime' key 'gh_retry_base_seconds' must be a number, "
             f"got {type(gh_retry_base_seconds).__name__}"
         )
+    gh_timeout_seconds = runtime_data.get("gh_timeout_seconds")
+    if gh_timeout_seconds is not None:
+        if isinstance(gh_timeout_seconds, bool) or not isinstance(
+            gh_timeout_seconds, (int, float)
+        ):
+            raise ConfigError(
+                "config section 'runtime' key 'gh_timeout_seconds' must be a number, "
+                f"got {type(gh_timeout_seconds).__name__}"
+            )
+        # Rejected rather than silently coerced: 0/negative would mean "time out
+        # instantly", turning every gh call into a failure. There is no
+        # "disable" value on purpose — an unbounded gh call is the defect.
+        if gh_timeout_seconds <= 0:
+            raise ConfigError(
+                "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
+                f"got {gh_timeout_seconds}"
+            )
     graphql_rate_limit_threshold = runtime_data.get("graphql_rate_limit_threshold")
     if graphql_rate_limit_threshold is not None:
         if not isinstance(graphql_rate_limit_threshold, int):
