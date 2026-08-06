@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
@@ -583,6 +584,30 @@ def _escalation_flags(
     pr_escalated = pr_state.get("status") == "escalated"
     issue_escalated = issue_state is not None and issue_state.get("status") == "escalated"
     return pr_escalated, issue_escalated
+
+
+def _deescalation_skip(reason: str, issue_number: int) -> dict[str, Any]:
+    """Build the "this candidate was not acted on" outcome of the de-escalation sweep.
+
+    ``_deescalate_mechanical_issue`` used to signal every one of its
+    not-acted-on branches by returning ``None``, which
+    ``_maybe_deescalate_mechanical`` collapsed into a bare ``continue``. The
+    resulting ``deescalation_pass_completed`` event recorded a candidate count
+    and nothing else, so "48 candidates, 0 cleared" -- the steady state on the
+    job-cannon fleet for 274 consecutive passes -- was not diagnosable from
+    ``events.db`` at all and cost a full manual investigation to explain.
+
+    Naming the reason at the branch (rather than having the caller re-derive
+    it from a parallel table it maintains) is what keeps the histogram
+    honest: the caller counts whatever string arrives, so a skip branch added
+    later is reported without anyone remembering to register it.
+    ``tests/test_deescalation.py`` enforces the one way that can still go
+    wrong -- it asserts, over workflow.py's AST, that
+    ``_deescalate_mechanical_issue`` keeps its non-Optional return annotation
+    and contains no ``return None``, so a new branch cannot fall back into
+    the unattributed bucket this helper exists to eliminate.
+    """
+    return {"skipped": reason, "issue_number": issue_number}
 
 
 def _escalate_issue(
@@ -16472,7 +16497,7 @@ class OrchestratorApp:
                 run.created_at,
             )
 
-    def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any] | None:
+    def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
         """Re-evaluate one ``mechanical`` escalation and clear it if safe.
 
         Called only from ``_maybe_deescalate_mechanical`` for issues whose
@@ -16483,10 +16508,13 @@ class OrchestratorApp:
         ``charlie unescalate``, a re-escalation with a new reason, or a
         parallel loop lane already touched the entry).
 
-        Returns ``None`` when there is nothing to report: the entry no
-        longer qualifies, a worker is still live, no open PR is bound to the
-        issue, or the fresh mergeable/janitor check failed (stays
-        escalated -- this is the expected, common outcome). Returns
+        Always returns a dict, never ``None``. Returns
+        ``{"skipped": "<reason>", "issue_number": ...}`` when the issue was
+        left escalated -- the entry no longer qualifies, a worker is still
+        live, no open PR is bound to the issue, or the fresh
+        mergeable/janitor check failed (this is the expected, common
+        outcome; the reason string is what the caller histograms into
+        ``deescalation_pass_completed``, see ``_deescalation_skip``). Returns
         ``{"cap_exhausted": True, ...}`` the first time
         ``auto_deescalation_count`` has already reached
         ``config.deescalation.max_auto_deescalations``. Returns
@@ -16529,31 +16557,34 @@ class OrchestratorApp:
         A pre-PR dispatch failure (e.g. ``dispatch_failed_cap_exceeded`` --
         the launch never produced a PR at all) has no artifact AC3's
         "mergeable AND janitor_ok" can be checked against, so it is left
-        untouched here (return ``None``) rather than guessed at; a human
-        still recovers it via ``charlie unescalate --issue``.
+        untouched here (skip reason ``no_open_pr``) rather than guessed at; a
+        human still recovers it via ``charlie unescalate --issue``.
         """
         state = load_state_locked(self.paths.state_file)
         issue_key = str(issue_number)
         issue_entry = state.get("issues", {}).get(issue_key, {})
         if not isinstance(issue_entry, dict):
-            return None
+            return _deescalation_skip("invalid_issue_entry", issue_number)
         if issue_entry.get("status") not in ("escalated", "blocked"):
-            return None  # already resolved by something else since the snapshot
+            # already resolved by something else since the snapshot
+            return _deescalation_skip("not_escalated", issue_number)
         if issue_entry.get("reason_class") != "mechanical":
-            return None  # fail closed: judgment (or re-classified) since the snapshot
+            # fail closed: judgment (or re-classified) since the snapshot
+            return _deescalation_skip("not_mechanical", issue_number)
 
         max_auto = self.config.deescalation.max_auto_deescalations
         auto_count = int(issue_entry.get("auto_deescalation_count", 0) or 0)
         if auto_count >= max_auto:
             if issue_entry.get("deescalation_cap_notified_at"):
-                return None  # already reported once; do not re-notify every pass
+                # already reported once; do not re-notify every pass
+                return _deescalation_skip("cap_already_notified", issue_number)
             with state_lock(self.paths.state_file):
                 fresh_state = load_state(self.paths.state_file)
                 fresh_entry = fresh_state["issues"].get(issue_key, {})
                 if not isinstance(fresh_entry, dict) or fresh_entry.get(
                     "deescalation_cap_notified_at"
                 ):
-                    return None
+                    return _deescalation_skip("cap_notify_raced", issue_number)
                 fresh_state["issues"][issue_key] = {
                     **fresh_entry,
                     "number": issue_number,
@@ -16582,7 +16613,7 @@ class OrchestratorApp:
                 pr_number = int(key)
                 break
         if pr_number is None:
-            return None
+            return _deescalation_skip("no_open_pr", issue_number)
 
         from .worker import issue_worker_liveness
 
@@ -16590,7 +16621,8 @@ class OrchestratorApp:
             issue_number, issue_entry, self._layout.sessions_dir, self.config, datetime.now(UTC)
         )
         if liveness.live:
-            return None  # a live worker is using this issue; not stuck
+            # a live worker is using this issue; not stuck
+            return _deescalation_skip("worker_live", issue_number)
 
         pr = self.gh.pr_view(pr_number)
         pr_state_str = str(pr.get("state") or "").upper()
@@ -16637,11 +16669,24 @@ class OrchestratorApp:
                 # re-escalation with a different reason_class, etc.) -- do
                 # not act on stale intent.
                 save_state(self.paths.state_file, fresh_state)
-                return None
+                return _deescalation_skip("changed_concurrently", issue_number)
 
-            if not (pr_state_str == "OPEN" and mergeable != "CONFLICTING" and janitor_verdict.ok):
+            # Split from a single composite condition purely so each blocking
+            # reason is attributable in the histogram -- the three checks below
+            # are the same test, in the same order, with the same outcome. The
+            # only ``skipped`` reason that means "the sweep works but the PR is
+            # not ready" is ``janitor_blocked``; ``pr_not_open`` and
+            # ``pr_conflicting`` mean the escalation should never have been a
+            # sweep candidate at all.
+            if pr_state_str != "OPEN":
                 save_state(self.paths.state_file, fresh_state)
-                return None
+                return _deescalation_skip("pr_not_open", issue_number)
+            if mergeable == "CONFLICTING":
+                save_state(self.paths.state_file, fresh_state)
+                return _deescalation_skip("pr_conflicting", issue_number)
+            if not janitor_verdict.ok:
+                save_state(self.paths.state_file, fresh_state)
+                return _deescalation_skip("janitor_blocked", issue_number)
 
             cleared_condition = fresh_issue_entry.get("escalation_reason")
             cleared_auto_count = auto_count + 1
@@ -16849,6 +16894,7 @@ class OrchestratorApp:
         cleared: list[dict[str, Any]] = []
         cap_exhausted: list[int] = []
         errors: list[dict[str, Any]] = []
+        skipped: Counter[str] = Counter()
         for issue_number in candidates:
             try:
                 outcome = self._deescalate_mechanical_issue(issue_number)
@@ -16857,12 +16903,16 @@ class OrchestratorApp:
                     {"issue_number": issue_number, "error": f"{type(exc).__name__}: {exc}"}
                 )
                 continue
-            if outcome is None:
-                continue
             if outcome.get("cap_exhausted"):
                 cap_exhausted.append(issue_number)
             elif outcome.get("cleared"):
                 cleared.append(outcome)
+            else:
+                # ``unknown`` is unreachable via ``_deescalation_skip`` (which
+                # always sets a reason); it exists so a future outcome shape
+                # that is neither cleared nor cap-exhausted still lands in the
+                # histogram as a countable bucket instead of vanishing.
+                skipped[str(outcome.get("skipped") or "unknown")] += 1
 
         with state_lock(state_file):
             state = load_state(state_file)
@@ -16874,6 +16924,15 @@ class OrchestratorApp:
                     "candidates": len(candidates),
                     "cleared": cleared,
                     "cap_exhausted": cap_exhausted,
+                    # Attribution for the difference between ``candidates`` and
+                    # everything else in this payload. Before issue #1090 that
+                    # difference was silent: a sweep that considered 29 issues
+                    # and cleared none emitted the same event as a sweep with
+                    # no candidates at all, so "the sweep is inert" and "the
+                    # sweep ran and every PR was legitimately blocked" were
+                    # indistinguishable from events.db alone. Sorted for a
+                    # stable diff across passes.
+                    "skipped": dict(sorted(skipped.items())),
                     "errors": errors,
                 },
             )
