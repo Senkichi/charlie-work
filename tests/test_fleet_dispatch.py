@@ -21,6 +21,7 @@ from charlie_work.config import (
 )
 from charlie_work.fleet_dispatch import (
     ApiWorkerFleetReport,
+    FleetLocalSnapshot,
     _build_fleet_attention_digest,
     _emit_fleet_transition,
     _extract_attention_events,
@@ -3971,6 +3972,40 @@ def test_take_fleet_snapshot_detects_delta_with_devin_sessions_dir_override(
     after = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
 
     assert _has_fleet_delta(before, after) is True
+
+
+def test_take_fleet_snapshot_skips_repo_with_malformed_config(
+    tmp_path: Path,
+) -> None:
+    """A repo with an unparseable per-repo config does not crash _take_fleet_snapshot.
+
+    Regression for the review of issue #707: _take_fleet_snapshot's new
+    load_layered_config call caught only ConfigError and OSError, so a
+    malformed orchestrator.config.yaml (which raises yaml.YAMLError) crashed
+    the fleet supervisor at startup.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=None)
+
+    # Plant a malformed YAML file that yaml.safe_load cannot parse.
+    (repo / "orchestrator.config.yaml").write_text(
+        "devin:\n  sessions_dir: [unclosed\n",
+        encoding="utf-8",
+    )
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    result = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    assert isinstance(result, FleetLocalSnapshot)
 
 
 # --------------------------------------------------------------------------

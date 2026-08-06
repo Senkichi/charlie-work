@@ -1757,7 +1757,7 @@ def _take_fleet_snapshot(
                     Path(explicit_cfg) if explicit_cfg else None,
                     fleet_dir_override=fleet_dir_override,
                 )
-            except (ConfigError, OSError):
+            except Exception:  # noqa: BLE001 - match count_fleet_live_sessions containment
                 config = None
         sessions_dir, prs_dir = _repo_state_dirs(repo_root, state_dir, config)
         repo_snapshots.add((repo_key, take_snapshot(sessions_dir, prs_dir)))

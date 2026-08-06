@@ -155,16 +155,19 @@ def count_fleet_live_sessions(
 
     Reads the fleet registry, iterates over each registered repo, resolves its
     sessions_dir, and counts live workers using the adapter-agnostic iter_workers
-    from worker.py. Tolerates vanished/moved repo dirs by skipping them and
-    returning a list of skipped repo keys for operator visibility.
+    from worker.py. Tolerates per-repo problems by skipping them and returning a
+    list of skipped repo keys for operator visibility.
 
     Args:
         fleet_dir_override: Optional override for the fleet directory path.
 
     Returns:
         A tuple of (total_live_count, skipped_repos) where skipped_repos is a
-        list of name_with_owner keys whose repo_root no longer exists or is not
-        a git worktree.
+        list of name_with_owner keys for any of:
+        - repo_root missing or not a git worktree,
+        - state_dir missing,
+        - config load failure (missing/unreadable/malformed/invalid), or
+        - resolved sessions_dir missing.
     """
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
