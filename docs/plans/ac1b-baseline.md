@@ -19,7 +19,9 @@ VIRTUAL_ENV= PYTHONPATH="$PWD/src" uv run --no-sync python \
 - **Code SHA:** `8d28a83fc60bbb3ac0ee17f176ce58dcaac36931` (`fix: preserve
   per-worktree skip reasons in the worktrees_reclaimed event (#1012)`)
 - **F1 / F5 landings:**
-  - F1 = `35c072d` (PR #766), landed 2026-07-31T02:29:42Z
+  - F1 = `35c072d` (PR #766), merged 2026-07-31T02:29:42Z and deployed at
+    approximately `2026-07-31T02:06:00Z` (the pre/post split used in
+    `docs/plans/rework-findings-channel.md` section 13).
   - F5 = `9b1f637` (PR #768), refined by `395aab1` and `bbcc132`.
   All three are confirmed ancestors of the pinned SHA.
 - **Corpus:** `C:\Users\senki\repos\charlie-work\.var\charlie-work\prs`
@@ -34,8 +36,10 @@ VIRTUAL_ENV= PYTHONPATH="$PWD/src" uv run --no-sync python \
 | real_reviewer_prose | 14 | 14 | 8 |
 | **TOTAL** | **19** | **19** | **10** |
 
-The `proj. post-F1 AC-1b` column from the pre-F1 report has been replaced: the
-re-run uses the real post-F1 renderer, so there is no projection left to show.
+The real post-F1 renderer is in use, so the script suppresses the diagnostic
+`proj. post-F1 AC-1b` column on post-F1 runs: there is no projection left to
+show in the post-Fix report. (The pre-F1 baseline below retains the projection
+for comparison.)
 
 ## The aggregate is not an "after" number
 
@@ -44,17 +48,21 @@ post-fix result. F1 changed what gets captured at verdict *generation* time;
 re-rendering a pre-F1 record through the post-F1 renderer cannot add referents
 that were never captured.
 
-Splitting on each verdict's own `reviewed_at` field against F1's landing time
-(`2026-07-31T02:29:42Z`):
+Splitting on each verdict's own `reviewed_at` field against F1's deploy time
+(`2026-07-31T02:06:00Z`):
 
 | Period | Count | AC-1b (actionable) | Actionable % |
 |---|---|---:|---:|
-| pre-F1 (`reviewed_at < 2026-07-31T02:29:42Z`) | 11 | 3 | 27% |
-| post-F1 (`reviewed_at >= 2026-07-31T02:29:42Z`) | 8 | 7 | 88% |
+| pre-F1 (`reviewed_at < 2026-07-31T02:06:00Z`) | 11 | 3 | 27% |
+| post-F1 (`reviewed_at >= 2026-07-31T02:06:00Z`) | 8 | 7 | 88% |
 
-All 8 post-F1 verdicts have `carried_forward_from=False`, so none of them
-carry a post-F1 `reviewed_at` over pre-F1 content. F1's real effect on the
-records it could influence is therefore **27% -> 88%**.
+No verdict's `reviewed_at` falls between F1's deploy (`02:06:00Z`) and merge
+(`02:29:42Z`), so re-deriving the split at the deploy timestamp gives the same
+11/8 split and the same **27% -> 88%** headline as the merge timestamp.
+
+All 8 post-F1 verdicts have `carried_forward_from=[]`, so none of them carry a
+post-F1 `reviewed_at` over pre-F1 content. F1's real effect on the records it
+could influence is therefore **27% -> 88%**.
 
 ## Cross-family post-fix actionability is unmeasured, not zero
 
@@ -63,8 +71,8 @@ collapse as the FALSE GREEN that AC-1b exists to discriminate. That is the
 category the work targeted. Both cross-family verdicts in this corpus are
 pre-F1:
 
-- `pr-695` — `reviewed_at` 2026-07-31T01:08:02Z (~81 min before F1)
-- `pr-724` — `reviewed_at` 2026-07-30T05:20:18Z (~21 h before F1)
+- `pr-695` — `reviewed_at` 2026-07-31T01:08:02Z (~58 min before F1 deployed)
+- `pr-724` — `reviewed_at` 2026-07-30T05:20:18Z (~21 h before F1 deployed)
 
 **There is no post-F1 cross-family verdict in the corpus at all.** The `0/2`
 in the table above is therefore a pre-F1 artifact, not a post-fix result.

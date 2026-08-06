@@ -24,6 +24,7 @@ Covers two real bugs found running the harness against the live corpus
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -31,6 +32,8 @@ from types import ModuleType
 import pytest
 
 from charlie_work import cross_family
+from charlie_work.config import OrchestratorConfig, RuntimeConfig
+from charlie_work.paths import RuntimePaths
 
 
 def _load_ac1b_script() -> ModuleType:
@@ -162,3 +165,157 @@ def test_mixed_builtin_and_real_referent_keeps_only_the_real_one(ac1b: ModuleTyp
     assert ("code_symbol", "print(") not in referents
     assert ("file_path", "tests/test_worker.py") in referents
     assert ac1b.is_actionable(text) is True
+
+
+# --------------------------------------------------------------------------
+# Review feedback on PR #1076:
+# - The baseline doc must use F1's deploy time as the pre/post split.
+# - carried_forward_from is a list of head SHAs, never a boolean.
+# - The script must not keep emitting a 'proj. post-F1 AC-1b' column on
+#   post-F1 runs while the doc claims there is 'no projection left to show'.
+# --------------------------------------------------------------------------
+
+
+def test_renderer_has_f1_summary_fallback_true(ac1b: ModuleType) -> None:
+    """The real renderer in this checkout has F1's summary fallback, so the
+    diagnostic projection is suppressed.
+    """
+    assert ac1b._renderer_has_f1_summary_fallback() is True
+
+
+def test_project_f1_rendering_fences_summary_when_required_changes_empty(
+    ac1b: ModuleType,
+) -> None:
+    """The pre-F1 stand-in fences the reviewer summary when the structured
+    list is empty, producing a scoreable body with concrete referents.
+    """
+    decision = {
+        "decision": "request_changes",
+        "required_changes": [],
+        "summary": "Fix `foo()` in src/bar.py:10.",
+    }
+    rendered = ac1b.project_f1_rendering(decision)
+    assert rendered.startswith("## Required changes (fallback: reviewer summary)")
+    body = ac1b.extract_scoreable_body(rendered)
+    referents = ac1b.find_concrete_referents(body)
+    assert any(kind == "file_path" and "src/bar.py" in value for kind, value in referents)
+    assert any(kind == "code_symbol" and "foo" in value for kind, value in referents)
+
+
+def _make_fake_repo(tmp_path: Path) -> Path:
+    prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-1"
+    prs_dir.mkdir(parents=True)
+    (prs_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "summary": "See src/charlie_work/workflow.py:1 for details.",
+                "required_changes": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return prs_dir.parent
+
+
+def _fake_runtime_paths(root: Path, state_dir: str) -> RuntimePaths:
+    resolved = root / state_dir
+    return RuntimePaths(
+        root=resolved,
+        issues=resolved / "issues",
+        prs=resolved / "prs",
+        dispatches=resolved / "dispatches",
+        logs=resolved / "logs",
+        state_file=resolved / "state.json",
+        worktrees=resolved / "worktrees",
+        cross_family=resolved / "cross_family",
+    )
+
+
+def _fake_repo_root(path: Path, *, explicit: bool) -> Path:  # noqa: ARG001
+    return path
+
+
+def _fake_config(_path: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(runtime=RuntimeConfig(state_dir=".var/charlie-work"))
+
+
+def _fake_code_sha() -> str:
+    return "1234567890abcdef1234567890abcdef12345678"
+
+
+def test_main_omits_projection_column_on_post_f1(
+    ac1b: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """On a post-F1 checkout, the script detects the real F1 renderer and
+    omits the diagnostic 'proj. post-F1 AC-1b' column. The review found this
+    column was still being printed despite the baseline claiming there was
+    'no projection left to show'.
+    """
+    _make_fake_repo(tmp_path)
+    monkeypatch.setattr(ac1b, "find_repo_root", _fake_repo_root)
+    monkeypatch.setattr(ac1b, "load_layered_config", _fake_config)
+    monkeypatch.setattr(ac1b, "resolve_code_sha", _fake_code_sha)
+    monkeypatch.setattr(ac1b, "runtime_paths", _fake_runtime_paths)
+    monkeypatch.setattr(sys, "argv", ["ac1b_findings_actionability", "--repo", str(tmp_path)])
+
+    rc = ac1b.main()
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "proj. post-F1 AC-1b" not in out
+    assert "proj_AC1b" not in out
+    assert "AC-1b (actionable)" in out
+    assert "suppressed (real F1 renderer in use)" in out
+
+
+def test_main_shows_projection_column_on_pre_f1(
+    ac1b: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """On a pre-F1 checkout, the script keeps the diagnostic projection
+    column so the pre/post comparison is still visible.
+    """
+    _make_fake_repo(tmp_path)
+    real_renderer = ac1b._render_required_changes_section
+
+    def _pre_f1_renderer(decision: dict[str, object] | None) -> str:
+        # Pre-F1: only render when required_changes is non-empty.
+        if not isinstance(decision, dict):
+            return ""
+        changes = decision.get("required_changes")
+        if isinstance(changes, list) and changes:
+            return real_renderer(decision)
+        return ""
+
+    monkeypatch.setattr(ac1b, "_render_required_changes_section", _pre_f1_renderer)
+    monkeypatch.setattr(ac1b, "find_repo_root", _fake_repo_root)
+    monkeypatch.setattr(ac1b, "load_layered_config", _fake_config)
+    monkeypatch.setattr(ac1b, "resolve_code_sha", _fake_code_sha)
+    monkeypatch.setattr(ac1b, "runtime_paths", _fake_runtime_paths)
+    monkeypatch.setattr(sys, "argv", ["ac1b_findings_actionability", "--repo", str(tmp_path)])
+
+    rc = ac1b.main()
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "proj. post-F1 AC-1b" in out
+    assert "shown (pre-F1 renderer; local stand-in)" in out
+
+
+def test_ac1b_baseline_markdown_split_and_schema() -> None:
+    """The baseline doc must use F1's deploy time as the pre/post split, not
+    the merge/land time, and must not mis-state ``carried_forward_from`` as a
+    boolean.
+    """
+    baseline_path = Path(__file__).parent.parent / "docs" / "plans" / "ac1b-baseline.md"
+    text = baseline_path.read_text(encoding="utf-8")
+    pre_f1_section, _, _ = text.partition("## Pre-F1 baseline")
+
+    assert "2026-07-31T02:06" in pre_f1_section
+    assert "reviewed_at < 2026-07-31T02:29:42Z" not in text
+    assert "carried_forward_from=False" not in text
+    assert "carried_forward_from=[]" in text
