@@ -137,6 +137,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # error-level kinds: conditions that ended a lane or lost work
         # -----------------------------------------------------------------
         "cross_family_verdict_abandoned": "error",
+        # The head-SHA guard could not adjudicate, so the verdict is never
+        # recorded and nothing regenerates the report: the PR stalls in
+        # "reviewing" until a human intervenes. Ended a lane -> error.
+        "cross_family_verdict_head_indeterminate": "error",
         "dispatch_blocked_chain_dead": "error",
         "dispatch_failed": "error",
         "fleet_pass_config_error": "error",
