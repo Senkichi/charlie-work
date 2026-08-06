@@ -2893,6 +2893,34 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
 _SALVAGE_LOG_LIMIT = 20
 
 
+def _resolve_salvage_branch_ref(repo_root: Path, safe_branch: str) -> str | None:
+    """Return a ref for ``safe_branch`` that actually resolves in ``repo_root``.
+
+    Tries the local branch first, then the ``origin``-tracking ref, and
+    returns ``None`` if neither exists -- there is no evidence to report, and
+    fabricating a range against a name git has never heard of is exactly the
+    failure ``summarize_branch_work`` exists to avoid.
+    """
+    local = run_captured(
+        ["git", "rev-parse", "--verify", "--quiet", f"{safe_branch}^{{commit}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if local.ok:
+        return safe_branch
+
+    remote_candidate = f"origin/{safe_branch}"
+    remote = run_captured(
+        ["git", "rev-parse", "--verify", "--quiet", f"{remote_candidate}^{{commit}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if remote.ok:
+        return remote_candidate
+
+    return None
+
+
 def summarize_branch_work(
     repo_root: Path,
     branch: str,
@@ -2942,14 +2970,29 @@ def summarize_branch_work(
     except ValueError:
         return ""
 
+    # ``require_valid_ref_name`` checks NAME FORMAT only -- it never asks git
+    # whether ``safe_branch`` actually resolves in ``repo_root``. The
+    # orphaned-branch salvage lane (``_open_pr_for_orphaned_branch``) triggers
+    # on evidence that creates no local ref at all -- a durable
+    # ``reported_push`` record or an ``ahead_count`` from ``git ls-remote`` --
+    # so ``branch`` routinely exists only as ``refs/remotes/origin/<branch>``.
+    # Passing that bare name straight into the ranges below makes ``git log``
+    # exit 128 and the whole summary come back "", falling through to the
+    # boilerplate body this function exists to replace -- the same defect,
+    # reached through the other operand. Resolve to whichever ref actually
+    # exists before building the ranges, so both use the same resolved value.
+    resolved_branch = _resolve_salvage_branch_ref(repo_root, safe_branch)
+    if resolved_branch is None:
+        return ""
+
     # Two dots for log, three for diff -- deliberately different operators.
     # ``git log A...B`` is the SYMMETRIC difference and would list commits made
     # on the base branch since it forked, attributing unrelated work to this
     # worker. ``A..B`` is "on B, not on A". ``git diff A...B`` conversely means
     # "changes B introduced since the merge-base", which is the one that
     # ignores base-branch drift.
-    log_range = f"{safe_base}..{safe_branch}"
-    diff_range = f"{safe_base}...{safe_branch}"
+    log_range = f"{safe_base}..{resolved_branch}"
+    diff_range = f"{safe_base}...{resolved_branch}"
 
     log = run_captured(
         ["git", "log", "--no-merges", "--format=%s", log_range],
@@ -2966,12 +3009,21 @@ def summarize_branch_work(
         cwd=repo_root,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
-    changed = (
-        [line.strip() for line in names.stdout.splitlines() if line.strip()] if names.ok else []
+    # ``None`` means "the diff never produced an answer", which is NOT the same
+    # as "the diff produced an empty answer". Collapsing the two lets a failed
+    # ``git diff`` render as "changed no test files (0 file(s) changed in
+    # total)" -- a factual claim manufactured from a command that failed, which
+    # is precisely the fabricated evidence this function's contract forbids.
+    # ``git log`` and ``git diff`` genuinely diverge here: on a branch with no
+    # merge base the log succeeds and the diff exits 128.
+    changed: list[str] | None = (
+        [line.strip() for line in names.stdout.splitlines() if line.strip()] if names.ok else None
     )
-    test_files = [
-        name for name in changed if any(fnmatch.fnmatch(name, glob) for glob in test_path_globs)
-    ]
+    test_files = (
+        [name for name in changed if any(fnmatch.fnmatch(name, glob) for glob in test_path_globs)]
+        if changed is not None
+        else []
+    )
 
     if not subjects:
         # The commit log IS the worker's rationale. With no commits there is
@@ -2987,7 +3039,18 @@ def summarize_branch_work(
         lines += f"\n- ... and {len(subjects) - len(shown)} more commit(s)"
     sections = [f"## Worker's commit log\n\n{lines}"]
 
-    if test_files:
+    if changed is None:
+        # Report the absence of evidence as an absence, not as a zero. This
+        # deliberately does NOT change whether the gate passes: the ``## Tests``
+        # heading already satisfies the regex on its own, which the contract
+        # above accepts on purpose for any branch that has commits. The defect
+        # being fixed is the false factual claim, not the gate outcome.
+        sections.append(
+            "## Tests\n\nThe set of changed files could not be determined "
+            "(`git diff` failed), so this PR asserts nothing about which files "
+            "it touched. `test_adequacy` gates that separately."
+        )
+    elif test_files:
         listed = "\n".join(f"- `{name}`" for name in test_files)
         sections.append(
             f"## Tests\n\nThe branch changed {len(test_files)} test file(s):\n\n{listed}"

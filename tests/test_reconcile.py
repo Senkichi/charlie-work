@@ -1418,6 +1418,76 @@ def test_detect_drift_provider_throttle_detected_with_repo_root(tmp_path: Path) 
     assert throttle_drift[0].throttle_adapter_kind == "devin"
 
 
+def test_detect_drift_defers_dead_session_on_inconclusive_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #755: detect_drift must not reap a not-alive worker on the first
+    inconclusive probe; it must respect ``max_inconclusive_probe_deferrals``.
+    """
+    from charlie_work.config import WatchdogConfig
+    from charlie_work.devin_shell import SessionRecord, _sidecar_path as devin_sidecar_path
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=1),
+    )
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("Session log\n", encoding="utf-8")
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 42)
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=99999,  # Dead PID
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    def _inconclusive_probe(*_args: object, **_kwargs: object) -> RealActivityProbe:
+        return RealActivityProbe(
+            sources=(
+                ActivitySource(
+                    name="sessions.db",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error="no session found matching working_directory",
+                ),
+                ActivitySource(
+                    name="devin_per_pid_log",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error="no per-PID log found",
+                ),
+            )
+        )
+
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: False)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
+
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # Sidecar must still be present and the deferral counter advanced.
+    assert sidecar_path.exists(), "detect_drift should defer, not reap, on an inconclusive probe"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar.get("inconclusive_probe_deferred_count") == 1
+
+    # No drift item should propose a reap/relabel/throttle for this session yet.
+    assert not any(d.issue_number == 42 for d in drift)
+    assert gh.labels_added == []
+    assert gh.labels_removed == []
+
+
 def test_apply_fixes_provider_throttle_sets_throttled_until() -> None:
     """Test that apply_fixes correctly sets throttled_until for provider throttle drift."""
     from datetime import UTC, datetime, timedelta

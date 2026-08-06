@@ -18,6 +18,7 @@ import pytest
 from charlie_work.config import OrchestratorConfig, SupervisorConfig
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import resolved_layout
+from charlie_work import layout
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.supervise import (
     SelfDeployResult,
@@ -1132,10 +1133,35 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
         ["git", "diff", "--name-only", "abc123..def456"],
     ]
 
-    marker_path = _pending_sync_marker_path(tmp_path)
+    marker_path = _pending_sync_marker_path(layout.default_state_root(tmp_path))
     assert marker_path.exists()
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     assert marker == {"from_sha": "abc123", "to_sha": "def456"}
+
+
+def test_self_deploy_honors_state_root_override(tmp_path: Path, monkeypatch: Any) -> None:
+    """Issue #720: a configured state_root moves the pending-sync marker out of default."""
+    custom_state_root = tmp_path / ".var" / "devin-orchestrator"
+
+    def _fake_count(_fleet_dir_override: str | None) -> tuple[int, list[str]]:
+        return 1, []
+
+    monkeypatch.setattr("charlie_work.fleet_registry.count_fleet_live_sessions", _fake_count)
+
+    runner, _ = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "", ""),  # pull ok
+            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
+            RunResult(0, "", ""),  # uv sync (not reached)
+        ]
+    )
+
+    result = self_deploy(tmp_path, state_root=custom_state_root, run_command=runner)
+    assert result.deferred is True
+    assert _pending_sync_marker_path(custom_state_root).exists()
+    assert not _pending_sync_marker_path(layout.default_state_root(tmp_path)).exists()
 
 
 def test_self_deploy_proceeds_when_zero_fleet_runners(
@@ -1162,7 +1188,7 @@ def test_self_deploy_proceeds_when_zero_fleet_runners(
     assert result.to_sha == "def456"
     assert "updated and synced" in result.message
     assert calls[-1][0] == ["uv", "sync"]
-    assert not _pending_sync_marker_path(tmp_path).exists()
+    assert not _pending_sync_marker_path(layout.default_state_root(tmp_path)).exists()
 
 
 def test_self_deploy_retries_sync_after_deferral(
@@ -1196,7 +1222,7 @@ def test_self_deploy_retries_sync_after_deferral(
     assert first.synced is False
     assert first.message == "sync deferred: 2 runners active"
 
-    marker_path = _pending_sync_marker_path(tmp_path)
+    marker_path = _pending_sync_marker_path(layout.default_state_root(tmp_path))
     assert marker_path.exists()
 
     # Pass N+1: no new commits, runners now idle -> sync from marker and clear it.
@@ -1244,7 +1270,7 @@ def test_self_deploy_loud_warning_on_repeated_deferral(
     )
 
     # Create marker from a previous deferral.
-    marker_path = _pending_sync_marker_path(tmp_path)
+    marker_path = _pending_sync_marker_path(layout.default_state_root(tmp_path))
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     marker_path.write_text(
         json.dumps({"from_sha": "abc123", "to_sha": "def456"}), encoding="utf-8"
@@ -1621,7 +1647,7 @@ def test_self_deploy_streak_survives_a_real_deferral_end_to_end(
     assert result1.ok is False
     assert result1.deferred is False
     assert json.loads(counter_path.read_text(encoding="utf-8"))["consecutive_failures"] == 1
-    assert _pending_sync_marker_path(tmp_path).exists()
+    assert _pending_sync_marker_path(layout.default_state_root(tmp_path)).exists()
 
     # Pass 2: no new commits, marker still pending, 0 runners -> retries sync, fails again.
     runner2, _ = _make_fake_runner(

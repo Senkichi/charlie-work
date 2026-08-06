@@ -251,6 +251,159 @@ def test_the_reader_distinguishes_absent_from_unknown(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The injected provenance anchor — the seam that says which tree is running
+# ---------------------------------------------------------------------------
+
+
+def test_importing_charlie_work_installs_the_provenance_anchor() -> None:
+    """Weak form: an anchor is registered, and it is charlie-work's."""
+    import charlie_work.instrumentation  # noqa: F401  (registers the seam)
+
+    from charlie_work.ci_fleet_anchor import declared_ci_fleet_root
+    from ci_fleet.provenance import get_provenance_anchor
+
+    assert get_provenance_anchor() is declared_ci_fleet_root
+
+
+def test_the_installed_anchor_agrees_with_the_live_import_root() -> None:
+    """Strong form: in this venv the check actually returns ``ok``.
+
+    A registered anchor proves a callable was handed over, not that it names
+    the right directory. Under ``no_anchor`` the fleet keeps actuating and
+    merely accumulates a streak, so an anchor that pointed somewhere wrong
+    would look installed and report nothing useful until it started refusing
+    passes for the wrong reason.
+    """
+    import charlie_work.instrumentation  # noqa: F401
+
+    from charlie_work.ci_fleet_anchor import declared_ci_fleet_root
+    from ci_fleet.provenance import check_provenance
+
+    verdict = check_provenance()
+
+    # Unconditional: whatever the layout, the installed anchor must never
+    # disagree with the tree that is actually loaded. This is the assertion
+    # that would catch a wrong declaration.
+    assert verdict.status != "mismatch", verdict.detail
+    assert not verdict.blocks_actuation, verdict.detail
+
+    # Conditional on the declaration resolving at all, which it does from the
+    # real checkout and from CI (which checks ci_runners out as a sibling), but
+    # not from a worktree under .claude/worktrees/.
+    if declared_ci_fleet_root() is not None:
+        assert verdict.status == "ok", verdict.detail
+
+
+def test_a_wrong_declaration_is_reported_as_mismatch(tmp_path: Path) -> None:
+    """Control. Without this, the ``ok`` above could be vacuous.
+
+    ``check_provenance`` reports ``no_anchor`` for anything it cannot
+    evaluate, and ``no_anchor`` does not block. So a check that had quietly
+    become incapable of ever saying ``mismatch`` would still let the test
+    above pass. Drive a deliberately wrong declaration through the same
+    function and require it to disagree.
+    """
+    from ci_fleet.provenance import check_provenance
+
+    verdict = check_provenance(anchor=lambda: tmp_path)
+
+    assert verdict.status == "mismatch", verdict.detail
+    assert verdict.blocks_actuation
+
+
+def test_the_anchor_reads_the_declaration_not_the_install_artifacts() -> None:
+    """The anchor's whole value is that it has an independent origin.
+
+    ``direct_url.json`` and ``_editable_impl_ci_fleet.pth`` are both written by
+    the same ``uv pip install -e`` run, so an install repointed at another tree
+    carries both and neither can contradict it. ``pyproject.toml`` is the
+    install's *input*, lives in this repo, and no ``.pth`` can move it — which
+    is the only reason the comparison is a check rather than a tautology.
+
+    This recomputes the expected root straight from the TOML and requires the
+    anchor to match, so rewiring the anchor to read an install artifact fails
+    here rather than silently turning the guard into a no-op.
+    """
+    import tomllib
+
+    from charlie_work.ci_fleet_anchor import declared_ci_fleet_root, repo_root
+
+    root = repo_root()
+    with (root / "pyproject.toml").open("rb") as handle:
+        declared = tomllib.load(handle)["tool"]["uv"]["sources"]["ci-fleet"]["path"]
+
+    expected = (root / declared / "src").resolve()
+    # Not asserted unconditionally: this suite also runs from worktrees, where
+    # the relative declaration resolves to a directory that does not exist and
+    # the anchor correctly abstains. See the abstention test below.
+    assert declared_ci_fleet_root() == (expected if expected.is_dir() else None)
+
+
+def test_an_unresolvable_declaration_abstains_instead_of_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one that keeps this guard from becoming an outage.
+
+    ``../ci_runners`` is relative, so from a worktree under
+    ``.claude/worktrees/`` it names a sibling of the *worktree* — a directory
+    that does not exist. If the anchor returned that path anyway, the verdict
+    would be ``mismatch``, ``blocks_actuation`` would be true, and the fleet
+    would refuse to actuate from every worktree in the repo. This repo runs
+    twenty of them.
+
+    Abstaining is also the honest answer: from a worktree we genuinely cannot
+    tell where ci_fleet ought to load from.
+    """
+    import charlie_work.ci_fleet_anchor as anchor_mod
+
+    from ci_fleet.provenance import check_provenance
+
+    fake_repo = tmp_path / "worktrees" / "agent-something"
+    fake_repo.mkdir(parents=True)
+    (fake_repo / "pyproject.toml").write_text(
+        '[tool.uv.sources]\nci-fleet = { path = "../ci_runners", editable = true }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(anchor_mod, "repo_root", lambda: fake_repo)
+
+    assert not (fake_repo.parent / "ci_runners").exists(), "control: the sibling must be absent"
+    assert anchor_mod.declared_ci_fleet_root() is None
+
+    verdict = check_provenance(anchor=anchor_mod.declared_ci_fleet_root)
+    assert verdict.status == "no_anchor", verdict.detail
+    assert not verdict.blocks_actuation, "an unresolvable declaration must never block the fleet"
+
+
+def test_a_resolvable_declaration_is_still_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control for the abstention: existing-but-wrong must still be caught.
+
+    The ``is_dir()`` guard above could have been written so broadly that it
+    swallowed real disagreements too. A repointed install still resolves to a
+    directory that exists, so it must still come back ``mismatch``.
+    """
+    import charlie_work.ci_fleet_anchor as anchor_mod
+
+    from ci_fleet.provenance import check_provenance
+
+    fake_repo = tmp_path / "charlie-work"
+    fake_repo.mkdir()
+    (tmp_path / "ci_runners" / "src").mkdir(parents=True)  # exists, but is not the live tree
+    (fake_repo / "pyproject.toml").write_text(
+        '[tool.uv.sources]\nci-fleet = { path = "../ci_runners", editable = true }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(anchor_mod, "repo_root", lambda: fake_repo)
+
+    assert anchor_mod.declared_ci_fleet_root() == (tmp_path / "ci_runners" / "src").resolve()
+
+    verdict = check_provenance(anchor=anchor_mod.declared_ci_fleet_root)
+    assert verdict.status == "mismatch", verdict.detail
+    assert verdict.blocks_actuation
+
+
+# ---------------------------------------------------------------------------
 # The adapter surface
 # ---------------------------------------------------------------------------
 
