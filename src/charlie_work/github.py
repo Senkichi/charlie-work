@@ -49,6 +49,11 @@ _LIST_LIMIT = 500
 # configurable via orchestrator.config.yaml.
 _DEFAULT_GH_MAX_RETRIES = 3
 _DEFAULT_GH_RETRY_BASE_SECONDS = 1.0
+_DEFAULT_GH_TIMEOUT_SECONDS = 120.0
+# Conventional exit status for "killed by timeout" (GNU coreutils `timeout`).
+# A TimeoutExpired carries no returncode of its own, and callers that branch on
+# returncode must not see a 0 that reads as success.
+_TIMEOUT_RETURNCODE = 124
 _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD = 1500
 
 # Bound on concurrent `gh` subprocesses spawned by are_issues_open() for a
@@ -271,6 +276,11 @@ class GitHub:
             return self.runtime.gh_retry_base_seconds
         return _DEFAULT_GH_RETRY_BASE_SECONDS
 
+    def _timeout_seconds(self) -> float:
+        if self.runtime is not None:
+            return self.runtime.gh_timeout_seconds
+        return _DEFAULT_GH_TIMEOUT_SECONDS
+
     def __post_init__(self) -> None:
         # Cache expensive list results within a single orchestrator pass to
         # avoid repeated GraphQL calls. NOT valid across passes: long-running
@@ -323,6 +333,7 @@ class GitHub:
         is_mutating = _is_mutating(args)
         max_retries = self._max_retries()
         base_delay = self._retry_base_seconds()
+        timeout_seconds = self._timeout_seconds()
         last_result: subprocess.CompletedProcess[str] | None = None
 
         for attempt in range(max_retries + 1):
@@ -335,6 +346,7 @@ class GitHub:
                     errors="replace",
                     capture_output=True,
                     check=False,
+                    timeout=timeout_seconds,
                     **no_console_window_kwargs(),
                 )
             except FileNotFoundError as exc:
@@ -348,6 +360,47 @@ class GitHub:
                         error="GitHub CLI `gh` is not installed or not on PATH.",
                     )
                 raise GitHubError("GitHub CLI `gh` is not installed or not on PATH.") from exc
+            except subprocess.TimeoutExpired as exc:
+                timeout_error = (
+                    f"gh command timed out after {timeout_seconds:g}s: {' '.join(command)}"
+                )
+                # A timeout is not evidence about whether GitHub received the
+                # request. Reads are idempotent, so they may retry. A mutation
+                # that timed out may already have been applied server-side, so
+                # retrying it risks double-merging, double-labelling, or a
+                # duplicate comment. That is the same rule _should_retry()
+                # applies to mutations, reached through a different signal —
+                # checked explicitly here rather than by calling _should_retry(),
+                # which classifies stderr from a process that actually returned
+                # and has no string to classify for a call that never did.
+                if is_mutating or attempt >= max_retries:
+                    if not allow_failure:
+                        raise GitHubError(timeout_error) from exc
+                    return GitHubRunResult(
+                        ok=False,
+                        returncode=_TIMEOUT_RETURNCODE,
+                        # Partial output captured before the kill. Coerced
+                        # rather than trusted: TimeoutExpired.stdout is bytes
+                        # when the child was not opened in text mode, and this
+                        # error path must not raise on the way out.
+                        stdout=exc.stdout if isinstance(exc.stdout, str) else "",
+                        stderr=timeout_error,
+                        value=None,
+                        error=timeout_error,
+                    )
+                delay = base_delay * (2**attempt)
+                jitter = random.uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
+                sleep_seconds = max(0.0, delay + jitter)
+                logger.warning(
+                    "gh command timed out after %gs (attempt %d/%d): %s; retrying in %.2fs",
+                    timeout_seconds,
+                    attempt + 1,
+                    max_retries + 1,
+                    " ".join(command),
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+                continue
 
             last_result = result
             output = result.stdout.strip()
@@ -1172,10 +1225,19 @@ class GitHub:
                     errors="replace",
                     capture_output=True,
                     check=False,
+                    timeout=self._timeout_seconds(),
                     **no_console_window_kwargs(),
                 )
             except FileNotFoundError as exc:
                 raise ConfigError("GitHub CLI `gh` is not installed or not on PATH") from exc
+            except subprocess.TimeoutExpired as exc:
+                # No retry here: this probe runs once at startup to validate
+                # field lists, and a hang means the environment cannot answer
+                # the question at all. Surfacing it as ConfigError matches the
+                # other failure modes of this loop rather than hanging boot.
+                raise ConfigError(
+                    f"gh timed out validating field list {name} after {self._timeout_seconds():g}s"
+                ) from exc
 
             if result.returncode == 0:
                 raise ConfigError(
