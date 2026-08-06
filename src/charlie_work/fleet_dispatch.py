@@ -1846,6 +1846,7 @@ def run_fleet_supervise(
     if max_runtime_override is not None:
         overrides["max_runtime_minutes"] = max_runtime_override
     cfg = replace(global_config.supervisor, **overrides)
+    state_root = runtime_paths(orchestrator_root(), global_config.runtime.state_dir).root
 
     lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     lock = try_acquire_supervisor_lock(lock_path)
@@ -1976,6 +1977,7 @@ def run_fleet_supervise(
             # diverged or dirty tree.
             deploy = self_deploy(
                 orchestrator_root(),
+                state_root=state_root,
                 fleet_dir_override=fleet_dir_override,
                 dry_run=dry_run,
                 failure_alarm_threshold=cfg.self_deploy_failure_alarm,
