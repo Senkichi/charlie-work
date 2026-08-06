@@ -23,24 +23,18 @@ Covers two real bugs found running the harness against the live corpus
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from _script_loader import load_script_module
 from charlie_work import cross_family
 
 
 def _load_ac1b_script() -> ModuleType:
     path = Path(__file__).parent.parent / "scripts" / "ac1b_findings_actionability.py"
-    spec = importlib.util.spec_from_file_location("ac1b_findings_actionability", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["ac1b_findings_actionability"] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_script_module(path, "ac1b_findings_actionability")
 
 
 @pytest.fixture(scope="module")

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
 import json
-import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+from _script_loader import load_script_module
 from charlie_work.config import (
     ApiBudgetConfig,
     AutoMergeConfig,
@@ -904,10 +903,7 @@ def test_fake_github_payloads_align_with_field_constants() -> None:
     # Check the main FakeGitHub in test_charlie_work.py
     # Import dynamically to avoid module import issues
     test_charlie_work_path = Path(__file__).parent / "test_charlie_work.py"
-    spec = importlib.util.spec_from_file_location("test_charlie_work", test_charlie_work_path)
-    test_charlie_work = importlib.util.module_from_spec(spec)
-    sys.modules["test_charlie_work"] = test_charlie_work
-    spec.loader.exec_module(test_charlie_work)
+    test_charlie_work = load_script_module(test_charlie_work_path, "test_charlie_work")
 
     MainFakeGitHub = test_charlie_work.FakeGitHub
     fake_gh = MainFakeGitHub()
@@ -930,10 +926,7 @@ def test_fake_github_payloads_align_with_field_constants() -> None:
 
     # Check the FakeGitHub in test_reconcile.py
     test_reconcile_path = Path(__file__).parent / "test_reconcile.py"
-    spec = importlib.util.spec_from_file_location("test_reconcile", test_reconcile_path)
-    test_reconcile = importlib.util.module_from_spec(spec)
-    sys.modules["test_reconcile"] = test_reconcile
-    spec.loader.exec_module(test_reconcile)
+    test_reconcile = load_script_module(test_reconcile_path, "test_reconcile")
 
     _pr = test_reconcile._pr
     _issue = test_reconcile._issue
