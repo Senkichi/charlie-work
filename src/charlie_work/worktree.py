@@ -27,6 +27,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import OrchestratorConfig, WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
+from . import git_pull_blockers
 from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .janitor import _calculate_patch_id
 from . import layout
@@ -1151,98 +1152,45 @@ def _declared_scaffolding_matcher(
     return _is_declared
 
 
+def _worktree_git_runner(worktree_path: Path) -> git_pull_blockers.GitRunner:
+    """Bind :mod:`git_pull_blockers`' runner seam to this worktree."""
+
+    def run_git(argv: list[str]) -> RunResult:
+        return run_captured(argv, cwd=worktree_path, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
+
+    return run_git
+
+
 def _untracked_paths_shadowing_ref(worktree_path: Path, ref: str) -> tuple[str, ...]:
     """Worktree-relative untracked paths that ``ref`` also tracks.
 
-    These are exactly the files ``git merge`` refuses to overwrite ("The
-    following untracked working tree files would be overwritten by merge").
-    Computed from git's own data — the untracked set intersected with the
-    target ref's tree — rather than by parsing that error text, which is
-    localized and has been reworded across git versions.
-
-    ``--exclude-standard`` is deliberate: ignored files are silently
-    overwritten by merge, so they never block one and must not be swept up
-    into a deletion set.
+    Refusal class (a) — see :mod:`charlie_work.git_pull_blockers`, which owns
+    the implementation so the orchestrator's own self-deploy asks the same
+    question the same way.
     """
-    others = run_captured(
-        ["git", "-c", "core.quotePath=off", "ls-files", "--others", "--exclude-standard", "-z"],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    return git_pull_blockers.untracked_paths_shadowing_ref(
+        _worktree_git_runner(worktree_path), ref
     )
-    tracked = run_captured(
-        ["git", "-c", "core.quotePath=off", "ls-tree", "-r", "--name-only", "-z", ref],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not others.ok or not tracked.ok:
-        return ()
-    untracked_set = {p for p in others.stdout.split("\0") if p}
-    tracked_set = {p for p in tracked.stdout.split("\0") if p}
-    return tuple(sorted(untracked_set & tracked_set))
 
 
 def _modified_paths_overwritten_by_ref(worktree_path: Path, ref: str) -> tuple[str, ...]:
     """Worktree-relative tracked paths that are locally modified *and* that
     merging ``ref`` would change.
 
-    The second half of the same refusal ``_untracked_paths_shadowing_ref``
-    covers. Git declines to start a merge that would clobber local work, and it
-    does not care whether that work is an untracked file shadowing the incoming
-    tree or a modification to a file already tracked here ("Your local changes
-    to the following files would be overwritten by merge"). Both produce case
-    (c) — no ``MERGE_HEAD``, empty ``--diff-filter=U``, ``merge --abort`` exit
-    128 — so handling only the untracked half leaves the other half escalating.
+    Refusal class (b) — the other half of the same refusal
+    ``_untracked_paths_shadowing_ref`` covers, and the reason handling only the
+    untracked half left the rest escalating. Implementation and the full
+    rationale (merge-base basis, ``--diff-filter=M``) live in
+    :mod:`charlie_work.git_pull_blockers`.
 
     Live example this exists for: the devin shim rewrites ``.devin/prompts/*``
     in the worktree, and job-cannon's ``15dacbb6`` *deleted* those paths from
     the base. Merging then wants to remove a locally modified file, which git
     refuses. Every branch forked before that commit hits it.
-
-    The incoming side is computed against the merge base, not against ``ref``
-    directly: a path the *branch* changed and the base did not is not something
-    the merge touches, so it cannot block one and must not be restored.
-
-    ``--diff-filter=M`` keeps this to paths present in both ``HEAD`` and the
-    worktree, which are exactly the ones ``git checkout HEAD --`` can restore.
-    A staged addition or a local deletion is deliberately left out rather than
-    handed to a command that would fail on it — dropping it from the blocking
-    set escalates with a diagnosis instead of attempting a repair that cannot
-    work.
     """
-    base_result = run_captured(
-        ["git", "merge-base", "HEAD", ref],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    return git_pull_blockers.modified_paths_overwritten_by_ref(
+        _worktree_git_runner(worktree_path), ref
     )
-    if not base_result.ok:
-        return ()
-    merge_base = base_result.stdout.strip()
-    if not merge_base:
-        return ()
-    dirty = run_captured(
-        [
-            "git",
-            "-c",
-            "core.quotePath=off",
-            "diff",
-            "--name-only",
-            "--diff-filter=M",
-            "-z",
-            "HEAD",
-        ],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    incoming = run_captured(
-        ["git", "-c", "core.quotePath=off", "diff", "--name-only", "-z", merge_base, ref],
-        cwd=worktree_path,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if not dirty.ok or not incoming.ok:
-        return ()
-    dirty_set = {p for p in dirty.stdout.split("\0") if p}
-    incoming_set = {p for p in incoming.stdout.split("\0") if p}
-    return tuple(sorted(dirty_set & incoming_set))
 
 
 def _clear_declared_scaffolding_collisions(
