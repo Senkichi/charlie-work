@@ -26,10 +26,13 @@ from charlie_work.worktree import (
     WorktreeState,
     WorktreeUnsafeError,
     LiveWorkerRedispatchError,
+    ReworkBranchConflictError,
     ReworkMergeConflict,
+    _clear_declared_scaffolding_collisions,
     _default_worktrees_dir,
     _has_origin_remote,
     _is_confirmed_missing_ref,
+    _merge_update_rework_branch,
     _resolve_default_branch_ref,
     _worker_authored_dirty,
     _worktree_refuse_to_reset_reason,
@@ -547,6 +550,282 @@ def test_rework_merge_update_conflicts_with_remote_base(tmp_path: Path) -> None:
     assert merge_head_check.returncode != 0
 
     remove_worktree(repo_root, info1.path)
+
+
+def test_merge_update_rework_branch_real_conflict_reports_conflicted_files(
+    tmp_path: Path,
+) -> None:
+    """Case (a) of the three-outcome split: a genuine content conflict returns
+    a ``ReworkMergeConflict`` naming the conflicting file, and the internal
+    abort leaves no ``MERGE_HEAD`` behind.
+
+    A naive "any merge failure -> ReworkMergeConflict" fix would satisfy a
+    test that only checks the return type. Asserting ``conflicted_files`` is
+    non-empty and names the actual file is what distinguishes a real conflict
+    from the pre-merge failure covered below, which never touches MERGE_HEAD
+    at all.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    _git(repo_root, "checkout", "-b", "feature")
+    (repo_root / "file.txt").write_text("feature line\n", encoding="utf-8")
+    _git(repo_root, "add", "file.txt")
+    _git(repo_root, "commit", "-m", "feature change")
+
+    _git(repo_root, "checkout", "main")
+    (repo_root / "file.txt").write_text("main line\n", encoding="utf-8")
+    _git(repo_root, "add", "file.txt")
+    _git(repo_root, "commit", "-m", "main change")
+
+    _git(repo_root, "checkout", "feature")
+
+    result = _merge_update_rework_branch(repo_root, repo_root, "feature", "main")
+
+    assert isinstance(result, ReworkMergeConflict)
+    assert result.conflicted_files
+    assert "file.txt" in result.conflicted_files
+
+    merge_head_check = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    assert merge_head_check.returncode != 0
+
+
+def test_merge_update_rework_branch_clears_declared_scaffolding_and_retries(
+    tmp_path: Path,
+) -> None:
+    """Case (c) with a declared-scaffolding collision: an untracked copy of a
+    now-base-tracked path, left by the orchestrator's own materializer, is
+    cleared and the merge retried once — succeeding, because there was never
+    a real conflict between the branch and the base.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    _git(repo_root, "checkout", "-b", "feature")
+    (repo_root / "work.txt").write_text("worker output\n", encoding="utf-8")
+    _git(repo_root, "add", "work.txt")
+    _git(repo_root, "commit", "-m", "feature work")
+
+    _git(repo_root, "checkout", "main")
+    (repo_root / "prompts").mkdir()
+    (repo_root / "prompts" / "PROMPT.md").write_text("base prompt\n", encoding="utf-8")
+    _git(repo_root, "add", "prompts/PROMPT.md")
+    _git(repo_root, "commit", "-m", "add tracked prompt to main")
+
+    _git(repo_root, "checkout", "feature")
+    # Simulate orchestrator scaffolding materialized into the worktree ahead
+    # of this pre-merge: an UNTRACKED copy at a path the base now tracks.
+    (repo_root / "prompts").mkdir()
+    (repo_root / "prompts" / "PROMPT.md").write_text("scaffolding prompt\n", encoding="utf-8")
+    # An untracked, UNDECLARED file that sits outside the blocking set. It is
+    # not tracked by main (so `git clean` *can* delete it, unlike work.txt
+    # below), which is what makes it able to catch a cleanup that drops the
+    # `-- <blocking_paths>` pathspec and sweeps the whole worktree instead of
+    # only the declared collision.
+    (repo_root / "scratch-notes.txt").write_text("worker scratch\n", encoding="utf-8")
+
+    result = _merge_update_rework_branch(
+        repo_root,
+        repo_root,
+        "feature",
+        "main",
+        injected_paths=("prompts/PROMPT.md",),
+    )
+
+    assert result is None
+    # The merge succeeded, so the base's tracked copy is now checked out.
+    assert (repo_root / "prompts" / "PROMPT.md").read_text(encoding="utf-8") == "base prompt\n"
+    # An unrelated worker-authored (tracked) file must survive untouched.
+    assert (repo_root / "work.txt").read_text(encoding="utf-8") == "worker output\n"
+    # An unrelated worker-authored (untracked, undeclared) file must also
+    # survive: only the declared collision is in scope for the cleanup.
+    assert (repo_root / "scratch-notes.txt").read_text(encoding="utf-8") == "worker scratch\n"
+
+
+def test_merge_update_rework_branch_abort_failure_still_raises_conflict_stage(
+    tmp_path: Path,
+) -> None:
+    """Case (b) safety property: when a real conflict's ``git merge --abort``
+    itself fails, the worktree is genuinely mid-merge and unusable. This must
+    still raise ``ReworkBranchConflictError`` with ``stage="conflict"`` — the
+    property the fix must not have dropped while adding the pre_merge branch.
+
+    ``run_captured`` is monkeypatched for the ``merge --abort`` call (its
+    outcome is simulated entirely) and, separately, to overwrite just the
+    ``.stderr`` field of the real ``merge`` call's result with a synthetic
+    marker — the merge itself, its conflict, and the MERGE_HEAD it leaves
+    behind are still produced by real git; only the text of that one field is
+    substituted. This is necessary because real git writes conflict
+    diagnostics to stdout, not stderr (``CONFLICT (content): ...`` never
+    populates ``RunResult.stderr``), so a real conflict can never by itself
+    demonstrate that the merge's stderr is *preferred* over the abort's —
+    without the synthetic marker, the "or" fallback in the implementation
+    would trivially resolve to the abort's stderr regardless of which side
+    the ordering actually favors, and this test would pass for the wrong
+    reason.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    _git(repo_root, "checkout", "-b", "feature")
+    (repo_root / "file.txt").write_text("feature line\n", encoding="utf-8")
+    _git(repo_root, "add", "file.txt")
+    _git(repo_root, "commit", "-m", "feature change")
+
+    _git(repo_root, "checkout", "main")
+    (repo_root / "file.txt").write_text("main line\n", encoding="utf-8")
+    _git(repo_root, "add", "file.txt")
+    _git(repo_root, "commit", "-m", "main change")
+
+    _git(repo_root, "checkout", "feature")
+
+    original_run_captured = worktree_module.run_captured
+    _MERGE_STDERR_MARKER = "SIMULATED_MERGE_STDERR_MARKER"
+
+    def mock_run_captured(*args: object, **kwargs: object) -> object:
+        if args and args[0] == ["git", "merge", "--no-edit", "main"]:
+            real_result = original_run_captured(*args, **kwargs)
+            return RunResult(
+                returncode=real_result.returncode,
+                stdout=real_result.stdout,
+                stderr=_MERGE_STDERR_MARKER,
+                timed_out=real_result.timed_out,
+                error=real_result.error,
+            )
+        if args and args[0] == ["git", "merge", "--abort"]:
+            return RunResult(
+                returncode=1,
+                stdout="",
+                stderr="simulated abort failure",
+                error="simulated abort failure",
+            )
+        return original_run_captured(*args, **kwargs)
+
+    worktree_module.run_captured = mock_run_captured
+    try:
+        with pytest.raises(ReworkBranchConflictError) as exc_info:
+            _merge_update_rework_branch(repo_root, repo_root, "feature", "main")
+        assert exc_info.value.stage == "conflict"
+        # The conflicted paths must come from the real (pre-abort) merge
+        # state, not be empty just because the abort path was exercised.
+        assert exc_info.value.conflicted_paths
+        assert "file.txt" in exc_info.value.conflicted_paths
+        # The fix prefers the real merge's stderr over the abort's stderr
+        # (`merge_result.stderr or abort_result.stderr`, not the reverse) —
+        # the merge conflict is the actionable diagnostic; the abort failure
+        # is secondary.
+        assert exc_info.value.stderr == _MERGE_STDERR_MARKER
+
+        # The real abort never ran, so the worktree is genuinely still
+        # mid-merge — exactly the state that must escalate rather than be
+        # handed to a worker.
+        merge_head_check = subprocess.run(
+            ["git", "rev-parse", "--verify", "-q", "MERGE_HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        assert merge_head_check.returncode == 0
+    finally:
+        worktree_module.run_captured = original_run_captured
+        # Actually abort the still-mid-merge state so tmp_path teardown isn't
+        # fighting a live index lock / MERGE_HEAD.
+        subprocess.run(
+            ["git", "merge", "--abort"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_merge_update_rework_branch_undeclared_blocker_raises_pre_merge(
+    tmp_path: Path,
+) -> None:
+    """An untracked file the base tracks, but which was never declared as the
+    orchestrator's own scaffolding (via ``injected_paths``/``materialize_dirs``),
+    must not be deleted. Escalating is still correct — but as
+    ``stage="pre_merge"`` (not a content conflict), and with the file left in
+    place on disk.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    _git(repo_root, "checkout", "-b", "feature")
+    (repo_root / "work.txt").write_text("worker output\n", encoding="utf-8")
+    _git(repo_root, "add", "work.txt")
+    _git(repo_root, "commit", "-m", "feature work")
+
+    _git(repo_root, "checkout", "main")
+    (repo_root / "shared.txt").write_text("base version\n", encoding="utf-8")
+    _git(repo_root, "add", "shared.txt")
+    _git(repo_root, "commit", "-m", "add tracked shared.txt to main")
+
+    _git(repo_root, "checkout", "feature")
+    # An untracked collision that is NOT declared scaffolding, e.g. a
+    # worker-authored file that happens to share a base-tracked path.
+    (repo_root / "shared.txt").write_text("worker's own copy\n", encoding="utf-8")
+
+    with pytest.raises(ReworkBranchConflictError) as exc_info:
+        _merge_update_rework_branch(repo_root, repo_root, "feature", "main")
+
+    assert exc_info.value.stage == "pre_merge"
+    assert "shared.txt" in exc_info.value.conflicted_paths
+    # Nothing declared as scaffolding was involved, so nothing is deleted.
+    assert (repo_root / "shared.txt").read_text(encoding="utf-8") == "worker's own copy\n"
+
+
+def test_clear_declared_scaffolding_collisions_refuses_venv_paths(tmp_path: Path) -> None:
+    """``.venv`` must never be swept by the pre-merge scaffolding cleanup, even
+    if it were somehow declared as injected/materialize scaffolding — that
+    path is a junction into the SHARED virtualenv on this host, and
+    ``git clean -f -d`` would happily follow it into every other worktree.
+
+    Includes a positive control on an ordinary (non-``.venv``) declared
+    collision in the same repo: without it, "returns False and removes
+    nothing" for the .venv case would be equally consistent with the
+    function being unconditionally broken rather than specifically refusing
+    ``.venv``.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    venv_dir = repo_root / ".venv"
+    venv_dir.mkdir()
+    marker = venv_dir / "pyvenv.cfg"
+    marker.write_text("home = fake\n", encoding="utf-8")
+
+    cleared = _clear_declared_scaffolding_collisions(
+        repo_root,
+        (".venv/pyvenv.cfg",),
+        (".venv",),
+        (),
+    )
+
+    assert cleared is False
+    assert marker.exists()
+    assert marker.read_text(encoding="utf-8") == "home = fake\n"
+
+    # Positive control: an ordinary declared collision, untracked and
+    # outside .venv, IS cleared. This proves False above means "refused",
+    # not "the function can never return True."
+    (repo_root / "prompts").mkdir()
+    ordinary = repo_root / "prompts" / "PROMPT.md"
+    ordinary.write_text("scaffolding prompt\n", encoding="utf-8")
+
+    cleared_ordinary = _clear_declared_scaffolding_collisions(
+        repo_root,
+        ("prompts/PROMPT.md",),
+        ("prompts/PROMPT.md",),
+        (),
+    )
+
+    assert cleared_ordinary is True
+    assert not ordinary.exists()
 
 
 def test_rework_reuse_fetches_and_fast_forwards_to_origin_tip(tmp_path: Path) -> None:
