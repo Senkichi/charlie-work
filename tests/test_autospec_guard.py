@@ -190,10 +190,13 @@ def _is_monkeypatch_setattr_call(call: ast.Call, fixture_names: set[str]) -> boo
 
 
 def _value_node(call: ast.Call) -> ast.expr | None:
+    for kw in call.keywords:
+        if kw.arg == "value":
+            return kw.value
+    if len(call.args) >= 3:
+        return call.args[2]
     if len(call.args) == 2:
         return call.args[1]
-    if len(call.args) == 3:
-        return call.args[2]
     return None
 
 
@@ -342,6 +345,14 @@ MUST_FLAG: dict[str, str] = {
         "    _double = lambda self, x: x\n"
         '    monkeypatch.setattr("some.module", "method", _double)\n'
     ),
+    "value_keyword": (
+        "def test_foo(monkeypatch):\n"
+        '    monkeypatch.setattr("some.module", "method", value=lambda x: x)\n'
+    ),
+    "lambda_four_arg": (
+        "def test_foo(monkeypatch):\n"
+        '    monkeypatch.setattr("some.module", "method", lambda x: x, True)\n'
+    ),
 }
 
 MUST_ALLOW: dict[str, str] = {
@@ -371,6 +382,9 @@ MUST_ALLOW: dict[str, str] = {
         '    monkeypatch.setattr("sys", "stdout", fake_stdout)\n'
     ),
     "setenv_not_setattr": ('def test_foo(monkeypatch):\n    monkeypatch.setenv("KEY", "value")\n'),
+    "constant_four_arg": (
+        'def test_foo(monkeypatch):\n    monkeypatch.setattr("some.module", "method", 42, True)\n'
+    ),
 }
 
 
