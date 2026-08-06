@@ -739,6 +739,18 @@ class RuntimeConfig:
     # estimates are floors, not guarantees; dispatching at T+0 races the
     # provider's actual reset. Default 90 seconds.
     throttle_resume_margin_s: int = 90
+    # Issue #1088: max escalated issues the label self-heal sweep will verify
+    # against GitHub in a single pass. The bound is mandatory, not defensive.
+    # Every subject whose ``label_error`` key is absent costs one live
+    # ``issue_view`` call, and measured at the time of the fix *every* escalated
+    # subject was in that arm -- 8 in charlie-work and 49 in job-cannon. Sweeping
+    # all 57 in one pass would add ~57 sequential ``gh`` subprocess calls to a
+    # loop pass that is shared sequentially between both repos, which is the
+    # starvation mechanism of #1078. Bounding converges over a handful of passes
+    # instead of one long burst; verified subjects are then free forever (their
+    # ``label_error`` is None, which costs a dict lookup and no API call). Set
+    # to 0 for unlimited.
+    escalated_label_repair_max_per_pass: int = 10
 
 
 @dataclass(frozen=True)
@@ -1988,6 +2000,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'throttle_resume_margin_s' must be >= 0, "
                 f"got {throttle_resume_margin_s}"
+            )
+    repair_cap = runtime_data.get("escalated_label_repair_max_per_pass")
+    if repair_cap is not None:
+        if not isinstance(repair_cap, int) or isinstance(repair_cap, bool):
+            raise ConfigError(
+                "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
+                f"must be an int, got {type(repair_cap).__name__}"
+            )
+        # 0 means unlimited here (matching graphql_rate_limit_threshold's
+        # "0 disables the guard"), so only negatives are rejected.
+        if repair_cap < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
+                f"must be >= 0, got {repair_cap}"
             )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")

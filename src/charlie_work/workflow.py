@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import os
 import re
 import signal
@@ -687,15 +688,20 @@ _REWORK_ALREADY_ROUTED_STATUSES = (
 def _escalated_label_needs_repair(
     state: dict[str, Any],
     *,
-    pr_number: int,
+    pr_number: int | None,
     issue_number: int | None,
 ) -> bool:
     """Should the ``escalated`` label edge be re-applied for an already-escalated PR?
 
+    ``pr_number`` may be ``None``: an issue can be escalated by a path that never
+    produced a PR, and ``_collect_escalated_label_subjects`` yields those with no
+    PR to pair them with. The PR arm of the status check then simply never
+    matches, and the issue's own status decides.
+
     Same three-state ``label_error`` contract #586 established for
-    ``dispatch_reviews``' self-heal sweep, evaluated here because that sweep sits
-    below ``dispatch_reviews``' ``review_dispatch.enabled`` early return and is
-    unreachable whenever review dispatch is off:
+    ``dispatch_reviews``' self-heal sweep. This predicate is the shared
+    definition both that sweep and the cross-family escalation call site now
+    evaluate, so the two cannot drift apart:
 
     - ``None``        -> applied and verified on a prior pass; nothing to do.
                          This is the steady state, and answering it costs one
@@ -711,7 +717,7 @@ def _escalated_label_needs_repair(
     """
     if issue_number is None:
         return False
-    pr_entry = state.get("prs", {}).get(str(pr_number), {})
+    pr_entry = state.get("prs", {}).get(str(pr_number), {}) if pr_number is not None else {}
     issue_entry = state.get("issues", {}).get(str(issue_number), {})
     if not isinstance(pr_entry, dict):
         pr_entry = {}
@@ -720,6 +726,52 @@ def _escalated_label_needs_repair(
     if pr_entry.get("status") != "escalated" and issue_entry.get("status") != "escalated":
         return False
     return not ("label_error" in issue_entry and issue_entry["label_error"] is None)
+
+
+def _collect_escalated_label_subjects(
+    state: dict[str, Any],
+) -> list[tuple[int | None, int]]:
+    """``(pr_number, issue_number)`` pairs whose ``escalated`` label edge may be owed.
+
+    Issue #1088. The set #586's self-heal sweep iterated was built inside
+    ``dispatch_reviews``' candidate-filter loop, so its members were whatever the
+    *dispatch selection* happened to consider that pass. That is what made the
+    sweep unreachable: candidate selection runs below the
+    ``review_dispatch.enabled`` early return, and both deployed fleets run that
+    flag false, so the set was always empty and the sweep never had anything to
+    do. Deriving the subjects from ``state`` instead is the whole fix -- the
+    repair set must not depend on the dispatch lane being on.
+
+    An escalated PR contributes its linked issue; an escalated issue contributes
+    itself even when no PR points at it, because ``_escalate_issue`` and the
+    rework-cycle cap can escalate an issue that has no PR at all. Pairs are
+    deduplicated by issue, preferring the PR-derived pair so the caller's status
+    re-check can see both records.
+    """
+    subjects: dict[int, int | None] = {}
+    prs = state.get("prs", {})
+    if isinstance(prs, dict):
+        for pr_key, pr_entry in prs.items():
+            if not isinstance(pr_entry, dict) or pr_entry.get("status") != "escalated":
+                continue
+            issue_number = pr_entry.get("issue_number")
+            if issue_number is None:
+                continue
+            try:
+                subjects[int(issue_number)] = int(pr_key)
+            except (TypeError, ValueError):
+                continue
+    issues = state.get("issues", {})
+    if isinstance(issues, dict):
+        for issue_key, issue_entry in issues.items():
+            if not isinstance(issue_entry, dict) or issue_entry.get("status") != "escalated":
+                continue
+            try:
+                issue_number = int(issue_key)
+            except (TypeError, ValueError):
+                continue
+            subjects.setdefault(issue_number, None)
+    return [(pr_number, issue_number) for issue_number, pr_number in sorted(subjects.items())]
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -10515,6 +10567,134 @@ class OrchestratorApp:
         }
 
     @_guard_state_lock
+    def _repair_escalated_labels(self) -> dict[str, Any]:
+        """Re-apply the ``agent:human-needed`` edge for escalated issues that lack it.
+
+        Issue #586 established this self-heal: the edge is applied once at
+        escalation time, and if that ``transition()`` failed -- or the issue was
+        escalated by a path predating the edge -- the issue sits ``escalated`` in
+        ``state.json`` and invisible on GitHub, permanently excluded from dispatch
+        with no human-visible signal that operator action is required.
+
+        Issue #1088 is that the sweep never ran. Its subject set was built inside
+        ``dispatch_reviews``' candidate-filter loop, below the
+        ``review_dispatch.enabled`` early return, and both deployed fleets run
+        that flag false -- so the set was always empty and the loop always a
+        no-op. Deriving the subjects from ``state`` (see
+        ``_collect_escalated_label_subjects``) is what makes the guarantee real,
+        and this method is called *above* that early return.
+
+        Two properties worth preserving:
+
+        - **Steady state costs nothing.** Once an edge verifies, ``label_error``
+          is ``None`` and ``_escalated_label_needs_repair`` answers with a dict
+          lookup and no GitHub call. Without that, the sweep would re-apply every
+          label on every pass forever.
+        - **The per-pass cap is mandatory, not defensive.** Every subject in the
+          absent-key arm costs a live ``issue_view``, and when this was written
+          *every* escalated subject was in that arm (8 in charlie-work, 49 in
+          job-cannon). Sweeping all 57 in one pass would add that many sequential
+          ``gh`` calls to a loop shared sequentially between both repos, which is
+          #1078's starvation mechanism. The cap converges over a few passes
+          instead; subjects are visited in issue order so progress is monotonic
+          rather than re-rolling the same head of the list.
+        """
+        empty: dict[str, Any] = {"issue_numbers": [], "failures": [], "deferred": 0}
+        # --dry-run must not perform live GitHub label mutations or state.json
+        # writes (review finding on PR #670).
+        if self.dry_run:
+            return empty
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            subjects = [
+                (pr_number, issue_number)
+                for pr_number, issue_number in _collect_escalated_label_subjects(state)
+                if _escalated_label_needs_repair(
+                    state, pr_number=pr_number, issue_number=issue_number
+                )
+            ]
+        if not subjects:
+            return empty
+        cap = self.config.runtime.escalated_label_repair_max_per_pass
+        deferred = 0
+        if cap > 0 and len(subjects) > cap:
+            deferred = len(subjects) - cap
+            subjects = subjects[:cap]
+
+        outcomes: list[tuple[int, dict[str, Any] | None]] = []
+        for pr_number, issue_number in subjects:
+            # Re-evaluate per item, immediately before touching GitHub, rather
+            # than trusting the batch read above. #586 did this for a reason: a
+            # concurrent unescalate() can free the issue at any point, and it
+            # clears label_error, so the freed issue lands in the absent-key
+            # ("never attempted") arm and would be silently re-escalated. Doing
+            # the check once for the whole batch would widen that window from
+            # "immediately before the call" to "up to `cap` GitHub round-trips
+            # earlier" -- which is a real regression, and the existing race test
+            # catches it.
+            with state_lock(self.paths.state_file):
+                fresh = load_state(self.paths.state_file)
+            if not _escalated_label_needs_repair(
+                fresh, pr_number=pr_number, issue_number=issue_number
+            ):
+                continue
+            # issue_view/transition make GitHub API calls that can raise on
+            # transient errors; a failure to verify one escalated issue must not
+            # abort the pass. Skip it and retry next pass -- the escalated status
+            # is already durable in state, so deferring loses no ground truth.
+            try:
+                issue_view = self.gh.issue_view(int(issue_number))
+                if self.config.labels.human_needed in label_names(issue_view):
+                    outcomes.append((int(issue_number), None))
+                    continue
+                result = transition(self.gh, self.config.labels, int(issue_number), "escalated")
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "escalated label repair for issue %s deferred (GitHub fetch "
+                    "failed); will retry next pass",
+                    issue_number,
+                    exc_info=True,
+                )
+                continue
+            if result.outcome == TransitionOutcome.APPLIED:
+                outcomes.append((int(issue_number), None))
+            else:
+                outcomes.append(
+                    (
+                        int(issue_number),
+                        {
+                            "edge": "escalated",
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        },
+                    )
+                )
+        if not outcomes:
+            return {**empty, "deferred": deferred}
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            for issue_number, label_error in outcomes:
+                entry = state["issues"].get(str(issue_number), {})
+                state["issues"][str(issue_number)] = {
+                    **(entry if isinstance(entry, dict) else {}),
+                    "number": issue_number,
+                    "label_error": label_error,
+                }
+            summary = {
+                "issue_numbers": [i for i, _ in outcomes],
+                "failures": [i for i, e in outcomes if e is not None],
+                "deferred": deferred,
+            }
+            state = append_event(
+                state,
+                "escalated_label_repaired",
+                summary,
+                state_path=self.paths.state_file,
+            )
+            save_state(self.paths.state_file, state)
+        return summary
+
     def dispatch_reviews(
         self, limit: int | None = None, *, now: datetime | None = None
     ) -> CommandResult:
@@ -10580,6 +10760,16 @@ class OrchestratorApp:
         recorded_verdicts = verdict_result.get("recorded", [])
         missed_verdicts = verdict_result.get("missed", [])
 
+        # Issue #1088: this MUST stay above the ``review_dispatch.enabled`` early
+        # return below. The sweep it drives is #586's, and #586's whole purpose is
+        # that an escalated PR cannot sit invisible on GitHub -- a guarantee that
+        # has nothing to do with whether new reviewers are being launched. Placing
+        # it below the gate (where its input set used to be built) is what made it
+        # dead code in every deployed fleet. The reaper sweeps immediately above
+        # are the existing precedent for real work happening on this side of the
+        # gate.
+        repaired_labels = self._repair_escalated_labels()
+
         if not self.config.review_dispatch.enabled:
             # Issue #868 part 3: this is a real no-op for LAUNCHING new
             # reviewers, but the reaper sweeps above may still have done real
@@ -10599,6 +10789,13 @@ class OrchestratorApp:
                     "disabled": True,
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    # Issue #1088: reported on the disabled path for the same
+                    # reason #868 reports the reaper results here -- this is the
+                    # ONLY path the sweep runs on in a deployed fleet, so a
+                    # payload that omitted it would make the fix unobservable
+                    # from the outside and indistinguishable from the dead code
+                    # it replaces.
+                    "escalated_labels_repaired": repaired_labels,
                 },
             )
 
@@ -10761,14 +10958,12 @@ class OrchestratorApp:
         max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
         escalated_for_labels: list[tuple[int, int | None]] = []
         escalated_skipped: list[int] = []
-        # Issue #586: already-escalated PRs skipped by the gate below are
-        # collected here so their human-needed label edge can be re-applied
-        # out-of-lock. The edge is applied once at escalation time; if that
-        # transition() failed (or the PR was escalated by a path that
-        # predated the label edge), the label never lands and the PR sits
-        # escalated in state but invisible on GitHub -- permanently excluded
-        # from dispatch with no human-visible signal.
-        escalated_label_repair: list[tuple[int, int | None]] = []
+        # Issue #586's repair set used to be collected here, from the PRs this
+        # candidate loop skipped. Issue #1088: that made the sweep unreachable,
+        # because this loop runs below the ``review_dispatch.enabled`` early
+        # return and both deployed fleets run that flag false -- the set was
+        # always empty. The repair now derives its own subjects from state in
+        # ``_repair_escalated_labels()``, called above that early return.
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             # Escalate PRs whose dispatch attempt count has reached the cap.
@@ -10807,8 +11002,6 @@ class OrchestratorApp:
                     or issue_state_gate.get("status") == "escalated"
                 ):
                     escalated_skipped.append(c["pr"])
-                    if issue_num_gate is not None:
-                        escalated_label_repair.append((int(c["pr"]), issue_num_gate))
                     continue
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 if pr_state.get(
@@ -10913,108 +11106,6 @@ class OrchestratorApp:
                             "number": issue_num,
                             "label_error": label_error,
                         }
-                    save_state(self.paths.state_file, state)
-
-        # Issue #586: self-heal the escalated label edge for PRs that were
-        # already escalated (skipped by the gate above) but whose
-        # human-needed label never landed. The edge is applied once at
-        # escalation time; if transition() failed then (label_error is a
-        # dict) or the PR was escalated by a path that predated the label
-        # edge (label_error key absent), the PR sits escalated in state but
-        # invisible on GitHub -- permanently excluded from review dispatch
-        # with no human-visible signal that operator action is required.
-        # Re-apply the edge here every pass until it sticks, then mark it
-        # verified (label_error = None) so steady-state passes skip the
-        # GitHub label fetch. This is the single-point enforcement the issue
-        # asks for: state status == "escalated" and the agent:human-needed
-        # label cannot stay in disagreement past one dispatch_reviews pass.
-        # Gated by dry_run: --dry-run must not perform live GitHub label
-        # mutations or state.json writes (review finding on PR #670).
-        if not self.dry_run:
-            escalated_repair_outcomes: list[tuple[int, dict[str, Any] | None]] = []
-            import logging
-
-            for pr_num, issue_num in escalated_label_repair:
-                if issue_num is None:
-                    continue
-                with state_lock(self.paths.state_file):
-                    repair_state = load_state(self.paths.state_file)
-                    repair_entry = repair_state.get("issues", {}).get(str(issue_num), {})
-                    repair_pr = repair_state.get("prs", {}).get(str(pr_num), {})
-                # Race guard (review finding on PR #670): a concurrent
-                # unescalate() may have freed this issue between the
-                # escalation gate above and this per-item read. Re-check
-                # both the PR's and the issue's current status -- if neither
-                # is still "escalated", the issue is no longer awaiting a
-                # human and re-applying the agent:human-needed label would
-                # silently undo the unescalate (label_error is also cleared
-                # by unescalate, so the absent-key branch below would
-                # otherwise re-escalate without a status check).
-                if (
-                    repair_pr.get("status") != "escalated"
-                    and repair_entry.get("status") != "escalated"
-                ):
-                    continue
-                # label_error is None  -> verified OK on a prior pass, skip the
-                #   GitHub fetch entirely (steady-state cost: zero).
-                # label_error is a dict -> prior transition() failed, retry.
-                # label_error key absent -> edge never attempted (pre-#556
-                #   escalation or a call site that doesn't record label_error),
-                #   fetch live labels to decide whether repair is needed.
-                if "label_error" in repair_entry and repair_entry["label_error"] is None:
-                    continue
-                # issue_view/transition make GitHub API calls that can raise on
-                # transient errors; a failure to verify one escalated issue must
-                # not abort the entire dispatch_reviews pass. Skip the issue this
-                # pass and retry on the next -- the escalated status is already
-                # durable in state, so no ground truth is lost by deferring.
-                try:
-                    issue_view = self.gh.issue_view(int(issue_num))
-                    if self.config.labels.human_needed in label_names(issue_view):
-                        escalated_repair_outcomes.append((int(issue_num), None))
-                        continue
-                    result = transition(self.gh, self.config.labels, int(issue_num), "escalated")
-                except Exception:
-                    logging.getLogger(__name__).warning(
-                        "escalated label repair for issue %s deferred (GitHub "
-                        "fetch failed); will retry next pass",
-                        issue_num,
-                        exc_info=True,
-                    )
-                    continue
-                if result.outcome == TransitionOutcome.APPLIED:
-                    escalated_repair_outcomes.append((int(issue_num), None))
-                else:
-                    escalated_repair_outcomes.append(
-                        (
-                            int(issue_num),
-                            {
-                                "edge": "escalated",
-                                "outcome": result.outcome.value,
-                                "add_failures": result.add_failures,
-                                "remove_failures": result.remove_failures,
-                            },
-                        )
-                    )
-            if escalated_repair_outcomes:
-                with state_lock(self.paths.state_file):
-                    state = load_state(self.paths.state_file)
-                    for issue_num, label_error in escalated_repair_outcomes:
-                        entry = state["issues"].get(str(issue_num), {})
-                        state["issues"][str(issue_num)] = {
-                            **(entry if isinstance(entry, dict) else {}),
-                            "number": issue_num,
-                            "label_error": label_error,
-                        }
-                    state = append_event(
-                        state,
-                        "escalated_label_repaired",
-                        {
-                            "issue_numbers": [i for i, _ in escalated_repair_outcomes],
-                            "failures": [i for i, e in escalated_repair_outcomes if e is not None],
-                        },
-                        state_path=self.paths.state_file,
-                    )
                     save_state(self.paths.state_file, state)
 
         # Apply the local and provider-token caps. 0 means unlimited for both.
@@ -11364,6 +11455,7 @@ class OrchestratorApp:
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
             "rescue_review_results": rescue_review_results,
+            "escalated_labels_repaired": repaired_labels,
         }
         data.update(local_cap.report_fields())
         return CommandResult(ok, message, data)
@@ -19606,18 +19698,23 @@ class OrchestratorApp:
         # only; without this the PR sits escalated in state.json and invisible
         # on GitHub, which is the exact defect #586 fixed for the sibling call
         # site (pr-lifecycle.md: PRs 548/540/531 live escalated-without-label).
-        # Delegating the repair to #586's self-heal sweep is NOT an option here,
-        # and the reason is structural rather than a matter of taste. That sweep
-        # lives in dispatch_reviews below the `review_dispatch.enabled` early
-        # return (workflow.py:10545), and its input set `escalated_label_repair`
-        # is built by the dispatch-selection loop that the same return skips. So
-        # with review dispatch off -- the configuration this fleet actually runs
-        # -- the sweep is unreachable, not merely narrow. label_error is still
-        # written in the exact three-state shape that sweep consumes (dict =
-        # failed, None = applied-and-verified, absent = never attempted) so the
-        # two agree if dispatch is ever re-enabled, but nothing in this fleet
-        # reads it. This call site therefore owns the retry, which is what the
-        # `record.get("escalated")` branch above exists to route.
+        # This call site owns the retry rather than delegating it to #586's
+        # self-heal sweep, and that is deliberate even though #1088 has since
+        # made the sweep reachable (`_repair_escalated_labels`, called above
+        # dispatch_reviews' `review_dispatch.enabled` early return). The sweep is
+        # a NEXT-PASS backstop; applying the edge here makes the escalation
+        # visible on GitHub in the same pass that decided it. The two do not
+        # fight: label_error is written in the same three-state shape the sweep
+        # consumes (dict = failed, None = applied-and-verified, absent = never
+        # attempted) and both consult `_escalated_label_needs_repair`, so a
+        # success here makes the sweep skip this issue for free.
+        #
+        # Historical note, because the previous version of this comment said the
+        # opposite and was true when written: before #1088 the sweep's input set
+        # was built by the dispatch-selection loop *below* that early return, so
+        # with review dispatch off -- the configuration both fleets actually run
+        # -- it was unreachable, not merely narrow. That is why this site took
+        # ownership; #1088 fixed the sweep rather than changing that.
         #
         # The `issue_number is not None` arm is not a defensive nicety: per
         # _escalate_issue's contract the issue may be unresolvable (cross-repo

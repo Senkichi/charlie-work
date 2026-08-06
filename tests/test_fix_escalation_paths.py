@@ -315,27 +315,44 @@ def test_dispatch_reviews_repair_skips_when_status_no_longer_escalated(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Regression (review finding on PR #670): if a concurrent unescalate()
-    frees the issue between the escalation gate and the self-heal repair
-    loop, the repair loop must NOT re-apply the agent:human-needed label --
-    it would silently undo the unescalate. The repair loop re-checks the
-    PR's and issue's current status in its own state_lock read and skips
-    repair if neither is still "escalated".
+    frees the issue between subject collection and the GitHub call, the repair
+    must NOT re-apply the agent:human-needed label -- it would silently undo the
+    unescalate. ``_repair_escalated_labels`` re-checks each subject's current
+    status in its own state_lock read immediately before touching GitHub, and
+    skips when neither the PR nor the issue is still "escalated".
 
-    The race is simulated by wrapping ``load_state``: the escalation gate's
-    read (the 2nd ``load_state`` call that sees the PR as escalated) returns
-    the original escalated state so the gate still collects the PR, but
-    writes unescalated state to the file -- mimicking a concurrent
-    ``unescalate()`` that won the lock between the gate's release and the
-    repair loop's acquisition. The repair loop's subsequent read then sees
-    the unescalated state and the status guard skips repair.
+    How the race is simulated, and why this way (issue #1088 rewrite): the race
+    is injected as a side effect of ``_collect_escalated_label_subjects`` -- the
+    unescalate lands on disk the instant after the batch read produced the
+    subject list. That is exactly the window the per-item re-check exists to
+    close, and it is expressed with no coupling to *how many* times
+    ``load_state`` happens to be called.
+
+    The previous version of this test counted ``load_state`` calls and poisoned
+    "the 2nd read that sees escalated", returning stale-escalated state after
+    having written unescalated state to the file. That was calibrated to the old
+    call sequence, where the repair set was collected by ``dispatch_reviews``'
+    escalation gate. It also modelled a torn read -- a read returning a value
+    already false when it returned -- which ``state_lock`` plus atomic writes
+    make impossible. Both reasons are why the mechanism changed here while the
+    asserted property did not.
     """
     import json as _json
 
     from charlie_work import workflow as wf
     from charlie_work.state import PASSIVE_OPEN_STATUS
 
+    # review_dispatch DISABLED -- the configuration both deployed fleets run, and
+    # the one #1088 is about. It also isolates what this test asserts: with
+    # dispatch off, `_repair_escalated_labels` is the ONLY thing in this call
+    # that can add a label, so "no label was added" is a statement about the
+    # repair rather than about the pass as a whole. With dispatch on, freeing the
+    # PR hands it to candidate selection and the attempt-cap branch escalates it
+    # FRESH -- real behaviour, but a different mechanism than this test asserts.
+    # The positive control that the sweep DOES act when it should lives in
+    # test_escalated_label_repair_runs_with_review_dispatch_disabled.
     config = OrchestratorConfig(
-        review_dispatch=ReviewDispatchConfig(enabled=True, max_review_dispatch_attempts=2)
+        review_dispatch=ReviewDispatchConfig(enabled=False, max_review_dispatch_attempts=2)
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -353,31 +370,48 @@ def test_dispatch_reviews_repair_skips_when_status_no_longer_escalated(
     _write_review_packet(paths, 456, "sha-abc123")
     _seed_escalated_pr(paths, 456, 123)  # label_error absent, status escalated
 
-    original_load_state = wf.load_state
-    escalated_reads = [0]
+    original_collect = wf._collect_escalated_label_subjects
+    raced = [0]
 
-    def racing_load_state(path):
-        state = original_load_state(path)
-        pr = state.get("prs", {}).get("456", {})
-        if pr.get("status") == "escalated":
-            escalated_reads[0] += 1
-            # On the 2nd escalated read (the escalation gate), simulate a
-            # concurrent unescalate(): write unescalated state to the file
-            # but return the original escalated state so the gate still
-            # collects the PR into escalated_label_repair.
-            if escalated_reads[0] == 2:
-                raced = _json.loads(_json.dumps(state))
-                if "456" in raced.get("prs", {}):
-                    raced["prs"]["456"]["status"] = PASSIVE_OPEN_STATUS
-                if "123" in raced.get("issues", {}):
-                    raced["issues"]["123"]["status"] = PASSIVE_OPEN_STATUS
-                    raced["issues"]["123"].pop("label_error", None)
-                path.write_text(_json.dumps(raced))
-        return state
+    def racing_collect(state):
+        subjects = original_collect(state)
+        # The instant after collection, a concurrent unescalate() wins the lock
+        # and frees the issue. Use the literals unescalate actually writes: with
+        # the PR live and open both records land on PASSIVE_OPEN_STATUS, and
+        # label_error is POPPED (it is a member of
+        # _UNESCALATE_ISSUE_RESET_FIELDS) -- which is what puts the freed issue
+        # in the absent-key "never attempted" arm that the status re-check has
+        # to override.
+        if subjects and not raced[0]:
+            raced[0] = 1
+            on_disk = _json.loads(paths.state_file.read_text())
+            if "456" in on_disk.get("prs", {}):
+                on_disk["prs"]["456"]["status"] = PASSIVE_OPEN_STATUS
+                # unescalate() also clears the dispatch counters --
+                # "review_dispatch_attempt_count" is the FIRST member of
+                # _UNESCALATE_PR_RESET_FIELDS. Popping them here is fidelity,
+                # not convenience: _seed_escalated_pr seeds a count of 3 against
+                # a cap of 2, so a freed-but-uncleared PR immediately re-hits the
+                # attempt-cap branch and is escalated FRESH. That is a different
+                # mechanism from the repair undoing an unescalate, and leaving it
+                # in would have this test fail for a reason it does not assert.
+                for field in ("review_dispatch_attempt_count", "review_dispatch_status"):
+                    on_disk["prs"]["456"].pop(field, None)
+            if "123" in on_disk.get("issues", {}):
+                on_disk["issues"]["123"]["status"] = PASSIVE_OPEN_STATUS
+                on_disk["issues"]["123"].pop("label_error", None)
+            paths.state_file.write_text(_json.dumps(on_disk))
+        return subjects
 
-    monkeypatch.setattr(wf, "load_state", racing_load_state)
+    monkeypatch.setattr(wf, "_collect_escalated_label_subjects", racing_collect)
 
     result = app.dispatch_reviews()
+
+    # Control: the race actually fired. Without this the assertions below would
+    # pass just as well if `racing_collect` never ran -- "no label applied" is
+    # equally consistent with "the guard worked" and "nothing was ever a
+    # subject", and only one of those is the property under test.
+    assert raced[0] == 1
 
     assert result.ok is True
     # The human-needed label was NOT re-applied -- the race guard skipped
