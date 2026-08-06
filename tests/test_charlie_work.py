@@ -37,6 +37,7 @@ from charlie_work.config import (
     NotifyConfig,
     OrchestratorConfig,
     PostMortemConfig,
+    ReconcilePassConfig,
     ReviewConfig,
     ReviewDispatchConfig,
     RuntimeConfig,
@@ -28753,6 +28754,12 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        # This test intentionally leaves issues in rework_requested with only the
+        # needs-rework label. The in-loop reconcile pass would otherwise see open PRs
+        # with a stale active label and self-heal the status to open_passive before
+        # dispatch_rework can run (issue #762 paginated issue snapshots now expose the
+        # fixture to real reconcile drift detection).
+        reconcile_pass=ReconcilePassConfig(enabled=False),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
