@@ -39,7 +39,7 @@ from charlie_work.config import AutoMergeConfig, CrossFamilyConfig, Orchestrator
 from charlie_work.cross_family import _CAVEAT, CrossFamilyResult
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
-from charlie_work.state import load_state, save_state
+from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state
 from charlie_work.workflow import OrchestratorApp
 
 # Reuse the shared FakeGitHub whose default PR #456 is janitor-green.
@@ -623,10 +623,15 @@ def test_a_concurrent_unescalate_is_not_undone(tmp_path: Path) -> None:
     assert _claim(app) is False
     assert (123, human_needed) not in _labels_added(app)
 
-    # Simulate the concurrent unescalate: status cleared, label_error dropped.
+    # Simulate the concurrent unescalate, using the literals it actually writes
+    # rather than merely analogous ones: with the PR live and open both records
+    # land on PASSIVE_OPEN_STATUS (workflow.py `_apply_pr_reset` /
+    # `_apply_issue_reset`), and `label_error` is dropped because it is a member
+    # of `_UNESCALATE_ISSUE_RESET_FIELDS` -- which is what puts this in the
+    # absent-key ("never attempted") arm the status check has to override.
     state = load_state(app.paths.state_file)
-    state["prs"]["456"] = {**state["prs"]["456"], "status": "reviewing"}
-    issue_entry = {**state["issues"].get("123", {}), "status": "reviewing"}
+    state["prs"]["456"] = {**state["prs"]["456"], "status": PASSIVE_OPEN_STATUS}
+    issue_entry = {**state["issues"].get("123", {}), "status": PASSIVE_OPEN_STATUS}
     issue_entry.pop("label_error", None)
     state["issues"]["123"] = issue_entry
     save_state(app.paths.state_file, state)
