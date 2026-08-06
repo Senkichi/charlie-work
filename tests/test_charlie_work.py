@@ -32400,50 +32400,26 @@ def test_status_includes_blocked_section(tmp_path: Path) -> None:
     assert result.data["available_issue_count"] == 0
 
 
-def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
+def test_status_prefetch_uses_batched_graphql_for_blocker_data(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """Issue #870: `fleet status --json` measured at 90s-184s wall clock,
-    almost entirely (169s of 184s in the diagnosed baseline) spent in serial,
-    uncached `gh` subprocess calls made by _get_open_blockers -- once per
-    ready issue from _filter_blocked_issues, and AGAIN once per ready issue
-    from _summarize_issue. Two ready issues sharing a declared blocker (the
-    diagnosed case: issues #887/#888 both blocked by #886) meant the shared
-    blocker's `gh issue view` was fetched 4 times, and each issue's own
-    dependencies-API call was fetched twice.
+    """Issue #923: `fleet status --json` spawned 86 `gh` subprocesses, mostly
+    one `gh api .../dependencies/blocked_by` per ready issue plus one `gh issue
+    view` per unique blocker. That is replaced by a single batched GraphQL
+    query per repo that fetches both the native blockedBy relationships and the
+    blockers' open/closed states in one subprocess.
 
     This uses a real GitHub (not the hand-rolled FakeGitHub used elsewhere in
-    this file, which has its own non-caching are_issues_open/dependencies
-    stand-ins and would not exercise the production caching path at all) with
-    subprocess.run mocked, so every `gh` invocation status() actually makes is
-    visible and countable.
+    this file) with subprocess.run mocked, so every `gh` invocation status()
+    actually makes is visible and countable.
 
     Two ready issues (887, 888) both declare the same open blocker (886) via
-    GitHub-native dependencies. Before the fix: 2 dependency-API calls x2
-    (once per _filter_blocked_issues, once per _summarize_issue) = 4, plus
-    886's issue-view fetched once per calling issue x2 duplicate passes = 4.
-    After the fix: each unique resource is fetched exactly once per status()
-    call, regardless of how many internal consumers ask for it.
+    GitHub-native dependencies. Before this fix: 2 dependency-REST calls x2
+    consumers = 4, plus 886's issue-view fetched twice per consumer = 4. After
+    the batching fix: one GraphQL query fetches dependencies and blocker states
+    for the whole set; no further `gh` calls are needed.
     """
     calls: list[list[str]] = []
-    # Thread name recorded alongside each dependencies-API call, so the test
-    # can assert the fan-out actually ran concurrently -- not just that the
-    # call count was deduped. A regression that replaced the ThreadPoolExecutor
-    # in _prefetch_blocker_data with a plain serial loop would still pass every
-    # call-count assertion below; this is what catches that specifically.
-    #
-    # A 2-party barrier forces both dependency-API calls to be in flight at
-    # once: with the mocked (near-instant) gh call, ThreadPoolExecutor's lazy
-    # thread creation would otherwise let the first task finish and its
-    # thread go idle before the second task is even submitted, so both would
-    # land on the same reused thread despite running through a real
-    # ThreadPoolExecutor -- a false negative, not evidence of a serial loop.
-    # Blocking each call on the barrier until both have arrived guarantees a
-    # second thread must be spawned to service the second call. Bounded with
-    # a timeout so a future regression (e.g. back to one call) fails fast
-    # with BrokenBarrierError instead of hanging the test.
-    dependency_call_threads: list[str] = []
-    dependency_call_barrier = threading.Barrier(2, timeout=5)
 
     def make_issue(number: int) -> dict[str, Any]:
         return {
@@ -32459,17 +32435,11 @@ def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
         }
 
     ready_issues = [make_issue(887), make_issue(888)]
-    # Both 887 and 888 declare 886 as a GitHub-native dependency.
-    dependencies_by_issue = {887: [886], 888: [886]}
 
     def fake_run(command, **kwargs):
         args = command[1:]  # drop leading "gh"
         if args and args[-2:] == ["--json", "nonexistent"]:
             # OrchestratorApp.__init__'s validate_field_lists() startup probe
-            # (github.py: GitHub.validate_field_lists) -- not part of the
-            # behavior under test, so satisfy it generically by unioning
-            # every field-list constant it checks, rather than hand-picking
-            # (and inevitably under-covering) a subset here.
             all_field_list_constants = [
                 "ISSUE_LIST_FIELDS",
                 "ISSUE_VIEW_FIELDS",
@@ -32503,15 +32473,29 @@ def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
             payload = json.dumps(ready_issues)
         elif args[:2] == ["pr", "list"]:
             payload = json.dumps([])
-        elif args[:2] == ["issue", "view"]:
-            number = int(args[2])
-            payload = json.dumps({"number": number, "state": "OPEN"})
-        elif args[0] == "api" and "dependencies/blocked_by" in args[1]:
-            dependency_call_threads.append(threading.current_thread().name)
-            dependency_call_barrier.wait()
-            number = int(args[1].split("/issues/")[1].split("/")[0])
-            deps = dependencies_by_issue.get(number, [])
-            payload = json.dumps([{"number": d} for d in deps])
+        elif args[0] == "api" and len(args) >= 2 and args[1] == "graphql":
+            payload = json.dumps(
+                {
+                    "data": {
+                        "repository": {
+                            "i_887": {
+                                "number": 887,
+                                "blockedBy": {
+                                    "nodes": [{"number": 886, "state": "OPEN"}],
+                                    "pageInfo": {"hasNextPage": False},
+                                },
+                            },
+                            "i_888": {
+                                "number": 888,
+                                "blockedBy": {
+                                    "nodes": [{"number": 886, "state": "OPEN"}],
+                                    "pageInfo": {"hasNextPage": False},
+                                },
+                            },
+                        }
+                    }
+                }
+            )
         else:
             raise AssertionError(f"Unexpected gh command in status(): {command}")
         return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
@@ -32521,13 +32505,14 @@ def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
     config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = github_module.GitHub(repo_root=tmp_path)
+    # Avoid a real `git remote` call; the owner/name are only used for the
+    # GraphQL variables, and the mocked response is the same either way.
+    gh._list_cache[("_repo_owner_name",)] = ("owner", "repo")
     app = OrchestratorApp(tmp_path, paths, config, gh)
 
     result = app.status()
 
     assert result.ok is True
-    # Both issues correctly identified as blocked by the still-open #886 --
-    # the fix must not change the *answer*, only how many times it's fetched.
     assert result.data["available_issue_count"] == 0
     blocked_by_issue = {b["issue"]: b["blockers"] for b in result.data["blocked"]}
     assert blocked_by_issue == {887: [886], 888: [886]}
@@ -32535,29 +32520,17 @@ def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
     assert summaries[887] == {"declared": [886], "open": [886]}
     assert summaries[888] == {"declared": [886], "open": [886]}
 
-    dependency_calls = [c for c in calls if c[1] == "api" and "dependencies/blocked_by" in c[2]]
+    graphql_calls = [c for c in calls if c[1:3] == ["api", "graphql"]]
+    rest_dependency_calls = [
+        c for c in calls if c[1] == "api" and "dependencies/blocked_by" in c[2]
+    ]
     issue_view_calls = [c for c in calls if c[1:3] == ["issue", "view"]]
 
-    # One dependencies-API call per ready issue (887, 888) -- not one per
-    # (issue, consumer) pair. Before the fix this was 4 (2 issues x 2
-    # consumers: _filter_blocked_issues and _summarize_issue).
-    assert len(dependency_calls) == 2
-    assert {int(c[2].split("/issues/")[1].split("/")[0]) for c in dependency_calls} == {887, 888}
-
-    # Exactly one issue-view call for the shared blocker #886 -- not one per
-    # (blocker, calling issue) pair. Before the fix this was 4 (886 looked up
-    # once per calling issue x 2 duplicate passes).
-    assert len(issue_view_calls) == 1
-    assert issue_view_calls[0][3] == "886"
-
-    # The dedup assertions above would still pass if _prefetch_blocker_data's
-    # ThreadPoolExecutor were replaced by a plain serial loop -- call *counts*
-    # don't distinguish parallel from sequential. The 74% wall-clock reduction
-    # (184.39s -> 47.9s, issue #870) came from the fan-out, not just the
-    # caching, so assert the two dependency-API calls actually ran on
-    # different threads.
-    assert len(dependency_call_threads) == 2
-    assert len(set(dependency_call_threads)) == 2
+    # The whole dependency + blocker-state lookup is now one batched GraphQL
+    # query for the two ready issues, not N per-issue REST calls + M issue views.
+    assert len(graphql_calls) == 1
+    assert len(rest_dependency_calls) == 0
+    assert len(issue_view_calls) == 0
 
 
 def test_status_includes_stalled_section(tmp_path: Path) -> None:
