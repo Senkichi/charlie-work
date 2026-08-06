@@ -988,6 +988,20 @@ class CrossFamilyConfig:
     # gate (recorded as a caveated "approved") instead of looping forever or
     # escalating to a human — see workflow._record_cross_family_verdicts.
     max_parse_failures: int = 2
+    # Issue #1081: bounds how many times loop() will force review() to
+    # regenerate an *unusable* cross-family report (a "(UNAVAILABLE)" failure
+    # stub, or one carrying no head SHA) for one unchanged PR head. The bound
+    # is required because regeneration runs the cross-family model
+    # synchronously for up to ``timeout_seconds``; unbounded, a model that is
+    # simply down burns that timeout on every pass and starves the other repo
+    # in the shared sequential loop (#1078).
+    #
+    # This does NOT share max_parse_failures' terminal behaviour, and must not
+    # be "unified" with it. That bound ends in a caveated "approved"; this one
+    # ends in a human_needed escalation, because exhausting it means the head
+    # was never confirmed and approving on an unconfirmed head is precisely the
+    # fail-open #1079 closed.
+    max_regen_attempts: int = 2
 
 
 @dataclass(frozen=True)

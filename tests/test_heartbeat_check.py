@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import sqlite3
 import subprocess
-import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,16 +12,13 @@ from typing import Any
 
 import pytest
 
+from _script_loader import load_script_module
+
 
 def _load_heartbeat_check() -> ModuleType:
     """Load scripts/heartbeat_check.py as a module without adding scripts to sys.path."""
     path = Path(__file__).parent.parent / "scripts" / "heartbeat_check.py"
-    spec = importlib.util.spec_from_file_location("heartbeat_check", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["heartbeat_check"] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_script_module(path, "heartbeat_check")
 
 
 @pytest.fixture(scope="module")

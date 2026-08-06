@@ -61,7 +61,7 @@ from .cross_family import (
     extract_head_ref_oid,
     extract_report_body,
     parse_cross_family_verdict,
-    report_body_is_valid,
+    report_is_reusable,
     run_cross_family_review,
 )
 from .github import (
@@ -682,6 +682,44 @@ _REWORK_ALREADY_ROUTED_STATUSES = (
     "manifest_written",
     "rework_requested",
 )
+
+
+def _escalated_label_needs_repair(
+    state: dict[str, Any],
+    *,
+    pr_number: int,
+    issue_number: int | None,
+) -> bool:
+    """Should the ``escalated`` label edge be re-applied for an already-escalated PR?
+
+    Same three-state ``label_error`` contract #586 established for
+    ``dispatch_reviews``' self-heal sweep, evaluated here because that sweep sits
+    below ``dispatch_reviews``' ``review_dispatch.enabled`` early return and is
+    unreachable whenever review dispatch is off:
+
+    - ``None``        -> applied and verified on a prior pass; nothing to do.
+                         This is the steady state, and answering it costs one
+                         dict lookup rather than a GitHub label fetch.
+    - a ``dict``      -> a prior ``transition()`` failed; retry.
+    - key absent      -> the edge was never attempted; apply it.
+
+    The status re-check is a race guard, not belt-and-braces: a concurrent
+    ``unescalate()`` may have freed the issue since it was escalated, and it
+    clears ``label_error`` when it does. Without the check, the absent-key arm
+    would read that cleared state as "never attempted" and silently re-escalate
+    the issue the unescalate had just released.
+    """
+    if issue_number is None:
+        return False
+    pr_entry = state.get("prs", {}).get(str(pr_number), {})
+    issue_entry = state.get("issues", {}).get(str(issue_number), {})
+    if not isinstance(pr_entry, dict):
+        pr_entry = {}
+    if not isinstance(issue_entry, dict):
+        issue_entry = {}
+    if pr_entry.get("status") != "escalated" and issue_entry.get("status") != "escalated":
+        return False
+    return not ("label_error" in issue_entry and issue_entry["label_error"] is None)
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -10292,9 +10330,26 @@ class OrchestratorApp:
                 continue
             # Skip stale reports: the head SHA in the report must match the
             # packet head SHA so we don't record a verdict for an old diff.
+            # Require BOTH shas on positive confirmation -- an indeterminate
+            # comparison (either side unknown) must not fall through to the
+            # permissive branch. That fail-open let an unverifiable head
+            # authorize a merge.
             report_head = extract_head_ref_oid(report_text)
             packet_head = candidate.get("packet_head_sha")
-            if report_head is not None and packet_head is not None and report_head != packet_head:
+            if report_head is None or packet_head is None:
+                # The skip this fix *adds*: neither the mismatch case below
+                # (already skipped before, and self-healing -- a head move
+                # regenerates the report) nor the malformed-verdict case
+                # (bounded by max_parse_failures). Nothing regenerates a
+                # report whose head is simply absent, so this PR can sit
+                # here every pass forever. Emit once so it is visible
+                # instead of silently stalling -- the exact failure shape
+                # this whole guard exists to stop being invisible.
+                self._note_cross_family_head_indeterminate(
+                    pr_number, candidate.get("issue"), report_head, packet_head
+                )
+                continue
+            if report_head != packet_head:
                 continue
             parsed = parse_cross_family_verdict(report_text)
             if parsed is None:
@@ -10323,6 +10378,54 @@ class OrchestratorApp:
                 }
             )
         return results
+
+    def _note_cross_family_head_indeterminate(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        report_head: str | None,
+        packet_head: str | None,
+    ) -> None:
+        """Record, once per PR, that the head-SHA guard could not adjudicate.
+
+        The guard skips when either side is unknown, which is correct -- an
+        unverifiable head must not authorize a merge. But that skip re-runs
+        every ``_record_cross_family_verdicts`` pass with the same inputs and
+        nothing regenerates the report, so without a signal the PR stalls in
+        ``reviewing`` invisibly. This is deliberately *not* bounded the way
+        ``max_parse_failures`` bounds the malformed path: that bound ends in a
+        caveated ``approved``, and approving on an unconfirmed head is exactly
+        the fail-open this guard closes. Visibility is the remedy here, not an
+        eventual auto-approve.
+
+        The durable ``cross_family_head_indeterminate`` marker keeps this to
+        one event per PR rather than one per loop pass, which would flush the
+        capped ``events`` ring in ``state.json``.
+        """
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            if pr_state.get("cross_family_head_indeterminate"):
+                return
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "cross_family_head_indeterminate": True,
+            }
+            state = self._record_event(
+                state,
+                "cross_family_verdict_head_indeterminate",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "report_head_sha": report_head,
+                    "packet_head_sha": packet_head,
+                    "reason": "report head SHA missing"
+                    if report_head is None
+                    else "packet head SHA missing",
+                },
+            )
+            save_state(self.paths.state_file, state)
 
     def _handle_malformed_cross_family_verdict(
         self,
@@ -13541,18 +13644,11 @@ class OrchestratorApp:
         # to prevent reviewing stale code (issue #156).
         if report_path.exists() and report_path.stat().st_size > 0:
             text = report_path.read_text(encoding="utf-8")
-            first_line = text.splitlines()[0]
-            # The file is a wrapped report (header + caveat + body).  Validate the
-            # model body only, not the wrapper text that itself contains bold
-            # markdown ("**leads, not verdicts**").
-            body = extract_report_body(text)
-            stored_head_sha = extract_head_ref_oid(text)
-            current_head_sha = pr.get("headRefOid")
-            if (
-                "(UNAVAILABLE)" not in first_line
-                and report_body_is_valid(body)
-                and stored_head_sha == current_head_sha
-            ):
+            # The wrapper text itself contains bold markdown ("**leads, not
+            # verdicts**"), so validation runs against the model body only —
+            # see report_is_reusable, which is also what loop()'s same-head
+            # packet skip consults so the two cannot disagree (issue #1081).
+            if report_is_reusable(text, pr.get("headRefOid")):
                 return self._cross_family_section(report_path), CrossFamilyResult(
                     ok=True, report_path=str(report_path), model=cfg.model, reused=True
                 )
@@ -16949,7 +17045,19 @@ class OrchestratorApp:
                     template_current = packet_template_sha is None or (
                         packet_template_sha == current_template_sha
                     )
-                    if head_current and template_current:
+                    # Issue #1081: the cross-family report is a third
+                    # load-bearing input to the packet. An unusable one (a
+                    # "(UNAVAILABLE)" failure stub, or one carrying no head
+                    # SHA) can never yield a verdict, and on a PR whose head
+                    # never moves the two checks above skip review() forever --
+                    # so the regeneration that _cross_family_for_pr already
+                    # performs was unreachable and the PR waited on a human
+                    # indefinitely. Bounded per head; see
+                    # _cross_family_report_current.
+                    cross_family_current = self._cross_family_report_current(
+                        pr=pr, pr_number=pr_number, issue_number=issue_number
+                    )
+                    if head_current and template_current and cross_family_current:
                         # Packet is current — skip regenerating it. But an
                         # operator may have written review-decision.json
                         # directly without state.json reflecting it yet (the
@@ -19324,6 +19432,218 @@ class OrchestratorApp:
             return None
         value = data.get("headRefOid")
         return str(value) if value is not None else None
+
+    def _cross_family_report_current(
+        self,
+        *,
+        pr: dict[str, Any],
+        pr_number: int,
+        issue_number: int | None,
+    ) -> bool:
+        """Return True if the packet's cross-family report needs no regeneration.
+
+        Third staleness input to ``loop()``'s same-head packet skip, alongside
+        the packet head SHA and the prompt-template digest (issue #1081).
+
+        ``_cross_family_for_pr`` already refuses to reuse a failure stub or a
+        semantically empty report and regenerates instead. That logic was never
+        wrong -- it was *unreachable*. Its only caller is ``review()``, and the
+        skip bypasses ``review()`` whenever the head and template are
+        unchanged, so a PR whose head never moves keeps an unusable report
+        forever while ``_record_cross_family_verdicts`` skips it every pass,
+        emitting one event and then waiting on a human indefinitely. Asking
+        here the *same* question the regenerator asks -- ``report_is_reusable``,
+        shared by both -- is what removes the gap. If the skip and the
+        regenerator can disagree about whether a report is reusable, that
+        disagreement is the stall.
+        """
+        cfg = self.config.cross_family
+        # Mirror _cross_family_for_pr's own early return. With the pass
+        # disabled or on a draft PR it never writes a report at all, so an
+        # absent report is the steady state and not staleness. Reporting
+        # "stale" here would force review() every pass, forever.
+        if not cfg.enabled or pr.get("isDraft"):
+            return True
+        report_path = self.paths.prs / f"pr-{pr_number}" / "cross-family-review.md"
+        text = ""
+        if report_path.exists() and report_path.stat().st_size > 0:
+            try:
+                text = report_path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+        if report_is_reusable(text, pr.get("headRefOid")):
+            return True
+        # Unusable. Regeneration is the repair, but it is not free: claim a
+        # bounded attempt against this exact head.
+        return not self._claim_cross_family_regen_attempt(
+            pr_number=pr_number,
+            issue_number=issue_number,
+            head_sha=pr.get("headRefOid"),
+            report_head=extract_head_ref_oid(text) if text.strip() else None,
+        )
+
+    def _claim_cross_family_regen_attempt(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int | None,
+        head_sha: str | None,
+        report_head: str | None,
+    ) -> bool:
+        """Claim one bounded cross-family regeneration attempt for ``pr_number``.
+
+        Returns True when an attempt was claimed, meaning the caller should
+        report the packet stale so ``review()`` re-runs and regenerates the
+        report. Returns False once the budget for this head is spent.
+
+        The bound is mandatory, not defensive: regeneration runs the
+        cross-family model synchronously for up to ``timeout_seconds`` (600s in
+        this fleet). Unbounded, a model that is simply down would burn that
+        timeout on every pass for this PR and starve the other repo in the
+        shared sequential loop (#1078).
+
+        Attempts are counted *per head SHA* and reset when the head moves. A
+        head move already forces regeneration through the packet-head check, so
+        counting across heads would let a long-lived PR accumulate attempts
+        from unrelated pushes and escalate on one that had never actually
+        failed.
+
+        On exhaustion the issue escalates to a human -- it is never recorded as
+        approved. ``max_parse_failures`` deliberately ends in a caveated
+        ``approved``; copying that shape here would approve against a head that
+        was never positively confirmed, which is exactly the fail-open #1079
+        closed and which ``_note_cross_family_head_indeterminate``'s docstring
+        exists to steer a checklist-follower away from.
+
+        The escalation is classified ``judgment`` rather than ``mechanical``
+        deliberately. A mechanical escalation is eligible for the automatic
+        de-escalation sweep, which would return the issue to ``reviewing`` with
+        the report still unusable -- straight back into the indefinite silent
+        wait this change exists to make unreachable. Clearing it needs a human
+        to decide whether to re-run, switch model, or waive the gate.
+        """
+        max_attempts = max(0, int(self.config.cross_family.max_regen_attempts))
+        # --dry-run must not perform state.json writes or live GitHub label
+        # mutations (review finding on PR #670). Reporting "budget spent" is the
+        # non-mutating answer, and it also keeps a dry run from spending a real
+        # 600s model call.
+        if self.dry_run:
+            return False
+        escalated_now = False
+        repair_label_edge = False
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            record = pr_state.get("cross_family_regen")
+            if not isinstance(record, dict) or record.get("head_sha") != head_sha:
+                record = {"head_sha": head_sha, "attempts": 0}
+            attempts = int(record.get("attempts") or 0)
+            if attempts < max_attempts:
+                state["prs"][str(pr_number)] = {
+                    **pr_state,
+                    "number": pr_number,
+                    "cross_family_regen": {
+                        "head_sha": head_sha,
+                        "attempts": attempts + 1,
+                    },
+                }
+                state = self._record_event(
+                    state,
+                    "cross_family_report_regen_forced",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "head_sha": head_sha,
+                        "report_head_sha": report_head,
+                        "attempt": attempts + 1,
+                        "max_attempts": max_attempts,
+                    },
+                )
+                save_state(self.paths.state_file, state)
+                return True
+            # Budget spent for this head. Escalate exactly once -- the durable
+            # flag keeps this to one event per head rather than one per pass,
+            # which would flush the capped `events` ring in state.json.
+            if record.get("escalated"):
+                # Escalated on an earlier pass. Nothing left to claim -- but the
+                # label edge below may never have landed, and if it didn't, this
+                # early return is what makes that permanent. #586's self-heal
+                # sweep would normally repair it; it cannot reach this case (see
+                # the comment on the label block), so the retry is decided here.
+                repair_label_edge = _escalated_label_needs_repair(
+                    state, pr_number=pr_number, issue_number=issue_number
+                )
+                if not repair_label_edge:
+                    return False
+            else:
+                state = _escalate_issue(
+                    state,
+                    issue_number,
+                    reason="cross_family_report_unusable",
+                    reason_class="judgment",
+                    pr_number=pr_number,
+                    pr_extra={
+                        "cross_family_regen": {**record, "escalated": True},
+                    },
+                )
+                state = self._record_event(
+                    state,
+                    "cross_family_report_regen_exhausted",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "head_sha": head_sha,
+                        "report_head_sha": report_head,
+                        "attempts": attempts,
+                        "max_attempts": max_attempts,
+                    },
+                )
+                save_state(self.paths.state_file, state)
+                escalated_now = True
+
+        # Apply the human-needed label edge OUTSIDE the state lock --
+        # transition() makes GitHub API calls. _escalate_issue writes state
+        # only; without this the PR sits escalated in state.json and invisible
+        # on GitHub, which is the exact defect #586 fixed for the sibling call
+        # site (pr-lifecycle.md: PRs 548/540/531 live escalated-without-label).
+        # Delegating the repair to #586's self-heal sweep is NOT an option here,
+        # and the reason is structural rather than a matter of taste. That sweep
+        # lives in dispatch_reviews below the `review_dispatch.enabled` early
+        # return (workflow.py:10545), and its input set `escalated_label_repair`
+        # is built by the dispatch-selection loop that the same return skips. So
+        # with review dispatch off -- the configuration this fleet actually runs
+        # -- the sweep is unreachable, not merely narrow. label_error is still
+        # written in the exact three-state shape that sweep consumes (dict =
+        # failed, None = applied-and-verified, absent = never attempted) so the
+        # two agree if dispatch is ever re-enabled, but nothing in this fleet
+        # reads it. This call site therefore owns the retry, which is what the
+        # `record.get("escalated")` branch above exists to route.
+        #
+        # The `issue_number is not None` arm is not a defensive nicety: per
+        # _escalate_issue's contract the issue may be unresolvable (cross-repo
+        # or fork PR), in which case only the PR record was escalated and there
+        # is no issue to carry the label. Do not "fix" that by inventing a label
+        # target -- the PR record is the surface for that case.
+        if (escalated_now or repair_label_edge) and issue_number is not None:
+            result = transition(self.gh, self.config.labels, int(issue_number), "escalated")
+            label_error: dict[str, Any] | None = None
+            if result.outcome != TransitionOutcome.APPLIED:
+                label_error = {
+                    "edge": "escalated",
+                    "outcome": result.outcome.value,
+                    "add_failures": result.add_failures,
+                    "remove_failures": result.remove_failures,
+                }
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                entry = state["issues"].get(str(issue_number), {})
+                state["issues"][str(issue_number)] = {
+                    **(entry if isinstance(entry, dict) else {}),
+                    "number": int(issue_number),
+                    "label_error": label_error,
+                }
+                save_state(self.paths.state_file, state)
+        return False
 
     def _review_template_sha(self) -> str:
         """SHA-256 digest of the resolved review template + referenced section
