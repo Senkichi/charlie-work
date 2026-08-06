@@ -11,9 +11,9 @@ surface as a failure in some later unrelated test.
 
 The guard is intentionally scoped, not a blanket ratchet over the ~434 existing
 hand-rolled sites.  The scope is a growing allowlist of test files; within an
-allowed file, only test functions that have already opted into the ``autospec``
-fixture are enforced.  Both decisions are derived at runtime from the source, so
-no line-number allowlist can rot.
+allowed file, every test function that uses the ``monkeypatch`` fixture is
+enforced, whether or not it has also requested ``autospec``.  Both decisions are
+derived at runtime from the source, so no line-number allowlist can rot.
 """
 
 from __future__ import annotations
@@ -28,15 +28,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
 
 # Initial file allowlist.  A file is checked only once it is added here; within
-# the file, only tests that request the ``autospec`` fixture are enforced, which
-# identifies the converted region without hardcoding line numbers or test names.
+# the file, every test function that uses the ``monkeypatch`` fixture is
+# enforced, whether or not it has also requested ``autospec``.
 #
-# test_autospec_patch.py is the helper's own tests.  test_charlie_work.py's
-# fleet-status tests were converted to ``autospec`` in #949 and are the first
-# live region the guard watches.
-ENFORCED_FILES: frozenset[str] = frozenset(
-    {"tests/test_autospec_patch.py", "tests/test_charlie_work.py"}
-)
+# test_autospec_patch.py is the helper's own tests and the first live region
+# the guard watches.  test_charlie_work.py is intentionally not added yet: the
+# new all-test rule surfaces ~219 pre-existing hand-rolled doubles there, so
+# the file will be added back only once that fleet is converted.
+ENFORCED_FILES: frozenset[str] = frozenset({"tests/test_autospec_patch.py"})
 
 
 @dataclass(frozen=True)
@@ -58,17 +57,6 @@ def _build_parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
         for child in ast.iter_child_nodes(parent):
             parents[child] = parent
     return parents
-
-
-def _nearest_function(
-    node: ast.AST, parents: dict[ast.AST, ast.AST]
-) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-    current = parents.get(node)
-    while current is not None:
-        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return current
-        current = parents.get(current)
-    return None
 
 
 def _collect_test_nodes(
@@ -148,8 +136,6 @@ def _local_double_names(
             continue
         if _enclosing_test(node, parents, test_nodes) is not test_fn:
             continue
-        if _nearest_function(node, parents) is not test_fn:
-            continue
         targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
         for target in targets:
             if isinstance(target, ast.Name):
@@ -210,8 +196,8 @@ def find_autospec_violations(
 
     ``enforced_files`` limits which files are checked.  ``None`` checks every
     test function (used for positive/negative controls).  Within an allowed
-    file, only test functions that request the ``autospec`` fixture are
-    enforced, which identifies the converted region without a line allowlist.
+    file, every test function that uses the ``monkeypatch`` fixture is
+    enforced, including nested helper functions defined inside the test.
     """
     try:
         tree = ast.parse(source, filename=filename)
@@ -224,11 +210,8 @@ def find_autospec_violations(
     violations: list[AutospecViolation] = []
 
     for test_fn in test_nodes:
-        if enforced_files is not None:
-            if filename not in enforced_files:
-                continue
-            if not _has_autospec_fixture(test_fn):
-                continue
+        if enforced_files is not None and filename not in enforced_files:
+            continue
 
         fixture_names = _monkeypatch_fixture_names(test_fn)
         if not fixture_names:
@@ -238,8 +221,6 @@ def find_autospec_violations(
 
         for node in ast.walk(test_fn):
             if not isinstance(node, ast.Call):
-                continue
-            if _nearest_function(node, parents) is not test_fn:
                 continue
             if not _is_monkeypatch_setattr_call(node, fixture_names):
                 continue
@@ -279,7 +260,7 @@ def _scan_enforced_test_files() -> list[AutospecViolation]:
 
 
 def test_no_hand_rolled_doubles_in_enforced_regions() -> None:
-    """No allowed-file ``autospec`` test may introduce a hand-rolled double."""
+    """No allowed-file test may introduce a hand-rolled double."""
     violations = _scan_enforced_test_files()
     assert not violations, _format_violations(violations)
 
@@ -287,9 +268,10 @@ def test_no_hand_rolled_doubles_in_enforced_regions() -> None:
 def test_converted_region_uses_autospec_fixture() -> None:
     """The fleet-status tests in test_charlie_work.py request ``autospec``.
 
-    This is the anti-vacuity anchor for the file-level scope: the guard is not
-    an empty allowlist, and the converted region is identified by the fixture
-    request, not by a hand-maintained list of test names.
+    The guard no longer uses the fixture request as an opt-in gate, but the
+    fleet-status tests remain the converted region that will let
+    test_charlie_work.py enter ``ENFORCED_FILES`` once the rest of the file is
+    converted.
     """
     source = (TESTS_DIR / "test_charlie_work.py").read_text(encoding="utf-8")
     tree = ast.parse(source, filename="tests/test_charlie_work.py")
@@ -301,8 +283,8 @@ def test_converted_region_uses_autospec_fixture() -> None:
     assert not missing, f"fleet-status tests missing autospec fixture: {missing}"
 
 
-def test_guard_only_enforces_autospec_opted_in_tests() -> None:
-    """Within an allowed file, only tests that request ``autospec`` are checked."""
+def test_guard_enforces_all_tests_in_allowed_file() -> None:
+    """Within an allowed file, every ``monkeypatch`` test is checked."""
     source = (
         "def test_converted(monkeypatch, autospec):\n"
         '    monkeypatch.setattr("some.module", "method", lambda x: x)\n'
@@ -312,8 +294,36 @@ def test_guard_only_enforces_autospec_opted_in_tests() -> None:
     violations = find_autospec_violations(
         source, "probe.py", enforced_files=frozenset({"probe.py"})
     )
-    assert len(violations) == 1
-    assert violations[0].funcname == "test_converted"
+    assert len(violations) == 2
+    assert {v.funcname for v in violations} == {"test_converted", "test_unconverted"}
+
+
+def test_guard_catches_verified_test_charlie_work_example() -> None:
+    """The reviewer-verified unconverted example is caught under the new rule.
+
+    tests/test_charlie_work.py:35040 installs a local def and a lambda via
+    ``monkeypatch.setattr`` without requesting the ``autospec`` fixture.  With
+    the file in ``ENFORCED_FILES`` this must produce two violations.
+    """
+    source = (
+        "def test_fleet_review_queue_aggregates_and_isolates_errors(monkeypatch):\n"
+        "    from some.module import GitHub\n"
+        "\n"
+        "    def mock_pr_list(self):\n"
+        "        return []\n"
+        "\n"
+        '    monkeypatch.setattr(GitHub, "pr_list", mock_pr_list)\n'
+        '    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)\n'
+    )
+    violations = find_autospec_violations(
+        source,
+        "tests/test_charlie_work.py",
+        enforced_files=frozenset({"tests/test_charlie_work.py"}),
+    )
+    assert len(violations) == 2
+    assert {v.funcname for v in violations} == {
+        "test_fleet_review_queue_aggregates_and_isolates_errors"
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -352,6 +362,12 @@ MUST_FLAG: dict[str, str] = {
     "lambda_four_arg": (
         "def test_foo(monkeypatch):\n"
         '    monkeypatch.setattr("some.module", "method", lambda x: x, True)\n'
+    ),
+    "nested_helper_setattr": (
+        "def test_foo(monkeypatch):\n"
+        "    def _install():\n"
+        '        monkeypatch.setattr("some.module", "method", lambda x: x)\n'
+        "    _install()\n"
     ),
 }
 
