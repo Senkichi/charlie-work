@@ -206,6 +206,10 @@ def compute_api_worker_fleet_report(
     configured_m = 0
     representative: tuple[str, OrchestratorConfig, dict[str, Any]] | None = None
 
+    # Keep every successfully resolved config so the live-api count loop below
+    # can honor devin.sessions_dir without re-loading per-repo config twice.
+    repo_configs: dict[str, tuple[Path, OrchestratorConfig, dict[str, Any]]] = {}
+
     for repo_key, entry in repos.items():
         repo_root = Path(entry.get("repo_root", ""))
         if not repo_root.is_dir():
@@ -221,6 +225,9 @@ def compute_api_worker_fleet_report(
                 )
             except (ConfigError, GitHubError, OSError):
                 continue
+        if config is None:
+            continue
+        repo_configs[repo_key] = (repo_root, config, entry)
         if not _api_worker_configured(config):
             continue
         configured_m += 1
@@ -255,13 +262,24 @@ def compute_api_worker_fleet_report(
         except Exception:
             pass
 
-    # Fleet-wide live api worker count.
+    # Fleet-wide live api worker count. Reuse the layered configs resolved
+    # above so devin.sessions_dir overrides (including the fleet-wide layer)
+    # are honored and no redundant config load is performed.
     live = 0
     for _repo_key, entry in repos.items():
         state_dir_str = entry.get("state_dir")
         if not state_dir_str:
             continue
-        sessions_dir = layout.sessions_dir_default(Path(state_dir_str))
+        repo_data = repo_configs.get(_repo_key)
+        if repo_data is None:
+            continue
+        _, config, _ = repo_data
+        state_dir = Path(state_dir_str)
+        sessions_dir = layout.resolve_state_child(
+            config.devin.sessions_dir,
+            repo_root=Path(entry.get("repo_root", "")),
+            default=layout.sessions_dir_default(state_dir),
+        )
         if not sessions_dir.is_dir():
             continue
         try:
@@ -1689,9 +1707,25 @@ class FleetLocalSnapshot:
     repo_snapshots: frozenset[tuple[str, LocalSnapshot]]
 
 
-def _repo_state_dirs(state_dir: Path) -> tuple[Path, Path]:
-    """Return the (sessions_dir, prs_dir) for a repo given its state dir."""
-    sessions_dir = layout.sessions_dir_default(state_dir)
+def _repo_state_dirs(
+    repo_root: Path,
+    state_dir: Path,
+    config: OrchestratorConfig | None = None,
+) -> tuple[Path, Path]:
+    """Return the (sessions_dir, prs_dir) for a repo given its state dir.
+
+    Honors ``devin.sessions_dir`` when a resolved config is provided, falling
+    back to the layout default otherwise.
+    """
+    default_sessions_dir = layout.sessions_dir_default(state_dir)
+    if config is not None:
+        sessions_dir = layout.resolve_state_child(
+            config.devin.sessions_dir,
+            repo_root=repo_root,
+            default=default_sessions_dir,
+        )
+    else:
+        sessions_dir = default_sessions_dir
     prs_dir = state_dir / "prs"
     return sessions_dir, prs_dir
 
@@ -1713,7 +1747,19 @@ def _take_fleet_snapshot(
         state_dir = Path(state_dir_str)
         if not state_dir.exists():
             continue
-        sessions_dir, prs_dir = _repo_state_dirs(state_dir)
+        repo_root = Path(entry.get("repo_root", ""))
+        config: OrchestratorConfig | None = None
+        if repo_root.is_dir():
+            try:
+                explicit_cfg = entry.get("config_path")
+                config = load_layered_config(
+                    repo_root,
+                    Path(explicit_cfg) if explicit_cfg else None,
+                    fleet_dir_override=fleet_dir_override,
+                )
+            except (ConfigError, OSError):
+                config = None
+        sessions_dir, prs_dir = _repo_state_dirs(repo_root, state_dir, config)
         repo_snapshots.add((repo_key, take_snapshot(sessions_dir, prs_dir)))
 
     return FleetLocalSnapshot(frozenset(repo_snapshots))

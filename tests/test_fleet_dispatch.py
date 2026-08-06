@@ -25,10 +25,12 @@ from charlie_work.fleet_dispatch import (
     _emit_fleet_transition,
     _extract_attention_events,
     _fleet_has_configured_repos,
+    _has_fleet_delta,
     _is_fleet_pass_active,
     _lane_failure_state_path,
     _run_fleet_allocation_prologue,
     _select_repos,
+    _take_fleet_snapshot,
     compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
@@ -3866,6 +3868,109 @@ def test_fleet_loop_api_worker_report_none_when_unconfigured(
 
     assert result.ok is True
     assert result.data["api_worker_report"] is None
+
+
+def test_compute_api_worker_fleet_report_respects_global_devin_sessions_dir_override(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """The live-api count resolves sessions_dir from the layered config, not state_dir default.
+
+    Regression for the review of issue #707: the live-api loop in
+    compute_api_worker_fleet_report used layout.sessions_dir_default directly,
+    so a devin.sessions_dir override from the global fleet layer was ignored.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=_API_WORKER_YAML.format(enabled="true"))
+
+    # Global fleet layer sets the sessions dir; per-repo config only declares api_worker.
+    (fleet_dir / "config.yaml").write_text(
+        "devin:\n  sessions_dir: custom-sessions\n",
+        encoding="utf-8",
+    )
+
+    # The default sessions dir is empty; the live api sidecar is in the override.
+    custom_sessions = repo / "custom-sessions"
+    custom_sessions.mkdir(parents=True)
+    (custom_sessions / "issue-1.api.json").write_text(
+        _json.dumps(
+            {
+                "issue_number": 1,
+                "branch": "main",
+                "worktree_path": str(repo / "worktrees" / "issue-1"),
+                "prompt_path": str(repo / "prompt.md"),
+                "command": ["claude"],
+                "pid": 1234,
+                "started_at": "2026-08-05T00:00:00Z",
+                "log_path": str(repo / "log.txt"),
+                "adapter_kind": "api",
+                "provider": "kimi-k3",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda _record: True)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.live == 1
+
+
+def test_take_fleet_snapshot_detects_delta_with_devin_sessions_dir_override(
+    tmp_path: Path,
+) -> None:
+    """_take_fleet_snapshot uses the resolved sessions_dir, not the default.
+
+    Regression for the review of issue #707: _repo_state_dirs built the
+    sessions dir from layout.sessions_dir_default, so a devin.sessions_dir
+    override produced no snapshot signal and no fleet delta.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=None)
+
+    # Global fleet layer overrides the sessions dir.
+    (fleet_dir / "config.yaml").write_text(
+        "devin:\n  sessions_dir: custom-sessions\n",
+        encoding="utf-8",
+    )
+
+    custom_sessions = repo / "custom-sessions"
+    custom_sessions.mkdir(parents=True)
+    (custom_sessions / "issue-1.json").write_text(
+        _json.dumps({"dummy": "sidecar"}), encoding="utf-8"
+    )
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    before = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    (custom_sessions / "issue-2.json").write_text(
+        _json.dumps({"dummy": "sidecar"}), encoding="utf-8"
+    )
+
+    after = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    assert _has_fleet_delta(before, after) is True
 
 
 # --------------------------------------------------------------------------

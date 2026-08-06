@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import layout
-from .config import DEFAULT_CONFIG_FILENAME, load_config
+from .config import DEFAULT_CONFIG_FILENAME
+from .global_config import load_layered_config
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError, GitHubLike
@@ -205,18 +206,24 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        # Resolve sessions_dir from the repo's own config + the layout module.
-        # The registry's state_dir is the actual resolved state root; the repo's
-        # config owns any devin.sessions_dir override, and layout provides the
-        # default. This makes the "missing because layout drifted" case
-        # structurally impossible instead of something to detect after the fact.
-        config_path = Path(entry.get("config_path", ""))
+        # Resolve sessions_dir from the repo's effective layered config.
+        # The registry's state_dir is the resolved state root, but the repo's
+        # per-repo orchestrator.config.yaml may not declare devin.sessions_dir;
+        # the fleet-wide <fleet_dir>/config.yaml layer is also allowed to set it
+        # (known_config_sections() includes "devin"). Use load_layered_config so
+        # both layers are merged and an explicit devin.sessions_dir is resolved
+        # against repo_root via the single sentinel resolver in layout.py.
+        explicit_cfg = entry.get("config_path")
         try:
-            repo_config = load_config(config_path if config_path.exists() else None)
+            repo_config = load_layered_config(
+                repo_root,
+                Path(explicit_cfg) if explicit_cfg else None,
+                fleet_dir_override=fleet_dir_override,
+            )
         except Exception as exc:  # noqa: BLE001 - containment is deliberate
             logger.warning(
                 f"Skipping fleet live-count for {name_with_owner}: "
-                f"failed to load repo config {config_path}: {exc}"
+                f"failed to load repo config for {repo_root}: {exc}"
             )
             skipped_repos.append(name_with_owner)
             continue

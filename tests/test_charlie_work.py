@@ -28553,6 +28553,77 @@ def test_count_fleet_live_sessions_respects_devin_sessions_dir_override(
     assert skipped_repos == []
 
 
+def test_count_fleet_live_sessions_respects_global_devin_sessions_dir_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A repo with no per-repo override is still counted when fleet config sets devin.sessions_dir.
+
+    Regression for the review of issue #707: count_fleet_live_sessions loaded the
+    per-repo orchestrator.config.yaml only, so a global <fleet_dir>/config.yaml
+    devin.sessions_dir override was silently ignored.
+    """
+    from charlie_work.fleet_registry import count_fleet_live_sessions
+
+    fleet_dir = tmp_path / ".fleet"
+    fleet_dir.mkdir(parents=True)
+    fleet_json = fleet_dir / "fleet.json"
+
+    # No per-repo config; all config comes from the fleet-wide layer.
+    (fleet_dir / "config.yaml").write_text(
+        "devin:\n  sessions_dir: custom-sessions\n",
+        encoding="utf-8",
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    # Default sessions dir is missing; the global override is the live one.
+    state = repo / ".var" / "charlie-work"
+    state.mkdir(parents=True)
+
+    custom_sessions = repo / "custom-sessions"
+    custom_sessions.mkdir(parents=True)
+    (custom_sessions / "issue-1.json").write_text(
+        json.dumps(
+            {
+                "issue_number": 1,
+                "branch": "main",
+                "worktree_path": str(repo / "worktrees" / "issue-1"),
+                "prompt_path": str(repo / "prompt.md"),
+                "command": ["devin"],
+                "pid": 1234,
+                "started_at": "2026-08-05T00:00:00Z",
+                "log_path": str(repo / "log.txt"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(repo / "orchestrator.config.yaml"),
+                "state_dir": str(state),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+        },
+    }
+    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
+
+    live_count, skipped_repos = count_fleet_live_sessions(None)
+
+    assert live_count == 1
+    assert skipped_repos == []
+
+
 def test_concurrency_governor_result_enabled_property() -> None:
     """ConcurrencyGovernorResult.enabled property correctly reflects governor enabled state."""
     # Disabled (max_concurrent=0)
