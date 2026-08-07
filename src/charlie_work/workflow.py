@@ -9,7 +9,6 @@ import signal
 import subprocess
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18713,18 +18712,19 @@ class OrchestratorApp:
         this exact path, including confirmed duplicate fetches (issues #887/
         #888 each fetched twice; their shared blocker #886 fetched 4 times).
 
-        This method does the equivalent fetching *once* per unique resource,
-        concurrently, before any of the unmodified per-issue code below runs:
+        This method does the equivalent fetching *once* per unique resource
+        before any of the unmodified per-issue code below runs:
 
-          1. Fetch each ready issue's GitHub-native dependencies in parallel
-             (one `gh api` call per unique issue number -- no duplicates,
-             since ``issues`` already contains each ready issue exactly once).
+          1. Fetch all ready issues' GitHub-native dependencies in a single
+             batched GraphQL query when the GitHub client supports it. The
+             client falls back to per-issue REST calls when the query cannot
+             be built (no git remote, no gh auth, etc.).
           2. Union those dependencies with each issue's body-declared
              blockers (pure Python, no I/O) into one deduplicated set of
              blocker issue numbers.
           3. Resolve open/closed state for that whole set in a single
-             ``are_issues_open`` call, which itself fans out cache misses
-             concurrently (see github.py).
+             ``are_issues_open`` call, which itself batches cache misses in
+             one GraphQL query when possible (see github.py).
 
         Both fetch layers cache into ``self.gh._list_cache``, so every
         subsequent call to ``_get_open_blockers`` -- unchanged, still called
@@ -18745,17 +18745,21 @@ class OrchestratorApp:
         if not issue_numbers:
             return
 
-        max_workers = min(_MAX_PREFETCH_WORKERS, len(issue_numbers))
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            deps_by_number = dict(
-                zip(
-                    issue_numbers,
-                    pool.map(
-                        lambda number: get_github_issue_dependencies(self.gh, number),
-                        issue_numbers,
-                    ),
-                )
-            )
+        if hasattr(self.gh, "issue_dependencies"):
+            try:
+                deps_by_number = self.gh.issue_dependencies(issue_numbers)
+            except (GitHubError, OSError, ValueError, TypeError):
+                # The batch method should fall back internally, but if it
+                # raises for any reason, fall back to the per-issue function.
+                deps_by_number = {
+                    number: get_github_issue_dependencies(self.gh, number)
+                    for number in issue_numbers
+                }
+        else:
+            # Test doubles and older GitHub-like objects without the batch method.
+            deps_by_number = {
+                number: get_github_issue_dependencies(self.gh, number) for number in issue_numbers
+            }
 
         all_blockers: set[int] = set()
         for issue in issues:

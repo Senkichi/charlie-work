@@ -514,6 +514,72 @@ def test_check_dispatch_coverage_anomaly_when_persisting(
     assert "dispatchable across 2 consecutive beats" in report.lines[0]
 
 
+def test_check_dispatch_coverage_ok_when_degraded_but_empty(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Degraded blocked lookup with no dispatchable issues is a sound OK.
+
+    The blocked set is unavailable, but that can only *inflate* dispatchable,
+    so an empty dispatchable set cannot be a false negative. The OK line must
+    still note the degraded lookup so a reader does not infer an empty fleet.
+    """
+    repo = _make_repo(hb, tmp_path)
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, [], ""),
+    )
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report,
+        repo,
+        {},
+        {},
+        skip_delta=False,
+        blocked_numbers=None,
+        blocked_err="charlie fleet status --json timed out",
+    )
+    assert not report.anomaly
+    assert "OK dispatch-coverage" in report.lines[0]
+    assert "result is sound" in report.lines[0]
+    assert "charlie fleet status --json timed out" in report.lines[0]
+
+
+def test_check_dispatch_coverage_anomaly_possibly_spurious_when_degraded(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Degraded blocked lookup makes a dispatchable-persisting anomaly suspect.
+
+    A dispatchable issue may actually be blocked; the anomaly must carry a
+    caveat rather than read as a confirmed dispatch failure.
+    """
+    repo = _make_repo(hb, tmp_path)
+    issues = [
+        {"number": 42, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, issues, ""),
+    )
+    prev = {"dispatchable_issues": [42]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report,
+        repo,
+        prev,
+        new,
+        skip_delta=False,
+        blocked_numbers=None,
+        blocked_err="blocked-issue lookup failed",
+    )
+    assert report.anomaly
+    assert "possibly-spurious" in report.lines[0]
+    assert "blocked-issue lookup failed" in report.lines[0]
+    assert "dispatchable across 2 consecutive beats" in report.lines[0]
+
+
 def test_check_in_progress_staleness_anomaly_when_unchanged_across_beats(
     hb: ModuleType, tmp_path: Path
 ) -> None:

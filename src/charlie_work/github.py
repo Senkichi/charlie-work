@@ -63,8 +63,40 @@ _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD = 1500
 # still cutting a serial N x ~2s loop down substantially. See issue #870.
 _MAX_ISSUE_STATE_WORKERS = 8
 
+# How many issue numbers to pack into one batched `gh api graphql` query.
+# Kept conservative to stay under the ~32KB Windows command-line limit and
+# GitHub's GraphQL node/complexity budgets. See issue #923.
+_GRAPHQL_BATCH_SIZE = 50
+
+# GitHub allows up to 50 blocked-by / blocking relationships per issue.
+# `first:` counts nodes toward the query's complexity, so matching the product
+# limit keeps the query cheap and avoids false negatives.
+_GRAPHQL_BLOCKED_BY_FIRST = 50
+
 # Fractional jitter applied to each retry backoff (e.g. 0.25 => +/- 25%).
 _JITTER_FRACTION = 0.25
+
+# Parse "owner/repo" out of common git remote URL shapes. Intentionally loose:
+# it matches the tail `.../owner/repo(.git)?` of https/ssh/git URLs, including
+# `https://token@host/owner/repo.git` and `git@github.com:owner/repo.git`.
+_GIT_REMOTE_URL_RE = re.compile(
+    r"[:/](?P<owner>[^/\s]+)/(?P<name>[^/\s]+?)(?:\.git)?$",
+    re.IGNORECASE,
+)
+
+
+def _parse_git_remote_url(url: str) -> tuple[str, str] | None:
+    """Return (owner, repo) parsed from a git remote URL, or None if unparseable."""
+    url = url.strip()
+    match = _GIT_REMOTE_URL_RE.search(url)
+    if not match:
+        return None
+    owner = match.group("owner").strip()
+    name = match.group("name").strip()
+    if not owner or not name:
+        return None
+    return owner, name
+
 
 # Module-level constants for gh --json field lists.
 # These are the single source of truth for all JSON field queries to GitHub.
@@ -1401,16 +1433,10 @@ class GitHub:
         dependency gate to check if blocker issues are still open.
 
         Per-issue-number results are cached in the pass-scoped ``_list_cache``
-        (keyed ``("issue_open", number)``), and cache misses are resolved
-        concurrently. This function was previously a fully serial, one
-        `gh issue view` per number loop, and with dozens of ready issues
-        sharing overlapping blockers, was the dominant cost of `fleet status`
-        (issue #870: ~140s of a ~184s run). Errors are cached the same as a
-        real "closed" answer -- that mirrors this function's existing
-        per-call contract (an errored/nonexistent issue is already treated as
-        "not open" / not blocking), so caching it for the rest of this one
-        pass changes nothing about correctness, only how many times it's
-        re-derived.
+        (keyed ``("issue_open", number)``). Cache misses are first resolved in
+        a single batched GraphQL query (one subprocess for the whole set); only
+        if the batch fails do we fall back to the previous parallel
+        per-``issue_view`` fetch.
 
         Args:
             issue_numbers: List of issue numbers to check
@@ -1431,25 +1457,33 @@ class GitHub:
                 open_issues.add(number)
 
         if uncached:
-
-            def _fetch_state(number: int) -> tuple[int, bool]:
-                try:
-                    issue = self.issue_view(number)
-                    # GitHub API returns issues regardless of state; we need to
-                    # check the state field. If the issue doesn't exist,
-                    # issue_view raises.
-                    is_open = str(issue.get("state") or "").upper() == "OPEN"
-                except (GitHubError, ValueError, TypeError):
-                    # Issue doesn't exist or API error — treat as not blocking
-                    is_open = False
-                return number, is_open
-
-            max_workers = min(_MAX_ISSUE_STATE_WORKERS, len(uncached))
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                for number, is_open in pool.map(_fetch_state, uncached):
+            try:
+                states = self._graphql_issue_states(uncached)
+                for number, is_open in states.items():
                     self._list_cache[("issue_open", number)] = is_open
                     if is_open:
                         open_issues.add(number)
+            except (GitHubError, OSError, ValueError, TypeError):
+                logger.warning(
+                    "Batched issue state query failed, falling back to per-issue view",
+                    exc_info=True,
+                )
+
+                # Fallback to the previous parallel per-issue view fetch.
+                def _fetch_state(number: int) -> tuple[int, bool]:
+                    try:
+                        issue = self.issue_view(number)
+                        is_open = str(issue.get("state") or "").upper() == "OPEN"
+                    except (GitHubError, ValueError, TypeError):
+                        is_open = False
+                    return number, is_open
+
+                max_workers = min(_MAX_ISSUE_STATE_WORKERS, len(uncached))
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    for number, is_open in pool.map(_fetch_state, uncached):
+                        self._list_cache[("issue_open", number)] = is_open
+                        if is_open:
+                            open_issues.add(number)
 
         return open_issues
 
@@ -1469,6 +1503,241 @@ class GitHub:
         if not isinstance(name_with_owner, str):
             raise GitHubError("Expected nameWithOwner string in gh repo view output")
         return name_with_owner
+
+    def _repo_owner_name(self) -> tuple[str, str]:
+        """Resolve the repository owner and name from the local git remote.
+
+        Prefers `git remote get-url origin` over a network round-trip so this
+        can work under `--dry-run` and so fleet status does not pay an extra
+        `gh repo view` process. The result is cached in ``_list_cache`` for the
+        duration of the pass.
+
+        Raises GitHubError when the remote cannot be read or does not point at
+        a parseable GitHub-style URL.
+        """
+        cache_key = ("_repo_owner_name",)
+        cached = self._list_cache.get(cache_key)
+        if isinstance(cached, tuple) and len(cached) == 2:
+            return cached
+
+        try:
+            result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                **no_console_window_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GitHubError(f"Unable to read git remote origin: {exc}") from exc
+
+        if result.returncode != 0:
+            raise GitHubError(
+                f"git remote get-url origin failed: "
+                f"{(result.stderr or '').strip() or result.returncode}"
+            )
+
+        parsed = _parse_git_remote_url(result.stdout.strip())
+        if parsed is None:
+            raise GitHubError(
+                f"Unable to parse owner/name from git remote: {result.stdout.strip()[:200]}"
+            )
+
+        self._list_cache[cache_key] = parsed
+        return parsed
+
+    def _graphql_query(
+        self,
+        query: str,
+        *,
+        allow_failure: bool = False,
+    ) -> dict[str, Any]:
+        """Run a single read-only GraphQL query via ``gh api graphql``.
+
+        The command is classified as read-only by ``_api_is_mutating`` because
+        it starts with the GraphQL ``query`` keyword, so it is not suppressed by
+        ``--dry-run``. Raises GitHubError for non-zero exit or a response that
+        contains no usable ``data``.
+        """
+        result = self.run(
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={query}",
+                "-f",
+                f"owner={self._repo_owner_name()[0]}",
+                "-f",
+                f"name={self._repo_owner_name()[1]}",
+            ],
+            json_output=True,
+            allow_failure=allow_failure,
+        )
+
+        if isinstance(result, GitHubRunResult):
+            if not result.ok:
+                raise GitHubError(f"GraphQL query failed: {result.error}")
+            value = result.value
+        else:
+            value = result
+
+        if not isinstance(value, dict):
+            raise GitHubError("GraphQL query returned non-dict JSON")
+
+        if value.get("data") is None and value.get("errors"):
+            errors = value.get("errors")
+            if isinstance(errors, list):
+                messages = [str(e.get("message", e)) for e in errors]
+                raise GitHubError("; ".join(messages))
+            raise GitHubError(str(errors))
+
+        return value
+
+    def _graphql_issue_states(self, issue_numbers: list[int]) -> dict[int, bool]:
+        """Fetch open/closed state for many issue numbers in one GraphQL query.
+
+        Returns a mapping ``issue_number -> is_open`` for the requested numbers.
+        Missing or errored issues are treated as not open, matching the
+        contract of ``are_issues_open``.
+        """
+        if not issue_numbers:
+            return {}
+
+        owner, name = self._repo_owner_name()
+        states: dict[int, bool] = {}
+
+        for i in range(0, len(issue_numbers), _GRAPHQL_BATCH_SIZE):
+            chunk = issue_numbers[i : i + _GRAPHQL_BATCH_SIZE]
+            fields = " ".join(f"s_{n}: issue(number: {n}) {{ number state }}" for n in chunk)
+            query = (
+                f"query($owner: String!, $name: String!) {{ "
+                f"repository(owner: $owner, name: $name) {{ {fields} }} "
+                f"}}"
+            )
+
+            data = self._graphql_query(query).get("data", {})
+            repo = data.get("repository", {})
+            if not isinstance(repo, dict):
+                raise GitHubError("GraphQL response missing repository")
+
+            for number in chunk:
+                alias = f"s_{number}"
+                issue = repo.get(alias)
+                if not isinstance(issue, dict):
+                    states[number] = False
+                    continue
+                returned_number = issue.get("number")
+                if returned_number is not None:
+                    number = int(returned_number)
+                is_open = str(issue.get("state") or "").upper() == "OPEN"
+                states[number] = is_open
+
+        return states
+
+    def _graphql_issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
+        """Fetch GitHub-native ``blockedBy`` dependencies for many issues at once.
+
+        Returns a mapping ``issue_number -> [blocker_number, ...]``. Also warms
+        the ``("issue_open", blocker_number)`` cache for the returned blockers
+        so the downstream ``are_issues_open`` call can avoid refetching them.
+        """
+        if not issue_numbers:
+            return {}
+
+        owner, name = self._repo_owner_name()
+        deps_by_number: dict[int, list[int]] = {}
+
+        for i in range(0, len(issue_numbers), _GRAPHQL_BATCH_SIZE):
+            chunk = issue_numbers[i : i + _GRAPHQL_BATCH_SIZE]
+            fields = " ".join(
+                f"i_{n}: issue(number: {n}) {{ "
+                f"number "
+                f"blockedBy(first: {_GRAPHQL_BLOCKED_BY_FIRST}) {{ "
+                f"nodes {{ number state }} "
+                f"pageInfo {{ hasNextPage }} "
+                f"}} "
+                f"}}"
+                for n in chunk
+            )
+            query = (
+                f"query($owner: String!, $name: String!) {{ "
+                f"repository(owner: $owner, name: $name) {{ {fields} }} "
+                f"}}"
+            )
+
+            data = self._graphql_query(query).get("data", {})
+            repo = data.get("repository", {})
+            if not isinstance(repo, dict):
+                raise GitHubError("GraphQL response missing repository")
+
+            for number in chunk:
+                alias = f"i_{number}"
+                issue = repo.get(alias)
+                if not isinstance(issue, dict):
+                    deps_by_number[number] = []
+                    self._list_cache[("issue_dependencies", number)] = []
+                    continue
+
+                returned_number = issue.get("number")
+                if returned_number is not None:
+                    number = int(returned_number)
+
+                blocked_by: list[int] = []
+                blocked_by_conn = issue.get("blockedBy")
+                if isinstance(blocked_by_conn, dict):
+                    if blocked_by_conn.get("pageInfo", {}).get("hasNextPage"):
+                        logger.warning(
+                            "Issue #%d has more than %d blockedBy entries; "
+                            "only the first page was fetched",
+                            number,
+                            _GRAPHQL_BLOCKED_BY_FIRST,
+                        )
+                    for node in blocked_by_conn.get("nodes") or []:
+                        if isinstance(node, dict):
+                            blocker_number = node.get("number")
+                            if blocker_number is not None:
+                                blocked_by.append(int(blocker_number))
+                                # Cache the blocker state now so
+                                # are_issues_open does not need to re-derive it.
+                                is_open = str(node.get("state") or "").upper() == "OPEN"
+                                self._list_cache[("issue_open", int(blocker_number))] = is_open
+
+                deps_by_number[number] = blocked_by
+                self._list_cache[("issue_dependencies", number)] = blocked_by
+
+        return deps_by_number
+
+    def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
+        """Fetch GitHub-native blocked-by relationships for a list of issues.
+
+        Uses a single batched GraphQL query (or a small number of chunked
+        queries for large backlogs) instead of one REST API call per issue.
+        Mirrors the fail-open contract of ``get_github_issue_dependencies``:
+        if the batched query cannot be built or fails, falls back to the
+        original per-issue REST calls and returns whatever was successfully
+        resolved.
+        """
+        if not issue_numbers:
+            return {}
+
+        try:
+            return self._graphql_issue_dependencies(issue_numbers)
+        except (GitHubError, OSError, ValueError, TypeError):
+            logger.warning(
+                "Batched issue dependency query failed, falling back to per-issue REST",
+                exc_info=True,
+            )
+
+        # Fallback to the original per-issue REST endpoint, preserving the
+        # warm-cache contract for callers that later call get_github_issue_dependencies.
+        result: dict[int, list[int]] = {}
+        for number in issue_numbers:
+            deps = get_github_issue_dependencies(self, number)
+            result[number] = deps
+        return result
 
 
 @runtime_checkable
@@ -1556,6 +1825,8 @@ class GitHubLike(Protocol):
     def pr_ready(self, number: int) -> GitHubRunResult: ...
 
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]: ...
+
+    def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]: ...
 
     def name_with_owner(self) -> str: ...
 
@@ -1867,6 +2138,47 @@ def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:
     return _is_pre_connection_error(error)
 
 
+def _graphql_field_value(args: list[str], field: str) -> str | None:
+    """Return the raw value of a `gh api graphql -f/--field name=value` pair.
+
+    Handles detached (`-f query=...`), attached shorthand (`-fquery=...`),
+    and `--field=query=...` spellings (#919). Returns `None` if the field is
+    absent or its value is missing.
+    """
+    for i, arg in enumerate(args):
+        if arg in ("-f", "--raw-field", "-F", "--field"):
+            next_arg = args[i + 1] if i + 1 < len(args) else ""
+            if "=" in next_arg and next_arg.split("=", 1)[0] == field:
+                return next_arg.split("=", 1)[1]
+        elif arg.startswith("-f") and len(arg) > 2:
+            rest = arg[2:].lstrip("=")
+            if "=" in rest and rest.split("=", 1)[0] == field:
+                return rest.split("=", 1)[1]
+        elif arg.startswith(("--field=", "--raw-field=")):
+            rest = arg.split("=", 1)[1]
+            if "=" in rest and rest.split("=", 1)[0] == field:
+                return rest.split("=", 1)[1]
+    return None
+
+
+def _is_graphql_query(args: list[str]) -> bool:
+    """A `gh api graphql -f query='query { ... }'` is a read-only query.
+
+    `args` is the argv after the leading `gh` token, so a GraphQL call looks
+    like `["api", "graphql", "-f", "query=..."]`.
+
+    Fails closed: only an operation that *starts* with the GraphQL `query`
+    keyword is treated as read-only. `mutation` or anything unparseable is
+    classified as mutating so a stray write never runs under `--dry-run`.
+    """
+    if len(args) < 2 or args[0] != "api" or args[1] != "graphql":
+        return False
+    query = _graphql_field_value(args, "query")
+    if not query:
+        return False
+    return query.lstrip()[:5].lower() == "query"
+
+
 def _api_is_mutating(args: list[str]) -> bool:
     """Classify a `gh api` invocation, for the --dry-run gate.
 
@@ -1884,7 +2196,14 @@ def _api_is_mutating(args: list[str]) -> bool:
     (#914, #917). Enumeration is the wrong shape here: it silently fails open on
     each spelling nobody thought of (`-X`, `-X=`, `-XDELETE`, a trailing `--method`
     with no value).
+
+    Read-only `gh api graphql -f query='query { ... }'` is an exception: it is a
+    GraphQL query and must be runnable under `--dry-run` so `fleet status` can
+    batch issue dependency/state lookups in a single subprocess (#923).
     """
+    if _is_graphql_query(args):
+        return False
+
     for i, arg in enumerate(args):
         if arg in ("-X", "--method"):
             method = args[i + 1] if i + 1 < len(args) else ""
@@ -1899,16 +2218,12 @@ def _api_is_mutating(args: list[str]) -> bool:
         return not method or method.upper() not in ("GET", "HEAD")
     # No explicit method. gh switches GET -> POST when request parameters are added
     # ("adding request parameters will automatically switch the request method to
-    # POST" -- gh api --help). No call site uses these today, so this arm is latent;
-    # it costs one condition and closes the same class before a site appears. Note
-    # it also classifies a read-only `gh api graphql -f query=...` as mutating, which
-    # over-blocks a dry run rather than under-blocking it -- the safe direction.
-    #
-    # Prefix-matched, not membership-tested, for the same reason as the method arm:
-    # pflag accepts both the detached (`-f title=x`, `--field=labels[]=bug`) and the
-    # attached (`-ftitle=x`) spelling, and a membership test sees only the detached
-    # one (#919). `--field`/`--raw-field`/`--input` are prefixes rather than exact
-    # matches so the bare and `=` forms collapse into one condition.
+    # POST" -- gh api --help). Prefix-matched, not membership-tested, for the same
+    # reason as the method arm: pflag accepts both the detached (`-f title=x`,
+    # `--field=labels[]=bug`) and the attached (`-ftitle=x`) spelling, and a
+    # membership test sees only the detached one (#919). `--field`/`--raw-field`/
+    # `--input` are prefixes rather than exact matches so the bare and `=` forms
+    # collapse into one condition.
     param_prefixes = ("--raw-field", "--field", "--input")
     return any(arg.startswith(param_prefixes) or arg[:2] in ("-f", "-F") for arg in args)
 
