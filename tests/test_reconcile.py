@@ -23,9 +23,13 @@ from charlie_work.github import (
 from charlie_work.instrumentation import read_event_log
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.reconcile import (
+    ACTIVE_STATE_STATUSES,
     AVIATOR_BLOCKED_MESSAGE,
     AVIATOR_CHECK_NAME,
+    DORMANT_CONVERGENCE_EXCLUDED_STATUSES,
     DriftItem,
+    _LABEL_CORROBORATING_STATUSES,
+    _LABEL_STALE_STATUSES,
     _LIST_LIMIT as reconcile_list_limit,
     _fetch_issues,
     _fetch_prs,
@@ -555,7 +559,14 @@ def test_apply_fixes_issue_active_label_with_open_pr() -> None:
     state = empty_state()
     state["issues"]["30"] = {
         "number": 30,
-        "status": "rework_requested",
+        # Issue #1092: was "rework_requested", which now corroborates the
+        # needs_rework label and correctly suppresses the rule. The status is
+        # incidental scaffolding for this test -- its subject is the --fix
+        # APPLY path, not which statuses qualify -- so it is retargeted to a
+        # genuinely-stale status rather than the assertion being relaxed.
+        # test_detect_drift_skips_issue_whose_status_corroborates_the_label
+        # pins the behaviour that displaced it.
+        "status": "dispatch_failed",
         "worker_pid": 12345,
     }
 
@@ -576,6 +587,193 @@ def test_apply_fixes_issue_active_label_with_open_pr() -> None:
     # (#955).
     assert new_state["issues"]["30"]["status"] == PASSIVE_OPEN_STATUS
     assert "worker_pid" not in new_state["issues"]["30"]
+
+
+def test_detect_drift_skips_issue_whose_status_corroborates_the_label() -> None:
+    """Issue #1092: reconcile must not revert a lane the orchestrator is holding.
+
+    This fixture is the exact shape of the production deadlock (job-cannon issue
+    1487): an issue queued behind the dispatch concurrency cap carries
+    ``agent:needs-rework`` with ``status == "rework_requested"`` and an open PR,
+    and has no live worker session because it has not been dispatched yet.
+
+    "Active label + open PR + no live worker" -- the rule's only pre-existing
+    false-positive guard -- is satisfied by that state, so the rule fired and
+    reset the status to PASSIVE_OPEN_STATUS. Since ``_dispatch_rework_impl``
+    selects on ``status == "rework_requested"``, that removed the issue from the
+    dispatch scan; the stranded-PR router then re-set it, and the two alternated
+    every reconcile pass with no forward progress.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, [config.labels.needs_rework])],
+    )
+    state = empty_state()
+    state["issues"]["30"] = {"number": 30, "status": "rework_requested"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "issue_active_label_with_open_pr"] == []
+
+
+def test_corroborating_status_suppresses_both_sub_cases_not_just_stale_active() -> None:
+    """Issue #1092: the exemption must not be gated on ``stale_active`` alone.
+
+    The rule has two independent sub-cases and the motivating issue triggers
+    BOTH at once: it carries ``agent:needs-rework`` (so ``stale_active`` is
+    non-empty) and lacks ``agent:pr-open`` (so ``needs_pr_open`` is true). An
+    exemption written as "skip only when ``not stale_active``" reads correctly,
+    passes a naive version of the criterion above, and still flips this issue on
+    every single pass via the ``needs_pr_open`` half.
+
+    Asserting the fixture really does arm both predicates is the point of this
+    test -- without it the suppression assertion could pass for the wrong reason.
+    """
+    config = OrchestratorConfig()
+    issue_labels = [config.labels.needs_rework]
+
+    # Positive control on the fixture itself: both sub-cases must be armed, or
+    # this test degenerates into a duplicate of the one above.
+    assert set(issue_labels) - {config.labels.pr_open, config.labels.reviewing}, (
+        "fixture must arm the stale_active sub-case"
+    )
+    assert config.labels.pr_open not in issue_labels, "fixture must arm the needs_pr_open sub-case"
+
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, issue_labels)],
+    )
+    state = empty_state()
+    state["issues"]["30"] = {"number": 30, "status": "rework_requested"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "issue_active_label_with_open_pr"] == []
+
+
+def test_detect_drift_still_heals_stale_active_label_after_failed_dispatch() -> None:
+    """Issue #1092: ``dispatch_failed`` stays outside the exemption.
+
+    A rework loop that failed to dispatch is precisely the "left over from a
+    failed rework loop" case the rule was written for (#515). Nothing is holding
+    the issue, so nothing will re-set the label, and the self-heal must still run.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, [config.labels.needs_rework])],
+    )
+    state = empty_state()
+    state["issues"]["30"] = {"number": 30, "status": "dispatch_failed"}
+
+    matches = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "issue_active_label_with_open_pr"
+    ]
+
+    assert len(matches) == 1
+    assert matches[0].issue_number == 30
+    assert matches[0].new_status == PASSIVE_OPEN_STATUS
+
+
+def test_needs_pr_open_still_fires_when_the_issue_has_no_state_entry() -> None:
+    """Issue #1092: an absent status must FALL THROUGH, not be exempted.
+
+    ``tracked_status`` is ``None`` for an issue with no state entry at all. That
+    is the untracked-issue case the ``needs_pr_open`` half exists to catch, so it
+    must still be reported. This is why the predicate is written in the deny-list
+    direction (``not in _LABEL_CORROBORATING_STATUSES``); the allow-list spelling
+    (``in _LABEL_STALE_STATUSES``) reads equivalently, excludes ``None``, and
+    would silently stop labelling brand-new issues forever.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, [])],
+    )
+    state = empty_state()
+    assert "30" not in state["issues"], "fixture must leave tracked_status None"
+
+    matches = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "issue_active_label_with_open_pr"
+    ]
+
+    assert len(matches) == 1
+    assert matches[0].add_labels == (config.labels.pr_open,)
+
+
+def test_label_stale_statuses_stays_derived_from_active_state_statuses() -> None:
+    """Issue #1092: a status added later must default to PROTECTED.
+
+    The protected set is derived by subtraction rather than enumerated, so the
+    safe default is automatic. This guard fails if someone converts the
+    derivation back into a hand-maintained list, or adds a member to
+    ``_LABEL_STALE_STATUSES`` that no longer names a real status.
+
+    The asymmetry that justifies the direction: a wrong "stale" verdict is an
+    infinite loop that starves dispatch, while a wrong "corroborated" verdict is
+    one missed self-heal.
+    """
+    # Derivation preserved, not replaced by a literal.
+    assert _LABEL_CORROBORATING_STATUSES == ACTIVE_STATE_STATUSES - _LABEL_STALE_STATUSES
+
+    # No orphan members: every "stale" status is a real ACTIVE_STATE_STATUSES member.
+    assert _LABEL_STALE_STATUSES <= ACTIVE_STATE_STATUSES
+
+    # Positive control -- an empty protected set would satisfy every assertion
+    # above while exempting nothing, i.e. the guard would pass on the bug.
+    assert _LABEL_CORROBORATING_STATUSES, "protected set must not be empty"
+
+    # The two members the fix turns on, pinned by name.
+    assert "rework_requested" in _LABEL_CORROBORATING_STATUSES
+    assert "dispatch_failed" not in _LABEL_CORROBORATING_STATUSES
+
+    # "escalated" must stay PROTECTED. This assertion is currently unobservable
+    # through behaviour -- the `tracked_status == "escalated"` branch upstream
+    # converges labels from state and `continue`s, so an escalated issue never
+    # reaches the predicate either way (pinned by the companion test below).
+    # It is asserted anyway because the construction must fail CLOSED: if that
+    # short-circuit is ever removed, listing "escalated" as stale would reset
+    # an escalated issue's status to PASSIVE_OPEN_STATUS while
+    # `agent:human-needed` stayed live -- the #894 split-brain that
+    # DORMANT_CONVERGENCE_EXCLUDED_STATUSES exists to prevent.
+    assert "escalated" in _LABEL_CORROBORATING_STATUSES
+    assert "escalated" in DORMANT_CONVERGENCE_EXCLUDED_STATUSES
+
+
+def test_escalated_issue_never_reaches_the_open_pr_self_heal() -> None:
+    """Issue #1092 / #894: escalation is terminal-until-human at BOTH layers.
+
+    The upstream ``tracked_status == "escalated"`` branch short-circuits, so
+    this rule never sees an escalated issue. That is the behaviour this asserts
+    -- and it is asserted with a positive control, because "no drift of kind X"
+    is equally consistent with "correctly suppressed" and "fixture never armed
+    the rule at all". The control uses ``dispatch_failed`` on the byte-identical
+    fixture: it must produce drift, proving the shape reaches the rule.
+    """
+    config = OrchestratorConfig()
+
+    def probe(status: str) -> list[str]:
+        gh = FakeGitHub(
+            prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+            issues=[_issue(30, [config.labels.needs_rework])],
+        )
+        state = empty_state()
+        state["issues"]["30"] = {"number": 30, "status": status}
+        return [item.kind for item in detect_drift(gh, state, config)]
+
+    # Positive control: the same fixture DOES arm the rule.
+    assert "issue_active_label_with_open_pr" in probe("dispatch_failed")
+
+    escalated_kinds = probe("escalated")
+    assert "issue_active_label_with_open_pr" not in escalated_kinds
+    # ...and it is suppressed by being HANDLED elsewhere, not by falling through
+    # every rule silently. The escalated issue still gets its labels converged.
+    assert "escalated_labels_converged" in escalated_kinds
 
 
 def test_detect_drift_finds_done_label_with_active_labels(tmp_path: Path) -> None:

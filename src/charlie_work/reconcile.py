@@ -147,6 +147,61 @@ ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
 # kind permanently unreachable rather than narrowly excluding "escalated".
 DORMANT_CONVERGENCE_EXCLUDED_STATUSES: frozenset[str] = frozenset({"escalated"})
 
+# Issue #1092: the subset of ACTIVE_STATE_STATUSES for which an active agent
+# label on an issue with an open PR is genuinely STALE -- i.e. the orchestrator
+# is not currently holding that issue in any lane, so nothing will re-set the
+# label and issue_active_label_with_open_pr is free to clear it.
+#
+# Every other ACTIVE_STATE_STATUSES member CORROBORATES the label: some router
+# put the issue in that lane deliberately and will set the label again on its
+# next pass. Reverting it there is not a repair, it is one half of a loop --
+# reconcile clears the label and resets status to PASSIVE_OPEN_STATUS, the
+# router re-sets both, forever, at whatever the reconcile cadence happens to be.
+# Measured in job-cannon at a ~29-minute period across 26 issues with zero
+# forward progress, because _dispatch_rework_impl selects on
+# status == "rework_requested" (workflow.py) and the revert removes the issue
+# from that scan entirely.
+#
+# Derived by SUBTRACTION rather than enumerated, so a status added to
+# ACTIVE_STATE_STATUSES later defaults to protected. The asymmetry justifies the
+# direction: a wrong "stale" verdict is an infinite loop that starves dispatch,
+# while a wrong "corroborated" verdict is one missed self-heal that some other
+# sweep or the next status change will pick up.
+#
+# The two members are here for DIFFERENT reasons; neither generalizes to the
+# other:
+#
+#   "dispatch_failed" -- a rework loop that failed to dispatch is precisely the
+#   "left over from a failed rework loop" case the rule was written for (#515).
+#   Exempting it would disable the rule's original purpose.
+#
+#   "open_passive" -- this is the status the rule itself WRITES on repair, so
+#   its presence here means "re-fire on an issue this rule already converged".
+#   That is reachable and intended: labels can drift after convergence (an
+#   external relabel, a partially-applied transition), and repairing labels
+#   against an already-correct status is idempotent, not a loop. No router
+#   holds an issue in this lane, so nothing re-sets the label afterwards.
+#
+# "escalated" is deliberately NOT a member, and its absence is load-bearing
+# even though it is currently unobservable. Escalated issues never reach this
+# predicate at all -- the `tracked_status == "escalated"` branch above
+# converges labels from state and `continue`s, and its comment names this rule
+# as the thing it is protecting against ("the zero-label shape the open-PR
+# self-heal below would otherwise silently re-arm"). Listing it as STALE would
+# therefore be inert today but fail OPEN: if that branch ever stopped
+# short-circuiting, an escalated issue would get its status silently reset to
+# PASSIVE_OPEN_STATUS while `agent:human-needed` stayed live -- the #894
+# status/label split-brain that DORMANT_CONVERGENCE_EXCLUDED_STATUSES (above)
+# exists to prevent, re-created one rule over. Protected here means this rule
+# fails closed if that guard ever moves.
+_LABEL_STALE_STATUSES: frozenset[str] = frozenset(
+    {
+        "dispatch_failed",
+        "open_passive",
+    }
+)
+_LABEL_CORROBORATING_STATUSES: frozenset[str] = ACTIVE_STATE_STATUSES - _LABEL_STALE_STATUSES
+
 
 def _issue_state(issue: dict[str, Any] | None) -> str:
     """Return the upper-cased GitHub state for an issue dict.
@@ -1537,6 +1592,22 @@ def detect_drift(
                 and not terminal_present
                 and issue_number not in issues_handled_by_session_relabel
                 and issue_number not in live_session_issue_numbers
+                # Issue #1092: state corroborates the label -- some router is
+                # deliberately holding this issue in a lane and will re-set both
+                # the label and the status on its next pass, so "repairing" it
+                # here just starts a loop. Worker liveness (the check above) is
+                # NOT sufficient on its own: "active label + open PR + no live
+                # worker" is also the exact, correct state of an issue queued
+                # behind the dispatch concurrency cap, which is every issue past
+                # the Nth in any rework batch.
+                #
+                # Deny-list form is deliberate. tracked_status is None when the
+                # issue has no state entry at all, and None must FALL THROUGH to
+                # let the rule fire -- a brand-new issue whose PR went unnoticed
+                # is exactly what the needs_pr_open half exists to catch. The
+                # allow-list spelling (`tracked_status in _LABEL_STALE_STATUSES`)
+                # reads equivalently and silently excludes that issue forever.
+                and tracked_status not in _LABEL_CORROBORATING_STATUSES
                 and _issue_state(issue) == "OPEN"
             ):
                 pr_number = min(int(pr["number"]) for pr in open_prs)
