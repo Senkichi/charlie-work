@@ -147,10 +147,19 @@ def test_kill_process_tree_start_time_verification() -> None:
     """Test that kill_process_tree verifies start time when provided."""
     from unittest.mock import patch
 
-    # Spawn a real child process
-    # On POSIX, use start_new_session=True to avoid sharing pytest's process group
+    # Spawn a real child process.
+    # On POSIX, use start_new_session=True to avoid sharing pytest's process group.
+    #
+    # The sleep must outlast the whole test body, not just "long enough" (it was
+    # 10s, which flaked on CI: this suite runs under `-n 2` on a shared Windows
+    # box alongside the live fleet). If the child exits on its own first,
+    # `taskkill /T /F /PID` reports the PID as not found and exits outside the
+    # (0, 1) codes kill_process_tree accepts, so it returns [] -- which makes the
+    # *negative* case below pass vacuously and the positive case fail with a
+    # baffling `assert <pid> in []`. The finally block terminates the child
+    # regardless, so a long sleep costs nothing.
     proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(10)"],
+        [sys.executable, "-c", "import time; time.sleep(300)"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=(os.name != "nt"),
@@ -217,10 +226,29 @@ def test_kill_process_tree_start_time_verification() -> None:
 
         # Mock _enumerate_child_pids to avoid wmic on Windows
         with patch("charlie_work.process_utils._enumerate_child_pids", return_value=[]):
+            # Both assertions below are only meaningful while the child is
+            # still alive. If it has already exited, `taskkill /F /PID` exits
+            # with a not-found code outside (0, 1), kill_process_tree returns [],
+            # and the mismatch case below passes for a reason that has nothing to
+            # do with start-time verification -- while the positive case fails as
+            # a baffling `assert <pid> in []`. That is precisely the CI flake
+            # this test had.
+            #
+            # Probe with is_pid_alive, NOT proc.poll() and NOT
+            # get_process_start_time. Both of those still report "alive" for a
+            # child that Popen still holds a handle to: poll() until Python reaps
+            # it, and get_process_start_time because a terminated process object
+            # stays queryable. Each was tried first, and each sailed straight
+            # through a mutation that killed the fixture mid-test.
+            assert is_pid_alive(proc.pid), (
+                "fixture process was already gone before the mismatch case"
+            )
+
             # Test 1: Wrong start time should NOT kill
             wrong_start_time = actual_start_time - 1000  # 1000 seconds in the past
             killed = kill_process_tree(proc.pid, wrong_start_time)
             assert killed == []  # Should not kill due to start time mismatch
+            assert is_pid_alive(proc.pid), "mismatched start time must leave the process alive"
 
             # Test 2: Correct start time should kill
             killed = kill_process_tree(proc.pid, actual_start_time)
