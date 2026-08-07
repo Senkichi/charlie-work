@@ -35,7 +35,12 @@ from typing import Any
 
 import pytest
 
-from charlie_work.config import AutoMergeConfig, CrossFamilyConfig, OrchestratorConfig
+from charlie_work.config import (
+    AutoMergeConfig,
+    CrossFamilyConfig,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+)
 from charlie_work.cross_family import _CAVEAT, CrossFamilyResult
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
@@ -100,6 +105,7 @@ def _make_app(
     max_regen_attempts: int = 2,
     auto_verdict: bool = True,
     dry_run: bool = False,
+    review_dispatch_enabled: bool = False,
 ) -> OrchestratorApp:
     """Mirror of test_charlie_work._make_loop_app, but with cross-family ON.
 
@@ -114,6 +120,11 @@ def _make_app(
             max_regen_attempts=max_regen_attempts,
         ),
         auto_merge=AutoMergeConfig(required_checks=(), require_approved_review=True),
+        # Defaults to False, matching ReviewDispatchConfig's own default and
+        # both live fleets. The `review_started` label edge at the tail of
+        # review() is gated on this, so it is off in every other test here --
+        # which is precisely why the #384 clobber below stayed invisible.
+        review_dispatch=ReviewDispatchConfig(enabled=review_dispatch_enabled),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -395,6 +406,56 @@ def test_regeneration_is_bounded_and_escalates_to_a_human(
     # AC-2: no verdict was recorded against the unconfirmed head.
     decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
     assert decision["decision"] != "approved"
+
+
+def test_the_escalating_pass_does_not_strip_the_human_needed_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #384: `review_started` must not fire on the pass that escalates.
+
+    Since #1099 the cross-family exhaustion escalates from *inside* review()
+    (`_cross_family_for_pr` -> `_escalate_cross_family_regen_exhausted`), below
+    the escalated-guard at the head of the method. review() then continues to
+    its label side-effects, and the `review_started` edge adds
+    `(pr_open, reviewing)` while removing every other workflow label --
+    `human_needed` among them. Left unguarded, the escalating pass applies the
+    label and strips it moments later: escalated in state, invisible on GitHub.
+
+    ``_labels_added`` cannot see this. It is append-only bookkeeping, so the
+    assertion in the sibling test above stays true even if the label is removed
+    on the next line. The discriminating signal is *how many* `review_started`
+    edges fire, which is ordering-independent: the model runs on passes 1 and 2,
+    and the escalation lands at the end of pass 2, so the edge must fire once.
+    Without the guard it fires twice -- the second one being the clobber.
+
+    This is the only test here that enables `review_dispatch`; with it at its
+    default the edge is skipped entirely and the whole path is unreachable.
+    """
+    app = _make_app(
+        tmp_path,
+        prs=[_pr456(HEAD)],
+        max_regen_attempts=2,
+        review_dispatch_enabled=True,
+    )
+    _plant_packet(app, tmp_path, 456, head_sha=HEAD, report_text=_UNAVAILABLE_STUB)
+    model_calls = _stub_model(monkeypatch, writes=None)  # model stays down
+
+    for _ in range(4):
+        app.loop(limit=0)
+
+    reviewing = app.config.labels.reviewing
+    human_needed = app.config.labels.human_needed
+
+    # Control: the edge is genuinely live in this configuration. If this is 0
+    # the test proves nothing -- it would pass just as happily with the label
+    # machinery switched off, which is the state every other test here runs in.
+    assert (123, reviewing) in _labels_added(app), "review_started never fired at all"
+
+    assert len(model_calls) == 2, "precondition: escalation lands on the second pass"
+    assert (123, human_needed) in _labels_added(app), "escalation must apply the label"
+    assert _labels_added(app).count((123, reviewing)) == 1, (
+        "review_started fired on the escalating pass and stripped human_needed"
+    )
 
 
 def test_pr_blocked_upstream_of_cross_family_terminates_by_parking(

@@ -9932,6 +9932,33 @@ class OrchestratorApp:
                     and live_head_sha == reviewed_head_sha
                 ):
                     should_skip_transition = True
+                # Issue #384, re-checked here and not only at the top of
+                # review(): the `review_started` edge removes every workflow
+                # label it is not adding, `human_needed` included. The guard at
+                # the head of this method reads state before any of review()'s
+                # own work, so it cannot see an escalation applied *during* this
+                # pass -- and since issue #1099
+                # `_escalate_cross_family_regen_exhausted` does exactly that,
+                # from `_cross_family_for_pr` a few hundred lines above.
+                # Without this re-read the escalating pass would apply
+                # `human_needed` and then strip it moments later, leaving the
+                # issue escalated in state with no label on GitHub: the
+                # #586/#594 escalated-without-label shape, reintroduced from
+                # inside the pass rather than from the next one.
+                #
+                # The sibling mid-review escalation (the infra-rerun cap) avoids
+                # this by returning immediately. This path cannot -- the model
+                # already ran and its packet is worth writing -- so it suppresses
+                # the label edge instead. Enforced at the boundary for *any*
+                # escalation, not just the cross-family one, so the next
+                # mid-review escalation added here inherits the fix.
+                issue_state_now = (
+                    state.get("issues", {}).get(str(issue_number), {})
+                    if issue_number is not None
+                    else None
+                )
+                if any(_escalation_flags(pr_state, issue_state_now)):
+                    should_skip_transition = True
 
             if not should_skip_transition and not dispatch_disabled:
                 result = transition(self.gh, self.config.labels, issue_number, "review_started")

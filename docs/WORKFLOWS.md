@@ -221,8 +221,12 @@ Setting `max_regen_attempts` to `0` disables forced regeneration entirely: an
 unusable report parks the PR on the first pass. (Before #1099 it escalated on
 the first pass instead. With regeneration disabled the model can never run, so
 that escalation asserted a failure it had no evidence for — the defect #1099
-fixed. The PR is still visible: `_record_cross_family_verdicts` emits an
-error-level `cross_family_verdict_head_indeterminate` for it every pass.)
+fixed. The PR does not go dark: the janitor re-runs on every pass and rewrites
+`janitor_ok` / `janitor_failures` on the PR's `state.json` record
+unconditionally, so its actual blocker is always current and readable. A
+`janitor_gate` event is emitted whenever that failure set *changes* — note it is
+change-gated, not per-pass, so read the state record rather than counting
+events.)
 
 Manually running `charlie why-charlie-hate --pr <n>` calls `review()` with the
 budget explicitly disabled (`enforce_regen_budget=False`), so it always attempts
