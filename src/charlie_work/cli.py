@@ -1820,7 +1820,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "review-queue":
         return app.review_queue()
     if args.command == "why-charlie-hate":
-        return app.review(args.pr, cross_family=args.cross_family)
+        # The operator's manual re-run is deliberately exempt from the per-head
+        # cross-family regeneration budget (issue #1099): a human typing a
+        # command is not the loop the bound defends against, and RUNBOOK.md's
+        # recovery procedure for an exhausted budget is exactly this command.
+        return app.review(args.pr, cross_family=args.cross_family, enforce_regen_budget=False)
     if args.command == "why-charlie-hate-spec":
         try:
             return app.spec_review(args.spec_file)

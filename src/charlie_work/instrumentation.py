@@ -188,6 +188,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # regenerated. The lane recovers, but it needed repair to get there and
         # a repeating burst on one PR is the signature of a model outage.
         "cross_family_report_regen_forced": "warning",
+        # review() was forced to run to regenerate an unusable cross-family
+        # report and returned before ever reaching the regenerator -- almost
+        # always the janitor gate declining a PR with merge conflicts or missing
+        # checks. Warning, not error: the PR has a real upstream problem that
+        # its own gate already reported, and this bound only stops the fleet
+        # from re-entering review() for it forever. Before #1099 this decline
+        # was recorded nowhere, which is why diagnosing it took reconstructing
+        # the call path by hand.
+        "cross_family_regen_not_reached": "warning",
         "deescalation_cap_exhausted": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",

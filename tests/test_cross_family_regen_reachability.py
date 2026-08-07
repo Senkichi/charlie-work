@@ -35,7 +35,12 @@ from typing import Any
 
 import pytest
 
-from charlie_work.config import AutoMergeConfig, CrossFamilyConfig, OrchestratorConfig
+from charlie_work.config import (
+    AutoMergeConfig,
+    CrossFamilyConfig,
+    OrchestratorConfig,
+    ReviewDispatchConfig,
+)
 from charlie_work.cross_family import _CAVEAT, CrossFamilyResult
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
@@ -100,6 +105,7 @@ def _make_app(
     max_regen_attempts: int = 2,
     auto_verdict: bool = True,
     dry_run: bool = False,
+    review_dispatch_enabled: bool = False,
 ) -> OrchestratorApp:
     """Mirror of test_charlie_work._make_loop_app, but with cross-family ON.
 
@@ -114,6 +120,11 @@ def _make_app(
             max_regen_attempts=max_regen_attempts,
         ),
         auto_merge=AutoMergeConfig(required_checks=(), require_approved_review=True),
+        # Defaults to False, matching ReviewDispatchConfig's own default and
+        # both live fleets. The `review_started` label edge at the tail of
+        # review() is gated on this, so it is off in every other test here --
+        # which is precisely why the #384 clobber below stayed invisible.
+        review_dispatch=ReviewDispatchConfig(enabled=review_dispatch_enabled),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -397,22 +408,85 @@ def test_regeneration_is_bounded_and_escalates_to_a_human(
     assert decision["decision"] != "approved"
 
 
-def test_pr_blocked_upstream_of_cross_family_still_terminates(
+def test_the_escalating_pass_does_not_strip_the_human_needed_label(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The bound must also terminate when regeneration can never even run.
+    """Issue #384: `review_started` must not fire on the pass that escalates.
+
+    Since #1099 the cross-family exhaustion escalates from *inside* review()
+    (`_cross_family_for_pr` -> `_escalate_cross_family_regen_exhausted`), below
+    the escalated-guard at the head of the method. review() then continues to
+    its label side-effects, and the `review_started` edge adds
+    `(pr_open, reviewing)` while removing every other workflow label --
+    `human_needed` among them. Left unguarded, the escalating pass applies the
+    label and strips it moments later: escalated in state, invisible on GitHub.
+
+    ``_labels_added`` cannot see this. It is append-only bookkeeping, so the
+    assertion in the sibling test above stays true even if the label is removed
+    on the next line. The discriminating signal is *how many* `review_started`
+    edges fire, which is ordering-independent: the model runs on passes 1 and 2,
+    and the escalation lands at the end of pass 2, so the edge must fire once.
+    Without the guard it fires twice -- the second one being the clobber.
+
+    This is the only test here that enables `review_dispatch`; with it at its
+    default the edge is skipped entirely and the whole path is unreachable.
+    """
+    app = _make_app(
+        tmp_path,
+        prs=[_pr456(HEAD)],
+        max_regen_attempts=2,
+        review_dispatch_enabled=True,
+    )
+    _plant_packet(app, tmp_path, 456, head_sha=HEAD, report_text=_UNAVAILABLE_STUB)
+    model_calls = _stub_model(monkeypatch, writes=None)  # model stays down
+
+    for _ in range(4):
+        app.loop(limit=0)
+
+    reviewing = app.config.labels.reviewing
+    human_needed = app.config.labels.human_needed
+
+    # Control: the edge is genuinely live in this configuration. If this is 0
+    # the test proves nothing -- it would pass just as happily with the label
+    # machinery switched off, which is the state every other test here runs in.
+    assert (123, reviewing) in _labels_added(app), "review_started never fired at all"
+
+    assert len(model_calls) == 2, "precondition: escalation lands on the second pass"
+    assert (123, human_needed) in _labels_added(app), "escalation must apply the label"
+    assert _labels_added(app).count((123, reviewing)) == 1, (
+        "review_started fired on the escalating pass and stripped human_needed"
+    )
+
+
+def test_pr_blocked_upstream_of_cross_family_terminates_by_parking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Work must also terminate when regeneration can never even run.
 
     This is the shape PR #1073 actually has in production: it is janitor-blocked,
     so ``review()`` returns on the janitor gate and never reaches the
     cross-family pass at all. The model is therefore never invoked and the report
-    can never improve, no matter how many passes run.
+    can never improve, no matter how many passes run. Unbounded, this PR would
+    re-enter ``review()`` on literally every pass forever.
 
-    The previous test's bound is spent by a model that runs and fails; this one
-    is spent by a model that never runs. Without a bound this PR would re-enter
-    ``review()`` on literally every pass forever -- the same unbounded-work
-    failure, reached by a different route. The escalation reason stays literally
-    accurate: the report is unusable, which is observed, rather than naming a
-    cause that was inferred.
+    **The termination changed in #1099, deliberately, and this test changed with
+    it.** It used to end in the same ``cross_family_report_unusable`` escalation
+    as the previous test, on the reasoning that "the report is unusable" is
+    observed rather than inferred. That reasoning was wrong in a way only
+    production showed: "unusable" is observed, but the escalation asserts
+    unusable *and unfixable*, and regeneration was never tried even once. In
+    job-cannon 36 of 54 escalated issues carried that reason for a report whose
+    model had never been invoked, and 26 of 27 re-escalated within hours of
+    being re-armed. The sink refilled as fast as it was drained.
+
+    So this path now terminates by PARKING -- the counter is recorded, no
+    escalation, no label. The asymmetry is the point: the record is keyed by
+    head SHA, so a park self-heals on the next push, whereas
+    ``reason_class="judgment"`` is excluded from the automatic de-escalation
+    sweep and needs a human. A wrong park costs a few cheap passes; a wrong
+    escalation costs a person. The PR is not abandoned either -- the janitor
+    gate reports its actual problem on its own channel every pass, which is the
+    consumer that was always supposed to own this.
     """
     pr = _pr456(HEAD)
     # Drop the tests/rationale mention -> janitor gate blocks review() early.
@@ -420,23 +494,30 @@ def test_pr_blocked_upstream_of_cross_family_still_terminates(
     app = _make_app(tmp_path, prs=[pr], max_regen_attempts=2)
     pr_dir = _plant_packet(app, tmp_path, 456, head_sha=HEAD, report_text=_UNAVAILABLE_STUB)
     model_calls = _stub_model(monkeypatch, writes=_good_report(HEAD))
+    review_calls = _track_review(app)
 
     for _ in range(5):
         app.loop(limit=0)
 
     assert model_calls == [], "review() never reaches the cross-family pass here"
+    # The bound still binds: two forced passes, then parked. Five would mean it
+    # never terminated, which is the failure this test has always existed for.
+    assert review_calls.count(456) == 2
 
-    # Escalated once and stayed put -- passes 4 and 5 must add nothing.
-    exhausted = _events(app, "cross_family_report_regen_exhausted")
-    assert [e.get("pr_number") for e in exhausted] == [456]
-    assert len(_events(app, "cross_family_report_regen_forced")) == 2
+    not_reached = _events(app, "cross_family_regen_not_reached")
+    assert [e["payload"]["not_reached"] for e in not_reached] == [1, 2]
+
+    # The regeneration budget is untouched -- nothing was regenerated, so
+    # nothing may be charged for regenerating. This is the assertion that would
+    # have caught the production defect.
+    assert _events(app, "cross_family_report_regen_forced") == []
+    assert _events(app, "cross_family_report_regen_exhausted") == []
 
     state = load_state(app.paths.state_file)
-    assert state["issues"]["123"]["status"] == "escalated"
-    assert (123, app.config.labels.human_needed) in _labels_added(app)
-    # The label edge is applied once, not re-applied on every later pass.
-    assert _labels_added(app).count((123, app.config.labels.human_needed)) == 1
-    assert state["issues"]["123"]["label_error"] is None
+    assert state["prs"]["456"]["cross_family_regen"]["not_reached"] == 2
+    assert state["prs"]["456"]["cross_family_regen"]["attempts"] == 0
+    assert state["issues"].get("123", {}).get("status") != "escalated"
+    assert (123, app.config.labels.human_needed) not in _labels_added(app)
     decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
     assert decision["decision"] != "approved"
 
@@ -444,41 +525,50 @@ def test_pr_blocked_upstream_of_cross_family_still_terminates(
 def test_dry_run_claims_nothing_and_fires_no_label_edit(tmp_path: Path) -> None:
     """``--dry-run`` must not write ``state.json`` or edit a live label.
 
-    Exercised against the ESCALATION branch (``max_regen_attempts=0``) rather
-    than the claim branch, because escalation is the branch that reaches
-    GitHub. A dry-run gate proven only on the claim branch would leave the
-    label edit -- the part that mutates something outside this process --
-    untested.
+    Since #1099 the bound has two mutating halves, and the gate is exercised on
+    BOTH: ``_claim_...`` writes ``state.json``, and
+    ``_escalate_cross_family_regen_exhausted`` is the only one that reaches
+    GitHub. Proving the gate on one half would leave the other -- for the
+    escalation, the part that mutates something outside this process --
+    untested. That is not hypothetical: the gate used to be a single check in a
+    single method, and the split is exactly the kind of change that silently
+    drops one of them.
 
-    Carries its own positive control. "Nothing was written" is equally
+    Each half carries its own positive control. "Nothing was written" is equally
     consistent with "the gate works" and with "the call never reached the
     mutating code", so the identical call is made on a live app first and
-    asserted to write state AND add the label. Without that control this test
-    would still pass if the escalation branch were deleted outright.
+    asserted to mutate. Without those controls this test would still pass if
+    either branch were deleted outright.
     """
-    (tmp_path / "live").mkdir()
-    (tmp_path / "dry").mkdir()
+    for name in ("live-claim", "dry-claim", "live-esc", "dry-esc"):
+        (tmp_path / name).mkdir()
 
-    live = _make_app(tmp_path / "live", prs=[_pr456(HEAD)], max_regen_attempts=0)
-    assert (
-        live._claim_cross_family_regen_attempt(
-            pr_number=456, issue_number=123, head_sha=HEAD, report_head=None
-        )
-        is False
-    )
-    # Control: this exact call really does reach the mutating code.
-    assert live.paths.state_file.exists()
-    assert (123, live.config.labels.human_needed) in _labels_added(live)
+    # --- half 1: the claim, which writes state.json --------------------------
+    # max_regen_attempts=1 so there IS a budget to claim; at 0 the claim
+    # short-circuits before the write and the control would prove nothing.
+    live_claim = _make_app(tmp_path / "live-claim", prs=[_pr456(HEAD)], max_regen_attempts=1)
+    assert _claim(live_claim) is True
+    assert live_claim.paths.state_file.exists(), "control: the claim really does write"
+    assert _events(live_claim, "cross_family_report_regen_forced") != []
 
-    dry = _make_app(tmp_path / "dry", prs=[_pr456(HEAD)], max_regen_attempts=0, dry_run=True)
-    assert (
-        dry._claim_cross_family_regen_attempt(
-            pr_number=456, issue_number=123, head_sha=HEAD, report_head=None
-        )
-        is False
+    dry_claim = _make_app(
+        tmp_path / "dry-claim", prs=[_pr456(HEAD)], max_regen_attempts=1, dry_run=True
     )
-    assert not dry.paths.state_file.exists()
-    assert _labels_added(dry) == []
+    assert _claim(dry_claim) is False
+    assert not dry_claim.paths.state_file.exists()
+
+    # --- half 2: the escalation, which reaches GitHub ------------------------
+    live_esc = _make_app(tmp_path / "live-esc", prs=[_pr456(HEAD)], max_regen_attempts=0)
+    _adjudicate(live_esc)
+    assert live_esc.paths.state_file.exists()
+    assert (123, live_esc.config.labels.human_needed) in _labels_added(live_esc)
+
+    dry_esc = _make_app(
+        tmp_path / "dry-esc", prs=[_pr456(HEAD)], max_regen_attempts=0, dry_run=True
+    )
+    _adjudicate(dry_esc)
+    assert not dry_esc.paths.state_file.exists()
+    assert _labels_added(dry_esc) == []
 
 
 def test_regen_budget_resets_when_the_head_moves(
@@ -492,17 +582,17 @@ def test_regen_budget_resets_when_the_head_moves(
     been tried even once.
     """
     pr = _pr456(HEAD)
-    app = _make_app(tmp_path, prs=[pr], max_regen_attempts=1)
+    app = _make_app(tmp_path, prs=[pr], max_regen_attempts=2)
     _plant_packet(app, tmp_path, 456, head_sha=HEAD, report_text=_UNAVAILABLE_STUB)
     model_calls = _stub_model(monkeypatch, writes=None)
     _track_review(app)
 
-    # Exactly one pass: that spends the budget of 1 without yet exhausting it.
-    # A second pass at this head would escalate the issue, and an escalated PR
-    # is skipped earlier in loop(), so the head-move reset below would never be
-    # reached and this test would pass for the wrong reason.
+    # Exactly one pass of a budget of 2, so the budget is spent-but-not-
+    # exhausted. Running it to exhaustion here would escalate the issue, and an
+    # escalated PR is skipped earlier in loop(), so the head-move reset below
+    # would never be reached and this test would pass for the wrong reason.
     app.loop(limit=0)
-    assert len(model_calls) == 1, "budget of 1 spent at the first head"
+    assert len(model_calls) == 1, "one attempt spent at the first head"
 
     # New push: live head and packet head advance together, staying "same-head"
     # so the pre-existing head check still skips and only the reset is under test.
@@ -517,6 +607,80 @@ def test_regen_budget_resets_when_the_head_moves(
     record = state["prs"]["456"]["cross_family_regen"]
     assert record["head_sha"] == new_head
     assert record["attempts"] == 1
+
+
+def test_the_operator_manual_rerun_is_exempt_from_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`charlie why-charlie-hate --pr <n>` must regenerate even once parked.
+
+    This is RUNBOOK.md's documented recovery for an exhausted budget, and it is
+    only safe to exempt because a human typing a command is not the loop the
+    bound defends against (#1078). #1099 moved the claim INTO the regenerator,
+    which is exactly the change that would have silently killed this path --
+    hence the explicit ``enforce_regen_budget=False`` and this test.
+
+    The negative control runs first: the identical call WITH the budget enforced
+    must be refused. Without it this test would pass just as well if the budget
+    had never been spent, or if the bound had been deleted outright.
+    """
+    app = _make_app(tmp_path, prs=[_pr456(HEAD)], max_regen_attempts=2)
+    _plant_packet(app, tmp_path, 456, head_sha=HEAD, report_text=_UNAVAILABLE_STUB)
+    model_calls = _stub_model(monkeypatch, writes=None)  # model stays down
+
+    # A spent budget on a PR that is NOT escalated. Planted rather than driven
+    # through loop(), because loop() escalates in the same pass that spends the
+    # budget and review() hard-stops on an escalated issue -- which would make
+    # both assertions below pass for a reason that has nothing to do with the
+    # budget.
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "cross_family_regen": {"head_sha": HEAD, "attempts": 2, "not_reached": 0},
+    }
+    save_state(app.paths.state_file, state)
+
+    # Control: the budgeted path is genuinely refused at this point.
+    app.review(456)
+    assert model_calls == [], "control: an enforced re-run must not regenerate"
+
+    app.review(456, enforce_regen_budget=False)
+    assert len(model_calls) == 1, "the operator's manual re-run gets a fresh attempt"
+    # ...and it charges nothing, so repeated manual runs during diagnosis cannot
+    # consume the loop's budget, and recovery needs no hand-edit of state.json.
+    record = load_state(app.paths.state_file)["prs"]["456"]["cross_family_regen"]
+    assert record["attempts"] == 2
+
+
+def test_a_head_move_resets_both_budgets_together(tmp_path: Path) -> None:
+    """``attempts`` and ``not_reached`` share one head-keyed record.
+
+    That shared key is the whole reason the two budgets can share
+    ``max_regen_attempts`` as their bound instead of taking a second config
+    knob. If they could reset independently, a PR that burned its not-reached
+    budget while janitor-blocked could push the fix that unblocks it and STILL
+    be parked -- a silent park, with no escalation and no label, that nobody
+    would think to look for.
+    """
+    app = _make_app(tmp_path, prs=[_pr456(HEAD)], max_regen_attempts=2)
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "cross_family_regen": {"head_sha": HEAD, "attempts": 2, "not_reached": 2},
+    }
+    save_state(app.paths.state_file, state)
+
+    # Control: at the head that spent them, both budgets read as spent and the
+    # PR really is parked. Without this the assertions below would also pass if
+    # the record were simply never read.
+    spent = app._cross_family_regen_record(pr_number=456, head_sha=HEAD)
+    assert (spent["attempts"], spent["not_reached"]) == (2, 2)
+    assert app._cross_family_report_current(pr=_pr456(HEAD), pr_number=456) is True
+
+    moved = _pr456("sha-moved")
+    fresh = app._cross_family_regen_record(pr_number=456, head_sha="sha-moved")
+    assert (fresh["attempts"], fresh["not_reached"]) == (0, 0)
+    assert app._cross_family_report_current(pr=moved, pr_number=456) is False
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +729,24 @@ def _claim(app: OrchestratorApp) -> bool:
     )
 
 
+def _adjudicate(app: OrchestratorApp) -> None:
+    """Run the exhaustion adjudication for PR #456.
+
+    Since #1099 the bound has two halves: ``_claim_...`` counts, and this one
+    decides. Escalation and the label edge moved here because only a caller
+    positioned *after* the model call can observe that the report is still
+    unusable -- which is what ``cross_family_report_unusable`` asserts. No
+    report file is planted, so ``report_is_reusable("")`` is False and these
+    apps land on the escalating branch exactly as they did before the split.
+    """
+    app._escalate_cross_family_regen_exhausted(
+        pr_number=456,
+        issue_number=123,
+        head_sha=HEAD,
+        report_path=app.paths.prs / "pr-456" / "cross-family-review.md",
+    )
+
+
 def _label_error(app: OrchestratorApp) -> Any:
     """``label_error`` as persisted, distinguishing absent from None."""
     entry = load_state(app.paths.state_file)["issues"].get("123", {})
@@ -580,13 +762,13 @@ def test_a_failed_label_edge_is_retried_on_the_next_pass(tmp_path: Path) -> None
     """
     app = _escalating_app(tmp_path, _FlakyLabelGitHub(fail_adds=1))
 
-    assert _claim(app) is False
+    _adjudicate(app)
     human_needed = app.config.labels.human_needed
     assert (123, human_needed) not in _labels_added(app)
     assert isinstance(_label_error(app), dict), "a failed edge must be recorded as a dict"
 
-    # Second pass: nothing to claim, but the edge is still owed.
-    assert _claim(app) is False
+    # Second pass: already escalated, but the edge is still owed.
+    _adjudicate(app)
     assert (123, human_needed) in _labels_added(app)
     assert _label_error(app) is None, "a verified edge must be recorded as None"
 
@@ -601,12 +783,12 @@ def test_a_verified_label_edge_is_not_re_applied(tmp_path: Path) -> None:
     app = _escalating_app(tmp_path, _FlakyLabelGitHub(fail_adds=0))
     human_needed = app.config.labels.human_needed
 
-    assert _claim(app) is False
+    _adjudicate(app)
     assert _labels_added(app).count((123, human_needed)) == 1
     assert _label_error(app) is None
 
     for _ in range(3):
-        assert _claim(app) is False
+        _adjudicate(app)
     assert _labels_added(app).count((123, human_needed)) == 1, "re-applied a verified edge"
 
 
@@ -620,7 +802,7 @@ def test_a_concurrent_unescalate_is_not_undone(tmp_path: Path) -> None:
     app = _escalating_app(tmp_path, _FlakyLabelGitHub(fail_adds=1))
     human_needed = app.config.labels.human_needed
 
-    assert _claim(app) is False
+    _adjudicate(app)
     assert (123, human_needed) not in _labels_added(app)
 
     # Simulate the concurrent unescalate, using the literals it actually writes
@@ -636,5 +818,5 @@ def test_a_concurrent_unescalate_is_not_undone(tmp_path: Path) -> None:
     state["issues"]["123"] = issue_entry
     save_state(app.paths.state_file, state)
 
-    assert _claim(app) is False
+    _adjudicate(app)
     assert (123, human_needed) not in _labels_added(app), "re-escalated a released issue"

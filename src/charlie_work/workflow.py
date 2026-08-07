@@ -8871,8 +8871,23 @@ class OrchestratorApp:
         )
 
     @_guard_state_lock
-    def review(self, pr_number: int, *, cross_family: bool | None = None) -> CommandResult:
+    def review(
+        self,
+        pr_number: int,
+        *,
+        cross_family: bool | None = None,
+        enforce_regen_budget: bool = True,
+    ) -> CommandResult:
         """Generate a review packet for a PR.
+
+        ``enforce_regen_budget`` gates the per-head cross-family regeneration
+        bound (issue #1099). It defaults to True -- the automated behaviour --
+        so a caller added later inherits the bound instead of silently escaping
+        it; the operator CLI (`charlie why-charlie-hate`) is the one caller that
+        passes False. A human typing a command is not a loop, so the starvation
+        the bound defends against (#1078) does not apply, and RUNBOOK.md's
+        recovery procedure depends on that manual re-run getting a fresh attempt
+        without hand-editing ``state.json``.
 
         When config.test_adequacy.enabled, this method may itself issue a
         request_changes verdict and advance/terminate the rework loop (previously
@@ -9681,6 +9696,7 @@ class OrchestratorApp:
             issue_number=issue_number,
             diff_path=diff_path,
             enabled=cross_family,
+            enforce_regen_budget=enforce_regen_budget,
         )
         prompt_path = pr_dir / "review-prompt.md"
         decision_path = pr_dir / "review-decision.json"
@@ -9915,6 +9931,33 @@ class OrchestratorApp:
                     and live_head_sha is not None
                     and live_head_sha == reviewed_head_sha
                 ):
+                    should_skip_transition = True
+                # Issue #384, re-checked here and not only at the top of
+                # review(): the `review_started` edge removes every workflow
+                # label it is not adding, `human_needed` included. The guard at
+                # the head of this method reads state before any of review()'s
+                # own work, so it cannot see an escalation applied *during* this
+                # pass -- and since issue #1099
+                # `_escalate_cross_family_regen_exhausted` does exactly that,
+                # from `_cross_family_for_pr` a few hundred lines above.
+                # Without this re-read the escalating pass would apply
+                # `human_needed` and then strip it moments later, leaving the
+                # issue escalated in state with no label on GitHub: the
+                # #586/#594 escalated-without-label shape, reintroduced from
+                # inside the pass rather than from the next one.
+                #
+                # The sibling mid-review escalation (the infra-rerun cap) avoids
+                # this by returning immediately. This path cannot -- the model
+                # already ran and its packet is worth writing -- so it suppresses
+                # the label edge instead. Enforced at the boundary for *any*
+                # escalation, not just the cross-family one, so the next
+                # mid-review escalation added here inherits the fix.
+                issue_state_now = (
+                    state.get("issues", {}).get(str(issue_number), {})
+                    if issue_number is not None
+                    else None
+                )
+                if any(_escalation_flags(pr_state, issue_state_now)):
                     should_skip_transition = True
 
             if not should_skip_transition and not dispatch_disabled:
@@ -12264,6 +12307,13 @@ class OrchestratorApp:
         "janitor_warnings",
         "escalation_reason",
         "label_error",
+        # Issue #1099: the per-head cross-family regeneration record holds both
+        # budgets. Leaving it behind makes the re-arm inert -- loop() reads the
+        # spent counters and parks the PR again on the very next pass, so the
+        # operator's unescalate accomplishes nothing without also hand-editing
+        # state.json. That is the same "re-arm does not stick" shape this
+        # command exists to fix.
+        "cross_family_regen",
         # Rescue tier (issue #555): rescue_attempted is the durable "used my
         # one shot" marker. Only charlie unescalate clears it (this tuple) —
         # every other code path treats a present marker as permanent.
@@ -13791,6 +13841,7 @@ class OrchestratorApp:
         issue_number: int | None,
         diff_path: Path,
         enabled: bool | None,
+        enforce_regen_budget: bool = True,
     ) -> tuple[str, CrossFamilyResult | None]:
         cfg: CrossFamilyConfig = self.config.cross_family
         use = cfg.enabled if enabled is None else enabled
@@ -13805,6 +13856,7 @@ class OrchestratorApp:
         # silent skip on every subsequent pass.
         # Additionally, reports are invalidated when the PR head SHA changes
         # to prevent reviewing stale code (issue #156).
+        text = ""
         if report_path.exists() and report_path.stat().st_size > 0:
             text = report_path.read_text(encoding="utf-8")
             # The wrapper text itself contains bold markdown ("**leads, not
@@ -13815,6 +13867,43 @@ class OrchestratorApp:
                 return self._cross_family_section(report_path), CrossFamilyResult(
                     ok=True, report_path=str(report_path), model=cfg.model, reused=True
                 )
+        # The report is unusable, so the regeneration below is the repair -- and
+        # it is the thing the per-head budget exists to bound, because it runs
+        # the cross-family model synchronously for up to timeout_seconds and
+        # unbounded would starve the other repo in the shared sequential loop
+        # (#1078).
+        #
+        # The claim therefore lives HERE, at the model call it bounds, and not
+        # at loop()'s staleness check where it used to (issue #1099). review()
+        # reaches this line only once the janitor gate has passed; a PR with
+        # merge conflicts or missing required checks returns thousands of lines
+        # earlier. Charging at the staleness check spent the whole budget
+        # without ever regenerating, then escalated
+        # "cross_family_report_unusable" against a PR whose actual problem was
+        # the conflict the janitor gate had already reported in that same pass.
+        # An operation that does not run must not be able to spend its own
+        # budget -- which is why this placement is correct regardless of *which*
+        # of review()'s early returns fires.
+        #
+        # `enforce_regen_budget` is False only for `charlie why-charlie-hate`,
+        # the operator's manual re-run. See review()'s docstring: a human typing
+        # a command is not a loop, and RUNBOOK.md's recovery procedure for an
+        # exhausted budget depends on that path getting a fresh attempt.
+        if (
+            enforce_regen_budget
+            and not self.dry_run
+            and not self._claim_cross_family_regen_attempt(
+                pr_number=pr_number,
+                issue_number=issue_number,
+                head_sha=pr.get("headRefOid"),
+                report_head=extract_head_ref_oid(text) if text.strip() else None,
+            )
+        ):
+            # Budget spent for this head; the pass that spent it escalated to a
+            # human. Return the same shape as the disabled/draft path so the
+            # packet still goes out, just without a cross-family section -- and
+            # no further model call is spent on this head.
+            return "", None
         prompt_text = self._render(
             "cross_family_review.md",
             {
@@ -13838,6 +13927,24 @@ class OrchestratorApp:
             dry_run=self.dry_run,
             head_ref_oid=pr.get("headRefOid"),
         )
+        # Exhaustion is decided HERE, immediately after the model call that
+        # spends the budget, because this is the only point at which both facts
+        # the escalation asserts are actually observed: the model ran, and the
+        # report it left behind is still unusable. Before #1099 this lived
+        # inside the claim, which runs *before* the model -- so it could only
+        # ever assert that a counter had been incremented, and on a
+        # janitor-blocked PR that counter was incremented by a pass that never
+        # invoked the model at all.
+        #
+        # Gated on the same flag as the claim: an unbudgeted manual run charges
+        # nothing, so it must not be able to exhaust anything either.
+        if enforce_regen_budget:
+            self._escalate_cross_family_regen_exhausted(
+                pr_number=pr_number,
+                issue_number=issue_number,
+                head_sha=pr.get("headRefOid"),
+                report_path=report_path,
+            )
         return self._cross_family_section(result.report_path), result
 
     def _build_prior_review_section(
@@ -17249,10 +17356,11 @@ class OrchestratorApp:
                     # never moves the two checks above skip review() forever --
                     # so the regeneration that _cross_family_for_pr already
                     # performs was unreachable and the PR waited on a human
-                    # indefinitely. Bounded per head; see
-                    # _cross_family_report_current.
+                    # indefinitely. Regeneration is still bounded per head, but
+                    # the bound is claimed by the regenerator itself, not here
+                    # -- this call only asks a question (issue #1099).
                     cross_family_current = self._cross_family_report_current(
-                        pr=pr, pr_number=pr_number, issue_number=issue_number
+                        pr=pr, pr_number=pr_number
                     )
                     if head_current and template_current and cross_family_current:
                         # Packet is current — skip regenerating it. But an
@@ -17287,7 +17395,32 @@ class OrchestratorApp:
                                 },
                                 repo=self.repo_root.name,
                             )
+                        # Sampled BEFORE review() so the charge below can tell
+                        # "the regenerator never ran" from "it ran and failed".
+                        # After the fact the two are indistinguishable from the
+                        # report alone -- both leave it unusable (issue #1099).
+                        attempts_before = (
+                            0
+                            if cross_family_current
+                            else int(
+                                self._cross_family_regen_record(
+                                    pr_number=pr_number, head_sha=live_head_sha
+                                ).get("attempts")
+                                or 0
+                            )
+                        )
                         review = self.review(pr_number)
+                        if not cross_family_current:
+                            # review() has now run for the express purpose of
+                            # regenerating this report. If it is still unusable
+                            # and no attempt was charged, the regenerator was
+                            # never reached (issue #1099).
+                            self._charge_cross_family_regen_not_reached(
+                                pr_number=pr_number,
+                                issue_number=issue_number,
+                                head_sha=live_head_sha,
+                                attempts_before=attempts_before,
+                            )
                         if self._record_review_or_error(review, errors, reviews):
                             continue
                         decision = self._review_decision(pr_number)
@@ -19640,7 +19773,6 @@ class OrchestratorApp:
         *,
         pr: dict[str, Any],
         pr_number: int,
-        issue_number: int | None,
     ) -> bool:
         """Return True if the packet's cross-family report needs no regeneration.
 
@@ -19658,6 +19790,13 @@ class OrchestratorApp:
         shared by both -- is what removes the gap. If the skip and the
         regenerator can disagree about whether a report is reusable, that
         disagreement is the stall.
+
+        **This method only asks a question.** It writes no state, escalates
+        nothing, and applies no label. It used to do all three, and because it
+        runs from ``loop()`` rather than from the regenerator, everything it
+        charged was charged by a pass that had not done the work -- issue #1099,
+        and the fleet's single largest source of non-autonomy while it lasted.
+        Keep any new logic here on the read side.
         """
         cfg = self.config.cross_family
         # Mirror _cross_family_for_pr's own early return. With the pass
@@ -19675,14 +19814,154 @@ class OrchestratorApp:
                 text = ""
         if report_is_reusable(text, pr.get("headRefOid")):
             return True
-        # Unusable. Regeneration is the repair, but it is not free: claim a
-        # bounded attempt against this exact head.
-        return not self._claim_cross_family_regen_attempt(
-            pr_number=pr_number,
-            issue_number=issue_number,
-            head_sha=pr.get("headRefOid"),
-            report_head=extract_head_ref_oid(text) if text.strip() else None,
+        # Unusable, so the packet is stale and review() must run. Answering that
+        # one question is now ALL this method does: the regeneration budget is
+        # claimed by the regenerator itself (_cross_family_for_pr), because
+        # review() can -- and for a PR with merge conflicts routinely does --
+        # return before ever reaching it (issue #1099). A predicate must not
+        # mutate state.json, escalate an issue, or apply a GitHub label.
+        #
+        # The budget read below is not a mutation. Once this head's budget is
+        # spent, continuing to report "stale" would re-run the whole review path
+        # every pass, forever, for a PR that this pass cannot advance. Parking
+        # it is what the pre-#1099 code did on this same condition -- via the
+        # claim's return value rather than a read, which is the part that was
+        # wrong.
+        #
+        # TWO budgets park a PR, and they bound different work (issue #1099):
+        #
+        #   attempts     the model RAN and left an unusable report. Bounds a
+        #                600s synchronous call per pass. Terminates by
+        #                escalating to a human, from the regenerator itself.
+        #   not_reached  review() returned before the regenerator, so the model
+        #                never ran. Bounds only the cheap re-entry into
+        #                review(). Terminates by parking, with NO escalation.
+        #
+        # The asymmetry is deliberate. Parking self-heals: the record is keyed
+        # by head SHA, so the next push resets both counters and the PR is
+        # reconsidered for free. `reason_class="judgment"` does not -- it is
+        # excluded from the automatic de-escalation sweep and needs a human. So
+        # a wrong park costs some extra cheap passes until the head moves, while
+        # a wrong escalation costs a human. The measured cost of getting that
+        # backwards is 36 escalated job-cannon issues.
+        record = self._cross_family_regen_record(
+            pr_number=pr_number, head_sha=pr.get("headRefOid")
         )
+        max_attempts = max(0, int(cfg.max_regen_attempts))
+        return (
+            int(record.get("attempts") or 0) >= max_attempts
+            or int(record.get("not_reached") or 0) >= max_attempts
+        )
+
+    def _cross_family_regen_record(
+        self, *, pr_number: int, head_sha: str | None
+    ) -> dict[str, Any]:
+        """This head's cross-family regeneration counters.
+
+        Read-only by construction (issue #1099): the authoritative writes happen
+        under the state lock in ``_claim_cross_family_regen_attempt`` and
+        ``_charge_cross_family_regen_not_reached``, and this snapshot must not
+        be mutated. Reads through ``load_state_locked`` per issue #310's single
+        point of enforcement rather than a bare ``load_state`` -- a read-only
+        caller still takes the lock, and ``tests/test_load_state_locked.py``
+        fails the build otherwise.
+
+        Both counters are stored in one head-keyed record and therefore reset
+        together: a record left by an earlier head reads as all-zero, matching
+        the claim's own reset rule. That shared key is what makes it safe for
+        the two budgets to share ``max_regen_attempts`` as their bound rather
+        than adding a second config knob.
+        """
+        state = load_state_locked(self.paths.state_file)
+        record = state["prs"].get(str(pr_number), {}).get("cross_family_regen")
+        if not isinstance(record, dict) or record.get("head_sha") != head_sha:
+            return {"head_sha": head_sha, "attempts": 0, "not_reached": 0}
+        return record
+
+    def _charge_cross_family_regen_not_reached(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int | None,
+        head_sha: str | None,
+        attempts_before: int,
+    ) -> None:
+        """Charge one "review() ran but never reached the regenerator" pass.
+
+        ``loop()`` forced ``review()`` for the express purpose of regenerating an
+        unusable cross-family report. If the report is *still* unusable and the
+        attempt counter did not move, ``_cross_family_for_pr`` was never reached
+        -- ``review()`` returned at the janitor gate thousands of lines earlier,
+        which is what a PR with merge conflicts or missing required checks does
+        on every pass (issue #1099).
+
+        That re-entry is cheap -- no model call -- but it is not free, and
+        nothing else bounds it: the attempts budget cannot, because it is spent
+        by the regenerator this path never reaches. So this is its own budget,
+        counted in the same head-keyed record and bounded by the same
+        ``max_regen_attempts``.
+
+        It terminates by PARKING, never by escalating. The report being unusable
+        is observed, but "unusable and unfixable" -- what
+        ``cross_family_report_unusable`` claims -- is not: regeneration was
+        never tried. Parking states exactly what is known, and unlike a
+        ``judgment`` escalation it self-heals when the head moves.
+
+        ``attempts_before`` is the discriminator and must be sampled *before*
+        ``review()``. Without it this would also fire for a model that ran and
+        failed -- a case the attempts budget already owns and already escalates
+        -- and the event's name would be a false claim about a path that was in
+        fact reached.
+        """
+        if self.dry_run:
+            return
+        max_attempts = max(0, int(self.config.cross_family.max_regen_attempts))
+        report_path = self.paths.prs / f"pr-{pr_number}" / "cross-family-review.md"
+        text = ""
+        if report_path.exists() and report_path.stat().st_size > 0:
+            try:
+                text = report_path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+        if report_is_reusable(text, head_sha):
+            return  # regeneration was reached and produced a usable report
+        # Pre-check before the write section. Both reads take the lock, but this
+        # one releases it before deciding, so the already-charged and
+        # regenerator-ran cases skip the write entirely. The counter is
+        # re-derived under the lock below; this is a fast path, not the
+        # authority.
+        seen = self._cross_family_regen_record(pr_number=pr_number, head_sha=head_sha)
+        if int(seen.get("attempts") or 0) != attempts_before:
+            return  # the regenerator ran; the attempts budget owns this pass
+        if int(seen.get("not_reached") or 0) >= max_attempts:
+            return
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            current = pr_state.get("cross_family_regen")
+            if not isinstance(current, dict) or current.get("head_sha") != head_sha:
+                current = {"head_sha": head_sha, "attempts": 0, "not_reached": 0}
+            not_reached = int(current.get("not_reached") or 0)
+            if not_reached >= max_attempts:
+                return
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "cross_family_regen": {**current, "not_reached": not_reached + 1},
+            }
+            state = self._record_event(
+                state,
+                "cross_family_regen_not_reached",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "head_sha": head_sha,
+                    "attempts": int(current.get("attempts") or 0),
+                    "not_reached": not_reached + 1,
+                    "max_attempts": max_attempts,
+                },
+            )
+            save_state(self.paths.state_file, state)
 
     def _claim_cross_family_regen_attempt(
         self,
@@ -19694,9 +19973,13 @@ class OrchestratorApp:
     ) -> bool:
         """Claim one bounded cross-family regeneration attempt for ``pr_number``.
 
-        Returns True when an attempt was claimed, meaning the caller should
-        report the packet stale so ``review()`` re-runs and regenerates the
-        report. Returns False once the budget for this head is spent.
+        Returns True when an attempt was claimed, meaning the caller may run the
+        cross-family model. Returns False once the budget for this head is
+        spent. Counting is *all* this does: it does not escalate, label, or
+        decide anything (issue #1099). The caller is ``_cross_family_for_pr``,
+        immediately before ``run_cross_family_review`` -- the operation the
+        budget bounds -- so an attempt cannot be charged by a pass that never
+        reaches the model.
 
         The bound is mandatory, not defensive: regeneration runs the
         cross-family model synchronously for up to ``timeout_seconds`` (600s in
@@ -19710,59 +19993,119 @@ class OrchestratorApp:
         from unrelated pushes and escalate on one that had never actually
         failed.
 
-        On exhaustion the issue escalates to a human -- it is never recorded as
-        approved. ``max_parse_failures`` deliberately ends in a caveated
-        ``approved``; copying that shape here would approve against a head that
-        was never positively confirmed, which is exactly the fail-open #1079
-        closed and which ``_note_cross_family_head_indeterminate``'s docstring
-        exists to steer a checklist-follower away from.
+        Exhaustion is adjudicated by ``_escalate_cross_family_regen_exhausted``
+        *after* the model call, because only there is "the report is still
+        unusable" an observation rather than an inference.
+        """
+        max_attempts = max(0, int(self.config.cross_family.max_regen_attempts))
+        # --dry-run must not write state.json (review finding on PR #670).
+        # Reporting "budget spent" is the non-mutating answer, and it also keeps
+        # a dry run from spending a real 600s model call.
+        if self.dry_run:
+            return False
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            record = pr_state.get("cross_family_regen")
+            if not isinstance(record, dict) or record.get("head_sha") != head_sha:
+                record = {"head_sha": head_sha, "attempts": 0, "not_reached": 0}
+            attempts = int(record.get("attempts") or 0)
+            if attempts >= max_attempts:
+                return False
+            # Spread `record` rather than rebuilding it, so the sibling
+            # not-reached counter survives a claim on the same head.
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "cross_family_regen": {**record, "attempts": attempts + 1},
+            }
+            state = self._record_event(
+                state,
+                "cross_family_report_regen_forced",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "head_sha": head_sha,
+                    "report_head_sha": report_head,
+                    "attempt": attempts + 1,
+                    "max_attempts": max_attempts,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        return True
+
+    def _escalate_cross_family_regen_exhausted(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int | None,
+        head_sha: str | None,
+        report_path: Path,
+    ) -> None:
+        """Escalate to a human once this head's regeneration budget is spent.
+
+        Called immediately after ``run_cross_family_review`` returns, and a
+        no-op unless BOTH conditions hold: the report the model just left behind
+        is still unusable, and ``attempts`` has reached ``max_regen_attempts``.
+
+        Both are *observed* here. That placement is the fix for issue #1099 --
+        this block used to live in ``_claim_cross_family_regen_attempt``, which
+        runs before the model does and is reached from ``loop()``'s staleness
+        check by way of ``review()``. On a PR with merge conflicts or missing
+        required checks ``review()`` returns at the janitor gate long before the
+        regenerator, so the budget was spent, and this escalation fired, against
+        a PR whose model had never been invoked once. 36 of 54 escalated
+        job-cannon issues carried the resulting ``cross_family_report_unusable``
+        for a report that was never actually retried.
+
+        Usability is re-read from disk with ``report_is_reusable`` -- the same
+        predicate the reuse check and ``loop()``'s packet skip consult -- rather
+        than taken from ``CrossFamilyResult.ok``, so the three cannot disagree
+        about what "unusable" means. A model that exits zero having written a
+        blocked or empty report is ``ok=True`` and still unusable.
+
+        On exhaustion the issue escalates -- it is never recorded as approved.
+        ``max_parse_failures`` deliberately ends in a caveated ``approved``;
+        copying that shape here would approve against a head that was never
+        positively confirmed, which is exactly the fail-open #1079 closed and
+        which ``_note_cross_family_head_indeterminate``'s docstring exists to
+        steer a checklist-follower away from.
 
         The escalation is classified ``judgment`` rather than ``mechanical``
         deliberately. A mechanical escalation is eligible for the automatic
         de-escalation sweep, which would return the issue to ``reviewing`` with
         the report still unusable -- straight back into the indefinite silent
         wait this change exists to make unreachable. Clearing it needs a human
-        to decide whether to re-run, switch model, or waive the gate.
+        to decide whether to re-run, switch model, or waive the gate. That cost
+        is why the sibling not-reached budget parks instead of escalating; see
+        ``_charge_cross_family_regen_not_reached``.
         """
-        max_attempts = max(0, int(self.config.cross_family.max_regen_attempts))
         # --dry-run must not perform state.json writes or live GitHub label
-        # mutations (review finding on PR #670). Reporting "budget spent" is the
-        # non-mutating answer, and it also keeps a dry run from spending a real
-        # 600s model call.
+        # mutations (review finding on PR #670). This method owns the only
+        # GitHub-reaching path in the regeneration bound, so the gate lives here
+        # rather than at the call site.
         if self.dry_run:
-            return False
+            return
+        max_attempts = max(0, int(self.config.cross_family.max_regen_attempts))
+        text = ""
+        if report_path.exists() and report_path.stat().st_size > 0:
+            try:
+                text = report_path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+        if report_is_reusable(text, head_sha):
+            return  # regeneration succeeded; nothing is exhausted
+        report_head = extract_head_ref_oid(text) if text.strip() else None
         escalated_now = False
         repair_label_edge = False
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            pr_state = state["prs"].get(str(pr_number), {})
-            record = pr_state.get("cross_family_regen")
+            record = state["prs"].get(str(pr_number), {}).get("cross_family_regen")
             if not isinstance(record, dict) or record.get("head_sha") != head_sha:
-                record = {"head_sha": head_sha, "attempts": 0}
+                record = {"head_sha": head_sha, "attempts": 0, "not_reached": 0}
             attempts = int(record.get("attempts") or 0)
             if attempts < max_attempts:
-                state["prs"][str(pr_number)] = {
-                    **pr_state,
-                    "number": pr_number,
-                    "cross_family_regen": {
-                        "head_sha": head_sha,
-                        "attempts": attempts + 1,
-                    },
-                }
-                state = self._record_event(
-                    state,
-                    "cross_family_report_regen_forced",
-                    {
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "head_sha": head_sha,
-                        "report_head_sha": report_head,
-                        "attempt": attempts + 1,
-                        "max_attempts": max_attempts,
-                    },
-                )
-                save_state(self.paths.state_file, state)
-                return True
+                return  # budget remains; a later pass may still succeed
             # Budget spent for this head. Escalate exactly once -- the durable
             # flag keeps this to one event per head rather than one per pass,
             # which would flush the capped `events` ring in state.json.
@@ -19776,7 +20119,7 @@ class OrchestratorApp:
                     state, pr_number=pr_number, issue_number=issue_number
                 )
                 if not repair_label_edge:
-                    return False
+                    return
             else:
                 state = _escalate_issue(
                     state,
@@ -19850,7 +20193,6 @@ class OrchestratorApp:
                     "label_error": label_error,
                 }
                 save_state(self.paths.state_file, state)
-        return False
 
     def _review_template_sha(self) -> str:
         """SHA-256 digest of the resolved review template + referenced section
