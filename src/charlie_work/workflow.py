@@ -13805,6 +13805,7 @@ class OrchestratorApp:
         # silent skip on every subsequent pass.
         # Additionally, reports are invalidated when the PR head SHA changes
         # to prevent reviewing stale code (issue #156).
+        text = ""
         if report_path.exists() and report_path.stat().st_size > 0:
             text = report_path.read_text(encoding="utf-8")
             # The wrapper text itself contains bold markdown ("**leads, not
@@ -13815,6 +13816,34 @@ class OrchestratorApp:
                 return self._cross_family_section(report_path), CrossFamilyResult(
                     ok=True, report_path=str(report_path), model=cfg.model, reused=True
                 )
+        # The report is unusable, so the regeneration below is the repair -- and
+        # it is the thing the per-head budget exists to bound, because it runs
+        # the cross-family model synchronously for up to timeout_seconds and
+        # unbounded would starve the other repo in the shared sequential loop
+        # (#1078).
+        #
+        # The claim therefore lives HERE, at the model call it bounds, and not
+        # at loop()'s staleness check where it used to (issue #1099). review()
+        # reaches this line only once the janitor gate has passed; a PR with
+        # merge conflicts or missing required checks returns thousands of lines
+        # earlier. Charging at the staleness check spent the whole budget
+        # without ever regenerating, then escalated
+        # "cross_family_report_unusable" against a PR whose actual problem was
+        # the conflict the janitor gate had already reported in that same pass.
+        # An operation that does not run must not be able to spend its own
+        # budget -- which is why this placement is correct regardless of *which*
+        # of review()'s early returns fires.
+        if not self.dry_run and not self._claim_cross_family_regen_attempt(
+            pr_number=pr_number,
+            issue_number=issue_number,
+            head_sha=pr.get("headRefOid"),
+            report_head=extract_head_ref_oid(text) if text.strip() else None,
+        ):
+            # Budget spent for this head; the claim escalated to a human on the
+            # transition pass. Return the same shape as the disabled/draft path
+            # so the packet still goes out, just without a cross-family section
+            # -- and no further model call is spent on this head.
+            return "", None
         prompt_text = self._render(
             "cross_family_review.md",
             {
@@ -17249,10 +17278,11 @@ class OrchestratorApp:
                     # never moves the two checks above skip review() forever --
                     # so the regeneration that _cross_family_for_pr already
                     # performs was unreachable and the PR waited on a human
-                    # indefinitely. Bounded per head; see
-                    # _cross_family_report_current.
+                    # indefinitely. Regeneration is still bounded per head, but
+                    # the bound is claimed by the regenerator itself, not here
+                    # -- this call only asks a question (issue #1099).
                     cross_family_current = self._cross_family_report_current(
-                        pr=pr, pr_number=pr_number, issue_number=issue_number
+                        pr=pr, pr_number=pr_number
                     )
                     if head_current and template_current and cross_family_current:
                         # Packet is current — skip regenerating it. But an
@@ -17288,6 +17318,15 @@ class OrchestratorApp:
                                 repo=self.repo_root.name,
                             )
                         review = self.review(pr_number)
+                        if not cross_family_current:
+                            # review() has now run for the express purpose of
+                            # regenerating this report. If it is still unusable,
+                            # the regenerator was never reached (issue #1099).
+                            self._note_cross_family_regen_not_reached(
+                                pr_number=pr_number,
+                                issue_number=issue_number,
+                                head_sha=live_head_sha,
+                            )
                         if self._record_review_or_error(review, errors, reviews):
                             continue
                         decision = self._review_decision(pr_number)
@@ -19640,7 +19679,6 @@ class OrchestratorApp:
         *,
         pr: dict[str, Any],
         pr_number: int,
-        issue_number: int | None,
     ) -> bool:
         """Return True if the packet's cross-family report needs no regeneration.
 
@@ -19675,14 +19713,109 @@ class OrchestratorApp:
                 text = ""
         if report_is_reusable(text, pr.get("headRefOid")):
             return True
-        # Unusable. Regeneration is the repair, but it is not free: claim a
-        # bounded attempt against this exact head.
-        return not self._claim_cross_family_regen_attempt(
-            pr_number=pr_number,
-            issue_number=issue_number,
-            head_sha=pr.get("headRefOid"),
-            report_head=extract_head_ref_oid(text) if text.strip() else None,
+        # Unusable, so the packet is stale and review() must run. Answering that
+        # one question is now ALL this method does: the regeneration budget is
+        # claimed by the regenerator itself (_cross_family_for_pr), because
+        # review() can -- and for a PR with merge conflicts routinely does --
+        # return before ever reaching it (issue #1099). A predicate must not
+        # mutate state.json, escalate an issue, or apply a GitHub label.
+        #
+        # The budget read below is not a mutation. Once this head's budget is
+        # spent the issue is already escalated to a human, so continuing to
+        # report "stale" would re-run the janitor gate every pass, forever, for
+        # a PR that nobody can advance. Parking it is exactly what the
+        # pre-#1099 code did on this same condition -- via the claim's return
+        # value rather than a read, which is the part that was wrong.
+        return self._cross_family_regen_budget_spent(
+            pr_number=pr_number, head_sha=pr.get("headRefOid")
         )
+
+    def _cross_family_regen_budget_spent(
+        self, *, pr_number: int, head_sha: str | None
+    ) -> bool:
+        """True when this head's cross-family regeneration budget is spent.
+
+        Read-only by construction (issue #1099). The authoritative claim happens
+        under the state lock in ``_claim_cross_family_regen_attempt``; this is a
+        staleness hint, so a dirty read is correct and a lock here would put a
+        write-lock acquisition on every packet-skip check.
+
+        Attempts are counted per head SHA, so a record left by an earlier head
+        reads as "not spent" -- matching the claim's own reset rule.
+        """
+        max_attempts = max(0, int(self.config.cross_family.max_regen_attempts))
+        state = load_state(self.paths.state_file)
+        record = state["prs"].get(str(pr_number), {}).get("cross_family_regen")
+        if not isinstance(record, dict) or record.get("head_sha") != head_sha:
+            return False
+        return int(record.get("attempts") or 0) >= max_attempts
+
+    def _note_cross_family_regen_not_reached(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int | None,
+        head_sha: str | None,
+    ) -> None:
+        """Record that a stale cross-family report survived a ``review()`` pass.
+
+        Diagnostic only -- no escalation, no label, no effect on the budget. The
+        packet was regenerated *because* the cross-family report was unusable;
+        if it is still unusable now, ``_cross_family_for_pr`` was never reached
+        (``review()`` returns at the janitor gate thousands of lines earlier for
+        a PR with merge conflicts or missing required checks) or its model call
+        left a failure stub.
+
+        Before #1099 this decline was recorded nowhere, which is why diagnosing
+        it required reconstructing the call path by hand. Deduped per head: one
+        event per pass would flush ``state.json``'s capped ``events`` ring, the
+        same reason the exhaustion escalation is deduped.
+        """
+        if self.dry_run:
+            return
+        report_path = self.paths.prs / f"pr-{pr_number}" / "cross-family-review.md"
+        text = ""
+        if report_path.exists() and report_path.stat().st_size > 0:
+            try:
+                text = report_path.read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+        if report_is_reusable(text, head_sha):
+            return  # regeneration was reached and produced a usable report
+        # Cheap unlocked pre-check: without it the already-logged case would
+        # take the state write-lock on every pass of the hot loop.
+        record = load_state(self.paths.state_file)["prs"].get(str(pr_number), {})
+        seen = record.get("cross_family_regen")
+        if (
+            isinstance(seen, dict)
+            and seen.get("head_sha") == head_sha
+            and seen.get("not_reached_logged")
+        ):
+            return
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            current = pr_state.get("cross_family_regen")
+            if not isinstance(current, dict) or current.get("head_sha") != head_sha:
+                current = {"head_sha": head_sha, "attempts": 0}
+            if current.get("not_reached_logged"):
+                return
+            state["prs"][str(pr_number)] = {
+                **pr_state,
+                "number": pr_number,
+                "cross_family_regen": {**current, "not_reached_logged": True},
+            }
+            state = self._record_event(
+                state,
+                "cross_family_regen_not_reached",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "head_sha": head_sha,
+                    "attempts": int(current.get("attempts") or 0),
+                },
+            )
+            save_state(self.paths.state_file, state)
 
     def _claim_cross_family_regen_attempt(
         self,
