@@ -106,15 +106,22 @@ before any reviewer produces a decision file, so check
    not that "one more rework round" will fix it.
 3. **Cross-family regeneration budget exhausted**
    (`escalation_reason == "cross_family_report_unusable"`, `reason_class ==
-   "judgment"`) — the cross-family report stayed unusable (an
-   `(UNAVAILABLE)` failure stub, or one with no head-SHA marker) through
-   `cross_family.max_regen_attempts` (default `2`) forced-regeneration
-   attempts against the PR's *current* head SHA. The budget is per head,
-   not per PR lifetime — a new push starts a fresh budget, since the new
-   head has never been tried. Unlike the rework cap, this never ends in a
-   caveated `approved`: an unconfirmed cross-family head must never pass as
-   reviewed, so it escalates instead (see
+   "judgment"`) — the cross-family model **ran** `cross_family.max_regen_attempts`
+   times (default `2`) against the PR's *current* head SHA and the report was
+   still unusable each time (an `(UNAVAILABLE)` failure stub, or one with no
+   head-SHA marker). The budget is per head, not per PR lifetime — a new push
+   starts a fresh budget, since the new head has never been tried. Unlike the
+   rework cap, this never ends in a caveated `approved`: an unconfirmed
+   cross-family head must never pass as reviewed, so it escalates instead (see
    [ARCHITECTURE.md](ARCHITECTURE.md#invariants)).
+
+   Since #1099 this reason means the model genuinely ran and failed. It used to
+   also fire for PRs whose model had never been invoked once — `review()`
+   returned at the janitor gate long before the regenerator, and the budget was
+   charged anyway. If you are triaging escalations created **before** #1099
+   shipped, check `events.db` for a `cross_family_report_regen_forced` row for
+   that PR with no corresponding model activity: those are false escalations,
+   and the PR's real blocker is whatever its `janitor_gate` payload names.
 
 **Recovery**: fix the underlying problem (rewrite the issue, resolve the
 product ambiguity, or manually push a fix to the PR branch yourself), then
@@ -126,14 +133,39 @@ either:
 - Manually swap `agent:human-needed` back to `agent:reviewing` (or
   `agent:needs-rework`) on GitHub and re-run `charlie why-charlie-hate --pr <n>` to
   regenerate a fresh packet before deciding again. For reason 3 specifically,
-  this is enough on its own: `review()`'s cross-family regeneration
-  (`_cross_family_for_pr`) is unconditional and is not gated by the
-  exhausted `loop()`-level budget, so the manual re-run gets a fresh attempt
-  without editing `state.json`.
+  this is enough on its own, and stays so after #1099 moved the budget claim
+  into the regenerator: `charlie why-charlie-hate` passes
+  `enforce_regen_budget=False`, so the manual re-run gets a fresh attempt and
+  charges nothing. `charlie unescalate` additionally clears the PR's
+  `cross_family_regen` record outright, so the automated loop gets a fresh
+  budget too — without that the re-arm would be inert, with `loop()` reading
+  the spent counters and parking the PR again on its very next pass.
 
 There is no automatic un-escalation — a human decision, once escalated,
 requires a human (or an explicit re-`verdict`) to move the issue
 forward again.
+
+### A PR making no progress with no `agent:human-needed` label
+
+Escalation is not the only terminal-ish state. A PR whose cross-family report is
+unusable **and** whose `review()` never reaches the regenerator is *parked*
+after `cross_family.max_regen_attempts` passes: no escalation, no label, and the
+report simply stops forcing `review()` on its own (issue #1099). This is by
+design — the model was never invoked, so there is nothing to escalate *about*,
+and parking self-heals on the next push.
+
+To confirm that is what you are looking at:
+
+```powershell
+.venv\Scripts\python.exe -c "from pathlib import Path; from charlie_work.instrumentation import query_events; s=Path('.var/charlie-work/state.json'); [print(e['ts'], e['kind'], e['payload']) for k in ('cross_family_regen_not_reached','janitor_gate') for e in query_events(s, kind=k, pr_number=<n>)]"
+```
+
+The `cross_family_regen_not_reached` payload carries `not_reached` and
+`max_attempts`; the `janitor_gate` payload names the PR's **actual** blocker,
+which is what to fix. Merge conflicts and missing required checks are the
+overwhelming majority. Fixing that and pushing resets both budgets, since the
+record is keyed by head SHA. A park with no accompanying `janitor_gate` event is
+worth investigating — it means `review()` returned somewhere else.
 
 ## Corrupt-state quarantine recovery
 

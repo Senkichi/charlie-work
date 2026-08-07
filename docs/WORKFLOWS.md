@@ -195,16 +195,39 @@ charlie why-charlie-hate --pr 123 --no-cross-family   # force off
 A non-empty successful report is **reused** on repeated `review()`/`loop()`
 passes over the same PR (no repeat model spend) — but a failed run's
 `(UNAVAILABLE)` stub (or one missing its head-SHA marker) is never reused.
-`loop()` forces regeneration instead, bounded by
-`cross_family.max_regen_attempts` (default `2`) attempts **per head SHA** —
-a new push resets the budget, since a new head has never been tried.
-Setting it to `0` disables forced regeneration entirely, so an unusable
-report escalates on the first pass instead of being retried. Past the
-budget the issue escalates to `agent:human-needed` rather than retrying
-forever (see [ARCHITECTURE.md](ARCHITECTURE.md#invariants) and
-[RUNBOOK.md](RUNBOOK.md#handling-agenthuman-needed-escalations)). Manually
-running `charlie why-charlie-hate --pr <n>` calls `review()` directly and
-is not subject to that budget — it always attempts regeneration.
+`loop()` forces regeneration instead, bounded **per head SHA** by
+`cross_family.max_regen_attempts` (default `2`). A new push resets the budget,
+since a new head has never been tried.
+
+That bound is really two budgets sharing one head-keyed record and one limit
+(issue #1099):
+
+- **`attempts`** — the cross-family model actually ran and left an unusable
+  report. Past the budget the issue escalates to `agent:human-needed` rather
+  than retrying forever.
+- **`not_reached`** — `review()` was forced for this reason but returned before
+  reaching the regenerator, so the model never ran. Almost always the janitor
+  gate declining a PR with merge conflicts or missing required checks. Past the
+  budget the PR is **parked** — the report stops forcing `review()` by itself —
+  with no escalation and no label, and a `cross_family_regen_not_reached` event
+  recording the decline. It parks rather than escalates because regeneration
+  was never tried, so "unusable *and unfixable*" was never observed; and unlike
+  a `judgment` escalation, a park self-heals on the next push.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md#invariants) and
+[RUNBOOK.md](RUNBOOK.md#handling-agenthuman-needed-escalations).
+
+Setting `max_regen_attempts` to `0` disables forced regeneration entirely: an
+unusable report parks the PR on the first pass. (Before #1099 it escalated on
+the first pass instead. With regeneration disabled the model can never run, so
+that escalation asserted a failure it had no evidence for — the defect #1099
+fixed. The PR is still visible: `_record_cross_family_verdicts` emits an
+error-level `cross_family_verdict_head_indeterminate` for it every pass.)
+
+Manually running `charlie why-charlie-hate --pr <n>` calls `review()` with the
+budget explicitly disabled (`enforce_regen_budget=False`), so it always attempts
+regeneration and never charges the loop's budget. A human typing a command is
+not the loop the bound defends against.
 
 ## Fleet dispatch loop
 
