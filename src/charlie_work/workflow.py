@@ -19829,13 +19829,15 @@ class OrchestratorApp:
     def _cross_family_regen_record(
         self, *, pr_number: int, head_sha: str | None
     ) -> dict[str, Any]:
-        """This head's cross-family regeneration counters, read without the lock.
+        """This head's cross-family regeneration counters.
 
-        Read-only by construction (issue #1099). The authoritative writes happen
+        Read-only by construction (issue #1099): the authoritative writes happen
         under the state lock in ``_claim_cross_family_regen_attempt`` and
-        ``_charge_cross_family_regen_not_reached``; every caller here wants a
-        staleness hint, so a dirty read is correct and a lock would put a
-        write-lock acquisition on every packet-skip check.
+        ``_charge_cross_family_regen_not_reached``, and this snapshot must not
+        be mutated. Reads through ``load_state_locked`` per issue #310's single
+        point of enforcement rather than a bare ``load_state`` -- a read-only
+        caller still takes the lock, and ``tests/test_load_state_locked.py``
+        fails the build otherwise.
 
         Both counters are stored in one head-keyed record and therefore reset
         together: a record left by an earlier head reads as all-zero, matching
@@ -19843,7 +19845,7 @@ class OrchestratorApp:
         the two budgets to share ``max_regen_attempts`` as their bound rather
         than adding a second config knob.
         """
-        state = load_state(self.paths.state_file)
+        state = load_state_locked(self.paths.state_file)
         record = state["prs"].get(str(pr_number), {}).get("cross_family_regen")
         if not isinstance(record, dict) or record.get("head_sha") != head_sha:
             return {"head_sha": head_sha, "attempts": 0, "not_reached": 0}
@@ -19896,8 +19898,11 @@ class OrchestratorApp:
                 text = ""
         if report_is_reusable(text, head_sha):
             return  # regeneration was reached and produced a usable report
-        # Cheap unlocked pre-check: without it a parked PR would take the state
-        # write-lock on every pass of the hot loop just to re-learn it is parked.
+        # Pre-check before the write section. Both reads take the lock, but this
+        # one releases it before deciding, so the already-charged and
+        # regenerator-ran cases skip the write entirely. The counter is
+        # re-derived under the lock below; this is a fast path, not the
+        # authority.
         seen = self._cross_family_regen_record(pr_number=pr_number, head_sha=head_sha)
         if int(seen.get("attempts") or 0) != attempts_before:
             return  # the regenerator ran; the attempts budget owns this pass
