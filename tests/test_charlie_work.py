@@ -20492,6 +20492,78 @@ def test_record_review_external_findings_override_vacuous_summary(
     assert decision["required_changes"] == [expected_body]
 
 
+def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path) -> None:
+    """A comment already surfaced in a prior round's required_changes (or
+    predating review entirely) must not be re-surfaced in a later round.
+
+    Without a since-cutoff, `_collect_external_findings` re-fetches the PR's
+    entire comment history on every `record_review` call, so a stale
+    round-1 finding (and a worker's unmarked rework reply) pile up on top of
+    the one new finding a human actually left for round 2 -- burying it in
+    `_write_rework_prompt`. The fix scopes ingestion to comments posted after
+    the previous round's `reviewed_at`, so a comment seen once can
+    structurally never come back.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+
+    # Round 1: an external comment predates the review packet and gets folded
+    # in as usual, since no prior decision exists yet.
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": "The retry wrapper swallows the exception type.",
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result1 = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary round 1",
+        required_changes=["fix the internal thing"],
+    )
+    assert result1.ok is True
+    decision1 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert any("retry wrapper" in item for item in decision1["required_changes"])
+    reviewed_at_round1 = decision1["reviewed_at"]
+    assert reviewed_at_round1
+
+    # Round 2: the round-1 comment is still sitting on the PR (GitHub never
+    # deletes it), plus a genuinely new comment posted after round 1 finished.
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": "The retry wrapper swallows the exception type.",
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+        {
+            "body": "Also missing: a regression test for the timeout path.",
+            "user": {"login": "a-real-human", "type": "User"},
+            # Far enough in the future to postdate round 1's reviewed_at
+            # (real wall-clock time) regardless of when this test runs.
+            "created_at": "2099-01-01T00:00:00Z",
+        },
+    ]
+    result2 = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary round 2",
+        required_changes=["fix the internal thing, round 2"],
+    )
+    assert result2.ok is True
+    decision2 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    changes2 = decision2["required_changes"]
+
+    # The new, post-round-1 comment is ingested.
+    assert any("regression test for the timeout path" in item for item in changes2)
+    # The stale round-1 comment (already surfaced once) is not re-ingested.
+    assert not any("retry wrapper" in item for item in changes2)
+
+
 def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
     tmp_path: Path,
 ) -> None:
