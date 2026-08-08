@@ -5005,7 +5005,9 @@ def _gh_api_list(gh: GitHubLike, path: str) -> list[dict[str, Any]]:
     return []
 
 
-def _collect_external_findings(gh: GitHubLike, pr_number: int) -> list[str]:
+def _collect_external_findings(
+    gh: GitHubLike, pr_number: int, *, since: str | None = None
+) -> list[str]:
     """Collect non-bot human feedback from the three external PR surfaces.
 
     Fetches issue-level comments, review bodies, and inline review comments.
@@ -5023,11 +5025,26 @@ def _collect_external_findings(gh: GitHubLike, pr_number: int) -> list[str]:
       person, and filtering on that login would drop exactly the findings #950
       exists to ingest. See ``ORCHESTRATOR_COMMENT_MARKER``.
 
+    ``since``, when given, is the previous round's ``reviewed_at`` (an
+    ``utc_now()``-formatted ISO 8601 UTC timestamp, see ``record_review``).
+    An item timestamped at or before ``since`` was already visible -- either
+    surfaced in a prior round's ``required_changes`` or predating review
+    entirely -- so it is skipped. This is what stops a rework loop from
+    re-ingesting the same stale findings (plus the growing pile of a worker's
+    own rework replies) on every round: without it, `_write_rework_prompt`
+    buries the one new finding under the full comment history every time.
+    GitHub's list endpoints disagree on which field carries the timestamp --
+    issue comments and inline review comments use ``created_at``, top-level
+    review bodies use ``submitted_at`` -- so both are checked per item. An
+    item with neither field (or an unparsable one) is never skipped: losing a
+    genuine finding is the expensive direction of this filter (see
+    ``test_human_quote_reply_to_orchestrator_comment_is_still_ingested``).
+
     Known gap: a worker's own rework reply ("Reworked in <sha>, here is what I
     changed") is machine-generated but posted through the worker's path, so it
-    carries no marker and is still ingested -- it would be presented back to
-    the worker as a required change. Tracked separately; fixing it needs either
-    a marker on the worker side or a cutoff at ``reviewed_head_sha``.
+    carries no marker and is still ingested if posted after ``since`` -- it
+    would be presented back to the worker as a required change. Tracked
+    separately; fixing it needs a marker on the worker side.
     """
     bodies: list[str] = []
     owner_repo = "{owner}/{repo}"
@@ -5041,10 +5058,16 @@ def _collect_external_findings(gh: GitHubLike, pr_number: int) -> list[str]:
         f"repos/{owner_repo}/pulls/{pr_number}/comments",
     )
 
+    since_dt = _parse_iso_timestamp(since) if since else None
+
     for path in surfaces:
         for item in _gh_api_list(gh, path):
             if _is_bot_comment(item) or _is_orchestrator_comment(item):
                 continue
+            if since_dt is not None:
+                item_dt = _parse_iso_timestamp(item.get("created_at") or item.get("submitted_at"))
+                if item_dt is not None and item_dt <= since_dt:
+                    continue
             body = (item.get("body") or "").strip()
             if body:
                 bodies.append(body)
@@ -11880,8 +11903,19 @@ class OrchestratorApp:
         # surfaces into the verdict at write time. This is a live fetch at
         # record_review time, not at render time, so _render_rework_prompt stays
         # a pure function of the durable verdict file.
+        #
+        # Scoped to comments posted after the previous round's reviewed_at
+        # (when a previous round exists): without a cutoff, every round
+        # re-fetches the PR's *entire* comment history, so stale prior-round
+        # findings and unmarked worker rework replies pile up in
+        # required_changes and bury the one live finding. review-decision.json
+        # is overwritten atomically per round, so the producer input -- an
+        # unbounded fetch -- was the actual defect, not the write.
         if decision in {"request_changes", "blocked"}:
-            external_findings = _collect_external_findings(self.gh, pr_number)
+            previous_decision = self._review_decision(pr_number)
+            previous_reviewed_at = previous_decision.get("reviewed_at")
+            since = previous_reviewed_at if isinstance(previous_reviewed_at, str) else None
+            external_findings = _collect_external_findings(self.gh, pr_number, since=since)
             if external_findings:
                 if findings_channel == "vacuous":
                     effective_required_changes = list(external_findings)
