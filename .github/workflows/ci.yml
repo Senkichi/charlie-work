@@ -31,15 +31,17 @@ jobs:
   Tests:
     name: Tests
     runs-on: self-hosted
-    # 35 min: derived from 28 successful runs (2026-07-28/29). Per-job
+    # 30 min: derived from 28 successful runs (2026-07-28/29). Per-job
     # execution time (startedAt->completedAt, excluding runner-queue wait):
-    # median 11.5 min, range 3.85-23.72 min. The 23.72 max was a contended
-    # run that still passed. 35 clears it by ~48% and catches the
-    # pathological 40+ min degraded/orphaned runs observed on this shared
-    # box (job-cannon #1440: 40, 51, 86 min). Tests is a required status
-    # check, so a spurious timeout wedges merges -- 3x median headroom
-    # avoids firing on ordinary contention. Sibling: job-cannon PR #1443.
-    timeout-minutes: 60
+    # median 11.5 min, range 3.85-23.72 min. The prior 60 min budget was
+    # generous enough that the 2026-08-08 cross-repo contention incident let
+    # wedged legs hold both runners for ~10h before anything timed out --
+    # the same shared-box pressure documented in job-cannon's own ci.yml
+    # (5 registered runners on one 8-core box; #1451). 30 clears the 23.72
+    # max by ~26% while applying the same fail-loud bar now used on
+    # job-cannon: a required check should time out fast enough to free the
+    # runner, not sit wedged for hours. Sibling: job-cannon PR #1443.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
