@@ -236,6 +236,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # other ordinary lifecycle events
         # -----------------------------------------------------------------
         "check_failure_rework_requested": "info",
+        "ci_run_never_created": "info",
         "closed_unmerged_pr_state_converged": "info",
         "containment_check": "info",
         "cross_pr_revert_rework_requested": "info",

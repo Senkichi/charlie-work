@@ -1096,6 +1096,29 @@ class GitHub:
         check_runs = value.get("check_runs")
         return check_runs if isinstance(check_runs, list) else None
 
+    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
+        """Fetch GitHub Actions workflow runs created for a head commit SHA.
+
+        Wraps ``gh api repos/{owner}/{repo}/actions/runs?head_sha=<sha>`` and
+        returns its ``workflow_runs`` array, or ``None`` on failure. Used to
+        distinguish "CI never created a run for this head" from "CI is still
+        pending": ``gh pr checks``/``statusCheckRollup`` can simply omit a
+        required check that never started, which is indistinguishable from
+        one still queued using check data alone. An empty (non-None) list
+        means the query succeeded and GitHub genuinely has zero run objects
+        for this SHA. Errors are returned as values, never raised.
+        """
+        result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/actions/runs?head_sha={head_sha}"],
+            json_output=True,
+            allow_failure=True,
+        )
+        value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
+        if not isinstance(value, dict):
+            return None
+        runs = value.get("workflow_runs")
+        return runs if isinstance(runs, list) else None
+
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
         """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.
 
@@ -1789,6 +1812,8 @@ class GitHubLike(Protocol):
     def commit(self, sha: str) -> dict[str, Any] | None: ...
 
     def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None: ...
+
+    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None: ...
 
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None: ...
 
