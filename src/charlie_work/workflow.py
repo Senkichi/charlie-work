@@ -8998,7 +8998,10 @@ class OrchestratorApp:
                         )
                     save_state(self.paths.state_file, fresh_state)
 
-            # Issue: an escalated PR returns from this early branch before the
+            # job-cannon 2026-08-06/07: GitHub Actions silently created no
+            # workflow run for pushed heads; detection added so the janitor
+            # gate distinguishes "CI never started" from "CI failed". An
+            # escalated PR returns from this early branch before the
             # non-escalated janitor-gate block below ever runs -- and a PR
             # stuck 4+ days behind a missing-checks failure (the exact
             # condition this detects) is itself a strong escalation
@@ -9018,7 +9021,15 @@ class OrchestratorApp:
                     escalated_verdict,
                     known_head=known_ci_run_never_created_head,
                 )
-            if ci_run_never_created_head_sha is not None:
+            # `escalated_verdict is not None` is runtime-redundant here (the
+            # only way ci_run_never_created_head_sha is non-None is if it was
+            # set above and that branch requires escalated_verdict to be set
+            # too) but Pyright's narrowing doesn't carry across the two `if`
+            # blocks, so escalated_verdict.missing_required_checks below reads
+            # as reportOptionalMemberAccess without it. Spelling out the
+            # correlation documents why the two are never non-None one
+            # without the other.
+            if ci_run_never_created_head_sha is not None and escalated_verdict is not None:
                 with state_lock(self.paths.state_file):
                     fresh_state = load_state(self.paths.state_file)
                     existing_pr_state = fresh_state["prs"].get(str(pr_number))

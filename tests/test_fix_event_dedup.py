@@ -273,6 +273,33 @@ def test_ci_run_never_created_emitted_once_per_head_with_control(tmp_path: Path)
     assert len(_events(control_state, "ci_run_never_created")) == 0
 
 
+def test_ci_run_never_created_stays_silent_when_the_runs_query_fails(tmp_path: Path) -> None:
+    """``workflow_runs_for_head`` returning ``None`` means the query itself
+    failed (rate limit, transient error) -- errors as values, per this
+    repo's convention -- and must never be treated as "zero runs = never
+    created". Only a successful, empty response is positive evidence of
+    "never created"; a failed query is not evidence of anything. This guards
+    the fail-closed branch a future ``if not head_runs:`` simplification
+    (collapsing the `None` and `[]` cases) would silently flip to fail-open.
+    """
+    config = _required_checks_config(ci_run_never_created_grace_minutes=5)
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    stale_updated_at = (
+        (datetime.now(UTC) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    )
+
+    fake_gh = FakeGitHubWithMissingRequiredAndRuns(runs=None)
+    fake_gh.prs[0]["headRefOid"] = "abc123abc123"
+    fake_gh.prs[0]["updatedAt"] = stale_updated_at
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+    assert result.ok is False
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "ci_run_never_created")) == 0
+    assert "ci_run_never_created_head" not in state["prs"]["456"]
+
+
 def test_ci_run_never_created_fires_for_an_escalated_pr(tmp_path: Path) -> None:
     """A PR stuck 4+ days behind a missing-checks failure -- the exact
     condition ``ci_run_never_created`` detects -- is itself a strong
