@@ -21,14 +21,21 @@ Covers cost-spirals.md Findings 2 and 3:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from charlie_work.config import DevinConfig, OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import FakeGitHub, FakeGitHubWithChecks
+from test_charlie_work import (
+    FakeGitHub,
+    FakeGitHubWithChecks,
+    FakeGitHubWithMissingRequired,
+    _required_checks_config,
+)
 
 
 def _events(state, kind: str) -> list[dict]:
@@ -180,6 +187,145 @@ def test_janitor_gate_emits_once_then_silent_until_failures_change(tmp_path: Pat
     state = load_state(app.paths.state_file)
     assert len(_events(state, "janitor_gate")) == 2
     assert state["prs"]["456"]["janitor_failures"] != first_failures
+
+
+class FakeGitHubWithMissingRequiredAndRuns(FakeGitHubWithMissingRequired):
+    """No required checks reported at all (so every required check is
+    "missing" per the janitor gate), plus a configurable
+    ``workflow_runs_for_head`` response so tests can control whether GitHub
+    Actions ever created a run for the head SHA.
+    """
+
+    def __init__(self, runs: list[dict[str, Any]] | None) -> None:
+        super().__init__()
+        self._runs = runs
+
+    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
+        return self._runs
+
+
+def test_ci_run_never_created_emitted_once_per_head_with_control(tmp_path: Path) -> None:
+    """Job-cannon measured 11 PRs stuck behind "Required check(s) missing"
+    for 4+ days with no run ever created for the head SHA -- indistinguishable
+    from ordinary CI latency using check data alone. When the janitor gate
+    reports missing required checks AND a direct Actions query finds zero
+    workflow runs for the (grace-period-aged) head SHA, ``ci_run_never_created``
+    must fire exactly once per (pr, head_sha); a head SHA with runs already
+    present must never fire it (the control).
+    """
+    config = _required_checks_config(ci_run_never_created_grace_minutes=5)
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    stale_updated_at = (
+        (datetime.now(UTC) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    )
+
+    # Real GitHub head SHAs are always hex (safe_ref.require_valid_sha is a
+    # defense-in-depth format guard on any value headed for a gh api argv,
+    # per issue #659) -- use a conforming value rather than the suite-wide
+    # "sha-abc123" placeholder, which is not valid hex.
+    fake_gh = FakeGitHubWithMissingRequiredAndRuns(runs=[])
+    fake_gh.prs[0]["headRefOid"] = "abc123abc123"
+    fake_gh.prs[0]["updatedAt"] = stale_updated_at
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result1 = app.review(456)
+    assert result1.ok is False
+    state = load_state(app.paths.state_file)
+    events = _events(state, "ci_run_never_created")
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["head_sha"] == "abc123abc123"
+    assert payload["branch"] == "agent/issue-123-fix-search"
+    assert set(payload["missing_checks"]) == {"Tests passed", "Lint & Format", "Pre-commit"}
+
+    # Second pass, same head SHA: must stay silent (at most once per
+    # (pr, head_sha)), even though the janitor gate re-evaluates every pass.
+    result2 = app.review(456)
+    assert result2.ok is False
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "ci_run_never_created")) == 1
+
+    # A subsequent push (new head SHA) is a fresh (pr, head_sha) pair and
+    # must be able to alert again.
+    fake_gh.prs[0]["headRefOid"] = "def456def456"
+    fake_gh.prs[0]["updatedAt"] = stale_updated_at
+    result3 = app.review(456)
+    assert result3.ok is False
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "ci_run_never_created")) == 2
+
+    # Control: workflow runs DO exist for the head SHA -> never fires, even
+    # though the janitor gate still reports the same "missing" required
+    # checks and the head is equally stale. This isolates the query result
+    # as the discriminator, not merely "checks are missing" or "PR is old".
+    control_tmp = tmp_path / "control"
+    control_paths = runtime_paths(control_tmp, config.runtime.state_dir)
+    control_gh = FakeGitHubWithMissingRequiredAndRuns(runs=[{"id": 1, "status": "queued"}])
+    control_gh.prs[0]["headRefOid"] = "abc123abc123"
+    control_gh.prs[0]["updatedAt"] = stale_updated_at
+    control_app = OrchestratorApp(control_tmp, control_paths, config, control_gh)
+
+    control_result = control_app.review(456)
+    assert control_result.ok is False
+    control_state = load_state(control_app.paths.state_file)
+    assert len(_events(control_state, "ci_run_never_created")) == 0
+
+
+def test_ci_run_never_created_fires_for_an_escalated_pr(tmp_path: Path) -> None:
+    """A PR stuck 4+ days behind a missing-checks failure -- the exact
+    condition ``ci_run_never_created`` detects -- is itself a strong
+    escalation candidate. ``review()`` returns from an early branch for any
+    escalated PR/issue (before the non-escalated janitor-gate block that the
+    sibling test above exercises ever runs), so the detector must also fire
+    from that branch or it is unreachable for the population it was built to
+    diagnose. Seeds state the way the escalated-PR fixture above does (PR
+    entry present, issue escalated) so ``review()`` takes the early-return
+    path, then asserts the event still fires exactly once from there.
+    """
+    config = _required_checks_config(ci_run_never_created_grace_minutes=5)
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    stale_updated_at = (
+        (datetime.now(UTC) - timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
+    )
+
+    fake_gh = FakeGitHubWithMissingRequiredAndRuns(runs=[])
+    fake_gh.prs[0]["headRefOid"] = "abc123abc123"
+    fake_gh.prs[0]["updatedAt"] = stale_updated_at
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "janitor_blocked",
+            "janitor_ok": False,
+            "janitor_failures": [],
+        }
+        state["issues"]["123"] = {"number": 123, "status": "escalated"}
+        save_state(paths.state_file, state)
+
+    result = app.review(456)
+    assert result.ok is True
+    assert result.data.get("skipped") is True
+
+    state = load_state(app.paths.state_file)
+    events = _events(state, "ci_run_never_created")
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["head_sha"] == "abc123abc123"
+    assert payload["escalated"] is True
+    assert state["prs"]["456"]["ci_run_never_created_head"] == "abc123abc123"
+
+    # Second pass, still escalated, same head: must stay silent.
+    result2 = app.review(456)
+    assert result2.data.get("skipped") is True
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "ci_run_never_created")) == 1
 
 
 def test_blocked_chain_dead_alerts_once_per_transition(tmp_path: Path) -> None:

@@ -92,6 +92,7 @@ from .janitor import (
     detect_cross_pr_revert,
     run_janitor,
     DiffContentSignature,
+    JanitorVerdict,
     TestAdequacyFacts,
     TestAdequacyVerdict,
 )
@@ -105,6 +106,7 @@ from .reconcile import (
     detect_drift,
     detect_mergequeue_not_approved,
 )
+from .safe_ref import require_valid_sha
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
@@ -8960,10 +8962,14 @@ class OrchestratorApp:
             escalated_checks = self.gh.pr_checks(pr_number)
             escalated_diff = self.gh.pr_diff(pr_number)
             escalated_verdict = None
+            known_ci_run_never_created_head = None
             with state_lock(self.paths.state_file):
                 fresh_state = load_state(self.paths.state_file)
                 existing_pr_state = fresh_state["prs"].get(str(pr_number))
                 if existing_pr_state is not None:
+                    known_ci_run_never_created_head = existing_pr_state.get(
+                        "ci_run_never_created_head"
+                    )
                     escalated_verdict = run_janitor(
                         pr,
                         escalated_checks,
@@ -8991,6 +8997,52 @@ class OrchestratorApp:
                             },
                         )
                     save_state(self.paths.state_file, fresh_state)
+
+            # Issue: an escalated PR returns from this early branch before the
+            # non-escalated janitor-gate block below ever runs -- and a PR
+            # stuck 4+ days behind a missing-checks failure (the exact
+            # condition this detects) is itself a strong escalation
+            # candidate, so the detector must be reachable from here too, not
+            # only the non-escalated path. Deliberately called OUTSIDE the
+            # state_lock above: it makes a `gh api` call, and the state lock
+            # must never span external I/O (mopup-rate-limit-lock-contention)
+            # -- a stalled/rate-limited call would otherwise hold the lock
+            # against every other writer. `known_ci_run_never_created_head`
+            # short-circuits the call once this exact head has already been
+            # recorded, so a PR that stays escalated for days doesn't re-query
+            # Actions every single pass forever.
+            ci_run_never_created_head_sha = None
+            if escalated_verdict is not None:
+                ci_run_never_created_head_sha = self._detect_ci_run_never_created(
+                    pr,
+                    escalated_verdict,
+                    known_head=known_ci_run_never_created_head,
+                )
+            if ci_run_never_created_head_sha is not None:
+                with state_lock(self.paths.state_file):
+                    fresh_state = load_state(self.paths.state_file)
+                    existing_pr_state = fresh_state["prs"].get(str(pr_number))
+                    if existing_pr_state is not None and (
+                        existing_pr_state.get("ci_run_never_created_head")
+                        != ci_run_never_created_head_sha
+                    ):
+                        fresh_state["prs"][str(pr_number)] = {
+                            **existing_pr_state,
+                            "ci_run_never_created_head": ci_run_never_created_head_sha,
+                        }
+                        fresh_state = self._record_event(
+                            fresh_state,
+                            "ci_run_never_created",
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "head_sha": ci_run_never_created_head_sha,
+                                "branch": pr.get("headRefName"),
+                                "missing_checks": list(escalated_verdict.missing_required_checks),
+                                "escalated": True,
+                            },
+                        )
+                        save_state(self.paths.state_file, fresh_state)
 
             # Issue #776: escalation must stay terminal for the reason that
             # caused it, but must not become a one-way door that ALSO blocks
@@ -9594,6 +9646,17 @@ class OrchestratorApp:
                 # nothing to route -- fall through to the janitor_blocked
                 # bookkeeping below and wait for the pending cycle.
 
+            # See _detect_ci_run_never_created for why this check exists
+            # (job-cannon measured 11 PRs stuck 4+ days behind an ambiguous
+            # "Required check(s) missing" janitor failure). Detection only --
+            # no retry or retrigger here; that is follow-up policy.
+            ci_run_never_created_head_sha = self._detect_ci_run_never_created(
+                pr,
+                verdict,
+                known_head=(pr_state or {}).get("ci_run_never_created_head"),
+            )
+            ci_run_never_created = ci_run_never_created_head_sha is not None
+
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 existing_pr_state = state["prs"].get(str(pr_number), {})
@@ -9605,7 +9668,7 @@ class OrchestratorApp:
                 failures_changed = existing_pr_state.get("janitor_failures") != list(
                     verdict.failures
                 )
-                state["prs"][str(pr_number)] = {
+                pr_state_update = {
                     **existing_pr_state,
                     "number": pr_number,
                     "issue_number": issue_number,
@@ -9614,6 +9677,28 @@ class OrchestratorApp:
                     "janitor_failures": list(verdict.failures),
                     "check_rerun_attempts": verdict.check_rerun_attempts,
                 }
+                # At most once per (pr, head_sha): only emit when this head
+                # hasn't already been flagged as never-created.
+                ci_run_never_created_new_head = (
+                    ci_run_never_created
+                    and existing_pr_state.get("ci_run_never_created_head")
+                    != ci_run_never_created_head_sha
+                )
+                if ci_run_never_created:
+                    pr_state_update["ci_run_never_created_head"] = ci_run_never_created_head_sha
+                state["prs"][str(pr_number)] = pr_state_update
+                if ci_run_never_created_new_head:
+                    state = self._record_event(
+                        state,
+                        "ci_run_never_created",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "head_sha": ci_run_never_created_head_sha,
+                            "branch": pr.get("headRefName"),
+                            "missing_checks": list(verdict.missing_required_checks),
+                        },
+                    )
                 if failures_changed:
                     # Issue #818: a draft co-occurring with another real
                     # failure (e.g. draft + empty body) is not auto-readied
@@ -12305,6 +12390,11 @@ class OrchestratorApp:
         "janitor_ok",
         "janitor_failures",
         "janitor_warnings",
+        # Same frozen-cache hazard as janitor_ok/janitor_failures above: once
+        # a head is flagged never-created, the dedup marker would otherwise
+        # silently suppress a fresh event even after an operator re-arms the
+        # PR and the same head is still stuck.
+        "ci_run_never_created_head",
         "escalation_reason",
         "label_error",
         # Issue #1099: the per-head cross-family regeneration record holds both
@@ -14831,6 +14921,70 @@ class OrchestratorApp:
             "no_op_rework_repair_requested",
             extra_state=extra_state,
         )
+
+    def _detect_ci_run_never_created(
+        self,
+        pr: dict[str, Any],
+        verdict: JanitorVerdict,
+        *,
+        known_head: str | None = None,
+    ) -> str | None:
+        """Return the head SHA when Actions never created a run for it, else None.
+
+        A "Required check(s) missing" janitor failure is ambiguous between
+        "still pending" and "GitHub never created a workflow run for this
+        head at all" -- job-cannon measured 11 PRs stuck behind this exact
+        failure for 4+ days: the webhook delivered (other check-suite apps
+        registered) but no github-actions run object ever appeared, and
+        nothing distinguished that from ordinary CI latency. This queries
+        Actions directly, once the head has had a grace period to actually
+        start CI, so the distinction is diagnosable via events.db instead of
+        blending into the janitor gate's generic bookkeeping. Detection
+        only -- no retry or retrigger here; that is follow-up policy.
+
+        Shared by both the escalated-PR path (``review()``'s early-return
+        branch, which recomputes janitor diagnostics for visibility only)
+        and the normal janitor-gate path below it -- a PR stuck 4+ days is
+        itself a strong escalation candidate, so the check must not be
+        reachable only from the non-escalated branch.
+
+        Does NOT take ``state_lock`` and must never be called while holding
+        it -- it makes a ``gh api`` call, and this repo's state lock must
+        never span external I/O (mopup-rate-limit-lock-contention). Callers
+        take the lock only to persist the already-computed result.
+
+        ``known_head`` is the previously-persisted ``ci_run_never_created_head``
+        marker, if any. When it matches the PR's current head, the event has
+        already fired for this exact head and would be deduped anyway, so the
+        ``gh api`` call is skipped -- otherwise a PR that stays escalated for
+        days would re-query Actions on every single pass forever (this is the
+        same population the grace period targets).
+        """
+        if not verdict.missing_required_checks:
+            return None
+        grace_minutes = self.config.auto_merge.ci_run_never_created_grace_minutes
+        if grace_minutes <= 0:
+            return None
+        raw_head_sha = str(pr.get("headRefOid") or "") or None
+        if raw_head_sha is None:
+            return None
+        try:
+            head_sha = require_valid_sha(
+                raw_head_sha, context="_detect_ci_run_never_created head_sha"
+            )
+        except ValueError:
+            return None
+        if known_head is not None and known_head == head_sha:
+            return None
+        if not _is_pr_updated_at_older_than(pr, datetime.now(UTC), grace_minutes):
+            return None
+        head_runs = self.gh.workflow_runs_for_head(head_sha)
+        # None means the query itself failed (rate limit, transient error) --
+        # fail closed: only a successful, empty response is positive evidence
+        # of "never created", never the absence of a successful response.
+        if head_runs is not None and len(head_runs) == 0:
+            return head_sha
+        return None
 
     def _route_janitor_gate_failure_to_rework(
         self,

@@ -181,6 +181,13 @@ class JanitorVerdict:
     # must branch on these flags, never on the failure-message text.
     is_draft: bool = False
     is_draft_only_block: bool = False
+    # Required check names GitHub has reported as missing from the check list
+    # (CheckSummary.missing) -- distinct from failed_required_checks (a check
+    # that ran and failed). Consumers must branch on this structured field,
+    # never on the "Required check(s) missing" failure-message text, to
+    # decide whether a gh Actions query for the head SHA is warranted (issue
+    # tracking the job-cannon "CI never created a run" incident).
+    missing_required_checks: tuple[str, ...] = ()
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -330,8 +337,10 @@ def run_janitor(
 
     required = config.auto_merge.required_checks
     summary: CheckSummary | None = summarize_checks(checks, required) if required else None
+    missing_required_checks: tuple[str, ...] = ()
     if summary is not None:
         failed_required_checks = summary.failed
+        missing_required_checks = summary.missing
 
     is_draft = _check_draft(pr, failures)
     _check_state(pr, failures)
@@ -441,6 +450,7 @@ def run_janitor(
         is_no_op_rework=is_no_op_rework,
         is_draft=is_draft,
         is_draft_only_block=is_draft_only_block,
+        missing_required_checks=missing_required_checks,
     )
 
 

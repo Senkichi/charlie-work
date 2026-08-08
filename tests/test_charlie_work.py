@@ -3586,6 +3586,9 @@ class FakeGitHub:
     def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
         return None
 
+    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
+        return None
+
     def validate_field_lists(self) -> None:
         pass
 

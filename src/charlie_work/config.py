@@ -563,6 +563,13 @@ class AutoMergeConfig:
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
     # DIRTY or a missing CI trigger). 0 disables the guard.
     readiness_no_ci_minutes: int = 15
+    # Maximum minutes after the PR's last update (updatedAt) to wait before
+    # querying GitHub Actions directly to distinguish "CI never created a run
+    # for this head" from "CI is pending" when the janitor gate reports
+    # required checks missing. Unlike readiness_no_ci_minutes (which only
+    # gates the post-approval merge_ready path), this applies to any PR
+    # blocked pre-review by the janitor gate. 0 disables the guard.
+    ci_run_never_created_grace_minutes: int = 5
     # Strategy controlling which open agent PRs are rebased after a
     # successful ship-it merge.
     #
@@ -1884,6 +1891,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         if readiness_no_ci_minutes < 0:
             raise ConfigError(
                 "config section 'auto_merge' key 'readiness_no_ci_minutes' must not be negative"
+            )
+    ci_run_never_created_grace_minutes = auto_merge_data.get("ci_run_never_created_grace_minutes")
+    if ci_run_never_created_grace_minutes is not None:
+        if isinstance(ci_run_never_created_grace_minutes, bool) or not isinstance(
+            ci_run_never_created_grace_minutes, int
+        ):
+            raise ConfigError(
+                "config section 'auto_merge' key 'ci_run_never_created_grace_minutes' "
+                f"must be an int, got {type(ci_run_never_created_grace_minutes).__name__}"
+            )
+        if ci_run_never_created_grace_minutes < 0:
+            raise ConfigError(
+                "config section 'auto_merge' key 'ci_run_never_created_grace_minutes' "
+                "must not be negative"
             )
     mergequeue_label = auto_merge_data.get("mergequeue_label")
     if mergequeue_label is not None:
