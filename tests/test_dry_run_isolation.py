@@ -26,6 +26,7 @@ import pytest
 
 from charlie_work.cross_family import run_cross_family_review
 from charlie_work.subprocess_runner import RunResult
+from charlie_work import supervise
 from charlie_work.supervise import SelfDeployResult, self_deploy
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
@@ -127,7 +128,7 @@ def test_self_deploy_dry_run_reports_when_nothing_is_pending(tmp_path: Path) -> 
 
 
 def test_self_deploy_dry_run_does_not_touch_the_venv(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, autospec
 ) -> None:
     """The gate must sit above ``_check_venv``, which repairs the ``.pth`` in place.
 
@@ -139,7 +140,7 @@ def test_self_deploy_dry_run_does_not_touch_the_venv(
     def boom(_repo_root: Path) -> Any:
         raise AssertionError("_check_venv must not run under dry_run")
 
-    monkeypatch.setattr("charlie_work.supervise._check_venv", boom)
+    autospec(monkeypatch, supervise, "_check_venv", side_effect=boom)
     runner, _commands = _make_fake_runner(
         [
             RunResult(0, "abc\n", ""),

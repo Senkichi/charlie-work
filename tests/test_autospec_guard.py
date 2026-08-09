@@ -32,10 +32,15 @@ TESTS_DIR = REPO_ROOT / "tests"
 # enforced, whether or not it has also requested ``autospec``.
 #
 # test_autospec_patch.py is the helper's own tests and the first live region
-# the guard watches.  test_charlie_work.py is intentionally not added yet: the
-# new all-test rule surfaces ~219 pre-existing hand-rolled doubles there, so
-# the file will be added back only once that fleet is converted.
-ENFORCED_FILES: frozenset[str] = frozenset({"tests/test_autospec_patch.py"})
+# the guard watches.  test_dry_run_isolation.py is the first file with real
+# hand-rolled doubles converted to the autospec helper in this PR, so the guard
+# has non-vacuous teeth on a file where drift can actually occur.
+# test_charlie_work.py is intentionally not added yet: the new all-test rule
+# surfaces ~219 pre-existing hand-rolled doubles there, so the file will be
+# added back only once that fleet is converted.
+ENFORCED_FILES: frozenset[str] = frozenset(
+    {"tests/test_autospec_patch.py", "tests/test_dry_run_isolation.py"}
+)
 
 
 @dataclass(frozen=True)
@@ -263,6 +268,19 @@ def test_no_hand_rolled_doubles_in_enforced_regions() -> None:
     """No allowed-file test may introduce a hand-rolled double."""
     violations = _scan_enforced_test_files()
     assert not violations, _format_violations(violations)
+
+
+def test_enforced_files_non_empty_and_real() -> None:
+    """``ENFORCED_FILES`` must be non-empty and every entry must be a real file.
+
+    Without this check the scope could silently become empty (guard vacuously
+    passes) or drift to a non-existent path (entry never scanned, so violations
+    there are invisible).  Both failures would make the guard look green while
+    protecting nothing.
+    """
+    assert ENFORCED_FILES, "ENFORCED_FILES is empty -- the guard protects nothing"
+    missing = [entry for entry in sorted(ENFORCED_FILES) if not (REPO_ROOT / entry).is_file()]
+    assert not missing, f"ENFORCED_FILES entries do not exist: {missing}"
 
 
 def test_converted_region_uses_autospec_fixture() -> None:
