@@ -19,7 +19,8 @@ from charlie_work.config import (
 from ci_fleet.charlie_work_adapter import ScaleAction
 from ci_fleet.runners import ScaleDecision
 from charlie_work.cross_family import LEGACY_VACUOUS_SUMMARY
-from charlie_work.fleet_dispatch import ApiWorkerFleetReport
+from charlie_work import fleet_dispatch
+from charlie_work.fleet_dispatch import ApiWorkerFleetReport, _CiFleetDirtyCheck
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
@@ -27,6 +28,8 @@ from charlie_work.quiesce import QuiesceReport
 from charlie_work.state_migration import MigrationChild, MigrationOutcome, MigrationPlan
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
+from ci_fleet.runner_allocation import AllocationPlan
+from ci_fleet.runner_allocation_pass import AllocationPassResult
 
 
 class _FakeGitHub:
@@ -1131,6 +1134,62 @@ def test_run_runners_allocate_loud_on_absent_global_layer(
     assert "not enabled" not in result.message, (
         "the silent-disable 'not enabled' message must NOT appear when the real "
         "cause is an unreachable global layer"
+    )
+
+
+def test_run_runners_allocate_forces_dry_run_when_ci_fleet_is_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #927 rework (PR #1048): `charlie runners allocate` -- the operator
+    path -- must be guarded against a dirty editable ci_fleet worktree exactly
+    like the unattended supervisor prologue.
+
+    The original guard only covered fleet_dispatch's prologue call site and
+    left this CLI command -- which CLAUDE.md names as "the only thing allowed
+    to decide which listeners run" -- completely unguarded. Both call sites
+    now go through ``run_allocation_pass_with_ci_fleet_guard``, so patching
+    the guard's underlying primitives (``_ci_fleet_worktree_dirty`` and
+    ``run_allocation_pass``, both resolved from ``charlie_work.fleet_dispatch``)
+    proves this CLI path is covered by that single enforcement point rather
+    than a second, independently-written copy of the check.
+    """
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    config = OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(managed_root=str(tmp_path)),
+        runner_allocation=RunnerAllocationConfig(enabled=True),
+    )
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "GitHub", lambda *a, **k: _FakeGitHub())
+
+    dirty_check = _CiFleetDirtyCheck(
+        is_dirty=True,
+        repo_root=tmp_path / "ci_fleet",
+        dirty_paths=(" M src/runner_allocation.py",),
+    )
+    monkeypatch.setattr(
+        fleet_dispatch,
+        "_ci_fleet_worktree_dirty",
+        lambda _module_file=None: dirty_check,
+    )
+    plan = AllocationPlan(budget=4, budget_reason="configured", targets=(), changes=())
+    pass_result = AllocationPassResult(ok=True, plan=plan, notes=())
+    pass_mock = MagicMock(return_value=pass_result)
+    monkeypatch.setattr(fleet_dispatch, "run_allocation_pass", pass_mock)
+
+    args = cli.build_parser().parse_args(["runners", "allocate"])
+    outcome = cli.run_runners_allocate(args)
+
+    assert pass_mock.call_args.kwargs["dry_run"] is True, (
+        "a dirty ci_fleet worktree must force dry_run on the CLI allocate path, "
+        "not only the unattended supervisor prologue"
+    )
+    assert outcome.data["dry_run"] is True
+    assert outcome.data["ci_fleet_worktree_dirty"]["dirty_paths"] == [
+        " M src/runner_allocation.py"
+    ], "the forced-dry-run reason must surface in the CommandResult data"
+    assert "forced dry-run" in outcome.message, (
+        f"the CLI message must say why it refused to actuate: {outcome.message!r}"
     )
 
 
