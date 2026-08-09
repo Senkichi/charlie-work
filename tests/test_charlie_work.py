@@ -37,6 +37,7 @@ from charlie_work.config import (
     NotifyConfig,
     OrchestratorConfig,
     PostMortemConfig,
+    ReconcilePassConfig,
     ReviewConfig,
     ReviewDispatchConfig,
     RuntimeConfig,
@@ -2736,6 +2737,32 @@ def test_validate_field_lists_fails_on_unsupported_field(monkeypatch, tmp_path: 
         github_module.GitHub(tmp_path).validate_field_lists()
 
 
+def test_validate_field_lists_timeout_raises_config_error(monkeypatch, tmp_path: Path) -> None:
+    """A hung `gh` probe during startup field-list validation surfaces as
+    ConfigError rather than blocking boot forever. This probe runs once and
+    is not retried, and it is bound by the configured gh_timeout_seconds."""
+    call_count = 0
+    captured_timeouts: list[float] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        captured_timeouts.append(kwargs.get("timeout"))
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_timeout_seconds=45.0))
+    with pytest.raises(ConfigError, match="timed out"):
+        gh.validate_field_lists()
+
+    # Fails fast on the first field list probed, not after trying all 10.
+    assert call_count == 1
+    # The timeout= kwarg passed to subprocess.run came from the configured
+    # gh_timeout_seconds, not a hardcoded value.
+    assert captured_timeouts == [45.0]
+
+
 def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> None:
     """Test that merge_flags are correctly passed to gh pr merge."""
     captured_args = []
@@ -3379,6 +3406,24 @@ class FakeGitHub:
         m = re.search(r"/pulls/(\d+)/comments", joined)
         if m and "/reviews/" not in joined:
             return self.pr_external_review_comments.get(int(m.group(1)), [])
+        # Handle paginated PR list REST API calls from reconcile.py.
+        if args[0] == "api" and "pulls?state=all" in args[1]:
+            url = args[1]
+            page_match = re.search(r"[?&]page=(\d+)", url)
+            page = int(page_match.group(1)) if page_match else 1
+            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
+            per_page = int(per_page_match.group(1)) if per_page_match else 100
+            start = (page - 1) * per_page
+            return self.prs[start : start + per_page]
+        # Handle paginated issue list REST API calls from reconcile.py.
+        if args[0] == "api" and "issues?state=all" in args[1]:
+            url = args[1]
+            page_match = re.search(r"[?&]page=(\d+)", url)
+            page = int(page_match.group(1)) if page_match else 1
+            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
+            per_page = int(per_page_match.group(1)) if per_page_match else 100
+            start = (page - 1) * per_page
+            return self.issues[start : start + per_page]
         # Handle other API calls (for reconcile tests)
         if json_output:
             return []
@@ -3539,6 +3584,9 @@ class FakeGitHub:
         return None
 
     def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
+        return None
+
+    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
         return None
 
     def validate_field_lists(self) -> None:
@@ -15867,8 +15915,8 @@ def test_reconcile_exit_nonzero_when_drift_found_and_not_fixed(tmp_path: Path) -
             # Handle dependency API calls
             if "dependencies" in " ".join(arguments):
                 return [] if json_output else ""
-            # pr list: one open PR linked to issue 123
-            if arguments[:2] == ["pr", "list"]:
+            # paginated PR list from reconcile._fetch_prs
+            if arguments[0] == "api" and "pulls?state=all" in arguments[1]:
                 return [
                     {
                         "number": 456,
@@ -15882,8 +15930,8 @@ def test_reconcile_exit_nonzero_when_drift_found_and_not_fixed(tmp_path: Path) -
                         "isCrossRepository": False,
                     }
                 ]
-            # issue list: issue 123 still has agent:in-progress (drift)
-            if arguments[:2] == ["issue", "list"]:
+            # paginated issue list from reconcile._fetch_issues
+            if arguments[0] == "api" and "issues?state=all" in arguments[1]:
                 return [
                     {
                         "number": 123,
@@ -15938,9 +15986,9 @@ def test_reconcile_exit_ok_when_drift_fixed(tmp_path: Path) -> None:
             # Handle dependency API calls
             if "dependencies" in " ".join(arguments):
                 return [] if json_output else ""
-            if arguments[:2] == ["pr", "list"]:
+            if arguments[0] == "api" and "pulls?state=all" in arguments[1]:
                 return [self._pr]
-            if arguments[:2] == ["issue", "list"]:
+            if arguments[0] == "api" and "issues?state=all" in arguments[1]:
                 return [self._issue]
             return []
 
@@ -16015,9 +16063,9 @@ def test_reconcile_removes_mergequeue_label_via_full_stack(tmp_path: Path) -> No
         def run(self, arguments, *, json_output=False, allow_failure=False):
             if "dependencies" in " ".join(arguments):
                 return [] if json_output else ""
-            if arguments[:2] == ["pr", "list"]:
+            if arguments[0] == "api" and "pulls?state=all" in arguments[1]:
                 return [self._pr]
-            if arguments[:2] == ["issue", "list"]:
+            if arguments[0] == "api" and "issues?state=all" in arguments[1]:
                 return []
             return []
 
@@ -16062,9 +16110,9 @@ def test_reconcile_partial_fix_failure_reports_remaining_drift(tmp_path: Path) -
             # Handle dependency API calls
             if "dependencies" in " ".join(arguments):
                 return [] if json_output else ""
-            if arguments[:2] == ["pr", "list"]:
+            if arguments[0] == "api" and "pulls?state=all" in arguments[1]:
                 return []
-            if arguments[:2] == ["issue", "list"]:
+            if arguments[0] == "api" and "issues?state=all" in arguments[1]:
                 return [self._issue]
             return []
 
@@ -20445,6 +20493,78 @@ def test_record_review_external_findings_override_vacuous_summary(
     assert decision["findings_channel"] == "external"
     expected_body = _load_external_fixture("issue_comments")[0]["body"].strip()
     assert decision["required_changes"] == [expected_body]
+
+
+def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path) -> None:
+    """A comment already surfaced in a prior round's required_changes (or
+    predating review entirely) must not be re-surfaced in a later round.
+
+    Without a since-cutoff, `_collect_external_findings` re-fetches the PR's
+    entire comment history on every `record_review` call, so a stale
+    round-1 finding (and a worker's unmarked rework reply) pile up on top of
+    the one new finding a human actually left for round 2 -- burying it in
+    `_write_rework_prompt`. The fix scopes ingestion to comments posted after
+    the previous round's `reviewed_at`, so a comment seen once can
+    structurally never come back.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+
+    # Round 1: an external comment predates the review packet and gets folded
+    # in as usual, since no prior decision exists yet.
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": "The retry wrapper swallows the exception type.",
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result1 = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary round 1",
+        required_changes=["fix the internal thing"],
+    )
+    assert result1.ok is True
+    decision1 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    assert any("retry wrapper" in item for item in decision1["required_changes"])
+    reviewed_at_round1 = decision1["reviewed_at"]
+    assert reviewed_at_round1
+
+    # Round 2: the round-1 comment is still sitting on the PR (GitHub never
+    # deletes it), plus a genuinely new comment posted after round 1 finished.
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": "The retry wrapper swallows the exception type.",
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+        {
+            "body": "Also missing: a regression test for the timeout path.",
+            "user": {"login": "a-real-human", "type": "User"},
+            # Far enough in the future to postdate round 1's reviewed_at
+            # (real wall-clock time) regardless of when this test runs.
+            "created_at": "2099-01-01T00:00:00Z",
+        },
+    ]
+    result2 = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary round 2",
+        required_changes=["fix the internal thing, round 2"],
+    )
+    assert result2.ok is True
+    decision2 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
+    changes2 = decision2["required_changes"]
+
+    # The new, post-round-1 comment is ingested.
+    assert any("regression test for the timeout path" in item for item in changes2)
+    # The stale round-1 comment (already surfaced once) is not re-ingested.
+    assert not any("retry wrapper" in item for item in changes2)
 
 
 def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
@@ -28709,6 +28829,12 @@ def test_dispatch_rework_two_candidates_loop_limit_one(tmp_path: Path) -> None:
                 "{issue_number}",
             ),
         ),
+        # This test intentionally leaves issues in rework_requested with only the
+        # needs-rework label. The in-loop reconcile pass would otherwise see open PRs
+        # with a stale active label and self-heal the status to open_passive before
+        # dispatch_rework can run (issue #762 paginated issue snapshots now expose the
+        # fixture to real reconcile drift detection).
+        reconcile_pass=ReconcilePassConfig(enabled=False),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -30728,7 +30854,14 @@ def _reconcile_pass_app(
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.state_file.parent.mkdir(parents=True, exist_ok=True)
-    return OrchestratorApp(tmp_path, paths, config, gh if gh is not None else FakeGitHub())
+    if gh is None:
+        gh = FakeGitHub()
+        # Wiring tests for _maybe_reconcile_drift expect a clean repo. The
+        # default FakeGitHub carries a sample issue/PR that now resolve through
+        # the paginated REST snapshots and would produce unrelated drift.
+        gh.issues = []
+        gh.prs = []
+    return OrchestratorApp(tmp_path, paths, config, gh)
 
 
 def test_loop_forwards_shared_now_to_cadence_gated_lanes(
@@ -32343,50 +32476,26 @@ def test_status_includes_blocked_section(tmp_path: Path) -> None:
     assert result.data["available_issue_count"] == 0
 
 
-def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
+def test_status_prefetch_uses_batched_graphql_for_blocker_data(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """Issue #870: `fleet status --json` measured at 90s-184s wall clock,
-    almost entirely (169s of 184s in the diagnosed baseline) spent in serial,
-    uncached `gh` subprocess calls made by _get_open_blockers -- once per
-    ready issue from _filter_blocked_issues, and AGAIN once per ready issue
-    from _summarize_issue. Two ready issues sharing a declared blocker (the
-    diagnosed case: issues #887/#888 both blocked by #886) meant the shared
-    blocker's `gh issue view` was fetched 4 times, and each issue's own
-    dependencies-API call was fetched twice.
+    """Issue #923: `fleet status --json` spawned 86 `gh` subprocesses, mostly
+    one `gh api .../dependencies/blocked_by` per ready issue plus one `gh issue
+    view` per unique blocker. That is replaced by a single batched GraphQL
+    query per repo that fetches both the native blockedBy relationships and the
+    blockers' open/closed states in one subprocess.
 
     This uses a real GitHub (not the hand-rolled FakeGitHub used elsewhere in
-    this file, which has its own non-caching are_issues_open/dependencies
-    stand-ins and would not exercise the production caching path at all) with
-    subprocess.run mocked, so every `gh` invocation status() actually makes is
-    visible and countable.
+    this file) with subprocess.run mocked, so every `gh` invocation status()
+    actually makes is visible and countable.
 
     Two ready issues (887, 888) both declare the same open blocker (886) via
-    GitHub-native dependencies. Before the fix: 2 dependency-API calls x2
-    (once per _filter_blocked_issues, once per _summarize_issue) = 4, plus
-    886's issue-view fetched once per calling issue x2 duplicate passes = 4.
-    After the fix: each unique resource is fetched exactly once per status()
-    call, regardless of how many internal consumers ask for it.
+    GitHub-native dependencies. Before this fix: 2 dependency-REST calls x2
+    consumers = 4, plus 886's issue-view fetched twice per consumer = 4. After
+    the batching fix: one GraphQL query fetches dependencies and blocker states
+    for the whole set; no further `gh` calls are needed.
     """
     calls: list[list[str]] = []
-    # Thread name recorded alongside each dependencies-API call, so the test
-    # can assert the fan-out actually ran concurrently -- not just that the
-    # call count was deduped. A regression that replaced the ThreadPoolExecutor
-    # in _prefetch_blocker_data with a plain serial loop would still pass every
-    # call-count assertion below; this is what catches that specifically.
-    #
-    # A 2-party barrier forces both dependency-API calls to be in flight at
-    # once: with the mocked (near-instant) gh call, ThreadPoolExecutor's lazy
-    # thread creation would otherwise let the first task finish and its
-    # thread go idle before the second task is even submitted, so both would
-    # land on the same reused thread despite running through a real
-    # ThreadPoolExecutor -- a false negative, not evidence of a serial loop.
-    # Blocking each call on the barrier until both have arrived guarantees a
-    # second thread must be spawned to service the second call. Bounded with
-    # a timeout so a future regression (e.g. back to one call) fails fast
-    # with BrokenBarrierError instead of hanging the test.
-    dependency_call_threads: list[str] = []
-    dependency_call_barrier = threading.Barrier(2, timeout=5)
 
     def make_issue(number: int) -> dict[str, Any]:
         return {
@@ -32402,17 +32511,11 @@ def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
         }
 
     ready_issues = [make_issue(887), make_issue(888)]
-    # Both 887 and 888 declare 886 as a GitHub-native dependency.
-    dependencies_by_issue = {887: [886], 888: [886]}
 
     def fake_run(command, **kwargs):
         args = command[1:]  # drop leading "gh"
         if args and args[-2:] == ["--json", "nonexistent"]:
             # OrchestratorApp.__init__'s validate_field_lists() startup probe
-            # (github.py: GitHub.validate_field_lists) -- not part of the
-            # behavior under test, so satisfy it generically by unioning
-            # every field-list constant it checks, rather than hand-picking
-            # (and inevitably under-covering) a subset here.
             all_field_list_constants = [
                 "ISSUE_LIST_FIELDS",
                 "ISSUE_VIEW_FIELDS",
@@ -32446,15 +32549,29 @@ def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
             payload = json.dumps(ready_issues)
         elif args[:2] == ["pr", "list"]:
             payload = json.dumps([])
-        elif args[:2] == ["issue", "view"]:
-            number = int(args[2])
-            payload = json.dumps({"number": number, "state": "OPEN"})
-        elif args[0] == "api" and "dependencies/blocked_by" in args[1]:
-            dependency_call_threads.append(threading.current_thread().name)
-            dependency_call_barrier.wait()
-            number = int(args[1].split("/issues/")[1].split("/")[0])
-            deps = dependencies_by_issue.get(number, [])
-            payload = json.dumps([{"number": d} for d in deps])
+        elif args[0] == "api" and len(args) >= 2 and args[1] == "graphql":
+            payload = json.dumps(
+                {
+                    "data": {
+                        "repository": {
+                            "i_887": {
+                                "number": 887,
+                                "blockedBy": {
+                                    "nodes": [{"number": 886, "state": "OPEN"}],
+                                    "pageInfo": {"hasNextPage": False},
+                                },
+                            },
+                            "i_888": {
+                                "number": 888,
+                                "blockedBy": {
+                                    "nodes": [{"number": 886, "state": "OPEN"}],
+                                    "pageInfo": {"hasNextPage": False},
+                                },
+                            },
+                        }
+                    }
+                }
+            )
         else:
             raise AssertionError(f"Unexpected gh command in status(): {command}")
         return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
@@ -32464,13 +32581,14 @@ def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
     config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = github_module.GitHub(repo_root=tmp_path)
+    # Avoid a real `git remote` call; the owner/name are only used for the
+    # GraphQL variables, and the mocked response is the same either way.
+    gh._list_cache[("_repo_owner_name",)] = ("owner", "repo")
     app = OrchestratorApp(tmp_path, paths, config, gh)
 
     result = app.status()
 
     assert result.ok is True
-    # Both issues correctly identified as blocked by the still-open #886 --
-    # the fix must not change the *answer*, only how many times it's fetched.
     assert result.data["available_issue_count"] == 0
     blocked_by_issue = {b["issue"]: b["blockers"] for b in result.data["blocked"]}
     assert blocked_by_issue == {887: [886], 888: [886]}
@@ -32478,29 +32596,17 @@ def test_status_prefetch_dedupes_gh_calls_across_shared_blockers(
     assert summaries[887] == {"declared": [886], "open": [886]}
     assert summaries[888] == {"declared": [886], "open": [886]}
 
-    dependency_calls = [c for c in calls if c[1] == "api" and "dependencies/blocked_by" in c[2]]
+    graphql_calls = [c for c in calls if c[1:3] == ["api", "graphql"]]
+    rest_dependency_calls = [
+        c for c in calls if c[1] == "api" and "dependencies/blocked_by" in c[2]
+    ]
     issue_view_calls = [c for c in calls if c[1:3] == ["issue", "view"]]
 
-    # One dependencies-API call per ready issue (887, 888) -- not one per
-    # (issue, consumer) pair. Before the fix this was 4 (2 issues x 2
-    # consumers: _filter_blocked_issues and _summarize_issue).
-    assert len(dependency_calls) == 2
-    assert {int(c[2].split("/issues/")[1].split("/")[0]) for c in dependency_calls} == {887, 888}
-
-    # Exactly one issue-view call for the shared blocker #886 -- not one per
-    # (blocker, calling issue) pair. Before the fix this was 4 (886 looked up
-    # once per calling issue x 2 duplicate passes).
-    assert len(issue_view_calls) == 1
-    assert issue_view_calls[0][3] == "886"
-
-    # The dedup assertions above would still pass if _prefetch_blocker_data's
-    # ThreadPoolExecutor were replaced by a plain serial loop -- call *counts*
-    # don't distinguish parallel from sequential. The 74% wall-clock reduction
-    # (184.39s -> 47.9s, issue #870) came from the fan-out, not just the
-    # caching, so assert the two dependency-API calls actually ran on
-    # different threads.
-    assert len(dependency_call_threads) == 2
-    assert len(set(dependency_call_threads)) == 2
+    # The whole dependency + blocker-state lookup is now one batched GraphQL
+    # query for the two ready issues, not N per-issue REST calls + M issue views.
+    assert len(graphql_calls) == 1
+    assert len(rest_dependency_calls) == 0
+    assert len(issue_view_calls) == 0
 
 
 def test_status_includes_stalled_section(tmp_path: Path) -> None:

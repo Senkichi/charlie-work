@@ -214,6 +214,14 @@ DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
         # comment is ever found to be describing a kind the test no longer
         # flags.
         "janitor_gate",
+        # Same shape as janitor_gate immediately above: diagnostics-only,
+        # emitted either while re-running janitor diagnostics for visibility
+        # on an already-escalated PR (that occurrence's ``escalated: True``
+        # payload key documents the ambient status, it does not cause the
+        # transition) or from the ordinary non-escalated janitor-gate block,
+        # which never sets status "escalated". The kind alone never
+        # identifies an escalation transition.
+        "ci_run_never_created",
     }
 )
 
@@ -742,7 +750,7 @@ def append_event(
     behavior they are validating.
 
     When ``state_path`` is provided, the event is also written to the
-    unlimited append-only ``events.jsonl`` log file alongside ``state.json``.
+    unlimited append-only ``events.db`` SQLite log alongside ``state.json``.
     This dual-write preserves the complete audit history beyond the bounded
     convenience cap in ``state.json``'s ``events`` array. The write is
     best-effort — instrumentation never breaks the core workflow.
