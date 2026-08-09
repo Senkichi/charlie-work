@@ -1792,6 +1792,52 @@ def is_junction(path: Path) -> bool:
     return os.path.islink(path)
 
 
+def is_live_foreign_worktree(entry: Path, repo_root: Path) -> bool:
+    """Return True if ``entry`` is a live git worktree administered by a
+    repository other than ``repo_root``.
+
+    Worker launch shims provision sibling checkouts of *other* repos inside
+    this repo's worktrees dir (e.g. the ``ci_runners`` worktree the ci-fleet
+    editable resolves against). Such a directory is never in this repo's
+    ``git worktree list``, so the orphan sweep would classify it as residue
+    and delete it out from under running workers (2026-08-09 incident: the
+    08:15:43Z reclaim pass removed the sibling minutes after provisioning).
+
+    A linked worktree's ``.git`` is a *file* containing ``gitdir: <admin>``.
+    The directory is a live foreign worktree when that admin dir exists and
+    is not under this repo's own ``.git``. A dangling gitdir (admin dir gone,
+    e.g. after ``git worktree remove`` failed to delete the tree) is residue
+    and stays sweepable. Unreadable/unresolvable ``.git`` fails closed
+    (treated as foreign): deleting what we cannot classify risks destroying
+    live state, while skipping it merely defers cleanup."""
+    gitfile = entry / ".git"
+    try:
+        if not gitfile.is_file():
+            return False
+        content = gitfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    for line in content.splitlines():
+        if line.startswith("gitdir:"):
+            admin = Path(line.split(":", 1)[1].strip())
+            break
+    else:
+        return True
+    if not admin.is_absolute():
+        admin = entry / admin
+    try:
+        admin = admin.resolve()
+        if not admin.is_dir():
+            return False
+        # ``repo_root/.git`` is a directory for a main checkout; resolve()
+        # canonicalizes both sides so the containment test defeats junctions
+        # and 8.3 short names, same as the ci_fleet containment checks.
+        own_git = (repo_root / ".git").resolve()
+    except OSError:
+        return True
+    return not (admin == own_git or admin.is_relative_to(own_git))
+
+
 def _unlink_reparse_point(path: Path) -> None:
     """Remove a reparse point (Windows junction/symlink) or POSIX symlink.
 
@@ -4156,6 +4202,11 @@ def clean_worktrees(
         registered_paths = {Path(wt["worktree"]) for wt in registered_worktrees}
         for child in worktrees_dir.iterdir():
             if not child.is_dir() or child in registered_paths or is_junction(child):
+                continue
+            if is_live_foreign_worktree(child, repo_root):
+                # e.g. the sibling ci_runners checkout worker shims provision
+                # for the ci-fleet editable — another repo's live worktree,
+                # not this repo's residue. Never sweep it.
                 continue
             if dry_run:
                 orphans["planned"].append({"worktree": str(child)})

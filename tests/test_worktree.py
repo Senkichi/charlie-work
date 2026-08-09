@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -6763,6 +6764,52 @@ def test_clean_worktrees_orphan_sweep_removes_unregistered_tree_with_reparse_poi
     assert shared_venv.exists()
     assert marker.read_text(encoding="utf-8") == "shared contents\n"
     assert any(str(orphan_dir) == r["worktree"] for r in result.data["orphans"]["removed"])
+
+
+def test_clean_worktrees_orphan_sweep_spares_live_foreign_worktree(
+    tmp_path: Path,
+) -> None:
+    """2026-08-09 incident: the orphan sweep deleted the sibling ci_runners
+    worktree (another repo's live checkout inside this repo's worktrees dir,
+    provisioned by worker launch shims for the ci-fleet editable) because it
+    can never appear in this repo's own ``git worktree list``. A live foreign
+    worktree must be spared; a dangling one (admin dir gone) is residue and
+    stays sweepable.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+
+    foreign_repo = tmp_path / "ci_runners"
+    _init_repo(foreign_repo)
+    foreign_sibling = worktrees_dir / "ci_runners"
+    _git(foreign_repo, "worktree", "add", "--detach", str(foreign_sibling))
+    assert (foreign_sibling / ".git").is_file()
+
+    plain_orphan = worktrees_dir / "agent-issue-999-residue"
+    plain_orphan.mkdir()
+    (plain_orphan / "stale.txt").write_text("stale\n", encoding="utf-8")
+
+    config = OrchestratorConfig()
+    state = _make_state(issue_number=999, pr_number=999)
+    result = clean_worktrees(repo_root, worktrees_dir, state, config, _FakeGH())
+
+    assert result.ok is True
+    assert foreign_sibling.is_dir()
+    assert not plain_orphan.exists()
+    removed_paths = {r["worktree"] for r in result.data["orphans"]["removed"]}
+    assert str(plain_orphan) in removed_paths
+    assert str(foreign_sibling) not in removed_paths
+
+    # Dangle the foreign worktree's registration: with the admin dir gone it
+    # is residue, and the next sweep must reclaim it.
+    shutil.rmtree(foreign_repo / ".git" / "worktrees")
+    result = clean_worktrees(repo_root, worktrees_dir, state, config, _FakeGH())
+    assert result.ok is True
+    assert not foreign_sibling.exists()
+    removed_paths = {r["worktree"] for r in result.data["orphans"]["removed"]}
+    assert str(foreign_sibling) in removed_paths
 
 
 def test_clean_worktrees_skips_orphan_sweep_when_worktree_list_fails(
