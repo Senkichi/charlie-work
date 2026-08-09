@@ -87,6 +87,14 @@ DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = (
     "--print",
     "--permission-mode",
     "dangerous",
+    # A 2026-08 Devin CLI update enforces workspace trust in --print mode:
+    # non-interactive runs cannot show the trust prompt and fail hard in any
+    # untrusted directory. Worker worktrees are created fresh per issue and
+    # are never interactively trusted, so every headless launch died at
+    # startup (10 rework sessions across both lanes on 2026-08-08). The CLI's
+    # documented remedy for exactly this case is passing the flag explicitly.
+    "--respect-workspace-trust",
+    "false",
 )
 
 
