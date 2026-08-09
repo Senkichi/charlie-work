@@ -183,6 +183,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
+        "ci_fleet_worktree_dirty": "warning",
         "cross_family_verdict_unparseable": "warning",
         # The packet was forced stale so an unusable cross-family report gets
         # regenerated. The lane recovers, but it needed repair to get there and

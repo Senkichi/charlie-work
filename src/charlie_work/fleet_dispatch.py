@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import importlib.util
 import json
 import logging
 import os
@@ -45,7 +46,7 @@ from ci_fleet.charlie_work_adapter import (
     scale_down_idle_runners,
 )
 from .state import state_lock, utc_now
-from .subprocess_runner import no_console_window_kwargs
+from .subprocess_runner import no_console_window_kwargs, run_captured
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
     EXIT_RESTART_REQUESTED,
@@ -63,6 +64,158 @@ from .supervisor_lifecycle import (
 from .workflow import DEFERRED_BY_CONCURRENCY_REASON_PREFIX, CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
+
+# Event kind for the guard that refuses to actuate runners when the editable
+# ci_fleet dependency has uncommitted changes in its working tree (issue #927).
+_CI_FLEET_WORKTREE_DIRTY_KIND = "ci_fleet_worktree_dirty"
+_CI_FLEET_STATUS_TIMEOUT_SECONDS = 10
+
+
+@dataclass(frozen=True)
+class _CiFleetDirtyCheck:
+    """Outcome of checking whether the editable ci_fleet source tree is dirty.
+
+    ``is_dirty`` is only True when a real git working tree was found and
+    ``git status --porcelain src/`` returned non-empty output. Every other
+    outcome (no origin, no .git, git error, clean tree) returns False so the
+    guard fails inert, never closed.
+    """
+
+    is_dirty: bool
+    repo_root: Path | None = None
+    dirty_paths: tuple[str, ...] = ()
+    reason: str | None = None
+
+
+def _ci_fleet_module_path() -> Path | None:
+    """Resolve the filesystem path of the imported ``ci_fleet`` module.
+
+    Returns None when ``ci_fleet`` is not importable, is a namespace package
+    with no ``__init__.py`` origin, or is installed as a real wheel inside
+    ``site-packages`` with no working tree.
+    """
+    spec = importlib.util.find_spec("ci_fleet")
+    if spec is None or not spec.origin:
+        return None
+    return Path(spec.origin).resolve()
+
+
+def _ci_fleet_worktree_dirty(module_file: Path | None = None) -> _CiFleetDirtyCheck:
+    """Check the editable ci_fleet source tree for uncommitted src/ changes.
+
+    Walks up from ``ci_fleet.__file__`` (or the supplied ``module_file``) to
+    the nearest ``.git`` and runs ``git status --porcelain -- src/``. Returns
+    ``is_dirty=True`` when that output is non-empty, with the dirty paths.
+    Returns ``is_dirty=False`` for a clean tree or whenever the check cannot
+    safely run, so the guard never blocks allocation because the guard itself
+    broke.
+    """
+    if module_file is None:
+        module_file = _ci_fleet_module_path()
+    if module_file is None:
+        return _CiFleetDirtyCheck(
+            is_dirty=False,
+            reason="ci_fleet has no resolvable module origin",
+        )
+
+    repo_root: Path | None = None
+    for parent in module_file.parents:
+        if (parent / ".git").exists():
+            repo_root = parent
+            break
+    if repo_root is None:
+        return _CiFleetDirtyCheck(
+            is_dirty=False,
+            reason=f"no .git found above {module_file}",
+        )
+
+    result = run_captured(
+        ["git", "status", "--porcelain", "--", "src/"],
+        cwd=repo_root,
+        timeout_seconds=_CI_FLEET_STATUS_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return _CiFleetDirtyCheck(
+            is_dirty=False,
+            repo_root=repo_root,
+            reason=f"git status failed: {result.error or result.stderr}",
+        )
+
+    dirty_paths = tuple(line for line in result.stdout.splitlines() if line.strip())
+    if dirty_paths:
+        return _CiFleetDirtyCheck(
+            is_dirty=True,
+            repo_root=repo_root,
+            dirty_paths=dirty_paths,
+        )
+    return _CiFleetDirtyCheck(is_dirty=False, repo_root=repo_root)
+
+
+def run_allocation_pass_with_ci_fleet_guard(
+    gh: GitHub,
+    allocation: Any,
+    *,
+    managed_root_fallback: str,
+    fleet_dir_override: str | None,
+    state_path: Path | None,
+    dry_run: bool,
+    source: str,
+    full_pass_interval_seconds: int,
+) -> tuple[Any, _CiFleetDirtyCheck]:
+    """Run ci_fleet's ``run_allocation_pass`` with the #927 actuation guard applied.
+
+    This is the single point of enforcement for the dirty-worktree guard:
+    every caller that can start or park a runner listener must go through
+    this wrapper rather than calling ``run_allocation_pass`` directly, so a
+    future caller inherits the guard by construction instead of needing its
+    own copy of the dirty-check. It currently has two callers -- the
+    unattended supervisor prologue (``_run_fleet_allocation_prologue``) and
+    the operator-driven ``charlie runners allocate`` command
+    (``cli.run_runners_allocate``) -- and both must see identical behavior,
+    since either one actuating while dirty defeats the issue's purpose.
+
+    Issue #927: the editable ci_fleet dependency is a foreign working tree.
+    If its src/ directory has uncommitted changes, this forces the pass to
+    run in dry-run mode so it plans and reports but never parks or starts a
+    runner. The guard is deliberately inert on any failure (wheel install, no
+    .git, git error) so an unrelated git problem cannot stop allocation.
+
+    Returns the pass result together with the dirty-check outcome so callers
+    can render their own event/log formatting around the decision.
+    """
+    dirty_check = _ci_fleet_worktree_dirty()
+    force_dry_run = dry_run
+    if dirty_check.is_dirty:
+        dirty_paths_text = "; ".join(dirty_check.dirty_paths)
+        reason = (
+            f"ci_fleet dependency tree at {dirty_check.repo_root} has uncommitted "
+            f"changes; refusing to actuate runners: {dirty_paths_text}"
+        )
+        logger.warning("Runner allocation guard: %s", reason)
+        if state_path is not None:
+            log_event(
+                state_path,
+                _CI_FLEET_WORKTREE_DIRTY_KIND,
+                {
+                    "ci_fleet_root": str(dirty_check.repo_root),
+                    "dirty_paths": list(dirty_check.dirty_paths),
+                    "dry_run_forced": True,
+                    "source": source,
+                },
+            )
+        force_dry_run = True
+
+    result = run_allocation_pass(
+        gh,
+        allocation,
+        managed_root_fallback=managed_root_fallback,
+        fleet_dir_override=fleet_dir_override,
+        state_path=state_path,
+        dry_run=force_dry_run,
+        source=source,
+        full_pass_interval_seconds=full_pass_interval_seconds,
+    )
+    return result, dirty_check
 
 
 def _select_repos(
@@ -211,7 +364,7 @@ def compute_api_worker_fleet_report(
     repo_configs: dict[str, tuple[Path, OrchestratorConfig, dict[str, Any]]] = {}
 
     for repo_key, entry in repos.items():
-        repo_root = Path(entry.get("repo_root", ""))
+        repo_root = Path(entry.get("repo_root") or "")
         if not repo_root.is_dir():
             continue
         config = preloaded_configs.get(repo_key) if preloaded_configs else None
@@ -223,7 +376,7 @@ def compute_api_worker_fleet_report(
                     Path(explicit_cfg) if explicit_cfg else None,
                     fleet_dir_override=fleet_dir_override,
                 )
-            except (ConfigError, GitHubError, OSError):
+            except Exception:  # noqa: BLE001 - match _take_fleet_snapshot / count_fleet_live_sessions containment
                 continue
         if config is None:
             continue
@@ -277,7 +430,7 @@ def compute_api_worker_fleet_report(
         state_dir = Path(state_dir_str)
         sessions_dir = layout.resolve_state_child(
             config.devin.sessions_dir,
-            repo_root=Path(entry.get("repo_root", "")),
+            repo_root=Path(entry.get("repo_root") or ""),
             default=layout.sessions_dir_default(state_dir),
         )
         if not sessions_dir.is_dir():
@@ -413,7 +566,7 @@ def _run_fleet_allocation_prologue(
     anchor_root: Path | None = None
     anchor_state: Path | None = None
     for entry in registry.get("repos", {}).values():
-        candidate = Path(entry.get("repo_root", ""))
+        candidate = Path(entry.get("repo_root") or "")
         if candidate.is_dir():
             anchor_root = candidate
             state_dir = entry.get("state_dir")
@@ -441,7 +594,11 @@ def _run_fleet_allocation_prologue(
     runner_scaling = getattr(global_config, "runner_scaling", None)
     gh = GitHub(repo_root=anchor_root, runtime=runtime, dry_run=False)
 
-    result = run_allocation_pass(
+    # Issue #927: run_allocation_pass_with_ci_fleet_guard forces dry_run when
+    # the editable ci_fleet dependency's src/ tree has uncommitted changes, so
+    # this pass plans and reports but never parks or starts a runner. See the
+    # wrapper's docstring for why the guard lives there and not inline here.
+    result, dirty_check = run_allocation_pass_with_ci_fleet_guard(
         gh,
         allocation,
         managed_root_fallback=getattr(runner_scaling, "managed_root", "") or "",
@@ -451,6 +608,22 @@ def _run_fleet_allocation_prologue(
         source=UNATTENDED_ALLOCATION_SOURCE,
         full_pass_interval_seconds=full_pass_interval_seconds,
     )
+
+    if dirty_check.is_dirty:
+        dirty_paths_text = "; ".join(dirty_check.dirty_paths)
+        reason = (
+            f"ci_fleet dependency tree at {dirty_check.repo_root} has uncommitted "
+            f"changes; refusing to actuate runners: {dirty_paths_text}"
+        )
+        events.append(
+            {
+                "repo_key": "fleet",
+                "type": _CI_FLEET_WORKTREE_DIRTY_KIND,
+                "reason": reason,
+                "ci_fleet_root": str(dirty_check.repo_root),
+                "dry_run_forced": True,
+            }
+        )
 
     if result.error:
         logger.warning("Fleet allocation prologue: %s", result.error)
@@ -590,7 +763,7 @@ def _run_fleet_autoscale_prologue(
 
     representative_repo = None
     for repo_key, entry in repos_map.items():
-        repo_root = Path(entry.get("repo_root"))
+        repo_root = Path(entry.get("repo_root") or "")
         if not repo_root.exists():
             continue
 
@@ -1816,7 +1989,7 @@ def _take_fleet_snapshot(
         state_dir = Path(state_dir_str)
         if not state_dir.exists():
             continue
-        repo_root = Path(entry.get("repo_root", ""))
+        repo_root = Path(entry.get("repo_root") or "")
         config: OrchestratorConfig | None = None
         if repo_root.is_dir():
             try:

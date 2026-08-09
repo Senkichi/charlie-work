@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ from charlie_work.config import (
 from charlie_work.fleet_dispatch import (
     ApiWorkerFleetReport,
     FleetLocalSnapshot,
+    _CiFleetDirtyCheck,
     _build_fleet_attention_digest,
     _emit_fleet_transition,
     _extract_attention_events,
@@ -32,12 +35,14 @@ from charlie_work.fleet_dispatch import (
     _run_fleet_allocation_prologue,
     _run_fleet_autoscale_prologue,
     _select_repos,
+    _ci_fleet_worktree_dirty as _real_ci_fleet_worktree_dirty,
     _take_fleet_snapshot,
     compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
     run_fleet_supervise_loop,
 )
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.notify import AttentionEntry
 from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.instrumentation import query_events
@@ -122,6 +127,22 @@ def _patch_self_deploy_for_fleet_tests(monkeypatch: Any) -> dict[str, MagicMock]
     mocks["detect_prior_abnormal_exit"].return_value = None
     mocks["is_exit_alertable"].return_value = False
     return mocks
+
+
+@pytest.fixture(autouse=True)
+def _patch_ci_fleet_dirty_for_hermetic_tests(monkeypatch: Any) -> None:
+    """Fleet dispatch tests must not fail because the real ci_fleet tree is dirty.
+
+    The editable path dependency lives in a sibling checkout whose porcelain
+    state is outside these tests' control. A dirty upstream tree would force
+    every allocation-prologue test into dry-run mode and break assertions on
+    the ``dry_run`` flag. This fixture makes the guard inert; tests that need
+    to exercise the dirty path monkeypatch it explicitly.
+    """
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._ci_fleet_worktree_dirty",
+        lambda _module_file=None: _CiFleetDirtyCheck(is_dirty=False),
+    )
 
 
 def test_select_repos_all_sorted_by_last_seen() -> None:
@@ -4293,6 +4314,99 @@ def test_take_fleet_snapshot_skips_repo_with_malformed_config(
     assert isinstance(result, FleetLocalSnapshot)
 
 
+def test_compute_api_worker_fleet_report_skips_repo_with_malformed_config(
+    tmp_path: Path,
+) -> None:
+    """A repo with an unparseable per-repo config does not crash compute_api_worker_fleet_report.
+
+    Regression for the review of issue #707: compute_api_worker_fleet_report's
+    first loop caught only (ConfigError, GitHubError, OSError), so a malformed
+    orchestrator.config.yaml (which raises yaml.YAMLError) crashed the fleet
+    pass and ``charlie fleet status`` instead of skipping the repo.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=_API_WORKER_YAML.format(enabled="true"))
+
+    # Plant a malformed YAML file that yaml.safe_load cannot parse.
+    (repo / "orchestrator.config.yaml").write_text(
+        "devin:\n  sessions_dir: [unclosed\n",
+        encoding="utf-8",
+    )
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    # Must return None (no repo configured a usable api_worker section) rather
+    # than raising yaml.YAMLError.
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is None
+
+
+def test_take_fleet_snapshot_skips_repo_with_null_repo_root(
+    tmp_path: Path,
+) -> None:
+    """A corrupted registry entry with repo_root: null does not crash _take_fleet_snapshot.
+
+    Regression for the review of issue #707: ``Path(entry.get("repo_root", ""))``
+    returns ``Path(None)`` when the key is present with a null value (``.get``'s
+    default only applies when the key is *absent*), raising TypeError. The same
+    bug class existed in compute_api_worker_fleet_report and the autoscale
+    prologue; all three now use ``entry.get("repo_root") or ""``.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=None)
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": None,
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    result = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    assert isinstance(result, FleetLocalSnapshot)
+
+
+def test_compute_api_worker_fleet_report_skips_repo_with_null_repo_root(
+    tmp_path: Path,
+) -> None:
+    """A corrupted registry entry with repo_root: null does not crash compute_api_worker_fleet_report.
+
+    ``entry.get("repo_root") or ""`` makes a null value behave like a missing
+    key (fall back to cwd), matching the pre-existing behavior — the fix is
+    about preventing the TypeError crash, not changing the missing-key path.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=_API_WORKER_YAML.format(enabled="true"))
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": None,
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    # Must not raise TypeError; the call completes and returns a value.
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is None or isinstance(report, ApiWorkerFleetReport)
+
+
 # --------------------------------------------------------------------------
 # Runner-allocation prologue (the path the 5-minute fleet pass actually takes)
 # --------------------------------------------------------------------------
@@ -4720,6 +4834,179 @@ def test_allocation_prologue_logs_its_inputs_before_any_branch(tmp_path: Any, ca
     assert "prologue: entered" in caplog.text
     assert "enabled=False" in caplog.text
     assert "C:/actions-runners" in caplog.text
+
+
+def _make_ci_fleet_git_repo(tmp_path: Path) -> Path:
+    """Create a minimal editable-style ci_fleet repo with a clean ``src/`` tree."""
+    repo = tmp_path / "ci_fleet_repo"
+    repo.mkdir()
+    pkg = repo / "src" / "ci_fleet"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("# ci_fleet", encoding="utf-8")
+
+    # Use a per-test gitconfig so the commit does not depend on global config.
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text("[user]\n\tname = Test\n\temail = test@test\n", encoding="utf-8")
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=str(gitconfig))
+
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    return repo
+
+
+def test_ci_fleet_guard_detects_dirty_src_tree(tmp_path: Path) -> None:
+    """Issue #927: the guard must fire when src/ has uncommitted changes.
+
+    This is the positive-control test: a guard whose tests only exercise the
+    clean path can pass forever while the dirty path is broken.
+    """
+    repo = _make_ci_fleet_git_repo(tmp_path)
+    module_file = repo / "src" / "ci_fleet" / "__init__.py"
+    # Uncommitted addition under src/ -- the same shape as an agent editing
+    # planner.py in the live ci_fleet tree.
+    (repo / "src" / "ci_fleet" / "planner.py").write_text("x = 1", encoding="utf-8")
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is True
+    assert check.repo_root == repo
+    assert check.dirty_paths
+    assert any("planner.py" in p for p in check.dirty_paths)
+
+
+def test_ci_fleet_guard_clean_src_tree_is_inert(tmp_path: Path) -> None:
+    """A clean src/ tree must let allocation proceed normally."""
+    repo = _make_ci_fleet_git_repo(tmp_path)
+    module_file = repo / "src" / "ci_fleet" / "__init__.py"
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is False
+    assert check.repo_root == repo
+    assert check.dirty_paths == ()
+
+
+def test_ci_fleet_guard_no_git_is_inert(tmp_path: Path) -> None:
+    """A wheel install or missing .git must not block allocation."""
+    pkg = tmp_path / "pkg" / "ci_fleet"
+    pkg.mkdir(parents=True)
+    module_file = pkg / "__init__.py"
+    module_file.write_text("# installed wheel", encoding="utf-8")
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is False
+    assert check.repo_root is None
+    assert check.dirty_paths == ()
+
+
+def test_ci_fleet_guard_git_failure_is_inert(tmp_path: Path, monkeypatch: Any) -> None:
+    """A git error must make the guard a no-op, not a hard stop."""
+    repo = _make_ci_fleet_git_repo(tmp_path)
+    module_file = repo / "src" / "ci_fleet" / "__init__.py"
+
+    def _failing_git(*, cwd, timeout_seconds):  # pragma: no cover
+        return RunResult(
+            returncode=1,
+            stdout="",
+            stderr="git exploded",
+            error="git exploded",
+        )
+
+    # Accept the positional `command` argument and ignore it.
+    def _failing_run_captured(
+        command: list[str], *, cwd: Path | str, timeout_seconds: int
+    ) -> RunResult:
+        return _failing_git(cwd=cwd, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.run_captured", _failing_run_captured)
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is False
+    assert check.repo_root == repo
+    assert "git status failed" in (check.reason or "")
+
+
+def test_allocation_prologue_forces_dry_run_when_ci_fleet_is_dirty(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Issue #927: a dirty ci_fleet src/ forces a dry run and emits a guard event."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    state_dir = repo / ".var" / "charlie-work"
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(state_dir)}},
+    )
+
+    dirty_check = _CiFleetDirtyCheck(
+        is_dirty=True,
+        repo_root=tmp_path / "ci_fleet",
+        dirty_paths=(" M src/planner.py",),
+    )
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._ci_fleet_worktree_dirty",
+        lambda _module_file=None: dirty_check,
+    )
+
+    plan = AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=())
+    result = AllocationPassResult(ok=True, plan=plan, notes=("cw: pinned",))
+
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=result) as pass_mock,
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert pass_mock.call_args.kwargs["dry_run"] is True
+    assert any(e["type"] == "ci_fleet_worktree_dirty" for e in events)
+
+    state_path = layout.state_file_path(state_dir)
+    rows = query_events(state_path, kind="ci_fleet_worktree_dirty")
+    assert len(rows) == 1
+    assert rows[0]["payload"]["dirty_paths"] == [" M src/planner.py"]
+    assert rows[0]["payload"]["dry_run_forced"] is True
+    assert rows[0]["level"] == "warning"
+
+
+def test_allocation_prologue_keeps_original_dry_run_when_ci_fleet_is_clean(
+    tmp_path: Path,
+) -> None:
+    """A clean ci_fleet tree must not force dry_run on an actuating pass."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(repo / ".var")}},
+    )
+    balanced = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+    )
+
+    with (
+        patch(
+            "charlie_work.fleet_dispatch.run_allocation_pass", return_value=balanced
+        ) as pass_mock,
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert pass_mock.call_args.kwargs["dry_run"] is False
 
 
 def test_digest_renders_event_types_that_have_no_explicit_branch() -> None:
