@@ -646,11 +646,18 @@ def _run_fleet_autoscale_prologue(
 
     # Execute the decision
     if decision.action == ScaleAction.UP:
+        # Affinity knobs (issue: ci_runners #92 companion) — sourced from the
+        # same runner_allocation section launch_runner_listener's callers use,
+        # never hardcoded. 0/0 (the section's defaults) is a no-op downstream.
+        # Requires ci_runners #92 merged and deployed: the currently installed
+        # ci_fleet.provision_runner does not yet accept these kwargs.
         result = provision_runner(
             gh,
             config.runner_scaling,
             state.busy_runners,
             dry_run=False,
+            reserved_threads=config.runner_allocation.reserved_threads,
+            threads_per_slot=config.runner_allocation.threads_per_slot,
         )
         if result.ok:
             record_scale_event(paths.root, "up")
@@ -784,6 +791,16 @@ def _extract_attention_events(
     verdict_events = _collect_review_verdict_events(repo_key, data)
     events.extend(verdict_events)
 
+    # Issue #1088: surface an escalated-label repair sweep that could not reach
+    # GitHub. A subject whose ``issue_view`` raised has NOTHING written for it in
+    # state.json -- deliberately, so it retries next pass -- which makes the
+    # digest the only push-based surface that can tell a fleet with N permanently
+    # unreachable escalated issues from a healthy idle one. Without it the
+    # ``errored`` list is only discoverable by someone already querying events.db,
+    # and the whole point of #1088 is that a safety net went inert for eight days
+    # with nothing saying so.
+    events.extend(_collect_escalated_label_repair_events(repo_key, data))
+
     # Extract health transitions (if present from #161/#165)
     health_transitions = data.get("health_transitions", [])
     for transition in health_transitions:
@@ -834,6 +851,58 @@ def _add_skip_reasons(data: dict[str, Any], reasons: set[str]) -> None:
     skip_reason = data.get("reason") or data.get("deferred_reason")
     if data.get("skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
         reasons.add(skip_reason or "state_lock_busy")
+
+
+def _collect_escalated_label_repair_events(repo_key: str, data: Any) -> list[dict[str, Any]]:
+    """Collect FAILED escalated-label repairs from a result and nested dispatch_reviews.
+
+    ``dispatch_reviews`` returns ``escalated_labels_repaired``; ``loop()`` nests it
+    under the ``dispatch_reviews`` key, and the ``review_dispatch.enabled``-disabled
+    early return reports it too -- which is the only path a deployed fleet takes.
+    Both are walked, mirroring ``_collect_review_verdict_events``.
+
+    Only ``errored`` (the GitHub call raised) and ``failures`` (``transition()``
+    returned non-APPLIED) produce an entry. A *successful* repair deliberately does
+    not, for the same reason ``runner_allocation`` is excluded from the digest in
+    ``_build_fleet_attention_digest``: it is a self-healed success, the digest is
+    for things needing attention, and events.db already carries it. ``deferred`` is
+    likewise silent -- it is the per-pass cap converging normally, not a fault.
+
+    The emitted type ends in ``_error`` so the generic fallback in
+    ``_build_fleet_attention_digest`` renders it at ``health="ERROR"`` without
+    needing its own branch (issue #590 made that fallback non-dropping).
+    """
+    events: list[dict[str, Any]] = []
+    if not isinstance(data, dict):
+        return events
+    for source in (data, data.get("dispatch_reviews")):
+        if not isinstance(source, dict):
+            continue
+        repaired = source.get("escalated_labels_repaired")
+        if not isinstance(repaired, dict):
+            continue
+        errored = repaired.get("errored") or []
+        failures = repaired.get("failures") or []
+        if not isinstance(errored, list) or not isinstance(failures, list):
+            continue
+        if not errored and not failures:
+            continue
+        events.append(
+            {
+                "repo_key": repo_key,
+                # AttentionEntry requires an issue number; the first affected
+                # subject anchors the entry and the full lists are in the message,
+                # since one sweep can cover up to the per-pass cap.
+                "issue_number": (errored or failures)[0],
+                "type": "escalated_label_repair_error",
+                "error": (
+                    "agent:human-needed edge still owed -- "
+                    f"{len(errored)} unreachable {errored}, "
+                    f"{len(failures)} not applied {failures}"
+                ),
+            }
+        )
+    return events
 
 
 def _collect_review_verdict_events(repo_key: str, data: Any) -> list[dict[str, Any]]:

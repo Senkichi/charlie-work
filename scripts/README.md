@@ -35,18 +35,18 @@ stdlib-only; see the notes below before "fixing" one.
   moved or checked out under a different user profile, re-import it with
   `schtasks /create /tn charlie-fleet-pass /xml charlie-fleet-pass-task.xml`
   (or `Register-ScheduledTask`) after fixing the paths inside.
-- **`monitor_events.py`** / **`verify_events.py`** — read `events.db`
-  (via `charlie_work.instrumentation`) for live monitoring / one-shot health
-  checks. Both accept an optional `state.json` path as `argv[1]`; when
-  omitted, the path is resolved from the current repo's layered config
-  (`runtime.state_dir`) via `charlie_work.global_config.load_layered_config`,
-  so they target the right tree on any repo that overrides the default
-  `.var/charlie-work`. `verify_events.py` confirms the `state.json` path and
-  its `events.db` genuinely pre-exist, and that the DB holds at least one
-  event or loop pass, before printing `PASSED` (#718) — the read helpers it
-  calls resolve through `instrumentation._get_db`, which silently creates an
-  empty `events.db` for any path that doesn't exist yet, so an unguarded
-  run against the wrong tree would otherwise report a false-positive pass.
+- **`verify_events.py`** — read `events.db`
+  (via `charlie_work.instrumentation`) for a one-shot health check.
+  Accepts an optional `state.json` path as `argv[1]`; when omitted, the
+  path is resolved from the current repo's layered config (`runtime.state_dir`)
+  via `charlie_work.global_config.load_layered_config`, so it targets the
+  right tree on any repo that overrides the default `.var/charlie-work`.
+  `verify_events.py` confirms the `state.json` path and its `events.db`
+  genuinely pre-exist, and that the DB holds at least one event or loop
+  pass, before printing `PASSED` (#718) — the read helpers it calls resolve
+  through `instrumentation._get_db`, which silently creates an empty `events.db`
+  for any path that doesn't exist yet, so an unguarded run against the wrong
+  tree would otherwise report a false-positive pass.
 - **`heartbeat_check.py`** — deterministic fleet-heartbeat check (see its
   module docstring). Deliberately **stdlib-only** (plus `psutil`/`yaml`,
   already project dependencies) so a broken package install can never break

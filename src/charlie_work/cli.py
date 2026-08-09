@@ -1628,11 +1628,18 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     if decision.action == ScaleAction.UP:
         from ci_fleet.charlie_work_adapter import provision_runner
 
+        # Affinity knobs (issue: ci_runners #92 companion) — sourced from the
+        # same runner_allocation section launch_runner_listener's callers use,
+        # never hardcoded. 0/0 (the section's defaults) is a no-op downstream.
+        # Requires ci_runners #92 merged and deployed: the currently installed
+        # ci_fleet.provision_runner does not yet accept these kwargs.
         result = provision_runner(
             gh,
             config.runner_scaling,
             state.busy_runners,
             dry_run=False,
+            reserved_threads=config.runner_allocation.reserved_threads,
+            threads_per_slot=config.runner_allocation.threads_per_slot,
         )
         if result.ok:
             # Record scale event
@@ -1820,7 +1827,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "review-queue":
         return app.review_queue()
     if args.command == "why-charlie-hate":
-        return app.review(args.pr, cross_family=args.cross_family)
+        # The operator's manual re-run is deliberately exempt from the per-head
+        # cross-family regeneration budget (issue #1099): a human typing a
+        # command is not the loop the bound defends against, and RUNBOOK.md's
+        # recovery procedure for an exhausted budget is exactly this command.
+        return app.review(args.pr, cross_family=args.cross_family, enforce_regen_budget=False)
     if args.command == "why-charlie-hate-spec":
         try:
             return app.spec_review(args.spec_file)
