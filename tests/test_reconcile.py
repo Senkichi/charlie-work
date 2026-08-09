@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -22,12 +23,18 @@ from charlie_work.github import (
 from charlie_work.instrumentation import read_event_log
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.reconcile import (
+    ACTIVE_STATE_STATUSES,
     AVIATOR_BLOCKED_MESSAGE,
     AVIATOR_CHECK_NAME,
+    DORMANT_CONVERGENCE_EXCLUDED_STATUSES,
     DriftItem,
+    _LABEL_CORROBORATING_STATUSES,
+    _LABEL_STALE_STATUSES,
     _LIST_LIMIT as reconcile_list_limit,
     _fetch_issues,
     _fetch_prs,
+    _normalize_reconcile_issue,
+    _normalize_reconcile_pr,
     apply_fixes,
     detect_aviator_stale_blocked,
     detect_drift,
@@ -85,7 +92,27 @@ class FakeGitHub:
         if args[:2] == ["pr", "list"]:
             return self._prs
         if args[:2] == ["issue", "list"]:
-            return self._issues
+            # Model the real ``gh issue list --state all --limit 500`` cap for
+            # mutation tests that revert _fetch_issues to the pre-#762 path.
+            return self._issues[:reconcile_list_limit]
+        if args[0] == "api" and "pulls?state=all" in args[1]:
+            url = args[1]
+            page_match = re.search(r"[?&]page=(\d+)", url)
+            page = int(page_match.group(1)) if page_match else 1
+            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
+            per_page = int(per_page_match.group(1)) if per_page_match else 100
+            start = (page - 1) * per_page
+            return self._prs[start : start + per_page]
+        if args[0] == "api" and "issues?state=all" in args[1]:
+            url = args[1]
+            page_match = re.search(r"[?&]page=(\d+)", url)
+            page = int(page_match.group(1)) if page_match else 1
+            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
+            per_page = int(per_page_match.group(1)) if per_page_match else 100
+            start = (page - 1) * per_page
+            return self._issues[start : start + per_page]
+        if args[0] == "api":
+            return [] if json_output else ""
         raise AssertionError(f"unexpected gh.run call: {args}")
 
     def add_issue_label(self, number: int, label: str) -> bool:
@@ -118,6 +145,9 @@ class FakeGitHub:
             self._rate_limit_remaining,
             self._rate_limit_reset,
         )
+
+    def name_with_owner(self) -> str:
+        return "owner/test-repo"
 
 
 def _pr(
@@ -153,6 +183,43 @@ def _issue(number: int, labels: list[str], state: str = "OPEN") -> dict[str, Any
     }
 
 
+def _raw_rest_pr(
+    number: int,
+    state: str = "open",
+    *,
+    merged: bool = False,
+    merged_at: str | None = None,
+    head_ref: str = "agent/issue-1-x",
+    head_repo: str | None = "owner/test-repo",
+    base_repo: str | None = "owner/test-repo",
+) -> dict[str, Any]:
+    """Return a raw REST ``pulls`` response with no ``headRefName``.
+
+    This is the shape ``_normalize_reconcile_pr`` sees in production, but
+    existing test fixtures all set the normalized ``RECONCILE_PR_FIELDS`` keys.
+    """
+    return {
+        "number": number,
+        "title": f"pr {number}",
+        "html_url": f"https://example.test/pull/{number}",
+        "head": {
+            "ref": head_ref,
+            "sha": f"sha-{number}",
+            "repo": {"full_name": head_repo} if head_repo is not None else None,
+        },
+        "base": {
+            "ref": "main",
+            "sha": "base-sha",
+            "repo": {"full_name": base_repo} if base_repo is not None else None,
+        },
+        "body": "",
+        "state": state,
+        "labels": [],
+        "merged": merged,
+        "merged_at": merged_at,
+    }
+
+
 def test_detect_drift_makes_zero_mutating_calls() -> None:
     config = OrchestratorConfig()
     gh = FakeGitHub(
@@ -165,8 +232,9 @@ def test_detect_drift_makes_zero_mutating_calls() -> None:
 
     assert gh.labels_added == []
     assert gh.labels_removed == []
-    # Exactly one PR list query and one issue list query.
-    assert [call[:2] for call in gh.run_calls] == [["pr", "list"], ["issue", "list"]]
+    # PRs and issues are both fetched via paginated REST snapshots.
+    assert any(call[0] == "api" and "pulls?state=all" in call[1] for call in gh.run_calls)
+    assert any(call[0] == "api" and "issues?state=all" in call[1] for call in gh.run_calls)
 
 
 def test_detect_drift_finds_merged_outside_orchestrator() -> None:
@@ -255,35 +323,131 @@ def test_detect_drift_finds_state_pr_missing_on_github() -> None:
     assert matches[0].issue_number == 5
 
 
-def test_detect_drift_pr_snapshot_truncated_still_skips_state_pr_missing_on_github(
+def test_detect_drift_pr_list_paginated_finds_state_pr_missing_on_github(
     caplog,
 ) -> None:
-    """Issue #857 acceptance criterion 2: state_pr_missing_on_github stays fully gated.
-
-    Unlike the issue-side sweeps (state_active_status_issue_closed,
-    issue_status_normalized), this sweep's per-item fix is NOT safe to run
-    against a partial snapshot: a false positive here reaches
-    ``new_prs.pop(...)`` in ``apply_fixes`` and erases ``decision`` /
-    ``reviewed_head_sha`` for an approved PR fleet-wide. Issue #857 deliberately
-    leaves this gate untouched -- pin that it still skips outright when the PR
-    snapshot is truncated, so a future refactor of the issue-side gate doesn't
-    accidentally also lift this one.
+    """Issue #762: the PR list is fetched via paginated REST and is complete,
+    so state_pr_missing_on_github is no longer gated on an artificial
+    ``_LIST_LIMIT`` snapshot cap. A tracked PR that is genuinely absent from the
+    complete snapshot must still be flagged.
     """
     caplog.set_level(logging.WARNING)
     config = OrchestratorConfig()
-    # Exactly _LIST_LIMIT PRs, none numbered 999: the PR snapshot is provably
-    # truncated AND PR #999 (tracked in state, "missing" on GitHub) fell off it.
-    prs = [_pr(i, "OPEN") for i in range(1, reconcile_list_limit + 1)]
+    # More than _LIST_LIMIT PRs, none numbered 999. With a single 500-item page
+    # the snapshot would be provably truncated, but the paginated fetch must now
+    # return all of them, so PR #999 (tracked in state, missing on GitHub) is
+    # unambiguously missing and must be reported.
+    prs = [_pr(i, "OPEN") for i in range(1, reconcile_list_limit + 101)]
     gh = FakeGitHub(prs=prs, issues=[])
     state = empty_state()
     state["prs"]["999"] = {"issue_number": 5, "status": "reviewing"}
 
     drift = detect_drift(gh, state, config)
 
-    assert [item for item in drift if item.kind == "state_pr_missing_on_github"] == []
-    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
-    assert len(truncated) == 1
-    assert "incomplete" in caplog.text.lower()
+    missing = [item for item in drift if item.kind == "state_pr_missing_on_github"]
+    assert len(missing) == 1
+    assert missing[0].pr_number == 999
+    assert not any(item.kind == "snapshot_truncated" and "PR" in item.detail for item in drift)
+    assert "incomplete" not in caplog.text.lower()
+
+
+def test_fetch_prs_normalizes_raw_rest_pulls() -> None:
+    """Issue #762: _normalize_reconcile_pr must map the REST ``pulls`` shape
+    (no ``headRefName``, ``head``/``base`` sub-objects, ``merged_at``) to the
+    ``RECONCILE_PR_FIELDS`` shape. Existing test fixtures already carry the
+    normalized keys, so the transformation branch was previously unexercised.
+    """
+    merged = _raw_rest_pr(1, state="closed", merged_at="2026-08-05T00:00:00Z")
+    open_same = _raw_rest_pr(2, state="open")
+    cross = _raw_rest_pr(
+        3,
+        state="open",
+        head_ref="fork/issue-3-x",
+        head_repo="fork/test-repo",
+        base_repo="owner/test-repo",
+    )
+    deleted_fork = _raw_rest_pr(4, state="open", head_repo=None)
+    gh = FakeGitHub(prs=[merged, open_same, cross, deleted_fork], issues=[])
+
+    result = _fetch_prs(gh)
+
+    assert len(result) == 4
+    assert result[0]["state"] == "MERGED"
+    assert result[0]["headRefName"] == "agent/issue-1-x"
+    assert result[0]["url"] == "https://example.test/pull/1"
+    assert result[1]["isCrossRepository"] is False
+    assert result[2]["isCrossRepository"] is True
+    assert result[3]["isCrossRepository"] is None
+    assert all("headRefName" in pr for pr in result)
+
+
+def test_normalize_reconcile_pr_is_idempotent_on_gh_shape() -> None:
+    """The normalizer must be a no-op for fixtures that already carry the
+    normalized ``RECONCILE_PR_FIELDS`` shape (``headRefName`` present).
+    """
+    normalized = _pr(1, "OPEN")
+    assert _normalize_reconcile_pr(normalized) is normalized
+
+
+def test_fetch_issues_filters_pull_requests_and_maps_url() -> None:
+    """Issue #762: the REST ``issues`` endpoint returns both issues and PRs;
+    _fetch_issues must drop PR-shaped rows and map ``html_url`` to ``url``.
+    """
+    raw_issue = {
+        "number": 1,
+        "title": "issue 1",
+        "html_url": "https://example.test/issues/1",
+        "body": "",
+        "labels": [{"name": "ready"}],
+        "state": "open",
+    }
+    raw_pr = {
+        "number": 2,
+        "title": "pr 2",
+        "html_url": "https://example.test/pull/2",
+        "body": "",
+        "labels": [],
+        "state": "open",
+        "pull_request": {"url": "https://example.test/pull/2"},
+    }
+    gh = FakeGitHub(prs=[], issues=[raw_issue, raw_pr])
+
+    result = _fetch_issues(gh)
+
+    assert len(result) == 1
+    assert result[0]["number"] == 1
+    assert result[0]["url"] == "https://example.test/issues/1"
+    assert _normalize_reconcile_issue(raw_issue)["url"] == "https://example.test/issues/1"
+
+
+def test_detect_drift_issue_list_paginated_finalizes_out_of_window_closed_issue(
+    caplog,
+) -> None:
+    """Issue #762: the issue list is fetched via paginated REST and is complete,
+    so state_active_status_issue_closed is no longer gated on an artificial
+    ``_LIST_LIMIT`` snapshot cap. A closed issue beyond the old cap must still be
+    finalized.
+    """
+    caplog.set_level(logging.WARNING)
+    config = OrchestratorConfig()
+    # More than _LIST_LIMIT issues, with the closed one at the end of the list.
+    closed_issue_number = reconcile_list_limit + 100
+    issues = [_issue(i, [config.labels.ready]) for i in range(1, closed_issue_number)]
+    issues.append(_issue(closed_issue_number, [config.labels.in_progress], state="CLOSED"))
+    gh = FakeGitHub(prs=[], issues=issues)
+    state = empty_state()
+    state["issues"][str(closed_issue_number)] = {
+        "number": closed_issue_number,
+        "status": "dispatched",
+    }
+
+    drift = detect_drift(gh, state, config)
+
+    closed_items = [item for item in drift if item.kind == "state_active_status_issue_closed"]
+    assert len(closed_items) == 1
+    assert closed_items[0].issue_number == closed_issue_number
+    assert not any(item.kind == "snapshot_truncated" and "Issue" in item.detail for item in drift)
+    assert "truncated" not in caplog.text.lower()
 
 
 def test_detect_drift_finds_issue_active_label_no_open_pr(tmp_path: Path) -> None:
@@ -395,7 +559,14 @@ def test_apply_fixes_issue_active_label_with_open_pr() -> None:
     state = empty_state()
     state["issues"]["30"] = {
         "number": 30,
-        "status": "rework_requested",
+        # Issue #1092: was "rework_requested", which now corroborates the
+        # needs_rework label and correctly suppresses the rule. The status is
+        # incidental scaffolding for this test -- its subject is the --fix
+        # APPLY path, not which statuses qualify -- so it is retargeted to a
+        # genuinely-stale status rather than the assertion being relaxed.
+        # test_detect_drift_skips_issue_whose_status_corroborates_the_label
+        # pins the behaviour that displaced it.
+        "status": "dispatch_failed",
         "worker_pid": 12345,
     }
 
@@ -416,6 +587,193 @@ def test_apply_fixes_issue_active_label_with_open_pr() -> None:
     # (#955).
     assert new_state["issues"]["30"]["status"] == PASSIVE_OPEN_STATUS
     assert "worker_pid" not in new_state["issues"]["30"]
+
+
+def test_detect_drift_skips_issue_whose_status_corroborates_the_label() -> None:
+    """Issue #1092: reconcile must not revert a lane the orchestrator is holding.
+
+    This fixture is the exact shape of the production deadlock (job-cannon issue
+    1487): an issue queued behind the dispatch concurrency cap carries
+    ``agent:needs-rework`` with ``status == "rework_requested"`` and an open PR,
+    and has no live worker session because it has not been dispatched yet.
+
+    "Active label + open PR + no live worker" -- the rule's only pre-existing
+    false-positive guard -- is satisfied by that state, so the rule fired and
+    reset the status to PASSIVE_OPEN_STATUS. Since ``_dispatch_rework_impl``
+    selects on ``status == "rework_requested"``, that removed the issue from the
+    dispatch scan; the stranded-PR router then re-set it, and the two alternated
+    every reconcile pass with no forward progress.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, [config.labels.needs_rework])],
+    )
+    state = empty_state()
+    state["issues"]["30"] = {"number": 30, "status": "rework_requested"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "issue_active_label_with_open_pr"] == []
+
+
+def test_corroborating_status_suppresses_both_sub_cases_not_just_stale_active() -> None:
+    """Issue #1092: the exemption must not be gated on ``stale_active`` alone.
+
+    The rule has two independent sub-cases and the motivating issue triggers
+    BOTH at once: it carries ``agent:needs-rework`` (so ``stale_active`` is
+    non-empty) and lacks ``agent:pr-open`` (so ``needs_pr_open`` is true). An
+    exemption written as "skip only when ``not stale_active``" reads correctly,
+    passes a naive version of the criterion above, and still flips this issue on
+    every single pass via the ``needs_pr_open`` half.
+
+    Asserting the fixture really does arm both predicates is the point of this
+    test -- without it the suppression assertion could pass for the wrong reason.
+    """
+    config = OrchestratorConfig()
+    issue_labels = [config.labels.needs_rework]
+
+    # Positive control on the fixture itself: both sub-cases must be armed, or
+    # this test degenerates into a duplicate of the one above.
+    assert set(issue_labels) - {config.labels.pr_open, config.labels.reviewing}, (
+        "fixture must arm the stale_active sub-case"
+    )
+    assert config.labels.pr_open not in issue_labels, "fixture must arm the needs_pr_open sub-case"
+
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, issue_labels)],
+    )
+    state = empty_state()
+    state["issues"]["30"] = {"number": 30, "status": "rework_requested"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item for item in drift if item.kind == "issue_active_label_with_open_pr"] == []
+
+
+def test_detect_drift_still_heals_stale_active_label_after_failed_dispatch() -> None:
+    """Issue #1092: ``dispatch_failed`` stays outside the exemption.
+
+    A rework loop that failed to dispatch is precisely the "left over from a
+    failed rework loop" case the rule was written for (#515). Nothing is holding
+    the issue, so nothing will re-set the label, and the self-heal must still run.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, [config.labels.needs_rework])],
+    )
+    state = empty_state()
+    state["issues"]["30"] = {"number": 30, "status": "dispatch_failed"}
+
+    matches = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "issue_active_label_with_open_pr"
+    ]
+
+    assert len(matches) == 1
+    assert matches[0].issue_number == 30
+    assert matches[0].new_status == PASSIVE_OPEN_STATUS
+
+
+def test_needs_pr_open_still_fires_when_the_issue_has_no_state_entry() -> None:
+    """Issue #1092: an absent status must FALL THROUGH, not be exempted.
+
+    ``tracked_status`` is ``None`` for an issue with no state entry at all. That
+    is the untracked-issue case the ``needs_pr_open`` half exists to catch, so it
+    must still be reported. This is why the predicate is written in the deny-list
+    direction (``not in _LABEL_CORROBORATING_STATUSES``); the allow-list spelling
+    (``in _LABEL_STALE_STATUSES``) reads equivalently, excludes ``None``, and
+    would silently stop labelling brand-new issues forever.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+        issues=[_issue(30, [])],
+    )
+    state = empty_state()
+    assert "30" not in state["issues"], "fixture must leave tracked_status None"
+
+    matches = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "issue_active_label_with_open_pr"
+    ]
+
+    assert len(matches) == 1
+    assert matches[0].add_labels == (config.labels.pr_open,)
+
+
+def test_label_stale_statuses_stays_derived_from_active_state_statuses() -> None:
+    """Issue #1092: a status added later must default to PROTECTED.
+
+    The protected set is derived by subtraction rather than enumerated, so the
+    safe default is automatic. This guard fails if someone converts the
+    derivation back into a hand-maintained list, or adds a member to
+    ``_LABEL_STALE_STATUSES`` that no longer names a real status.
+
+    The asymmetry that justifies the direction: a wrong "stale" verdict is an
+    infinite loop that starves dispatch, while a wrong "corroborated" verdict is
+    one missed self-heal.
+    """
+    # Derivation preserved, not replaced by a literal.
+    assert _LABEL_CORROBORATING_STATUSES == ACTIVE_STATE_STATUSES - _LABEL_STALE_STATUSES
+
+    # No orphan members: every "stale" status is a real ACTIVE_STATE_STATUSES member.
+    assert _LABEL_STALE_STATUSES <= ACTIVE_STATE_STATUSES
+
+    # Positive control -- an empty protected set would satisfy every assertion
+    # above while exempting nothing, i.e. the guard would pass on the bug.
+    assert _LABEL_CORROBORATING_STATUSES, "protected set must not be empty"
+
+    # The two members the fix turns on, pinned by name.
+    assert "rework_requested" in _LABEL_CORROBORATING_STATUSES
+    assert "dispatch_failed" not in _LABEL_CORROBORATING_STATUSES
+
+    # "escalated" must stay PROTECTED. This assertion is currently unobservable
+    # through behaviour -- the `tracked_status == "escalated"` branch upstream
+    # converges labels from state and `continue`s, so an escalated issue never
+    # reaches the predicate either way (pinned by the companion test below).
+    # It is asserted anyway because the construction must fail CLOSED: if that
+    # short-circuit is ever removed, listing "escalated" as stale would reset
+    # an escalated issue's status to PASSIVE_OPEN_STATUS while
+    # `agent:human-needed` stayed live -- the #894 split-brain that
+    # DORMANT_CONVERGENCE_EXCLUDED_STATUSES exists to prevent.
+    assert "escalated" in _LABEL_CORROBORATING_STATUSES
+    assert "escalated" in DORMANT_CONVERGENCE_EXCLUDED_STATUSES
+
+
+def test_escalated_issue_never_reaches_the_open_pr_self_heal() -> None:
+    """Issue #1092 / #894: escalation is terminal-until-human at BOTH layers.
+
+    The upstream ``tracked_status == "escalated"`` branch short-circuits, so
+    this rule never sees an escalated issue. That is the behaviour this asserts
+    -- and it is asserted with a positive control, because "no drift of kind X"
+    is equally consistent with "correctly suppressed" and "fixture never armed
+    the rule at all". The control uses ``dispatch_failed`` on the byte-identical
+    fixture: it must produce drift, proving the shape reaches the rule.
+    """
+    config = OrchestratorConfig()
+
+    def probe(status: str) -> list[str]:
+        gh = FakeGitHub(
+            prs=[_pr(3, "OPEN", head_ref="agent/issue-30-x")],
+            issues=[_issue(30, [config.labels.needs_rework])],
+        )
+        state = empty_state()
+        state["issues"]["30"] = {"number": 30, "status": status}
+        return [item.kind for item in detect_drift(gh, state, config)]
+
+    # Positive control: the same fixture DOES arm the rule.
+    assert "issue_active_label_with_open_pr" in probe("dispatch_failed")
+
+    escalated_kinds = probe("escalated")
+    assert "issue_active_label_with_open_pr" not in escalated_kinds
+    # ...and it is suppressed by being HANDLED elsewhere, not by falling through
+    # every rule silently. The escalated issue still gets its labels converged.
+    assert "escalated_labels_converged" in escalated_kinds
 
 
 def test_detect_drift_finds_done_label_with_active_labels(tmp_path: Path) -> None:
@@ -893,37 +1251,17 @@ def test_reconcile_and_github_share_list_limit_constant() -> None:
     assert reconcile_list_limit == github_list_limit
 
 
-def test_detect_drift_snapshot_truncated_still_finalizes_in_window_closed_issue(
+def test_detect_drift_issue_snapshot_paginated_finalizes_in_window_and_skips_missing(
     caplog,
 ) -> None:
-    """Issue #857: an in-window closed issue is finalized while an out-of-window
-    entry in the SAME pass is still skipped silently.
-
-    This test used to assert ZERO finalization whenever the issue snapshot hit
-    the page limit at all. That assertion was wrong: it conflated "the snapshot
-    as a whole is incomplete" with "this specific item is unanswerable". The
-    closed issue built below IS present in the truncated snapshot -- GitHub gave
-    a definite CLOSED answer for it -- so skipping its finalization discarded a
-    known-good signal for no reason. The per-item lookup
-    (`issues_by_number.get(...)` -> ``None`` -> ``continue``) already fails safe
-    on issues that truly fell off the page; the outer total-skip gate added
-    nothing beyond that and is removed by issue #857.
-
-    Both entries share one ``detect_drift()`` call (issue #857 acceptance
-    criterion 4's exact wording: "assert the in-window issue IS finalized while
-    genuinely out-of-window entries are still skipped"). A version of this test
-    with only the out-of-window entry would pass unchanged under the OLD, fully
-    gated code too -- a lone out-of-window entry produces zero drift either
-    way -- so it alone would not prove per-item discrimination replaced the
-    outer gate. Combining both in one pass is what actually pins that.
-
-    A warning drift item (``snapshot_truncated``) is still emitted so operators
-    know the snapshot is incomplete, but it must not claim the sweeps were
-    skipped outright now that they partially ran (acceptance criterion 5).
+    """Issue #762/#857: the issue list is now fetched via paginated REST, so the
+    snapshot is complete by construction. A closed issue that IS in the snapshot
+    is still finalized, while a state-tracked issue whose number does not appear
+    anywhere in the snapshot is still skipped silently because its absence is
+    unanswerable -- not because the snapshot as a whole is truncated.
     """
     caplog.set_level(logging.WARNING)
     config = OrchestratorConfig()
-    # Exactly _LIST_LIMIT issues: the snapshot is provably truncated.
     closed_issue_number = reconcile_list_limit
     issues = [_issue(i, [config.labels.ready]) for i in range(1, reconcile_list_limit)]
     issues.append(_issue(closed_issue_number, [config.labels.in_progress], state="CLOSED"))
@@ -933,9 +1271,6 @@ def test_detect_drift_snapshot_truncated_still_finalizes_in_window_closed_issue(
         "number": closed_issue_number,
         "status": "dispatched",
     }
-    # A second entry whose number never appears in the snapshot above: GitHub's
-    # answer for it is genuinely unknown (not "closed"), so it must be skipped
-    # silently rather than flagged (acceptance criterion 3).
     out_of_window_issue_number = reconcile_list_limit + 1000
     state["issues"][str(out_of_window_issue_number)] = {
         "number": out_of_window_issue_number,
@@ -948,40 +1283,15 @@ def test_detect_drift_snapshot_truncated_still_finalizes_in_window_closed_issue(
     assert len(closed_items) == 1
     assert closed_items[0].issue_number == closed_issue_number
     assert [item for item in drift if item.kind == "issue_status_normalized"] == []
-    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
-    assert len(truncated) == 1
-    assert truncated[0].issue_number is None
-
-    warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert len(warning_records) == 1
-    message = warning_records[0].getMessage()
-    # Positive check (acceptance criterion 5): the message must name both
-    # sweeps and describe partial coverage, not just "truncated".
-    assert "state_active_status_issue_closed" in message
-    assert "issue_status_normalized" in message
-    assert "ran against" in message
-    # It must not claim the sweeps were skipped outright now that they
-    # partially run. Scoped to this one record (not all of caplog.text) so an
-    # unrelated future warning containing "skip" can't false-fail this test.
-    assert "skipping" not in message.lower()
+    assert not any(item.kind == "snapshot_truncated" for item in drift)
+    assert "truncated" not in caplog.text.lower()
 
 
-def test_detect_drift_snapshot_truncated_skips_out_of_window_issue() -> None:
-    """Issue #857 acceptance criterion 3: an out-of-window entry is skipped silently.
-
-    An issue tracked in state.json with an active status, but whose number does
-    NOT appear anywhere in the (truncated, exactly-_LIST_LIMIT) snapshot, is
-    genuinely unanswerable -- GitHub may have closed it, or it may still be
-    open; the snapshot simply doesn't say. It must be skipped, not flagged, and
-    the skip must not itself produce a drift item (the single snapshot_truncated
-    warning already covers that). This is a standalone companion to the combined
-    in-window/out-of-window test above: it isolates the out-of-window case on
-    its own so a future change to the in-window path can't accidentally also
-    break this one without a dedicated assertion catching it.
+def test_detect_drift_issue_snapshot_paginated_skips_genuinely_missing_issue() -> None:
+    """Issue #762: a state-tracked issue that is simply not in the (now
+    complete) issue snapshot is skipped silently, with no truncation warning.
     """
     config = OrchestratorConfig()
-    # Exactly _LIST_LIMIT issues, none numbered `out_of_window_issue_number`:
-    # the snapshot is provably truncated AND this issue fell off the page.
     out_of_window_issue_number = reconcile_list_limit + 1000
     issues = [_issue(i, [config.labels.ready]) for i in range(1, reconcile_list_limit + 1)]
     gh = FakeGitHub(prs=[], issues=issues)
@@ -995,8 +1305,7 @@ def test_detect_drift_snapshot_truncated_skips_out_of_window_issue() -> None:
 
     assert [item for item in drift if item.kind == "state_active_status_issue_closed"] == []
     assert [item for item in drift if item.kind == "issue_status_normalized"] == []
-    truncated = [item for item in drift if item.kind == "snapshot_truncated"]
-    assert len(truncated) == 1
+    assert not any(item.kind == "snapshot_truncated" for item in drift)
 
 
 def test_detect_drift_snapshot_not_truncated_finalizes_closed_issues() -> None:
@@ -1404,6 +1713,76 @@ def test_detect_drift_provider_throttle_detected_with_repo_root(tmp_path: Path) 
     # into set_throttled_until -- see test_apply_fixes_provider_throttle_threads_reason_and_adapter_kind.
     assert throttle_drift[0].throttle_reason == "rate_limited"
     assert throttle_drift[0].throttle_adapter_kind == "devin"
+
+
+def test_detect_drift_defers_dead_session_on_inconclusive_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #755: detect_drift must not reap a not-alive worker on the first
+    inconclusive probe; it must respect ``max_inconclusive_probe_deferrals``.
+    """
+    from charlie_work.config import WatchdogConfig
+    from charlie_work.devin_shell import SessionRecord, _sidecar_path as devin_sidecar_path
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    config = OrchestratorConfig(
+        watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=1),
+    )
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text("Session log\n", encoding="utf-8")
+
+    sidecar_path = devin_sidecar_path(sessions_dir, 42)
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=99999,  # Dead PID
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    def _inconclusive_probe(*_args: object, **_kwargs: object) -> RealActivityProbe:
+        return RealActivityProbe(
+            sources=(
+                ActivitySource(
+                    name="sessions.db",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error="no session found matching working_directory",
+                ),
+                ActivitySource(
+                    name="devin_per_pid_log",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error="no per-PID log found",
+                ),
+            )
+        )
+
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: False)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
+
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # Sidecar must still be present and the deferral counter advanced.
+    assert sidecar_path.exists(), "detect_drift should defer, not reap, on an inconclusive probe"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar.get("inconclusive_probe_deferred_count") == 1
+
+    # No drift item should propose a reap/relabel/throttle for this session yet.
+    assert not any(d.issue_number == 42 for d in drift)
+    assert gh.labels_added == []
+    assert gh.labels_removed == []
 
 
 def test_apply_fixes_provider_throttle_sets_throttled_until() -> None:
@@ -3058,6 +3437,10 @@ def test_reconcile_deferred_when_graphql_rate_limit_below_threshold(
     assert result.data["graphql_remaining"] == 100
     assert result.data["graphql_reset"] == 1234567890
     # No list calls were made because the guard stopped the sweep.
+    assert not any(
+        c[0] == "api" and ("pulls?state=all" in c[1] or "issues?state=all" in c[1])
+        for c in gh.run_calls
+    )
     assert not any(c[:2] == ["pr", "list"] for c in gh.run_calls)
     assert not any(c[:2] == ["issue", "list"] for c in gh.run_calls)
     # A deferred event was persisted to state.json.

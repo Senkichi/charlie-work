@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -925,8 +926,15 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
     # diverged or dirty tree.
+    state_dir = (
+        global_config.runtime.state_dir if global_config is not None else layout.DEFAULT_STATE_DIR
+    )
+    state_root = runtime_paths(orchestrator_root(), state_dir).root
     deploy = self_deploy(
-        orchestrator_root(), fleet_dir_override=args.fleet_dir, dry_run=args.dry_run
+        orchestrator_root(),
+        state_root=state_root,
+        fleet_dir_override=args.fleet_dir,
+        dry_run=args.dry_run,
     )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
@@ -1208,6 +1216,7 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
         journal_path as shadow_journal_path,
         read_all as read_shadow_journal,
     )
+    from ci_fleet.runner_allocation import SlotAction
     from ci_fleet.shadow_gate import (
         REQUIRED_CALENDAR_DAYS,
         REQUIRED_STREAK,
@@ -1293,6 +1302,8 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
     if not journal_found:
         data["agreement_streak"] = None
         data["change_agreement_streak"] = None
+        data["change_agreement_streak_by_action"] = None
+        data["provisioning_action"] = None
         data["gate"] = None
         return CommandResult(ok=True, message="runners shadow-status complete", data=data)
 
@@ -1319,6 +1330,52 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
         "streak": _trailing_streak(changed_records),
         "total": len(changed_records),
     }
+
+    # Per-action split of the load-bearing streak (#926). Counts individual
+    # changes, not passes, because one pass can contain several decisions. The
+    # action for a change is taken only where both planners agree on the exact
+    # (repo, runner, action) tuple -- a disagreement about the kind of change
+    # is the finding and must not be collapsed into a bucket.
+    def _change_action_tuples(rec: Mapping[str, Any]) -> set[tuple[str, str, str]]:
+        live = (rec.get("live_plan") or {}).get("changes") or []
+        shadow = (rec.get("shadow_plan") or {}).get("changes") or []
+        live_set = {(c["repo"], c["runner"], c["action"]) for c in live}
+        shadow_set = {(c["repo"], c["runner"], c["action"]) for c in shadow}
+        return live_set & shadow_set
+
+    def _action_counts(recs: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for rec in recs:
+            for _repo, _runner, action in _change_action_tuples(rec):
+                counts[action] = counts.get(action, 0) + 1
+        return counts
+
+    # The trailing run of changed passes that all agreed (same suffix that
+    # underlies change_agreement_streak, but we need the records, not just a
+    # count, to tally the actions inside them).
+    trailing_changed_records: list[Mapping[str, Any]] = []
+    for rec in reversed(changed_records):
+        if not rec.get("agreed"):
+            break
+        trailing_changed_records.append(rec)
+
+    total_action_counts = _action_counts(changed_records)
+    streak_action_counts = _action_counts(reversed(trailing_changed_records))
+
+    # Always show both SlotAction values so a 0/0 action is surfaced even when
+    # it has never been observed in the journal.
+    known_actions = {SlotAction.PARK.value, SlotAction.START.value}
+    observed_actions = set(total_action_counts) | set(streak_action_counts)
+    all_actions = known_actions | observed_actions
+
+    data["change_agreement_streak_by_action"] = {
+        action: {
+            "streak": streak_action_counts.get(action, 0),
+            "total": total_action_counts.get(action, 0),
+        }
+        for action in sorted(all_actions)
+    }
+    data["provisioning_action"] = SlotAction.START.value
 
     verdict = evaluate_shadow_gate(records)
     data["gate"] = {
@@ -1571,11 +1628,18 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     if decision.action == ScaleAction.UP:
         from ci_fleet.charlie_work_adapter import provision_runner
 
+        # Affinity knobs (issue: ci_runners #92 companion) — sourced from the
+        # same runner_allocation section launch_runner_listener's callers use,
+        # never hardcoded. 0/0 (the section's defaults) is a no-op downstream.
+        # Requires ci_runners #92 merged and deployed: the currently installed
+        # ci_fleet.provision_runner does not yet accept these kwargs.
         result = provision_runner(
             gh,
             config.runner_scaling,
             state.busy_runners,
             dry_run=False,
+            reserved_threads=config.runner_allocation.reserved_threads,
+            threads_per_slot=config.runner_allocation.threads_per_slot,
         )
         if result.ok:
             # Record scale event
@@ -1783,7 +1847,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "review-queue":
         return app.review_queue()
     if args.command == "why-charlie-hate":
-        return app.review(args.pr, cross_family=args.cross_family)
+        # The operator's manual re-run is deliberately exempt from the per-head
+        # cross-family regeneration budget (issue #1099): a human typing a
+        # command is not the loop the bound defends against, and RUNBOOK.md's
+        # recovery procedure for an exhausted budget is exactly this command.
+        return app.review(args.pr, cross_family=args.cross_family, enforce_regen_budget=False)
     if args.command == "why-charlie-hate-spec":
         try:
             return app.spec_review(args.spec_file)
@@ -2092,6 +2160,19 @@ def main(argv: list[str] | None = None) -> int:
                     f"    Agreement streak (passes with a real change) "
                     f"[LOAD-BEARING]: {change_streak.get('streak')}/{change_streak.get('total')}"
                 )
+                by_action = result.data.get("change_agreement_streak_by_action") or {}
+                provisioning_action = result.data.get("provisioning_action") or "start"
+                for action, info in sorted(by_action.items()):
+                    streak = info.get("streak", 0)
+                    total = info.get("total", 0)
+                    if total == 0:
+                        if action == provisioning_action:
+                            note = " <- provisioning path, never compared"
+                        else:
+                            note = " <- never compared"
+                    else:
+                        note = ""
+                    print(f"      {action}: {streak}/{total}{note}")
                 gate = result.data.get("gate") or {}
                 if gate:
                     print(
@@ -2112,7 +2193,8 @@ def main(argv: list[str] | None = None) -> int:
                         f"{all_streak.get('total')} pass(es), of which "
                         f"{(all_streak.get('total') or 0) - (change_streak.get('total') or 0)} "
                         "emitted no change; the change-emitting path has been "
-                        f"compared {change_streak.get('total')} time(s)."
+                        f"compared {change_streak.get('total')} time(s). "
+                        "Per-action counts are individual changes, not passes."
                     )
         elif args.runners_command == "ensure-started" and result.ok:
             started_count = result.data.get("started_count", 0)

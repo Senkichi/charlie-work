@@ -285,6 +285,31 @@ NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 # exists to prevent. If a future consumer inside the package needs that path,
 # add the constant then and update the script to match in the same change.
 
+#: Filenames whose *re-spelling* is a divergence hazard, and which
+#: ``tests/test_no_path_literals.py`` therefore forbids outside this module.
+#:
+#: Deliberately narrower than the full set of ``*_FILENAME`` constants.
+#: ``GLOBAL_CONFIG_FILENAME`` (``config.yaml``) is deliberately excluded:
+#: it is a bare, generic name that Rule 1 can only match by exact string
+#: membership, so it would false-positive on any unrelated
+#: ``some_dir / "config.yaml"`` and induce the wrong import. The constants
+#: below are specific enough that a re-spelling elsewhere is almost always a
+#: real divergence hazard.
+_ENFORCED_FILENAMES = (
+    STATE_FILENAME,
+    SUPERVISOR_LOCK_FILENAME,
+    PENDING_SYNC_FILENAME,
+    SELF_DEPLOY_FAILURE_STATE_FILENAME,
+    ZERO_PASS_STREAK_STATE_FILENAME,
+    NOTIFY_DIGEST_FILENAME,
+    SESSION_MANIFEST_FILENAME,
+    SESSION_RESULTS_FILENAME,
+    FLEET_REGISTRY_FILENAME,
+    FLEET_LOCK_FILENAME,
+    FLEET_SUPERVISOR_LOCK_FILENAME,
+    NOTIFY_HEALTH_STATE_FILENAME,
+)
+
 
 def global_config_path(override: str | None = None) -> Path:
     """Return the host-wide global config path in the fleet dir.

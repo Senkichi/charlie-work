@@ -7,8 +7,9 @@ then permanently disagree with reality — e.g. ``agent:in-progress`` /
 ``agent:reviewing`` never clears because the label edge that would clear it
 (``labels.transition(..., "merged")``) never ran.
 
-``detect_drift`` is read-only: it issues exactly one PR list query and one
-issue list query via ``gh.run`` and never calls a mutating GitHub method.
+``detect_drift`` is read-only: it fetches every PR and every issue via
+paginated REST snapshots through ``gh.run``, and never calls a mutating GitHub
+method.
 ``apply_fixes`` is the only function in this module that mutates GitHub, and
 it is never invoked implicitly — callers gate it behind an explicit
 ``--fix`` flag. It reuses ``labels.transition`` for the one drift
@@ -33,8 +34,6 @@ from .github import (
     GitHubLike,
     GraphQLBudgetError,
     _LIST_LIMIT,
-    RECONCILE_ISSUE_FIELDS,
-    RECONCILE_PR_FIELDS,
     label_names,
     linked_issue_number,
 )
@@ -58,6 +57,7 @@ from .worktree import (
     push_branch,
     remove_review_checkout,
     resolve_base_branch_name,
+    summarize_branch_work,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,13 @@ class DriftItem:
 # Deliberate exclusions: "closed" (already terminal), "approved"/"blocked"
 # (finalization of closed approved/blocked issues is owned by the merged-PR
 # finalization flow, pre-existing behavior).
+# Issue #1066: membership here does NOT mean uniform treatment across every
+# sweep that consumes this set. closed_unmerged_pr_issue_state_converged
+# excludes "escalated" via DORMANT_CONVERGENCE_EXCLUDED_STATUSES (defined
+# below) because that sweep drops the status key entirely rather than
+# converging to a terminal value; "escalated" stays in this set because
+# state_active_status_issue_closed and the coverage invariant above still
+# need it here.
 ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
     {
         "dispatched",
@@ -123,6 +130,77 @@ ACTIVE_STATE_STATUSES: frozenset[str] = frozenset(
         "escalated",
     }
 )
+
+# Issue #1066: the subset of ACTIVE_STATE_STATUSES that is a human-owned
+# terminal disposition rather than orchestrator work-in-flight -- currently
+# just "escalated". A repair sweep that converges a stale ACTIVE_STATE_STATUSES
+# entry to the dormant baseline (dropping the status key entirely, as opposed
+# to state_active_status_issue_closed's convergence to the terminal "closed"
+# value) must exclude this set: silently dropping "escalated" detaches the
+# issue's state from its still-live agent:human-needed label with no repair
+# path back into the human queue, since nothing else is watching a
+# status-less issue for that label. reconcile.py's own
+# ORCHESTRATOR_OWNED_ISSUE_STATUSES import is NOT the right predicate for
+# this -- ACTIVE_STATE_STATUSES is entirely a subset of it (both share every
+# member except "approved"/"blocked"/"closed", none of which are ever in
+# ACTIVE_STATE_STATUSES), so gating on it here would make the affected drift
+# kind permanently unreachable rather than narrowly excluding "escalated".
+DORMANT_CONVERGENCE_EXCLUDED_STATUSES: frozenset[str] = frozenset({"escalated"})
+
+# Issue #1092: the subset of ACTIVE_STATE_STATUSES for which an active agent
+# label on an issue with an open PR is genuinely STALE -- i.e. the orchestrator
+# is not currently holding that issue in any lane, so nothing will re-set the
+# label and issue_active_label_with_open_pr is free to clear it.
+#
+# Every other ACTIVE_STATE_STATUSES member CORROBORATES the label: some router
+# put the issue in that lane deliberately and will set the label again on its
+# next pass. Reverting it there is not a repair, it is one half of a loop --
+# reconcile clears the label and resets status to PASSIVE_OPEN_STATUS, the
+# router re-sets both, forever, at whatever the reconcile cadence happens to be.
+# Measured in job-cannon at a ~29-minute period across 26 issues with zero
+# forward progress, because _dispatch_rework_impl selects on
+# status == "rework_requested" (workflow.py) and the revert removes the issue
+# from that scan entirely.
+#
+# Derived by SUBTRACTION rather than enumerated, so a status added to
+# ACTIVE_STATE_STATUSES later defaults to protected. The asymmetry justifies the
+# direction: a wrong "stale" verdict is an infinite loop that starves dispatch,
+# while a wrong "corroborated" verdict is one missed self-heal that some other
+# sweep or the next status change will pick up.
+#
+# The two members are here for DIFFERENT reasons; neither generalizes to the
+# other:
+#
+#   "dispatch_failed" -- a rework loop that failed to dispatch is precisely the
+#   "left over from a failed rework loop" case the rule was written for (#515).
+#   Exempting it would disable the rule's original purpose.
+#
+#   "open_passive" -- this is the status the rule itself WRITES on repair, so
+#   its presence here means "re-fire on an issue this rule already converged".
+#   That is reachable and intended: labels can drift after convergence (an
+#   external relabel, a partially-applied transition), and repairing labels
+#   against an already-correct status is idempotent, not a loop. No router
+#   holds an issue in this lane, so nothing re-sets the label afterwards.
+#
+# "escalated" is deliberately NOT a member, and its absence is load-bearing
+# even though it is currently unobservable. Escalated issues never reach this
+# predicate at all -- the `tracked_status == "escalated"` branch above
+# converges labels from state and `continue`s, and its comment names this rule
+# as the thing it is protecting against ("the zero-label shape the open-PR
+# self-heal below would otherwise silently re-arm"). Listing it as STALE would
+# therefore be inert today but fail OPEN: if that branch ever stopped
+# short-circuiting, an escalated issue would get its status silently reset to
+# PASSIVE_OPEN_STATUS while `agent:human-needed` stayed live -- the #894
+# status/label split-brain that DORMANT_CONVERGENCE_EXCLUDED_STATUSES (above)
+# exists to prevent, re-created one rule over. Protected here means this rule
+# fails closed if that guard ever moves.
+_LABEL_STALE_STATUSES: frozenset[str] = frozenset(
+    {
+        "dispatch_failed",
+        "open_passive",
+    }
+)
+_LABEL_CORROBORATING_STATUSES: frozenset[str] = ACTIVE_STATE_STATUSES - _LABEL_STALE_STATUSES
 
 
 def _issue_state(issue: dict[str, Any] | None) -> str:
@@ -176,38 +254,153 @@ def _fetch_snapshot(gh: GitHubLike, args: list[str], *, what: str) -> list[dict[
     return result
 
 
+def _normalize_reconcile_pr(pr: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a REST ``pulls`` response to the ``gh pr list --json`` shape.
+
+    Existing ``FakeGitHub`` test doubles already return the normalized
+    ``RECONCILE_PR_FIELDS`` shape, so this function is idempotent: if the input
+    already carries ``headRefName`` it is returned unchanged.
+    """
+    if isinstance(pr.get("head"), dict) and pr.get("headRefName") is None:
+        head = pr.get("head") or {}
+        base = pr.get("base") or {}
+        head_repo = (head.get("repo") or {}).get("full_name")
+        base_repo = (base.get("repo") or {}).get("full_name")
+        is_cross_repository = (
+            None if head_repo is None or base_repo is None else head_repo != base_repo
+        )
+
+        raw_state = str(pr.get("state") or "open").lower()
+        if pr.get("merged") or pr.get("merged_at"):
+            state = "MERGED"
+        elif raw_state == "closed":
+            state = "CLOSED"
+        else:
+            state = "OPEN"
+
+        return {
+            "number": pr.get("number"),
+            "title": pr.get("title"),
+            "url": pr.get("html_url") or pr.get("url"),
+            "headRefName": head.get("ref"),
+            "baseRefName": base.get("ref"),
+            "body": pr.get("body"),
+            "state": state,
+            "labels": pr.get("labels", []),
+            "isCrossRepository": is_cross_repository,
+            "headRefOid": head.get("sha"),
+        }
+
+    return pr
+
+
 def _fetch_prs(gh: GitHubLike) -> list[dict[str, Any]]:
-    return _fetch_snapshot(
-        gh,
-        [
-            "pr",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            str(_LIST_LIMIT),
-            "--json",
-            RECONCILE_PR_FIELDS,
-        ],
-        what="PR",
-    )
+    """Fetch every PR via the REST ``pulls`` endpoint, paging to exhaustion.
+
+    ``gh pr list --state all --limit 500`` was permanently capped at
+    ``_LIST_LIMIT`` (500). Once a repo crossed that limit the PR snapshot was
+    always provably incomplete, which made ``detect_drift`` skip the
+    ``state_pr_missing_on_github`` sweep on every subsequent pass (issue #762).
+    The REST ``pulls`` endpoint is paged and has no hard cap, so we walk it
+    until a page comes back with fewer items than requested.
+    """
+    per_page = 100
+    all_prs: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        result = gh.run(
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/pulls?state=all&per_page={per_page}&page={page}",
+            ],
+            json_output=True,
+        )
+        if not isinstance(result, list):
+            raise GitHubError(
+                f"reconcile: `gh api pulls?state=all` returned {type(result).__name__}, not a list; "
+                f"refusing to treat an unreadable PR snapshot as an empty one "
+                "(that reading would drop every tracked PR from state.json)"
+            )
+        if not result:
+            break
+        all_prs.extend(_normalize_reconcile_pr(pr) for pr in result)
+        if len(result) < per_page:
+            break
+        page += 1
+    return all_prs
+
+
+def _repo_slug(gh: GitHubLike) -> str:
+    """Return the ``owner/repo`` slug, or ``?`` if the lookup fails.
+
+    This is used only in log records; a lookup failure must not stop the
+    reconcile pass, so it falls back to a placeholder.
+    """
+    try:
+        return gh.name_with_owner()
+    except Exception:
+        return "?"
+
+
+def _normalize_reconcile_issue(issue: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a REST ``issues`` response to the ``gh issue list --json`` shape.
+
+    ``gh issue list --json`` names the web URL ``url``; the REST endpoint names
+    the same URL ``html_url``. This function is idempotent: if the input
+    already carries ``url`` and no ``html_url`` it is returned unchanged.
+    """
+    if isinstance(issue, dict) and "html_url" in issue:
+        normalized = dict(issue)
+        normalized["url"] = normalized.pop("html_url")
+        return normalized
+    return issue
 
 
 def _fetch_issues(gh: GitHubLike) -> list[dict[str, Any]]:
-    return _fetch_snapshot(
-        gh,
-        [
-            "issue",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            str(_LIST_LIMIT),
-            "--json",
-            RECONCILE_ISSUE_FIELDS,
-        ],
-        what="issue",
-    )
+    """Fetch every issue via the REST ``issues`` endpoint, paging to exhaustion
+    and filtering out pull requests.
+
+    ``gh issue list --state all --limit 500`` was permanently capped at
+    ``_LIST_LIMIT`` (500). Once a repo crossed that limit the issue snapshot was
+    always provably incomplete, so any state-tracked issue outside the most
+    recent 500 became permanently unanswerable (issue #762). The REST
+    ``issues`` endpoint is paged and has no hard cap, so we walk it until a page
+    comes back with fewer items than requested. The endpoint returns both
+    issues and PRs; we drop PR-shaped entries so the issue snapshot contains
+    only real issues.
+    """
+    per_page = 100
+    all_issues: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        result = gh.run(
+            [
+                "api",
+                f"repos/{{owner}}/{{repo}}/issues?state=all&per_page={per_page}&page={page}",
+            ],
+            json_output=True,
+        )
+        if not isinstance(result, list):
+            raise GitHubError(
+                f"reconcile: `gh api issues?state=all` returned {type(result).__name__}, not a list; "
+                f"refusing to treat an unreadable issue snapshot as an empty one "
+                "(that reading would drop every tracked issue from state.json)"
+            )
+        if not result:
+            break
+        for issue in result:
+            if not isinstance(issue, dict):
+                continue
+            # The REST ``issues`` endpoint returns both issues and PRs; ``gh
+            # issue list`` filters PRs client-side. Skip PR-shaped rows so they
+            # do not pollute the issue snapshot and duplicate the PR snapshot.
+            if issue.get("pull_request"):
+                continue
+            all_issues.append(_normalize_reconcile_issue(issue))
+        if len(result) < per_page:
+            break
+        page += 1
+    return all_issues
 
 
 # Aviator (job-cannon/charlie-work's merge-queue bot) owns these strings; they
@@ -617,31 +810,20 @@ def detect_drift(
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
-    # Issue #45: the `--state all` query is capped at _LIST_LIMIT. If it returns
-    # that many, the snapshot is provably incomplete for issues outside the
-    # page window. Issue #857: this flag no longer gates any sweep outright --
-    # state_active_status_issue_closed and issue_status_normalized (below) run
-    # against every issue that IS in the snapshot regardless of this flag, and
-    # fail safe per-item on the issues that aren't. This flag's only remaining
-    # consumer is the honesty warning emitted near the end of this function.
-    issue_snapshot_truncated = len(issues) >= _LIST_LIMIT
+    # Issue #762: issues are now fetched via a paginated REST ``issues``
+    # snapshot. The list is either complete (we stopped because GitHub returned
+    # an under-full page) or the fetch raised. It is no longer a fixed
+    # ``_LIST_LIMIT`` page, so the snapshot is not permanently incomplete.
+    # The per-item ``issue is None`` checks below already fail safe on any
+    # genuinely missing issue, and the warning remains defensive dead code.
+    issue_snapshot_truncated = False
     state_prs: dict[str, Any] = state.get("prs", {})
-    # PR-side counterpart of issue_snapshot_truncated, guarding
-    # state_pr_missing_on_github below: truncated-from-above only.
-    # `--limit _LIST_LIMIT` returning exactly that many means real GitHub has
-    # strictly more PRs than fit in this snapshot, so the sweep can't be
-    # trusted to see every tracked PR.
-    #
-    # Deliberately NOT "prs is empty while state.json tracks PRs" -- that
-    # signal is unsatisfiable at this layer: detect_drift receives
-    # bit-identical inputs (prs=[], non-empty state_prs) from a genuinely
-    # empty GitHub snapshot (state_pr_missing_on_github must fire; see
-    # test_detect_drift_finds_state_pr_missing_on_github) and from a
-    # test-double gap that isn't a real production signal at all. Adding an
-    # "empty implies incomplete" branch here to work around the latter always
-    # breaks the former -- confirmed by running both variants. The actual
-    # fidelity gap belongs in the test double, not in production logic.
-    pr_snapshot_incomplete = len(prs) >= _LIST_LIMIT
+    # Issue #762: PRs are now fetched via a paginated REST ``pulls`` snapshot.
+    # The list is either complete (we stopped because GitHub returned an
+    # under-full page) or the fetch raised. It is no longer a fixed
+    # ``_LIST_LIMIT`` page, so the snapshot is not permanently incomplete.
+    # state_pr_missing_on_github therefore runs unconditionally below.
+    pr_snapshot_incomplete = False
 
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}
@@ -766,7 +948,7 @@ def detect_drift(
             # issue's state status away from any ACTIVE_STATE_STATUS when
             # its PR is closed-unmerged and the GitHub issue itself is
             # still OPEN. Without this, an issue stuck in
-            # "rework_requested" (or "reviewing", "escalated", ...) is
+            # "rework_requested" (or "reviewing", "dispatched", ...) is
             # selected by dispatch_rework's state-driven candidate scan
             # every loop pass, which calls gh.issue_view() on it before
             # any open-PR filtering -- a permanent per-pass GitHub fetch
@@ -783,10 +965,25 @@ def detect_drift(
             # a human re-arms it. The linked issue's label disposition
             # remains owned by closed_unmerged_pr_active_labels; the two
             # are independent and may both fire for the same PR.
+            #
+            # Issue #1066: "escalated" is excluded via
+            # DORMANT_CONVERGENCE_EXCLUDED_STATUSES. Unlike the other
+            # ACTIVE_STATE_STATUSES members, "escalated" is not orchestrator
+            # work-in-flight that should be reset to dormant when its PR dies
+            # -- it is a human-owned terminal disposition, and the issue's
+            # agent:human-needed label stays live regardless of what happens
+            # to this PR. Dropping the status key here would silently detach
+            # the state entry from that still-live label with no automated
+            # path back into the human queue (fired in production: issue
+            # #894 via PR #948). Leaving "escalated" status in place does not
+            # make this issue a rework candidate: dispatch_rework's candidate
+            # filter is status == "rework_requested" specifically (not
+            # general ACTIVE_STATE_STATUSES membership), so this exclusion
+            # does not reintroduce that path's per-pass gh.issue_view() cost.
             if issue is not None and _issue_state(issue) == "OPEN" and issue_number is not None:
                 issue_entry = state.get("issues", {}).get(str(issue_number))
                 issue_status = issue_entry.get("status") if isinstance(issue_entry, dict) else None
-                if issue_status in ACTIVE_STATE_STATUSES:
+                if issue_status in ACTIVE_STATE_STATUSES - DORMANT_CONVERGENCE_EXCLUDED_STATUSES:
                     drift.append(
                         DriftItem(
                             kind="closed_unmerged_pr_issue_state_converged",
@@ -834,22 +1031,21 @@ def detect_drift(
                 )
 
     pr_numbers_on_github = {int(pr["number"]) for pr in prs if pr.get("number") is not None}
-    if not pr_snapshot_incomplete:
-        for pr_number_str in state_prs:
-            try:
-                pr_number = int(pr_number_str)
-            except ValueError:
-                continue
-            if pr_number not in pr_numbers_on_github:
-                drift.append(
-                    DriftItem(
-                        kind="state_pr_missing_on_github",
-                        issue_number=state_prs[pr_number_str].get("issue_number"),
-                        pr_number=pr_number,
-                        detail=f"state has prs[{pr_number}] but gh reports no such PR",
-                        fix_actions=(f"drop prs[{pr_number}] from state",),
-                    )
+    for pr_number_str in state_prs:
+        try:
+            pr_number = int(pr_number_str)
+        except ValueError:
+            continue
+        if pr_number not in pr_numbers_on_github:
+            drift.append(
+                DriftItem(
+                    kind="state_pr_missing_on_github",
+                    issue_number=state_prs[pr_number_str].get("issue_number"),
+                    pr_number=pr_number,
+                    detail=f"state has prs[{pr_number}] but gh reports no such PR",
+                    fix_actions=(f"drop prs[{pr_number}] from state",),
                 )
+            )
 
     # Detect dead sessions and classify failures for provider throttle state
     # This must happen AFTER the PR loop (to populate open_prs_by_issue) but BEFORE
@@ -860,9 +1056,9 @@ def detect_drift(
         from .post_mortem import classify_and_record
         from .worker import (
             _log_is_stalled_at_shim,
+            is_worker_confirmed_dead,
             iter_workers,
             real_activity_probe_for,
-            update_worker_log_stat,
         )
 
         sessions_dir = resolved_layout(config, repo_root).sessions_dir
@@ -965,10 +1161,17 @@ def detect_drift(
                                     # Mark this issue as handled to avoid double-emission
                                     issues_handled_by_session_relabel.add(w.issue_number)
 
-                if not skip_dead_session_sweep and w.error is None and not w.is_alive():
-                    # Update log stat fields for progress tracking (final update before classification)
-                    update_worker_log_stat(sessions_dir, w)
-
+                if (
+                    not skip_dead_session_sweep
+                    and w.error is None
+                    and is_worker_confirmed_dead(
+                        w,
+                        config,
+                        now,
+                        sessions_dir,
+                        persist_inconclusive_probe_counter=True,
+                    )
+                ):
                     # Issue #252: inspect the worktree before deciding how to classify.
                     # This is the single enforcement point shared with workflow.py.
                     worktree_path = Path(w.worktree_path)
@@ -1389,6 +1592,22 @@ def detect_drift(
                 and not terminal_present
                 and issue_number not in issues_handled_by_session_relabel
                 and issue_number not in live_session_issue_numbers
+                # Issue #1092: state corroborates the label -- some router is
+                # deliberately holding this issue in a lane and will re-set both
+                # the label and the status on its next pass, so "repairing" it
+                # here just starts a loop. Worker liveness (the check above) is
+                # NOT sufficient on its own: "active label + open PR + no live
+                # worker" is also the exact, correct state of an issue queued
+                # behind the dispatch concurrency cap, which is every issue past
+                # the Nth in any rework batch.
+                #
+                # Deny-list form is deliberate. tracked_status is None when the
+                # issue has no state entry at all, and None must FALL THROUGH to
+                # let the rule fire -- a brand-new issue whose PR went unnoticed
+                # is exactly what the needs_pr_open half exists to catch. The
+                # allow-list spelling (`tracked_status in _LABEL_STALE_STATUSES`)
+                # reads equivalently and silently excludes that issue forever.
+                and tracked_status not in _LABEL_CORROBORATING_STATUSES
                 and _issue_state(issue) == "OPEN"
             ):
                 pr_number = min(int(pr["number"]) for pr in open_prs)
@@ -1674,9 +1893,10 @@ def detect_drift(
     # _LIST_LIMIT flag, so it stays proportionate to what really happened.
     if issue_status_normalization_deferred:
         logger.warning(
-            "issue_status_normalized deferred for %d issue(s) whose "
+            "[repo=%s] issue_status_normalized deferred for %d issue(s) whose "
             "state-tracked open PR(s) are absent from this pass's PR "
             "snapshot: %s",
+            _repo_slug(gh),
             len(issue_status_normalization_deferred),
             issue_status_normalization_deferred,
         )
@@ -1711,10 +1931,11 @@ def detect_drift(
     # than claiming the sweeps were skipped outright.
     if issue_snapshot_truncated:
         logger.warning(
-            "Issue snapshot is truncated at the page limit (%d); "
+            "[repo=%s] Issue snapshot is truncated at the page limit (%d); "
             "state_active_status_issue_closed and issue_status_normalized ran "
             "against the %d issues in the snapshot, but issues outside that "
             "page window were not evaluated this pass",
+            _repo_slug(gh),
             _LIST_LIMIT,
             len(issues),
         )
@@ -1736,13 +1957,14 @@ def detect_drift(
             )
         )
 
-    # PR-side counterpart: see pr_snapshot_incomplete's definition above for
-    # the two conditions this covers (truncated-from-above, or suspiciously
-    # empty relative to what state.json tracks).
+    # Defensive: this is dead code while _fetch_prs paginates to completion,
+    # but if the fetch is ever re-capped the warning (and DriftItem) must still
+    # carry the repo slug.
     if pr_snapshot_incomplete:
         logger.warning(
-            "PR snapshot is incomplete (%d returned, %d tracked in state); "
+            "[repo=%s] PR snapshot is incomplete (%d returned, %d tracked in state); "
             "skipping state_pr_missing_on_github sweep for this pass",
+            _repo_slug(gh),
             len(prs),
             len(state_prs),
         )
@@ -1960,6 +2182,10 @@ def apply_fixes(
             # state status, converging to the dormant baseline (no status
             # key) that issue_status_normalized also uses for a
             # never-dispatched issue. Other fields are preserved.
+            # Issue #1066: detect_drift never emits this kind for an
+            # "escalated" issue status (DORMANT_CONVERGENCE_EXCLUDED_STATUSES),
+            # so this branch cannot reach an escalated entry -- no
+            # apply-time guard is needed here, only at emission.
             if item.issue_number is not None:
                 issue_key = str(item.issue_number)
                 existing_issue = new_issues.get(issue_key, {})
@@ -2173,15 +2399,28 @@ def apply_fixes(
                     if push_ok:
                         pr_create = getattr(gh, "pr_create", None)
                         if pr_create is not None:
+                            # Same janitor body gate as a worker-authored PR --
+                            # boilerplate alone can never satisfy it. Derive the
+                            # rationale from the worker's own commit log rather
+                            # than injecting the gate's keywords.
+                            salvage_body = (
+                                f"Closes #{item.issue_number}\n\n"
+                                "Salvaged by the orchestrator from a completed-but-unpublished "
+                                "worker worktree."
+                            )
+                            branch_summary = summarize_branch_work(
+                                repo_root,
+                                item.branch,
+                                item.base_branch,
+                                test_path_globs=config.test_adequacy.test_path_globs,
+                            )
+                            if branch_summary:
+                                salvage_body = f"{salvage_body}\n\n{branch_summary}"
                             pr_number = pr_create(
                                 head=item.branch,
                                 base=item.base_branch,
                                 title=f"Salvaged work for issue #{item.issue_number}",
-                                body=(
-                                    f"Closes #{item.issue_number}\n\n"
-                                    "Salvaged by the orchestrator from a completed-but-unpublished "
-                                    "worker worktree."
-                                ),
+                                body=salvage_body,
                             )
                         if pr_number is not None:
                             salvage_ok = True

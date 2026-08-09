@@ -563,6 +563,13 @@ class AutoMergeConfig:
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
     # DIRTY or a missing CI trigger). 0 disables the guard.
     readiness_no_ci_minutes: int = 15
+    # Maximum minutes after the PR's last update (updatedAt) to wait before
+    # querying GitHub Actions directly to distinguish "CI never created a run
+    # for this head" from "CI is pending" when the janitor gate reports
+    # required checks missing. Unlike readiness_no_ci_minutes (which only
+    # gates the post-approval merge_ready path), this applies to any PR
+    # blocked pre-review by the janitor gate. 0 disables the guard.
+    ci_run_never_created_grace_minutes: int = 5
     # Strategy controlling which open agent PRs are rebased after a
     # successful ship-it merge.
     #
@@ -717,6 +724,14 @@ class RuntimeConfig:
     # a frozen value object with no mutable state.
     gh_max_retries: int = 3
     gh_retry_base_seconds: float = 1.0
+    # Wall-clock ceiling on a single `gh` invocation. Without it a hung gh
+    # process blocks the orchestrator loop pass forever: the pass never
+    # completes, the supervisor's staleness watchdog eventually kills the
+    # child, and every PR waiting on merge_ready stalls until a human
+    # intervenes (observed 2026-08-05, loop pass 0636dca635de). Retries do not
+    # help a call that never returns — only a timeout converts the hang into a
+    # failure the existing retry/next-pass machinery can absorb.
+    gh_timeout_seconds: float = 120.0
     # Pre-emptive GraphQL rate-limit guard. Before starting quota-heavy phases
     # (mop-up sweeps, merged-PR listings), GitHub.check_graphql_rate_limit()
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
@@ -731,6 +746,18 @@ class RuntimeConfig:
     # estimates are floors, not guarantees; dispatching at T+0 races the
     # provider's actual reset. Default 90 seconds.
     throttle_resume_margin_s: int = 90
+    # Issue #1088: max escalated issues the label self-heal sweep will verify
+    # against GitHub in a single pass. The bound is mandatory, not defensive.
+    # Every subject whose ``label_error`` key is absent costs one live
+    # ``issue_view`` call, and measured at the time of the fix *every* escalated
+    # subject was in that arm -- 8 in charlie-work and 49 in job-cannon. Sweeping
+    # all 57 in one pass would add ~57 sequential ``gh`` subprocess calls to a
+    # loop pass that is shared sequentially between both repos, which is the
+    # starvation mechanism of #1078. Bounding converges over a handful of passes
+    # instead of one long burst; verified subjects are then free forever (their
+    # ``label_error`` is None, which costs a dict lookup and no API call). Set
+    # to 0 for unlimited.
+    escalated_label_repair_max_per_pass: int = 10
 
 
 @dataclass(frozen=True)
@@ -980,6 +1007,20 @@ class CrossFamilyConfig:
     # gate (recorded as a caveated "approved") instead of looping forever or
     # escalating to a human — see workflow._record_cross_family_verdicts.
     max_parse_failures: int = 2
+    # Issue #1081: bounds how many times loop() will force review() to
+    # regenerate an *unusable* cross-family report (a "(UNAVAILABLE)" failure
+    # stub, or one carrying no head SHA) for one unchanged PR head. The bound
+    # is required because regeneration runs the cross-family model
+    # synchronously for up to ``timeout_seconds``; unbounded, a model that is
+    # simply down burns that timeout on every pass and starves the other repo
+    # in the shared sequential loop (#1078).
+    #
+    # This does NOT share max_parse_failures' terminal behaviour, and must not
+    # be "unified" with it. That bound ends in a caveated "approved"; this one
+    # ends in a human_needed escalation, because exhausting it means the head
+    # was never confirmed and approving on an unconfirmed head is precisely the
+    # fail-open #1079 closed.
+    max_regen_attempts: int = 2
 
 
 @dataclass(frozen=True)
@@ -1851,6 +1892,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'auto_merge' key 'readiness_no_ci_minutes' must not be negative"
             )
+    ci_run_never_created_grace_minutes = auto_merge_data.get("ci_run_never_created_grace_minutes")
+    if ci_run_never_created_grace_minutes is not None:
+        if isinstance(ci_run_never_created_grace_minutes, bool) or not isinstance(
+            ci_run_never_created_grace_minutes, int
+        ):
+            raise ConfigError(
+                "config section 'auto_merge' key 'ci_run_never_created_grace_minutes' "
+                f"must be an int, got {type(ci_run_never_created_grace_minutes).__name__}"
+            )
+        if ci_run_never_created_grace_minutes < 0:
+            raise ConfigError(
+                "config section 'auto_merge' key 'ci_run_never_created_grace_minutes' "
+                "must not be negative"
+            )
     mergequeue_label = auto_merge_data.get("mergequeue_label")
     if mergequeue_label is not None:
         if not isinstance(mergequeue_label, str):
@@ -1909,6 +1964,23 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'runtime' key 'gh_retry_base_seconds' must be a number, "
             f"got {type(gh_retry_base_seconds).__name__}"
         )
+    gh_timeout_seconds = runtime_data.get("gh_timeout_seconds")
+    if gh_timeout_seconds is not None:
+        if isinstance(gh_timeout_seconds, bool) or not isinstance(
+            gh_timeout_seconds, (int, float)
+        ):
+            raise ConfigError(
+                "config section 'runtime' key 'gh_timeout_seconds' must be a number, "
+                f"got {type(gh_timeout_seconds).__name__}"
+            )
+        # Rejected rather than silently coerced: 0/negative would mean "time out
+        # instantly", turning every gh call into a failure. There is no
+        # "disable" value on purpose — an unbounded gh call is the defect.
+        if gh_timeout_seconds <= 0:
+            raise ConfigError(
+                "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
+                f"got {gh_timeout_seconds}"
+            )
     graphql_rate_limit_threshold = runtime_data.get("graphql_rate_limit_threshold")
     if graphql_rate_limit_threshold is not None:
         if not isinstance(graphql_rate_limit_threshold, int):
@@ -1923,7 +1995,11 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             )
     event_ring_size = runtime_data.get("event_ring_size")
     if event_ring_size is not None:
-        if not isinstance(event_ring_size, int):
+        # bool is an int subclass, so a bare isinstance(..., int) accepts
+        # `event_ring_size: true` and silently uses it as 1 -- a two-entry ring
+        # that looks configured. Reject it explicitly, matching
+        # escalated_label_repair_max_per_pass below.
+        if not isinstance(event_ring_size, int) or isinstance(event_ring_size, bool):
             raise ConfigError(
                 "config section 'runtime' key 'event_ring_size' must be an int, "
                 f"got {type(event_ring_size).__name__}"
@@ -1949,6 +2025,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'throttle_resume_margin_s' must be >= 0, "
                 f"got {throttle_resume_margin_s}"
+            )
+    repair_cap = runtime_data.get("escalated_label_repair_max_per_pass")
+    if repair_cap is not None:
+        if not isinstance(repair_cap, int) or isinstance(repair_cap, bool):
+            raise ConfigError(
+                "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
+                f"must be an int, got {type(repair_cap).__name__}"
+            )
+        # 0 means unlimited here (matching graphql_rate_limit_threshold's
+        # "0 disables the guard"), so only negatives are rejected.
+        if repair_cap < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
+                f"must be >= 0, got {repair_cap}"
             )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")

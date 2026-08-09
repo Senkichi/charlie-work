@@ -39,6 +39,7 @@ from charlie_work.config import (
     ReviewDispatchConfig,
     RuntimeConfig,
 )
+from charlie_work.layout import resolve_state_child
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.worktree import WorktreeCleanResult
 from charlie_work.workflow import OrchestratorApp
@@ -142,6 +143,25 @@ def test_resolved_layout_explicit_child_override_wins_over_state_dir(tmp_path: P
     # derive from the overridden state_dir root -- proving the state_dir
     # override is live, not that everything above happened to no-op.
     assert layout_view.cross_family == tmp_path / "custom-state" / "cross-family"
+
+
+def test_resolve_state_child_absolute_path_does_not_join_repo_root(tmp_path: Path) -> None:
+    """An absolute override must be returned as-is, not re-anchored under
+    ``repo_root`` -- the branch of :func:`charlie_work.layout.resolve_state_child`
+    that no existing ``resolved_layout`` test exercises (all current cases use
+    relative overrides).
+    """
+    default = tmp_path / ".var" / "charlie-work" / "default-sessions"
+    absolute = tmp_path.parent / "elsewhere" / "sessions"
+
+    assert resolve_state_child(str(absolute), repo_root=tmp_path, default=default) == absolute
+    # Contrast: relative values are still resolved under repo_root.
+    assert (
+        resolve_state_child("relative/sessions", repo_root=tmp_path, default=default)
+        == tmp_path / "relative" / "sessions"
+    )
+    # Empty values fall through to the pre-computed default.
+    assert resolve_state_child("", repo_root=tmp_path, default=default) == default
 
 
 def _dispatch_worktrees_root(repo: Path, config: OrchestratorConfig) -> Path:

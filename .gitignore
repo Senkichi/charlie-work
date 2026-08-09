@@ -26,3 +26,6 @@ rollcall_charlie.json
 *.tmp_log*.txt
 test_marker*.txt
 *.bak
+# MSYS/Cygwin crash dumps. Written to the repo root by whatever cwd bash died in,
+# so they land untracked and `git add .` will happily commit one.
+*.stackdump
