@@ -45,7 +45,10 @@ import ast
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 from charlie_work.instrumentation import log_event
+from charlie_work.janitor import JanitorVerdict
 from charlie_work.state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
@@ -54,6 +57,7 @@ from charlie_work.state import (
     save_state,
     state_lock,
 )
+from charlie_work.workflow import OrchestratorApp
 
 from test_charlie_work import _second_mergequeue_pr
 from test_fix_unescalate import _app, _events
@@ -236,7 +240,7 @@ def test_deescalation_cap_exhausted_stops_clearing_and_notifies_once(tmp_path: P
     # terminal state is diagnosable from the first event, not re-announced
     # forever.
     outcome_again = app._deescalate_mechanical_issue(123)
-    assert outcome_again is None
+    assert outcome_again == {"skipped": "cap_already_notified", "issue_number": 123}
 
     state = load_state(app.paths.state_file)
     assert len(_events(state, "deescalation_cap_exhausted")) == 1
@@ -748,3 +752,154 @@ def test_escalation_event_kind_mapping_is_complete() -> None:
         f"escalation event kinds not covered by mapping: {discovered - expected}\n"
         f"mapping/unclassified kinds not discovered in source: {expected - discovered}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Skip-reason histogram in deescalation_pass_completed
+# ---------------------------------------------------------------------------
+
+
+def _janitor_blocked_verdict() -> JanitorVerdict:
+    """A janitor verdict that fails the gate, so the sweep skips at it."""
+    return JanitorVerdict(
+        ok=False,
+        failures=("PR diff unchanged since request_changes verdict (patch-id abcdef123456...)",),
+        warnings=(),
+        is_no_op_rework=True,
+    )
+
+
+def _escalated_pr_456(app: OrchestratorApp, *, reason: str) -> None:
+    """Put issue 123 / PR 456 into a mechanical escalation with ``reason``."""
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {"number": 456, "issue_number": 123, "status": "escalated"}
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": reason,
+            "reason_class": "mechanical",
+        }
+        save_state(app.paths.state_file, state)
+
+
+def test_pass_event_records_why_each_candidate_was_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass reporting "N candidates, 0 cleared" must be diagnosable straight
+    from events.db.
+
+    Before this, every not-acted-on branch returned ``None`` and the caller
+    dropped it on the floor, so the steady state on the job-cannon fleet (274
+    consecutive passes, 48 candidates, 0 cleared) recorded no reason at all
+    and cost a full investigation to explain.
+
+    Deliberately mixes two DIFFERENT skip reasons in one pass. A single-reason
+    pass is also satisfied by a caller that hardcodes one bucket or collapses
+    everything into one key -- the discrimination is the whole point of a
+    histogram, so it is what gets asserted.
+    """
+    app = _app(tmp_path)
+    # Issue 123 / PR 456 is open and non-conflicting, so it reaches the janitor
+    # gate and is blocked there -- a second, distinct bucket.
+    monkeypatch.setattr(
+        "charlie_work.workflow.run_janitor", lambda *a, **k: _janitor_blocked_verdict()
+    )
+    _escalated_pr_456(app, reason="dispatch_failed_cap_exceeded")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        # No PR bound to this issue at all.
+        state["issues"]["901"] = {
+            "number": 901,
+            "status": "escalated",
+            "escalation_reason": "dispatch_failed_cap_exceeded",
+            "reason_class": "mechanical",
+        }
+        # A PR exists but is already merged, so it is not an open PR either.
+        state["prs"]["902"] = {"number": 902, "issue_number": 902, "status": "merged"}
+        state["issues"]["902"] = {
+            "number": 902,
+            "status": "escalated",
+            "escalation_reason": "max_rework_cycles_exceeded",
+            "reason_class": "mechanical",
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    passes = _events(state, "deescalation_pass_completed")
+    assert passes[-1]["payload"]["candidates"] == 3
+    assert passes[-1]["payload"]["cleared"] == []
+    assert passes[-1]["payload"]["skipped"] == {"janitor_blocked": 1, "no_open_pr": 2}
+
+
+# ---------------------------------------------------------------------------
+# Drift guards for the histogram's completeness
+# ---------------------------------------------------------------------------
+
+
+def _workflow_ast() -> ast.Module:
+    spec = importlib.util.find_spec("charlie_work.workflow")
+    assert spec is not None and spec.origin is not None
+    return ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+
+
+def _deescalate_issue_func() -> ast.FunctionDef:
+    for node in ast.walk(_workflow_ast()):
+        if isinstance(node, ast.FunctionDef) and node.name == "_deescalate_mechanical_issue":
+            return node
+    raise AssertionError("_deescalate_mechanical_issue not found in workflow.py")
+
+
+def test_deescalate_mechanical_issue_never_returns_none() -> None:
+    """The histogram is only complete if every branch names its own reason.
+
+    A branch that returns ``None`` -- explicitly, via a bare ``return``, or
+    by someone widening the annotation back to ``| None`` -- would land in
+    the caller's ``else`` and be counted as ``"unknown"``, silently
+    reintroducing the exact blind spot this change removes. Asserted
+    structurally so a new branch cannot regress it.
+    """
+    func = _deescalate_issue_func()
+    assert func.returns is not None
+    assert ast.unparse(func.returns) == "dict[str, Any]", (
+        "return annotation must stay non-Optional so a None-returning branch is a type error"
+    )
+    offenders = [
+        node.lineno
+        for node in ast.walk(func)
+        if isinstance(node, ast.Return)
+        and (
+            node.value is None
+            or (isinstance(node.value, ast.Constant) and node.value.value is None)
+        )
+    ]
+    assert offenders == [], (
+        f"workflow.py lines {offenders} return None from _deescalate_mechanical_issue; "
+        "return _deescalation_skip('<reason>', issue_number) instead so the skip is counted"
+    )
+
+
+def test_skip_reason_vocabulary_is_derived_from_the_branches() -> None:
+    """Positive control for the guard above: the branches really do name
+    reasons (so an all-empty derivation cannot pass), and each reason is used
+    exactly once -- a copy-pasted duplicate would silently merge two distinct
+    skips into one histogram bucket."""
+    func = _deescalate_issue_func()
+    reasons = [
+        node.args[0].value
+        for node in ast.walk(func)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_deescalation_skip"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    ]
+    assert len(reasons) >= 9, f"expected the known skip branches, found {reasons}"
+    assert len(reasons) == len(set(reasons)), f"duplicate skip reasons: {reasons}"
+    # The three checks split out of what used to be one composite condition
+    # must stay separately attributable -- collapsing them back into a single
+    # `if not (... and ... and ...)` is what made "0 cleared" unreadable, and
+    # only `janitor_blocked` means "the sweep works but the PR is not ready".
+    assert {"janitor_blocked", "pr_not_open", "pr_conflicting", "no_open_pr"} <= set(reasons)

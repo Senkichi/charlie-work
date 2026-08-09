@@ -16,6 +16,8 @@ from charlie_work.config import (
     RunnerAllocationConfig,
     RunnerScalingConfig,
 )
+from ci_fleet.charlie_work_adapter import ScaleAction
+from ci_fleet.runners import ScaleDecision
 from charlie_work.cross_family import LEGACY_VACUOUS_SUMMARY
 from charlie_work.fleet_dispatch import ApiWorkerFleetReport
 from charlie_work.fleet_paths import fleet_dir
@@ -1177,6 +1179,56 @@ def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
 # --------------------------------------------------------------------------
 # runners ensure-started: single-controller guard (issue #598)
 # --------------------------------------------------------------------------
+
+
+def test_run_runners_autoscale_up_forwards_affinity_knobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The autoscale-up call site forwards runner_allocation's affinity knobs.
+
+    Companion to ci_runners #92: provision_runner grew keyword-only
+    reserved_threads/threads_per_slot, but the call site was inert until it
+    forwarded them. This pins that the values are read from
+    config.runner_allocation (never hardcoded, never defaulted away) and
+    passed through unchanged.
+
+    provision_runner is mocked at the charlie_work_adapter import boundary
+    used by cli.py's local ``from ci_fleet.charlie_work_adapter import
+    provision_runner`` -- this passes against whichever ci_fleet is
+    currently installed, independent of whether #92 has merged yet.
+    """
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+
+    config = OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(enabled=True, managed_root=str(tmp_path)),
+        runner_allocation=RunnerAllocationConfig(reserved_threads=4, threads_per_slot=6),
+    )
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "observe_runner_pool", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(cli, "is_in_cooldown", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "is_pool_idle_for_minutes", lambda *a, **k: False)
+    monkeypatch.setattr(
+        cli,
+        "decide_autoscale",
+        lambda *a, **k: ScaleDecision(action=ScaleAction.UP, count=1, reason="test"),
+    )
+
+    provision_mock = MagicMock(return_value=MagicMock(ok=True, runner_name="jc-1"))
+    monkeypatch.setattr(
+        "ci_fleet.charlie_work_adapter.provision_runner",
+        provision_mock,
+    )
+
+    args = cli.build_parser().parse_args(["runners", "autoscale"])
+    result = cli.run_runners_autoscale(args)
+
+    assert result.ok is True
+    provision_mock.assert_called_once()
+    _, kwargs = provision_mock.call_args
+    assert kwargs["reserved_threads"] == 4
+    assert kwargs["threads_per_slot"] == 6
 
 
 def _ensure_started_config(
