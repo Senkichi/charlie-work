@@ -28,6 +28,7 @@ from charlie_work.fleet_dispatch import (
     _is_fleet_pass_active,
     _lane_failure_state_path,
     _run_fleet_allocation_prologue,
+    _run_fleet_autoscale_prologue,
     _select_repos,
     compute_api_worker_fleet_report,
     fleet_loop,
@@ -37,7 +38,12 @@ from charlie_work.fleet_dispatch import (
 from charlie_work.notify import AttentionEntry
 from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.instrumentation import query_events
-from ci_fleet.charlie_work_adapter import ALLOCATION_STATE_FILENAME, load_allocation_stamp
+from ci_fleet.charlie_work_adapter import (
+    ALLOCATION_STATE_FILENAME,
+    ScaleAction,
+    load_allocation_stamp,
+)
+from ci_fleet.runners import ScaleDecision
 from ci_fleet.runner_allocation import (
     AllocationPlan,
     SlotAction,
@@ -4667,6 +4673,74 @@ def test_fleet_loop_actually_reaches_the_allocation_pass(
     # The daemon must identify itself as the unattended writer: the doctor probe
     # accepts only this value as evidence that allocation runs without an operator.
     assert mock_run_allocation_pass.call_args.kwargs["source"] == UNATTENDED_ALLOCATION_SOURCE
+
+
+@patch("charlie_work.fleet_dispatch.provision_runner")
+@patch("charlie_work.fleet_dispatch.decide_autoscale")
+@patch("charlie_work.fleet_dispatch.is_pool_idle_for_minutes")
+@patch("charlie_work.fleet_dispatch.is_in_cooldown")
+@patch("charlie_work.fleet_dispatch.observe_runner_pool")
+@patch("charlie_work.fleet_dispatch.count_fleet_runners")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch._load_registry")
+def test_autoscale_prologue_up_forwards_affinity_knobs(
+    mock_load_registry: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_count_fleet_runners: MagicMock,
+    mock_observe_runner_pool: MagicMock,
+    mock_is_in_cooldown: MagicMock,
+    mock_is_pool_idle: MagicMock,
+    mock_decide_autoscale: MagicMock,
+    mock_provision_runner: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The fleet-wide autoscale-up call site forwards runner_allocation's knobs.
+
+    Companion to ci_runners #92: provision_runner grew keyword-only
+    reserved_threads/threads_per_slot, but this call site (distinct from
+    cli.py's ``runners autoscale``) was independently inert until it forwarded
+    them too. Pins that the values come from the representative repo's
+    config.runner_allocation section -- never hardcoded, never left at the
+    off default -- and reach provision_runner unchanged.
+    """
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        }
+    }
+    config = OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(enabled=True, managed_root=str(tmp_path)),
+        runner_allocation=RunnerAllocationConfig(reserved_threads=4, threads_per_slot=6),
+    )
+    mock_load_layered_config.return_value = config
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_count_fleet_runners.return_value = (1, 0, [])
+    mock_is_in_cooldown.return_value = False
+    mock_is_pool_idle.return_value = False
+    mock_decide_autoscale.return_value = ScaleDecision(action=ScaleAction.UP, count=1, reason="t")
+    mock_provision_runner.return_value = MagicMock(ok=True, runner_name="jc-1")
+
+    global_config = MagicMock()
+    global_config.runners.fleet_autoscale_prologue = True
+    global_config.runner_scaling.enabled = True
+
+    _run_fleet_autoscale_prologue(str(tmp_path / "fleet"), global_config, False)
+
+    mock_provision_runner.assert_called_once()
+    _, kwargs = mock_provision_runner.call_args
+    assert kwargs["reserved_threads"] == 4
+    assert kwargs["threads_per_slot"] == 6
 
 
 def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:

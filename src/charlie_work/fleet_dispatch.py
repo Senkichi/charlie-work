@@ -646,11 +646,18 @@ def _run_fleet_autoscale_prologue(
 
     # Execute the decision
     if decision.action == ScaleAction.UP:
+        # Affinity knobs (issue: ci_runners #92 companion) — sourced from the
+        # same runner_allocation section launch_runner_listener's callers use,
+        # never hardcoded. 0/0 (the section's defaults) is a no-op downstream.
+        # Requires ci_runners #92 merged and deployed: the currently installed
+        # ci_fleet.provision_runner does not yet accept these kwargs.
         result = provision_runner(
             gh,
             config.runner_scaling,
             state.busy_runners,
             dry_run=False,
+            reserved_threads=config.runner_allocation.reserved_threads,
+            threads_per_slot=config.runner_allocation.threads_per_slot,
         )
         if result.ok:
             record_scale_event(paths.root, "up")
