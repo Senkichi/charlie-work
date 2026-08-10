@@ -9002,6 +9002,7 @@ class OrchestratorApp:
                         pr_state=existing_pr_state,
                         repo_root=self.repo_root,
                         pr_diff=escalated_diff,
+                        review_decision=self._review_decision(pr_number),
                     )
                     failures_changed = existing_pr_state.get("janitor_failures") != list(
                         escalated_verdict.failures
@@ -9184,8 +9185,28 @@ class OrchestratorApp:
         # are the worker's/CI's to fix. A definitive required-check failure on
         # a linked-issue PR is routed to rework so the worker can push a fix.
         verdict = run_janitor(
-            pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
+            pr,
+            checks,
+            self.config,
+            pr_state=pr_state,
+            repo_root=self.repo_root,
+            pr_diff=diff,
+            review_decision=self._review_decision(pr_number),
         )
+
+        # Issue #1116: the stale-CI skip let a reworked-but-unchanged PR
+        # through the gate it was permanently wedged behind. Record it so the
+        # packet-rebuild -> fresh-review sequence that follows is attributable
+        # to the skip rather than looking like a spontaneous unblock.
+        if verdict.ok and verdict.no_op_check_skipped_stale_ci and not self.dry_run:
+            log_event(
+                self.paths.state_file,
+                "stale_ci_verdict_gate_pass",
+                {
+                    "pr_number": pr_number,
+                    "head_sha": str(pr.get("headRefOid") or "") or None,
+                },
+            )
 
         # Issue #820: reconcile the operator merge-hold marker for the #818
         # draft-auto-ready actuator unconditionally, on every review() pass
@@ -17082,6 +17103,7 @@ class OrchestratorApp:
             pr_state=pr_entry_for_janitor if isinstance(pr_entry_for_janitor, dict) else None,
             repo_root=self.repo_root,
             pr_diff=diff,
+            review_decision=self._review_decision(pr_number),
         )
 
         with state_lock(self.paths.state_file):
