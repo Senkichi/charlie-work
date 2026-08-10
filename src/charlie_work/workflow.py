@@ -3901,9 +3901,16 @@ def _detect_and_handle_orphaned_workers(
     state every pass (not from any one-shot flag), so a half-finished reclaim
     -- or one stranded before this fix ever existed -- gets completed here
     without a human needing to notice.
+
+    Issue #1122: this sweep is NOT gated on ``watchdog.enabled``. The watchdog
+    flag controls log-mtime stall detection (``_detect_stalled_sessions`` /
+    ``_detect_and_handle_stalled_sessions``), which is unrelated to this
+    function's dead-pid state-keyed recovery. A deployment that disables
+    watchdog (e.g. to work around a shim log-mtime blindness) must not lose
+    the #935 pushed-branch salvage backstop, the #417 ground-truth label
+    reclaim, or the orphan drift diagnostics -- all of which are keyed off
+    state.json PID records, not log mtimes.
     """
-    if not config.watchdog.enabled:
-        return
 
     def _drift_fingerprint(**parts: Any) -> str:
         """Stable fingerprint for an orphaned-worker drift finding."""
@@ -19175,18 +19182,71 @@ class OrchestratorApp:
         worker whose issue later opens a PR is routed to rework by the
         dead-session reaper lane, not by dispatch.
 
+        Issue #1122: before reaping, inspect the worktree using the same
+        ``inspect_worktree_state`` single enforcement point the reaper lane
+        uses (issue #252). If the worktree is COMPLETED or the worker reported
+        a successful push (``.worker-outcome.json`` with
+        ``push_succeeded=true``), do NOT reap the sidecar or strip labels --
+        leave the sidecar untouched so the reaper lane
+        (``_classify_dead_sessions_and_update_throttle_state``) can salvage the
+        pushed branch on a subsequent pass. Reaping here would destroy the
+        sidecar the reaper lane is keyed off, making salvage impossible and
+        escalating review-ready pushed work to a human.
+
         Returns ``(status, dispatched_at, state)``. The status is
         ``"dispatch_failed"`` so the caller's entry-building frees the slot;
         ``dispatched_at`` is ``None`` because no worker was actually launched.
         """
+        from .worktree import WorktreeState
+
         issue_number = request.issue_number
+
+        # Issue #1122: inspect the worktree before reaping. A completed or
+        # push-succeeded worktree must be left for the reaper lane's salvage
+        # path (_attempt_salvage). Reaping the sidecar here would destroy the
+        # key the reaper lane iterates over, making salvage impossible.
+        phantom_workers = [w for w in iter_workers(sessions_dir) if w.issue_number == issue_number]
+        for w in phantom_workers:
+            worktree_path = Path(w.worktree_path)
+            inspection = inspect_worktree_state(
+                worktree_path,
+                self.config.dispatch.base_ref,
+                self.config.dispatch.injected_paths,
+                self.config.dispatch.materialize_dirs,
+            )
+            worker_outcome = read_worker_outcome(worktree_path)
+            reported_push = (
+                isinstance(worker_outcome, dict)
+                and worker_outcome.get("push_succeeded") is True
+                and worker_outcome.get("pr_created") is False
+            )
+            if inspection.state == WorktreeState.COMPLETED or reported_push:
+                # Preserve the sidecar so the reaper lane can salvage. Do NOT
+                # strip labels -- the issue should stay in its active state
+                # until salvage moves it to pr_open, preventing re-dispatch
+                # into the occupied worktree.
+                state = append_event(
+                    state,
+                    "session_failed_relabeled",
+                    {
+                        "issue_number": issue_number,
+                        "failure_kind": "live_worker_redispatch_averted",
+                        "reason": "phantom_live_worker_completed_work_preserved",
+                        "worktree_state": inspection.state.value,
+                        "reported_push": reported_push,
+                        "removed_labels": [],
+                        "added_ready": False,
+                        "label_write_ok": True,
+                    },
+                    state_path=self.paths.state_file,
+                )
+                return "dispatch_failed", None, state
 
         # Reap the stale sidecar and matching worktree writer marker. Reuse
         # WorkerView.reap_sidecar so the adapter-specific path derivation and
         # session-id-gated marker removal stay in one place.
-        for w in iter_workers(sessions_dir):
-            if w.issue_number == issue_number:
-                w.reap_sidecar(sessions_dir)
+        for w in phantom_workers:
+            w.reap_sidecar(sessions_dir)
 
         # Strip active labels and ensure the ready label is present so the
         # issue becomes dispatchable. This mirrors
