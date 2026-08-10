@@ -15838,10 +15838,94 @@ class OrchestratorApp:
         rework can dispatch a worker, and reconcile's repair pass must never
         synthesize ``rework_requested`` (reconcile.py's own invariant) --
         only a dispatch-context caller may complete this transition.
+
+        Issue #1123: the restorer must never re-activate a CLOSED GitHub
+        issue. Issue state is the source of truth (state-in-labels
+        invariant), and reconcile's ``state_active_status_issue_closed``
+        owns the terminal "closed" status for an issue GitHub reports as
+        CLOSED. Without this guard the restorer flips the status back to
+        ``rework_requested`` every pass, the no-op rework cap escalates it,
+        and reconcile flips it back to "closed" -- a perpetual three-lane
+        loop. A closed issue's open PR surfaces once as drift via
+        reconcile's ``state_active_status_issue_closed`` for human
+        adjudication instead of re-entering the rework state machine. If
+        the issue fetch itself fails (transient GitHubError, missing from
+        the snapshot), defer to the next pass rather than re-activating
+        state that may belong to a closed issue -- the stranded repair is
+        a best-effort lane, not a correctness-critical one.
+
+        Idempotency (review rework): the closed-issue skip must fire once
+        per stranded PR, not on every ``review_queue()`` pass. ``"closed"``
+        cannot be added to ``_REWORK_ALREADY_ROUTED_STATUSES`` because the
+        #789 repair path depends on the restorer re-activating an issue
+        whose status was clobbered to ``"closed"`` by a reconcile bug while
+        the issue is still OPEN on GitHub -- a shared early-return on
+        ``"closed"`` would suppress that repair. Instead a per-issue
+        ``stranded_skip_closed`` marker in ``state["issues"][n]`` records
+        that the restorer has already confirmed the issue is CLOSED and
+        skipped. The marker is checked only when ``status == "closed"`` so
+        the #789 path (status ``"closed"`` but issue OPEN, marker absent)
+        still fetches and re-activates. When the skip fires for an issue
+        whose status is not yet ``"closed"`` (e.g. ``"reviewing"``), the
+        restorer converges the status to ``"closed"`` and strips active
+        labels -- mirroring reconcile's ``state_active_status_issue_closed``
+        -- so the next pass sees ``status == "closed"`` + marker set and
+        short-circuits without a ``gh.issue_view()`` call or a duplicate
+        event. Reconcile preserves unknown keys in issue entries (spread
+        copy), so the marker survives reconcile sweeps; if reconcile
+        normalizes the status away from ``"closed"`` (issue re-opened),
+        the marker check no longer applies and the restorer re-evaluates.
         """
         state = load_state_locked(self.paths.state_file)
-        issue_status = state.get("issues", {}).get(str(issue_number), {}).get("status")
+        issue_entry = state.get("issues", {}).get(str(issue_number), {})
+        issue_status = issue_entry.get("status")
         if issue_status in _REWORK_ALREADY_ROUTED_STATUSES:
+            return None
+        # Local idempotency guard for the closed-issue skip (see docstring):
+        # once the restorer has confirmed a CLOSED issue and recorded the
+        # marker, short-circuit without re-fetching or re-emitting. Gated on
+        # status == "closed" so the #789 repair (status clobbered to "closed"
+        # for an OPEN issue, marker absent) still proceeds.
+        if issue_status == "closed" and issue_entry.get("stranded_skip_closed"):
+            return None
+        try:
+            issue = self.gh.issue_view(issue_number)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "stranded_request_changes restorer for issue %s deferred "
+                "(GitHub issue fetch failed); will retry next pass",
+                issue_number,
+                exc_info=True,
+            )
+            return None
+        if str(issue.get("state") or "OPEN").upper() == "CLOSED":
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                issues = state.setdefault("issues", {})
+                issue_entry = issues.get(str(issue_number), {})
+                issue_entry["stranded_skip_closed"] = True
+                if issue_entry.get("status") != "closed":
+                    issue_entry["status"] = "closed"
+                issues[str(issue_number)] = issue_entry
+                state = self._record_event(
+                    state,
+                    "stranded_request_changes_skipped_issue_closed",
+                    {
+                        "pr_number": int(pr["number"]),
+                        "issue_number": issue_number,
+                        "head_sha": pr.get("headRefOid"),
+                    },
+                )
+                save_state(self.paths.state_file, state)
+            # Strip active labels from the closed issue, mirroring
+            # reconcile's state_active_status_issue_closed: setting
+            # status to "closed" here would prevent that drift kind from
+            # firing (it requires status in ACTIVE_STATE_STATUSES), so the
+            # restorer must do the label cleanup itself to avoid leaving
+            # active labels on a finalized issue.
+            active_labels = label_names(issue) & self.config.labels.active
+            for label in sorted(active_labels):
+                self.gh.remove_issue_label(issue_number, label)
             return None
         return self._route_to_rework(
             pr,
