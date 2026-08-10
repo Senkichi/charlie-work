@@ -15831,10 +15831,49 @@ class OrchestratorApp:
         rework can dispatch a worker, and reconcile's repair pass must never
         synthesize ``rework_requested`` (reconcile.py's own invariant) --
         only a dispatch-context caller may complete this transition.
+
+        Issue #1123: the restorer must never re-activate a CLOSED GitHub
+        issue. Issue state is the source of truth (state-in-labels
+        invariant), and reconcile's ``state_active_status_issue_closed``
+        owns the terminal "closed" status for an issue GitHub reports as
+        CLOSED. Without this guard the restorer flips the status back to
+        ``rework_requested`` every pass, the no-op rework cap escalates it,
+        and reconcile flips it back to "closed" -- a perpetual three-lane
+        loop. A closed issue's open PR surfaces once as drift via
+        reconcile's ``state_active_status_issue_closed`` for human
+        adjudication instead of re-entering the rework state machine. If
+        the issue fetch itself fails (transient GitHubError, missing from
+        the snapshot), defer to the next pass rather than re-activating
+        state that may belong to a closed issue -- the stranded repair is
+        a best-effort lane, not a correctness-critical one.
         """
         state = load_state_locked(self.paths.state_file)
         issue_status = state.get("issues", {}).get(str(issue_number), {}).get("status")
         if issue_status in _REWORK_ALREADY_ROUTED_STATUSES:
+            return None
+        try:
+            issue = self.gh.issue_view(issue_number)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "stranded_request_changes restorer for issue %s deferred "
+                "(GitHub issue fetch failed); will retry next pass",
+                issue_number,
+                exc_info=True,
+            )
+            return None
+        if str(issue.get("state") or "OPEN").upper() == "CLOSED":
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state = self._record_event(
+                    state,
+                    "stranded_request_changes_skipped_issue_closed",
+                    {
+                        "pr_number": int(pr["number"]),
+                        "issue_number": issue_number,
+                        "head_sha": pr.get("headRefOid"),
+                    },
+                )
+                save_state(self.paths.state_file, state)
             return None
         return self._route_to_rework(
             pr,

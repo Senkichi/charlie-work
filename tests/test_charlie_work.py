@@ -12745,6 +12745,20 @@ def test_review_queue_reroutes_stranded_request_changes_and_is_idempotent(
         },
     ]
     app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    # Issue #1123: the restorer now consults the GitHub issue state before
+    # re-activating. The motivating case (issue #789) is a GitHub-OPEN issue
+    # whose state status was clobbered to "closed" by a reconcile bug -- so
+    # the fake must report #649 as OPEN for the repair to fire.
+    app.gh.issues = [
+        {
+            "number": 649,
+            "title": "Fix search",
+            "url": "https://example.test/issues/649",
+            "body": "Search is broken",
+            "labels": [],
+            "state": "OPEN",
+        }
+    ]
     _write_review_packet(
         tmp_path,
         693,
@@ -12797,6 +12811,108 @@ def test_review_queue_reroutes_stranded_request_changes_and_is_idempotent(
     assert state_final["prs"]["693"]["status"] == "rework_requested"
     assert len(state_final["events"]) == events_before_second_pass
     assert app.gh.labels_added == labels_added_before_second_pass
+
+
+def test_review_queue_does_not_reroute_stranded_request_changes_for_closed_issue(
+    tmp_path: Path,
+) -> None:
+    """Issue #1123: the stranded request_changes restorer must never re-activate
+    a CLOSED GitHub issue. The motivating real-world case is jc #1293 / PR #1394:
+    the issue was closed as COMPLETED by the operator, but PR #1394 stayed open
+    with a recorded ``request_changes`` verdict at an unchanged head -- the exact
+    bait the stranded restorer keys on. Without consulting the GitHub issue
+    state, the restorer flips the status back to ``rework_requested`` every pass,
+    the no-op rework cap escalates it, and reconcile's
+    ``state_active_status_issue_closed`` flips it back to "closed" -- a perpetual
+    three-lane loop that emitted 56 bogus escalation events over 1.3 days.
+
+    The fix: the restorer consults ``gh.issue_view`` and skips (emitting a
+    ``stranded_request_changes_skipped_issue_closed`` event) when the linked
+    issue is CLOSED on GitHub, leaving reconcile as the single writer of the
+    terminal "closed" status. A second pass must not re-emit the skip event
+    once the state status is already "closed" (reconcile owns that transition).
+    """
+    pr_number = 1394
+    issue_number = 1293
+    head = "2ee42f8d"
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}: some change",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    # The linked issue is CLOSED on GitHub -- the operator closed it as
+    # COMPLETED via a different PR. This is the ground truth the restorer
+    # must consult.
+    app.gh.issues = [
+        {
+            "number": issue_number,
+            "title": f"Issue {issue_number}",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "Some issue",
+            "labels": [],
+            "state": "CLOSED",
+        }
+    ]
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": head,
+            "required_changes": [],
+            "summary": "Real reviewer prose describing a real problem to fix.",
+            "escalated": False,
+        },
+    )
+    # Plant the state status as "closed" -- the value reconcile's
+    # state_active_status_issue_closed writes for a CLOSED GitHub issue.
+    # "closed" is NOT in _REWORK_ALREADY_ROUTED_STATUSES, so the restorer's
+    # idempotency guard does not short-circuit and the bug would fire
+    # (flipping it back to "rework_requested") without the #1123 fix.
+    state = load_state(app.paths.state_file)
+    state["issues"][str(issue_number)] = {"number": issue_number, "status": "closed"}
+    save_state(app.paths.state_file, state)
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    state_after = load_state(app.paths.state_file)
+    # The restorer must NOT have re-activated the issue.
+    assert state_after["issues"][str(issue_number)]["status"] == "closed"
+    assert state_after["prs"].get(str(pr_number), {}).get("status") != "rework_requested"
+    # No rework prompt written, no labels added.
+    prompt_path = app.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
+    assert not prompt_path.exists()
+    assert app.gh.labels_added == []
+
+    # A skip event must be recorded for observability.
+    skip_events = query_events(
+        app.paths.state_file, kind="stranded_request_changes_skipped_issue_closed"
+    )
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["pr_number"] == pr_number
+    assert skip_events[0]["payload"]["issue_number"] == issue_number
+    assert skip_events[0]["payload"]["head_sha"] == head
+
+    # No stranded_request_changes_rework_requested event must have fired.
+    rework_events = query_events(
+        app.paths.state_file, kind="stranded_request_changes_rework_requested"
+    )
+    assert rework_events == []
 
 
 def test_review_queue_does_not_reroute_escalated_request_changes(tmp_path: Path) -> None:
