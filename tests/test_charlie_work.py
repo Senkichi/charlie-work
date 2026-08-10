@@ -36968,6 +36968,84 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
     assert recovered_events[0]["payload"]["duration_seconds"] is None
 
 
+def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
+    tmp_path: Path,
+) -> None:
+    """Issue #1108: the dead-pid orphan recovery sweep must reset a
+    ``status=dispatched`` issue with a dead PID and an open PR carrying a
+    ``request_changes`` verdict (head unchanged) to ``rework_requested`` even
+    when ``watchdog.enabled=False``.
+
+    The ``watchdog.enabled`` flag controls log-mtime stall detection
+    (``_detect_stalled_sessions`` / ``_detect_and_handle_stalled_sessions``),
+    not the dead-pid state-keyed recovery in
+    ``_detect_and_handle_orphaned_workers``. A deployment that disables
+    watchdog (e.g. job-cannon, to work around shim log-mtime blindness) must
+    not lose the request_changes → rework_requested transition — without it,
+    issues with dead workers and open PRs sit wedged in ``dispatched``
+    indefinitely with no path to redispatch (the exact 8+ hour stall observed
+    2026-08-09/10 on jc #1358, #1479, et al.).
+    """
+    from unittest.mock import patch
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    # watchdog disabled — the sweep must still run.
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=False, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1108"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1108",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1108"]
+
+    # The sweep fired despite watchdog being disabled: the issue was reset to
+    # rework_requested so dispatch_rework can re-select it.
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    assert recovered_events[0]["payload"]["issue_number"] == 1108
+    assert recovered_events[0]["payload"]["pr_number"] == 100
+    assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
+
+
 def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     """Issue #773: a worker that exited 0 (clean, no-op) must not be reset to
     rework_requested or burn a redispatch attempt, even though its dead PID and
