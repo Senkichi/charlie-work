@@ -7896,6 +7896,167 @@ def test_review_queue_carry_forward_suppressed_when_stale_ci(tmp_path: Path) -> 
     assert requeue_events[0]["payload"]["reviewed_head_sha"] == old_head
 
 
+def test_review_queue_same_head_stale_ci_requeue_deduped_per_head(tmp_path: Path) -> None:
+    """Issue #1120: ``review_queue()`` is called multiple times per loop pass
+    (once by ``dispatch_reviews()``, once by
+    ``_record_cross_family_verdicts()``), so the ``stale_ci_verdict_requeued``
+    event double-fires for the same PR/head within one pass. Mirroring the
+    ``stale_ci_gate_pass_head`` fix (PR #1117), the emission is now keyed on
+    ``stale_ci_verdict_requeued_head`` stored in the PR state entry: a second
+    consecutive ``review_queue()`` for the same PR/head must not emit a
+    duplicate."""
+    pr_number = 456
+    issue_number = 123
+    head = "sha-live-head"
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, head)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    first = app.review_queue()
+    second = app.review_queue()
+
+    assert first.ok is True
+    assert second.ok is True
+    # Both calls queue the PR -- the dispatch dedup is separate.
+    assert len(first.data["queue"]) == 1
+    assert len(second.data["queue"]) == 1
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["stale_ci_verdict_requeued_head"] == head
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_events) == 1
+
+
+def test_review_queue_carry_forward_stale_ci_requeue_deduped_per_head(tmp_path: Path) -> None:
+    """Issue #1120 (carry-forward variant): the head-advanced stale-CI
+    requeue emission site must also dedup per live head. A second
+    ``review_queue()`` call for the same PR/live-head must not re-emit."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, new_head)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    app.gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    first = app.review_queue()
+    second = app.review_queue()
+
+    assert first.ok is True
+    assert second.ok is True
+    assert len(first.data["queue"]) == 1
+    assert len(second.data["queue"]) == 1
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["stale_ci_verdict_requeued_head"] == new_head
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_events) == 1
+
+
+def test_review_queue_stale_ci_requeue_re_emits_after_head_transition(tmp_path: Path) -> None:
+    """Issue #1120: the dedup key is the live head, not a permanent
+    suppression. When the PR advances to a new head, the next
+    ``review_queue()`` call must re-emit ``stale_ci_verdict_requeued`` for
+    the new head transition."""
+    pr_number = 456
+    issue_number = 123
+    head_a = "sha-head-a"
+    head_b = "sha-head-b"
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, head_a)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head_a,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head_a,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    first = app.review_queue()
+    assert first.ok is True
+    requeue_after_first = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_after_first) == 1
+
+    # Advance to a new head: update the PR's live head, the packet head, and
+    # the recorded verdict to the new head.
+    app.gh.prs = [_stale_ci_pr(pr_number, issue_number, head_b)]
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head_b,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head_b,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    second = app.review_queue()
+    assert second.ok is True
+    requeue_after_second = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_after_second) == 2
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["stale_ci_verdict_requeued_head"] == head_b
+
+
 def test_review_no_op_rework_suppressed_when_stale_ci_verdict(tmp_path: Path) -> None:
     """Issue #1111 (d): review()'s no-op-rework routing must not fire -- and
     must not burn ``no_op_rework_attempts`` -- when the on-disk verdict is a

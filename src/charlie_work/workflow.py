@@ -10232,6 +10232,54 @@ class OrchestratorApp:
             )
             return queue
 
+    def _emit_stale_ci_verdict_requeued(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        reviewed_head_sha: str | None,
+        live_head_sha: str,
+        required_changes: Sequence[str] | None,
+    ) -> None:
+        """Emit ``stale_ci_verdict_requeued`` once per PR/head transition.
+
+        Issue #1120: ``review_queue()`` is called multiple times per loop pass
+        (once by ``dispatch_reviews()``, once by
+        ``_record_cross_family_verdicts()``), so without dedup the event
+        double-fires for the same PR within a single pass -- ~30s apart, the
+        second emission landing after review_dispatch has already claimed and
+        launched the PR. The dispatch itself is deduped by
+        ``review_dispatch_claim``, so the only impact is log noise, but the
+        pattern is the same missing-dedup family as the PR #1117 round-1
+        review finding on ``stale_ci_verdict_gate_pass``.
+
+        Mirrors the ``stale_ci_gate_pass_head`` fix: key the emission on a
+        stored head field (``stale_ci_verdict_requeued_head`` in the PR state
+        entry) so only the first queue evaluation per head transition emits,
+        rather than every evaluation that sees the stale verdict.
+        """
+        if self.dry_run:
+            return
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            existing_pr_state = state["prs"].get(str(pr_number), {})
+            if existing_pr_state.get("stale_ci_verdict_requeued_head") == live_head_sha:
+                return
+            state["prs"][str(pr_number)] = {
+                **existing_pr_state,
+                "stale_ci_verdict_requeued_head": live_head_sha,
+            }
+            state = self._record_event(
+                state,
+                "stale_ci_verdict_requeued",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "required_changes": list(required_changes or []),
+                },
+            )
+            save_state(self.paths.state_file, state)
+
     def review_queue(self) -> CommandResult:
         """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
 
@@ -10358,19 +10406,13 @@ class OrchestratorApp:
                         if packet_head_sha == live_head_sha and self._packet_template_current(
                             pr_number
                         ):
-                            if not self.dry_run:
-                                log_event(
-                                    self.paths.state_file,
-                                    "stale_ci_verdict_requeued",
-                                    {
-                                        "pr_number": pr_number,
-                                        "issue_number": issue_number,
-                                        "reviewed_head_sha": reviewed_head_sha,
-                                        "required_changes": list(
-                                            decision.get("required_changes") or []
-                                        ),
-                                    },
-                                )
+                            self._emit_stale_ci_verdict_requeued(
+                                pr_number,
+                                issue_number,
+                                reviewed_head_sha,
+                                live_head_sha,
+                                decision.get("required_changes"),
+                            )
                             queue.append(
                                 {
                                     "pr": pr_number,
@@ -10414,17 +10456,13 @@ class OrchestratorApp:
                     # so skip the carry-forward and fall through to the
                     # stale-queue path below: a fresh review supersedes the
                     # verdict (never auto-approved).
-                    if not self.dry_run:
-                        log_event(
-                            self.paths.state_file,
-                            "stale_ci_verdict_requeued",
-                            {
-                                "pr_number": pr_number,
-                                "issue_number": issue_number,
-                                "reviewed_head_sha": reviewed_head_sha,
-                                "required_changes": list(decision.get("required_changes") or []),
-                            },
-                        )
+                    self._emit_stale_ci_verdict_requeued(
+                        pr_number,
+                        issue_number,
+                        reviewed_head_sha,
+                        live_head_sha,
+                        decision.get("required_changes"),
+                    )
                 elif check.carry_forward:
                     # In dry-run mode we still run the content check so the queue
                     # reflects real changes, but we skip the durable head update.
