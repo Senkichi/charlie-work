@@ -292,6 +292,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "stale_ci_verdict_gate_pass": "info",
         "stale_ci_verdict_requeued": "info",
         "stranded_request_changes_rework_requested": "info",
+        "stranded_request_changes_skipped_issue_closed": "info",
         "supervisor_exited": "info",
         "supervisor_started": "info",
         "unauthorized_merge_acknowledged": "info",
