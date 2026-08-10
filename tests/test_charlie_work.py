@@ -7660,6 +7660,317 @@ def test_review_queue_carry_forward_records_event(tmp_path: Path) -> None:
     assert payload["carry_forward_tier"] == "patch-id"
 
 
+# --------------------------------------------------------------------------
+# Issue #1111: stale-CI request_changes verdict suppression in review_queue()
+# --------------------------------------------------------------------------
+
+_STALE_CI_REQUIRED = ("Tests passed", "Pre-commit")
+
+_STALE_CI_GREEN_CHECKS = [
+    {"name": "Tests passed", "state": "SUCCESS"},
+    {"name": "Pre-commit", "state": "SUCCESS"},
+]
+
+_STALE_CI_RED_CHECKS = [
+    {"name": "Tests passed", "state": "FAILURE"},
+    {"name": "Pre-commit", "state": "SUCCESS"},
+]
+
+_STALE_CI_CONTAMINATED_REQUIRED_CHANGES = [
+    "Tests passed: .github:18 — Process completed with exit code 1."
+]
+
+
+def _stale_ci_review_queue_app(
+    tmp_path: Path,
+    *,
+    prs: list[dict[str, Any]],
+    checks: list[dict[str, Any]],
+    dry_run: bool = False,
+) -> OrchestratorApp:
+    """Build an OrchestratorApp with a configured ``required_checks`` set and
+    a ``FakeGitHubWithChecks`` fixture, for issue #1111's stale-CI-verdict
+    ``review_queue()`` tests. ``required_check_citation_names``/
+    ``is_stale_ci_verdict`` only fire when ``config.auto_merge.required_checks``
+    is non-empty, which the default ``OrchestratorConfig()`` used by the
+    sibling carry-forward helper does not set."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHubWithChecks(checks=checks)
+    fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
+
+
+def _stale_ci_pr(pr_number: int, issue_number: int, head: str) -> dict[str, Any]:
+    return {
+        "number": pr_number,
+        "title": f"Fix #{issue_number}",
+        "url": f"https://example.test/pull/{pr_number}",
+        "headRefName": f"agent/issue-{issue_number}-fix",
+        "baseRefName": "main",
+        "headRefOid": head,
+        "mergeStateStatus": "CLEAN",
+        "body": f"Closes #{issue_number}",
+        "labels": [],
+        "isCrossRepository": False,
+        "state": "OPEN",
+    }
+
+
+def test_review_queue_same_head_stale_ci_requeues_as_stale(tmp_path: Path) -> None:
+    """Issue #1111 (a): a same-head request_changes verdict whose only
+    findings cite required checks that are all green now must be re-queued
+    for a fresh review (decision "stale") with a ``stale_ci_verdict_requeued``
+    event, and must NOT be routed through
+    ``_reroute_stranded_request_changes`` -- that repair would re-drive the
+    SAME (now-nonexistent) failure into a rework worker instead of waiting
+    for the fresh review this path queues."""
+    pr_number = 456
+    issue_number = 123
+    head = "sha-live-head"
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, head)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": head,
+            "decision": "stale",
+            "reviewed_head_sha": head,
+        }
+    ]
+
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_events) == 1
+    assert requeue_events[0]["payload"]["pr_number"] == pr_number
+    assert requeue_events[0]["payload"]["issue_number"] == issue_number
+    assert requeue_events[0]["payload"]["reviewed_head_sha"] == head
+
+    # _reroute_stranded_request_changes must NOT have fired: it would have
+    # transitioned the issue to rework_requested via _route_to_rework.
+    state = load_state(app.paths.state_file)
+    assert state["issues"].get(str(issue_number), {}).get("status") != "rework_requested"
+
+
+def test_review_queue_same_head_not_stale_when_checks_red(tmp_path: Path) -> None:
+    """Issue #1111 control: the identical contaminated-shape verdict, but a
+    required check is still red. ``is_stale_ci_verdict`` must be False, so
+    the pre-#1111 behavior is preserved: the PR is not queued (same-head
+    request_changes verdicts are never queued, stale or not), and the
+    stranded-verdict repair fires normally since the issue was never routed
+    to rework."""
+    pr_number = 456
+    issue_number = 123
+    head = "sha-live-head"
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, head)],
+        checks=_STALE_CI_RED_CHECKS,
+        dry_run=False,
+    )
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert requeue_events == []
+    # Preserved existing behavior: the stranded verdict IS re-routed to rework
+    # because it describes a real (still-red) failure.
+    state = load_state(app.paths.state_file)
+    assert state["issues"][str(issue_number)]["status"] == "rework_requested"
+
+
+def test_review_queue_carry_forward_suppressed_when_stale_ci(tmp_path: Path) -> None:
+    """Issue #1111 (c): carry-forward matches (identical patch-id) but the
+    recorded verdict is stale-CI. The carry-forward must be skipped -- no
+    ``_update_approval_head`` call, no ``verdict_carried_forward_clean_rebase``
+    event -- and the PR falls through to the stale-queue path instead, so a
+    fresh review supersedes the (already-resolved) failure rather than
+    silently re-confirming it on the new head."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, new_head)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    app.gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+
+    # The decision file must NOT have been carry-forwarded onto the new head.
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == old_head
+    assert "carry_forward_tier" not in decision
+
+    state = load_state(app.paths.state_file)
+    assert "reviewed_head_sha" not in state["prs"].get(str(pr_number), {})
+    carry_events = query_events(app.paths.state_file, kind="verdict_carried_forward_clean_rebase")
+    assert carry_events == []
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_events) == 1
+    assert requeue_events[0]["payload"]["reviewed_head_sha"] == old_head
+
+
+def test_review_no_op_rework_suppressed_when_stale_ci_verdict(tmp_path: Path) -> None:
+    """Issue #1111 (d): review()'s no-op-rework routing must not fire -- and
+    must not burn ``no_op_rework_attempts`` -- when the on-disk verdict is a
+    stale-CI request_changes (contaminated shape, all required checks
+    currently green). Mirrors
+    test_fix_janitor_routing.test_janitor_no_op_rework_routes_to_rework's
+    same-head/same-diff setup, which is what makes ``verdict.is_no_op_rework``
+    True in the first place; the only difference is the recorded verdict's
+    ``required_changes`` shape and a configured, all-green ``required_checks``."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=_STALE_CI_GREEN_CHECKS)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary="Tests passed: .github:18 — Process completed with exit code 1.",
+        required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+    )
+    state = load_state(app.paths.state_file)
+    record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
+    state["issues"]["123"] = record
+    save_state(app.paths.state_file, state)
+
+    # Same head, same diff as the recorded verdict: no actual content change,
+    # so the janitor's no-op-rework signal fires -- but the verdict is
+    # stale-CI, so routing must be suppressed.
+    result = app.review(456)
+
+    assert result.data.get("routed_to_rework") is not True
+    state = load_state(app.paths.state_file)
+    assert state["prs"].get("456", {}).get("no_op_rework_attempts", 0) == 0
+    assert state["issues"]["123"]["status"] != "rework_requested"
+
+
+def test_review_no_op_rework_routes_when_prose_finding(tmp_path: Path) -> None:
+    """Issue #1111 control: the same same-head/same-diff no-op setup, but the
+    recorded verdict's finding is real prose rather than a check citation.
+    ``is_stale_ci_verdict`` must be False, so the pre-#1111 no-op-rework
+    routing (and its attempt-burn) is preserved exactly as
+    test_fix_janitor_routing.test_janitor_no_op_rework_routes_to_rework
+    already covers -- reproduced here as the control for the suppression
+    test above rather than relying on cross-file coupling."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=_STALE_CI_GREEN_CHECKS)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary="fix A",
+        required_changes=["src/foo.py:42 — off-by-one error in the loop bound."],
+    )
+    state = load_state(app.paths.state_file)
+    record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
+    state["issues"]["123"] = record
+    save_state(app.paths.state_file, state)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data["routed_to_rework"] is True
+    assert result.data["rework_reason"] == "no_op_rework"
+
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["no_op_rework_attempts"] == 1
+
+
 def test_merge_ready_post_update_branch_records_verified_sync_event(
     tmp_path: Path,
 ) -> None:
