@@ -125,9 +125,11 @@ class LiveWorkerRedispatchError(RuntimeError):
 class WorktreeForeignWriterError(RuntimeError):
     """Raised when ``create_worktree`` is about to use a worktree that has a
     live writer marker belonging to a session the orchestrator does not own
-    (e.g. an operator's editor or an out-of-band agent). The launch shim
-    surfaces this as ``failure_kind="worktree_foreign_writer"`` so the issue
-    stays queued and the dispatch event log records the conflict.
+    (e.g. an operator's editor or an out-of-band agent), OR when the target
+    branch is already checked out in a worktree at a foreign path the
+    orchestrator did not create (issue #1118). The launch shim surfaces this
+    as ``failure_kind="worktree_foreign_writer"`` so the issue stays queued
+    and the dispatch event log records the conflict.
     """
 
     def __init__(
@@ -140,10 +142,18 @@ class WorktreeForeignWriterError(RuntimeError):
         self.worktree_path = worktree_path
         self.pid = pid
         self.session_id = session_id
-        super().__init__(
-            f"worktree {worktree_path} has a live foreign writer "
-            f"(pid={pid}, session_id={session_id})"
-        )
+        if pid is None and session_id is None:
+            # Issue #1118: the branch is checked out in a worktree at a path
+            # the orchestrator did not create — no writer marker to inspect.
+            super().__init__(
+                f"worktree {worktree_path} is a foreign checkout the "
+                f"orchestrator did not create; refusing to adopt it"
+            )
+        else:
+            super().__init__(
+                f"worktree {worktree_path} has a live foreign writer "
+                f"(pid={pid}, session_id={session_id})"
+            )
 
 
 # How many lines of git's stderr to carry into a pre-merge failure message.
@@ -2597,8 +2607,42 @@ def create_worktree(
         )
 
         if existing_wt:
+            # Issue #1118: refuse to adopt a worktree at a foreign path. The
+            # branch-name lookup above spans ALL registered worktrees, so a
+            # branch checked out by the operator in a different directory
+            # (e.g. .claude/worktrees/<name>) would be silently adopted,
+            # committing the operator's uncommitted edits as worker output.
+            # Only a worktree at the orchestrator's expected path is one we
+            # could have created; anything else is a foreign checkout.
+            existing_wt_path = Path(existing_wt["worktree"])
+            if existing_wt_path != worktree_path:
+                raise WorktreeForeignWriterError(
+                    worktree_path=existing_wt_path,
+                    pid=None,
+                    session_id=None,
+                )
             # Reuse existing worktree: fetch and fast-forward to origin tip
-            worktree_path = Path(existing_wt["worktree"])
+            worktree_path = existing_wt_path
+            # Issue #1118: a dirty worktree at adoption time is an independent
+            # hard stop — never commit tracked modifications the shim did not
+            # itself produce. In recovery mode the dirt is a prior (owned)
+            # worker's partial work, so the check is skipped there.
+            #
+            # The ``.venv`` junction is orchestrator scaffolding (a reparse
+            # point, not worker content), so it is excluded from the dirty
+            # check — a leftover junction from a prior dispatch must not
+            # trigger a false positive here. It is unlinked below when
+            # ``venv_source`` is None.
+            if recovery is None:
+                dirty_injected = injected_paths
+                venv_link = worktree_path / ".venv"
+                if is_junction(venv_link):
+                    dirty_injected = injected_paths + (".venv",)
+                dirty_reason = _worktree_dirty_reason(
+                    worktree_path, dirty_injected, materialize_dirs
+                )
+                if dirty_reason:
+                    raise WorktreeUnsafeError(dirty_reason)
             # Only fetch if origin remote exists (deterministic check)
             if _has_origin_remote(repo_root):
                 # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
