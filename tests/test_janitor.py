@@ -3402,9 +3402,7 @@ def _all_green_summary(required: tuple = _STALE_REQUIRED) -> CheckSummary:
 
 def test_required_check_citation_names_matches_contaminated_shape() -> None:
     """The real #1111 shape: a check-status observation, not a code finding."""
-    decision = _stale_decision(
-        ["Tests passed: .github:18 — Process completed with exit code 1."]
-    )
+    decision = _stale_decision(["Tests passed: .github:18 — Process completed with exit code 1."])
     assert required_check_citation_names(decision, _STALE_REQUIRED) == ("Tests passed",)
 
 
@@ -3462,9 +3460,7 @@ def test_required_check_citation_names_non_string_entry_returns_none() -> None:
 
 
 def test_required_check_citation_names_empty_required_tuple_returns_none() -> None:
-    decision = _stale_decision(
-        ["Tests passed: .github:18 — Process completed with exit code 1."]
-    )
+    decision = _stale_decision(["Tests passed: .github:18 — Process completed with exit code 1."])
     assert required_check_citation_names(decision, ()) is None
 
 
@@ -3473,16 +3469,12 @@ def test_required_check_citation_names_none_decision_returns_none() -> None:
 
 
 def test_is_stale_ci_verdict_true_when_all_green() -> None:
-    decision = _stale_decision(
-        ["Tests passed: .github:18 — Process completed with exit code 1."]
-    )
+    decision = _stale_decision(["Tests passed: .github:18 — Process completed with exit code 1."])
     assert is_stale_ci_verdict(decision, _all_green_summary()) is True
 
 
 def test_is_stale_ci_verdict_false_when_summary_none() -> None:
-    decision = _stale_decision(
-        ["Tests passed: .github:18 — Process completed with exit code 1."]
-    )
+    decision = _stale_decision(["Tests passed: .github:18 — Process completed with exit code 1."])
     assert is_stale_ci_verdict(decision, None) is False
 
 
@@ -3492,9 +3484,7 @@ def test_is_stale_ci_verdict_false_when_non_citation_decision() -> None:
 
 
 def test_is_stale_ci_verdict_false_when_required_check_still_failed() -> None:
-    decision = _stale_decision(
-        ["Tests passed: .github:18 — Process completed with exit code 1."]
-    )
+    decision = _stale_decision(["Tests passed: .github:18 — Process completed with exit code 1."])
     summary = CheckSummary(
         required=_STALE_REQUIRED,
         passed=("Pre-commit",),
@@ -3508,9 +3498,7 @@ def test_is_stale_ci_verdict_false_when_required_check_still_failed() -> None:
 
 
 def test_is_stale_ci_verdict_false_when_required_check_pending() -> None:
-    decision = _stale_decision(
-        ["Tests passed: .github:18 — Process completed with exit code 1."]
-    )
+    decision = _stale_decision(["Tests passed: .github:18 — Process completed with exit code 1."])
     summary = CheckSummary(
         required=_STALE_REQUIRED,
         passed=("Pre-commit",),
@@ -3524,9 +3512,7 @@ def test_is_stale_ci_verdict_false_when_required_check_pending() -> None:
 
 
 def test_is_stale_ci_verdict_false_when_required_check_missing() -> None:
-    decision = _stale_decision(
-        ["Tests passed: .github:18 — Process completed with exit code 1."]
-    )
+    decision = _stale_decision(["Tests passed: .github:18 — Process completed with exit code 1."])
     summary = CheckSummary(
         required=_STALE_REQUIRED,
         passed=("Pre-commit",),
@@ -3540,9 +3526,7 @@ def test_is_stale_ci_verdict_false_when_required_check_missing() -> None:
 
 
 def test_is_stale_ci_verdict_false_when_required_check_infra_failed() -> None:
-    decision = _stale_decision(
-        ["Tests passed: .github:18 — Process completed with exit code 1."]
-    )
+    decision = _stale_decision(["Tests passed: .github:18 — Process completed with exit code 1."])
     summary = CheckSummary(
         required=_STALE_REQUIRED,
         passed=("Pre-commit",),
