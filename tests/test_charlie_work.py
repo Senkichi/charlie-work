@@ -8005,6 +8005,43 @@ def test_review_stale_ci_skip_no_gate_pass_event_in_dry_run(tmp_path: Path) -> N
     assert query_events(app.paths.state_file, kind="stale_ci_verdict_gate_pass") == []
 
 
+def test_review_stale_ci_gate_pass_event_deduped_per_head(tmp_path: Path) -> None:
+    """PR #1117 review finding: the gate re-passes on EVERY orchestrator poll
+    while the PR waits on review-dispatch capacity, so without dedup the
+    ``stale_ci_verdict_gate_pass`` event re-fires each pass (the log-spam
+    pattern review() guards against everywhere else -- cost-spirals.md
+    Finding 2). A second consecutive review() for the same PR/head must not
+    emit a duplicate; the emission is keyed on ``stale_ci_gate_pass_head``
+    stored in the PR state entry."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=_STALE_CI_GREEN_CHECKS)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary="Tests passed: .github:18 — Process completed with exit code 1.",
+        required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+    )
+    state = load_state(app.paths.state_file)
+    record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
+    state["issues"]["123"] = record
+    save_state(app.paths.state_file, state)
+
+    first = app.review(456)
+    second = app.review(456)
+
+    assert first.ok is True
+    assert second.ok is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["stale_ci_gate_pass_head"] == "sha-abc123"
+    gate_pass_events = query_events(app.paths.state_file, kind="stale_ci_verdict_gate_pass")
+    assert len(gate_pass_events) == 1
+
+
 def test_review_no_op_rework_routes_when_prose_finding(tmp_path: Path) -> None:
     """Issue #1111 control: the same same-head/same-diff no-op setup, but the
     recorded verdict's finding is real prose rather than a check citation.

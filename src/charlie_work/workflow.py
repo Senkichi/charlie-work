@@ -9197,16 +9197,27 @@ class OrchestratorApp:
         # Issue #1116: the stale-CI skip let a reworked-but-unchanged PR
         # through the gate it was permanently wedged behind. Record it so the
         # packet-rebuild -> fresh-review sequence that follows is attributable
-        # to the skip rather than looking like a spontaneous unblock.
+        # to the skip rather than looking like a spontaneous unblock. Dedup on
+        # the head sha (mirroring the failures_changed / draft_hold_reason
+        # pattern elsewhere in this function): the gate re-passes on every
+        # poll while the PR waits on review-dispatch capacity, and only the
+        # first pass per head is signal (cost-spirals.md Finding 2).
         if verdict.ok and verdict.no_op_check_skipped_stale_ci and not self.dry_run:
-            log_event(
-                self.paths.state_file,
-                "stale_ci_verdict_gate_pass",
-                {
-                    "pr_number": pr_number,
-                    "head_sha": str(pr.get("headRefOid") or "") or None,
-                },
-            )
+            gate_pass_head = str(pr.get("headRefOid") or "") or None
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                existing_pr_state = state["prs"].get(str(pr_number), {})
+                if existing_pr_state.get("stale_ci_gate_pass_head") != gate_pass_head:
+                    state["prs"][str(pr_number)] = {
+                        **existing_pr_state,
+                        "stale_ci_gate_pass_head": gate_pass_head,
+                    }
+                    state = self._record_event(
+                        state,
+                        "stale_ci_verdict_gate_pass",
+                        {"pr_number": pr_number, "head_sha": gate_pass_head},
+                    )
+                    save_state(self.paths.state_file, state)
 
         # Issue #820: reconcile the operator merge-hold marker for the #818
         # draft-auto-ready actuator unconditionally, on every review() pass
