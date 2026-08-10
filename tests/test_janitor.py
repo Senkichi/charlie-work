@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from charlie_work.checks import CheckSummary
 from charlie_work.config import (
     AutoMergeConfig,
     OrchestratorConfig,
@@ -19,12 +20,14 @@ from charlie_work.janitor import (
     _get_unpushed_commit_info,
     CONVENTIONAL_COMMIT_TYPES,
     detect_cross_pr_revert,
+    is_stale_ci_verdict,
     JANITOR_PR_KEYS,
     JanitorVerdict,
     check_operator_containment,
     check_stub_tests,
     check_test_adequacy,
     iter_diff_files,
+    required_check_citation_names,
     run_janitor,
 )
 
@@ -3368,3 +3371,185 @@ def test_detect_cross_pr_revert_warns_on_invalid_ref(
         "detect_cross_pr_revert" in record.message and "not a valid git ref name" in record.message
         for record in caplog.records
     )
+
+
+# --------------------------------------------------------------------------
+# required_check_citation_names / is_stale_ci_verdict (issue #1111)
+# --------------------------------------------------------------------------
+
+_STALE_REQUIRED = ("Tests passed", "Pre-commit")
+
+
+def _stale_decision(required_changes: list) -> dict:
+    return {
+        "decision": "request_changes",
+        "escalated": False,
+        "required_changes": required_changes,
+    }
+
+
+def _all_green_summary(required: tuple = _STALE_REQUIRED) -> CheckSummary:
+    return CheckSummary(
+        required=required,
+        passed=required,
+        pending=(),
+        failed=(),
+        missing=(),
+        infra_failed=(),
+        unavailable=(),
+    )
+
+
+def test_required_check_citation_names_matches_contaminated_shape() -> None:
+    """The real #1111 shape: a check-status observation, not a code finding."""
+    decision = _stale_decision(
+        ["Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    assert required_check_citation_names(decision, _STALE_REQUIRED) == ("Tests passed",)
+
+
+def test_required_check_citation_names_leading_whitespace_still_matches() -> None:
+    decision = _stale_decision(
+        ["  Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    assert required_check_citation_names(decision, _STALE_REQUIRED) == ("Tests passed",)
+
+
+def test_required_check_citation_names_mixed_entries_returns_none() -> None:
+    """One citation plus one real code finding must not be treated as stale."""
+    decision = _stale_decision(
+        [
+            "Tests passed: .github:18 — Process completed with exit code 1.",
+            "src/foo.py:42 — off-by-one error in the loop bound.",
+        ]
+    )
+    assert required_check_citation_names(decision, _STALE_REQUIRED) is None
+
+
+def test_required_check_citation_names_prose_only_entry_returns_none() -> None:
+    decision = _stale_decision(["The implementation does not handle the empty-list case."])
+    assert required_check_citation_names(decision, _STALE_REQUIRED) is None
+
+
+def test_required_check_citation_names_empty_required_changes_returns_none() -> None:
+    decision = _stale_decision([])
+    assert required_check_citation_names(decision, _STALE_REQUIRED) is None
+
+
+def test_required_check_citation_names_approved_decision_returns_none() -> None:
+    decision = {
+        "decision": "approve",
+        "escalated": False,
+        "required_changes": ["Tests passed: .github:18 — Process completed with exit code 1."],
+    }
+    assert required_check_citation_names(decision, _STALE_REQUIRED) is None
+
+
+def test_required_check_citation_names_escalated_returns_none() -> None:
+    decision = {
+        "decision": "request_changes",
+        "escalated": True,
+        "required_changes": ["Tests passed: .github:18 — Process completed with exit code 1."],
+    }
+    assert required_check_citation_names(decision, _STALE_REQUIRED) is None
+
+
+def test_required_check_citation_names_non_string_entry_returns_none() -> None:
+    decision = _stale_decision(
+        [{"check": "Tests passed"}]  # type: ignore[list-item]
+    )
+    assert required_check_citation_names(decision, _STALE_REQUIRED) is None
+
+
+def test_required_check_citation_names_empty_required_tuple_returns_none() -> None:
+    decision = _stale_decision(
+        ["Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    assert required_check_citation_names(decision, ()) is None
+
+
+def test_required_check_citation_names_none_decision_returns_none() -> None:
+    assert required_check_citation_names(None, _STALE_REQUIRED) is None
+
+
+def test_is_stale_ci_verdict_true_when_all_green() -> None:
+    decision = _stale_decision(
+        ["Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    assert is_stale_ci_verdict(decision, _all_green_summary()) is True
+
+
+def test_is_stale_ci_verdict_false_when_summary_none() -> None:
+    decision = _stale_decision(
+        ["Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    assert is_stale_ci_verdict(decision, None) is False
+
+
+def test_is_stale_ci_verdict_false_when_non_citation_decision() -> None:
+    decision = _stale_decision(["src/foo.py:42 — off-by-one error in the loop bound."])
+    assert is_stale_ci_verdict(decision, _all_green_summary()) is False
+
+
+def test_is_stale_ci_verdict_false_when_required_check_still_failed() -> None:
+    decision = _stale_decision(
+        ["Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    summary = CheckSummary(
+        required=_STALE_REQUIRED,
+        passed=("Pre-commit",),
+        pending=(),
+        failed=("Tests passed",),
+        missing=(),
+        infra_failed=(),
+        unavailable=(),
+    )
+    assert is_stale_ci_verdict(decision, summary) is False
+
+
+def test_is_stale_ci_verdict_false_when_required_check_pending() -> None:
+    decision = _stale_decision(
+        ["Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    summary = CheckSummary(
+        required=_STALE_REQUIRED,
+        passed=("Pre-commit",),
+        pending=("Tests passed",),
+        failed=(),
+        missing=(),
+        infra_failed=(),
+        unavailable=(),
+    )
+    assert is_stale_ci_verdict(decision, summary) is False
+
+
+def test_is_stale_ci_verdict_false_when_required_check_missing() -> None:
+    decision = _stale_decision(
+        ["Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    summary = CheckSummary(
+        required=_STALE_REQUIRED,
+        passed=("Pre-commit",),
+        pending=(),
+        failed=(),
+        missing=("Tests passed",),
+        infra_failed=(),
+        unavailable=(),
+    )
+    assert is_stale_ci_verdict(decision, summary) is False
+
+
+def test_is_stale_ci_verdict_false_when_required_check_infra_failed() -> None:
+    decision = _stale_decision(
+        ["Tests passed: .github:18 — Process completed with exit code 1."]
+    )
+    summary = CheckSummary(
+        required=_STALE_REQUIRED,
+        passed=("Pre-commit",),
+        pending=(),
+        failed=(),
+        missing=(),
+        infra_failed=("Tests passed",),
+        unavailable=(),
+    )
+    assert is_stale_ci_verdict(decision, summary) is False

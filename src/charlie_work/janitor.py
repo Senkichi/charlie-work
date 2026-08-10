@@ -25,7 +25,7 @@ import fnmatch
 import logging
 import re
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -873,6 +873,68 @@ def _check_no_op_rework(
             f"If the advance was only base-update merges, this may be a no-op rework."
         )
     return False
+
+
+def required_check_citation_names(
+    decision: Mapping[str, Any] | None,
+    required: Sequence[str],
+) -> tuple[str, ...] | None:
+    """Return the required-check names a request_changes verdict cites, or None.
+
+    A verdict "cites only required checks" when it is a non-escalated
+    ``request_changes`` whose ``required_changes`` list is non-empty and EVERY
+    entry begins with a configured required-check name followed by ``:`` —
+    the shape record_review's #792 derivation produces when a reviewer's sole
+    findings were check-status observations (issue #1111: e.g.
+    ``"Tests passed: .github:18 — Process completed with exit code 1."``).
+    Check names come from ``config.auto_merge.required_checks``, never from a
+    hard-coded list. Any entry that does not match — a real code finding, free
+    prose, an empty string — makes the whole verdict non-citation (None), so
+    mixed verdicts keep their normal lifecycle. Fail-closed by construction:
+    None means "treat the verdict as substantive".
+    """
+    if not decision or not required:
+        return None
+    if decision.get("decision") != "request_changes" or decision.get("escalated"):
+        return None
+    required_changes = decision.get("required_changes")
+    if not isinstance(required_changes, list) or not required_changes:
+        return None
+    cited: list[str] = []
+    for entry in required_changes:
+        if not isinstance(entry, str):
+            return None
+        text = entry.lstrip()
+        match = next((name for name in required if text.startswith(f"{name}:")), None)
+        if match is None:
+            return None
+        cited.append(match)
+    return tuple(cited)
+
+
+def is_stale_ci_verdict(
+    decision: Mapping[str, Any] | None,
+    summary: CheckSummary | None,
+) -> bool:
+    """True when a request_changes verdict's only findings are required-check
+    citations and every required check is green right now.
+
+    This is the issue #1111 staleness predicate: a reviewer recorded
+    ``request_changes`` citing a required CI check (typically a transient
+    infra/timeout failure that flipped mid-review), the check has since
+    recovered on the same content, and the verdict therefore describes a
+    failure that no longer exists. A stale verdict must be superseded by a
+    FRESH review — never auto-approved — so callers use this only to (a)
+    re-queue the PR for review despite an unchanged patch-id and (b) suppress
+    no-op-rework counter burn while that re-review is pending. ``summary``
+    must be a live :class:`CheckSummary` over the configured required checks;
+    ``None`` (checks unavailable) fails closed to False.
+    """
+    if summary is None:
+        return False
+    if required_check_citation_names(decision, summary.required) is None:
+        return False
+    return summary.ready
 
 
 def _get_unpushed_commit_info(

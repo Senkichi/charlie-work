@@ -289,6 +289,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "self_deploy_skipped": "info",
         "self_deploy_succeeded": "info",
         "spec_review": "info",
+        "stale_ci_verdict_requeued": "info",
         "stranded_request_changes_rework_requested": "info",
         "supervisor_exited": "info",
         "supervisor_started": "info",

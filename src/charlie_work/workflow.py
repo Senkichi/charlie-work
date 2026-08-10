@@ -90,6 +90,8 @@ from .janitor import (
     check_operator_containment,
     check_test_adequacy,
     detect_cross_pr_revert,
+    is_stale_ci_verdict,
+    required_check_citation_names,
     run_janitor,
     DiffContentSignature,
     JanitorVerdict,
@@ -9105,9 +9107,29 @@ class OrchestratorApp:
                 ).upper() == "CONFLICTING" or (
                     str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
                 )
+                # Issue #1111: mirror the non-escalated path's stale-CI-verdict
+                # suppression — a request_changes verdict citing only required
+                # checks that are green now must not burn no_op_rework_attempts
+                # (the predicate itself refuses escalated decisions, so this is
+                # a no-op for verdicts recorded as escalated).
+                escalated_stale_ci = False
+                if (
+                    escalated_verdict.is_no_op_rework
+                    and not escalated_verdict.failed_required_checks
+                ):
+                    required = self.config.auto_merge.required_checks
+                    escalated_stale_ci = (
+                        bool(required)
+                        and escalated_checks is not None
+                        and is_stale_ci_verdict(
+                            self._review_decision(pr_number),
+                            summarize_checks(escalated_checks, required),
+                        )
+                    )
                 is_no_op_rework_block = (
                     escalated_verdict.is_no_op_rework
                     and not escalated_verdict.failed_required_checks
+                    and not escalated_stale_ci
                 )
                 if is_merge_conflict_block or is_no_op_rework_block:
                     if is_merge_conflict_block:
@@ -9654,7 +9676,30 @@ class OrchestratorApp:
             # that existing invariant is out of this fix's scope. This only
             # newly routes the PURE no-op-rework case (no co-occurring check
             # failure), which previously had no consumer at all.
-            is_no_op_rework_block = verdict.is_no_op_rework and not verdict.failed_required_checks
+            #
+            # Issue #1111: ALSO excluded is the stale-CI-verdict case — the
+            # request_changes verdict's only findings cite required checks
+            # that are all green right now (a transient failure the reviewer
+            # saw has recovered on the same content). Routing rework there is
+            # a guaranteed no-op that burns no_op_rework_attempts toward a
+            # manufactured human escalation; review_queue() re-queues the PR
+            # for a fresh review instead, so this pass just waits.
+            stale_ci_verdict = False
+            if verdict.is_no_op_rework and not verdict.failed_required_checks:
+                required = self.config.auto_merge.required_checks
+                stale_ci_verdict = (
+                    bool(required)
+                    and checks is not None
+                    and is_stale_ci_verdict(
+                        self._review_decision(pr_number),
+                        summarize_checks(checks, required),
+                    )
+                )
+            is_no_op_rework_block = (
+                verdict.is_no_op_rework
+                and not verdict.failed_required_checks
+                and not stale_ci_verdict
+            )
             if issue_number is not None and (is_merge_conflict_block or is_no_op_rework_block):
                 if is_merge_conflict_block:
                     routed = self._route_janitor_gate_failure_to_rework(
@@ -10263,6 +10308,47 @@ class OrchestratorApp:
                     continue
 
                 if reviewed_head_sha == live_head_sha:
+                    if decision_value == "request_changes" and self._is_stale_ci_request_changes(
+                        pr_number, decision
+                    ):
+                        # Issue #1111: the verdict's only findings cite
+                        # required checks that are all green on this same head
+                        # — the failure it describes no longer exists (the
+                        # check flipped transiently mid-review, or a rerun
+                        # recovered it). Re-driving rework here is a
+                        # guaranteed no-op that burns no_op_rework_attempts
+                        # toward a manufactured escalation, so instead queue
+                        # the PR for a FRESH review despite the unchanged
+                        # head. The stale verdict is only ever superseded by
+                        # a new recorded verdict, never auto-approved;
+                        # repeated request_changes re-verdicts stay bounded
+                        # by max_rework_cycles in record_review.
+                        if packet_head_sha == live_head_sha and self._packet_template_current(
+                            pr_number
+                        ):
+                            if not self.dry_run:
+                                log_event(
+                                    self.paths.state_file,
+                                    "stale_ci_verdict_requeued",
+                                    {
+                                        "pr_number": pr_number,
+                                        "issue_number": issue_number,
+                                        "reviewed_head_sha": reviewed_head_sha,
+                                        "required_changes": list(
+                                            decision.get("required_changes") or []
+                                        ),
+                                    },
+                                )
+                            queue.append(
+                                {
+                                    "pr": pr_number,
+                                    "issue": issue_number,
+                                    "packet_head_sha": packet_head_sha,
+                                    "decision": "stale",
+                                    "reviewed_head_sha": reviewed_head_sha,
+                                }
+                            )
+                        continue
                     # Issue #784 AC-8 (Case 2): "reviewed at live head" only
                     # means "nothing to do" if the recorded verdict was
                     # actually actioned. A request_changes verdict that
@@ -10282,7 +10368,32 @@ class OrchestratorApp:
                     continue
 
                 check = self._check_carry_forward(pr_number, decision)
-                if check.carry_forward:
+                if (
+                    check.carry_forward
+                    and decision_value == "request_changes"
+                    and self._is_stale_ci_request_changes(pr_number, decision)
+                ):
+                    # Issue #1111 (head-advanced variant): the diff content is
+                    # unchanged (carry-forward matched), but the verdict's only
+                    # findings cite required checks that are all green on the
+                    # live head — e.g. a no-op rework push after a transient CI
+                    # failure recovered. Carrying the request_changes verdict
+                    # forward would re-apply a failure that no longer exists,
+                    # so skip the carry-forward and fall through to the
+                    # stale-queue path below: a fresh review supersedes the
+                    # verdict (never auto-approved).
+                    if not self.dry_run:
+                        log_event(
+                            self.paths.state_file,
+                            "stale_ci_verdict_requeued",
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "reviewed_head_sha": reviewed_head_sha,
+                                "required_changes": list(decision.get("required_changes") or []),
+                            },
+                        )
+                elif check.carry_forward:
                     # In dry-run mode we still run the content check so the queue
                     # reflects real changes, but we skip the durable head update.
                     if not self.dry_run:
@@ -15723,6 +15834,26 @@ class OrchestratorApp:
 
         candidates.sort(key=lambda item: (item[0], item[1]))
         return candidates
+
+    def _is_stale_ci_request_changes(self, pr_number: int, decision: dict[str, Any]) -> bool:
+        """True when ``decision`` is a request_changes verdict whose only
+        findings cite required checks that are all green on the live head
+        (issue #1111 staleness predicate, network half).
+
+        The pure text-shape check (``required_check_citation_names``) runs
+        first so ``gh pr checks`` is only fetched for the small set of
+        verdicts that could possibly be stale. Checks-unavailable (``None``)
+        fails closed to False — the verdict keeps its normal lifecycle.
+        """
+        required = self.config.auto_merge.required_checks
+        if not required:
+            return False
+        if required_check_citation_names(decision, required) is None:
+            return False
+        checks = self.gh.pr_checks(pr_number)
+        if checks is None:
+            return False
+        return is_stale_ci_verdict(decision, summarize_checks(checks, required))
 
     def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> CarryForwardCheck:
         """Determine whether ``decision``'s verdict can carry forward to the
