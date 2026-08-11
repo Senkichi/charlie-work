@@ -23,7 +23,9 @@ concurrency:
 # "Tests (ubuntu-latest)"/"Tests (windows-latest)" to "Tests"; the local
 # orchestrator.config.yaml auto_merge.required_checks list must match.
 #
-# enable-cache stays OFF on self-hosted: setup-uv's GitHub-cache mode runs a
+# setup-uv was removed entirely on 2026-08-11 (#1115) in favor of a
+# PATH-append step -- see the comment on that step. If it is ever restored,
+# enable-cache must stay OFF on self-hosted: its GitHub-cache mode runs a
 # post-job `uv cache prune --ci` that destroys sibling jobs' in-flight cache
 # extractions when runners share a box (observed 2026-07-08 on job-cannon).
 # The persistent local disk cache is already warm.
@@ -44,9 +46,32 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: false
+      # setup-uv@v7 replaced with a PATH-append (#1115): the action's runner
+      # Node process crashed twice in 12 min with a libuv assertion
+      # (async.c:94, upstream flake class) on this box, and on a self-hosted
+      # runner the action's only real job -- downloading uv -- is unnecessary:
+      # the tool cache and the host both already have it. Resolution order:
+      # newest uv in the runner tool cache (what setup-uv itself installed),
+      # else host uv on PATH, else fail loudly -- never silently download.
+      - name: Add uv to PATH (self-hosted, no setup-uv)
+        shell: bash
+        run: |
+          set -e
+          cache="$RUNNER_TOOL_CACHE/uv"
+          dir=""
+          if [ -d "$cache" ]; then
+            ver=$(ls "$cache" | grep -E '^[0-9]+[.][0-9]+[.][0-9]+$' | sort -V | tail -1)
+            [ -n "$ver" ] && dir="$cache/$ver/x64"
+          fi
+          if [ -n "$dir" ] && [ -x "$dir/uv.exe" ]; then
+            echo "$dir" >> "$GITHUB_PATH"
+            "$dir/uv.exe" --version
+          elif command -v uv >/dev/null; then
+            uv --version
+          else
+            echo "::error::uv not found in tool cache ($cache) or host PATH; install uv on the host"
+            exit 1
+          fi
       # ci_fleet is consumed as an editable path dependency at ../ci_runners
       # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
       # exist BEFORE uv sync runs -- without it, sync exits 2 with
@@ -204,9 +229,32 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: false
+      # setup-uv@v7 replaced with a PATH-append (#1115): the action's runner
+      # Node process crashed twice in 12 min with a libuv assertion
+      # (async.c:94, upstream flake class) on this box, and on a self-hosted
+      # runner the action's only real job -- downloading uv -- is unnecessary:
+      # the tool cache and the host both already have it. Resolution order:
+      # newest uv in the runner tool cache (what setup-uv itself installed),
+      # else host uv on PATH, else fail loudly -- never silently download.
+      - name: Add uv to PATH (self-hosted, no setup-uv)
+        shell: bash
+        run: |
+          set -e
+          cache="$RUNNER_TOOL_CACHE/uv"
+          dir=""
+          if [ -d "$cache" ]; then
+            ver=$(ls "$cache" | grep -E '^[0-9]+[.][0-9]+[.][0-9]+$' | sort -V | tail -1)
+            [ -n "$ver" ] && dir="$cache/$ver/x64"
+          fi
+          if [ -n "$dir" ] && [ -x "$dir/uv.exe" ]; then
+            echo "$dir" >> "$GITHUB_PATH"
+            "$dir/uv.exe" --version
+          elif command -v uv >/dev/null; then
+            uv --version
+          else
+            echo "::error::uv not found in tool cache ($cache) or host PATH; install uv on the host"
+            exit 1
+          fi
       # ci_fleet is consumed as an editable path dependency at ../ci_runners
       # ([tool.uv.sources] in pyproject.toml), so the sibling checkout has to
       # exist BEFORE uv sync runs -- without it, sync exits 2 with

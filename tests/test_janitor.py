@@ -2577,6 +2577,42 @@ index 123..456 100644
     assert verdict.facts.untested_product_files == ()
 
 
+def test_check_test_adequacy_workflow_files_exempt() -> None:
+    """GitHub Actions workflow YAML files (.github/workflows/**) are CI
+    infrastructure, not product code — exempt from the test-adequacy gate.
+
+    Guards against the false positive that flagged .github/workflows/ci.yml
+    as untested product code (PR #1127 / issue #1115). Workflow files are
+    validated by CI itself: a broken workflow cannot start, so a workflow-only
+    PR is self-validating in the same way a docs-only PR is.
+    """
+    diff = """diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 123..456 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -1,5 +1,8 @@
+ jobs:
+   test:
+     steps:
+-      - uses: actions/checkout@v5
++      - uses: actions/checkout@v5
++      - name: Add uv to PATH
++        run: |
++          echo "$RUNNER_TOOL_CACHE/uv" >> "$GITHUB_PATH"
+"""
+    pr = _test_pr()
+    config = _test_adequacy_config()
+
+    verdict = check_test_adequacy(diff, pr, config)
+
+    assert verdict.ok is True
+    assert verdict.failures == ()
+    assert verdict.warnings == ()
+    assert verdict.facts.added_product_loc == 0
+    assert verdict.facts.added_test_loc == 0
+    assert verdict.facts.untested_product_files == ()
+
+
 def test_check_test_adequacy_rename_only_passes() -> None:
     """Rename-only diff (100% similarity, no hunk body) → ok=True, facts.added_product_loc == 0."""
     diff = """diff --git a/old_name.py b/new_name.py
