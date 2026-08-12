@@ -198,6 +198,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # was recorded nowhere, which is why diagnosing it took reconstructing
         # the call path by hand.
         "cross_family_regen_not_reached": "warning",
+        "dead_dispatched_worker_reaped": "warning",
         "deescalation_cap_exhausted": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",
