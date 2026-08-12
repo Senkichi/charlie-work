@@ -29953,6 +29953,295 @@ def test_count_fleet_live_sessions_skips_vanished_repos(tmp_path: Path, monkeypa
     assert len(skipped_repos) == 1
 
 
+def test_count_fleet_live_sessions_reports_missing_sessions_dir(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A repo whose state_dir exists but whose sessions_dir is missing is reported."""
+    from charlie_work.fleet_registry import count_fleet_live_sessions
+
+    fleet_dir = tmp_path / ".fleet"
+    fleet_dir.mkdir(parents=True)
+    fleet_json = fleet_dir / "fleet.json"
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    # state_dir exists, but the default sessions subdir is deliberately absent.
+    state = repo / ".var" / "charlie-work"
+    state.mkdir(parents=True)
+
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(repo / "orchestrator.config.yaml"),
+                "state_dir": str(state),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+        },
+    }
+    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+
+    live_count, skipped_repos = count_fleet_live_sessions(None)
+
+    assert live_count == 0
+    assert "owner/repo" in skipped_repos
+    assert len(skipped_repos) == 1
+
+
+def test_count_fleet_live_sessions_respects_devin_sessions_dir_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A repo that overrides devin.sessions_dir is counted from that path."""
+    from charlie_work.fleet_registry import count_fleet_live_sessions
+
+    fleet_dir = tmp_path / ".fleet"
+    fleet_dir.mkdir(parents=True)
+    fleet_json = fleet_dir / "fleet.json"
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    # Default sessions dir is missing; the override is the live one.
+    state = repo / ".var" / "charlie-work"
+    state.mkdir(parents=True)
+
+    custom_sessions = repo / "custom-sessions"
+    custom_sessions.mkdir(parents=True)
+    (custom_sessions / "issue-1.json").write_text(
+        json.dumps(
+            {
+                "issue_number": 1,
+                "branch": "main",
+                "worktree_path": str(repo / "worktrees" / "issue-1"),
+                "prompt_path": str(repo / "prompt.md"),
+                "command": ["devin"],
+                "pid": 1234,
+                "started_at": "2026-08-05T00:00:00Z",
+                "log_path": str(repo / "log.txt"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    (repo / "orchestrator.config.yaml").write_text(
+        "devin:\n  sessions_dir: custom-sessions\n",
+        encoding="utf-8",
+    )
+
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(repo / "orchestrator.config.yaml"),
+                "state_dir": str(state),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+        },
+    }
+    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
+
+    live_count, skipped_repos = count_fleet_live_sessions(None)
+
+    assert live_count == 1
+    assert skipped_repos == []
+
+
+def test_count_fleet_live_sessions_respects_global_devin_sessions_dir_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A repo with no per-repo override is still counted when fleet config sets devin.sessions_dir.
+
+    Regression for the review of issue #707: count_fleet_live_sessions loaded the
+    per-repo orchestrator.config.yaml only, so a global <fleet_dir>/config.yaml
+    devin.sessions_dir override was silently ignored.
+    """
+    from charlie_work.fleet_registry import count_fleet_live_sessions
+
+    fleet_dir = tmp_path / ".fleet"
+    fleet_dir.mkdir(parents=True)
+    fleet_json = fleet_dir / "fleet.json"
+
+    # No per-repo config; all config comes from the fleet-wide layer.
+    (fleet_dir / "config.yaml").write_text(
+        "devin:\n  sessions_dir: custom-sessions\n",
+        encoding="utf-8",
+    )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    # Default sessions dir is missing; the global override is the live one.
+    state = repo / ".var" / "charlie-work"
+    state.mkdir(parents=True)
+
+    custom_sessions = repo / "custom-sessions"
+    custom_sessions.mkdir(parents=True)
+    (custom_sessions / "issue-1.json").write_text(
+        json.dumps(
+            {
+                "issue_number": 1,
+                "branch": "main",
+                "worktree_path": str(repo / "worktrees" / "issue-1"),
+                "prompt_path": str(repo / "prompt.md"),
+                "command": ["devin"],
+                "pid": 1234,
+                "started_at": "2026-08-05T00:00:00Z",
+                "log_path": str(repo / "log.txt"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(repo / "orchestrator.config.yaml"),
+                "state_dir": str(state),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+        },
+    }
+    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
+
+    live_count, skipped_repos = count_fleet_live_sessions(None)
+
+    assert live_count == 1
+    assert skipped_repos == []
+
+
+def test_count_fleet_live_sessions_skips_repo_with_null_state_dir(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A corrupted registry entry with state_dir: null does not crash count_fleet_live_sessions.
+
+    Regression for the review of issue #707 (rework round 3):
+    ``Path(entry.get("state_dir", ""))`` returns ``Path(None)`` when the key is
+    present with a null value (``.get``'s default only applies when the key is
+    *absent*), raising TypeError. The same bug class was already fixed in this
+    PR for ``repo_root`` across fleet_dispatch.py but missed for ``state_dir``
+    in this exact function. The fix ``entry.get("state_dir") or ""`` makes null
+    behave identically to a missing key (fall back to cwd), and the repo is
+    then reported in skipped_repos because the resolved sessions_dir under cwd
+    does not exist.
+    """
+    from charlie_work.fleet_registry import count_fleet_live_sessions
+
+    fleet_dir = tmp_path / ".fleet"
+    fleet_dir.mkdir(parents=True)
+    fleet_json = fleet_dir / "fleet.json"
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    # Pin cwd to tmp_path so the cwd-fallback (Path("") == Path(".")) resolves
+    # deterministically: sessions_dir_default(tmp_path) = tmp_path/dispatches/
+    # sessions, which does not exist, so the repo is skipped + reported.
+    monkeypatch.chdir(tmp_path)
+
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(repo / "orchestrator.config.yaml"),
+                "state_dir": None,
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+        },
+    }
+    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+
+    # Must not raise TypeError; the repo is skipped + reported.
+    live_count, skipped_repos = count_fleet_live_sessions(None)
+
+    assert live_count == 0
+    assert "owner/repo" in skipped_repos
+    assert len(skipped_repos) == 1
+
+
+def test_count_fleet_live_sessions_skips_repo_with_malformed_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A repo with an unparseable per-repo config does not crash count_fleet_live_sessions.
+
+    Regression for the review of issue #707 (rework round 3): the
+    ``load_layered_config`` call in ``count_fleet_live_sessions`` is wrapped in
+    a broad ``except Exception`` containment, but no test exercised a malformed
+    ``orchestrator.config.yaml`` (which raises ``yaml.YAMLError``) against it.
+    Mirrors the equivalent malformed-config tests already added for
+    fleet_dispatch.py. The repo must land in skipped_repos instead of crashing.
+    """
+    from charlie_work.fleet_registry import count_fleet_live_sessions
+
+    fleet_dir = tmp_path / ".fleet"
+    fleet_dir.mkdir(parents=True)
+    fleet_json = fleet_dir / "fleet.json"
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    state = repo / ".var" / "charlie-work"
+    state.mkdir(parents=True)
+
+    # Plant a malformed YAML file that yaml.safe_load cannot parse.
+    (repo / "orchestrator.config.yaml").write_text(
+        "devin:\n  sessions_dir: [unclosed\n",
+        encoding="utf-8",
+    )
+
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo": {
+                "repo_root": str(repo),
+                "name_with_owner": "owner/repo",
+                "config_path": str(repo / "orchestrator.config.yaml"),
+                "state_dir": str(state),
+                "first_seen": "2024-01-01T00:00:00Z",
+                "last_seen": "2024-01-01T00:00:00Z",
+            },
+        },
+    }
+    fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+
+    # Must not raise yaml.YAMLError; the repo is skipped + reported.
+    live_count, skipped_repos = count_fleet_live_sessions(None)
+
+    assert live_count == 0
+    assert "owner/repo" in skipped_repos
+    assert len(skipped_repos) == 1
+
+
 def test_concurrency_governor_result_enabled_property() -> None:
     """ConcurrencyGovernorResult.enabled property correctly reflects governor enabled state."""
     # Disabled (max_concurrent=0)

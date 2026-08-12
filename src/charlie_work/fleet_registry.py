@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import layout
 from .config import DEFAULT_CONFIG_FILENAME
+from .global_config import load_layered_config
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError, GitHubLike
@@ -154,16 +155,19 @@ def count_fleet_live_sessions(
 
     Reads the fleet registry, iterates over each registered repo, resolves its
     sessions_dir, and counts live workers using the adapter-agnostic iter_workers
-    from worker.py. Tolerates vanished/moved repo dirs by skipping them and
-    returning a list of skipped repo keys for operator visibility.
+    from worker.py. Tolerates per-repo problems by skipping them and returning a
+    list of skipped repo keys for operator visibility.
 
     Args:
         fleet_dir_override: Optional override for the fleet directory path.
 
     Returns:
         A tuple of (total_live_count, skipped_repos) where skipped_repos is a
-        list of name_with_owner keys whose repo_root no longer exists or is not
-        a git worktree.
+        list of name_with_owner keys for any of:
+        - repo_root missing or not a git worktree,
+        - state_dir missing,
+        - config load failure (missing/unreadable/malformed/invalid), or
+        - resolved sessions_dir missing.
     """
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
@@ -196,8 +200,14 @@ def count_fleet_live_sessions(
             continue
 
         # Resolve sessions_dir from the registry entry's state_dir
-        # The state_dir is the .var/charlie-work root for that repo
-        state_dir = Path(entry.get("state_dir", ""))
+        # The state_dir is the .var/charlie-work root for that repo.
+        # ``or ""`` (not ``.get(key, default)``): a present-but-null state_dir
+        # returns None from .get — the default only applies when the key is
+        # *absent* — and Path(None) raises TypeError. Same bug class fixed for
+        # repo_root across fleet_dispatch.py; null here behaves like a missing
+        # key (cwd fallback), then the state_dir.exists() / sessions_dir checks
+        # skip + report the repo.
+        state_dir = Path(entry.get("state_dir") or "")
         if not state_dir.exists():
             logger.warning(
                 f"Skipping fleet live-count for {name_with_owner}: state_dir {state_dir} does not exist"
@@ -205,14 +215,39 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        # NOTE: reconstructs the *default* layout and ignores a per-repo
-        # ``devin.sessions_dir`` override (deferred behavioral fix). A repo that
-        # overrides ``sessions_dir`` is silently skipped from this fleet-wide
-        # concurrency count, which fails open toward over-dispatch rather than
-        # under-dispatch.
-        sessions_dir = layout.sessions_dir_default(state_dir)
+        # Resolve sessions_dir from the repo's effective layered config.
+        # The registry's state_dir is the resolved state root, but the repo's
+        # per-repo orchestrator.config.yaml may not declare devin.sessions_dir;
+        # the fleet-wide <fleet_dir>/config.yaml layer is also allowed to set it
+        # (known_config_sections() includes "devin"). Use load_layered_config so
+        # both layers are merged and an explicit devin.sessions_dir is resolved
+        # against repo_root via the single sentinel resolver in layout.py.
+        explicit_cfg = entry.get("config_path")
+        try:
+            repo_config = load_layered_config(
+                repo_root,
+                Path(explicit_cfg) if explicit_cfg else None,
+                fleet_dir_override=fleet_dir_override,
+            )
+        except Exception as exc:  # noqa: BLE001 - containment is deliberate
+            logger.warning(
+                f"Skipping fleet live-count for {name_with_owner}: "
+                f"failed to load repo config for {repo_root}: {exc}"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+
+        sessions_dir = layout.resolve_state_child(
+            repo_config.devin.sessions_dir,
+            repo_root=repo_root,
+            default=layout.sessions_dir_default(state_dir),
+        )
         if not sessions_dir.exists():
-            # No sessions dir means no live sessions for this repo
+            logger.warning(
+                f"Skipping fleet live-count for {name_with_owner}: "
+                f"sessions_dir {sessions_dir} does not exist"
+            )
+            skipped_repos.append(name_with_owner)
             continue
 
         # Count live workers using adapter-agnostic iter_workers
