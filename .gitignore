@@ -29,3 +29,14 @@ test_marker*.txt
 # MSYS/Cygwin crash dumps. Written to the repo root by whatever cwd bash died in,
 # so they land untracked and `git add .` will happily commit one.
 *.stackdump
+
+# Worker/orchestrator protocol residue written into the worktree root at runtime.
+# These are state sentinels, not source: a worker writes them per-session and
+# salvage/reap tooling reads them back. If tracked, a fresh worktree materializes
+# a phantom outcome before the worker has done anything, and a worker's own write
+# shows up as a modification to a tracked file -- the exact shape of dirt that
+# trips the worktree_unsafe escalation path (issue #1138). Ignoring them here is
+# structural prevention so neither workers' own writes nor a salvage that
+# `git add -A`s a worktree with residue can commit them again.
+.worker-outcome.json
+.charlie-writer.json
