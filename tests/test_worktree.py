@@ -7036,11 +7036,9 @@ def _seed_live_writer_worktree(
     write_worktree_marker(info.path, marker_pid, session_id)
     # Sidecar: gives the marker check (and the liveness gate) a recorded
     # session with a start-time fingerprint to corroborate.
-    sidecar = sessions_dir / f"issue-1141.json"
+    sidecar = sessions_dir / "issue-1141.json"
     sidecar.write_text(
-        json.dumps(
-            {"session_id": session_id, "pid": marker_pid, "process_start_time": 1.0}
-        ),
+        json.dumps({"session_id": session_id, "pid": marker_pid, "process_start_time": 1.0}),
         encoding="utf-8",
     )
     return info
