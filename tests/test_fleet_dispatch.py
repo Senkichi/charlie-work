@@ -2862,6 +2862,7 @@ def test_run_fleet_supervise_self_deploys_before_each_pass(
     assert deploy_mock.call_count == 3
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -2869,6 +2870,7 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -2886,6 +2888,8 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     watchdog, which relaunches a fresh process with the new commit
     actually imported.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
@@ -2895,6 +2899,13 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     )
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()
+    # Issue #604: the self-deploy restart exit now probes the watchdog
+    # scheduled task. Mock it to ``armed=None`` (unknown) so the test stays
+    # hermetic -- no real ``schtasks`` subprocess call, no coupling to the
+    # live state of the ``charlie-fleet-pass`` task -- and the alert path
+    # (which fires only on a confirmed ``armed=False``) is not exercised
+    # here. The dedicated watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     deploy_mock = MagicMock(
         return_value=SelfDeployResult(
@@ -2927,6 +2938,7 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     assert result.data["restart_requested"] is True
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -2934,6 +2946,7 @@ def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -2952,6 +2965,8 @@ def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
     did fail, so ok=False is correct. What must survive is the instruction to
     replace this process.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
@@ -2961,6 +2976,11 @@ def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
     )
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()
+    # Issue #604: mock the watchdog probe so this test does not perform a real
+    # ``schtasks`` subprocess call. ``armed=None`` (unknown) does not trigger
+    # the alert path, keeping the test focused on the bookkeeping-failure
+    # invariant it exists to guard.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     deploy_mock = MagicMock(
         return_value=SelfDeployResult(
@@ -3158,6 +3178,7 @@ def test_run_fleet_supervise_does_not_restart_on_deferred_sync_with_unmoved_head
     assert mock_fleet_loop.call_count == 3
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -3165,6 +3186,7 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -3175,6 +3197,8 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     startup-vs-current HEAD comparison, the daemon would run stale code
     forever (observed 2026-07-23: ~90 minutes of ConfigError crashes).
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
@@ -3184,6 +3208,13 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     )
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()
+    # Issue #604: the head-drift restart exit now probes the watchdog
+    # scheduled task. Mock it to ``armed=None`` (unknown) so the test does
+    # not perform a real ``schtasks`` subprocess call and stays hermetic --
+    # the same pattern used by the self_deploy/read_head_sha/fleet_loop
+    # mocks already applied in this test. The alert path (armed=False) is
+    # covered by the dedicated watchdog-alert tests below.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     deploy_mock = MagicMock(
         return_value=SelfDeployResult(
