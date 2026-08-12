@@ -32570,10 +32570,94 @@ def test_loop_corrects_escalated_label_divergence_via_reconcile_pass(tmp_path: P
     assert (40, "agent:needs-rework") in gh.labels_removed
 
     # B-AC7 (critical safety invariant): reconcile must never rewrite an
-    # escalated issue's status to match labels -- only `charlie unescalate`
+    # open escalated issue's status to match labels -- only `charlie unescalate`
     # re-enters the machine.
     final_state = load_state(app.paths.state_file)
     assert final_state["issues"]["40"]["status"] == "escalated"
+
+
+def test_reconcile_closed_unmerged_pr_does_not_drop_escalated_issue_status(
+    tmp_path: Path,
+) -> None:
+    """D-2 regression guard for issue #1066: an OPEN escalated issue whose
+    linked PR is CLOSED-unmerged must NOT have its ``status`` key dropped by
+    the ``closed_unmerged_pr_issue_state_converged`` drift kind.
+
+    Before #1066's ``DORMANT_CONVERGENCE_EXCLUDED_STATUSES`` exclusion, this
+    path dropped the ``status`` key for any ``ACTIVE_STATE_STATUSES`` member
+    -- including ``"escalated"`` -- silently detaching the state entry from
+    its still-live ``agent:human-needed`` label with no repair path back into
+    the human queue (fired in production: issue #894 via PR #948). The
+    sibling ``issue_status_normalized`` sweep already excluded escalated via
+    ``ORCHESTRATOR_OWNED_ISSUE_STATUSES``; the asymmetry was the defect.
+
+    This test calls ``detect_drift``/``apply_fixes`` directly (the same
+    surface the reviewer reproduced the bug on) and asserts both that no
+    ``closed_unmerged_pr_issue_state_converged`` drift item is emitted for
+    the escalated issue and that the ``status`` key survives ``apply_fixes``.
+    """
+    from charlie_work.reconcile import apply_fixes, detect_drift
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub()
+    # OPEN escalated issue with the terminal human-needed label already
+    # present -- the exact live shape of issue #894 at the time of the
+    # production incident.
+    gh.issues = [
+        {
+            "number": 894,
+            "title": "issue 894",
+            "url": "https://example.test/issues/894",
+            "body": "",
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    # CLOSED-unmerged PR linked to issue #894 via the branch-name convention.
+    gh.prs = [
+        {
+            "number": 948,
+            "title": "Fix #894",
+            "url": "https://example.test/pull/948",
+            "headRefName": "agent/issue-894-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-948",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #894",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "CLOSED",
+        }
+    ]
+
+    state = empty_state()
+    state["issues"]["894"] = {"number": 894, "status": "escalated"}
+    state["prs"]["948"] = {"number": 948, "status": "reviewing", "issue_number": 894}
+    state_file = tmp_path / "state.json"
+    save_state(state_file, state)
+
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    # No closed_unmerged_pr_issue_state_converged drift item for the escalated
+    # issue -- the DORMANT_CONVERGENCE_EXCLUDED_STATUSES exclusion (#1066)
+    # prevents it.
+    issue_converged = [
+        d
+        for d in drift
+        if d.kind == "closed_unmerged_pr_issue_state_converged" and d.issue_number == 894
+    ]
+    assert issue_converged == [], (
+        f"escalated issue should be excluded from closed_unmerged_pr_issue_state_"
+        f"converged, got: {issue_converged}"
+    )
+
+    new_state = apply_fixes(gh, state, drift, config, repo_root=tmp_path, state_path=state_file)
+
+    # D-2: the escalated issue's status key must survive -- not dropped to
+    # None and not rewritten to any other value.
+    assert new_state["issues"]["894"]["status"] == "escalated", (
+        f"escalated issue status was rewritten to {new_state['issues']['894'].get('status')!r}"
+    )
 
 
 def test_maybe_reconcile_drift_runs_while_supervisor_lock_held(tmp_path: Path) -> None:

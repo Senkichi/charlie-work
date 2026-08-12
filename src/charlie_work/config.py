@@ -377,9 +377,11 @@ class ReconcilePassConfig:
     key, to the terminal ``merged`` value on a finalized PR, and to the
     passive ``open_passive`` placeholder (most notably
     ``issue_active_label_with_open_pr``). It never rewrites ``status`` to an
-    active dispatch/rework value and never rewrites an escalated issue's
-    ``status`` (D-2), so this is safe to run unattended on every repo,
-    every cycle.
+    active dispatch/rework value and never rewrites an open escalated
+    issue's ``status`` (D-2) -- a closed-while-escalated issue is
+    finalized to ``closed`` like any other closed issue, but no escalated
+    issue is ever re-entered into the machine -- so this is safe to run
+    unattended on every repo, every cycle.
     """
 
     # Default True: the fleet has never run its own repair (baseline: zero
