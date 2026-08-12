@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import patch
 
 import pytest
@@ -19380,6 +19380,150 @@ def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
 
     assert result.data["merged"] is True
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
+
+
+def test_merge_ready_dry_run_does_not_merge_or_persist(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run, merge_ready must not call merge_pr, must
+    not write status='merged' to state.json, and must return the computed
+    readiness verdict (can_merge=True) without persisting."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    # The verdict is computed (can_merge=True) but nothing happened.
+    assert result.data["can_merge"] is True
+    assert result.data["merged"] is False
+    assert result.data["dry_run"] is True
+    assert "would merge" in result.message
+    # No merge was attempted.
+    assert fake_gh.merged == []
+    assert fake_gh.deleted_branches == []
+    # State was NOT written — no 'merged' status, no prs entry at all.
+    state = load_state(paths.state_file)
+    pr_state = state["prs"].get("456", {})
+    assert pr_state.get("status") != "merged"
+    assert pr_state.get("merged") is not True
+
+
+def test_merge_ready_dry_run_mergequeue_does_not_label_or_persist(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run with mergequeue_label set, merge_ready must
+    not call add_pr_label, must not write status='mergequeue' to state.json,
+    and must return the computed readiness verdict without persisting.
+
+    This is the highest-severity blast radius: without the gate, the dry-run
+    stub's _run_bool returns True, state records status='mergequeue', and the
+    PR is silently stranded — the orchestrator believes Aviator owns it but
+    Aviator never received the label."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merged"] is False
+    assert result.data["dry_run"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert "would hand off to mergequeue" in result.message
+    # No label was added, no merge was attempted.
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    # State was NOT written — no 'mergequeue' status.
+    state = load_state(paths.state_file)
+    pr_state = state["prs"].get("456", {})
+    assert pr_state.get("status") != "mergequeue"
+    assert pr_state.get("status") != "merged"
+
+
+def test_merge_ready_dry_run_preserves_existing_state(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run, merge_ready must not increment
+    consecutive_failed_merge_attempts or advance the state machine in any
+    way.  A pre-existing PR state entry must be byte-for-byte unchanged
+    after a dry-run pass."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    app.record_review(456, "approved", summary="ok")
+
+    # Plant a pre-existing PR state entry with a non-zero counter.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "approved",
+            "consecutive_failed_merge_attempts": 3,
+            "consecutive_stale_base_deferrals": 0,
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["dry_run"] is True
+    # The counter is reported from the existing state, not incremented.
+    assert result.data["consecutive_failed_merge_attempts"] == 3
+    # State on disk is unchanged.
+    persisted = load_state(paths.state_file)["prs"]["456"]
+    assert persisted["consecutive_failed_merge_attempts"] == 3
+    assert persisted["status"] == "approved"
+
+
+def test_merge_ready_dry_run_already_merged_is_noop(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run, an already-merged PR returns the
+    idempotency no-op without writing state (the real path's idempotency
+    block conditionally clears merge_alert — a write that must be skipped)."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Plant an already-merged PR state entry with a non-OK merge_alert.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "merged",
+            "merged": True,
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "merge_alert": "DEGRADED",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["already_merged"] is True
+    assert result.data["merged"] is True
+    assert result.data["dry_run"] is True
+    # The merge_alert was NOT cleared (the real path would clear it).
+    persisted_issue = load_state(paths.state_file)["issues"]["123"]
+    assert persisted_issue["merge_alert"] == "DEGRADED"
+
+
+def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run, an unapproved PR reports can_merge=False
+    without persisting any state."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert result.data["dry_run"] is True
+    # No state was written for this PR.
+    assert "456" not in load_state(paths.state_file)["prs"]
 
 
 def test_merge_ready_keeps_merged_state_when_label_transition_fails(tmp_path: Path) -> None:
@@ -40419,6 +40563,14 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
 
+    # Issue #614: merge_ready's dry-run gate sits above the state_lock and
+    # returns a read-only verdict without acquiring the lock — so the
+    # state-lock guard is only reachable on the non-dry-run path.  The state
+    # lock is the first thing that path hits, so no side effects occur before
+    # the StateLockBusy exception.
+    if method_name == "merge_ready":
+        app.dry_run = False
+
     state_path = paths.state_file
     state_path.parent.mkdir(parents=True, exist_ok=True)
     initial_state = {
@@ -44236,6 +44388,334 @@ def test_dispatch_partitioned_writes_combined_manifest_for_mixed_adapters(
     # text explains the multi-adapter partition (not the generic fallback).
     assert manifest["adapter"] == "mixed"
     assert "multiple worker adapters" in " ".join(manifest["instructions"])
+
+
+def test_manifest_adapter_label_helper() -> None:
+    """Issue #626: ``manifest_adapter_label`` is the single point of label
+    derivation. One kind → that kind; more than one → ``"mixed"``."""
+    from charlie_work.adapters import manifest_adapter_label
+
+    assert manifest_adapter_label({"devin-shell"}) == "devin-shell"
+    assert manifest_adapter_label({"api"}) == "api"
+    assert manifest_adapter_label({"claude-code"}) == "claude-code"
+    assert manifest_adapter_label({"api", "devin-shell"}) == "mixed"
+    assert manifest_adapter_label({"api", "claude-code", "devin-shell"}) == "mixed"
+
+
+def test_dispatch_partitioned_homogeneous_batch_labels_with_single_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #626: when api_worker is enabled but every issue in the pass
+    routes to the same fallback adapter (e.g. no API key → fallback:auth for
+    all), the manifest's adapter label is that single kind, not ``"mixed"``.
+    Before #626, ``_dispatch_partitioned`` unconditionally wrote
+    ``adapter="mixed"`` for any non-empty ``adapter_choices``."""
+    from charlie_work import devin_shell
+    from charlie_work.worktree import WorktreeInfo
+
+    def _fake_create_worktree(repo_root, branch, **kwargs):
+        wt = tmp_path / "worktrees" / branch.replace("/", "-")
+        wt.mkdir(parents=True, exist_ok=True)
+        return WorktreeInfo(path=wt, branch=branch, venv_junction=None)
+
+    monkeypatch.setattr(devin_shell, "create_worktree", _fake_create_worktree)
+
+    # api_worker enabled but NO API key set → every complexity:high issue
+    # fails preflight with fallback:auth and routes to devin-shell.
+    # Do NOT set MOONSHOT_API_KEY.
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="devin-shell",
+            shell_command=(sys.executable, "-c", "import sys; sys.exit(0)"),
+        ),
+        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="devin-shell"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = _two_complexity_high_issues_github(config)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.gh.prs[0]["state"] = "CLOSED"
+    result = app.dispatch(limit=2)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 2
+    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
+    assert session_issue_numbers == {123, 124}
+    # Homogeneous batch: both issues fell back to devin-shell. The label must
+    # be "devin-shell", not "mixed" (the #626 bug).
+    assert manifest["adapter"] == "devin-shell"
+    # Instructions text matches the devin-shell adapter, not the mixed
+    # partition text.
+    assert "devin CLI" in " ".join(manifest["instructions"])
+    assert "multiple worker adapters" not in " ".join(manifest["instructions"])
+
+
+def _fake_dispatch_sessions_writing_manifests(
+    manifest_writes: list[str], tmp_path: Path
+) -> Callable[..., list[Any]]:
+    """Build a fake dispatch_sessions that writes manifest+results like the real
+    one, recording the adapter label each call used. This lets a rework test
+    verify the combined trailing write's label without launching workers."""
+
+    def _fake(_repo_root, manifest_path, results_path, settings, requests):
+        from charlie_work.adapters import (
+            SessionDispatchResult,
+            write_session_manifest,
+            write_session_results,
+        )
+
+        write_session_manifest(manifest_path, requests, adapter=settings.adapter)
+        manifest_writes.append(settings.adapter)
+        results = [
+            SessionDispatchResult(
+                issue_number=r.issue_number,
+                issue_title=r.issue_title,
+                prompt_path=str(r.prompt_path),
+                branch_name=r.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=4242,
+                process_start_time=1.0,
+            )
+            for r in requests
+        ]
+        write_session_results(results_path, results)
+        return results
+
+    return _fake
+
+
+def _seed_two_rework_issues(paths, config: Any, *, rescue_issue_numbers: set[int]) -> None:
+    """Seed state with two rework_requested issues (123 normal, 124 rescue-marked)
+    and open PRs, plus rework prompts on disk."""
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {"number": 123, "status": "rework_requested"}
+        state["issues"]["124"] = {"number": 124, "status": "rework_requested"}
+        state["prs"]["456"] = {"number": 456, "issue_number": 123}
+        pr124_fields: dict[str, Any] = {"number": 457, "issue_number": 124}
+        if 124 in rescue_issue_numbers:
+            pr124_fields["rescue_attempted"] = True
+            pr124_fields["rescue_cause"] = "rework_cycle_cap"
+        state["prs"]["457"] = pr124_fields
+        save_state(paths.state_file, state)
+    for pr_num in (456, 457):
+        pr_dir = paths.prs / f"pr-{pr_num}"
+        pr_dir.mkdir(parents=True, exist_ok=True)
+        (pr_dir / "rework-prompt.md").write_text("rework prompt", encoding="utf-8")
+
+
+class _TwoReworkIssuesGitHub(FakeGitHub):
+    """FakeGitHub with two issues (123, 124) and two open PRs (456, 457)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.issues.append(
+            {
+                "number": 124,
+                "title": "Another issue",
+                "url": "https://example.test/issues/124",
+                "body": "Body",
+                "labels": [{"name": "agent:needs-rework"}],
+                "state": "OPEN",
+            }
+        )
+        self.prs.append(
+            {
+                "number": 457,
+                "title": "Fix #124",
+                "url": "https://example.test/pull/457",
+                "headRefName": "agent/issue-124-another-issue",
+                "baseRefName": "main",
+                "headRefOid": "sha-def456",
+                "mergeStateStatus": "CLEAN",
+                "body": "Closes #124",
+                "labels": [],
+                "isCrossRepository": False,
+                "state": "OPEN",
+            }
+        )
+
+
+def test_dispatch_rework_combined_manifest_mixed_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #626: when a rework pass dispatches both a normal issue (via the
+    default adapter ``devin-shell``) and a rescue-marked issue (via the
+    claude-code rescue adapter), the combined manifest's adapter label is
+    ``"mixed"`` — derived from the actual partition, not the default adapter
+    name. Before #626, the trailing write used ``self.config.devin.adapter``
+    unconditionally, mislabeling a mixed batch."""
+    from charlie_work.config import RescueConfig
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _seed_two_rework_issues(paths, config, rescue_issue_numbers={124})
+    fake_gh = _TwoReworkIssuesGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    manifest_writes: list[str] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.dispatch_sessions",
+        _fake_dispatch_sessions_writing_manifests(manifest_writes, tmp_path),
+    )
+
+    result = app.dispatch_rework(limit=5)
+
+    assert result.ok is True
+    # Sub-calls wrote manifests with their own adapter labels; the combined
+    # trailing write is the last manifest write and must be "mixed".
+    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
+    assert session_issue_numbers == {123, 124}
+    assert manifest["adapter"] == "mixed"
+    assert "multiple worker adapters" in " ".join(manifest["instructions"])
+
+
+def test_dispatch_rework_combined_manifest_homogeneous_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #626: when a rework pass dispatches both a normal issue and a
+    rescue-marked issue, but both use the same adapter kind (claude-code),
+    the combined manifest's adapter label is ``"claude-code"`` — not
+    ``"mixed"`` and not the default adapter name.
+
+    The normal issue routes to claude-code via api_worker's fallback_adapter
+    (api preflight fails on missing API key → fallback:auth → claude-code),
+    while the rescue issue uses claude-code via the rescue adapter. Both
+    kinds are ``"claude-code"`` → homogeneous → ``"claude-code"``. Before
+    #626, the trailing write used ``self.config.devin.adapter`` (``"devin-shell"``
+    here) unconditionally, mislabeling the homogeneous batch."""
+    from charlie_work.config import RescueConfig
+
+    # devin.adapter is "devin-shell" but both issues actually use claude-code:
+    # the normal issue falls back to claude-code (fallback_adapter), the
+    # rescue issue uses claude-code (rescue adapter). The old code's trailing
+    # write would label this "devin-shell" (wrong); the fix derives "claude-code"
+    # from the partition.
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        api_worker=_api_worker_config_for_routing(enabled=True, fallback_adapter="claude-code"),
+        rescue=RescueConfig(enabled=True, worker_model="claude-opus-4-1"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _seed_two_rework_issues(paths, config, rescue_issue_numbers={124})
+    fake_gh = _TwoReworkIssuesGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Do NOT set MOONSHOT_API_KEY so the normal issue fails api preflight
+    # (fallback:auth) and routes to the claude-code fallback adapter.
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+
+    manifest_writes: list[str] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.dispatch_sessions",
+        _fake_dispatch_sessions_writing_manifests(manifest_writes, tmp_path),
+    )
+
+    result = app.dispatch_rework(limit=5)
+
+    assert result.ok is True
+    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    session_issue_numbers = {s["issue_number"] for s in manifest["sessions"]}
+    assert session_issue_numbers == {123, 124}
+    # Both normal and rescue use claude-code → homogeneous → "claude-code".
+    assert manifest["adapter"] == "claude-code"
+    assert "multiple worker adapters" not in " ".join(manifest["instructions"])
+
+
+def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #626: when a rework pass has only normal (non-rescue) issues, the
+    trailing combined manifest write is skipped — ``_dispatch_partitioned``
+    already wrote the correct manifest. Before #626, the trailing write was
+    unconditional, writing the manifest twice per pass with the wrong label.
+
+    This test monkeypatches ``write_session_manifest`` in the workflow module
+    (not just ``dispatch_sessions``) so the trailing direct call is counted
+    too — that is the call #626 makes conditional."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    # Only issue 123 (normal), no rescue marker on issue 124's PR.
+    _seed_two_rework_issues(paths, config, rescue_issue_numbers=set())
+    # Remove issue 124's rework state so only 123 is a candidate.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        del state["issues"]["124"]
+        save_state(paths.state_file, state)
+    fake_gh = _TwoReworkIssuesGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Count every write_session_manifest call from the workflow module,
+    # including the trailing combined write that #626 makes conditional.
+    from charlie_work.adapters import write_session_manifest as _real_wsm
+
+    manifest_write_count = 0
+
+    def _counting_write_session_manifest(path, requests, *, adapter="manual"):
+        nonlocal manifest_write_count
+        manifest_write_count += 1
+        return _real_wsm(path, requests, adapter=adapter)
+
+    # Patch write_session_manifest in both modules: workflow.py's trailing
+    # write uses the workflow-module binding, and dispatch_sessions uses the
+    # adapters-module binding.
+    monkeypatch.setattr(
+        "charlie_work.workflow.write_session_manifest",
+        _counting_write_session_manifest,
+    )
+    monkeypatch.setattr(
+        "charlie_work.adapters.write_session_manifest",
+        _counting_write_session_manifest,
+    )
+
+    # Also patch dispatch_sessions to avoid real worker launches, having it
+    # call the counting write_session_manifest like the real one does.
+    def _fake_dispatch_sessions(_repo_root, manifest_path, results_path, settings, requests):
+        from charlie_work.adapters import SessionDispatchResult, write_session_results
+
+        _counting_write_session_manifest(manifest_path, requests, adapter=settings.adapter)
+        results = [
+            SessionDispatchResult(
+                issue_number=r.issue_number,
+                issue_title=r.issue_title,
+                prompt_path=str(r.prompt_path),
+                branch_name=r.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=4242,
+                process_start_time=1.0,
+            )
+            for r in requests
+        ]
+        write_session_results(results_path, results)
+        return results
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
+
+    result = app.dispatch_rework(limit=5)
+
+    assert result.ok is True
+    # With the fix: one write from dispatch_sessions inside
+    # _dispatch_partitioned. The trailing combined write is skipped because
+    # rescue_requests is empty. Before #626, this was 2 (the trailing write
+    # was unconditional).
+    assert manifest_write_count == 1
+    manifest_path = tmp_path / ".var" / "charlie-work" / "dispatches" / "session-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["adapter"] == "devin-shell"
 
 
 def _two_complexity_high_issues_github(config: Any) -> Any:
