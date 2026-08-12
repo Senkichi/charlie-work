@@ -1056,12 +1056,22 @@ class GitHub:
             return result.value if result.ok and isinstance(result.value, list) else []
         return result if isinstance(result, list) else []
 
-    def commit(self, sha: str) -> dict[str, Any] | None:
+    def commit(self, sha: str) -> GitHubRunResult:
         """Fetch a single commit's metadata by SHA.
 
-        Wraps ``gh api repos/{owner}/{repo}/commits/{sha}``. Returns the parsed
-        JSON response, including ``parents`` and ``committer``/``commit.committer``,
-        or ``None`` on failure. Errors are returned as values, never raised.
+        Wraps ``gh api repos/{owner}/{repo}/commits/{sha}``. Returns a
+        ``GitHubRunResult`` whose ``value`` is the parsed JSON response
+        (including ``parents`` and ``committer``/``commit.committer``) on
+        success, or ``None`` with ``error`` set on failure. Errors are
+        returned as values, never raised.
+
+        Callers that only want the dict can use
+        ``result.value if result.ok and isinstance(result.value, dict) else None``;
+        callers that need the failure reason (e.g. for event payloads, issue
+        #1140) read ``result.error``. Returning the full ``GitHubRunResult``
+        rather than collapsing to ``None`` preserves the transport/API error
+        (TLS blip vs rate limit vs auth vs 404) at the boundary that most
+        needs it, consistent with this repo's errors-as-values invariant.
         """
         result = self.run(
             ["api", f"repos/{{owner}}/{{repo}}/commits/{sha}"],
@@ -1069,8 +1079,22 @@ class GitHub:
             allow_failure=True,
         )
         if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, dict) else None
-        return result if isinstance(result, dict) else None
+            return result
+        # Dry-run short-circuit or an unexpected double that returned a raw
+        # value instead of a GitHubRunResult. Normalize so the contract is
+        # uniform -- callers never need to branch on the return type.
+        if isinstance(result, dict):
+            return GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=result
+            )
+        return GitHubRunResult(
+            ok=False,
+            returncode=0,
+            stdout="",
+            stderr="",
+            value=None,
+            error=f"unexpected response from gh.run: {type(result).__name__}",
+        )
 
     def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
         """Fetch the GitHub Check Runs attached to a commit SHA.
@@ -1809,7 +1833,7 @@ class GitHubLike(Protocol):
 
     def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]: ...
 
-    def commit(self, sha: str) -> dict[str, Any] | None: ...
+    def commit(self, sha: str) -> GitHubRunResult: ...
 
     def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None: ...
 

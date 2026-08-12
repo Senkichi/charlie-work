@@ -58,11 +58,17 @@ class FakeGh:
     main_ci_reclaim.py calls. Always returns ``GitHubRunResult`` for
     ``allow_failure=True`` calls, matching the real ``GitHub.run()``'s
     contract exactly (the module under test always passes
-    ``allow_failure=True``).
+    ``allow_failure=True``). ``commit()`` also returns ``GitHubRunResult``
+    to match the real ``GitHub.commit()`` contract (issue #1140): callers
+    read ``.value`` for the dict and ``.error`` for the failure reason.
     """
 
     dry_run: bool = False
     tip_commits: dict[str, dict[str, Any] | None] = field(default_factory=dict)
+    # branch -> error string to simulate a failed commit lookup. When set,
+    # ``commit()`` returns a ``GitHubRunResult`` with ``ok=False`` and this
+    # error, modeling a gh outage (TLS blip, rate limit, auth failure, etc.).
+    tip_commit_errors: dict[str, str] = field(default_factory=dict)
     workflow_runs: list[dict[str, Any]] = field(default_factory=list)
     # run_id -> status to report on the pre-cancel re-fetch. Defaults to the
     # same status as in workflow_runs (no drift between list and re-fetch)
@@ -74,8 +80,29 @@ class FakeGh:
     list_calls: int = 0
     refetch_calls: list[int] = field(default_factory=list)
 
-    def commit(self, sha: str) -> dict[str, Any] | None:
-        return self.tip_commits.get(sha)
+    def commit(self, sha: str) -> GitHubRunResult:
+        if sha in self.tip_commit_errors:
+            return GitHubRunResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr=self.tip_commit_errors[sha],
+                value=None,
+                error=self.tip_commit_errors[sha],
+            )
+        commit = self.tip_commits.get(sha)
+        if not isinstance(commit, dict):
+            return GitHubRunResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="",
+                value=None,
+                error=f"commit {sha} not found",
+            )
+        return GitHubRunResult(
+            ok=True, returncode=0, stdout="", stderr="", value=commit
+        )
 
     def run(
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
@@ -300,6 +327,31 @@ def test_reclaim_fails_safe_when_tip_resolution_fails(
     result = reclaim_superseded_main_ci_runs(gh, repo_root)
     assert result.ok is False
     assert result.error is not None and "tip" in result.error
+    assert gh.list_calls == 0
+    assert gh.cancel_calls == []
+
+
+def test_reclaim_tip_resolution_failure_carries_underlying_gh_error(
+    repo_with_history: tuple[Path, str, str, str, str],
+) -> None:
+    """Issue #1140: when ``gh.commit()`` fails, the pass-level error must
+    include the underlying gh error string (TLS blip, rate limit, auth
+    failure, ...) -- not just a fixed 'failed to resolve' message. Without
+    this, a ``main_ci_reclaim_failed`` event during a GitHub-side outage
+    cannot say *why* resolution failed, and attribution requires manual
+    timestamp correlation against a separate probe."""
+    repo_root, _c1, _c2, _c3, _d1 = repo_with_history
+    gh = FakeGh(
+        tip_commit_errors={
+            "main": "TLS handshake timeout (x509: certificate signed by unknown authority)"
+        }
+    )
+    result = reclaim_superseded_main_ci_runs(gh, repo_root)
+    assert result.ok is False
+    assert result.error is not None
+    assert "tip" in result.error
+    assert "TLS handshake timeout" in result.error
+    assert "certificate signed by unknown authority" in result.error
     assert gh.list_calls == 0
     assert gh.cancel_calls == []
 

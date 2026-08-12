@@ -193,11 +193,24 @@ def reclaim_superseded_main_ci_runs(
             error=f"git fetch origin {default_branch} failed: {fetch_result.error or fetch_result.stderr}",
         )
 
-    tip_commit = gh.commit(default_branch)
+    tip_result = gh.commit(default_branch)
+    if isinstance(tip_result, GitHubRunResult):
+        tip_commit = tip_result.value if tip_result.ok and isinstance(tip_result.value, dict) else None
+        tip_error = tip_result.error
+    elif isinstance(tip_result, dict):
+        # Defensive: a non-GitHubRunResult dict (e.g. from a dry-run double
+        # that short-circuits to a raw value). Preserve the value, no error.
+        tip_commit = tip_result
+        tip_error = None
+    else:
+        tip_commit = None
+        tip_error = f"unexpected response type {type(tip_result).__name__}"
     tip_sha = tip_commit.get("sha") if isinstance(tip_commit, dict) else None
     if not isinstance(tip_sha, str) or not tip_sha:
         return MainCiReclaimResult(
-            ok=False, error=f"failed to resolve current tip sha for {default_branch}"
+            ok=False,
+            error=f"failed to resolve current tip sha for {default_branch}"
+            f": {tip_error or 'no sha in response'}",
         )
     if not _object_exists(repo_root, tip_sha):
         return MainCiReclaimResult(
