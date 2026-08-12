@@ -13150,6 +13150,22 @@ class OrchestratorApp:
         merge: bool | None = None,
         merge_train_head: int | None = None,
     ) -> CommandResult:
+        # Issue #614: dry-run short-circuit. Under --dry-run the GitHub
+        # client's synthetic stubs make ``merge_pr`` / ``add_pr_label`` appear
+        # to succeed without raising, which the real path below interprets as
+        # proof of a merge and durably records to state.json — stranding the PR
+        # in a terminal "merged" or "mergequeue" status that never actually
+        # happened. The gate must sit above the ``state_lock`` (the idempotency
+        # short-circuit below conditionally writes) and return the computed
+        # readiness verdict without persisting, mirroring ``_dispatch_impl``'s
+        # dry-run gate. Gating lower — after the idempotency block but before
+        # the merge — would drop into the shared failed-attempt-alarm block
+        # and increment ``consecutive_failed_merge_attempts``, advancing the
+        # state machine instead of merely previewing it.
+        if self.dry_run:
+            return self._merge_ready_dry_run(
+                pr_number, merge=merge, merge_train_head=merge_train_head
+            )
         # Idempotence: if state already records this PR as merged, short-circuit
         # to a success no-op. Re-running `ship-it` on a completed PR must not
         # re-attempt `gh pr merge` (which fails on an already-merged PR and
@@ -14218,6 +14234,284 @@ class OrchestratorApp:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
         return CommandResult(
             not (checks_unavailable or merge_hold_check_unavailable), message, data
+        )
+
+    def _merge_ready_dry_run(
+        self,
+        pr_number: int,
+        *,
+        merge: bool | None = None,
+        merge_train_head: int | None = None,
+    ) -> CommandResult:
+        """Dry-run readiness evaluation for ``merge_ready`` (issue #614).
+
+        Mirrors the read-only prefix of :meth:`merge_ready` — fetching the PR,
+        review decision, checks, diff, and computing ``can_merge`` — but skips
+        every state write, label transition, branch update, merge, and
+        mergequeue label add.  Returns the computed readiness verdict so a
+        preview can report what *would* happen without fabricating a merge or
+        stranding the PR in a terminal state.
+
+        The gate in :meth:`merge_ready` sits above its ``state_lock`` (the
+        idempotency short-circuit conditionally writes) and touches nothing,
+        mirroring ``_dispatch_impl``'s dry-run gate.  Gating lower would drop
+        into the shared failed-attempt-alarm block and increment
+        ``consecutive_failed_merge_attempts``, advancing the state machine
+        instead of merely previewing it.
+        """
+        # Read-only state snapshot — dry-run never writes, so no lock is
+        # needed.  The idempotency short-circuit's conditional merge_alert
+        # clear is a write and is skipped; the verdict is still accurate
+        # because "already merged" is a read-only fact.
+        state = load_state(self.paths.state_file)
+        existing_pr_state = state["prs"].get(str(pr_number), {})
+        if existing_pr_state.get("status") == "merged":
+            return CommandResult(
+                True,
+                f"PR #{pr_number} already merged",
+                {
+                    "pr": pr_number,
+                    "issue": existing_pr_state.get("issue_number"),
+                    "already_merged": True,
+                    "merged": True,
+                    "dry_run": True,
+                },
+            )
+
+        pr = self.gh.pr_view(pr_number)
+        if not pr:
+            return CommandResult(False, f"PR #{pr_number} was not found", {})
+
+        issue_number = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=self.config.dispatch.branch_prefix,
+        )
+        decision = self._review_decision(pr_number)
+        approved = decision.get("decision") == "approved"
+        sync_failed = False
+        merge_conflict = False
+        cross_pr_revert_detected = False
+        cross_pr_revert_reason: str | None = None
+
+        if approved:
+            reviewed_head_sha = decision.get("reviewed_head_sha")
+            live_head_sha = pr.get("headRefOid")
+            head_moved = reviewed_head_sha is None or live_head_sha != reviewed_head_sha
+            if head_moved and live_head_sha:
+                check = self._check_carry_forward(pr_number, decision)
+                if not check.carry_forward:
+                    # Under dry-run the head-moved re-review transition
+                    # (state write + label transition) is skipped; return the
+                    # verdict without persisting.
+                    return CommandResult(
+                        False,
+                        "PR head moved since approval — re-review required",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "can_merge": False,
+                            "merged": False,
+                            "head_moved": True,
+                            "reviewed_head_sha": reviewed_head_sha,
+                            "live_head_sha": live_head_sha,
+                            "review_decision": decision,
+                            "dry_run": True,
+                        },
+                    )
+                # Carry-forward would apply; continue with read-only checks.
+                # The approval-head write (_update_approval_head) is skipped
+                # under dry-run, so reviewed_head_sha stays stale — but
+                # ``approved`` is still True and ``can_merge`` depends on
+                # checks/sync_failed, not on the head SHA directly.
+
+            # Genuine merge conflict detection (read-only).
+            if self._is_merge_conflict(pr):
+                merge_conflict = True
+                sync_failed = True
+
+            update_branch_strategy = self.config.auto_merge.update_branch_strategy
+            if update_branch_strategy == "front_of_train":
+                if merge_train_head is not None and merge_train_head != pr_number:
+                    return self._merge_not_ready_result(
+                        pr_number, issue_number, decision, existing_pr_state
+                    )
+                if merge_train_head is None:
+                    try:
+                        prs = self.gh.pr_list()
+                    except GitHubError:
+                        sync_failed = True
+                    else:
+                        head = self._merge_train_head(prs)
+                        if head is not None and head != pr_number:
+                            return self._merge_not_ready_result(
+                                pr_number, issue_number, decision, existing_pr_state
+                            )
+
+            # Base freshness check (read-only). The ``pr_update_branch`` WRITE
+            # is skipped under dry-run; if the base is stale, report the
+            # deferral without persisting the counter increment or event.
+            if not sync_failed and update_branch_strategy != "off":
+                base_currency_gated = self._is_base_currency_gated(
+                    pr.get("baseRefName") or self.config.runners.default_branch
+                )
+                if base_currency_gated and update_branch_strategy in {
+                    "front_of_train",
+                    "broadcast",
+                }:
+                    base_current = self._is_base_current(pr)
+                    if base_current is not True:
+                        return CommandResult(
+                            True,
+                            f"PR #{pr_number} base is stale; merge deferred until base is current",
+                            {
+                                "pr": pr_number,
+                                "issue": issue_number,
+                                "can_merge": False,
+                                "auto_merge_enabled": self.config.auto_merge.enabled,
+                                "merged": False,
+                                "merge_output": None,
+                                "branch_deleted": None,
+                                "review_decision": decision,
+                                "checks": asdict(
+                                    summarize_checks([], self.config.auto_merge.required_checks)
+                                ),
+                                "checks_unavailable": False,
+                                "label_error": None,
+                                "update_open_prs_results": None,
+                                "cancel_superseded_runs_results": None,
+                                "containment_warnings": [],
+                                "stale_base": True,
+                                "consecutive_failed_merge_attempts": (
+                                    existing_pr_state.get("consecutive_failed_merge_attempts", 0)
+                                ),
+                                "consecutive_stale_base_deferrals": (
+                                    existing_pr_state.get("consecutive_stale_base_deferrals", 0)
+                                ),
+                                "merge_attempt_alarm": False,
+                                "merge_attempt_warning": None,
+                                "merge_conflict": False,
+                                "dry_run": True,
+                            },
+                        )
+
+            # Cross-PR revert detection (read-only). The rework routing write
+            # is skipped under dry-run.
+            if not sync_failed:
+                cross_pr_revert_reason = detect_cross_pr_revert(pr, self.repo_root)
+                if cross_pr_revert_reason:
+                    cross_pr_revert_detected = True
+                    sync_failed = True
+
+        checks = self.gh.pr_checks(pr_number)
+        checks_unavailable = checks is None
+
+        if checks_unavailable:
+            summary = summarize_checks(None, self.config.auto_merge.required_checks)
+            enriched_checks: list[dict[str, Any]] = []
+        else:
+            # Enrich check data with infrastructure failure detection — same
+            # read-only logic as the real path (issue #210).
+            enriched_checks = []
+            for check in checks:
+                check_state = str(check.get("state") or "").upper()
+                if check_state == "FAILURE":
+                    check_run_id = check.get("databaseId")
+                    if check_run_id and isinstance(check_run_id, int):
+                        job = self.gh.actions_job(check_run_id)
+                        annotations = self.gh.check_run_annotations(check_run_id)
+                        if job and is_infrastructure_failure(job, annotations):
+                            check = {**check, "state": "INFRA_FAILURE"}
+                enriched_checks.append(check)
+            summary = summarize_checks(enriched_checks, self.config.auto_merge.required_checks)
+
+        diff = self.gh.pr_diff(pr_number)
+        containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
+
+        can_merge = (
+            summary.ready
+            and (approved or not self.config.auto_merge.require_approved_review)
+            and not sync_failed
+        )
+        should_merge = self.config.auto_merge.enabled if merge is None else merge
+        mergequeue_label = self.config.auto_merge.mergequeue_label
+
+        # Read-only merge-hold check (same condition as the real path).
+        merge_hold = False
+        merge_hold_check_unavailable = False
+        if can_merge and should_merge:
+            merge_hold = self.config.labels.merge_hold in label_names(pr)
+            if not merge_hold and issue_number is not None:
+                try:
+                    issue = self.gh.issue_view(issue_number)
+                except (GitHubError, ValueError):
+                    merge_hold_check_unavailable = True
+                    issue = None
+                if not merge_hold_check_unavailable and (
+                    not isinstance(issue, dict) or "labels" not in issue
+                ):
+                    merge_hold_check_unavailable = True
+                    issue = None
+                if not merge_hold_check_unavailable:
+                    issue_labels = label_names(issue) if issue else set()
+                    merge_hold = self.config.labels.merge_hold in issue_labels
+
+        # Describe what *would* happen so the preview is actionable.
+        message = "dry-run: merge readiness evaluated"
+        if can_merge and should_merge and not merge_hold:
+            if mergequeue_label:
+                message += f" (would hand off to mergequeue label {mergequeue_label!r})"
+            else:
+                message += " (would merge)"
+        elif merge_hold:
+            message += (
+                f" (merge-hold label {self.config.labels.merge_hold!r} present"
+                f" — would be left alone)"
+            )
+        elif merge_conflict:
+            message += " (merge conflict — would route to rework on threshold)"
+        elif cross_pr_revert_detected:
+            message += f" (cross-PR revert: {cross_pr_revert_reason})"
+        elif checks_unavailable:
+            message = "dry-run: checks unavailable (gh failure)"
+        elif merge_hold_check_unavailable:
+            message += f" (merge-hold check unavailable for issue #{issue_number})"
+
+        return CommandResult(
+            not (checks_unavailable or merge_hold_check_unavailable),
+            message,
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "can_merge": can_merge,
+                "auto_merge_enabled": self.config.auto_merge.enabled,
+                "merged": False,
+                "merge_output": None,
+                "branch_deleted": None,
+                "review_decision": decision,
+                "checks": asdict(summary),
+                "checks_unavailable": checks_unavailable,
+                "label_error": None,
+                "update_open_prs_results": None,
+                "cancel_superseded_runs_results": None,
+                "containment_warnings": list(containment_warnings),
+                "consecutive_failed_merge_attempts": existing_pr_state.get(
+                    "consecutive_failed_merge_attempts", 0
+                ),
+                "consecutive_stale_base_deferrals": existing_pr_state.get(
+                    "consecutive_stale_base_deferrals", 0
+                ),
+                "merge_attempt_alarm": False,
+                "merge_attempt_warning": None,
+                "merge_conflict": merge_conflict,
+                "cross_pr_revert_detected": cross_pr_revert_detected,
+                "cross_pr_revert_reason": cross_pr_revert_reason,
+                "cross_pr_revert_routed": False,
+                "mergequeue_label_applied": None,
+                "merge_hold": merge_hold,
+                "merge_hold_check_unavailable": merge_hold_check_unavailable,
+                "dry_run": True,
+            },
         )
 
     @_guard_state_lock
