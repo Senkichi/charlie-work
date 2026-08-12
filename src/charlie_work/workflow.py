@@ -18950,6 +18950,182 @@ class OrchestratorApp:
                     data,
                 )
 
+        # Dry-run: read-only planning — compute selection and would-be
+        # SessionRequests, but skip all state writes, label transitions,
+        # escalations, review routing, and worker launches. Mirrors
+        # _dispatch_impl's dry-run branch. Without this, the fabricated
+        # _dry_run_result objects (adapters.py, ok=True for every request)
+        # are consumed as ground truth: issues marked "dispatched" with real
+        # dispatched_at, redispatch_at counters advanced, orphan flags
+        # cleared, and auto-escalation at the redispatch cap — all on zero
+        # actual work (issue #616). The no-op-rework and worker-death
+        # escalation paths also write state + transition GitHub labels, and
+        # the review-routing path calls self.review() which writes state;
+        # all are skipped here.
+        if self.dry_run:
+            dry_candidates = [
+                issue for issue in rework_issues if int(issue["number"]) in pr_by_issue
+            ]
+
+            # Head-check filtering (read-only): identify candidates that
+            # would be routed to review or escalated, but do NOT perform the
+            # routing or escalation — both write state and transition GitHub
+            # labels.
+            dry_head_check_state = load_state_locked(self.paths.state_file)
+            dry_routed_to_review: list[int] = []
+            dry_head_indeterminate: list[int] = []
+            dry_no_op_rework_escalated: list[int] = []
+            dry_worker_death_escalated: list[int] = []
+            dry_filtered_candidates: list[dict[str, Any]] = []
+            for issue in dry_candidates:
+                issue_number = int(issue["number"])
+                pr_data = pr_by_issue[issue_number]
+                pr_number = int(pr_data["number"])
+                live_head_sha = pr_data.get("headRefOid")
+                pr_state = dry_head_check_state.get("prs", {}).get(str(pr_number), {})
+                reviewed_head_sha = pr_state.get("reviewed_head_sha")
+
+                if not reviewed_head_sha:
+                    dry_filtered_candidates.append(issue)
+                    continue
+                if not live_head_sha:
+                    dry_head_indeterminate.append(issue_number)
+                    continue
+                if live_head_sha == reviewed_head_sha:
+                    issue_entry = dry_head_check_state.get("issues", {}).get(str(issue_number), {})
+                    if isinstance(issue_entry, dict):
+                        prior_redispatch = _windowed_redispatch_at(
+                            issue_entry,
+                            window_minutes=self.config.watchdog.redispatch_window_minutes,
+                        )
+                        prior_deaths = _windowed_worker_death_at(
+                            issue_entry,
+                            window_minutes=self.config.watchdog.redispatch_window_minutes,
+                        )
+                        no_op_count = max(0, len(prior_redispatch) - len(prior_deaths))
+                        if no_op_count >= self.config.watchdog.max_auto_redispatch:
+                            dry_no_op_rework_escalated.append(issue_number)
+                            continue
+                        if len(prior_deaths) >= self.config.watchdog.max_auto_redispatch:
+                            dry_worker_death_escalated.append(issue_number)
+                            continue
+                    dry_filtered_candidates.append(issue)
+                    continue
+
+                reviewed_patch_id = pr_state.get("reviewed_patch_id")
+                diff = self.gh.pr_diff(pr_number)
+                live_patch_id = _calculate_patch_id(diff) if diff else ""
+                if not reviewed_patch_id or not live_patch_id:
+                    dry_head_indeterminate.append(issue_number)
+                    continue
+                if live_patch_id == reviewed_patch_id:
+                    dry_filtered_candidates.append(issue)
+                    continue
+                dry_routed_to_review.append(issue_number)
+
+            dry_candidates = dry_filtered_candidates
+
+            # Apply only_issues filter and concurrency cap (read-only)
+            if only_issues:
+                wanted = parse_issue_numbers(only_issues)
+                by_number = {int(issue["number"]): issue for issue in dry_candidates}
+                dry_selected = [by_number[number] for number in wanted if number in by_number]
+                if len(dry_selected) > rework_limit:
+                    dry_deferred_by_concurrency = [
+                        int(issue["number"]) for issue in dry_selected[rework_limit:]
+                    ]
+                    dry_selected = dry_selected[:rework_limit]
+                else:
+                    dry_deferred_by_concurrency = []
+            else:
+                dry_selected = dry_candidates[:rework_limit]
+                dry_deferred_by_concurrency = []
+
+            # Compute would-be SessionRequests without state mutation, label
+            # transitions, or worker launches. Rework-prompt re-rendering
+            # (which writes files) is skipped; the existing on-disk prompt
+            # is used as-is for the planning report.
+            dry_session_requests: list[SessionRequest] = []
+            dry_skipped_issue_numbers: list[int] = []
+            dry_missing_prompt_failures: dict[int, str] = {}
+            dry_adapter_choices: dict[int, AdapterChoice] = {}
+            dry_api_enabled = self.config.api_worker.enabled
+            dry_routing_inputs = self._routing_inputs() if dry_api_enabled else None
+            dry_rescue_issue_numbers: set[int] = set()
+            for issue in dry_selected:
+                issue_number = int(issue["number"])
+                full_issue = self.gh.issue_view(issue_number)
+                pr = pr_by_issue[issue_number]
+                pr_number = int(pr["number"])
+                branch_name = pr.get("headRefName", "")
+                rework_prompt_path = self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
+                if not rework_prompt_path.exists():
+                    dry_skipped_issue_numbers.append(issue_number)
+                    dry_missing_prompt_failures[issue_number] = (
+                        f"missing rework prompt: {rework_prompt_path}"
+                    )
+                    continue
+                pr_state_for_rescue = dry_head_check_state.get("prs", {}).get(str(pr_number), {})
+                if pr_state_for_rescue.get("rescue_attempted"):
+                    dry_rescue_issue_numbers.add(issue_number)
+                else:
+                    if dry_api_enabled and dry_routing_inputs is not None:
+                        issue_labels = {label["name"] for label in full_issue.get("labels", [])}
+                        choice = self._select_adapter_for_issue(
+                            rework=True,
+                            issue_labels=issue_labels,
+                            routing_inputs=dry_routing_inputs,
+                        )
+                        dry_adapter_choices[issue_number] = choice
+                dry_session_requests.append(
+                    SessionRequest(
+                        issue_number=issue_number,
+                        issue_title=str(full_issue.get("title") or ""),
+                        prompt_path=rework_prompt_path,
+                        branch_name=branch_name,
+                        rework=True,
+                    )
+                )
+
+            data = {
+                "adapter": self.config.devin.adapter,
+                "selected_count": len(dry_session_requests),
+                "attempted_count": len(dry_session_requests),
+                "failed_count": 0,
+                "failures": _build_failure_map(
+                    [],
+                    set(),
+                    dry_deferred_by_concurrency,
+                    rework_limit,
+                    extra_failures=dry_missing_prompt_failures,
+                ),
+                "deferred_by_concurrency": dry_deferred_by_concurrency,
+                "skipped_issue_numbers": sorted(dry_skipped_issue_numbers),
+                "sessions": [asdict(request) for request in dry_session_requests],
+                "adapter_choices": {
+                    str(n): {
+                        "kind": c.kind,
+                        "provider": c.provider,
+                        "reason": c.reason,
+                    }
+                    for n, c in sorted(dry_adapter_choices.items())
+                },
+                "dispatch_results": [],
+                "routed_to_review": sorted(dry_routed_to_review),
+                "skipped_head_indeterminate": sorted(dry_head_indeterminate),
+                "operator_claimed_skipped": sorted(operator_claimed_skipped),
+                "no_op_rework_escalated": sorted(dry_no_op_rework_escalated),
+                "worker_death_escalated": sorted(dry_worker_death_escalated),
+                "rescue_issue_numbers": sorted(dry_rescue_issue_numbers),
+            }
+            if gov.enabled or gov.fleet_enabled:
+                data.update(gov.report_fields())
+            return CommandResult(
+                True,
+                f"dry-run: would dispatch rework for {len(dry_session_requests)} issue(s)",
+                data,
+            )
+
         # pr_list() returns only open PRs by contract (--state open); its field
         # list does not include "state", so no per-PR state check here.
         # rework_issues already contains only issues with an open PR (the
