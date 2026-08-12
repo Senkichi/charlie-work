@@ -2112,6 +2112,29 @@ def _is_permanent_no_match_error(error: str | None) -> bool:
     return any(error.startswith(prefix) for prefix in _PERMANENT_NO_MATCH_ERROR_PREFIXES)
 
 
+def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorConfig) -> str | None:
+    """Extract the recorded worker adapter kind from a recovery record.
+
+    Returns the most recent ``adapter_history`` entry's ``kind`` (written by
+    ``routing.record_adapter_choice`` when api routing is enabled), falling
+    back to ``config.devin.adapter`` when no history is recorded (api routing
+    disabled — every worker uses the repo default adapter). Returns ``None``
+    only when neither source yields a usable string, which causes
+    ``real_activity_for_worker`` to consult all sources as before (issue #639).
+    """
+    history = recovery.get("adapter_history")
+    if isinstance(history, list) and history:
+        latest = history[-1]
+        if isinstance(latest, dict):
+            kind = latest.get("kind")
+            if isinstance(kind, str) and kind:
+                return kind
+    default = config.devin.adapter
+    if isinstance(default, str) and default:
+        return default
+    return None
+
+
 def _probe_recovery_liveness(
     recovery: dict[str, Any],
     worktree_path: Path,
@@ -2178,11 +2201,17 @@ def _probe_recovery_liveness(
 
     # For devin-shell sessions, the real-activity probe (sessions.db +
     # per-PID Devin log) is the source of truth even when the wrapper PID is
-    # gone or has been recycled.
+    # gone or has been recycled. The probe's Devin sources are skipped for
+    # non-Devin workers (issue #639): a claude-code/api worker has no
+    # sessions.db rows or per-PID Devin logs by construction, so consulting
+    # them would produce permanent "no session found" / "no pid" errors that
+    # block recovery forever — "no Devin subject exists" is not "subject
+    # exists but could not be read".
     if resolved_config.devin.adapter == "devin-shell":
         started_at = recovery.get("started_at") or recovery.get("dispatched_at") or ""
         pm_config = resolved_config.post_mortem
         now = datetime.now(UTC)
+        worker_kind = _worker_kind_from_recovery(recovery, resolved_config)
         try:
             probe = real_activity_for_worker(
                 pm_config,
@@ -2190,6 +2219,7 @@ def _probe_recovery_liveness(
                 started_at,
                 worker_pid,
                 now,
+                worker_kind=worker_kind,
             )
         except Exception:
             # The probe is best-effort; never let it crash the recovery path.

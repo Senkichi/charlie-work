@@ -1131,6 +1131,20 @@ class WatchdogConfig:
     worktree_mtime_threshold_minutes: int = 45
     worktree_mtime_max_depth: int = 4
     worktree_mtime_exclude_dirs: tuple[str, ...] = (".git", ".venv")
+    # Issue #654: time-based escape for a dead dispatched worker whose drift
+    # was surfaced by ``_detect_and_handle_orphaned_workers`` but whose PR
+    # state did not qualify for auto-reset (clean exit with no push, a non-
+    # request_changes decision, a head change without a review callback, ...).
+    # Without this, the dispatch label holds indefinitely -- the label only
+    # clears when a worker that no longer exists reports back, and there is no
+    # time-based escape. After this many minutes since the drift was first
+    # surfaced (``orphan_drift_at``), the issue is escalated to
+    # ``agent:human-needed`` so a human can inspect the worktree for unpushed
+    # commits. 0 disables the time-based escape (reverts to the pre-#654
+    # hold-forever behavior). The default (60) matches the "1+ hour" window
+    # in the issue title, which is trivially distinguishable from a
+    # legitimately long worker session.
+    dead_dispatched_reap_minutes: int = 60
 
 
 @dataclass(frozen=True)

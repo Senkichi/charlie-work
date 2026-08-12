@@ -1607,6 +1607,168 @@ def test_find_matching_session_suffix_fallback_rejects_different_issue_slug(
     assert db_source.error is not None
 
 
+# ---------------------------------------------------------------------------
+# Issue #639: worker_kind skips Devin sources for non-Devin workers
+# ---------------------------------------------------------------------------
+
+
+def test_real_activity_for_worker_skips_devin_sources_for_non_devin_kind(
+    tmp_path: Path,
+) -> None:
+    """Issue #639: when ``worker_kind`` is a non-Devin adapter (claude-code,
+    api, manual, command), the Devin-specific sources (sessions.db and
+    per-PID Devin log) are skipped entirely — a non-Devin worker has no
+    Devin subject to look up. The probe must not contain those sources at
+    all, so no permanent "no session found" / "no pid" errors are produced.
+    """
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        "C:/repo/.var/worktrees/issue-42",
+        "2026-07-11T11:55:00+00:00",
+        12345,
+        now,
+        worker_kind="claude-code",
+    )
+
+    # No Devin sources at all — they were skipped.
+    source_names = {s.name for s in probe.sources}
+    assert "sessions.db" not in source_names
+    assert "devin_per_pid_log" not in source_names
+    # No errored sources (the Devin sources that would have errored are absent).
+    assert all(s.error is None for s in probe.sources)
+
+
+def test_real_activity_for_worker_skips_devin_sources_for_api_kind(
+    tmp_path: Path,
+) -> None:
+    """Issue #639: ``api``-routed workers (which delegate to claude-code) also
+    have no Devin subject. The Devin sources must be skipped for
+    ``worker_kind="api"`` just as for ``"claude-code"``.
+    """
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        "C:/repo/.var/worktrees/issue-42",
+        "2026-07-11T11:55:00+00:00",
+        12345,
+        now,
+        worker_kind="api",
+    )
+
+    source_names = {s.name for s in probe.sources}
+    assert "sessions.db" not in source_names
+    assert "devin_per_pid_log" not in source_names
+
+
+def test_real_activity_for_worker_consults_devin_sources_for_devin_shell(
+    tmp_path: Path,
+) -> None:
+    """Issue #639 regression guard: ``worker_kind="devin-shell"`` must still
+    consult the Devin sources. The skip only applies to non-Devin kinds.
+    """
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        "C:/repo/.var/worktrees/issue-42",
+        "2026-07-11T11:55:00+00:00",
+        12345,
+        now,
+        worker_kind="devin-shell",
+    )
+
+    source_names = {s.name for s in probe.sources}
+    assert "sessions.db" in source_names
+    assert "devin_per_pid_log" in source_names
+    # sessions.db matched and has a fresh timestamp.
+    assert probe.latest_source == "sessions.db"
+
+
+def test_real_activity_for_worker_consults_devin_sources_for_devin_view_kind(
+    tmp_path: Path,
+) -> None:
+    """Issue #639: the ``WorkerView.adapter_kind`` convention uses
+    ``"devin"`` (not ``"devin-shell"``). Both must be recognized as Devin
+    kinds so the watchdog's ``real_activity_probe_for`` wrapper — which passes
+    ``view.adapter_kind`` — does not accidentally skip Devin sources for
+    Devin-shell workers.
+    """
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        "C:/repo/.var/worktrees/issue-42",
+        "2026-07-11T11:55:00+00:00",
+        12345,
+        now,
+        worker_kind="devin",
+    )
+
+    source_names = {s.name for s in probe.sources}
+    assert "sessions.db" in source_names
+    assert "devin_per_pid_log" in source_names
+
+
+def test_real_activity_for_worker_consults_all_sources_when_kind_unknown(
+    tmp_path: Path,
+) -> None:
+    """Issue #639: ``worker_kind=None`` (unknown) preserves the pre-#639
+    behavior — all sources are consulted. This is the backward-compatibility
+    path for callers that have not been updated to pass ``worker_kind``.
+    """
+    db_path = tmp_path / "sessions.db"
+    _build_sessions_db(
+        db_path,
+        working_directory="C:/repo/.var/worktrees/issue-42",
+        nodes=[("assistant", "working", "2026-07-11T11:57:00")],
+    )
+    config = _config_with_db(db_path)
+    now = datetime(2026, 7, 11, 12, 0, 0, tzinfo=UTC)
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        "C:/repo/.var/worktrees/issue-42",
+        "2026-07-11T11:55:00+00:00",
+        12345,
+        now,
+    )
+
+    source_names = {s.name for s in probe.sources}
+    assert "sessions.db" in source_names
+    assert "devin_per_pid_log" in source_names
+
+
 def test_find_matching_session_suffix_fallback_requires_parent_segment_match(
     tmp_path: Path,
 ) -> None:

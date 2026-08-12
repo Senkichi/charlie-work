@@ -37986,6 +37986,287 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     assert payload["duration_seconds"] == 300.0
 
 
+def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> None:
+    """Issue #654: a dead dispatched worker whose drift was already surfaced on
+    a prior pass (``orphan_drift_at`` set) but whose PR state did not qualify
+    for auto-reset (clean exit with no push -- the #773 no-op branch) must be
+    escalated to ``agent:human-needed`` after ``dead_dispatched_reap_minutes``,
+    not held in ``dispatched`` indefinitely.  This is the exact scenario from
+    job-cannon #1408: the rework worker made 5 local commits, exited 0 without
+    pushing, and the dispatch label held for 1+ hour because the #773 branch
+    surfaces drift but never resets status or clears the label.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Simulate the "second pass" state: the first pass already emitted drift
+    # (dead_worker_clean_exit_no_op) and set orphan_drift_at.  The drift
+    # fingerprint matches the #773 clean-exit branch so the specific sub-branch
+    # would short-circuit to ``continue`` without this fix.
+    old_drift_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    fingerprint = json.dumps(
+        {"reason": "dead_worker_clean_exit_no_op", "reviewed_head_sha": "abc123"},
+        sort_keys=True,
+        default=str,
+    )
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "orphan_drift_at": old_drift_at,
+        "orphan_drift_fingerprint": fingerprint,
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 0,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:05:00Z",
+                "duration_seconds": 300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # The time-based escape must have escalated the issue.
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+    assert entry.get("dispatched_at") is None
+    # The drift fingerprint/at are cleared so a de-escalated issue does not
+    # immediately re-trigger the drift path.
+    assert entry.get("orphan_drift_at") is None
+    assert entry.get("orphan_drift_fingerprint") is None
+    # Issue #282: the liveness fingerprint is preserved.
+    assert entry["worker_pid"] == 99999
+
+    # The ``escalated`` label edge must have been applied via transition().
+    assert (207, config.labels.human_needed) in fake_gh.labels_added
+    assert (207, config.labels.in_progress) in fake_gh.labels_removed
+
+    # A dedicated reap event must be recorded.
+    reaped_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 207
+    assert payload["pr_number"] == 100
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
+    assert payload["exit_code"] == 0
+
+
+def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -> None:
+    """Issue #654: a dead dispatched worker whose drift was surfaced recently
+    (within ``dead_dispatched_reap_minutes``) must NOT be time-escalated.  The
+    existing drift-only behavior (fingerprint match short-circuits to
+    ``continue``) is preserved so a freshly-dead worker is not prematurely
+    escalated before its specific sub-branch has had a chance to act.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    recent_drift_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    fingerprint = json.dumps(
+        {"reason": "dead_worker_clean_exit_no_op", "reviewed_head_sha": "abc123"},
+        sort_keys=True,
+        default=str,
+    )
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "orphan_drift_at": recent_drift_at,
+        "orphan_drift_fingerprint": fingerprint,
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 0,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:05:00Z",
+                "duration_seconds": 300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # Within the grace period: the existing drift-only behavior is preserved.
+    # The fingerprint match short-circuits to ``continue`` without escalating.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("escalation_reason") is None
+    assert entry.get("orphan_drift_at") == recent_drift_at
+
+    # No reap event, no label transition.
+    reaped_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert reaped_events == []
+    assert (207, config.labels.human_needed) not in fake_gh.labels_added
+
+
+def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
+    """Issue #654: ``dead_dispatched_reap_minutes=0`` disables the time-based
+    escape, reverting to the pre-#654 hold-forever behavior.  A dead dispatched
+    worker with old drift stays ``dispatched`` -- the operator explicitly opted
+    out.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=0),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    old_drift_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    fingerprint = json.dumps(
+        {"reason": "dead_worker_clean_exit_no_op", "reviewed_head_sha": "abc123"},
+        sort_keys=True,
+        default=str,
+    )
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "orphan_drift_at": old_drift_at,
+        "orphan_drift_fingerprint": fingerprint,
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 0,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:05:00Z",
+                "duration_seconds": 300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+
+    # With the escape disabled, the issue stays dispatched (pre-#654 behavior).
+    assert entry.get("status") == "dispatched"
+    assert entry.get("escalation_reason") is None
+    reaped_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert reaped_events == []
+
+
 def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> None:
     """Regression test for issue #996.
 

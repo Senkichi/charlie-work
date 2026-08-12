@@ -4177,6 +4177,9 @@ def _detect_and_handle_orphaned_workers(
     # collected and routed to the review lane outside the state lock (review()
     # itself acquires the lock and may call transition()).
     review_routes: list[tuple[int, int, str, str, str]] = []
+    # Issue #654: dead dispatched workers time-escalated inside the lock
+    # collected here for the post-lock transition() call (network I/O).
+    reap_escalations: list[int] = []
     with state_lock(state_file):
         state = load_state(state_file)
         sweep_events: list[tuple[str, dict[str, Any]]] = []
@@ -4188,6 +4191,70 @@ def _detect_and_handle_orphaned_workers(
             # Re-verify status (state may have changed between lock windows)
             if entry.get("status") != "dispatched":
                 continue
+
+            # Issue #654: time-based escape for a dead dispatched worker whose
+            # drift was already surfaced on a prior pass (``orphan_drift_at`` is
+            # set) but whose PR state did not qualify for auto-reset -- a clean
+            # exit with no push (issue #773's ``dead_worker_clean_exit_no_op``
+            # branch), a non-request_changes decision, a head change without a
+            # review callback, or a PR-create failure on a pushed branch. In all
+            # of these the specific sub-branch below emits drift once, sets
+            # ``orphan_drift_at``, then on every subsequent pass the fingerprint
+            # match short-circuits to ``continue`` -- so the dispatch label
+            # (``agent:in-progress``) holds indefinitely. The label is the
+            # one-writer-per-branch mutex, so no re-dispatch can proceed on that
+            # branch until a worker that no longer exists reports back. After
+            # ``dead_dispatched_reap_minutes`` since the drift was first
+            # surfaced, escalate to ``agent:human-needed`` so a human can inspect
+            # the worktree for unpushed commits and decide whether to salvage or
+            # re-dispatch. This runs BEFORE the specific sub-branches so it is a
+            # pure backstop: on the first pass ``orphan_drift_at`` is not yet set
+            # and the specific sub-branch runs normally (either resetting
+            # immediately or emitting the first drift). Only issues that already
+            # have drift recorded and have exceeded the grace period are
+            # escalated here. 0 disables the escape (pre-#654 hold-forever).
+            orphan_drift_at = entry.get("orphan_drift_at")
+            if orphan_drift_at is not None and config.watchdog.dead_dispatched_reap_minutes > 0:
+                drift_dt = _parse_iso_timestamp(orphan_drift_at)
+                if (
+                    drift_dt is not None
+                    and (now - drift_dt).total_seconds() / 60
+                    >= config.watchdog.dead_dispatched_reap_minutes
+                ):
+                    pr_data_for_reap = pr_by_issue.get(issue_number)
+                    pr_number_for_reap = (
+                        int(pr_data_for_reap["number"]) if pr_data_for_reap else None
+                    )
+                    terminal = find_worker_terminal_status(sessions_dir, issue_number)
+                    terminal_exit_code = terminal.get("exit_code") if terminal else None
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="dead_dispatched_worker_reap",
+                        reason_class="mechanical",
+                        pr_number=pr_number_for_reap,
+                        issue_extra={
+                            "dispatched_at": None,
+                            "orphan_drift_fingerprint": None,
+                            "orphan_drift_at": None,
+                        },
+                    )
+                    sweep_events.append(
+                        (
+                            "dead_dispatched_worker_reaped",
+                            {
+                                "issue_number": issue_number,
+                                "pr_number": pr_number_for_reap,
+                                "previous_status": "dispatched",
+                                "reason": "dead_dispatched_worker_reap",
+                                "orphan_drift_at": orphan_drift_at,
+                                "reap_minutes": (config.watchdog.dead_dispatched_reap_minutes),
+                                "exit_code": terminal_exit_code,
+                            },
+                        )
+                    )
+                    reap_escalations.append(issue_number)
+                    continue
 
             # Issue #282: do not clear the liveness fingerprint here. The worker
             # is dead (``_worker_pid_alive`` returned False), but the PID record
@@ -4591,6 +4658,18 @@ def _detect_and_handle_orphaned_workers(
                 state_path=state_file,
             )
             save_state(state_file, state)
+
+    # Issue #654: apply the ``escalated`` label edge for dead dispatched
+    # workers that exceeded the reap grace period. The state.json update
+    # (``_escalate_issue``) was done inside the lock above; ``transition``
+    # does network I/O (GitHub label API) so it runs here, outside the lock,
+    # matching the pattern ``_check_janitor_rework_stall`` uses. A failed
+    # transition leaves the issue escalated in state.json with a stale label
+    # -- the next pass's ``_detect_and_handle_orphaned_workers`` will not
+    # re-escalate (status is no longer ``dispatched``), but reconcile's
+    # ground-truth label sweep will eventually converge the label.
+    for issue_number in reap_escalations:
+        transition(gh, config.labels, issue_number, "escalated")
 
 
 def _sweep_orphan_processes_for_dead_sessions(
