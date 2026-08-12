@@ -353,19 +353,30 @@ def run_mutation_checks(sample_decision: dict[str, Any]) -> bool:
     print(f"  rendered after (summary edited) : {after!r}")
     print(f"  count moved                     : {moved}")
     if not moved:
-        print(
-            "  EXPECTED on this PRE-F1 baseline: _render_required_changes_section\n"
-            '  (workflow.py:3678) early-returns "" whenever `required_changes` is\n'
-            "  empty, WITHOUT ever consulting `summary` -- so a summary-only\n"
-            "  mutation cannot move anything before F1 lands. This null result IS\n"
-            "  itself evidence of the exact defect this harness measures (plan\n"
-            "  section 2.1), not a broken check."
+        sample_has_changes = bool(
+            isinstance(sample_decision.get("required_changes"), list)
+            and sample_decision["required_changes"]
         )
+        if sample_has_changes:
+            print(
+                "  EXPECTED: the real renderer reads `required_changes` first, so\n"
+                "  a summary-only mutation does not move the output when the\n"
+                "  structured list is non-empty."
+            )
+        else:
+            print(
+                "  EXPECTED on this PRE-F1 checkout: _render_required_changes_section\n"
+                '  early-returns "" whenever `required_changes` is empty, WITHOUT\n'
+                "  ever consulting `summary` -- so a summary-only mutation cannot\n"
+                "  move anything before F1 lands. This null result IS itself\n"
+                "  evidence of the exact defect this harness measures (plan\n"
+                "  section 2.1), not a broken check."
+            )
     print()
 
     print(
-        "=== Mutation check 2: mutate `required_changes` (the field the PRE-F1\n"
-        "    renderer actually reads), through the REAL unmodified renderer ==="
+        "=== Mutation check 2: mutate `required_changes` (the field the real\n"
+        "    renderer reads first), through the REAL unmodified renderer ==="
     )
     mutated_rc = copy.deepcopy(sample_decision)
     mutated_rc["required_changes"] = ["Fix the null check in src/charlie_work/workflow.py:3700"]
@@ -387,12 +398,11 @@ def run_mutation_checks(sample_decision: dict[str, Any]) -> bool:
 
 # --------------------------------------------------------------------------
 # Post-F1 projection -- diagnostic only, NOT the authoritative AC-1/AC-1b
-# number. F1 has not merged at the pinned baseline SHA this script's `src/`
-# was imported from, so there is no real post-F1 renderer to call yet. This
-# local stand-in exists solely to make the "would the count move" evidence
-# concrete and to preview the CI-failure-category conflict (see report).
-# Re-run this SAME script (unmodified) against the real post-F1 code once
-# it lands -- do not treat this projection as a substitute for that re-run.
+# number. When the real renderer already implements F1's summary fallback,
+# the projection is obsolete and is suppressed so the report does not show a
+# "proj. post-F1 AC-1b" column alongside the real post-F1 numbers. On a
+# pre-F1 checkout the local stand-in still runs and makes the "would the
+# count move" evidence concrete.
 # --------------------------------------------------------------------------
 
 
@@ -415,6 +425,23 @@ def project_f1_rendering(decision: dict[str, Any]) -> str:
     if not summary:
         return ""
     return "## Required changes (fallback: reviewer summary)\n\n```md\n" + summary + "\n```\n"
+
+
+def _renderer_has_f1_summary_fallback() -> bool:
+    """Probe the REAL renderer for F1's summary fallback.
+
+    Returns True when a ``request_changes`` verdict with an empty
+    ``required_changes`` list but a non-empty ``summary`` renders a non-empty
+    section. That is the exact contract ``project_f1_rendering`` simulates;
+    when the real code already implements it, the projection column is
+    obsolete and must not be printed next to the real post-F1 numbers.
+    """
+    probe: dict[str, Any] = {
+        "decision": "request_changes",
+        "required_changes": [],
+        "summary": "Probe summary containing `src/charlie_work/workflow.py:1`.",
+    }
+    return bool(_render_required_changes_section(probe).strip())
 
 
 # --------------------------------------------------------------------------
@@ -487,11 +514,17 @@ def main() -> int:
     prs_dir = runtime_paths(data_repo_root, config.runtime.state_dir).prs
     code_sha = resolve_code_sha()
 
+    show_projection = not _renderer_has_f1_summary_fallback()
+
     print("=" * 78)
     print("AC-1b findings-actionability measurement harness")
     print("=" * 78)
     print(f"  code under test (charlie_work src) pinned at SHA: {code_sha or 'UNKNOWN'}")
     print(f"  corpus directory                                : {prs_dir}")
+    print(
+        f"  projection column                               : "
+        f"{'suppressed (real F1 renderer in use)' if not show_projection else 'shown (pre-F1 renderer; local stand-in)'}"
+    )
     print()
 
     self_test_ok = run_self_test()
@@ -556,47 +589,60 @@ def main() -> int:
         if ac1b_pass:
             cat_stats.ac1b_actionable += 1
 
-        projected_rendered = project_f1_rendering(v.decision)
-        projected_body = extract_scoreable_body(projected_rendered)
-        projected_referents = find_concrete_referents(projected_body)
-        if projected_referents:
-            cat_stats.projected_ac1b_actionable += 1
+        projected_referents: list[tuple[str, str]] = []
+        if show_projection:
+            projected_rendered = project_f1_rendering(v.decision)
+            projected_body = extract_scoreable_body(projected_rendered)
+            projected_referents = find_concrete_referents(projected_body)
+            if projected_referents:
+                cat_stats.projected_ac1b_actionable += 1
 
         # Show referents from whichever pass actually found something, so a
         # reader can see WHERE a match came from (baseline vs. projection)
         # instead of a confusing "actionable=True, referents=[]" pairing.
-        referent_source = "baseline" if referents else "projected"
-        referent_pool = referents if referents else projected_referents
+        if referents:
+            referent_source = "baseline"
+            referent_pool = referents
+        elif show_projection and projected_referents:
+            referent_source = "projected"
+            referent_pool = projected_referents
+        else:
+            referent_source = "baseline"
+            referent_pool = []
         referent_preview = ", ".join(f"{k}:{s!r}" for k, s in referent_pool[:3])
+        proj_part = f"proj_AC1b={bool(projected_referents)!s:<5}  " if show_projection else ""
         cat_stats.rows.append(
             f"    {v.pr_dir:>10}  len(summary)={len(summary):>5}  "
             f"AC1={ac1_pass!s:<5}  AC1b={ac1b_pass!s:<5}  "
-            f"proj_AC1b={bool(projected_referents)!s:<5}  "
+            f"{proj_part}"
             f"referents[{referent_source}]=[{referent_preview}]"
         )
 
     print("=== Results BY CATEGORY (never a single aggregate) ===")
-    print(
-        f"{'category':<32} {'count':>6} {'AC-1 (non-empty)':>18} "
-        f"{'AC-1b (actionable)':>20} {'proj. post-F1 AC-1b':>20}"
-    )
+    header = f"{'category':<32} {'count':>6} {'AC-1 (non-empty)':>18} {'AC-1b (actionable)':>20}"
+    if show_projection:
+        header += f" {'proj. post-F1 AC-1b':>20}"
+    print(header)
     total_all = total_ac1 = total_ac1b = total_proj = 0
     for category in (*CATEGORY_ORDER, "UNKNOWN_provenance_unavailable"):
         s = stats[category]
         if s.total == 0 and category == "UNKNOWN_provenance_unavailable":
             continue
-        print(
-            f"{category:<32} {s.total:>6} {s.ac1_non_empty:>18} "
-            f"{s.ac1b_actionable:>20} {s.projected_ac1b_actionable:>20}"
-        )
+        row = f"{category:<32} {s.total:>6} {s.ac1_non_empty:>18} {s.ac1b_actionable:>20}"
+        if show_projection:
+            row += f" {s.projected_ac1b_actionable:>20}"
+        print(row)
         total_all += s.total
         total_ac1 += s.ac1_non_empty
         total_ac1b += s.ac1b_actionable
         total_proj += s.projected_ac1b_actionable
-    print(
+    total_row = (
         f"{'TOTAL (sum, not a substitute for the rows above)':<32} {total_all:>6} "
-        f"{total_ac1:>18} {total_ac1b:>20} {total_proj:>20}"
+        f"{total_ac1:>18} {total_ac1b:>20}"
     )
+    if show_projection:
+        total_row += f" {total_proj:>20}"
+    print(total_row)
     print()
 
     print("=== Per-verdict detail ===")
@@ -614,13 +660,21 @@ def main() -> int:
     print(f"  mutation check 2 passed : {mutation_ok}")
     print(f"  sentinel derivation OK  : {sentinel_ok}")
     print(f"  corpus size             : {total_all}")
-    print(
-        "  Baseline AC-1 / AC-1b are measured against the REAL production\n"
-        "  renderer at the pinned SHA above. 'proj. post-F1 AC-1b' is a\n"
-        "  diagnostic projection using a local stand-in for F1's contract\n"
-        "  (NOT the real F1 code) -- re-run this unmodified script against\n"
-        "  the real post-F1 checkout to get the authoritative post-fix number."
-    )
+    if show_projection:
+        print(
+            "  Baseline AC-1 / AC-1b are measured against the REAL production\n"
+            "  renderer at the pinned SHA above. 'proj. post-F1 AC-1b' is a\n"
+            "  diagnostic projection using a local stand-in for F1's contract\n"
+            "  (NOT the real F1 code) -- re-run this unmodified script against\n"
+            "  the real post-F1 checkout to get the authoritative post-fix number."
+        )
+    else:
+        print(
+            "  Baseline AC-1 / AC-1b are measured against the REAL production\n"
+            "  renderer at the pinned SHA above. The diagnostic 'proj. post-F1\n"
+            "  AC-1b' projection is suppressed because the real F1 renderer is\n"
+            "  already in use."
+        )
     return 0 if (self_test_ok and mutation_ok and sentinel_ok) else 1
 
 
