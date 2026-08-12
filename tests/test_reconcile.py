@@ -12,7 +12,12 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
-from charlie_work.config import LabelConfig, OrchestratorConfig, PostMortemConfig
+from charlie_work.config import (
+    LabelConfig,
+    OrchestratorConfig,
+    PostMortemConfig,
+    ReconcilePassConfig,
+)
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.file_lock import try_acquire_byte_range_lock
 from charlie_work.github import (
@@ -4616,6 +4621,76 @@ def test_reconcile_dry_run_fix_does_not_mutate_local_state(tmp_path: Path) -> No
 
     after_state = json.loads(paths.state_file.read_text(encoding="utf-8"))
     assert after_state["prs"]["1"]["status"] == "reviewing"
+
+
+def test_maybe_reconcile_drift_dry_run_does_not_mutate_local_state(tmp_path: Path) -> None:
+    """Issue #615 (round-2 review): the periodic in-loop auto-fix pass
+    ``_maybe_reconcile_drift`` -- the entry point ``fleet supervise --dry-run``
+    actually uses -- must honour ``app.dry_run`` the same way the operator
+    ``mop-up --fix --dry-run`` path does. With real drift present and
+    ``dry_run=True`` it must NOT remove the review checkout, clear
+    review-dispatch state fields, or write any GitHub labels.
+
+    Mirrors ``test_reconcile_dry_run_fix_does_not_mutate_local_state`` but
+    drives the periodic-loop entry point (``_maybe_reconcile_drift``) rather
+    than the direct ``reconcile(fix=True)`` CLI entry point. The fix under
+    test is the ``dry_run=self.dry_run`` threading in ``_maybe_reconcile_drift``'s
+    call to ``_reconcile_locked``; without it, ``fleet supervise --dry-run``
+    would run the real repair on every loop pass -- the same data-loss bug
+    class as #615, one layer up.
+    """
+    config = OrchestratorConfig(
+        reconcile_pass=ReconcilePassConfig(enabled=True, interval_minutes=30)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeGitHub(
+        prs=[_pr(1, "MERGED", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.in_progress, config.labels.reviewing])],
+    )
+    state = empty_state()
+    state["prs"]["1"] = {
+        "number": 1,
+        "issue_number": 10,
+        "status": "reviewing",
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+    }
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    reviews_dir = resolved_layout(config, tmp_path).reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    checkout_path = reviews_dir / "pr-1"
+    checkout_path.mkdir(parents=True, exist_ok=True)
+
+    app = OrchestratorApp(tmp_path, paths, config, gh, dry_run=True)
+    # A fresh state has no next_reconcile_at, so is_reconcile_due is True and
+    # the pass runs immediately -- no schedule priming required.
+    app._maybe_reconcile_drift()
+
+    # No checkout/worktree removal: the drift fix would have deleted pr-1.
+    assert checkout_path.exists(), "dry-run reconcile pass removed the review checkout"
+
+    # No state mutation of the PR's review-dispatch fields: the drift fix
+    # would have cleared status/review_dispatch_* back to idle.
+    after_state = json.loads(paths.state_file.read_text(encoding="utf-8"))
+    assert after_state["prs"]["1"]["status"] == "reviewing"
+    assert after_state["prs"]["1"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+    # No GitHub label writes: the drift fix would have removed the stale
+    # in_progress/reviewing labels from issue 10.
+    assert gh.labels_added == []
+    assert gh.labels_removed == []
+
+    # The pass-level summary event is legitimate bookkeeping (not data-loss
+    # mutation); it must record that drift was detected but NOT fixed, proving
+    # the dry-run gate actually engaged rather than the pass silently no-opping.
+    events = after_state.get("events", [])
+    completed = [e for e in events if e.get("kind") == "reconcile_pass_completed"]
+    assert len(completed) == 1
+    assert completed[0]["payload"]["drift_detected"] == 1
+    assert completed[0]["payload"]["drift_fixed"] == 0
+    assert completed[0]["payload"]["drift_remaining"] == 1
 
 
 def test_reconcile_dry_run_without_fix_still_reports_drift(tmp_path: Path) -> None:
