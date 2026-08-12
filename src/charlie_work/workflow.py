@@ -4761,6 +4761,16 @@ def _reap_restore_rework_requested(
     e.g. ``worktree_unsafe``) loops rework_requested forever instead of
     escalating to a human. Rework workers always have an open PR, so they
     never reach those lanes' checks; the equivalent must live here.
+
+    Issue #1134: a worker that dies before pushing leaves the PR head
+    unchanged but is NOT a no-op — the worker may have completed its work
+    and died mid-push with salvageable stranded commits.  This lane records
+    each non-terminal death in ``worker_death_at`` (parallel to the orphan
+    sweep) and separates the death count from the no-op count in the cap
+    check.  A death-loop escalates with ``worker_death_loop`` (triage:
+    "check the worktree for stranded work") instead of
+    ``redispatch_cap_exceeded`` (triage: "worker is spinning"), and
+    includes ``stranded_commits`` in the escalation payload.
     """
     pr_data = _rework_pr_for_worker(open_prs_by_issue, worker)
     if pr_data is None:
@@ -4802,32 +4812,82 @@ def _reap_restore_rework_requested(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-        should_escalate = (
-            terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch
+
+        # Issue #1134: a worker that died before pushing leaves the PR head
+        # unchanged, but that is NOT a no-op — the worker may have completed
+        # its work and died mid-push with salvageable stranded commits.
+        # Record this death in worker_death_at (parallel to the orphan sweep
+        # at ~line 4245), and separate the death count from the no-op count
+        # in the cap check below.  A death-loop escalates with
+        # worker_death_loop (triage: "check the worktree for stranded work")
+        # instead of redispatch_cap_exceeded (triage: "worker is spinning").
+        worker_death_at = _windowed_worker_death_at(
+            entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
+        if not terminal_failure:
+            worker_death_at = worker_death_at + [
+                datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            ]
+
+        no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
+        death_count = len(worker_death_at)
+        death_loop = not terminal_failure and death_count > config.watchdog.max_auto_redispatch
+        no_op_loop = (
+            not terminal_failure
+            and not death_loop
+            and no_op_count > config.watchdog.max_auto_redispatch
+        )
+        should_escalate = terminal_failure or death_loop or no_op_loop
 
         if should_escalate:
-            reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+            if terminal_failure:
+                reason = failure_kind
+            elif death_loop:
+                reason = "worker_death_loop"
+            else:
+                reason = "redispatch_cap_exceeded"
             # Preserve worker_pid/worker_process_start_time (issue #282): the
             # recovery probe still needs the fingerprint even after escalation.
+            issue_extra: dict[str, Any] = {
+                "redispatch_at": redispatch_at,
+                "dispatched_at": None,
+            }
+            event_payload: dict[str, Any] = {
+                "issue_number": worker.issue_number,
+                "pr_number": pr_number,
+                "failure_kind": failure_kind,
+                "previous_status": "dispatched",
+                "reason": "dead_rework_session_escalated",
+                "redispatch_count": len(redispatch_at),
+            }
+            if not terminal_failure:
+                # Persist the death record regardless of which cap fired —
+                # the death still happened, and the consumption side
+                # (_dispatch_rework_impl) reads it from state.
+                issue_extra["worker_death_at"] = worker_death_at
+            if death_loop:
+                event_payload["reason"] = "worker_death_loop"
+                event_payload["worker_death_count"] = death_count
+                # Issue #1134: probe the worktree for stranded commits —
+                # work the worker completed but died before pushing.
+                if live_head_sha and worker.worktree_path:
+                    stranded, _err = worktree_ahead_of_sha(
+                        Path(worker.worktree_path), live_head_sha
+                    )
+                    if stranded is not None:
+                        issue_extra["stranded_commits"] = stranded
+                        event_payload["stranded_commits"] = stranded
             state = _escalate_issue(
                 state,
                 worker.issue_number,
                 reason=reason,
                 reason_class="mechanical",
-                issue_extra={"redispatch_at": redispatch_at},
+                issue_extra=issue_extra,
             )
             state = append_event(
                 state,
                 "session_failed_escalated",
-                {
-                    "issue_number": worker.issue_number,
-                    "pr_number": pr_number,
-                    "failure_kind": failure_kind,
-                    "previous_status": "dispatched",
-                    "reason": "dead_rework_session_escalated",
-                    "redispatch_count": len(redispatch_at),
-                },
+                event_payload,
                 state_path=state_file,
             )
             save_state(state_file, state)
@@ -4835,6 +4895,8 @@ def _reap_restore_rework_requested(
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
             entry["redispatch_at"] = redispatch_at
+            if not terminal_failure:
+                entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
             state = append_event(

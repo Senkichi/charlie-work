@@ -23747,20 +23747,20 @@ def test_classify_dead_rework_session_stale_prompt_does_not_reopen_approved_head
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
 
-def test_classify_dead_rework_session_escalates_at_redispatch_cap(
+def test_classify_dead_rework_session_escalates_at_death_cap(
     tmp_path: Path,
 ) -> None:
-    """Issue #315 review finding 2a: a dead rework worker must be escalated
-    (not restored to rework_requested) once its redispatch_at history hits
-    config.watchdog.max_auto_redispatch, matching the cap semantics the
-    sibling lanes already enforce (workflow.py's no-open-PR dead-session lane
-    and OrchestratorApp.dispatch_rework's success path both escalate when
-    `len(redispatch_at) > max_auto_redispatch`).
+    """Issue #315 review finding 2a + #1134: a dead rework worker must be
+    escalated (not restored to rework_requested) once its death history hits
+    config.watchdog.max_auto_redispatch.  Since every reap from this lane is
+    a worker death (non-terminal failure), the prior redispatches are all
+    deaths — seeded in ``worker_death_at`` to match.  The fourth death trips
+    the death cap and escalates with ``worker_death_loop`` (not
+    ``redispatch_cap_exceeded``), because a death is not a no-op.
 
-    Mutation gate: dropping the
-    `len(redispatch_at) > config.watchdog.max_auto_redispatch` half of
-    _reap_restore_rework_requested's `should_escalate` check makes this test
-    fail (the issue would be restored to rework_requested indefinitely
+    Mutation gate: dropping the ``death_loop`` half of
+    _reap_restore_rework_requested's ``should_escalate`` check makes this
+    test fail (the issue would be restored to rework_requested indefinitely
     instead of escalating).
     """
     import json
@@ -23789,11 +23789,9 @@ def test_classify_dead_rework_session_escalates_at_redispatch_cap(
     # fake_gh.prs[0]["headRefOid"] defaults to "sha-abc123".
 
     now = datetime.now(UTC)
-    # Three recent redispatches, all inside the default 240-minute window --
-    # max_auto_redispatch defaults to 3, so a fourth entry trips the cap.
-    recent_redispatches = [
-        (now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (6, 4, 2)
-    ]
+    # Three recent deaths, all inside the default 240-minute window --
+    # max_auto_redispatch defaults to 3, so a fourth death trips the cap.
+    recent = [(now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (6, 4, 2)]
 
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -23803,7 +23801,8 @@ def test_classify_dead_rework_session_escalates_at_redispatch_cap(
             "worker_pid": 99999,
             "worker_process_start_time": 1234567890.0,
             "branch_name": "agent/issue-123-fix-search",
-            "redispatch_at": recent_redispatches,
+            "redispatch_at": recent,
+            "worker_death_at": recent,  # all prior redispatches were deaths
         }
         # Live request_changes decision matching the current head, so this
         # test isolates the cap check rather than finding 1's gate.
@@ -23846,14 +23845,198 @@ def test_classify_dead_rework_session_escalates_at_redispatch_cap(
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
-    assert entry["escalation_reason"] == "redispatch_cap_exceeded"
+    # Issue #1134: deaths escalate as worker_death_loop, not redispatch_cap_exceeded.
+    assert entry["escalation_reason"] == "worker_death_loop"
     assert len(entry["redispatch_at"]) == 4
+    assert len(entry["worker_death_at"]) == 4
     assert (123, config.labels.human_needed) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
     assert "session_failed_escalated" in event_kinds
     assert "rework_requeued" not in event_kinds
+
+
+def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
+    tmp_path: Path,
+) -> None:
+    """Issue #1134: when there are enough prior *genuine* no-op redispatches
+    (no worker deaths), the no-op cap still fires even though the current
+    reap is a death.  With 4 prior no-op redispatches (no ``worker_death_at``)
+    and cap=3, the reap adds 1 redispatch + 1 death, making no_op_count = 4
+    (5 redispatches - 1 death) which exceeds the cap → ``redispatch_cap_exceeded``.
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+    # Four recent no-op redispatches (no worker_death_at — these were genuine
+    # no-ops from the dispatch path, not deaths).  cap=3, so after the reap
+    # adds 1 redispatch + 1 death: no_op_count = 5-1 = 4 > 3.
+    recent_no_ops = [
+        (now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (8, 6, 4, 2)
+    ]
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": recent_no_ops,
+            # No worker_death_at — these were genuine no-ops.
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text(
+        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        encoding="utf-8",
+    )
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="devin launch failed: rate limit",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "redispatch_cap_exceeded"
+    assert len(entry["redispatch_at"]) == 5
+    # The reap recorded this as a death too, but the no-ops dominate.
+    assert len(entry["worker_death_at"]) == 1
+
+
+def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
+    tmp_path: Path,
+) -> None:
+    """Issue #1134: when both the death count and the no-op count are below
+    the cap, the issue must NOT be escalated — it is restored to
+    rework_requested for re-dispatch.  With 2 prior deaths (cap=3), the reap
+    adds 1 death making death_count=3 (not > 3) and no_op_count=0.
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+    recent = [(now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (6, 4)]
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": recent,
+            "worker_death_at": recent,  # both prior redispatches were deaths
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text(
+        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        encoding="utf-8",
+    )
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="devin launch failed: rate limit",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    # Not escalated — death_count=3 is not > cap(3), no_op_count=0.
+    assert entry["status"] == "rework_requested"
+    assert len(entry["worker_death_at"]) == 3
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
 
 
 def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immediately(
@@ -37272,6 +37455,100 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
     assert payload["pid"] == 99999
     assert payload["exit_code"] == 1
     assert payload["duration_seconds"] == 5.0
+
+
+def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) -> None:
+    """Issue #1134: ``_detect_and_handle_orphaned_workers`` must write
+    ``worker_death_at`` into the issue's state entry (and the
+    ``orphaned_worker_recovered`` event payload) when it recovers a dead
+    rework worker whose PR head has not moved.  The death timestamp is what
+    the no-op cap check in ``_dispatch_rework_impl`` subtracts from the
+    redispatch count to separate genuine no-ops from worker deaths — without
+    it, every death counts as a no-op and produces a false
+    ``no_op_rework_cap_exceeded`` escalation.
+
+    This test exercises the *production* side (the sweep itself writing the
+    timestamp), complementing the existing ``test_dispatch_rework_*`` tests
+    which only seed ``worker_death_at`` directly to exercise the consumption
+    side.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 1,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:00:05Z",
+                "duration_seconds": 5.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry.get("status") == "rework_requested"
+
+    # The sweep must have recorded a worker_death_at timestamp.
+    death_at = entry.get("worker_death_at")
+    assert isinstance(death_at, list)
+    assert len(death_at) == 1
+    assert isinstance(death_at[0], str)
+    # The timestamp must be a valid ISO 8601 string.
+    from datetime import datetime
+
+    datetime.fromisoformat(death_at[0].replace("Z", "+00:00"))
+
+    # The event payload must also carry the death timestamp.
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    payload = recovered_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_with_request_changes"
+    assert payload.get("worker_death_at") == death_at[0]
 
 
 def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
