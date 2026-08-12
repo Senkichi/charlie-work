@@ -178,6 +178,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_salvaged": "error",
         "session_stalled": "error",
         "spec_review_failed": "error",
+        "supervisor_restart_watchdog_disabled": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
         # -----------------------------------------------------------------
