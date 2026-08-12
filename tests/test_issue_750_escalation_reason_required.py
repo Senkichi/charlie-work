@@ -9,6 +9,10 @@ be an ``ast.Constant``, so any rephrasing of the same write -- a conditional
 expression, a local binding, an f-string -- passed unseen. Matching the shape
 of a forbidden value fails *open*; the scan now derives its exemption from the
 call graph instead, which fails closed.
+
+Issue #981: ``set_escalation`` (state.py) was the pre-#750 half-write helper and
+is now dead code. Keeping it exported offers a documented side-door around the
+``_escalate_issue`` invariant, so it must not be re-introduced.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from test_charlie_work import FakeGitHub
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_WORKFLOW = REPO_ROOT / "src" / "charlie_work" / "workflow.py"
+SRC_STATE = REPO_ROOT / "src" / "charlie_work" / "state.py"
 
 FORBIDDEN_STATUS = "escalated"
 HELPER_NAME = "_escalate_issue"
@@ -419,3 +424,24 @@ def test_escalate_issue_helper_refreshes_terminal_since_on_reescalation() -> Non
     state = _escalate_issue(state, 1, reason="test_reason", reason_class="judgment")
 
     assert state["issues"]["1"]["terminal_since"] != "2020-01-01T00:00:00Z"
+
+
+def test_set_escalation_is_not_defined() -> None:
+    """Issue #981: the pre-#750 half-write helper must not be re-exported.
+
+    ``_escalate_issue`` makes ``status="escalated"`` without a reason
+    unrepresentable at the call site. ``set_escalation`` intentionally made
+    the status write a separate caller responsibility, so its continued
+    existence would be a documented path back to the bug #750 closed.
+    """
+    source = SRC_STATE.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(SRC_STATE))
+    functions = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "set_escalation" not in functions, (
+        "set_escalation is still defined in state.py; delete it so the "
+        "escalation write cannot bypass _escalate_issue"
+    )

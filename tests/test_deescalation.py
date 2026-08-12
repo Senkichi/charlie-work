@@ -676,7 +676,7 @@ def _escalation_event_kinds_from_workflow() -> set[str]:
     # helper (as ``_escalate_issue`` did) is then picked up automatically; a
     # hard-coded name list would silently stop discovering the kinds those call
     # sites emit, and the test would pass while covering less.
-    escalators = {"escalation_reason_class", "set_escalation"}
+    escalators = {"escalation_reason_class", "_escalate_issue"}
     while True:
         grown = {
             name for name, called in calls_by_name.items() if called & escalators
