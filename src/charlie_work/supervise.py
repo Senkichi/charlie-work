@@ -25,10 +25,10 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Sequence
 
-from . import fleet_registry, layout, worktree
+from . import fleet_registry, git_pull_blockers, layout, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .instrumentation import log_event
 from .safe_path import contains
@@ -872,6 +872,196 @@ def self_deploy(
     return result
 
 
+_BLOCKER_NAMES_IN_MESSAGE = 10
+
+
+def _format_blocker_names(paths: tuple[str, ...]) -> str:
+    """Render blocker paths for an operator-facing message, bounded.
+
+    The caller always prints ``len(paths)`` alongside this, so truncating the
+    names loses no information about scale, and ``git status`` has the rest.
+    Unbounded it would be a slow leak rather than a crash: a wedged checkout
+    can hold dozens of blockers (19 untracked files in the deployed checkout
+    at the time of writing), and the resulting string lands in
+    ``SelfDeployResult.error`` -- which is re-rendered into a
+    ``self_deploy_failed`` payload once per retry, roughly every five minutes,
+    for as long as the wedge lasts. The readability of that message is the
+    real reason for the cap; an operator scanning a failure line wants the
+    first few names and the count, not a paragraph.
+    """
+    if len(paths) <= _BLOCKER_NAMES_IN_MESSAGE:
+        return ", ".join(paths)
+    shown = ", ".join(paths[:_BLOCKER_NAMES_IN_MESSAGE])
+    return f"{shown}, +{len(paths) - _BLOCKER_NAMES_IN_MESSAGE} more"
+
+
+@dataclass(frozen=True)
+class PullBlockerRepair:
+    """What one lossless-blocker sweep cleared before a self-deploy retry.
+
+    ``retained`` names the blockers deliberately left in place -- either
+    because their content genuinely differs from the incoming commit (so
+    discarding them would lose work) or because they sit somewhere repair must
+    never touch. An operator reading the ``self_deploy_failed`` event needs
+    that list to know what to adjudicate, so it is carried on the result rather
+    than only logged.
+    """
+
+    cleared: tuple[str, ...] = ()
+    retained: tuple[str, ...] = ()
+
+    @property
+    def acted(self) -> bool:
+        """True when disk changed, i.e. when a retry could plausibly differ."""
+        return bool(self.cleared)
+
+    def describe(self) -> str:
+        parts: list[str] = []
+        if self.cleared:
+            names = _format_blocker_names(self.cleared)
+            parts.append(f"auto-cleared {len(self.cleared)} lossless blocker(s) [{names}]")
+        if self.retained:
+            names = _format_blocker_names(self.retained)
+            parts.append(f"{len(self.retained)} blocker(s) still need a human [{names}]")
+        return "; ".join(parts)
+
+
+def _repairable_blocker_path(repo_root: Path, path: str) -> bool:
+    """Whether blocker repair is allowed to touch ``path`` at all.
+
+    Independent of whether removing it would lose content: some paths are off
+    limits regardless. ``.venv`` is the orchestrator's own interpreter, and
+    containment is enforced on the *resolved* path so a reparse point under
+    ``repo_root`` cannot hand back a tree somewhere else.
+    """
+    if PurePosixPath(path).parts[:1] == (".venv",):
+        return False
+    return contains(repo_root, repo_root / path)
+
+
+def _repair_lossless_pull_blockers(
+    repo_root: Path,
+    *,
+    run_command: Callable[..., RunResult],
+    timeout: int,
+) -> PullBlockerRepair:
+    """Clear only the pull blockers that provably cost nothing to clear.
+
+    ``git pull --ff-only`` refuses to *start* when the incoming tree would
+    clobber local work, in either of the two shapes
+    :mod:`charlie_work.git_pull_blockers` describes. On the outage below it
+    named both in a *single* refusal -- unlike the merge path, which revealed
+    the second class only after the first was cleared -- which is exactly why
+    both sets are derived here rather than read off the message.
+    Without remediation the orchestrator simply stops deploying:
+    on 2026-08-06 it ran stale code for 2h41m -- essentially the whole
+    observation window to that point -- because four files sat in the way and
+    nothing here could move them.
+
+    The bar for touching a file is deliberately high: its worktree content must
+    hash **identical to the blob the pull is about to write there**. Under that
+    proof, clearing it is not a discard -- the pull immediately restores the
+    same bytes. Anything else is left alone and named, because resolving it
+    needs someone who knows which version supersedes which. On the incident
+    above that split 3 auto-clearable against 1 (a stale draft) that genuinely
+    required judgement, so this narrows the manual surface rather than
+    eliminating it.
+
+    Partial clearing is deliberate, and differs from the union gate in
+    ``worktree._repair_declared_scaffolding_blockers`` because the proof is
+    stronger here. There, "declared scaffolding" means *the orchestrator can
+    regenerate this*, so a repair that failed to unblock the merge would have
+    destroyed files for no benefit. Byte-identity is not a claim about
+    regeneration -- there is nothing to lose, so clearing what is provably free
+    is worth doing even when a sibling blocker keeps the pull red.
+    """
+
+    def run_git(argv: list[str]) -> RunResult:
+        return run_command(argv, cwd=repo_root, timeout_seconds=timeout)
+
+    # Only a *pending fast-forward* is ours to unblock. When the fetch half of
+    # `git pull` is what failed, origin/main is stale -- usually equal to HEAD
+    # -- and this returns empty, so a network failure is left alone instead of
+    # provoking a repair of a tree that was never in the way. This is also the
+    # discriminator that avoids parsing git's localized refusal text.
+    head_res = run_git(["git", "rev-parse", "HEAD"])
+    target_res = run_git(["git", "rev-parse", "origin/main"])
+    if not head_res.ok or not target_res.ok:
+        return PullBlockerRepair()
+    head_sha = head_res.stdout.strip()
+    ref = target_res.stdout.strip()
+    if not head_sha or not ref or head_sha == ref:
+        return PullBlockerRepair()
+    if not run_git(["git", "merge-base", "--is-ancestor", head_sha, ref]).ok:
+        # Diverged, not fast-forwardable. Rewriting local history is never this
+        # function's call.
+        return PullBlockerRepair()
+
+    untracked = git_pull_blockers.untracked_paths_shadowing_ref(run_git, ref)
+    modified = git_pull_blockers.modified_paths_overwritten_by_ref(run_git, ref)
+    if not untracked and not modified:
+        return PullBlockerRepair()
+
+    def is_lossless(path: str) -> bool:
+        if not _repairable_blocker_path(repo_root, path):
+            return False
+        incoming = run_git(["git", "rev-parse", f"{ref}:{path}"])
+        if not incoming.ok:
+            return False
+        # Filters ON -- `git hash-object`'s default, NOT --no-filters. This
+        # checkout runs core.autocrlf=true, so worktree bytes are CRLF while
+        # the blob is LF; hashing raw reports every file as differing and makes
+        # this sweep silently inert rather than wrong-looking.
+        local = run_git(["git", "hash-object", "--", path])
+        if not local.ok:
+            return False
+        local_sha = local.stdout.strip()
+        return bool(local_sha) and local_sha == incoming.stdout.strip()
+
+    def nothing_staged(path: str) -> bool:
+        """No staged change for ``path``, so the index holds nothing to lose.
+
+        ``is_lossless`` hashes the *worktree* file, which says nothing about the
+        index. Without this, a path staged with unique content and then edited
+        to match origin would read as lossless, and ``git checkout HEAD --``
+        (which resets index *and* worktree) would destroy the staged version --
+        the one thing here that exists nowhere else.
+
+        Costless in practice: git does not block a fast-forward when the staged
+        content already equals the incoming content, so a path that is both
+        staged and genuinely lossless never reaches this code as a blocker.
+        """
+        return run_git(["git", "diff", "--cached", "--quiet", "HEAD", "--", path]).ok
+
+    lossless_modified = tuple(
+        path for path in modified if is_lossless(path) and nothing_staged(path)
+    )
+    # Untracked paths have no index entry, so there is no staged version to lose.
+    lossless_untracked = tuple(path for path in untracked if is_lossless(path))
+    retained = set(untracked) | set(modified)
+    retained -= set(lossless_modified) | set(lossless_untracked)
+
+    cleared: list[str] = []
+    if lossless_modified:
+        # `git checkout HEAD --`, never bare `git checkout --`: the latter
+        # restores from the *index*, so a staged copy survives and blocks the
+        # retry a second time. Same trap as in worktree.py.
+        checkout = run_git(["git", "checkout", "HEAD", "--", *lossless_modified])
+        if checkout.ok:
+            cleared.extend(lossless_modified)
+        else:
+            retained |= set(lossless_modified)
+    for path in lossless_untracked:
+        try:
+            (repo_root / path).unlink()
+        except OSError:
+            retained.add(path)
+        else:
+            cleared.append(path)
+
+    return PullBlockerRepair(cleared=tuple(sorted(cleared)), retained=tuple(sorted(retained)))
+
+
 def _self_deploy_attempt(
     repo_root: Path,
     marker_path: Path,
@@ -910,15 +1100,44 @@ def _self_deploy_attempt(
         pull_cmd = ["git", "pull", "--ff-only", "origin", "main"]
         pull_res = run_command(pull_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
         if not pull_res.ok:
-            return SelfDeployResult(
-                ok=False,
-                pulled=False,
-                changed=False,
-                synced=False,
-                from_sha=before_sha,
-                venv_repaired=venv_repaired,
-                error=_command_failure_message(pull_cmd, pull_res, "pull failed"),
+            repair = _repair_lossless_pull_blockers(
+                repo_root, run_command=run_command, timeout=pull_timeout
             )
+            if repair.acted:
+                # Exactly one retry, never a loop: the blocker set is recomputed
+                # from scratch on the next pass anyway, so looping here only
+                # hammers a tree that is genuinely stuck.
+                pull_res = run_command(pull_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
+                # A repair that WORKS is otherwise completely invisible: the
+                # wedge simply stops happening and the pass logs an ordinary
+                # success. That would make this fix a mask -- whatever keeps
+                # depositing these files (a script landing untracked, a
+                # half-applied cherry-pick) would go on doing so unobserved,
+                # and the one place it used to be visible was the outage. So
+                # record it on the success path too, not just in the failure
+                # message. Best-effort, like every other log_event here: a
+                # logging failure must never fail a deploy that worked.
+                log_event(
+                    _self_deploy_state_path(repo_root),
+                    "self_deploy_blockers_cleared",
+                    {
+                        "cleared": list(repair.cleared),
+                        "retained": list(repair.retained),
+                        "pull_ok_after_retry": pull_res.ok,
+                    },
+                )
+            if not pull_res.ok:
+                detail = repair.describe()
+                return SelfDeployResult(
+                    ok=False,
+                    pulled=False,
+                    changed=False,
+                    synced=False,
+                    from_sha=before_sha,
+                    venv_repaired=venv_repaired,
+                    error=_command_failure_message(pull_cmd, pull_res, "pull failed")
+                    + (f" -- {detail}" if detail else ""),
+                )
 
         after_cmd = ["git", "rev-parse", "HEAD"]
         after_res = run_command(after_cmd, cwd=repo_root, timeout_seconds=pull_timeout)

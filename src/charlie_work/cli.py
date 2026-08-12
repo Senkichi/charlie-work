@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
     compute_api_worker_fleet_report,
     fleet_loop,
+    run_allocation_pass_with_ci_fleet_guard,
     run_fleet_supervise,
     run_fleet_supervise_loop,
 )
@@ -51,7 +53,6 @@ from ci_fleet.charlie_work_adapter import (
     is_pool_idle_for_minutes,
     observe_runner_pool,
     plan_summary,
-    run_allocation_pass,
     scale_down_idle_runners,
 )
 
@@ -1215,6 +1216,7 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
         journal_path as shadow_journal_path,
         read_all as read_shadow_journal,
     )
+    from ci_fleet.runner_allocation import SlotAction
     from ci_fleet.shadow_gate import (
         REQUIRED_CALENDAR_DAYS,
         REQUIRED_STREAK,
@@ -1300,6 +1302,8 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
     if not journal_found:
         data["agreement_streak"] = None
         data["change_agreement_streak"] = None
+        data["change_agreement_streak_by_action"] = None
+        data["provisioning_action"] = None
         data["gate"] = None
         return CommandResult(ok=True, message="runners shadow-status complete", data=data)
 
@@ -1326,6 +1330,52 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
         "streak": _trailing_streak(changed_records),
         "total": len(changed_records),
     }
+
+    # Per-action split of the load-bearing streak (#926). Counts individual
+    # changes, not passes, because one pass can contain several decisions. The
+    # action for a change is taken only where both planners agree on the exact
+    # (repo, runner, action) tuple -- a disagreement about the kind of change
+    # is the finding and must not be collapsed into a bucket.
+    def _change_action_tuples(rec: Mapping[str, Any]) -> set[tuple[str, str, str]]:
+        live = (rec.get("live_plan") or {}).get("changes") or []
+        shadow = (rec.get("shadow_plan") or {}).get("changes") or []
+        live_set = {(c["repo"], c["runner"], c["action"]) for c in live}
+        shadow_set = {(c["repo"], c["runner"], c["action"]) for c in shadow}
+        return live_set & shadow_set
+
+    def _action_counts(recs: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for rec in recs:
+            for _repo, _runner, action in _change_action_tuples(rec):
+                counts[action] = counts.get(action, 0) + 1
+        return counts
+
+    # The trailing run of changed passes that all agreed (same suffix that
+    # underlies change_agreement_streak, but we need the records, not just a
+    # count, to tally the actions inside them).
+    trailing_changed_records: list[Mapping[str, Any]] = []
+    for rec in reversed(changed_records):
+        if not rec.get("agreed"):
+            break
+        trailing_changed_records.append(rec)
+
+    total_action_counts = _action_counts(changed_records)
+    streak_action_counts = _action_counts(reversed(trailing_changed_records))
+
+    # Always show both SlotAction values so a 0/0 action is surfaced even when
+    # it has never been observed in the journal.
+    known_actions = {SlotAction.PARK.value, SlotAction.START.value}
+    observed_actions = set(total_action_counts) | set(streak_action_counts)
+    all_actions = known_actions | observed_actions
+
+    data["change_agreement_streak_by_action"] = {
+        action: {
+            "streak": streak_action_counts.get(action, 0),
+            "total": total_action_counts.get(action, 0),
+        }
+        for action in sorted(all_actions)
+    }
+    data["provisioning_action"] = SlotAction.START.value
 
     verdict = evaluate_shadow_gate(records)
     data["gate"] = {
@@ -1578,11 +1628,18 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     if decision.action == ScaleAction.UP:
         from ci_fleet.charlie_work_adapter import provision_runner
 
+        # Affinity knobs (issue: ci_runners #92 companion) — sourced from the
+        # same runner_allocation section launch_runner_listener's callers use,
+        # never hardcoded. 0/0 (the section's defaults) is a no-op downstream.
+        # Requires ci_runners #92 merged and deployed: the currently installed
+        # ci_fleet.provision_runner does not yet accept these kwargs.
         result = provision_runner(
             gh,
             config.runner_scaling,
             state.busy_runners,
             dry_run=False,
+            reserved_threads=config.runner_allocation.reserved_threads,
+            threads_per_slot=config.runner_allocation.threads_per_slot,
         )
         if result.ok:
             # Record scale event
@@ -1705,7 +1762,11 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
     dry_run = getattr(args, "dry_run", False)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
-    result = run_allocation_pass(
+    # Issue #927: `charlie runners allocate` is the operator path to the same
+    # actuation the supervisor prologue guards -- run_allocation_pass_with_ci_fleet_guard
+    # is the single point of enforcement, so this command inherits the dirty-worktree
+    # guard by construction instead of needing its own copy of the check.
+    result, dirty_check = run_allocation_pass_with_ci_fleet_guard(
         gh,
         config.runner_allocation,
         managed_root_fallback=config.runner_scaling.managed_root,
@@ -1715,12 +1776,14 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
         source=CLI_ALLOCATION_SOURCE,
         full_pass_interval_seconds=config.supervisor.full_pass_interval_seconds,
     )
+    dry_run_forced = dirty_check.is_dirty
+    effective_dry_run = dry_run or dry_run_forced
 
     if result.error:
         return CommandResult(ok=False, message=f"allocate: {result.error}", data={})
 
     data: dict[str, Any] = {
-        "dry_run": dry_run,
+        "dry_run": effective_dry_run,
         "notes": list(result.notes),
         "applied": [
             {
@@ -1733,6 +1796,11 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
             for r in result.results
         ],
     }
+    if dry_run_forced:
+        data["ci_fleet_worktree_dirty"] = {
+            "ci_fleet_root": str(dirty_check.repo_root),
+            "dirty_paths": list(dirty_check.dirty_paths),
+        }
     if result.plan is not None:
         data["plan"] = plan_summary(result.plan)
 
@@ -1743,12 +1811,21 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
             data=data,
         )
 
-    prefix = "would " if dry_run else ""
+    if dry_run_forced:
+        prefix = "would "
+        dirty_paths_text = "; ".join(dirty_check.dirty_paths)
+        guard_suffix = (
+            f" (forced dry-run: ci_fleet dependency tree at {dirty_check.repo_root} "
+            f"has uncommitted changes: {dirty_paths_text})"
+        )
+    else:
+        prefix = "would " if dry_run else ""
+        guard_suffix = ""
     return CommandResult(
         ok=result.ok,
         message=(
             f"allocate: {prefix}start {result.started}, {prefix}park {result.parked} "
-            f"(budget {result.plan.budget if result.plan else 0})"
+            f"(budget {result.plan.budget if result.plan else 0})" + guard_suffix
         ),
         data=data,
     )
@@ -1770,7 +1847,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "review-queue":
         return app.review_queue()
     if args.command == "why-charlie-hate":
-        return app.review(args.pr, cross_family=args.cross_family)
+        # The operator's manual re-run is deliberately exempt from the per-head
+        # cross-family regeneration budget (issue #1099): a human typing a
+        # command is not the loop the bound defends against, and RUNBOOK.md's
+        # recovery procedure for an exhausted budget is exactly this command.
+        return app.review(args.pr, cross_family=args.cross_family, enforce_regen_budget=False)
     if args.command == "why-charlie-hate-spec":
         try:
             return app.spec_review(args.spec_file)
@@ -2079,6 +2160,19 @@ def main(argv: list[str] | None = None) -> int:
                     f"    Agreement streak (passes with a real change) "
                     f"[LOAD-BEARING]: {change_streak.get('streak')}/{change_streak.get('total')}"
                 )
+                by_action = result.data.get("change_agreement_streak_by_action") or {}
+                provisioning_action = result.data.get("provisioning_action") or "start"
+                for action, info in sorted(by_action.items()):
+                    streak = info.get("streak", 0)
+                    total = info.get("total", 0)
+                    if total == 0:
+                        if action == provisioning_action:
+                            note = " <- provisioning path, never compared"
+                        else:
+                            note = " <- never compared"
+                    else:
+                        note = ""
+                    print(f"      {action}: {streak}/{total}{note}")
                 gate = result.data.get("gate") or {}
                 if gate:
                     print(
@@ -2099,7 +2193,8 @@ def main(argv: list[str] | None = None) -> int:
                         f"{all_streak.get('total')} pass(es), of which "
                         f"{(all_streak.get('total') or 0) - (change_streak.get('total') or 0)} "
                         "emitted no change; the change-emitting path has been "
-                        f"compared {change_streak.get('total')} time(s)."
+                        f"compared {change_streak.get('total')} time(s). "
+                        "Per-action counts are individual changes, not passes."
                     )
         elif args.runners_command == "ensure-started" and result.ok:
             started_count = result.data.get("started_count", 0)

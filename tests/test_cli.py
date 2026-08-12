@@ -16,8 +16,11 @@ from charlie_work.config import (
     RunnerAllocationConfig,
     RunnerScalingConfig,
 )
+from ci_fleet.charlie_work_adapter import ScaleAction
+from ci_fleet.runners import ScaleDecision
 from charlie_work.cross_family import LEGACY_VACUOUS_SUMMARY
-from charlie_work.fleet_dispatch import ApiWorkerFleetReport
+from charlie_work import fleet_dispatch
+from charlie_work.fleet_dispatch import ApiWorkerFleetReport, _CiFleetDirtyCheck
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
@@ -25,6 +28,8 @@ from charlie_work.quiesce import QuiesceReport
 from charlie_work.state_migration import MigrationChild, MigrationOutcome, MigrationPlan
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
+from ci_fleet.runner_allocation import AllocationPlan
+from ci_fleet.runner_allocation_pass import AllocationPassResult
 
 
 class _FakeGitHub:
@@ -1132,6 +1137,62 @@ def test_run_runners_allocate_loud_on_absent_global_layer(
     )
 
 
+def test_run_runners_allocate_forces_dry_run_when_ci_fleet_is_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #927 rework (PR #1048): `charlie runners allocate` -- the operator
+    path -- must be guarded against a dirty editable ci_fleet worktree exactly
+    like the unattended supervisor prologue.
+
+    The original guard only covered fleet_dispatch's prologue call site and
+    left this CLI command -- which CLAUDE.md names as "the only thing allowed
+    to decide which listeners run" -- completely unguarded. Both call sites
+    now go through ``run_allocation_pass_with_ci_fleet_guard``, so patching
+    the guard's underlying primitives (``_ci_fleet_worktree_dirty`` and
+    ``run_allocation_pass``, both resolved from ``charlie_work.fleet_dispatch``)
+    proves this CLI path is covered by that single enforcement point rather
+    than a second, independently-written copy of the check.
+    """
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    config = OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(managed_root=str(tmp_path)),
+        runner_allocation=RunnerAllocationConfig(enabled=True),
+    )
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "GitHub", lambda *a, **k: _FakeGitHub())
+
+    dirty_check = _CiFleetDirtyCheck(
+        is_dirty=True,
+        repo_root=tmp_path / "ci_fleet",
+        dirty_paths=(" M src/runner_allocation.py",),
+    )
+    monkeypatch.setattr(
+        fleet_dispatch,
+        "_ci_fleet_worktree_dirty",
+        lambda _module_file=None: dirty_check,
+    )
+    plan = AllocationPlan(budget=4, budget_reason="configured", targets=(), changes=())
+    pass_result = AllocationPassResult(ok=True, plan=plan, notes=())
+    pass_mock = MagicMock(return_value=pass_result)
+    monkeypatch.setattr(fleet_dispatch, "run_allocation_pass", pass_mock)
+
+    args = cli.build_parser().parse_args(["runners", "allocate"])
+    outcome = cli.run_runners_allocate(args)
+
+    assert pass_mock.call_args.kwargs["dry_run"] is True, (
+        "a dirty ci_fleet worktree must force dry_run on the CLI allocate path, "
+        "not only the unattended supervisor prologue"
+    )
+    assert outcome.data["dry_run"] is True
+    assert outcome.data["ci_fleet_worktree_dirty"]["dirty_paths"] == [
+        " M src/runner_allocation.py"
+    ], "the forced-dry-run reason must surface in the CommandResult data"
+    assert "forced dry-run" in outcome.message, (
+        f"the CLI message must say why it refused to actuate: {outcome.message!r}"
+    )
+
+
 def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1177,6 +1238,56 @@ def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
 # --------------------------------------------------------------------------
 # runners ensure-started: single-controller guard (issue #598)
 # --------------------------------------------------------------------------
+
+
+def test_run_runners_autoscale_up_forwards_affinity_knobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The autoscale-up call site forwards runner_allocation's affinity knobs.
+
+    Companion to ci_runners #92: provision_runner grew keyword-only
+    reserved_threads/threads_per_slot, but the call site was inert until it
+    forwarded them. This pins that the values are read from
+    config.runner_allocation (never hardcoded, never defaulted away) and
+    passed through unchanged.
+
+    provision_runner is mocked at the charlie_work_adapter import boundary
+    used by cli.py's local ``from ci_fleet.charlie_work_adapter import
+    provision_runner`` -- this passes against whichever ci_fleet is
+    currently installed, independent of whether #92 has merged yet.
+    """
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+
+    config = OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(enabled=True, managed_root=str(tmp_path)),
+        runner_allocation=RunnerAllocationConfig(reserved_threads=4, threads_per_slot=6),
+    )
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "observe_runner_pool", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(cli, "is_in_cooldown", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "is_pool_idle_for_minutes", lambda *a, **k: False)
+    monkeypatch.setattr(
+        cli,
+        "decide_autoscale",
+        lambda *a, **k: ScaleDecision(action=ScaleAction.UP, count=1, reason="test"),
+    )
+
+    provision_mock = MagicMock(return_value=MagicMock(ok=True, runner_name="jc-1"))
+    monkeypatch.setattr(
+        "ci_fleet.charlie_work_adapter.provision_runner",
+        provision_mock,
+    )
+
+    args = cli.build_parser().parse_args(["runners", "autoscale"])
+    result = cli.run_runners_autoscale(args)
+
+    assert result.ok is True
+    provision_mock.assert_called_once()
+    _, kwargs = provision_mock.call_args
+    assert kwargs["reserved_threads"] == 4
+    assert kwargs["threads_per_slot"] == 6
 
 
 def _ensure_started_config(
@@ -1807,9 +1918,21 @@ def _write_allocation_event(state_file: Path, *, source: str, actuating_planner:
 
 
 def _journal_record(
-    pass_id: str, *, agreed: bool, changes: list[Any] | None = None
+    pass_id: str,
+    *,
+    agreed: bool,
+    changes: list[Any] | None = None,
+    shadow_changes: list[Any] | None = None,
 ) -> dict[str, Any]:
-    """One diff-journal record, matching ci_fleet.diff_journal's write shape."""
+    """One diff-journal record, matching ci_fleet.diff_journal's write shape.
+
+    By default the shadow plan mirrors the live plan's changes so an
+    ``agreed=True`` record is internally consistent. ``shadow_changes`` can be
+    set independently to simulate a planner disagreement about the kind of
+    change a pass emits.
+    """
+    live_changes = changes or []
+    shadow = shadow_changes if shadow_changes is not None else list(live_changes)
     return {
         "pass_id": pass_id,
         "inputs": {},
@@ -1817,14 +1940,14 @@ def _journal_record(
             "budget": 1,
             "budget_reason": "test",
             "targets": [],
-            "changes": changes or [],
+            "changes": live_changes,
             "notes": [],
         },
         "shadow_plan": {
             "budget": 1,
             "budget_reason": "test",
             "targets": [],
-            "changes": [],
+            "changes": shadow,
             "notes": [],
         },
         "agreed": agreed,
@@ -2093,3 +2216,124 @@ def test_main_runners_shadow_status_renders_pending_planner_and_note_ordering(
         "advisor-flagged regression this test pins"
     )
     assert "compared 1 time(s)" in out
+
+
+def test_run_runners_shadow_status_by_action_counts_individual_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Per-action streak/total counts individual changes, not passes.
+
+    A single pass can emit several start decisions; each one exercises the
+    provisioning path. The split must expose that granularity, not collapse it
+    to one per pass.
+    """
+    _repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    starts = [
+        {"repo": "x/y", "runner": "r-1", "action": "start", "reason": "test"},
+        {"repo": "x/z", "runner": "r-2", "action": "start", "reason": "test"},
+    ]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=True, changes=park),
+            _journal_record("p2", agreed=True, changes=park),
+            _journal_record("p3", agreed=True, changes=park),
+            _journal_record("p4", agreed=True, changes=starts),
+            _journal_record("p5", agreed=True, changes=starts),
+        ],
+    )
+
+    result = cli.run_runners_shadow_status(args)
+
+    assert result.data["change_agreement_streak"] == {"streak": 5, "total": 5}
+    by_action = result.data["change_agreement_streak_by_action"]
+    assert by_action["park"] == {"streak": 3, "total": 3}
+    assert by_action["start"] == {"streak": 4, "total": 4}
+
+
+def test_run_runners_shadow_status_by_action_trailing_streak_per_action(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each action's streak breaks when a change of that action disagrees.
+
+    The trailing suffix of changed passes that all agreed is still one suffix,
+    but a pass that does not contain a given action does not extend that
+    action's trailing count, even if the overall streak continues.
+    """
+    _repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    start = [{"repo": "x/y", "runner": "r-1", "action": "start", "reason": "test"}]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=True, changes=park),
+            _journal_record("p2", agreed=True, changes=start),
+            _journal_record("p3", agreed=False, changes=start),
+            _journal_record("p4", agreed=True, changes=park),
+            _journal_record("p5", agreed=True, changes=park),
+        ],
+    )
+
+    result = cli.run_runners_shadow_status(args)
+
+    by_action = result.data["change_agreement_streak_by_action"]
+    assert by_action["park"] == {"streak": 2, "total": 3}
+    assert by_action["start"] == {"streak": 0, "total": 2}
+
+
+def test_run_runners_shadow_status_by_action_skips_disputed_action_label(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A record where the planners disagree about the action is not bucketed.
+
+    The live planner says ``start`` for a runner, the shadow says ``park`` for
+    the same runner. That disagreement is the finding, so the record must not
+    be counted toward either action's total or streak.
+    """
+    _repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    live_start = [{"repo": "x/y", "runner": "r-1", "action": "start", "reason": "test"}]
+    shadow_park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=False, changes=live_start, shadow_changes=shadow_park),
+            _journal_record("p2", agreed=True, changes=park),
+        ],
+    )
+
+    result = cli.run_runners_shadow_status(args)
+
+    assert result.data["change_agreement_streak"] == {"streak": 1, "total": 2}
+    by_action = result.data["change_agreement_streak_by_action"]
+    assert by_action["start"] == {"streak": 0, "total": 0}
+    assert by_action["park"] == {"streak": 1, "total": 1}
+
+
+def test_main_runners_shadow_status_renders_action_split_and_zero_note(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI renders each action with its streak and a note when 0/0."""
+    repo_root, fleet_directory, args = _shadow_status_setup(monkeypatch, tmp_path)
+    state_file = _allocation_state_file(repo_root)
+    _write_allocation_event(state_file, source="prologue", actuating_planner="new")
+    park = [{"repo": "x/y", "runner": "r-1", "action": "park", "reason": "test"}]
+    _write_journal(
+        fleet_directory,
+        [
+            _journal_record("p1", agreed=True, changes=[]),
+            _journal_record("p2", agreed=True, changes=park),
+        ],
+    )
+
+    exit_code = cli.main(["--fleet-dir", str(fleet_directory), "runners", "shadow-status"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "Agreement streak (passes with a real change)" in out
+    assert "park:" in out
+    assert "start:" in out
+    assert "0/0" in out
+    assert "provisioning path" in out
+    assert "never compared" in out

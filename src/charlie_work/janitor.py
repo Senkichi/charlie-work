@@ -25,7 +25,7 @@ import fnmatch
 import logging
 import re
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -172,6 +172,13 @@ class JanitorVerdict:
     # patch-id or head-SHA unchanged since the last request_changes verdict).
     # Consumers must branch on this, never on the failure-message text.
     is_no_op_rework: bool = False
+    # Issue #1116: the no-op rework check was deliberately skipped because the
+    # recorded request_changes verdict is stale-CI (its only findings cite
+    # required checks that are all green now — is_stale_ci_verdict). An
+    # unchanged diff is EXPECTED under a contaminated verdict, and failing the
+    # gate on it would permanently block the packet rebuild the fresh review
+    # needs. Consumers must branch on this flag, never on the warning text.
+    no_op_check_skipped_stale_ci: bool = False
     # Structured flags for _check_draft's finding (issue #818). is_draft is
     # true whenever GitHub reports the PR as a draft, regardless of any other
     # failure. is_draft_only_block is true only when draft is the SOLE janitor
@@ -181,6 +188,15 @@ class JanitorVerdict:
     # must branch on these flags, never on the failure-message text.
     is_draft: bool = False
     is_draft_only_block: bool = False
+    # Required check names GitHub has reported as missing from the check list
+    # (CheckSummary.missing) -- distinct from failed_required_checks (a check
+    # that ran and failed). Consumers must branch on this structured field,
+    # never on the "Required check(s) missing" failure-message text, to
+    # decide whether a gh Actions query for the head SHA is warranted.
+    # job-cannon 2026-08-06/07: GitHub Actions silently created no workflow
+    # run for pushed heads; detection added so the janitor gate distinguishes
+    # "CI never started" from "CI failed".
+    missing_required_checks: tuple[str, ...] = ()
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -317,12 +333,22 @@ def run_janitor(
     pr_state: dict[str, Any] | None = None,
     repo_root: Path | None = None,
     pr_diff: str | None = None,
+    review_decision: Mapping[str, Any] | None = None,
 ) -> JanitorVerdict:
     """Run deterministic pre-review checks over ``pr``/``checks`` data.
 
     Missing keys in ``pr`` never raise: `gh` omits fields depending on the
     flags used to fetch it, so an absent key is treated as "unknown" and the
     check that depends on it is skipped rather than failed.
+
+    ``review_decision`` is the recorded review-decision mapping for this PR
+    (``prs/pr-N/review-decision.json`` content), used only by the issue #1116
+    stale-CI skip: when the verdict is a non-escalated request_changes whose
+    findings all cite required checks that are green now
+    (``is_stale_ci_verdict``), the no-op rework check is skipped so the gate
+    can pass and the packet/fresh-review machinery can run. ``None`` (or any
+    non-stale decision) preserves the existing behavior — the predicate fails
+    closed on red, pending, missing, or unavailable checks.
     """
     failures: list[str] = []
     warnings: list[str] = []
@@ -330,8 +356,10 @@ def run_janitor(
 
     required = config.auto_merge.required_checks
     summary: CheckSummary | None = summarize_checks(checks, required) if required else None
+    missing_required_checks: tuple[str, ...] = ()
     if summary is not None:
         failed_required_checks = summary.failed
+        missing_required_checks = summary.missing
 
     is_draft = _check_draft(pr, failures)
     _check_state(pr, failures)
@@ -357,7 +385,24 @@ def run_janitor(
 
     # Only run no-op rework check if repo_root is provided (needed for worktree enrichment)
     is_no_op_rework = False
-    if repo_root is not None:
+    # Issue #1116: under a stale-CI verdict an unchanged diff is the expected
+    # outcome of rework, not a worker no-op — the recorded findings only cite
+    # required checks that are green now, so there was nothing to change.
+    # Failing the gate here would permanently block the packet rebuild (and
+    # therefore the fresh review) for this PR. is_stale_ci_verdict fails
+    # closed: red/pending/missing checks, an escalated or prose-bearing
+    # verdict, or a missing summary all leave the no-op check active.
+    no_op_check_skipped_stale_ci = (
+        review_decision is not None
+        and summary is not None
+        and is_stale_ci_verdict(review_decision, summary)
+    )
+    if no_op_check_skipped_stale_ci:
+        warnings.append(
+            "No-op rework check skipped: recorded request_changes verdict is "
+            "stale-CI (all findings cite required checks that are green now)"
+        )
+    elif repo_root is not None:
         is_no_op_rework = _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
 
     is_check_failure_block = bool(failed_required_checks) and not failures
@@ -439,8 +484,10 @@ def run_janitor(
         infra_rerun_attempts=infra_rerun_attempts,
         infra_definitive_failed=infra_definitive_failed,
         is_no_op_rework=is_no_op_rework,
+        no_op_check_skipped_stale_ci=no_op_check_skipped_stale_ci,
         is_draft=is_draft,
         is_draft_only_block=is_draft_only_block,
+        missing_required_checks=missing_required_checks,
     )
 
 
@@ -861,6 +908,68 @@ def _check_no_op_rework(
             f"If the advance was only base-update merges, this may be a no-op rework."
         )
     return False
+
+
+def required_check_citation_names(
+    decision: Mapping[str, Any] | None,
+    required: Sequence[str],
+) -> tuple[str, ...] | None:
+    """Return the required-check names a request_changes verdict cites, or None.
+
+    A verdict "cites only required checks" when it is a non-escalated
+    ``request_changes`` whose ``required_changes`` list is non-empty and EVERY
+    entry begins with a configured required-check name followed by ``:`` —
+    the shape record_review's #792 derivation produces when a reviewer's sole
+    findings were check-status observations (issue #1111: e.g.
+    ``"Tests passed: .github:18 — Process completed with exit code 1."``).
+    Check names come from ``config.auto_merge.required_checks``, never from a
+    hard-coded list. Any entry that does not match — a real code finding, free
+    prose, an empty string — makes the whole verdict non-citation (None), so
+    mixed verdicts keep their normal lifecycle. Fail-closed by construction:
+    None means "treat the verdict as substantive".
+    """
+    if not decision or not required:
+        return None
+    if decision.get("decision") != "request_changes" or decision.get("escalated"):
+        return None
+    required_changes = decision.get("required_changes")
+    if not isinstance(required_changes, list) or not required_changes:
+        return None
+    cited: list[str] = []
+    for entry in required_changes:
+        if not isinstance(entry, str):
+            return None
+        text = entry.lstrip()
+        match = next((name for name in required if text.startswith(f"{name}:")), None)
+        if match is None:
+            return None
+        cited.append(match)
+    return tuple(cited)
+
+
+def is_stale_ci_verdict(
+    decision: Mapping[str, Any] | None,
+    summary: CheckSummary | None,
+) -> bool:
+    """True when a request_changes verdict's only findings are required-check
+    citations and every required check is green right now.
+
+    This is the issue #1111 staleness predicate: a reviewer recorded
+    ``request_changes`` citing a required CI check (typically a transient
+    infra/timeout failure that flipped mid-review), the check has since
+    recovered on the same content, and the verdict therefore describes a
+    failure that no longer exists. A stale verdict must be superseded by a
+    FRESH review — never auto-approved — so callers use this only to (a)
+    re-queue the PR for review despite an unchanged patch-id and (b) suppress
+    no-op-rework counter burn while that re-review is pending. ``summary``
+    must be a live :class:`CheckSummary` over the configured required checks;
+    ``None`` (checks unavailable) fails closed to False.
+    """
+    if summary is None:
+        return False
+    if required_check_citation_names(decision, summary.required) is None:
+        return False
+    return summary.ready
 
 
 def _get_unpushed_commit_info(

@@ -18,7 +18,7 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -27,6 +27,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import OrchestratorConfig, WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
+from . import git_pull_blockers
 from .github import GitHubRunResult, PR_VIEW_MERGED_FIELDS, linked_issue_number
 from .janitor import _calculate_patch_id
 from . import layout
@@ -124,9 +125,11 @@ class LiveWorkerRedispatchError(RuntimeError):
 class WorktreeForeignWriterError(RuntimeError):
     """Raised when ``create_worktree`` is about to use a worktree that has a
     live writer marker belonging to a session the orchestrator does not own
-    (e.g. an operator's editor or an out-of-band agent). The launch shim
-    surfaces this as ``failure_kind="worktree_foreign_writer"`` so the issue
-    stays queued and the dispatch event log records the conflict.
+    (e.g. an operator's editor or an out-of-band agent), OR when the target
+    branch is already checked out in a worktree at a foreign path the
+    orchestrator did not create (issue #1118). The launch shim surfaces this
+    as ``failure_kind="worktree_foreign_writer"`` so the issue stays queued
+    and the dispatch event log records the conflict.
     """
 
     def __init__(
@@ -139,10 +142,39 @@ class WorktreeForeignWriterError(RuntimeError):
         self.worktree_path = worktree_path
         self.pid = pid
         self.session_id = session_id
-        super().__init__(
-            f"worktree {worktree_path} has a live foreign writer "
-            f"(pid={pid}, session_id={session_id})"
-        )
+        if pid is None and session_id is None:
+            # Issue #1118: the branch is checked out in a worktree at a path
+            # the orchestrator did not create — no writer marker to inspect.
+            super().__init__(
+                f"worktree {worktree_path} is a foreign checkout the "
+                f"orchestrator did not create; refusing to adopt it"
+            )
+        else:
+            super().__init__(
+                f"worktree {worktree_path} has a live foreign writer "
+                f"(pid={pid}, session_id={session_id})"
+            )
+
+
+# How many lines of git's stderr to carry into a pre-merge failure message.
+# Enough for git's "untracked working tree files would be overwritten" header
+# plus the first few offending paths, without pasting a 200-line list into an
+# event payload.
+_PRE_MERGE_STDERR_LINES = 6
+
+
+def _first_lines(text: str | None, *, limit: int) -> str:
+    """Collapse the first ``limit`` non-blank lines of ``text`` onto one line."""
+    if not text:
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    head = lines[:limit]
+    joined = " | ".join(head)
+    if len(lines) > limit:
+        joined += f" | (+{len(lines) - limit} more lines)"
+    return joined
 
 
 class ReworkBranchConflictError(RuntimeError):
@@ -169,12 +201,30 @@ class ReworkBranchConflictError(RuntimeError):
         base_ref: str,
         conflicted_paths: tuple[str, ...],
         stderr: str | None = None,
+        stage: str = "conflict",
     ) -> None:
         self.worktree_path = worktree_path
         self.branch = branch
         self.base_ref = base_ref
         self.conflicted_paths = conflicted_paths
         self.stderr = stderr
+        self.stage = stage
+        if stage == "pre_merge":
+            # The merge never began, so there is no conflict to describe and
+            # `conflicted_paths` is empty by construction. Naming the stage and
+            # carrying git's own stderr is the whole diagnostic value here: the
+            # message is what reaches the event payload via `str(exc)`, and a
+            # bare "conflicts with base ...; conflicted paths: (unknown)" sent
+            # a reader looking for a content conflict that does not exist.
+            detail = _first_lines(stderr, limit=_PRE_MERGE_STDERR_LINES) or "(no stderr captured)"
+            blocked = ", ".join(conflicted_paths) if conflicted_paths else "(none identified)"
+            super().__init__(
+                f"rework branch {branch!r} could not begin a merge with base "
+                f"{base_ref!r} (no MERGE_HEAD — this is a pre-merge failure, "
+                f"NOT a content conflict); blocking paths outside declared "
+                f"scaffolding: {blocked}; git said: {detail}"
+            )
+            return
         paths_str = ", ".join(conflicted_paths) if conflicted_paths else "(unknown)"
         super().__init__(
             f"rework branch {branch!r} conflicts with base {base_ref!r}; "
@@ -648,6 +698,53 @@ def remote_branch_ahead_count(
         return None, f"rev-list returned non-integer: {count_result.stdout!r}"
 
 
+def worktree_ahead_of_sha(worktree_path: Path, base_sha: str) -> tuple[int | None, str | None]:
+    """Return how many commits the worktree HEAD is ahead of ``base_sha``.
+
+    Used by the rework death-loop escalation (issue #1134) to detect
+    *stranded* work — commits the worker made but never pushed because it
+    died mid-push.  Returns ``(ahead_count, error)``.  ``ahead_count`` is
+    ``None`` when the worktree does not exist, ``base_sha`` is not a known
+    object, or git fails.  A count of ``0`` means the worktree HEAD is at
+    or behind ``base_sha`` (no stranded commits).
+    """
+    if not worktree_path.is_dir():
+        return None, f"worktree does not exist: {worktree_path}"
+
+    head_result = run_captured(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not head_result.ok:
+        return None, f"rev-parse HEAD failed: {head_result.error or head_result.stderr}"
+    head_sha = head_result.stdout.strip()
+
+    if not _object_exists(worktree_path, base_sha):
+        return None, f"base sha not in worktree object store: {base_sha}"
+
+    merge_base_result = run_captured(
+        ["git", "merge-base", base_sha, head_sha],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not merge_base_result.ok:
+        return None, f"merge-base failed: {merge_base_result.error or merge_base_result.stderr}"
+    merge_base = merge_base_result.stdout.strip()
+
+    count_result = run_captured(
+        ["git", "rev-list", "--count", f"{merge_base}..{head_sha}"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not count_result.ok:
+        return None, f"rev-list failed: {count_result.error or count_result.stderr}"
+    try:
+        return int(count_result.stdout.strip()), None
+    except ValueError:
+        return None, f"rev-list returned non-integer: {count_result.stdout!r}"
+
+
 def _object_exists(repo_root: Path, sha: str) -> bool:
     """Return True if ``sha`` names an object present in the local object store.
 
@@ -725,6 +822,8 @@ def _merge_update_rework_branch(
     worktree_path: Path,
     branch: str,
     base_ref: str,
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
 ) -> ReworkMergeConflict | None:
     """Merge-update a checked-out rework branch onto the current base.
 
@@ -744,12 +843,29 @@ def _merge_update_rework_branch(
         None if the merge completed cleanly (including "already up to date").
         A ``ReworkMergeConflict`` describing the aborted merge otherwise.
 
+    ``injected_paths`` and ``materialize_dirs`` name the orchestrator's own
+    scaffolding. They are used only to clear a self-inflicted pre-merge
+    collision (see below); nothing outside them is ever removed.
+
     Raises:
-        ReworkBranchConflictError: only when recovery from the failed merge
-            itself fails — ``git merge --abort`` reports an error, or a
-            ``MERGE_HEAD`` is somehow still present afterward. This leaves the
-            worktree mid-merge and unusable, so it escalates instead of
-            handing a worker a broken workspace.
+        ReworkBranchConflictError: in two distinct situations, distinguished by
+            the exception's ``stage``.
+
+            ``stage="conflict"`` — a merge really was in progress and recovery
+            from it failed: ``git merge --abort`` reported an error AND a
+            ``MERGE_HEAD`` is still present. The worktree is mid-merge and
+            unusable, so this escalates instead of handing a worker a broken
+            workspace.
+
+            ``stage="pre_merge"`` — the merge never began (no ``MERGE_HEAD``),
+            and the reason could not be remediated. This is NOT a content
+            conflict; the branch may merge perfectly cleanly. Two causes are
+            remediated, both being the orchestrator's own scaffolding colliding
+            with the incoming tree in a reused worktree, and both repaired
+            before a single retry: an *untracked* copy of a base-tracked file
+            (removed), and a *locally modified tracked* file the merge would
+            overwrite (restored from ``HEAD``). Anything else — or any blocker
+            outside the declared scaffolding — is left untouched and escalated.
         RuntimeError: if the base ref cannot be fetched or the merge command
             itself cannot be run.
     """
@@ -776,6 +892,92 @@ def _merge_update_rework_branch(
     if merge_result.ok:
         return None
 
+    # A failed `git merge` has three outcomes, not two, and only MERGE_HEAD
+    # separates them. Capture it BEFORE aborting, because `merge --abort`
+    # destroys the very state being asked about:
+    #
+    #   (a) merge started, conflicted, aborts cleanly  -> ReworkMergeConflict
+    #   (b) merge started, conflicted, abort fails     -> unrecoverable, raise
+    #   (c) merge never started at all                 -> not a conflict
+    #
+    # Case (c) is what an untracked-file collision produces: the merge is
+    # refused up front, so there is no MERGE_HEAD, `--diff-filter=U` is empty,
+    # and `merge --abort` exits 128 "There is no merge to abort". Keying the
+    # raise off `not abort_result.ok` read that failure as evidence of a broken
+    # mid-merge worktree when it means the exact opposite — the tree is clean
+    # and untouched. That misread laundered a self-inflicted scaffolding
+    # collision into `rework_branch_conflict`, which is a deterministic-
+    # escalation kind, so 17 branches were parked at `agent:human-needed` on
+    # first occurrence with no real conflict between any of them and the base.
+    if not _merge_head_present(worktree_path):
+        # Case (c). The common cause is orchestrator scaffolding left behind by
+        # a previous attempt on a reused worktree: materialization runs later in
+        # `create_worktree` than this merge, so on a fresh worktree these files
+        # do not exist yet, and on a reused one they are untracked copies of
+        # paths the base now tracks. Clear only those and retry once.
+        #
+        # Scaffolding blocks a merge in two distinct ways and git reports them
+        # with two different messages, so both sets are collected before
+        # deciding anything. Repairing only the untracked half leaves a worktree
+        # that is *also* holding a modified tracked copy still blocked, and the
+        # retry then fails for a reason the first repair could never have
+        # addressed.
+        untracked_blocking = _untracked_paths_shadowing_ref(worktree_path, merge_base_ref)
+        modified_blocking = _modified_paths_overwritten_by_ref(worktree_path, merge_base_ref)
+        blocking = untracked_blocking + modified_blocking
+        undeclared = tuple(
+            path
+            for path in blocking
+            if not _declared_scaffolding_matcher(injected_paths, materialize_dirs)(path)
+        )
+        # The declared/undeclared verdict is taken over the *union*: a single
+        # undeclared blocker in either class means nothing is repaired at all,
+        # because a partial repair that still fails the merge would destroy
+        # files for no benefit.
+        if (
+            blocking
+            and not undeclared
+            and _repair_declared_scaffolding_blockers(
+                worktree_path,
+                untracked_blocking,
+                modified_blocking,
+                injected_paths,
+                materialize_dirs,
+            )
+        ):
+            retry_result = run_captured(
+                ["git", "merge", "--no-edit", merge_base_ref],
+                cwd=worktree_path,
+                timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            )
+            if retry_result.ok:
+                return None
+            if _merge_head_present(worktree_path):
+                # The retry got far enough to conflict for real. Fall through to
+                # the conflict path below so the worker is briefed to resolve it.
+                merge_result = retry_result
+            else:
+                raise ReworkBranchConflictError(
+                    worktree_path=worktree_path,
+                    branch=branch,
+                    base_ref=merge_base_ref,
+                    conflicted_paths=(),
+                    stderr=retry_result.stderr or retry_result.error,
+                    stage="pre_merge",
+                )
+        else:
+            # Either nothing identifiable is blocking, or something outside the
+            # declared scaffolding is. Escalating is correct — but say what it
+            # actually was instead of calling it a content conflict.
+            raise ReworkBranchConflictError(
+                worktree_path=worktree_path,
+                branch=branch,
+                base_ref=merge_base_ref,
+                conflicted_paths=undeclared,
+                stderr=merge_result.stderr or merge_result.error,
+                stage="pre_merge",
+            )
+
     # Read the unmerged paths while the merge is still in progress, then abort.
     diff_result = run_captured(
         ["git", "diff", "--name-only", "--diff-filter=U"],
@@ -792,14 +994,16 @@ def _merge_update_rework_branch(
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not abort_result.ok or _merge_head_present(worktree_path):
-        # Genuinely unrecoverable: the worktree may still be mid-merge. Escalate
-        # rather than handing a worker a broken workspace.
+        # Case (b): a merge genuinely was in progress and did not come back.
+        # The worktree may still be mid-merge, so escalate rather than handing a
+        # worker a broken workspace. Prefer the merge's own stderr — the abort's
+        # is about the abort, and the merge's is what explains the failure.
         raise ReworkBranchConflictError(
             worktree_path=worktree_path,
             branch=branch,
             base_ref=merge_base_ref,
             conflicted_paths=conflicted_paths,
-            stderr=abort_result.stderr or merge_result.stderr,
+            stderr=merge_result.stderr or abort_result.stderr,
         )
 
     base_sha_result = run_captured(
@@ -977,6 +1181,203 @@ def _parse_status_v2_paths(stdout: str) -> list[str]:
     return paths
 
 
+def _declared_scaffolding_matcher(
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
+) -> Callable[[str], bool]:
+    """Build a predicate matching worktree-relative paths the orchestrator
+    itself declares it writes (``injected_paths`` + ``materialize_dirs``).
+
+    Extracted so the dirty-check and the pre-merge collision cleanup share one
+    definition of "orchestrator scaffolding, not worker product". Two copies of
+    this rule that drift apart would let the cleanup delete something the dirty
+    check considers worker-authored — the one outcome that must never happen.
+    """
+    # Normalize the configured side too, so a Windows-style backslash override
+    # still matches git's forward-slash path reporting.
+    excluded = [
+        PurePosixPath(str(p).replace("\\", "/")) for p in (*injected_paths, *materialize_dirs)
+    ]
+
+    def _is_declared(raw_path: str) -> bool:
+        # Git may emit backslashes on Windows; normalize for comparison.
+        path = PurePosixPath(str(raw_path).replace("\\", "/"))
+        return any(
+            path == excluded_path or excluded_path in path.parents for excluded_path in excluded
+        )
+
+    return _is_declared
+
+
+def _worktree_git_runner(worktree_path: Path) -> git_pull_blockers.GitRunner:
+    """Bind :mod:`git_pull_blockers`' runner seam to this worktree."""
+
+    def run_git(argv: list[str]) -> RunResult:
+        return run_captured(argv, cwd=worktree_path, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
+
+    return run_git
+
+
+def _untracked_paths_shadowing_ref(worktree_path: Path, ref: str) -> tuple[str, ...]:
+    """Worktree-relative untracked paths that ``ref`` also tracks.
+
+    Refusal class (a) — see :mod:`charlie_work.git_pull_blockers`, which owns
+    the implementation so the orchestrator's own self-deploy asks the same
+    question the same way.
+    """
+    return git_pull_blockers.untracked_paths_shadowing_ref(
+        _worktree_git_runner(worktree_path), ref
+    )
+
+
+def _modified_paths_overwritten_by_ref(worktree_path: Path, ref: str) -> tuple[str, ...]:
+    """Worktree-relative tracked paths that are locally modified *and* that
+    merging ``ref`` would change.
+
+    Refusal class (b) — the other half of the same refusal
+    ``_untracked_paths_shadowing_ref`` covers, and the reason handling only the
+    untracked half left the rest escalating. Implementation and the full
+    rationale (merge-base basis, ``--diff-filter=M``) live in
+    :mod:`charlie_work.git_pull_blockers`.
+
+    Live example this exists for: the devin shim rewrites ``.devin/prompts/*``
+    in the worktree, and job-cannon's ``15dacbb6`` *deleted* those paths from
+    the base. Merging then wants to remove a locally modified file, which git
+    refuses. Every branch forked before that commit hits it.
+    """
+    return git_pull_blockers.modified_paths_overwritten_by_ref(
+        _worktree_git_runner(worktree_path), ref
+    )
+
+
+def _clear_declared_scaffolding_collisions(
+    worktree_path: Path,
+    blocking_paths: tuple[str, ...],
+    injected_paths: tuple[str, ...],
+    materialize_dirs: tuple[str, ...],
+) -> bool:
+    """Remove orchestrator scaffolding that is blocking a pre-merge.
+
+    Returns True only if every blocking path was declared scaffolding AND the
+    removal succeeded. If anything outside the declared set is blocking, this
+    refuses outright and removes nothing — a partial cleanup that still fails
+    the merge would destroy files for no benefit.
+
+    Safe by three independent properties:
+
+    1. Only paths matching ``_declared_scaffolding_matcher`` are eligible —
+       the same predicate ``_worker_authored_dirty`` uses to decide a path is
+       not worker product. Everything removed here is re-materialized
+       unconditionally later in ``create_worktree``.
+    2. Removal goes through ``git clean``, which structurally cannot remove a
+       tracked file or a modified tracked file. A filesystem ``rmtree`` could.
+    3. Each path is containment-checked against the worktree on its *resolved*
+       form, and anything at or under ``.venv`` is refused regardless — that
+       link is a junction into the SHARED virtualenv on this host, so
+       following it would corrupt every worktree at once.
+    """
+    if not _eligible_for_scaffolding_repair(
+        worktree_path, blocking_paths, injected_paths, materialize_dirs
+    ):
+        return False
+    result = run_captured(
+        ["git", "clean", "-f", "-d", "--", *blocking_paths],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
+def _eligible_for_scaffolding_repair(
+    worktree_path: Path,
+    blocking_paths: tuple[str, ...],
+    injected_paths: tuple[str, ...],
+    materialize_dirs: tuple[str, ...],
+) -> bool:
+    """The safety gate every scaffolding repair must pass before touching disk.
+
+    Shared by the untracked-removal and modified-restore paths for the same
+    reason ``_declared_scaffolding_matcher`` is shared with the dirty check: two
+    copies of a rule that decides what may be destroyed are two chances for them
+    to drift into disagreeing, and only one of those outcomes is recoverable.
+    """
+    if not blocking_paths:
+        return False
+    is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
+    if not all(is_declared(path) for path in blocking_paths):
+        return False
+    for path in blocking_paths:
+        if PurePosixPath(path).parts[:1] == (".venv",):
+            return False
+        if not contains(worktree_path, worktree_path / path):
+            return False
+    return True
+
+
+def _restore_declared_scaffolding_modifications(
+    worktree_path: Path,
+    blocking_paths: tuple[str, ...],
+    injected_paths: tuple[str, ...],
+    materialize_dirs: tuple[str, ...],
+) -> bool:
+    """Discard local modifications to orchestrator scaffolding blocking a merge.
+
+    The tracked-file counterpart of ``_clear_declared_scaffolding_collisions``,
+    gated by the identical eligibility check. Discarding these edits loses
+    nothing: every path here is one the orchestrator itself wrote and
+    re-materializes unconditionally later in ``create_worktree``, which is the
+    same premise that lets ``_worker_authored_dirty`` ignore them when deciding
+    whether a worktree holds real work.
+
+    ``git checkout HEAD --`` rather than ``git checkout --``: the latter
+    restores from the index, so a *staged* scaffolding edit would survive and
+    the retried merge would be blocked by the same path a second time.
+    """
+    if not _eligible_for_scaffolding_repair(
+        worktree_path, blocking_paths, injected_paths, materialize_dirs
+    ):
+        return False
+    result = run_captured(
+        ["git", "checkout", "HEAD", "--", *blocking_paths],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    return result.ok
+
+
+def _repair_declared_scaffolding_blockers(
+    worktree_path: Path,
+    untracked_blocking: tuple[str, ...],
+    modified_blocking: tuple[str, ...],
+    injected_paths: tuple[str, ...],
+    materialize_dirs: tuple[str, ...],
+) -> bool:
+    """Repair both classes of scaffolding blocker; True only if all of them were.
+
+    Each class is skipped when empty rather than treated as a failure — a
+    worktree blocked by only one class is the common case, and requiring both to
+    be non-empty would refuse to repair either.
+
+    A False return does not promise nothing was written: if the removal succeeds
+    and the restore then fails, the removed files stay removed. That is
+    deliberate and harmless — every path eligible here is re-materialized
+    unconditionally later in ``create_worktree`` — whereas rolling a partial
+    repair back would mean re-creating files from content this function never
+    had.
+    """
+    if not untracked_blocking and not modified_blocking:
+        return False
+    if untracked_blocking and not _clear_declared_scaffolding_collisions(
+        worktree_path, untracked_blocking, injected_paths, materialize_dirs
+    ):
+        return False
+    if modified_blocking and not _restore_declared_scaffolding_modifications(
+        worktree_path, modified_blocking, injected_paths, materialize_dirs
+    ):
+        return False
+    return True
+
+
 def _worker_authored_dirty(
     worktree_path: Path,
     injected_paths: tuple[str, ...] = (),
@@ -1027,17 +1428,9 @@ def _worker_authored_dirty(
             f"worktree status probe failed; treating as dirty: {detail}"
         )
 
-    # Normalize the configured side too, so a Windows-style backslash override
-    # still matches git's forward-slash path reporting.
-    excluded = [
-        PurePosixPath(str(p).replace("\\", "/")) for p in (*injected_paths, *materialize_dirs)
-    ]
+    is_declared = _declared_scaffolding_matcher(injected_paths, materialize_dirs)
     for raw_path in _parse_status_v2_paths(status_result.stdout):
-        # Git may emit backslashes on Windows; normalize for comparison.
-        path = PurePosixPath(str(raw_path).replace("\\", "/"))
-        if any(
-            path == excluded_path or excluded_path in path.parents for excluded_path in excluded
-        ):
+        if is_declared(raw_path):
             continue
         return True
     return False
@@ -1454,6 +1847,52 @@ def is_junction(path: Path) -> bool:
             return False
         return bool(result.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
     return os.path.islink(path)
+
+
+def is_live_foreign_worktree(entry: Path, repo_root: Path) -> bool:
+    """Return True if ``entry`` is a live git worktree administered by a
+    repository other than ``repo_root``.
+
+    Worker launch shims provision sibling checkouts of *other* repos inside
+    this repo's worktrees dir (e.g. the ``ci_runners`` worktree the ci-fleet
+    editable resolves against). Such a directory is never in this repo's
+    ``git worktree list``, so the orphan sweep would classify it as residue
+    and delete it out from under running workers (2026-08-09 incident: the
+    08:15:43Z reclaim pass removed the sibling minutes after provisioning).
+
+    A linked worktree's ``.git`` is a *file* containing ``gitdir: <admin>``.
+    The directory is a live foreign worktree when that admin dir exists and
+    is not under this repo's own ``.git``. A dangling gitdir (admin dir gone,
+    e.g. after ``git worktree remove`` failed to delete the tree) is residue
+    and stays sweepable. Unreadable/unresolvable ``.git`` fails closed
+    (treated as foreign): deleting what we cannot classify risks destroying
+    live state, while skipping it merely defers cleanup."""
+    gitfile = entry / ".git"
+    try:
+        if not gitfile.is_file():
+            return False
+        content = gitfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    for line in content.splitlines():
+        if line.startswith("gitdir:"):
+            admin = Path(line.split(":", 1)[1].strip())
+            break
+    else:
+        return True
+    if not admin.is_absolute():
+        admin = entry / admin
+    try:
+        admin = admin.resolve()
+        if not admin.is_dir():
+            return False
+        # ``repo_root/.git`` is a directory for a main checkout; resolve()
+        # canonicalizes both sides so the containment test defeats junctions
+        # and 8.3 short names, same as the ci_fleet containment checks.
+        own_git = (repo_root / ".git").resolve()
+    except OSError:
+        return True
+    return not (admin == own_git or admin.is_relative_to(own_git))
 
 
 def _unlink_reparse_point(path: Path) -> None:
@@ -2215,8 +2654,42 @@ def create_worktree(
         )
 
         if existing_wt:
+            # Issue #1118: refuse to adopt a worktree at a foreign path. The
+            # branch-name lookup above spans ALL registered worktrees, so a
+            # branch checked out by the operator in a different directory
+            # (e.g. .claude/worktrees/<name>) would be silently adopted,
+            # committing the operator's uncommitted edits as worker output.
+            # Only a worktree at the orchestrator's expected path is one we
+            # could have created; anything else is a foreign checkout.
+            existing_wt_path = Path(existing_wt["worktree"])
+            if existing_wt_path != worktree_path:
+                raise WorktreeForeignWriterError(
+                    worktree_path=existing_wt_path,
+                    pid=None,
+                    session_id=None,
+                )
             # Reuse existing worktree: fetch and fast-forward to origin tip
-            worktree_path = Path(existing_wt["worktree"])
+            worktree_path = existing_wt_path
+            # Issue #1118: a dirty worktree at adoption time is an independent
+            # hard stop — never commit tracked modifications the shim did not
+            # itself produce. In recovery mode the dirt is a prior (owned)
+            # worker's partial work, so the check is skipped there.
+            #
+            # The ``.venv`` junction is orchestrator scaffolding (a reparse
+            # point, not worker content), so it is excluded from the dirty
+            # check — a leftover junction from a prior dispatch must not
+            # trigger a false positive here. It is unlinked below when
+            # ``venv_source`` is None.
+            if recovery is None:
+                dirty_injected = injected_paths
+                venv_link = worktree_path / ".venv"
+                if is_junction(venv_link):
+                    dirty_injected = injected_paths + (".venv",)
+                dirty_reason = _worktree_dirty_reason(
+                    worktree_path, dirty_injected, materialize_dirs
+                )
+                if dirty_reason:
+                    raise WorktreeUnsafeError(dirty_reason)
             # Only fetch if origin remote exists (deterministic check)
             if _has_origin_remote(repo_root):
                 # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
@@ -2273,7 +2746,12 @@ def create_worktree(
                     )
             if recovery is None:
                 rework_conflict = _merge_update_rework_branch(
-                    repo_root, worktree_path, branch, resolved_base_ref
+                    repo_root,
+                    worktree_path,
+                    branch,
+                    resolved_base_ref,
+                    injected_paths,
+                    materialize_dirs,
                 )
             venv_link = worktree_path / ".venv"
             venv_junction: Path | None = None
@@ -2363,7 +2841,12 @@ def create_worktree(
                 )
             if recovery is None:
                 rework_conflict = _merge_update_rework_branch(
-                    repo_root, worktree_path, branch, resolved_base_ref
+                    repo_root,
+                    worktree_path,
+                    branch,
+                    resolved_base_ref,
+                    injected_paths,
+                    materialize_dirs,
                 )
     else:
         # Fresh dispatch: create new branch off base_ref
@@ -3810,6 +4293,11 @@ def clean_worktrees(
         registered_paths = {Path(wt["worktree"]) for wt in registered_worktrees}
         for child in worktrees_dir.iterdir():
             if not child.is_dir() or child in registered_paths or is_junction(child):
+                continue
+            if is_live_foreign_worktree(child, repo_root):
+                # e.g. the sibling ci_runners checkout worker shims provision
+                # for the ci-fleet editable — another repo's live worktree,
+                # not this repo's residue. Never sweep it.
                 continue
             if dry_run:
                 orphans["planned"].append({"worktree": str(child)})

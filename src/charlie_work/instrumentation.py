@@ -137,6 +137,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # error-level kinds: conditions that ended a lane or lost work
         # -----------------------------------------------------------------
         "cross_family_verdict_abandoned": "error",
+        # The head-SHA guard could not adjudicate, so no verdict is recorded on
+        # this pass. Since #1081 an unusable report is regenerated (bounded per
+        # head) rather than persisting forever, so this is normally transient --
+        # but the pass it fires on still ended a lane, and if regeneration keeps
+        # failing it is `cross_family_report_regen_exhausted` that terminates.
+        "cross_family_verdict_head_indeterminate": "error",
+        # Regeneration budget for one PR head is spent and the report is still
+        # unusable: escalated to a human rather than approved on an unconfirmed
+        # head. Terminal for this lane -> error.
+        "cross_family_report_regen_exhausted": "error",
         "dispatch_blocked_chain_dead": "error",
         "dispatch_failed": "error",
         "fleet_pass_config_error": "error",
@@ -173,7 +183,21 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
+        "ci_fleet_worktree_dirty": "warning",
         "cross_family_verdict_unparseable": "warning",
+        # The packet was forced stale so an unusable cross-family report gets
+        # regenerated. The lane recovers, but it needed repair to get there and
+        # a repeating burst on one PR is the signature of a model outage.
+        "cross_family_report_regen_forced": "warning",
+        # review() was forced to run to regenerate an unusable cross-family
+        # report and returned before ever reaching the regenerator -- almost
+        # always the janitor gate declining a PR with merge conflicts or missing
+        # checks. Warning, not error: the PR has a real upstream problem that
+        # its own gate already reported, and this bound only stops the fleet
+        # from re-entering review() for it forever. Before #1099 this decline
+        # was recorded nowhere, which is why diagnosing it took reconstructing
+        # the call path by hand.
+        "cross_family_regen_not_reached": "warning",
         "deescalation_cap_exhausted": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",
@@ -197,6 +221,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
         "runner_capacity_starved": "warning",
+        # Warning, not info: the deploy went on to succeed, but the checkout
+        # was in a state that needed repairing to get there. Logged at info it
+        # would vanish into the pass-by-pass noise, and the recurrence of the
+        # underlying cause is the whole point of recording it.
+        "self_deploy_blockers_cleared": "warning",
         "session_budget_exceeded": "warning",
         "session_exited": "warning",
         "session_rate_limit_deferred": "warning",
@@ -208,6 +237,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # other ordinary lifecycle events
         # -----------------------------------------------------------------
         "check_failure_rework_requested": "info",
+        "ci_run_never_created": "info",
         "closed_unmerged_pr_state_converged": "info",
         "containment_check": "info",
         "cross_pr_revert_rework_requested": "info",
@@ -259,7 +289,10 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "self_deploy_skipped": "info",
         "self_deploy_succeeded": "info",
         "spec_review": "info",
+        "stale_ci_verdict_gate_pass": "info",
+        "stale_ci_verdict_requeued": "info",
         "stranded_request_changes_rework_requested": "info",
+        "stranded_request_changes_skipped_issue_closed": "info",
         "supervisor_exited": "info",
         "supervisor_started": "info",
         "unauthorized_merge_acknowledged": "info",

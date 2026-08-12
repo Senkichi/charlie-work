@@ -113,6 +113,7 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
             "janitor_warnings": ["some warning"],
             "review_dispatch_status": "review_dispatch_failed",
             "escalation_reason": "max_review_dispatch_attempts_exceeded",
+            "ci_run_never_created_head": "abc123abc123",
         }
         state["issues"]["123"] = {
             "number": 123,
@@ -141,6 +142,7 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
         "janitor_warnings",
         "review_dispatch_status",
         "escalation_reason",
+        "ci_run_never_created_head",
     ):
         assert stale_field not in pr_entry, stale_field
 
