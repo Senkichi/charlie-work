@@ -13757,7 +13757,6 @@ class OrchestratorApp:
                             self.config,
                             repo_root=self.repo_root,
                             state_path=self.paths.state_file,
-                            dry_run=dry_run,
                         )
                         save_state(self.paths.state_file, new_state)
                         # Post-#134: transition() returns TransitionResult with PARTIAL_FAILURE
@@ -13814,7 +13813,7 @@ class OrchestratorApp:
             if fixed:
                 message += " — fixed"
             elif drift:
-                if dry_run:
+                if dry_run and fix:
                     message += " (dry-run; no changes applied)"
                 elif fix and post_fix_drift:
                     message += f" — partially fixed — {len(post_fix_drift)} item(s) remain"
@@ -13822,7 +13821,7 @@ class OrchestratorApp:
                     message += " (read-only; pass --fix to repair)"
             # ok=False when drift is present and not fixed: scripts and CI can gate
             # on exit code to detect unresolved drift, matching how `doctor` gates.
-            ok = not drift or fixed or dry_run
+            ok = not drift or fixed or (dry_run and fix)
             return CommandResult(
                 ok,
                 message,

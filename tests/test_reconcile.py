@@ -4268,49 +4268,6 @@ def test_apply_fixes_mergequeue_revoked_records_label_write_failure() -> None:
     )
 
 
-def test_apply_fixes_dry_run_skips_review_checkout_removal(monkeypatch, tmp_path: Path) -> None:
-    """Issue #615: apply_fixes(dry_run=True) must not remove review checkouts."""
-    config = OrchestratorConfig()
-    gh = FakeGitHub(
-        prs=[_pr(1, "MERGED", head_ref="agent/issue-10-x")],
-        issues=[_issue(10, [config.labels.in_progress, config.labels.reviewing])],
-    )
-    state = empty_state()
-    state["prs"]["1"] = {
-        "number": 1,
-        "issue_number": 10,
-        "status": "reviewing",
-        "review_dispatch_status": "review_dispatch_dispatched",
-        "review_dispatched_at": "2026-07-20T00:00:00Z",
-    }
-
-    removed_calls: list[tuple[Any, int, Any]] = []
-
-    def fake_remove_review_checkout(
-        repo_root: Path, pr_number: int, *, reviews_dir: Path | None = None
-    ) -> bool:
-        removed_calls.append((repo_root, pr_number, reviews_dir))
-        return True
-
-    monkeypatch.setattr(
-        "charlie_work.reconcile.remove_review_checkout",
-        fake_remove_review_checkout,
-    )
-
-    drift = [
-        item
-        for item in detect_drift(gh, state, config, repo_root=tmp_path)
-        if item.kind == "merged_outside_orchestrator"
-    ]
-    assert len(drift) == 1
-
-    new_state = apply_fixes(gh, state, drift, config, repo_root=tmp_path, dry_run=True)
-
-    assert removed_calls == []
-    assert new_state["prs"]["1"]["status"] == "merged"
-    assert new_state.get("events", []) == []
-
-
 def test_reconcile_dry_run_fix_does_not_mutate_local_state(tmp_path: Path) -> None:
     """Issue #615: mop-up --fix --dry-run must not remove checkouts or write state."""
     config = OrchestratorConfig()
@@ -4343,6 +4300,43 @@ def test_reconcile_dry_run_fix_does_not_mutate_local_state(tmp_path: Path) -> No
     assert result.data["fixed"] is False
     assert "dry-run" in result.message.lower()
     assert checkout_path.exists()
+
+    after_state = json.loads(paths.state_file.read_text(encoding="utf-8"))
+    assert after_state["prs"]["1"]["status"] == "reviewing"
+
+
+def test_reconcile_dry_run_without_fix_still_reports_drift(tmp_path: Path) -> None:
+    """Regression: `charlie --dry-run mop-up` (no --fix) must not report success with drift.
+
+    The global `--dry-run` flag only changes behaviour for the mutating `--fix`
+    path. A read-only drift check must keep `ok=False` when drift exists so
+    scripts and CI can gate on the exit code.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeGitHub(
+        prs=[_pr(1, "MERGED", head_ref="agent/issue-10-x")],
+        issues=[_issue(10, [config.labels.in_progress, config.labels.reviewing])],
+    )
+    state = empty_state()
+    state["prs"]["1"] = {
+        "number": 1,
+        "issue_number": 10,
+        "status": "reviewing",
+        "review_dispatch_status": "review_dispatch_dispatched",
+        "review_dispatched_at": "2026-07-20T00:00:00Z",
+    }
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    app = OrchestratorApp(tmp_path, paths, config, gh, dry_run=True)
+    result = app.reconcile(fix=False)
+
+    assert result.ok is False
+    assert result.data["drift_before"] == 1
+    assert result.data["fixed"] is False
+    assert "read-only; pass --fix to repair" in result.message
+    assert "(dry-run" not in result.message
 
     after_state = json.loads(paths.state_file.read_text(encoding="utf-8"))
     assert after_state["prs"]["1"]["status"] == "reviewing"
