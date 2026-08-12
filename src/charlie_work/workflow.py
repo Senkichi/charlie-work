@@ -10435,7 +10435,10 @@ class OrchestratorApp:
         ``rework_requested`` (or otherwise already spoken for).
 
         Returns:
-            CommandResult with a sorted ``queue`` list keyed by repo.
+            CommandResult with a sorted ``queue`` list keyed by repo. Each
+            candidate dict carries ``mergeable`` and ``mergeStateStatus`` from
+            ``pr_list()`` so callers (e.g. ``dispatch_reviews``) can detect
+            merge-conflicting PRs without an extra ``pr_view`` call (issue #1497).
         """
         prs = self.gh.pr_list()
         queue: list[dict[str, Any]] = []
@@ -10500,6 +10503,8 @@ class OrchestratorApp:
                             "packet_head_sha": packet_head_sha,
                             "decision": "vacuous",
                             "reviewed_head_sha": reviewed_head_sha,
+                            "mergeable": pr.get("mergeable"),
+                            "mergeStateStatus": pr.get("mergeStateStatus"),
                         }
                     )
                     continue
@@ -10537,6 +10542,8 @@ class OrchestratorApp:
                                     "packet_head_sha": packet_head_sha,
                                     "decision": "stale",
                                     "reviewed_head_sha": reviewed_head_sha,
+                                    "mergeable": pr.get("mergeable"),
+                                    "mergeStateStatus": pr.get("mergeStateStatus"),
                                 }
                             )
                         continue
@@ -10620,6 +10627,8 @@ class OrchestratorApp:
                         "packet_head_sha": packet_head_sha,
                         "decision": "stale",
                         "reviewed_head_sha": reviewed_head_sha,
+                        "mergeable": pr.get("mergeable"),
+                        "mergeStateStatus": pr.get("mergeStateStatus"),
                     }
                 )
             elif decision_value in ("pending", "missing", "invalid"):
@@ -10639,6 +10648,8 @@ class OrchestratorApp:
                         if decision_value in ("pending", "missing")
                         else "missing",
                         "reviewed_head_sha": None,
+                        "mergeable": pr.get("mergeable"),
+                        "mergeStateStatus": pr.get("mergeStateStatus"),
                     }
                 )
 
@@ -11486,9 +11497,20 @@ class OrchestratorApp:
 
         # Filter out PRs that are already claimed or still have a live reviewer.
         # Also escalate PRs that have exhausted their dispatch attempt budget.
+        # Route merge-conflicting PRs to rework instead of dispatching a reviewer
+        # (issue #1497): a CONFLICTING PR sitting in ``agent:reviewing`` with a
+        # current packet would otherwise be dispatched every pass, but the
+        # reviewer's verdict cannot merge — and if the PR never reaches the
+        # merge lane (e.g. no verdict is ever recorded), ``review()``'s own
+        # janitor-gate conflict route never runs either, so the PR sits in
+        # ``agent:reviewing`` forever with zero dispatch events. Routing here
+        # mirrors ``review()``'s janitor-gate merge-conflict path
+        # (``_route_janitor_gate_failure_to_rework`` with ``reason="merge_conflict"``),
+        # including the same attempt cap and escalation to ``agent:human-needed``.
         max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
         escalated_for_labels: list[tuple[int, int | None]] = []
         escalated_skipped: list[int] = []
+        merge_conflict_routed: list[dict[str, Any]] = []
         # Issue #586's repair set used to be collected here, from the PRs this
         # candidate loop skipped. Issue #1088: that made the sweep unreachable,
         # because this loop runs below the ``review_dispatch.enabled`` early
@@ -11533,6 +11555,33 @@ class OrchestratorApp:
                     or issue_state_gate.get("status") == "escalated"
                 ):
                     escalated_skipped.append(c["pr"])
+                    continue
+                # Issue #1497: a merge-conflicting PR in the review queue must
+                # not be dispatched — a reviewer verdict on a CONFLICTING branch
+                # cannot merge, and the PR may never reach ``review()``'s own
+                # janitor-gate conflict route (which only fires from the merge
+                # lane for approved PRs whose head moved). Collect it here for
+                # routing outside the lock; ``_route_janitor_gate_failure_to_
+                # rework`` acquires its own ``state_lock`` and calls
+                # ``transition()`` (GitHub API), so it cannot run inside this
+                # critical section. The escalation gate above already filtered
+                # out escalated PRs; a live in-flight reviewer is left alone
+                # (the live-reviewer check below) so its verdict is not
+                # orphaned.
+                if (
+                    str(c.get("mergeable") or "").upper() == "CONFLICTING"
+                    or str(c.get("mergeStateStatus") or "").upper() == "DIRTY"
+                ):
+                    if pr_state.get(
+                        "review_dispatch_status"
+                    ) == "review_dispatch_dispatched" and _reviewer_pid_alive(pr_state):
+                        # Same live-reviewer protection as the attempt-cap
+                        # path: do not route to rework while a reviewer is
+                        # mid-session — the verdict may still clear the
+                        # conflict (e.g. a request_changes that prompts a
+                        # rebase). Let the review finish first.
+                        continue
+                    merge_conflict_routed.append(c)
                     continue
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 if pr_state.get(
@@ -11585,11 +11634,15 @@ class OrchestratorApp:
             # attempt-count or claim mutation ran for them; here we only need
             # to exclude those same PR numbers so this second pass over
             # candidates doesn't re-select them via _is_review_dispatchable.
+            # Merge-conflict candidates (issue #1497) are excluded here too —
+            # they are routed to rework outside the lock below, not dispatched.
             escalated_skipped_set = set(escalated_skipped)
+            merge_conflict_pr_set = {c["pr"] for c in merge_conflict_routed}
             dispatchable = [
                 c
                 for c in candidates
                 if c["pr"] not in escalated_skipped_set
+                and c["pr"] not in merge_conflict_pr_set
                 and _is_review_dispatchable(
                     state, c["pr"], c, max_attempts=max_attempts, now=resolved_now
                 )
@@ -11639,6 +11692,56 @@ class OrchestratorApp:
                         }
                     save_state(self.paths.state_file, state)
 
+        # Issue #1497: route merge-conflicting candidates to rework outside the
+        # state lock. ``_route_janitor_gate_failure_to_rework`` acquires its own
+        # ``state_lock`` and calls ``transition()`` (GitHub API), so it cannot
+        # run inside the critical section above. This mirrors ``review()``'s
+        # janitor-gate merge-conflict path exactly — same ``reason``,
+        # same ``attempts_key``, same ``max_attempts`` cap, same escalation to
+        # ``agent:human-needed`` when the cap is exceeded — so a CONFLICTING PR
+        # discovered by either path converges to the same state. The method is
+        # idempotent: if a rework is already pending it returns ``None`` (no-op),
+        # and if the lane's own cap already escalated it returns ``None`` too.
+        # Gated by dry_run: --dry-run must not perform live GitHub label
+        # mutations or state.json writes (same gate as the escalation label
+        # edge above).
+        merge_conflict_results: list[dict[str, Any]] = []
+        if merge_conflict_routed and not self.dry_run:
+            for c in merge_conflict_routed:
+                pr_number = int(c["pr"])
+                issue_num = c.get("issue")
+                if issue_num is None:
+                    continue
+                pr = self.gh.pr_view(pr_number)
+                if pr is None:
+                    continue
+                # Re-check mergeable from the fresh pr_view: pr_list's
+                # ``mergeable`` can be UNKNOWN (GitHub computes it
+                # asynchronously), and the conflict may have resolved between
+                # the queue build and now. ``mergeStateStatus == "DIRTY"`` from
+                # pr_list is already a reliable signal, but pr_view's
+                # ``mergeable`` is the authoritative reading.
+                if not self._is_merge_conflict(pr):
+                    continue
+                routed = self._route_janitor_gate_failure_to_rework(
+                    pr,
+                    issue_num,
+                    attempts_key="conflict_rework_attempts",
+                    max_attempts=self.config.review.max_conflict_rework_attempts,
+                    reason="merge_conflict",
+                    router=self._request_merge_conflict_rework,
+                )
+                if routed is not None:
+                    merge_conflict_results.append(
+                        {
+                            "pr": pr_number,
+                            "issue": issue_num,
+                            "routed_to_rework": routed.data.get("routed_to_rework", False),
+                            "escalated": routed.data.get("escalated", False),
+                            "rescue_dispatched": routed.data.get("rescue_dispatched", False),
+                        }
+                    )
+
         # Apply the local and provider-token caps. 0 means unlimited for both.
         max_local = self.config.review_dispatch.max_local_review_processes
         max_concurrent = self.config.review_dispatch.max_concurrent_reviews
@@ -11665,6 +11768,7 @@ class OrchestratorApp:
                     "launched_count": 0,
                     "deferred_count": len(candidates) - len(selected),
                     "escalated_skipped": escalated_skipped,
+                    "merge_conflict_routed": [c["pr"] for c in merge_conflict_routed],
                     **local_cap.report_fields(),
                 },
             )
@@ -11983,6 +12087,7 @@ class OrchestratorApp:
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
             "escalated_skipped": escalated_skipped,
+            "merge_conflict_results": merge_conflict_results,
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
             "rescue_review_results": rescue_review_results,
