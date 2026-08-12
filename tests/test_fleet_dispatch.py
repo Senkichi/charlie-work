@@ -23,17 +23,20 @@ from charlie_work.config import (
 )
 from charlie_work.fleet_dispatch import (
     ApiWorkerFleetReport,
+    FleetLocalSnapshot,
     _CiFleetDirtyCheck,
     _build_fleet_attention_digest,
     _emit_fleet_transition,
     _extract_attention_events,
     _fleet_has_configured_repos,
+    _has_fleet_delta,
     _is_fleet_pass_active,
     _lane_failure_state_path,
     _run_fleet_allocation_prologue,
     _run_fleet_autoscale_prologue,
     _select_repos,
     _ci_fleet_worktree_dirty as _real_ci_fleet_worktree_dirty,
+    _take_fleet_snapshot,
     compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
@@ -4172,6 +4175,236 @@ def test_fleet_loop_api_worker_report_none_when_unconfigured(
 
     assert result.ok is True
     assert result.data["api_worker_report"] is None
+
+
+def test_compute_api_worker_fleet_report_respects_global_devin_sessions_dir_override(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """The live-api count resolves sessions_dir from the layered config, not state_dir default.
+
+    Regression for the review of issue #707: the live-api loop in
+    compute_api_worker_fleet_report used layout.sessions_dir_default directly,
+    so a devin.sessions_dir override from the global fleet layer was ignored.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=_API_WORKER_YAML.format(enabled="true"))
+
+    # Global fleet layer sets the sessions dir; per-repo config only declares api_worker.
+    (fleet_dir / "config.yaml").write_text(
+        "devin:\n  sessions_dir: custom-sessions\n",
+        encoding="utf-8",
+    )
+
+    # The default sessions dir is empty; the live api sidecar is in the override.
+    custom_sessions = repo / "custom-sessions"
+    custom_sessions.mkdir(parents=True)
+    (custom_sessions / "issue-1.api.json").write_text(
+        _json.dumps(
+            {
+                "issue_number": 1,
+                "branch": "main",
+                "worktree_path": str(repo / "worktrees" / "issue-1"),
+                "prompt_path": str(repo / "prompt.md"),
+                "command": ["claude"],
+                "pid": 1234,
+                "started_at": "2026-08-05T00:00:00Z",
+                "log_path": str(repo / "log.txt"),
+                "adapter_kind": "api",
+                "provider": "kimi-k3",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda _record: True)
+
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is not None
+    assert report.live == 1
+
+
+def test_take_fleet_snapshot_detects_delta_with_devin_sessions_dir_override(
+    tmp_path: Path,
+) -> None:
+    """_take_fleet_snapshot uses the resolved sessions_dir, not the default.
+
+    Regression for the review of issue #707: _repo_state_dirs built the
+    sessions dir from layout.sessions_dir_default, so a devin.sessions_dir
+    override produced no snapshot signal and no fleet delta.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=None)
+
+    # Global fleet layer overrides the sessions dir.
+    (fleet_dir / "config.yaml").write_text(
+        "devin:\n  sessions_dir: custom-sessions\n",
+        encoding="utf-8",
+    )
+
+    custom_sessions = repo / "custom-sessions"
+    custom_sessions.mkdir(parents=True)
+    (custom_sessions / "issue-1.json").write_text(
+        _json.dumps({"dummy": "sidecar"}), encoding="utf-8"
+    )
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    before = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    (custom_sessions / "issue-2.json").write_text(
+        _json.dumps({"dummy": "sidecar"}), encoding="utf-8"
+    )
+
+    after = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    assert _has_fleet_delta(before, after) is True
+
+
+def test_take_fleet_snapshot_skips_repo_with_malformed_config(
+    tmp_path: Path,
+) -> None:
+    """A repo with an unparseable per-repo config does not crash _take_fleet_snapshot.
+
+    Regression for the review of issue #707: _take_fleet_snapshot's new
+    load_layered_config call caught only ConfigError and OSError, so a
+    malformed orchestrator.config.yaml (which raises yaml.YAMLError) crashed
+    the fleet supervisor at startup.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=None)
+
+    # Plant a malformed YAML file that yaml.safe_load cannot parse.
+    (repo / "orchestrator.config.yaml").write_text(
+        "devin:\n  sessions_dir: [unclosed\n",
+        encoding="utf-8",
+    )
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    result = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    assert isinstance(result, FleetLocalSnapshot)
+
+
+def test_compute_api_worker_fleet_report_skips_repo_with_malformed_config(
+    tmp_path: Path,
+) -> None:
+    """A repo with an unparseable per-repo config does not crash compute_api_worker_fleet_report.
+
+    Regression for the review of issue #707: compute_api_worker_fleet_report's
+    first loop caught only (ConfigError, GitHubError, OSError), so a malformed
+    orchestrator.config.yaml (which raises yaml.YAMLError) crashed the fleet
+    pass and ``charlie fleet status`` instead of skipping the repo.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=_API_WORKER_YAML.format(enabled="true"))
+
+    # Plant a malformed YAML file that yaml.safe_load cannot parse.
+    (repo / "orchestrator.config.yaml").write_text(
+        "devin:\n  sessions_dir: [unclosed\n",
+        encoding="utf-8",
+    )
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": str(repo),
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    # Must return None (no repo configured a usable api_worker section) rather
+    # than raising yaml.YAMLError.
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is None
+
+
+def test_take_fleet_snapshot_skips_repo_with_null_repo_root(
+    tmp_path: Path,
+) -> None:
+    """A corrupted registry entry with repo_root: null does not crash _take_fleet_snapshot.
+
+    Regression for the review of issue #707: ``Path(entry.get("repo_root", ""))``
+    returns ``Path(None)`` when the key is present with a null value (``.get``'s
+    default only applies when the key is *absent*), raising TypeError. The same
+    bug class existed in compute_api_worker_fleet_report and the autoscale
+    prologue; all three now use ``entry.get("repo_root") or ""``.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=None)
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": None,
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    result = _take_fleet_snapshot(fleet_dir_override=str(fleet_dir))
+
+    assert isinstance(result, FleetLocalSnapshot)
+
+
+def test_compute_api_worker_fleet_report_skips_repo_with_null_repo_root(
+    tmp_path: Path,
+) -> None:
+    """A corrupted registry entry with repo_root: null does not crash compute_api_worker_fleet_report.
+
+    ``entry.get("repo_root") or ""`` makes a null value behave like a missing
+    key (fall back to cwd), matching the pre-existing behavior — the fix is
+    about preventing the TypeError crash, not changing the missing-key path.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    repo = _make_repo(tmp_path, "repo", api_worker=_API_WORKER_YAML.format(enabled="true"))
+
+    repos_map = {
+        "owner/repo": {
+            "repo_root": None,
+            "config_path": str(repo / "orchestrator.config.yaml"),
+            "state_dir": str(repo / ".var" / "charlie-work"),
+        }
+    }
+    _make_fleet_json(tmp_path, fleet_dir, repos_map)
+
+    # Must not raise TypeError; the call completes and returns a value.
+    report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
+
+    assert report is None or isinstance(report, ApiWorkerFleetReport)
 
 
 # --------------------------------------------------------------------------

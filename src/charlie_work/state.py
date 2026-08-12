@@ -239,30 +239,12 @@ def escalation_reason_class(reason_class: str) -> str:
     return reason_class
 
 
-def set_escalation(
-    entry: dict[str, Any],
-    *,
-    reason: str,
-    reason_class: str,
-) -> dict[str, Any]:
-    """Set the paired escalation fields on ``entry`` atomically.
-
-    ``reason_class`` is validated through ``escalation_reason_class`` so a
-    typo fails loudly at write time. Callers are responsible for setting
-    ``status`` to ``"escalated"`` or ``"blocked"`` separately -- this helper
-    owns only the paired reason/class invariant.
-    """
-    entry["escalation_reason"] = reason
-    entry["reason_class"] = escalation_reason_class(reason_class)
-    return entry
-
-
 def clear_escalation(entry: dict[str, Any]) -> dict[str, Any]:
     """Remove the paired escalation fields from ``entry``.
 
     Safe to call on any dict: missing keys are ignored. This is the
-    single-point inverse of ``set_escalation`` and must be used on every
-    code path that clears an escalation, so ``reason_class`` can never
+    single-point inverse of the escalation write path and must be used on
+    every code path that clears an escalation, so ``reason_class`` can never
     survive after its ``escalation_reason`` is removed.
     """
     entry.pop("escalation_reason", None)
