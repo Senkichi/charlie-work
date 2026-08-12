@@ -19382,6 +19382,150 @@ def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
 
 
+def test_merge_ready_dry_run_does_not_merge_or_persist(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run, merge_ready must not call merge_pr, must
+    not write status='merged' to state.json, and must return the computed
+    readiness verdict (can_merge=True) without persisting."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    # The verdict is computed (can_merge=True) but nothing happened.
+    assert result.data["can_merge"] is True
+    assert result.data["merged"] is False
+    assert result.data["dry_run"] is True
+    assert "would merge" in result.message
+    # No merge was attempted.
+    assert fake_gh.merged == []
+    assert fake_gh.deleted_branches == []
+    # State was NOT written — no 'merged' status, no prs entry at all.
+    state = load_state(paths.state_file)
+    pr_state = state["prs"].get("456", {})
+    assert pr_state.get("status") != "merged"
+    assert pr_state.get("merged") is not True
+
+
+def test_merge_ready_dry_run_mergequeue_does_not_label_or_persist(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run with mergequeue_label set, merge_ready must
+    not call add_pr_label, must not write status='mergequeue' to state.json,
+    and must return the computed readiness verdict without persisting.
+
+    This is the highest-severity blast radius: without the gate, the dry-run
+    stub's _run_bool returns True, state records status='mergequeue', and the
+    PR is silently stranded — the orchestrator believes Aviator owns it but
+    Aviator never received the label."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is True
+    assert result.data["merged"] is False
+    assert result.data["dry_run"] is True
+    assert result.data["mergequeue_label_applied"] is None
+    assert "would hand off to mergequeue" in result.message
+    # No label was added, no merge was attempted.
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    # State was NOT written — no 'mergequeue' status.
+    state = load_state(paths.state_file)
+    pr_state = state["prs"].get("456", {})
+    assert pr_state.get("status") != "mergequeue"
+    assert pr_state.get("status") != "merged"
+
+
+def test_merge_ready_dry_run_preserves_existing_state(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run, merge_ready must not increment
+    consecutive_failed_merge_attempts or advance the state machine in any
+    way.  A pre-existing PR state entry must be byte-for-byte unchanged
+    after a dry-run pass."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    app.record_review(456, "approved", summary="ok")
+
+    # Plant a pre-existing PR state entry with a non-zero counter.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "approved",
+            "consecutive_failed_merge_attempts": 3,
+            "consecutive_stale_base_deferrals": 0,
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["dry_run"] is True
+    # The counter is reported from the existing state, not incremented.
+    assert result.data["consecutive_failed_merge_attempts"] == 3
+    # State on disk is unchanged.
+    persisted = load_state(paths.state_file)["prs"]["456"]
+    assert persisted["consecutive_failed_merge_attempts"] == 3
+    assert persisted["status"] == "approved"
+
+
+def test_merge_ready_dry_run_already_merged_is_noop(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run, an already-merged PR returns the
+    idempotency no-op without writing state (the real path's idempotency
+    block conditionally clears merge_alert — a write that must be skipped)."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Plant an already-merged PR state entry with a non-OK merge_alert.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "merged",
+            "merged": True,
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "merge_alert": "DEGRADED",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["already_merged"] is True
+    assert result.data["merged"] is True
+    assert result.data["dry_run"] is True
+    # The merge_alert was NOT cleared (the real path would clear it).
+    persisted_issue = load_state(paths.state_file)["issues"]["123"]
+    assert persisted_issue["merge_alert"] == "DEGRADED"
+
+
+def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) -> None:
+    """Issue #614: under --dry-run, an unapproved PR reports can_merge=False
+    without persisting any state."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert result.data["dry_run"] is True
+    # No state was written for this PR.
+    assert "456" not in load_state(paths.state_file)["prs"]
+
+
 def test_merge_ready_keeps_merged_state_when_label_transition_fails(tmp_path: Path) -> None:
     """Issue #135: PARTIAL_FAILURE during merged transition must be recorded."""
     from charlie_work.labels import TransitionOutcome
@@ -40418,6 +40562,14 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    # Issue #614: merge_ready's dry-run gate sits above the state_lock and
+    # returns a read-only verdict without acquiring the lock — so the
+    # state-lock guard is only reachable on the non-dry-run path.  The state
+    # lock is the first thing that path hits, so no side effects occur before
+    # the StateLockBusy exception.
+    if method_name == "merge_ready":
+        app.dry_run = False
 
     state_path = paths.state_file
     state_path.parent.mkdir(parents=True, exist_ok=True)
