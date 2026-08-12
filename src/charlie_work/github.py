@@ -105,7 +105,7 @@ ISSUE_LIST_FIELDS = "number,title,url,body,labels,author,createdAt,updatedAt,sta
 ISSUE_VIEW_FIELDS = (
     "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state"
 )
-PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,state"
+PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,mergeable,state"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # The field contract for every merged-PR listing. Two producers must satisfy

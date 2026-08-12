@@ -6287,6 +6287,8 @@ def test_review_queue_includes_missing_pending_and_stale_decisions(
             "packet_head_sha": "sha-100",
             "decision": "missing",
             "reviewed_head_sha": None,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         },
         {
             "pr": 200,
@@ -6294,6 +6296,8 @@ def test_review_queue_includes_missing_pending_and_stale_decisions(
             "packet_head_sha": "sha-200",
             "decision": "pending",
             "reviewed_head_sha": None,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         },
         {
             "pr": 300,
@@ -6301,6 +6305,8 @@ def test_review_queue_includes_missing_pending_and_stale_decisions(
             "packet_head_sha": "sha-300-new",
             "decision": "stale",
             "reviewed_head_sha": "sha-300-old",
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         },
     ]
 
@@ -6624,6 +6630,8 @@ def test_review_queue_reports_stale_on_different_patch_id(tmp_path: Path) -> Non
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": "sha-old-head",
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
 
@@ -6696,6 +6704,8 @@ def test_review_queue_git_failure_falls_back_to_stale(
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": old_head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
 
@@ -6943,6 +6953,8 @@ def test_review_queue_reports_stale_on_reordered_changed_lines(tmp_path: Path) -
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": old_head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
     decision = json.loads(
@@ -7031,6 +7043,8 @@ def test_review_queue_reports_stale_on_changed_file_set(tmp_path: Path) -> None:
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": old_head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
 
@@ -7112,6 +7126,8 @@ def test_review_queue_git_failure_in_tier2_falls_back_to_stale(tmp_path: Path) -
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": old_head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
     decision = json.loads(
@@ -7324,6 +7340,8 @@ def test_review_queue_reports_stale_on_mixed_binary_content_change(tmp_path: Pat
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": old_head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
     decision = json.loads(
@@ -7403,6 +7421,8 @@ def test_review_queue_reports_stale_on_binary_only_content_change(tmp_path: Path
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": old_head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
 
@@ -7554,6 +7574,8 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": old_head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
     decision = json.loads(
@@ -7791,6 +7813,8 @@ def test_review_queue_same_head_stale_ci_requeues_as_stale(tmp_path: Path) -> No
             "packet_head_sha": head,
             "decision": "stale",
             "reviewed_head_sha": head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
 
@@ -7906,6 +7930,8 @@ def test_review_queue_carry_forward_suppressed_when_stale_ci(tmp_path: Path) -> 
             "packet_head_sha": new_head,
             "decision": "stale",
             "reviewed_head_sha": old_head,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
 
@@ -12772,6 +12798,8 @@ def test_review_queue_flags_content_free_request_changes_as_vacuous(tmp_path: Pa
             "packet_head_sha": "sha-700",
             "decision": "vacuous",
             "reviewed_head_sha": "sha-700",
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         },
     ]
 
@@ -37295,6 +37323,8 @@ def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monke
             "packet_head_sha": "sha-7",
             "decision": "missing",
             "reviewed_head_sha": None,
+            "mergeable": None,
+            "mergeStateStatus": "CLEAN",
         }
     ]
     assert len(result.data["errors"]) == 1
