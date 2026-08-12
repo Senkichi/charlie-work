@@ -218,6 +218,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "review_dispatch_lifecycle_reaped": "warning",
         "review_packet_template_stale": "warning",
         "review_quota_exhausted": "warning",
+        # The stale-claim recovery sweep (issue #487's "never claimed/dispatched"
+        # path) skipped a PR without acting on it -- prompt_path was missing from
+        # state or the file it names no longer exists on disk. Warning, not info:
+        # the PR remains stuck in whatever state it was in, and before #708 this
+        # skip was silent, so a repeating burst is the only signal that recovery
+        # kept giving up rather than the PR not needing recovery.
+        "review_stale_claim_recovery_skipped": "warning",
         "rework_issue_fetch_skipped": "warning",
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
