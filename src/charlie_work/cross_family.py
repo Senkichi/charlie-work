@@ -157,6 +157,53 @@ def report_body_is_valid(body: str) -> bool:
     return _find_json_verdict(text) is not None
 
 
+def report_is_reusable(text: str, current_head_sha: str | None) -> bool:
+    """Return True if a stored cross-family report can be reused as-is.
+
+    This is the *single* definition of "reusable", shared by the two callers
+    that must agree on it (issue #1081):
+
+    - ``workflow._cross_family_for_pr`` uses it to decide whether to reuse the
+      stored report or re-run the cross-family model.
+    - ``workflow.OrchestratorApp.loop``'s same-head packet skip uses it to
+      decide whether the packet is stale and ``review()`` must re-run.
+
+    They were previously separate: the skip considered only the packet head SHA
+    and the prompt-template digest, so a PR whose head never moved skipped
+    ``review()`` forever and the regeneration below was never reached. The
+    report stayed unusable permanently. Keeping one predicate is what makes
+    "the skip fires" and "the report would be reused" the same question — if
+    they can disagree, the disagreement *is* the stall.
+
+    A report is reusable only if all three hold:
+
+    - it is not a failure stub (``(UNAVAILABLE)`` header, written by ``_fail``
+      on timeout/non-zero exit),
+    - its body is a semantically real review (``report_body_is_valid``), and
+    - it was generated against exactly ``current_head_sha``.
+
+    The head comparison requires BOTH sides to be known, and is not a bare
+    equality. A bare ``extract_head_ref_oid(text) == current_head_sha`` reads
+    as if it already rejects a report with no head SHA, but it silently returns
+    True when the caller *also* has no head — ``None == None`` — so a
+    header-less report would be judged reusable precisely when the head is
+    unknowable. That is the same indeterminate-comparison-collapsing-into-the-
+    permissive-branch shape #1079 closed one layer up, and ``headRefOid`` being
+    absent is the very scenario #1081 was filed about. An unadjudicable head
+    must fail closed.
+    """
+    if not text.strip():
+        return False
+    if "(UNAVAILABLE)" in text.splitlines()[0]:
+        return False
+    if not report_body_is_valid(extract_report_body(text)):
+        return False
+    stored_head_sha = extract_head_ref_oid(text)
+    if stored_head_sha is None or current_head_sha is None:
+        return False
+    return stored_head_sha == current_head_sha
+
+
 @dataclass(frozen=True)
 class CrossFamilyResult:
     """Outcome of one cross-family review invocation."""
