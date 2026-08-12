@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -49,6 +50,7 @@ from charlie_work.worktree import (
     is_junction,
     list_worktrees,
     push_branch,
+    read_worktree_marker,
     remove_review_checkout,
     remove_worktree,
     verify_shared_venv,
@@ -7007,3 +7009,157 @@ def test_rework_recovery_allows_dirty_worktree(tmp_path: Path) -> None:
     # Clean up.
     _git(info.path, "checkout", "--", ".")
     remove_worktree(repo_root, info.path, branch=branch_name)
+
+
+# --- Issue #1141: worktree_unsafe sweep must not escalate a LIVE worker ---
+
+
+def _seed_live_writer_worktree(
+    repo_root: Path,
+    branch_name: str,
+    *,
+    marker_pid: int,
+    session_id: str,
+    sessions_dir: Path,
+) -> WorktreeInfo:
+    """Create a worktree (branch NOT pushed to origin), make it dirty in a
+    worktree_unsafe-triggering way, and plant a writer marker + sidecar.
+
+    This is the issue #1141 scenario: a live worker's transient working state
+    (uncommitted modifications) in a worktree whose branch has not been pushed
+    yet (killed-before-push recovery path).
+    """
+    info = create_worktree(repo_root, branch_name, base_ref="origin/main")
+    # Worker-authored uncommitted modification — the "unsafe" dirt.
+    (info.path / "worker_wip.txt").write_text("work in progress\n", encoding="utf-8")
+    # Writer marker: records the live worker's pid + session id.
+    write_worktree_marker(info.path, marker_pid, session_id)
+    # Sidecar: gives the marker check (and the liveness gate) a recorded
+    # session with a start-time fingerprint to corroborate.
+    sidecar = sessions_dir / f"issue-1141.json"
+    sidecar.write_text(
+        json.dumps(
+            {"session_id": session_id, "pid": marker_pid, "process_start_time": 1.0}
+        ),
+        encoding="utf-8",
+    )
+    return info
+
+
+def test_worktree_unsafe_defers_when_writer_marker_is_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1141: a dirty worktree whose writer marker has a LIVE pid must
+    defer (LiveWorkerRedispatchError), not escalate (WorktreeUnsafeError).
+    Dirt in a live worker's tree is normal working state, not residue.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-1141-live-writer"
+    sessions_dir = repo / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    marker_pid = 424242
+
+    info = _seed_live_writer_worktree(
+        repo,
+        branch_name,
+        marker_pid=marker_pid,
+        session_id="session-1141-live",
+        sessions_dir=sessions_dir,
+    )
+
+    # The recovery record carries a DIFFERENT, dead worker_pid so the recovery
+    # liveness probe (_probe_recovery_liveness) passes — simulating the bug
+    # scenario where the probe missed the live writer (stale/recycled pid in
+    # the record). The marker is the ground-truth liveness signal.
+    recovery = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+    }
+
+    # Only the marker's pid is alive; the recovery record's pid is dead.
+    monkeypatch.setattr(
+        "charlie_work.worktree.is_pid_alive",
+        lambda pid, start: pid == marker_pid,
+    )
+
+    with pytest.raises(LiveWorkerRedispatchError) as exc_info:
+        create_worktree(
+            repo,
+            branch_name,
+            base_ref="origin/main",
+            recovery=recovery,
+            sessions_dir=sessions_dir,
+            config=OrchestratorConfig(),
+            issue_number=1141,
+        )
+
+    assert exc_info.value.pid == marker_pid
+    assert exc_info.value.probe_result == "live_writer_at_unsafe_evaluation"
+    # No reap: the worktree and its dirty content must survive untouched.
+    assert info.path.exists()
+    assert (info.path / "worker_wip.txt").read_text(encoding="utf-8") == "work in progress\n"
+    # The writer marker must not have been cleaned by the deferred path.
+    assert read_worktree_marker(info.path) is not None
+
+    # Clean up.
+    remove_worktree(repo, info.path, branch=branch_name)
+
+
+def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1141 inverse: a dirty worktree whose writer marker has a DEAD
+    pid must still escalate (WorktreeUnsafeError) — death is established, so
+    the dirt check is meaningful.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-1141-dead-writer"
+    sessions_dir = repo / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    marker_pid = 424242
+
+    info = _seed_live_writer_worktree(
+        repo,
+        branch_name,
+        marker_pid=marker_pid,
+        session_id="session-1141-dead",
+        sessions_dir=sessions_dir,
+    )
+
+    recovery = {
+        "branch_name": branch_name,
+        "status": "dispatched",
+        "worker_pid": 999999,
+        "worker_process_start_time": 0.0,
+    }
+
+    # Every pid is dead — the marker is stale, the recovery record's pid is
+    # stale. The marker check at entry cleans the stale marker; the dirt check
+    # then escalates normally.
+    monkeypatch.setattr(
+        "charlie_work.worktree.is_pid_alive",
+        lambda pid, start: False,
+    )
+
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(
+            repo,
+            branch_name,
+            base_ref="origin/main",
+            recovery=recovery,
+            sessions_dir=sessions_dir,
+            config=OrchestratorConfig(),
+            issue_number=1141,
+        )
+
+    # No reap occurred (WorktreeUnsafeError refuses the reset); the dirty
+    # content survives.
+    assert info.path.exists()
+    assert (info.path / "worker_wip.txt").read_text(encoding="utf-8") == "work in progress\n"
+
+    # Clean up.
+    remove_worktree(repo, info.path, branch=branch_name)

@@ -2394,8 +2394,41 @@ def create_worktree(
             injected_paths,
             materialize_dirs,
         )
-        if reason:
-            raise WorktreeUnsafeError(reason)
+        if not reason:
+            return
+        # Issue #1141: dirt in a LIVE writer's tree is normal working state,
+        # not residue — a dirt verdict is only meaningful once death is
+        # established. The recovery liveness probe upstream can miss a live
+        # writer (stale/recycled pid in the recovery record), so re-check the
+        # worktree's own writer marker at the point of judgment, the same
+        # plan-is-a-snapshot discipline park_runner_slot applies before
+        # terminating a listener. A live writer defers the redispatch; it is
+        # never escalated as unsafe.
+        marker = read_worktree_marker(check_path)
+        if marker is not None and marker.get("kind") != OPERATOR_MARKER_KIND:
+            marker_pid = marker.get("pid")
+            marker_session_id = marker.get("session_id")
+            live_pid: int | None = None
+            if sessions_dir is not None and isinstance(marker_session_id, str):
+                # Prefer the recorded session sidecar: it carries the
+                # process-start-time fingerprint, defeating pid recycling.
+                live_pid = _own_live_session_pids(sessions_dir).get(marker_session_id)
+            if (
+                live_pid is None
+                and isinstance(marker_pid, int)
+                and marker_pid > 0
+                and is_pid_alive(marker_pid, None)
+            ):
+                live_pid = marker_pid
+            if live_pid is not None:
+                raise LiveWorkerRedispatchError(
+                    issue_number=issue_number,
+                    pid=live_pid,
+                    process_start_time=None,
+                    probe_result="live_writer_at_unsafe_evaluation",
+                    inconclusive_probe_deferred_count=0,
+                )
+        raise WorktreeUnsafeError(reason)
 
     if recovery is not None:
         # Validate that the recovery record matches the requested branch
