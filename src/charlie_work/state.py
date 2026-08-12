@@ -214,6 +214,14 @@ DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
         # comment is ever found to be describing a kind the test no longer
         # flags.
         "janitor_gate",
+        # Same shape as janitor_gate immediately above: diagnostics-only,
+        # emitted either while re-running janitor diagnostics for visibility
+        # on an already-escalated PR (that occurrence's ``escalated: True``
+        # payload key documents the ambient status, it does not cause the
+        # transition) or from the ordinary non-escalated janitor-gate block,
+        # which never sets status "escalated". The kind alone never
+        # identifies an escalation transition.
+        "ci_run_never_created",
     }
 )
 

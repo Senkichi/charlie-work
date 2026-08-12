@@ -657,16 +657,28 @@ def check_dispatch_coverage(
     facts = f"dispatchable={len(dispatchable)} queued={len(queued)} in_progress={len(in_progress)}"
     if cap is not None:
         facts += f" cap={cap}"
-    if blocked_err:
-        facts += f" (blocked-issue lookup degraded: {blocked_err})"
     if drain_note:
         facts = f"{drain_note}; {facts}"
     if skip_delta:
         facts += DELTA_SKIP_SUFFIX
 
     if reasons:
-        report.anom(check, f"{'; '.join(reasons)} ({facts})")
+        if blocked_err:
+            # The blocked set is unavailable, so a "dispatchable" issue may
+            # actually be blocked. Surface the degraded lookup as a caveat so
+            # the anomaly is not read as a confirmed dispatch failure.
+            detail = (
+                f"possibly-spurious due to blocked-issue lookup degraded: "
+                f"{blocked_err}; {'; '.join(reasons)}"
+            )
+        else:
+            detail = "; ".join(reasons)
+        report.anom(check, f"{detail} ({facts})")
     else:
+        if blocked_err:
+            # Degradation can only *inflate* the dispatchable set, so an empty
+            # reasons list with a degraded lookup is still a sound OK.
+            facts += f" (blocked-issue lookup degraded: {blocked_err}; result is sound)"
         report.ok(check, facts)
 
     check_dispatch_throttle(report, repo, now=resolved_now)

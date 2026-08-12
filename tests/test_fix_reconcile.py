@@ -857,12 +857,13 @@ def test_closed_unmerged_pr_issue_rework_requested_status_converges_to_dormant()
     assert new_state["issues"]["495"]["number"] == 495
 
 
-@pytest.mark.parametrize("stuck_status", ["reviewing", "escalated", "dispatched"])
+@pytest.mark.parametrize("stuck_status", ["reviewing", "dispatched"])
 def test_closed_unmerged_pr_issue_other_active_statuses_converge_to_dormant(
     stuck_status: str,
 ) -> None:
     """Every ACTIVE_STATE_STATUS on an OPEN issue whose PR closed-unmerged
-    must converge to dormant -- not just 'rework_requested'.
+    must converge to dormant -- not just 'rework_requested'. "escalated" is
+    the deliberate exception, covered separately below (issue #1066).
     """
     config = OrchestratorConfig()
     gh = FakeGitHub(
@@ -880,6 +881,66 @@ def test_closed_unmerged_pr_issue_other_active_statuses_converge_to_dormant(
     assert len(drift) == 1
     new_state = apply_fixes(gh, state, drift, config)
     assert "status" not in new_state["issues"]["200"]
+
+
+def test_closed_unmerged_pr_issue_escalated_status_is_not_converged_to_dormant() -> None:
+    """Issue #1066: an OPEN issue whose status is 'escalated' must NOT have
+    its status dropped when its linked PR closes unmerged, unlike every other
+    ACTIVE_STATE_STATUSES member. 'escalated' is a human-owned terminal
+    disposition (agent:human-needed stays live regardless of what happens to
+    this PR) -- dropping the status key detaches the state entry from that
+    still-live label with no automated repair path back into the human
+    queue. This mirrors the ORCHESTRATOR_OWNED_ISSUE_STATUSES guard the
+    sibling issue_status_normalized sweep already applies, and matches a
+    real production divergence (issue #894 via PR #948).
+
+    Without the fix this asserts `len(drift) == 0`, which is exactly what
+    the pre-#1066 code violates -- reverting the source change alone (fix
+    stays applied) must fail this test.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(948, "CLOSED", head_ref="agent/issue-894-x")],
+        issues=[_issue(894, [config.labels.human_needed])],
+    )
+    state = empty_state()
+    state["issues"]["894"] = {"number": 894, "status": "escalated"}
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_issue_state_converged"
+    ]
+    assert drift == []
+
+    # apply_fixes on the (empty) drift list must leave the escalated status
+    # entry completely untouched.
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["issues"]["894"]["status"] == "escalated"
+
+
+def test_closed_unmerged_pr_issue_escalated_status_stable_across_passes() -> None:
+    """A second detect_drift pass over an already-escalated issue whose PR is
+    closed-unmerged must also emit nothing -- this is not a transient
+    no-drift result, it is a stable exclusion.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(700, "CLOSED", head_ref="agent/issue-200-x")],
+        issues=[_issue(200, [config.labels.human_needed])],
+    )
+    state = empty_state()
+    state["issues"]["200"] = {"number": 200, "status": "escalated"}
+
+    for _ in range(2):
+        drift = [
+            item
+            for item in detect_drift(gh, state, config)
+            if item.kind == "closed_unmerged_pr_issue_state_converged"
+        ]
+        assert drift == []
+        state = apply_fixes(gh, state, drift, config)
+        assert state["issues"]["200"]["status"] == "escalated"
 
 
 def test_closed_unmerged_pr_issue_state_converged_skips_closed_github_issue() -> None:

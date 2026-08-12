@@ -161,6 +161,21 @@ def test_default_command_template_contains_permission_mode_dangerous() -> None:
     )
 
 
+def test_default_command_template_disables_workspace_trust() -> None:
+    """The 2026-08 Devin CLI enforces workspace trust in --print mode and
+    fails hard in untrusted directories (worker worktrees always are, being
+    created fresh per issue). The template must pass the CLI's documented
+    escape hatch for non-interactive runs, as consecutive argv tokens."""
+    template = DEFAULT_COMMAND_TEMPLATE
+    assert "--respect-workspace-trust" in template, (
+        "DEFAULT_COMMAND_TEMPLATE must contain '--respect-workspace-trust'"
+    )
+    idx = template.index("--respect-workspace-trust")
+    assert template[idx + 1] == "false", (
+        f"Expected 'false' after '--respect-workspace-trust', got {template[idx + 1]!r}"
+    )
+
+
 def test_default_command_template_permission_mode_flag_is_adjacent() -> None:
     """--permission-mode and dangerous must be consecutive argv tokens."""
     # After rendering with an empty worker_model, {model_args} becomes an empty

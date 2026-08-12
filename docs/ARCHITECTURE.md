@@ -194,7 +194,10 @@ sorted keys. Schema version pinned by `state.STATE_VERSION = 1`.
     {"at": "2026-07-02T18:05:00Z", "kind": "review_packet", "payload": {"pr_number": 123, "issue_number": 565, "cross_family_ok": true, "cross_family_reused": false}},
     {"at": "2026-07-02T18:10:00Z", "kind": "record_review", "payload": {"pr_number": 123, "decision": "approved"}},
     {"at": "2026-07-02T18:11:00Z", "kind": "merge_ready", "payload": {"pr_number": 123, "can_merge": true, "merged": true}}
-    // capped at the most recent 200 entries (append_event trims older ones)
+    // capped at state.DEFAULT_EVENT_RING_SIZE (2000) entries, overridable via
+    // runtime.event_ring_size — append_event trims older ones. Every event is
+    // also dual-written to the unlimited events.db; the ring is a recent view,
+    // the database is the audit trail.
   ]
 }
 ```
@@ -350,6 +353,43 @@ incidents actually happened — not scattered as defensive checks:
   an existing `cross-family-review.md` only if its first line does **not**
   contain `(UNAVAILABLE)` — a failed run's stub must not be treated as a
   permanent success on the next pass.
+- **Cross-family regeneration cap, per head SHA — two budgets.** `loop()`'s
+  same-head packet skip treats an unusable cross-family report (an
+  `(UNAVAILABLE)` stub, or one carrying no head-SHA marker) as staleness and
+  forces `review()` to regenerate it. Two separate budgets bound that, both
+  counted in one head-keyed record in `state.json` and both bounded by
+  `cross_family.max_regen_attempts` (default `2`). A new push resets **both**
+  together, since a new head has never been tried. Sharing the bound is safe
+  only because they share that key.
+
+  - `attempts` — charged by `_cross_family_for_pr` immediately before
+    `run_cross_family_review`, i.e. by the model call it bounds. Necessary
+    because regeneration runs the cross-family model synchronously for up to
+    `cross_family.timeout_seconds`; unbounded, a model that is simply down
+    would burn that timeout every pass and starve the other repo in the shared
+    sequential loop (#1078). Past the cap — adjudicated *after* the model
+    returns, when "the report is still unusable" is an observation rather than
+    a guess — the issue escalates to `agent:human-needed`
+    (`reason="cross_family_report_unusable"`, `reason_class="judgment"`).
+  - `not_reached` — charged when `review()` was forced for this reason, ran,
+    and returned before ever reaching the regenerator. Overwhelmingly the
+    janitor gate declining a PR with merge conflicts or missing required
+    checks. Past the cap the PR is **parked**: the cross-family report stops
+    forcing `review()` by itself, with no escalation and no label.
+
+  The asymmetric terminations are deliberate. A park is keyed by head SHA and
+  self-heals on the next push; `reason_class="judgment"` is excluded from the
+  automatic de-escalation sweep and needs a human. Escalating a PR whose model
+  was never invoked asserts "unusable *and unfixable*" on evidence for only the
+  first half — the #1099 defect, which put 36 of 54 escalated job-cannon issues
+  into a sink that refilled as fast as it was drained. A parked PR is not
+  silent: the janitor gate reports its actual blocker on its own channel every
+  pass, and `cross_family_regen_not_reached` records the decline.
+
+  Neither cap shares `max_parse_failures`' terminal shape — that one ends in a
+  caveated `approved`; neither of these ever does, because approving against a
+  head that was never positively confirmed is exactly the fail-open #1079
+  closed.
 - **Per-PR isolation in `loop()`.** Each PR's `review()`/`merge_ready()` call
   is wrapped in its own `try/except GitHubError`; one PR's merge conflict or
   `gh` failure is recorded in `errors` and does not abort the rest of the
