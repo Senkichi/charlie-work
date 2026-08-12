@@ -370,10 +370,18 @@ class ReconcilePassConfig:
     into the fleet loop on a fixed cadence, so a state/label divergence
     (e.g. an escalation whose ``human_needed`` label write silently failed,
     per the plan's PRIMARY defect) is repaired automatically instead of only
-    when an operator remembers to run mop-up. Repair direction is always
-    state-wins: reconcile only ever converges GitHub labels to match
-    ``state.json``; it never rewrites ``status`` (D-2), so this is safe to
-    run unattended on every repo, every cycle.
+    when an operator remembers to run mop-up. Most drift kinds are state-wins
+    for labels: reconcile converges GitHub labels to match ``state.json``.
+    It does rewrite ``status`` in a few narrow, machine-safe cases -- to the
+    externally derived ``closed`` value, to clear a missing/invalid status
+    key, to the terminal ``merged`` value on a finalized PR, and to the
+    passive ``open_passive`` placeholder (most notably
+    ``issue_active_label_with_open_pr``). It never rewrites ``status`` to an
+    active dispatch/rework value and never rewrites an open escalated
+    issue's ``status`` (D-2) -- a closed-while-escalated issue is
+    finalized to ``closed`` like any other closed issue, but no escalated
+    issue is ever re-entered into the machine -- so this is safe to run
+    unattended on every repo, every cycle.
     """
 
     # Default True: the fleet has never run its own repair (baseline: zero
