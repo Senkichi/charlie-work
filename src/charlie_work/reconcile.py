@@ -2048,22 +2048,19 @@ def apply_fixes(
                     new_pr_state["issue_number"] = item.issue_number
                 new_prs[pr_key] = new_pr_state
 
-                checkout_removed = False
                 if repo_root is not None:
                     reviews_dir = resolved_layout(config, repo_root).reviews_dir
                     checkout_removed = remove_review_checkout(
                         repo_root, item.pr_number, reviews_dir=reviews_dir
                     )
-                checkout_action = (
-                    (
+                    checkout_action = (
                         f"remove review checkout for PR #{item.pr_number}: "
                         f"{'ok' if checkout_removed else 'failed'}"
                     )
-                    if repo_root is not None
-                    else (
+                else:
+                    checkout_action = (
                         f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
                     )
-                )
                 fix_actions = list(item.fix_actions) + [
                     checkout_action,
                     f"clear review-dispatch fields for prs[{item.pr_number}]",
@@ -2102,7 +2099,6 @@ def apply_fixes(
             # Issue #504: defer if the reviewer process is still running.
             if item.pr_number is not None and item.pr_number in alive_pr_numbers:
                 continue
-            checkout_removed = False
             if item.pr_number is not None:
                 pr_key = str(item.pr_number)
                 if pr_key in new_prs:
@@ -2112,6 +2108,14 @@ def apply_fixes(
                     checkout_removed = remove_review_checkout(
                         repo_root, item.pr_number, reviews_dir=reviews_dir
                     )
+                    checkout_action = (
+                        f"remove review checkout for PR #{item.pr_number}: "
+                        f"{'ok' if checkout_removed else 'failed'}"
+                    )
+                else:
+                    checkout_action = (
+                        f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
+                    )
             if item.issue_number is not None:
                 label_ok = True
                 for label in item.remove_labels:
@@ -2120,16 +2124,6 @@ def apply_fixes(
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
                 if item.pr_number is not None:
-                    checkout_action = (
-                        (
-                            f"remove review checkout for PR #{item.pr_number}: "
-                            f"{'ok' if checkout_removed else 'failed'}"
-                        )
-                        if repo_root is not None
-                        else (
-                            f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
-                        )
-                    )
                     fix_actions.extend(
                         [
                             checkout_action,
