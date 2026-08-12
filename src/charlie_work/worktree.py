@@ -698,6 +698,53 @@ def remote_branch_ahead_count(
         return None, f"rev-list returned non-integer: {count_result.stdout!r}"
 
 
+def worktree_ahead_of_sha(worktree_path: Path, base_sha: str) -> tuple[int | None, str | None]:
+    """Return how many commits the worktree HEAD is ahead of ``base_sha``.
+
+    Used by the rework death-loop escalation (issue #1134) to detect
+    *stranded* work — commits the worker made but never pushed because it
+    died mid-push.  Returns ``(ahead_count, error)``.  ``ahead_count`` is
+    ``None`` when the worktree does not exist, ``base_sha`` is not a known
+    object, or git fails.  A count of ``0`` means the worktree HEAD is at
+    or behind ``base_sha`` (no stranded commits).
+    """
+    if not worktree_path.is_dir():
+        return None, f"worktree does not exist: {worktree_path}"
+
+    head_result = run_captured(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not head_result.ok:
+        return None, f"rev-parse HEAD failed: {head_result.error or head_result.stderr}"
+    head_sha = head_result.stdout.strip()
+
+    if not _object_exists(worktree_path, base_sha):
+        return None, f"base sha not in worktree object store: {base_sha}"
+
+    merge_base_result = run_captured(
+        ["git", "merge-base", base_sha, head_sha],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not merge_base_result.ok:
+        return None, f"merge-base failed: {merge_base_result.error or merge_base_result.stderr}"
+    merge_base = merge_base_result.stdout.strip()
+
+    count_result = run_captured(
+        ["git", "rev-list", "--count", f"{merge_base}..{head_sha}"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not count_result.ok:
+        return None, f"rev-list failed: {count_result.error or count_result.stderr}"
+    try:
+        return int(count_result.stdout.strip()), None
+    except ValueError:
+        return None, f"rev-list returned non-integer: {count_result.stdout!r}"
+
+
 def _object_exists(repo_root: Path, sha: str) -> bool:
     """Return True if ``sha`` names an object present in the local object store.
 
