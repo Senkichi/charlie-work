@@ -16415,7 +16415,17 @@ class OrchestratorApp:
         if new_head_sha == old_head_sha:
             return new_head_sha
 
-        commit = self.gh.commit(new_head_sha)
+        commit_result = self.gh.commit(new_head_sha)
+        if isinstance(commit_result, GitHubRunResult):
+            commit = (
+                commit_result.value
+                if commit_result.ok and isinstance(commit_result.value, dict)
+                else None
+            )
+        elif isinstance(commit_result, dict):
+            commit = commit_result
+        else:
+            commit = None
         if not commit:
             return None
 
