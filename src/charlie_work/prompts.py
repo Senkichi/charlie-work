@@ -7,6 +7,53 @@ from string import Template
 
 TEMPLATE_DIR = Path(__file__).with_name("prompts")
 
+# Markers that must appear in every rendered worker/rework prompt.  The
+# no-merge contract (issue #502, #714) is a safety-critical prompt section:
+# workers must never merge, close, or relabel their own PRs.  A repo-local
+# flat whole-file override can silently drop the ``$section_no_merge_contract``
+# reference, so these markers are checked against the *rendered output* — not
+# the template source — at the dispatch boundary.
+NO_MERGE_CONTRACT_MARKERS: tuple[str, ...] = (
+    "## No-merge contract",
+    "Your deliverable ENDS at pushing the branch and opening the PR",
+)
+
+
+class MissingNoMergeContractError(RuntimeError):
+    """A rendered worker/rework prompt is missing the no-merge contract.
+
+    Issue #714: a repo-local flat whole-file override of ``worker.md`` or
+    ``rework.md`` can silently drop the ``$section_no_merge_contract``
+    reference, dispatching workers with no instruction against merging,
+    closing, or relabeling their own PRs.  This post-render guard catches
+    that drift at the dispatch boundary — the single point of enforcement
+    — rather than relying on every consumer repo's override to remember
+    the section.
+    """
+
+    def __init__(self, context: str, missing: tuple[str, ...]) -> None:
+        self.context = context
+        self.missing = missing
+        super().__init__(
+            f"{context} is missing the no-merge contract (issue #714): "
+            f"required marker(s) not found: {', '.join(missing)}. "
+            f"A repo-local flat override may have dropped the "
+            f"$section_no_merge_contract reference."
+        )
+
+
+def assert_no_merge_contract(prompt: str, *, context: str = "worker prompt") -> None:
+    """Verify a rendered worker/rework prompt carries the no-merge contract.
+
+    Checks the *rendered output* (not the template source) so that a
+    repo-local flat override that drops the ``$section_no_merge_contract``
+    reference is caught regardless of how the override was structured.
+    """
+
+    missing = tuple(m for m in NO_MERGE_CONTRACT_MARKERS if m not in prompt)
+    if missing:
+        raise MissingNoMergeContractError(context, missing)
+
 
 class PromptTemplateError(RuntimeError):
     """A prompt template references placeholders that nothing supplies.

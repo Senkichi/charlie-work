@@ -5176,7 +5176,15 @@ def test_dispatch_worker_template_selects_claude_code_variant(tmp_path: Path) ->
 def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None:
     override_dir = tmp_path / "orchestrator-prompts"
     override_dir.mkdir()
-    (override_dir / "worker.md").write_text("REPO-LOCAL #$issue_number", encoding="utf-8")
+    # The override must carry the no-merge contract markers (issue #714):
+    # _write_worker_prompt's post-render guard rejects a flat override that
+    # drops them.
+    (override_dir / "worker.md").write_text(
+        "REPO-LOCAL #$issue_number\n\n"
+        "## No-merge contract\n\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n",
+        encoding="utf-8",
+    )
     config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir="orchestrator-prompts"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
@@ -5185,7 +5193,11 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
     app.dispatch(limit=1)
 
     prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
-    assert prompt_path.read_text(encoding="utf-8") == "REPO-LOCAL #123"
+    assert prompt_path.read_text(encoding="utf-8") == (
+        "REPO-LOCAL #123\n\n"
+        "## No-merge contract\n\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n"
+    )
 
 
 def test_command_dispatch_labels_only_successful_launches(tmp_path: Path) -> None:

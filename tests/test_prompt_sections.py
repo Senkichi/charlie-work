@@ -4,6 +4,8 @@ import re
 import string
 from pathlib import Path
 
+import pytest
+
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.prompt_sections import section_variables
 from charlie_work.prompts import render_prompt
@@ -478,6 +480,100 @@ def test_worker_prompts_contain_no_merge_contract() -> None:
         prompt = _render_worker_with_sections(template_name)
         assert "## No-merge contract" in prompt
         assert "Your deliverable ENDS at pushing the branch and opening the PR" in prompt
+
+
+def test_assert_no_merge_contract_passes_for_package_templates() -> None:
+    """The guard accepts prompts rendered from the package templates (issue #714)."""
+    from charlie_work.prompts import assert_no_merge_contract
+
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        # Must not raise — the package templates all reference
+        # $section_no_merge_contract.
+        assert_no_merge_contract(prompt)
+
+
+def test_assert_no_merge_contract_rejects_flat_override_without_contract(
+    tmp_path: Path,
+) -> None:
+    """The guard catches a flat override that drops the no-merge contract (issue #714).
+
+    This is the exact scenario the issue describes: a repo-local flat
+    whole-file ``worker.md`` override that does not reference
+    ``$section_no_merge_contract`` renders without the prohibition, and the
+    guard must refuse to let it through.
+    """
+    from charlie_work.prompts import (
+        MissingNoMergeContractError,
+        assert_no_merge_contract,
+    )
+
+    # Simulate a flat override that carries no no-merge contract — the
+    # kind job-cannon shipped before PR #1564 migrated it to package
+    # templates.
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\nGo fix the issue. No safety sections here.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        {
+            "issue_number": 42,
+            "issue_title": "Test",
+            "issue_url": "https://example.test/issues/42",
+            "issue_body": "",
+            "issue_body_block": "",
+            "branch_name": "agent/issue-42-test",
+            "worker_model_tier": "capable",
+            "issue_comments": "",
+        },
+        search_dirs=(override_dir,),
+    )
+    assert "## No-merge contract" not in prompt
+
+    with pytest.raises(MissingNoMergeContractError) as exc_info:
+        assert_no_merge_contract(prompt, context="worker prompt for issue #42")
+    assert "issue #714" in str(exc_info.value)
+    assert "worker prompt for issue #42" in str(exc_info.value)
+
+
+def test_assert_no_merge_contract_accepts_override_with_contract(
+    tmp_path: Path,
+) -> None:
+    """The guard accepts a flat override that does carry the contract (issue #714).
+
+    A repo-local override is not inherently wrong — it just must not drop
+    the safety-critical no-merge prohibition.
+    """
+    from charlie_work.prompts import assert_no_merge_contract
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\n"
+        "## No-merge contract\n\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR. "
+        "You must **never** merge or close PRs.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        {
+            "issue_number": 42,
+            "issue_title": "Test",
+            "issue_url": "https://example.test/issues/42",
+            "issue_body": "",
+            "issue_body_block": "",
+            "branch_name": "agent/issue-42-test",
+            "worker_model_tier": "capable",
+            "issue_comments": "",
+        },
+        search_dirs=(override_dir,),
+    )
+    # Must not raise — the override carries the contract text.
+    assert_no_merge_contract(prompt)
 
 
 def test_review_template_contains_test_adequacy_section_placeholder() -> None:
