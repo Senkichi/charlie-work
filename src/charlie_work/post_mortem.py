@@ -871,6 +871,19 @@ def _worktree_mtime_source(
     )
 
 
+# Adapter kinds that write to the Devin CLI's sessions.db and per-PID logs.
+# Only workers dispatched under one of these kinds have a Devin "subject" to
+# look up. For every other kind (claude-code, api, manual, command, …) the
+# Devin sources are skipped entirely — there is nothing to look up, which is
+# structurally different from "the subject exists but could not be read"
+# (locked/corrupt DB, schema drift, I/O failure). Conflating the two — as the
+# pre-#639 code did — made the redispatch lane fail-closed forever on
+# non-Devin workers, because every probe returned "errored sources" that were
+# really just permanent absence-of-record for a subject that never existed
+# (issue #639).
+_DEVIN_ADAPTER_KINDS = frozenset({"devin", "devin-shell"})
+
+
 def real_activity_for_worker(
     pm_config: PostMortemConfig,
     worktree_path: str,
@@ -879,6 +892,7 @@ def real_activity_for_worker(
     now: datetime,
     log_path: str | None = None,
     watchdog_config: WatchdogConfig | None = None,
+    worker_kind: str | None = None,
 ) -> RealActivityProbe:
     """Build a ``RealActivityProbe`` for a live worker session.
 
@@ -899,10 +913,27 @@ def real_activity_for_worker(
     should treat the session as genuinely stalled. Any I/O or schema problem
     is recorded as a source ``error`` and does not raise — this is best-effort,
     just like the post-mortem extractor.
+
+    ``worker_kind`` (issue #639): the adapter kind of the worker being probed
+    (``"devin-shell"``, ``"claude-code"``, ``"api"``, …, or ``"devin"`` in the
+    ``WorkerView`` convention). When it is provided and is not a Devin kind,
+    the Devin-specific sources (sessions.db and per-PID Devin log) are skipped
+    entirely — a non-Devin worker has no Devin subject to look up, and
+    consulting those sources would produce permanent "no session found" /
+    "no pid" errors that conflate "nothing to look up" with "could not look it
+    up". When ``None`` (unknown), all sources are consulted as before.
     """
     sources: list[ActivitySource] = []
     db_path = _resolve_db_path(pm_config.db_path)
     logs_dir = _devin_logs_dir(db_path)
+
+    # Issue #639: a non-Devin worker (claude-code, api, manual, command, …)
+    # never writes rows to sessions.db or per-PID Devin logs. Consulting those
+    # sources produces permanent absence-of-record errors that the redispatch
+    # lane treats as inconclusive (fail-closed), blocking recovery forever for
+    # workers that are simply not Devin subjects. Skip them instead — "no
+    # subject exists" is not "subject exists but could not be read".
+    consult_devin_sources = worker_kind is None or worker_kind in _DEVIN_ADAPTER_KINDS
 
     start_baseline: datetime | None = None
     try:
@@ -913,128 +944,135 @@ def real_activity_for_worker(
         pass
 
     # --- Source 1: sessions.db last message_nodes row for the matching session
-    conn: sqlite3.Connection | None = None
-    temp_copy_path: Path | None = None
-    db_error: str | None = None
-    db_timestamp: datetime | None = None
-    try:
-        conn, temp_copy_path, db_error = _open_readonly(db_path)
-        if conn is None:
-            sources.append(
-                ActivitySource(
-                    name="sessions.db", timestamp=None, staleness_seconds=None, error=db_error
-                )
-            )
-        else:
-            margin = timedelta(seconds=pm_config.match_window_margin_seconds)
-            if start_baseline is not None:
-                window_start = start_baseline - margin
-            else:
-                lookback = timedelta(seconds=pm_config.unparseable_started_at_lookback_seconds)
-                window_start = now - lookback
-            window_end = now + margin
-
-            session_id, match_error = _find_matching_session(
-                conn, worktree_path, window_start, window_end
-            )
-            if session_id is None:
+    # Skipped for non-Devin workers (issue #639): a claude-code/api worker has
+    # no row in sessions.db by construction, so consulting it would produce a
+    # permanent "no session found" error indistinguishable from a corrupt DB.
+    if consult_devin_sources:
+        conn: sqlite3.Connection | None = None
+        temp_copy_path: Path | None = None
+        db_error: str | None = None
+        db_timestamp: datetime | None = None
+        try:
+            conn, temp_copy_path, db_error = _open_readonly(db_path)
+            if conn is None:
                 sources.append(
                     ActivitySource(
-                        name="sessions.db",
-                        timestamp=None,
-                        staleness_seconds=None,
-                        error=match_error,
+                        name="sessions.db", timestamp=None, staleness_seconds=None, error=db_error
                     )
                 )
             else:
-                try:
-                    row = conn.execute(
-                        "SELECT created_at FROM message_nodes "
-                        "WHERE session_id = ? ORDER BY node_id DESC LIMIT 1",
-                        (session_id,),
-                    ).fetchone()
-                    if row is None:
-                        db_error = "no message_nodes for matched session"
-                    else:
-                        db_timestamp = _parse_session_created_at(row[0])
-                        if db_timestamp is None:
-                            db_error = f"unparseable message_nodes.created_at {row[0]!r}"
-                except sqlite3.Error as exc:
-                    db_error = f"message_nodes query failed (schema drift?): {exc}"
+                margin = timedelta(seconds=pm_config.match_window_margin_seconds)
+                if start_baseline is not None:
+                    window_start = start_baseline - margin
+                else:
+                    lookback = timedelta(seconds=pm_config.unparseable_started_at_lookback_seconds)
+                    window_start = now - lookback
+                window_end = now + margin
 
-                if db_timestamp is None:
+                session_id, match_error = _find_matching_session(
+                    conn, worktree_path, window_start, window_end
+                )
+                if session_id is None:
                     sources.append(
                         ActivitySource(
                             name="sessions.db",
                             timestamp=None,
                             staleness_seconds=None,
-                            error=db_error,
+                            error=match_error,
                         )
                     )
                 else:
-                    sources.append(
-                        ActivitySource(
-                            name="sessions.db",
-                            timestamp=db_timestamp,
-                            staleness_seconds=(now - db_timestamp).total_seconds(),
-                            error=None,
+                    try:
+                        row = conn.execute(
+                            "SELECT created_at FROM message_nodes "
+                            "WHERE session_id = ? ORDER BY node_id DESC LIMIT 1",
+                            (session_id,),
+                        ).fetchone()
+                        if row is None:
+                            db_error = "no message_nodes for matched session"
+                        else:
+                            db_timestamp = _parse_session_created_at(row[0])
+                            if db_timestamp is None:
+                                db_error = f"unparseable message_nodes.created_at {row[0]!r}"
+                    except sqlite3.Error as exc:
+                        db_error = f"message_nodes query failed (schema drift?): {exc}"
+
+                    if db_timestamp is None:
+                        sources.append(
+                            ActivitySource(
+                                name="sessions.db",
+                                timestamp=None,
+                                staleness_seconds=None,
+                                error=db_error,
+                            )
                         )
-                    )
-    except Exception as exc:
-        # Belt-and-suspenders: _open_readonly is already defensive, but if
-        # something unexpected escapes, record it and keep going.
-        sources.append(
-            ActivitySource(
-                name="sessions.db",
-                timestamp=None,
-                staleness_seconds=None,
-                error=f"unexpected: {exc}",
+                    else:
+                        sources.append(
+                            ActivitySource(
+                                name="sessions.db",
+                                timestamp=db_timestamp,
+                                staleness_seconds=(now - db_timestamp).total_seconds(),
+                                error=None,
+                            )
+                        )
+        except Exception as exc:
+            # Belt-and-suspenders: _open_readonly is already defensive, but if
+            # something unexpected escapes, record it and keep going.
+            sources.append(
+                ActivitySource(
+                    name="sessions.db",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error=f"unexpected: {exc}",
+                )
             )
-        )
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                pass
-        _cleanup_temp_copy(temp_copy_path)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            _cleanup_temp_copy(temp_copy_path)
 
     # --- Source 2: per-PID Devin log mtime
-    per_pid_timestamp: datetime | None = None
-    per_pid_error: str | None = None
-    if pid is None:
-        per_pid_error = "no pid"
-    elif not logs_dir.is_dir():
-        per_pid_error = "per-PID log directory not found"
-    else:
-        try:
-            log_paths = list(logs_dir.glob(f"devin_*_{pid}.log"))
-            if not log_paths:
-                per_pid_error = "no per-PID log found"
-            else:
-                latest_log = max(log_paths, key=lambda p: p.stat().st_mtime)
-                per_pid_timestamp = datetime.fromtimestamp(latest_log.stat().st_mtime, tz=UTC)
-        except OSError as exc:
-            per_pid_error = f"per-PID log stat failed: {exc}"
+    # Skipped for non-Devin workers (issue #639): a claude-code/api worker has
+    # no Devin per-PID log file by construction.
+    if consult_devin_sources:
+        per_pid_timestamp: datetime | None = None
+        per_pid_error: str | None = None
+        if pid is None:
+            per_pid_error = "no pid"
+        elif not logs_dir.is_dir():
+            per_pid_error = "per-PID log directory not found"
+        else:
+            try:
+                log_paths = list(logs_dir.glob(f"devin_*_{pid}.log"))
+                if not log_paths:
+                    per_pid_error = "no per-PID log found"
+                else:
+                    latest_log = max(log_paths, key=lambda p: p.stat().st_mtime)
+                    per_pid_timestamp = datetime.fromtimestamp(latest_log.stat().st_mtime, tz=UTC)
+            except OSError as exc:
+                per_pid_error = f"per-PID log stat failed: {exc}"
 
-    if per_pid_timestamp is None:
-        sources.append(
-            ActivitySource(
-                name="devin_per_pid_log",
-                timestamp=None,
-                staleness_seconds=None,
-                error=per_pid_error,
+        if per_pid_timestamp is None:
+            sources.append(
+                ActivitySource(
+                    name="devin_per_pid_log",
+                    timestamp=None,
+                    staleness_seconds=None,
+                    error=per_pid_error,
+                )
             )
-        )
-    else:
-        sources.append(
-            ActivitySource(
-                name="devin_per_pid_log",
-                timestamp=per_pid_timestamp,
-                staleness_seconds=(now - per_pid_timestamp).total_seconds(),
-                error=None,
+        else:
+            sources.append(
+                ActivitySource(
+                    name="devin_per_pid_log",
+                    timestamp=per_pid_timestamp,
+                    staleness_seconds=(now - per_pid_timestamp).total_seconds(),
+                    error=None,
+                )
             )
-        )
 
     # --- Source 3: Claude Code events.jsonl stream-json sibling
     if log_path:
