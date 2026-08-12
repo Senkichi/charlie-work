@@ -3429,8 +3429,20 @@ class FakeGitHub:
             return []
         return ""
 
-    def commit(self, sha: str) -> dict[str, Any] | None:
-        return self.commits.get(sha)
+    def commit(self, sha: str) -> github_module.GitHubRunResult:
+        commit = self.commits.get(sha)
+        if not isinstance(commit, dict):
+            return github_module.GitHubRunResult(
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="",
+                value=None,
+                error=f"commit {sha} not found",
+            )
+        return github_module.GitHubRunResult(
+            ok=True, returncode=0, stdout="", stderr="", value=commit
+        )
 
     def _ancestors(self, sha: str) -> set[str]:
         """Return all ancestors of ``sha`` (including ``sha`` itself)."""
