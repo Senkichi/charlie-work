@@ -55,6 +55,53 @@ def assert_no_merge_contract(prompt: str, *, context: str = "worker prompt") -> 
         raise MissingNoMergeContractError(context, missing)
 
 
+# Markers that must appear in every rendered *worker* (not rework) prompt's
+# PR-requirements section.  Issue #715: a repo-local flat whole-file override
+# of ``worker.md`` can mandate a stale non-conventional-commit title format
+# (e.g. ``Fix #$issue_number: <short title>``), which trips the janitor's
+# ``_check_title_conventional`` warning on every PR the worker opens.  The
+# package templates already use Conventional Commits; these markers are
+# checked against the *rendered output* — not the template source — at the
+# dispatch boundary so a stale override is caught before it ships.
+CONVENTIONAL_TITLE_MARKERS: tuple[str, ...] = ("Conventional-Commits format",)
+
+
+class MissingConventionalTitleError(RuntimeError):
+    """A rendered worker prompt is missing the conventional-commit title instruction.
+
+    Issue #715: a repo-local flat whole-file override of ``worker.md`` can
+    mandate a stale non-conventional-commit PR title format (e.g.
+    ``Fix #$issue_number: <short title>``), so every PR the worker opens
+    trips the janitor's ``_check_title_conventional`` warning.  This
+    post-render guard catches that drift at the dispatch boundary — the
+    single point of enforcement — rather than relying on every consumer
+    repo's override to carry the correct title instruction.
+    """
+
+    def __init__(self, context: str, missing: tuple[str, ...]) -> None:
+        self.context = context
+        self.missing = missing
+        super().__init__(
+            f"{context} is missing the conventional-commit title instruction "
+            f"(issue #715): required marker(s) not found: {', '.join(missing)}. "
+            f"A repo-local flat override may mandate a stale "
+            f"non-conventional-commit title format (e.g. 'Fix #N: ...')."
+        )
+
+
+def assert_conventional_commit_title(prompt: str, *, context: str = "worker prompt") -> None:
+    """Verify a rendered worker prompt instructs conventional-commit PR titles.
+
+    Checks the *rendered output* (not the template source) so that a
+    repo-local flat override that drops the conventional-commit title
+    instruction is caught regardless of how the override was structured.
+    """
+
+    missing = tuple(m for m in CONVENTIONAL_TITLE_MARKERS if m not in prompt)
+    if missing:
+        raise MissingConventionalTitleError(context, missing)
+
+
 class PromptTemplateError(RuntimeError):
     """A prompt template references placeholders that nothing supplies.
 
