@@ -17,6 +17,7 @@ from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
     compute_api_worker_fleet_report,
     fleet_loop,
+    run_allocation_pass_with_ci_fleet_guard,
     run_fleet_supervise,
     run_fleet_supervise_loop,
 )
@@ -52,7 +53,6 @@ from ci_fleet.charlie_work_adapter import (
     is_pool_idle_for_minutes,
     observe_runner_pool,
     plan_summary,
-    run_allocation_pass,
     scale_down_idle_runners,
 )
 
@@ -1628,11 +1628,18 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     if decision.action == ScaleAction.UP:
         from ci_fleet.charlie_work_adapter import provision_runner
 
+        # Affinity knobs (issue: ci_runners #92 companion) — sourced from the
+        # same runner_allocation section launch_runner_listener's callers use,
+        # never hardcoded. 0/0 (the section's defaults) is a no-op downstream.
+        # Requires ci_runners #92 merged and deployed: the currently installed
+        # ci_fleet.provision_runner does not yet accept these kwargs.
         result = provision_runner(
             gh,
             config.runner_scaling,
             state.busy_runners,
             dry_run=False,
+            reserved_threads=config.runner_allocation.reserved_threads,
+            threads_per_slot=config.runner_allocation.threads_per_slot,
         )
         if result.ok:
             # Record scale event
@@ -1755,7 +1762,11 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
     dry_run = getattr(args, "dry_run", False)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
 
-    result = run_allocation_pass(
+    # Issue #927: `charlie runners allocate` is the operator path to the same
+    # actuation the supervisor prologue guards -- run_allocation_pass_with_ci_fleet_guard
+    # is the single point of enforcement, so this command inherits the dirty-worktree
+    # guard by construction instead of needing its own copy of the check.
+    result, dirty_check = run_allocation_pass_with_ci_fleet_guard(
         gh,
         config.runner_allocation,
         managed_root_fallback=config.runner_scaling.managed_root,
@@ -1765,12 +1776,14 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
         source=CLI_ALLOCATION_SOURCE,
         full_pass_interval_seconds=config.supervisor.full_pass_interval_seconds,
     )
+    dry_run_forced = dirty_check.is_dirty
+    effective_dry_run = dry_run or dry_run_forced
 
     if result.error:
         return CommandResult(ok=False, message=f"allocate: {result.error}", data={})
 
     data: dict[str, Any] = {
-        "dry_run": dry_run,
+        "dry_run": effective_dry_run,
         "notes": list(result.notes),
         "applied": [
             {
@@ -1783,6 +1796,11 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
             for r in result.results
         ],
     }
+    if dry_run_forced:
+        data["ci_fleet_worktree_dirty"] = {
+            "ci_fleet_root": str(dirty_check.repo_root),
+            "dirty_paths": list(dirty_check.dirty_paths),
+        }
     if result.plan is not None:
         data["plan"] = plan_summary(result.plan)
 
@@ -1793,12 +1811,21 @@ def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
             data=data,
         )
 
-    prefix = "would " if dry_run else ""
+    if dry_run_forced:
+        prefix = "would "
+        dirty_paths_text = "; ".join(dirty_check.dirty_paths)
+        guard_suffix = (
+            f" (forced dry-run: ci_fleet dependency tree at {dirty_check.repo_root} "
+            f"has uncommitted changes: {dirty_paths_text})"
+        )
+    else:
+        prefix = "would " if dry_run else ""
+        guard_suffix = ""
     return CommandResult(
         ok=result.ok,
         message=(
             f"allocate: {prefix}start {result.started}, {prefix}park {result.parked} "
-            f"(budget {result.plan.budget if result.plan else 0})"
+            f"(budget {result.plan.budget if result.plan else 0})" + guard_suffix
         ),
         data=data,
     )
@@ -1820,7 +1847,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
     if args.command == "review-queue":
         return app.review_queue()
     if args.command == "why-charlie-hate":
-        return app.review(args.pr, cross_family=args.cross_family)
+        # The operator's manual re-run is deliberately exempt from the per-head
+        # cross-family regeneration budget (issue #1099): a human typing a
+        # command is not the loop the bound defends against, and RUNBOOK.md's
+        # recovery procedure for an exhausted budget is exactly this command.
+        return app.review(args.pr, cross_family=args.cross_family, enforce_regen_budget=False)
     if args.command == "why-charlie-hate-spec":
         try:
             return app.spec_review(args.spec_file)

@@ -30,10 +30,33 @@ Raw inspection:
 Get-Content .var\charlie-work\state.json | ConvertFrom-Json | Select-Object -ExpandProperty events | Select-Object -Last 20
 ```
 
-The `events` array (capped at the most recent 200 entries by
-`state.append_event`) is the closest thing to an audit trail — every
-`intake`, `dispatch`, `review_packet`, `record_review`, `merge_ready`, and
-`spec_review` call appends one entry with a UTC timestamp and a payload.
+The `events` array is a bounded recent-activity view, **not** the audit trail —
+`state.append_event` caps it at `state.DEFAULT_EVENT_RING_SIZE` (2000) entries,
+overridable via the `runtime.event_ring_size` config knob. Every `intake`,
+`dispatch`, `review_packet`, `record_review`, `merge_ready`, and `spec_review`
+call appends one entry with a UTC timestamp and a payload.
+
+The audit trail is `events.db`, the unlimited append-only SQLite database
+written alongside `state.json` — every event is dual-written to it, so anything
+evicted from the ring is still there. Reach for it, not the ring, whenever the
+question is about history rather than the last few minutes:
+
+```powershell
+.venv\Scripts\python.exe -c "from pathlib import Path; from charlie_work.instrumentation import event_counts_by_kind; print(event_counts_by_kind(Path('.var/charlie-work/state.json')))"
+```
+
+Note the argument is the **`state.json`** path, not `events.db` — every one of
+these helpers takes `state_path: Path` and derives the database beside it
+(`instrumentation.py:334`). Passing a string fails; passing the `.db` path only
+works by coincidence of that derivation.
+
+`query_events()` filters by `kind`, `ts`, `correlation_id`, `pr_number`, and
+`issue_number` (all indexed); `events_by_correlation_id()` returns every event
+from a single `loop()` pass.
+
+Scale of the difference, measured on this fleet: 22,467 events in `events.db`
+against a 2000-entry ring. If you reason about anything older than the last few
+hours from the ring alone, you are reading roughly the most recent 9% of history.
 
 ## Label meanings and legal transitions
 
@@ -47,7 +70,7 @@ The `events` array (capped at the most recent 200 entries by
 | `agent:needs-rework` | `verdict --decision request_changes`, under the rework cap. | `verdict` → event `rework_requested`. |
 | `agent:blocked` | `verdict --decision blocked` — a product/security decision is needed. | `verdict` → event `blocked`. |
 | `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
-| `agent:human-needed` | Either `blocked`, or the rework cap was exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated` or `blocked`. |
+| `agent:human-needed` | `blocked`, the rework cap exhausted, or the cross-family regeneration budget exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`, or `loop()` → event `cross_family_report_regen_exhausted`. |
 
 Legal transitions are exactly `labels.py`'s `_edges()` table — see the
 mermaid diagram in
@@ -65,9 +88,11 @@ internalizing operationally:
 
 ## Handling `agent:human-needed` escalations
 
-An issue lands on `agent:human-needed` for one of two reasons — check
-`review-decision.json` under `.var/charlie-work/prs/pr-<n>/` to tell
-which:
+An issue lands on `agent:human-needed` for one of three reasons. The first
+two are recorded in `review-decision.json` under
+`.var/charlie-work/prs/pr-<n>/`; the third is raised by `loop()` itself,
+before any reviewer produces a decision file, so check
+`state["issues"][<n>]["escalation_reason"]` in `state.json` instead:
 
 1. **Explicit block** (`"decision": "blocked"`) — a reviewer decided a
    product or security call is needed before more automation should touch
@@ -79,6 +104,24 @@ which:
    without converging. This usually means the issue brief was wrong,
    ambiguous, or the acceptance criteria are unimplementable as written —
    not that "one more rework round" will fix it.
+3. **Cross-family regeneration budget exhausted**
+   (`escalation_reason == "cross_family_report_unusable"`, `reason_class ==
+   "judgment"`) — the cross-family model **ran** `cross_family.max_regen_attempts`
+   times (default `2`) against the PR's *current* head SHA and the report was
+   still unusable each time (an `(UNAVAILABLE)` failure stub, or one with no
+   head-SHA marker). The budget is per head, not per PR lifetime — a new push
+   starts a fresh budget, since the new head has never been tried. Unlike the
+   rework cap, this never ends in a caveated `approved`: an unconfirmed
+   cross-family head must never pass as reviewed, so it escalates instead (see
+   [ARCHITECTURE.md](ARCHITECTURE.md#invariants)).
+
+   Since #1099 this reason means the model genuinely ran and failed. It used to
+   also fire for PRs whose model had never been invoked once — `review()`
+   returned at the janitor gate long before the regenerator, and the budget was
+   charged anyway. If you are triaging escalations created **before** #1099
+   shipped, check `events.db` for a `cross_family_report_regen_forced` row for
+   that PR with no corresponding model activity: those are false escalations,
+   and the PR's real blocker is whatever its `janitor_gate` payload names.
 
 **Recovery**: fix the underlying problem (rewrite the issue, resolve the
 product ambiguity, or manually push a fix to the PR branch yourself), then
@@ -89,11 +132,40 @@ either:
   routes straight to `ship-it` eligibility, or
 - Manually swap `agent:human-needed` back to `agent:reviewing` (or
   `agent:needs-rework`) on GitHub and re-run `charlie why-charlie-hate --pr <n>` to
-  regenerate a fresh packet before deciding again.
+  regenerate a fresh packet before deciding again. For reason 3 specifically,
+  this is enough on its own, and stays so after #1099 moved the budget claim
+  into the regenerator: `charlie why-charlie-hate` passes
+  `enforce_regen_budget=False`, so the manual re-run gets a fresh attempt and
+  charges nothing. `charlie unescalate` additionally clears the PR's
+  `cross_family_regen` record outright, so the automated loop gets a fresh
+  budget too — without that the re-arm would be inert, with `loop()` reading
+  the spent counters and parking the PR again on its very next pass.
 
 There is no automatic un-escalation — a human decision, once escalated,
 requires a human (or an explicit re-`verdict`) to move the issue
 forward again.
+
+### A PR making no progress with no `agent:human-needed` label
+
+Escalation is not the only terminal-ish state. A PR whose cross-family report is
+unusable **and** whose `review()` never reaches the regenerator is *parked*
+after `cross_family.max_regen_attempts` passes: no escalation, no label, and the
+report simply stops forcing `review()` on its own (issue #1099). This is by
+design — the model was never invoked, so there is nothing to escalate *about*,
+and parking self-heals on the next push.
+
+To confirm that is what you are looking at:
+
+```powershell
+.venv\Scripts\python.exe -c "from pathlib import Path; from charlie_work.instrumentation import query_events; s=Path('.var/charlie-work/state.json'); [print(e['ts'], e['kind'], e['payload']) for k in ('cross_family_regen_not_reached','janitor_gate') for e in query_events(s, kind=k, pr_number=<n>)]"
+```
+
+The `cross_family_regen_not_reached` payload carries `not_reached` and
+`max_attempts`; the `janitor_gate` payload names the PR's **actual** blocker,
+which is what to fix. Merge conflicts and missing required checks are the
+overwhelming majority. Fixing that and pushing resets both budgets, since the
+record is keyed by head SHA. A park with no accompanying `janitor_gate` event is
+worth investigating — it means `review()` returned somewhere else.
 
 ## Corrupt-state quarantine recovery
 
@@ -156,8 +228,8 @@ per the operator decision recorded in `config.py`'s `ReviewConfig`
 docstring). `record_review()` reads and increments a **durable per-PR
 counter** — `state["prs"][<pr_number>]["request_changes_count"]` — and bases
 the escalation decision on that field. This counter is intentionally **not**
-derived from `state["events"]`: `append_event` truncates the events log to the
-last 200 entries (`state.py`), so on a busy repo that eviction could silently
+derived from `state["events"]`: `append_event` truncates the events log to
+`state.DEFAULT_EVENT_RING_SIZE` (2000) entries, so on a busy repo that eviction could silently
 reset an events-derived count and allow a PR to rework indefinitely instead of
 escalating. The durable counter survives the events log rolling over. Practical
 implication: **the count is per-PR, not per-issue** — if a rework cycle

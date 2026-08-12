@@ -139,7 +139,9 @@ or subagent can't (policy tradeoffs, ambiguous review verdicts, anything flagged
    charlie-work's own environment. Both repos' `notify:` blocks are live (3.1 shipped, §6).
    Caveat: job-cannon's `watchdog.enabled=false` (shim log-mtime blindness, see that repo's config
    comment) means STALLED transitions specifically won't appear in its digest until that
-   structural fix lands — dead-pid reaping and other transitions are unaffected.
+   structural fix lands — dead-pid reaping and other transitions are unaffected. (The
+   "dead-pid reaping is unaffected" claim was false until #1122/#1108 un-gated
+   `_detect_and_handle_orphaned_workers` from `watchdog.enabled`; it is now true.)
 
 ## 6. Concrete action items
 

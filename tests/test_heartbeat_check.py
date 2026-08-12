@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import sqlite3
 import subprocess
-import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,16 +12,13 @@ from typing import Any
 
 import pytest
 
+from _script_loader import load_script_module
+
 
 def _load_heartbeat_check() -> ModuleType:
     """Load scripts/heartbeat_check.py as a module without adding scripts to sys.path."""
     path = Path(__file__).parent.parent / "scripts" / "heartbeat_check.py"
-    spec = importlib.util.spec_from_file_location("heartbeat_check", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["heartbeat_check"] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_script_module(path, "heartbeat_check")
 
 
 @pytest.fixture(scope="module")
@@ -516,6 +511,72 @@ def test_check_dispatch_coverage_anomaly_when_persisting(
         report, repo, prev, new, skip_delta=False, blocked_numbers=None, blocked_err=""
     )
     assert report.anomaly
+    assert "dispatchable across 2 consecutive beats" in report.lines[0]
+
+
+def test_check_dispatch_coverage_ok_when_degraded_but_empty(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Degraded blocked lookup with no dispatchable issues is a sound OK.
+
+    The blocked set is unavailable, but that can only *inflate* dispatchable,
+    so an empty dispatchable set cannot be a false negative. The OK line must
+    still note the degraded lookup so a reader does not infer an empty fleet.
+    """
+    repo = _make_repo(hb, tmp_path)
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, [], ""),
+    )
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report,
+        repo,
+        {},
+        {},
+        skip_delta=False,
+        blocked_numbers=None,
+        blocked_err="charlie fleet status --json timed out",
+    )
+    assert not report.anomaly
+    assert "OK dispatch-coverage" in report.lines[0]
+    assert "result is sound" in report.lines[0]
+    assert "charlie fleet status --json timed out" in report.lines[0]
+
+
+def test_check_dispatch_coverage_anomaly_possibly_spurious_when_degraded(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Degraded blocked lookup makes a dispatchable-persisting anomaly suspect.
+
+    A dispatchable issue may actually be blocked; the anomaly must carry a
+    caveat rather than read as a confirmed dispatch failure.
+    """
+    repo = _make_repo(hb, tmp_path)
+    issues = [
+        {"number": 42, "labels": [], "updatedAt": _iso(1)},
+    ]
+    _gh_dispatch(
+        monkeypatch,
+        hb,
+        lambda args, cwd: (True, issues, ""),
+    )
+    prev = {"dispatchable_issues": [42]}
+    new: dict[str, Any] = {}
+    report = hb.Report()
+    hb.check_dispatch_coverage(
+        report,
+        repo,
+        prev,
+        new,
+        skip_delta=False,
+        blocked_numbers=None,
+        blocked_err="blocked-issue lookup failed",
+    )
+    assert report.anomaly
+    assert "possibly-spurious" in report.lines[0]
+    assert "blocked-issue lookup failed" in report.lines[0]
     assert "dispatchable across 2 consecutive beats" in report.lines[0]
 
 

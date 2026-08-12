@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,7 @@ from charlie_work.config import (
 )
 from charlie_work.fleet_dispatch import (
     ApiWorkerFleetReport,
+    _CiFleetDirtyCheck,
     _build_fleet_attention_digest,
     _emit_fleet_transition,
     _extract_attention_events,
@@ -28,16 +31,24 @@ from charlie_work.fleet_dispatch import (
     _is_fleet_pass_active,
     _lane_failure_state_path,
     _run_fleet_allocation_prologue,
+    _run_fleet_autoscale_prologue,
     _select_repos,
+    _ci_fleet_worktree_dirty as _real_ci_fleet_worktree_dirty,
     compute_api_worker_fleet_report,
     fleet_loop,
     run_fleet_supervise,
     run_fleet_supervise_loop,
 )
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.notify import AttentionEntry
 from charlie_work.fleet_registry import count_fleet_runners
 from charlie_work.instrumentation import query_events
-from ci_fleet.charlie_work_adapter import ALLOCATION_STATE_FILENAME, load_allocation_stamp
+from ci_fleet.charlie_work_adapter import (
+    ALLOCATION_STATE_FILENAME,
+    ScaleAction,
+    load_allocation_stamp,
+)
+from ci_fleet.runners import ScaleDecision
 from ci_fleet.runner_allocation import (
     AllocationPlan,
     SlotAction,
@@ -113,6 +124,22 @@ def _patch_self_deploy_for_fleet_tests(monkeypatch: Any) -> dict[str, MagicMock]
     mocks["detect_prior_abnormal_exit"].return_value = None
     mocks["is_exit_alertable"].return_value = False
     return mocks
+
+
+@pytest.fixture(autouse=True)
+def _patch_ci_fleet_dirty_for_hermetic_tests(monkeypatch: Any) -> None:
+    """Fleet dispatch tests must not fail because the real ci_fleet tree is dirty.
+
+    The editable path dependency lives in a sibling checkout whose porcelain
+    state is outside these tests' control. A dirty upstream tree would force
+    every allocation-prologue test into dry-run mode and break assertions on
+    the ``dry_run`` flag. This fixture makes the guard inert; tests that need
+    to exercise the dirty path monkeypatch it explicitly.
+    """
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._ci_fleet_worktree_dirty",
+        lambda _module_file=None: _CiFleetDirtyCheck(is_dirty=False),
+    )
 
 
 def test_select_repos_all_sorted_by_last_seen() -> None:
@@ -3425,6 +3452,285 @@ def test_build_fleet_attention_digest_maps_review_verdict_events() -> None:
     assert by_health["ERROR"].issue_number == 11
 
 
+def _repair_payload(
+    issue_numbers: list[int] | None = None,
+    failures: list[int] | None = None,
+    errored: list[int] | None = None,
+    deferred: int = 0,
+) -> dict[str, Any]:
+    """Build a payload shaped like ``OrchestratorApp._repair_escalated_labels()``.
+
+    Mirrors the real return shape (``workflow.py``'s ``_repair_escalated_labels``):
+    ``issue_numbers`` is every subject whose ``transition()`` ran (successes and
+    failures both), ``failures`` is the subset that did not fully apply, ``errored``
+    is disjoint from both (nothing was written for those), and ``deferred`` is a
+    plain count. Kept realistic rather than minimal so these tests exercise the
+    same key combinations production actually emits.
+    """
+    return {
+        "issue_numbers": issue_numbers or [],
+        "failures": failures or [],
+        "errored": errored or [],
+        "deferred": deferred,
+    }
+
+
+def test_extract_attention_events_escalated_label_repair_errored() -> None:
+    """Issue #1088: a subject whose GitHub call raised must surface in the digest.
+
+    ``errored`` is the only durable record that an escalated-label repair was
+    attempted and failed to reach GitHub -- state.json gets nothing written for
+    it, so events.db and this digest are the sole places an operator could ever
+    learn about it. This also serves as the positive control for the
+    success/deferred/steady-state tests below: it proves the collector CAN
+    produce an event from this payload shape before those tests assert it does
+    not.
+    """
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[501, 502])},
+    )
+
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert len(repair_events) == 1
+    assert repair_events[0]["issue_number"] == 501
+    assert repair_events[0]["repo_key"] == "owner/repo"
+
+
+def test_extract_attention_events_escalated_label_repair_failures() -> None:
+    """Issue #1088: a subject whose transition() ran but did not fully apply.
+
+    ``failures`` (label add/remove partially rejected by GitHub) is a distinct
+    operational state from ``errored`` (nothing written) -- both are things a
+    human eventually has to look at, so both must produce an entry. ``errored``
+    is empty here to isolate that ``failures`` alone is sufficient.
+    """
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(issue_numbers=[601], failures=[601])},
+    )
+
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert len(repair_events) == 1
+    assert repair_events[0]["issue_number"] == 601
+
+
+def test_extract_attention_events_escalated_label_repair_mixed_prefers_errored_anchor() -> None:
+    """Issue #1088: with both `errored` and `failures` populated, `errored` anchors.
+
+    A single real pass can produce both: one subject's ``issue_view``/``transition()``
+    call raises (-> ``errored``) while a *different* subject's ``transition()``
+    completes but doesn't fully apply (-> ``failures``). Every other test in this
+    file exercises a payload where one of the two lists is empty, so the collector's
+    ``(errored or failures)[0]`` choice is never actually exercised elsewhere --
+    it degrades to "return the only non-empty list" and would pass just as well
+    under a reversed `(failures or errored)[0]`. This pins the real tie-break: the
+    unreachable subject (nothing durable in state.json, so this digest is its only
+    record) anchors the entry over the diagnosable one (already recorded via
+    `label_error` in state.json).
+    """
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {
+            "escalated_labels_repaired": _repair_payload(
+                issue_numbers=[602], failures=[602], errored=[501]
+            )
+        },
+    )
+
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert len(repair_events) == 1
+    assert repair_events[0]["issue_number"] == 501
+    assert "1 unreachable" in repair_events[0]["error"]
+    assert "1 not applied" in repair_events[0]["error"]
+
+
+def test_extract_attention_events_escalated_label_repair_success_silent() -> None:
+    """Issue #1088: a fully successful repair must NOT produce an attention event.
+
+    Deliberate, per the collector's docstring: a self-healed success is not
+    something needing attention, and it is already durable in events.db via
+    the ``escalated_label_repaired`` state event. Flooding the digest with a
+    healthy sweep's output would bury the ``errored``/``failures`` signal this
+    whole feature exists to surface.
+    """
+    # Positive control: the same call shape, but with `errored` populated,
+    # must produce an event -- otherwise the "no event" assertion below is
+    # equally consistent with a broken test harness as with correct behavior.
+    control_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[701])},
+    )
+    control_events = _extract_attention_events("owner/repo", control_result)
+    assert len([e for e in control_events if e["type"] == "escalated_label_repair_error"]) == 1
+
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(issue_numbers=[701])},
+    )
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert repair_events == []
+
+
+def test_extract_attention_events_escalated_label_repair_deferred_silent() -> None:
+    """Issue #1088: subjects held back by the per-pass cap must NOT produce an event.
+
+    ``deferred`` counts subjects beyond ``escalated_label_repair_max_per_pass``;
+    the sweep converges over subsequent passes by design, so this is normal
+    steady-state progress, not a fault worth an operator's attention.
+    """
+    # Positive control -- same shape, `errored` populated, must fire.
+    control_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[801])},
+    )
+    control_events = _extract_attention_events("owner/repo", control_result)
+    assert len([e for e in control_events if e["type"] == "escalated_label_repair_error"]) == 1
+
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(deferred=3)},
+    )
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert repair_events == []
+
+
+def test_extract_attention_events_escalated_label_repair_steady_state_silent() -> None:
+    """Issue #1088: the idle steady state (nothing to repair at all) is silent.
+
+    This is the ``empty`` sentinel ``_repair_escalated_labels`` returns when
+    there were no escalated subjects needing repair -- the common case on a
+    healthy fleet. It must not manufacture a digest entry every single pass.
+    """
+    # Positive control -- same shape, `errored` populated, must fire.
+    control_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[901])},
+    )
+    control_events = _extract_attention_events("owner/repo", control_result)
+    assert len([e for e in control_events if e["type"] == "escalated_label_repair_error"]) == 1
+
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload()},
+    )
+    events = _extract_attention_events("owner/repo", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert repair_events == []
+
+
+def test_extract_attention_events_nested_escalated_label_repair() -> None:
+    """Issue #1088: the key nested under ``dispatch_reviews`` (as loop() nests it).
+
+    ``dispatch_reviews()``'s own CommandResult carries ``escalated_labels_repaired``
+    at its top level; ``loop()`` nests that whole dict under a ``dispatch_reviews``
+    key in its own result. Mirrors
+    ``test_extract_attention_events_nested_review_verdicts`` -- if only the
+    top-level form were checked, every deployed fleet pass (which goes through
+    ``loop()``) would never surface this event at all.
+    """
+    result = CommandResult(
+        True,
+        "loop complete",
+        {
+            "stalled": [],
+            "errors": [],
+            "dispatch_reviews": {
+                "escalated_labels_repaired": _repair_payload(errored=[801]),
+            },
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+
+    repair_events = [e for e in events if e["type"] == "escalated_label_repair_error"]
+    assert len(repair_events) == 1
+    assert repair_events[0]["issue_number"] == 801
+
+
+def test_build_fleet_attention_digest_maps_escalated_label_repair_error() -> None:
+    """Issue #1088: the event survives the full digest-rendering pipeline as ERROR.
+
+    This is the property that matters most: it is not enough for the collector
+    to emit the right dict, since ``_build_fleet_attention_digest`` has an
+    explicit branch per event type and a generic fallback for anything else.
+    Issue #590 made that fallback render (instead of silently dropping)
+    unbranched types, keyed off an ``_error``-suffixed type name mapping to
+    ``health="ERROR"``. This test pins that ``escalated_label_repair_error``
+    actually rides that fallback through to a real ``AttentionEntry`` end to
+    end, rather than trusting the type-name convention by inspection.
+    """
+    result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": _repair_payload(errored=[901])},
+    )
+    events = _extract_attention_events("owner/repo", result)
+
+    digest = _build_fleet_attention_digest(events)
+
+    repair_entries = [e for e in digest.transitions if e.issue_number == 901]
+    assert len(repair_entries) == 1
+    entry = repair_entries[0]
+    assert entry.health == "ERROR"
+    assert entry.adapter_kind == "owner/repo"
+    assert "901" in (entry.last_log_line or "")
+
+
+def test_extract_attention_events_escalated_label_repair_malformed_input() -> None:
+    """Issue #1088: malformed ``escalated_labels_repaired`` shapes must not raise.
+
+    This payload comes from a per-repo ``CommandResult.data`` that ultimately
+    traces back to another process's JSON. A shape drift there (e.g. a future
+    refactor that changes ``errored`` from a list to a dict, or the whole key
+    to a bool) must degrade to "no event" in the fleet digest builder, not
+    crash the whole attention-extraction pass for every other repo in the
+    fleet loop.
+    """
+    not_a_dict_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {"escalated_labels_repaired": "not-a-dict"},
+    )
+    events_not_dict = _extract_attention_events("owner/repo", not_a_dict_result)
+    assert [e for e in events_not_dict if e["type"] == "escalated_label_repair_error"] == []
+
+    errored_not_list_result = CommandResult(
+        True,
+        "review dispatch disabled",
+        {
+            "escalated_labels_repaired": {
+                "issue_numbers": [],
+                "failures": [],
+                "errored": "901",
+                "deferred": 0,
+            }
+        },
+    )
+    events_bad_errored = _extract_attention_events("owner/repo", errored_not_list_result)
+    assert [e for e in events_bad_errored if e["type"] == "escalated_label_repair_error"] == []
+
+
 # ---------------------------------------------------------------------------
 # api-worker fleet report (issue #483)
 # ---------------------------------------------------------------------------
@@ -4297,6 +4603,179 @@ def test_allocation_prologue_logs_its_inputs_before_any_branch(tmp_path: Any, ca
     assert "C:/actions-runners" in caplog.text
 
 
+def _make_ci_fleet_git_repo(tmp_path: Path) -> Path:
+    """Create a minimal editable-style ci_fleet repo with a clean ``src/`` tree."""
+    repo = tmp_path / "ci_fleet_repo"
+    repo.mkdir()
+    pkg = repo / "src" / "ci_fleet"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("# ci_fleet", encoding="utf-8")
+
+    # Use a per-test gitconfig so the commit does not depend on global config.
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text("[user]\n\tname = Test\n\temail = test@test\n", encoding="utf-8")
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=str(gitconfig))
+
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    return repo
+
+
+def test_ci_fleet_guard_detects_dirty_src_tree(tmp_path: Path) -> None:
+    """Issue #927: the guard must fire when src/ has uncommitted changes.
+
+    This is the positive-control test: a guard whose tests only exercise the
+    clean path can pass forever while the dirty path is broken.
+    """
+    repo = _make_ci_fleet_git_repo(tmp_path)
+    module_file = repo / "src" / "ci_fleet" / "__init__.py"
+    # Uncommitted addition under src/ -- the same shape as an agent editing
+    # planner.py in the live ci_fleet tree.
+    (repo / "src" / "ci_fleet" / "planner.py").write_text("x = 1", encoding="utf-8")
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is True
+    assert check.repo_root == repo
+    assert check.dirty_paths
+    assert any("planner.py" in p for p in check.dirty_paths)
+
+
+def test_ci_fleet_guard_clean_src_tree_is_inert(tmp_path: Path) -> None:
+    """A clean src/ tree must let allocation proceed normally."""
+    repo = _make_ci_fleet_git_repo(tmp_path)
+    module_file = repo / "src" / "ci_fleet" / "__init__.py"
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is False
+    assert check.repo_root == repo
+    assert check.dirty_paths == ()
+
+
+def test_ci_fleet_guard_no_git_is_inert(tmp_path: Path) -> None:
+    """A wheel install or missing .git must not block allocation."""
+    pkg = tmp_path / "pkg" / "ci_fleet"
+    pkg.mkdir(parents=True)
+    module_file = pkg / "__init__.py"
+    module_file.write_text("# installed wheel", encoding="utf-8")
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is False
+    assert check.repo_root is None
+    assert check.dirty_paths == ()
+
+
+def test_ci_fleet_guard_git_failure_is_inert(tmp_path: Path, monkeypatch: Any) -> None:
+    """A git error must make the guard a no-op, not a hard stop."""
+    repo = _make_ci_fleet_git_repo(tmp_path)
+    module_file = repo / "src" / "ci_fleet" / "__init__.py"
+
+    def _failing_git(*, cwd, timeout_seconds):  # pragma: no cover
+        return RunResult(
+            returncode=1,
+            stdout="",
+            stderr="git exploded",
+            error="git exploded",
+        )
+
+    # Accept the positional `command` argument and ignore it.
+    def _failing_run_captured(
+        command: list[str], *, cwd: Path | str, timeout_seconds: int
+    ) -> RunResult:
+        return _failing_git(cwd=cwd, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr("charlie_work.fleet_dispatch.run_captured", _failing_run_captured)
+
+    check = _real_ci_fleet_worktree_dirty(module_file)
+
+    assert check.is_dirty is False
+    assert check.repo_root == repo
+    assert "git status failed" in (check.reason or "")
+
+
+def test_allocation_prologue_forces_dry_run_when_ci_fleet_is_dirty(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Issue #927: a dirty ci_fleet src/ forces a dry run and emits a guard event."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    state_dir = repo / ".var" / "charlie-work"
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(state_dir)}},
+    )
+
+    dirty_check = _CiFleetDirtyCheck(
+        is_dirty=True,
+        repo_root=tmp_path / "ci_fleet",
+        dirty_paths=(" M src/planner.py",),
+    )
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch._ci_fleet_worktree_dirty",
+        lambda _module_file=None: dirty_check,
+    )
+
+    plan = AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=())
+    result = AllocationPassResult(ok=True, plan=plan, notes=("cw: pinned",))
+
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=result) as pass_mock,
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        events = _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert pass_mock.call_args.kwargs["dry_run"] is True
+    assert any(e["type"] == "ci_fleet_worktree_dirty" for e in events)
+
+    state_path = layout.state_file_path(state_dir)
+    rows = query_events(state_path, kind="ci_fleet_worktree_dirty")
+    assert len(rows) == 1
+    assert rows[0]["payload"]["dirty_paths"] == [" M src/planner.py"]
+    assert rows[0]["payload"]["dry_run_forced"] is True
+    assert rows[0]["level"] == "warning"
+
+
+def test_allocation_prologue_keeps_original_dry_run_when_ci_fleet_is_clean(
+    tmp_path: Path,
+) -> None:
+    """A clean ci_fleet tree must not force dry_run on an actuating pass."""
+    fleet_dir = tmp_path / "fleet"
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {"owner/anchor": {"repo_root": str(repo), "state_dir": str(repo / ".var")}},
+    )
+    balanced = AllocationPassResult(
+        ok=True,
+        plan=AllocationPlan(budget=8, budget_reason="configured", targets=(), changes=()),
+    )
+
+    with (
+        patch(
+            "charlie_work.fleet_dispatch.run_allocation_pass", return_value=balanced
+        ) as pass_mock,
+        patch("charlie_work.fleet_dispatch.GitHub"),
+    ):
+        _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    assert pass_mock.call_args.kwargs["dry_run"] is False
+
+
 def test_digest_renders_event_types_that_have_no_explicit_branch() -> None:
     """An unmapped event type must not vanish.
 
@@ -4388,6 +4867,74 @@ def test_fleet_loop_actually_reaches_the_allocation_pass(
     # The daemon must identify itself as the unattended writer: the doctor probe
     # accepts only this value as evidence that allocation runs without an operator.
     assert mock_run_allocation_pass.call_args.kwargs["source"] == UNATTENDED_ALLOCATION_SOURCE
+
+
+@patch("charlie_work.fleet_dispatch.provision_runner")
+@patch("charlie_work.fleet_dispatch.decide_autoscale")
+@patch("charlie_work.fleet_dispatch.is_pool_idle_for_minutes")
+@patch("charlie_work.fleet_dispatch.is_in_cooldown")
+@patch("charlie_work.fleet_dispatch.observe_runner_pool")
+@patch("charlie_work.fleet_dispatch.count_fleet_runners")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch._load_registry")
+def test_autoscale_prologue_up_forwards_affinity_knobs(
+    mock_load_registry: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_count_fleet_runners: MagicMock,
+    mock_observe_runner_pool: MagicMock,
+    mock_is_in_cooldown: MagicMock,
+    mock_is_pool_idle: MagicMock,
+    mock_decide_autoscale: MagicMock,
+    mock_provision_runner: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """The fleet-wide autoscale-up call site forwards runner_allocation's knobs.
+
+    Companion to ci_runners #92: provision_runner grew keyword-only
+    reserved_threads/threads_per_slot, but this call site (distinct from
+    cli.py's ``runners autoscale``) was independently inert until it forwarded
+    them too. Pins that the values come from the representative repo's
+    config.runner_allocation section -- never hardcoded, never left at the
+    off default -- and reach provision_runner unchanged.
+    """
+    repo = _make_repo(tmp_path, "anchor", api_worker=None)
+    mock_load_registry.return_value = {
+        "repos": {
+            "owner/anchor": {
+                "repo_root": str(repo),
+                "config_path": "orchestrator.config.yaml",
+                "state_dir": str(repo / ".var" / "charlie-work"),
+            }
+        }
+    }
+    config = OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(enabled=True, managed_root=str(tmp_path)),
+        runner_allocation=RunnerAllocationConfig(reserved_threads=4, threads_per_slot=6),
+    )
+    mock_load_layered_config.return_value = config
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+    mock_count_fleet_runners.return_value = (1, 0, [])
+    mock_is_in_cooldown.return_value = False
+    mock_is_pool_idle.return_value = False
+    mock_decide_autoscale.return_value = ScaleDecision(action=ScaleAction.UP, count=1, reason="t")
+    mock_provision_runner.return_value = MagicMock(ok=True, runner_name="jc-1")
+
+    global_config = MagicMock()
+    global_config.runners.fleet_autoscale_prologue = True
+    global_config.runner_scaling.enabled = True
+
+    _run_fleet_autoscale_prologue(str(tmp_path / "fleet"), global_config, False)
+
+    mock_provision_runner.assert_called_once()
+    _, kwargs = mock_provision_runner.call_args
+    assert kwargs["reserved_threads"] == 4
+    assert kwargs["threads_per_slot"] == 6
 
 
 def test_digest_stays_quiet_on_a_converged_allocation_pass() -> None:

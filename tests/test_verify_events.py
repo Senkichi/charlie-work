@@ -5,7 +5,7 @@ script that runs its verification logic the moment it is loaded, using
 ``sys.argv[1]`` for the state.json path. ``_run_verify_events`` below loads
 it the same way tests/test_heartbeat_check.py and
 tests/test_backfill_stale_rework_briefs.py load their scripts (via
-``importlib.util.spec_from_file_location``, without adding scripts/ to
+``_script_loader.load_script_module``, without adding scripts/ to
 sys.path), but additionally sets ``sys.argv`` first and catches the
 ``SystemExit`` the script raises on its failure paths.
 
@@ -21,13 +21,12 @@ all-zero-results check after the read.
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
+from _script_loader import load_script_module
 from charlie_work.instrumentation import _db_path, close_db, log_event, record_loop_pass
 
 
@@ -57,33 +56,19 @@ def _run_verify_events(
     path); otherwise it is the code passed to ``sys.exit``. Output goes to
     the real stdout/stderr, so callers should wrap this in ``capsys``.
 
-    The module is registered in ``sys.modules`` before ``exec_module`` runs
-    (issue #1023): ``@dataclass`` resolves string annotations produced by
-    ``from __future__ import annotations`` through ``sys.modules[cls.__module__]``
-    during class creation, so an unregistered module makes class creation
-    raise ``AttributeError`` for any future dataclass added to the loaded
-    script. The registration is popped in ``finally`` because, unlike this
-    repo's other script loaders, this one reloads the module fresh on every
-    call under the same module name.
+    Loading is delegated to ``_script_loader.load_script_module`` so the
+    ``sys.modules`` registration and ``sys.argv`` save/restore are handled
+    in one place (issue #1028).
     """
-    argv_backup = sys.argv
-    sys.argv = ["verify_events.py", str(state_path)]
-    modules_backup = sys.modules.get("verify_events_under_test")
-    spec = importlib.util.spec_from_file_location("verify_events_under_test", script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["verify_events_under_test"] = module
     try:
-        spec.loader.exec_module(module)
+        module = load_script_module(
+            script_path,
+            "verify_events_under_test",
+            argv=["verify_events.py", str(state_path)],
+        )
         return None, module
     except SystemExit as exc:
-        return exc.code, module
-    finally:
-        if modules_backup is None:
-            sys.modules.pop("verify_events_under_test", None)
-        else:
-            sys.modules["verify_events_under_test"] = modules_backup
-        sys.argv = argv_backup
+        return exc.code, None
 
 
 def test_fails_when_state_path_does_not_exist(

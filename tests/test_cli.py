@@ -16,8 +16,11 @@ from charlie_work.config import (
     RunnerAllocationConfig,
     RunnerScalingConfig,
 )
+from ci_fleet.charlie_work_adapter import ScaleAction
+from ci_fleet.runners import ScaleDecision
 from charlie_work.cross_family import LEGACY_VACUOUS_SUMMARY
-from charlie_work.fleet_dispatch import ApiWorkerFleetReport
+from charlie_work import fleet_dispatch
+from charlie_work.fleet_dispatch import ApiWorkerFleetReport, _CiFleetDirtyCheck
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
@@ -25,6 +28,8 @@ from charlie_work.quiesce import QuiesceReport
 from charlie_work.state_migration import MigrationChild, MigrationOutcome, MigrationPlan
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
+from ci_fleet.runner_allocation import AllocationPlan
+from ci_fleet.runner_allocation_pass import AllocationPassResult
 
 
 class _FakeGitHub:
@@ -1132,6 +1137,62 @@ def test_run_runners_allocate_loud_on_absent_global_layer(
     )
 
 
+def test_run_runners_allocate_forces_dry_run_when_ci_fleet_is_dirty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #927 rework (PR #1048): `charlie runners allocate` -- the operator
+    path -- must be guarded against a dirty editable ci_fleet worktree exactly
+    like the unattended supervisor prologue.
+
+    The original guard only covered fleet_dispatch's prologue call site and
+    left this CLI command -- which CLAUDE.md names as "the only thing allowed
+    to decide which listeners run" -- completely unguarded. Both call sites
+    now go through ``run_allocation_pass_with_ci_fleet_guard``, so patching
+    the guard's underlying primitives (``_ci_fleet_worktree_dirty`` and
+    ``run_allocation_pass``, both resolved from ``charlie_work.fleet_dispatch``)
+    proves this CLI path is covered by that single enforcement point rather
+    than a second, independently-written copy of the check.
+    """
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+    config = OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(managed_root=str(tmp_path)),
+        runner_allocation=RunnerAllocationConfig(enabled=True),
+    )
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "GitHub", lambda *a, **k: _FakeGitHub())
+
+    dirty_check = _CiFleetDirtyCheck(
+        is_dirty=True,
+        repo_root=tmp_path / "ci_fleet",
+        dirty_paths=(" M src/runner_allocation.py",),
+    )
+    monkeypatch.setattr(
+        fleet_dispatch,
+        "_ci_fleet_worktree_dirty",
+        lambda _module_file=None: dirty_check,
+    )
+    plan = AllocationPlan(budget=4, budget_reason="configured", targets=(), changes=())
+    pass_result = AllocationPassResult(ok=True, plan=plan, notes=())
+    pass_mock = MagicMock(return_value=pass_result)
+    monkeypatch.setattr(fleet_dispatch, "run_allocation_pass", pass_mock)
+
+    args = cli.build_parser().parse_args(["runners", "allocate"])
+    outcome = cli.run_runners_allocate(args)
+
+    assert pass_mock.call_args.kwargs["dry_run"] is True, (
+        "a dirty ci_fleet worktree must force dry_run on the CLI allocate path, "
+        "not only the unattended supervisor prologue"
+    )
+    assert outcome.data["dry_run"] is True
+    assert outcome.data["ci_fleet_worktree_dirty"]["dirty_paths"] == [
+        " M src/runner_allocation.py"
+    ], "the forced-dry-run reason must surface in the CommandResult data"
+    assert "forced dry-run" in outcome.message, (
+        f"the CLI message must say why it refused to actuate: {outcome.message!r}"
+    )
+
+
 def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1177,6 +1238,56 @@ def test_run_doctor_command_reports_structured_finding_on_unparseable_config(
 # --------------------------------------------------------------------------
 # runners ensure-started: single-controller guard (issue #598)
 # --------------------------------------------------------------------------
+
+
+def test_run_runners_autoscale_up_forwards_affinity_knobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The autoscale-up call site forwards runner_allocation's affinity knobs.
+
+    Companion to ci_runners #92: provision_runner grew keyword-only
+    reserved_threads/threads_per_slot, but the call site was inert until it
+    forwarded them. This pins that the values are read from
+    config.runner_allocation (never hardcoded, never defaulted away) and
+    passed through unchanged.
+
+    provision_runner is mocked at the charlie_work_adapter import boundary
+    used by cli.py's local ``from ci_fleet.charlie_work_adapter import
+    provision_runner`` -- this passes against whichever ci_fleet is
+    currently installed, independent of whether #92 has merged yet.
+    """
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: tmp_path)
+
+    config = OrchestratorConfig(
+        runner_scaling=RunnerScalingConfig(enabled=True, managed_root=str(tmp_path)),
+        runner_allocation=RunnerAllocationConfig(reserved_threads=4, threads_per_slot=6),
+    )
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "observe_runner_pool", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(cli, "is_in_cooldown", lambda *a, **k: False)
+    monkeypatch.setattr(cli, "is_pool_idle_for_minutes", lambda *a, **k: False)
+    monkeypatch.setattr(
+        cli,
+        "decide_autoscale",
+        lambda *a, **k: ScaleDecision(action=ScaleAction.UP, count=1, reason="test"),
+    )
+
+    provision_mock = MagicMock(return_value=MagicMock(ok=True, runner_name="jc-1"))
+    monkeypatch.setattr(
+        "ci_fleet.charlie_work_adapter.provision_runner",
+        provision_mock,
+    )
+
+    args = cli.build_parser().parse_args(["runners", "autoscale"])
+    result = cli.run_runners_autoscale(args)
+
+    assert result.ok is True
+    provision_mock.assert_called_once()
+    _, kwargs = provision_mock.call_args
+    assert kwargs["reserved_threads"] == 4
+    assert kwargs["threads_per_slot"] == 6
 
 
 def _ensure_started_config(
