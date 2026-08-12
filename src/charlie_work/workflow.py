@@ -90,6 +90,8 @@ from .janitor import (
     check_operator_containment,
     check_test_adequacy,
     detect_cross_pr_revert,
+    is_stale_ci_verdict,
+    required_check_citation_names,
     run_janitor,
     DiffContentSignature,
     JanitorVerdict,
@@ -119,6 +121,7 @@ from .worktree import (
     remove_worktree_marker,
     resolve_base_branch_name,
     summarize_branch_work,
+    worktree_ahead_of_sha,
     worktree_path_for_branch,
     write_worktree_marker,
 )
@@ -1784,6 +1787,39 @@ def _windowed_redispatch_at(
     crash ``datetime.fromisoformat``).
     """
     raw = entry.get("redispatch_at")
+    if not isinstance(raw, list):
+        return []
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=window_minutes)
+    result: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        try:
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start:
+                result.append(t)
+        except (ValueError, AttributeError):
+            continue
+    return result
+
+
+def _windowed_worker_death_at(
+    entry: dict[str, Any],
+    *,
+    window_minutes: int,
+) -> list[str]:
+    """Return worker-death timestamps within the configured window, type-safely.
+
+    Parallel to ``_windowed_redispatch_at`` but reads
+    ``entry["worker_death_at"]`` — the list of timestamps recorded by the
+    orphan sweep each time it recovers a dead rework worker whose PR head
+    has not moved (issue #1134).  A death is not a no-op: the worker may
+    have completed its work but died before pushing.  Counting deaths
+    against the no-op rework cap mislabels salvageable stranded work as
+    "worker produced nothing."  This helper lets the no-op cap check
+    separate death redispatches from genuine no-op redispatches.
+    """
+    raw = entry.get("worker_death_at")
     if not isinstance(raw, list):
         return []
     now = datetime.now(UTC)
@@ -3899,9 +3935,16 @@ def _detect_and_handle_orphaned_workers(
     state every pass (not from any one-shot flag), so a half-finished reclaim
     -- or one stranded before this fix ever existed -- gets completed here
     without a human needing to notice.
+
+    Issue #1122: this sweep is NOT gated on ``watchdog.enabled``. The watchdog
+    flag controls log-mtime stall detection (``_detect_stalled_sessions`` /
+    ``_detect_and_handle_stalled_sessions``), which is unrelated to this
+    function's dead-pid state-keyed recovery. A deployment that disables
+    watchdog (e.g. to work around a shim log-mtime blindness) must not lose
+    the #935 pushed-branch salvage backstop, the #417 ground-truth label
+    reclaim, or the orphan drift diagnostics -- all of which are keyed off
+    state.json PID records, not log mtimes.
     """
-    if not config.watchdog.enabled:
-        return
 
     def _drift_fingerprint(**parts: Any) -> str:
         """Stable fingerprint for an orphaned-worker drift finding."""
@@ -4199,6 +4242,19 @@ def _detect_and_handle_orphaned_workers(
                             # request_changes).
                             entry["status"] = "rework_requested"
                             entry["dispatched_at"] = None
+                            # Issue #1134: record this as a worker death, not
+                            # a no-op.  A death redispatch must not count
+                            # against the no-op rework cap — the worker may
+                            # have completed its work but died before pushing
+                            # (salvageable stranded commits).  A separate
+                            # death counter with its own escalation reason
+                            # (worker_death_loop) lets the operator triage
+                            # "check the worktree" vs. "worker is spinning."
+                            death_ts = utc_now()
+                            prior_deaths = entry.get("worker_death_at")
+                            if not isinstance(prior_deaths, list):
+                                prior_deaths = []
+                            entry["worker_death_at"] = prior_deaths + [death_ts]
                             sweep_events.append(
                                 (
                                     "orphaned_worker_recovered",
@@ -4211,6 +4267,7 @@ def _detect_and_handle_orphaned_workers(
                                         "pid": terminal_pid,
                                         "exit_code": terminal_exit_code,
                                         "duration_seconds": terminal_duration_seconds,
+                                        "worker_death_at": death_ts,
                                     },
                                 )
                             )
@@ -4704,6 +4761,16 @@ def _reap_restore_rework_requested(
     e.g. ``worktree_unsafe``) loops rework_requested forever instead of
     escalating to a human. Rework workers always have an open PR, so they
     never reach those lanes' checks; the equivalent must live here.
+
+    Issue #1134: a worker that dies before pushing leaves the PR head
+    unchanged but is NOT a no-op — the worker may have completed its work
+    and died mid-push with salvageable stranded commits.  This lane records
+    each non-terminal death in ``worker_death_at`` (parallel to the orphan
+    sweep) and separates the death count from the no-op count in the cap
+    check.  A death-loop escalates with ``worker_death_loop`` (triage:
+    "check the worktree for stranded work") instead of
+    ``redispatch_cap_exceeded`` (triage: "worker is spinning"), and
+    includes ``stranded_commits`` in the escalation payload.
     """
     pr_data = _rework_pr_for_worker(open_prs_by_issue, worker)
     if pr_data is None:
@@ -4745,32 +4812,82 @@ def _reap_restore_rework_requested(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-        should_escalate = (
-            terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch
+
+        # Issue #1134: a worker that died before pushing leaves the PR head
+        # unchanged, but that is NOT a no-op — the worker may have completed
+        # its work and died mid-push with salvageable stranded commits.
+        # Record this death in worker_death_at (parallel to the orphan sweep
+        # at ~line 4245), and separate the death count from the no-op count
+        # in the cap check below.  A death-loop escalates with
+        # worker_death_loop (triage: "check the worktree for stranded work")
+        # instead of redispatch_cap_exceeded (triage: "worker is spinning").
+        worker_death_at = _windowed_worker_death_at(
+            entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
+        if not terminal_failure:
+            worker_death_at = worker_death_at + [
+                datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            ]
+
+        no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
+        death_count = len(worker_death_at)
+        death_loop = not terminal_failure and death_count > config.watchdog.max_auto_redispatch
+        no_op_loop = (
+            not terminal_failure
+            and not death_loop
+            and no_op_count > config.watchdog.max_auto_redispatch
+        )
+        should_escalate = terminal_failure or death_loop or no_op_loop
 
         if should_escalate:
-            reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+            if terminal_failure:
+                reason = failure_kind
+            elif death_loop:
+                reason = "worker_death_loop"
+            else:
+                reason = "redispatch_cap_exceeded"
             # Preserve worker_pid/worker_process_start_time (issue #282): the
             # recovery probe still needs the fingerprint even after escalation.
+            issue_extra: dict[str, Any] = {
+                "redispatch_at": redispatch_at,
+                "dispatched_at": None,
+            }
+            event_payload: dict[str, Any] = {
+                "issue_number": worker.issue_number,
+                "pr_number": pr_number,
+                "failure_kind": failure_kind,
+                "previous_status": "dispatched",
+                "reason": "dead_rework_session_escalated",
+                "redispatch_count": len(redispatch_at),
+            }
+            if not terminal_failure:
+                # Persist the death record regardless of which cap fired —
+                # the death still happened, and the consumption side
+                # (_dispatch_rework_impl) reads it from state.
+                issue_extra["worker_death_at"] = worker_death_at
+            if death_loop:
+                event_payload["reason"] = "worker_death_loop"
+                event_payload["worker_death_count"] = death_count
+                # Issue #1134: probe the worktree for stranded commits —
+                # work the worker completed but died before pushing.
+                if live_head_sha and worker.worktree_path:
+                    stranded, _err = worktree_ahead_of_sha(
+                        Path(worker.worktree_path), live_head_sha
+                    )
+                    if stranded is not None:
+                        issue_extra["stranded_commits"] = stranded
+                        event_payload["stranded_commits"] = stranded
             state = _escalate_issue(
                 state,
                 worker.issue_number,
                 reason=reason,
                 reason_class="mechanical",
-                issue_extra={"redispatch_at": redispatch_at},
+                issue_extra=issue_extra,
             )
             state = append_event(
                 state,
                 "session_failed_escalated",
-                {
-                    "issue_number": worker.issue_number,
-                    "pr_number": pr_number,
-                    "failure_kind": failure_kind,
-                    "previous_status": "dispatched",
-                    "reason": "dead_rework_session_escalated",
-                    "redispatch_count": len(redispatch_at),
-                },
+                event_payload,
                 state_path=state_file,
             )
             save_state(state_file, state)
@@ -4778,6 +4895,8 @@ def _reap_restore_rework_requested(
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
             entry["redispatch_at"] = redispatch_at
+            if not terminal_failure:
+                entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
             state = append_event(
@@ -9000,6 +9119,7 @@ class OrchestratorApp:
                         pr_state=existing_pr_state,
                         repo_root=self.repo_root,
                         pr_diff=escalated_diff,
+                        review_decision=self._review_decision(pr_number),
                     )
                     failures_changed = existing_pr_state.get("janitor_failures") != list(
                         escalated_verdict.failures
@@ -9105,9 +9225,29 @@ class OrchestratorApp:
                 ).upper() == "CONFLICTING" or (
                     str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
                 )
+                # Issue #1111: mirror the non-escalated path's stale-CI-verdict
+                # suppression — a request_changes verdict citing only required
+                # checks that are green now must not burn no_op_rework_attempts
+                # (the predicate itself refuses escalated decisions, so this is
+                # a no-op for verdicts recorded as escalated).
+                escalated_stale_ci = False
+                if (
+                    escalated_verdict.is_no_op_rework
+                    and not escalated_verdict.failed_required_checks
+                ):
+                    required = self.config.auto_merge.required_checks
+                    escalated_stale_ci = (
+                        bool(required)
+                        and escalated_checks is not None
+                        and is_stale_ci_verdict(
+                            self._review_decision(pr_number),
+                            summarize_checks(escalated_checks, required),
+                        )
+                    )
                 is_no_op_rework_block = (
                     escalated_verdict.is_no_op_rework
                     and not escalated_verdict.failed_required_checks
+                    and not escalated_stale_ci
                 )
                 if is_merge_conflict_block or is_no_op_rework_block:
                     if is_merge_conflict_block:
@@ -9162,8 +9302,39 @@ class OrchestratorApp:
         # are the worker's/CI's to fix. A definitive required-check failure on
         # a linked-issue PR is routed to rework so the worker can push a fix.
         verdict = run_janitor(
-            pr, checks, self.config, pr_state=pr_state, repo_root=self.repo_root, pr_diff=diff
+            pr,
+            checks,
+            self.config,
+            pr_state=pr_state,
+            repo_root=self.repo_root,
+            pr_diff=diff,
+            review_decision=self._review_decision(pr_number),
         )
+
+        # Issue #1116: the stale-CI skip let a reworked-but-unchanged PR
+        # through the gate it was permanently wedged behind. Record it so the
+        # packet-rebuild -> fresh-review sequence that follows is attributable
+        # to the skip rather than looking like a spontaneous unblock. Dedup on
+        # the head sha (mirroring the failures_changed / draft_hold_reason
+        # pattern elsewhere in this function): the gate re-passes on every
+        # poll while the PR waits on review-dispatch capacity, and only the
+        # first pass per head is signal (cost-spirals.md Finding 2).
+        if verdict.ok and verdict.no_op_check_skipped_stale_ci and not self.dry_run:
+            gate_pass_head = str(pr.get("headRefOid") or "") or None
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                existing_pr_state = state["prs"].get(str(pr_number), {})
+                if existing_pr_state.get("stale_ci_gate_pass_head") != gate_pass_head:
+                    state["prs"][str(pr_number)] = {
+                        **existing_pr_state,
+                        "stale_ci_gate_pass_head": gate_pass_head,
+                    }
+                    state = self._record_event(
+                        state,
+                        "stale_ci_verdict_gate_pass",
+                        {"pr_number": pr_number, "head_sha": gate_pass_head},
+                    )
+                    save_state(self.paths.state_file, state)
 
         # Issue #820: reconcile the operator merge-hold marker for the #818
         # draft-auto-ready actuator unconditionally, on every review() pass
@@ -9654,7 +9825,30 @@ class OrchestratorApp:
             # that existing invariant is out of this fix's scope. This only
             # newly routes the PURE no-op-rework case (no co-occurring check
             # failure), which previously had no consumer at all.
-            is_no_op_rework_block = verdict.is_no_op_rework and not verdict.failed_required_checks
+            #
+            # Issue #1111: ALSO excluded is the stale-CI-verdict case — the
+            # request_changes verdict's only findings cite required checks
+            # that are all green right now (a transient failure the reviewer
+            # saw has recovered on the same content). Routing rework there is
+            # a guaranteed no-op that burns no_op_rework_attempts toward a
+            # manufactured human escalation; review_queue() re-queues the PR
+            # for a fresh review instead, so this pass just waits.
+            stale_ci_verdict = False
+            if verdict.is_no_op_rework and not verdict.failed_required_checks:
+                required = self.config.auto_merge.required_checks
+                stale_ci_verdict = (
+                    bool(required)
+                    and checks is not None
+                    and is_stale_ci_verdict(
+                        self._review_decision(pr_number),
+                        summarize_checks(checks, required),
+                    )
+                )
+            is_no_op_rework_block = (
+                verdict.is_no_op_rework
+                and not verdict.failed_required_checks
+                and not stale_ci_verdict
+            )
             if issue_number is not None and (is_merge_conflict_block or is_no_op_rework_block):
                 if is_merge_conflict_block:
                     routed = self._route_janitor_gate_failure_to_rework(
@@ -10155,6 +10349,54 @@ class OrchestratorApp:
             )
             return queue
 
+    def _emit_stale_ci_verdict_requeued(
+        self,
+        pr_number: int,
+        issue_number: int | None,
+        reviewed_head_sha: str | None,
+        live_head_sha: str,
+        required_changes: Sequence[str] | None,
+    ) -> None:
+        """Emit ``stale_ci_verdict_requeued`` once per PR/head transition.
+
+        Issue #1120: ``review_queue()`` is called multiple times per loop pass
+        (once by ``dispatch_reviews()``, once by
+        ``_record_cross_family_verdicts()``), so without dedup the event
+        double-fires for the same PR within a single pass -- ~30s apart, the
+        second emission landing after review_dispatch has already claimed and
+        launched the PR. The dispatch itself is deduped by
+        ``review_dispatch_claim``, so the only impact is log noise, but the
+        pattern is the same missing-dedup family as the PR #1117 round-1
+        review finding on ``stale_ci_verdict_gate_pass``.
+
+        Mirrors the ``stale_ci_gate_pass_head`` fix: key the emission on a
+        stored head field (``stale_ci_verdict_requeued_head`` in the PR state
+        entry) so only the first queue evaluation per head transition emits,
+        rather than every evaluation that sees the stale verdict.
+        """
+        if self.dry_run:
+            return
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            existing_pr_state = state["prs"].get(str(pr_number), {})
+            if existing_pr_state.get("stale_ci_verdict_requeued_head") == live_head_sha:
+                return
+            state["prs"][str(pr_number)] = {
+                **existing_pr_state,
+                "stale_ci_verdict_requeued_head": live_head_sha,
+            }
+            state = self._record_event(
+                state,
+                "stale_ci_verdict_requeued",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "reviewed_head_sha": reviewed_head_sha,
+                    "required_changes": list(required_changes or []),
+                },
+            )
+            save_state(self.paths.state_file, state)
+
     def review_queue(self) -> CommandResult:
         """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
 
@@ -10263,6 +10505,41 @@ class OrchestratorApp:
                     continue
 
                 if reviewed_head_sha == live_head_sha:
+                    if decision_value == "request_changes" and self._is_stale_ci_request_changes(
+                        pr_number, decision
+                    ):
+                        # Issue #1111: the verdict's only findings cite
+                        # required checks that are all green on this same head
+                        # — the failure it describes no longer exists (the
+                        # check flipped transiently mid-review, or a rerun
+                        # recovered it). Re-driving rework here is a
+                        # guaranteed no-op that burns no_op_rework_attempts
+                        # toward a manufactured escalation, so instead queue
+                        # the PR for a FRESH review despite the unchanged
+                        # head. The stale verdict is only ever superseded by
+                        # a new recorded verdict, never auto-approved;
+                        # repeated request_changes re-verdicts stay bounded
+                        # by max_rework_cycles in record_review.
+                        if packet_head_sha == live_head_sha and self._packet_template_current(
+                            pr_number
+                        ):
+                            self._emit_stale_ci_verdict_requeued(
+                                pr_number,
+                                issue_number,
+                                reviewed_head_sha,
+                                live_head_sha,
+                                decision.get("required_changes"),
+                            )
+                            queue.append(
+                                {
+                                    "pr": pr_number,
+                                    "issue": issue_number,
+                                    "packet_head_sha": packet_head_sha,
+                                    "decision": "stale",
+                                    "reviewed_head_sha": reviewed_head_sha,
+                                }
+                            )
+                        continue
                     # Issue #784 AC-8 (Case 2): "reviewed at live head" only
                     # means "nothing to do" if the recorded verdict was
                     # actually actioned. A request_changes verdict that
@@ -10282,7 +10559,28 @@ class OrchestratorApp:
                     continue
 
                 check = self._check_carry_forward(pr_number, decision)
-                if check.carry_forward:
+                if (
+                    check.carry_forward
+                    and decision_value == "request_changes"
+                    and self._is_stale_ci_request_changes(pr_number, decision)
+                ):
+                    # Issue #1111 (head-advanced variant): the diff content is
+                    # unchanged (carry-forward matched), but the verdict's only
+                    # findings cite required checks that are all green on the
+                    # live head — e.g. a no-op rework push after a transient CI
+                    # failure recovered. Carrying the request_changes verdict
+                    # forward would re-apply a failure that no longer exists,
+                    # so skip the carry-forward and fall through to the
+                    # stale-queue path below: a fresh review supersedes the
+                    # verdict (never auto-approved).
+                    self._emit_stale_ci_verdict_requeued(
+                        pr_number,
+                        issue_number,
+                        reviewed_head_sha,
+                        live_head_sha,
+                        decision.get("required_changes"),
+                    )
+                elif check.carry_forward:
                     # In dry-run mode we still run the content check so the queue
                     # reflects real changes, but we skip the durable head update.
                     if not self.dry_run:
@@ -12460,6 +12758,7 @@ class OrchestratorApp:
     _UNESCALATE_ISSUE_RESET_FIELDS = (
         "dispatch_failed_at",
         "redispatch_at",
+        "worker_death_at",
         "escalation_reason",
         # Issue #783: a human-authorized manual unescalate clears the reason
         # class (the escalation itself is gone) and resets the auto
@@ -15650,10 +15949,94 @@ class OrchestratorApp:
         rework can dispatch a worker, and reconcile's repair pass must never
         synthesize ``rework_requested`` (reconcile.py's own invariant) --
         only a dispatch-context caller may complete this transition.
+
+        Issue #1123: the restorer must never re-activate a CLOSED GitHub
+        issue. Issue state is the source of truth (state-in-labels
+        invariant), and reconcile's ``state_active_status_issue_closed``
+        owns the terminal "closed" status for an issue GitHub reports as
+        CLOSED. Without this guard the restorer flips the status back to
+        ``rework_requested`` every pass, the no-op rework cap escalates it,
+        and reconcile flips it back to "closed" -- a perpetual three-lane
+        loop. A closed issue's open PR surfaces once as drift via
+        reconcile's ``state_active_status_issue_closed`` for human
+        adjudication instead of re-entering the rework state machine. If
+        the issue fetch itself fails (transient GitHubError, missing from
+        the snapshot), defer to the next pass rather than re-activating
+        state that may belong to a closed issue -- the stranded repair is
+        a best-effort lane, not a correctness-critical one.
+
+        Idempotency (review rework): the closed-issue skip must fire once
+        per stranded PR, not on every ``review_queue()`` pass. ``"closed"``
+        cannot be added to ``_REWORK_ALREADY_ROUTED_STATUSES`` because the
+        #789 repair path depends on the restorer re-activating an issue
+        whose status was clobbered to ``"closed"`` by a reconcile bug while
+        the issue is still OPEN on GitHub -- a shared early-return on
+        ``"closed"`` would suppress that repair. Instead a per-issue
+        ``stranded_skip_closed`` marker in ``state["issues"][n]`` records
+        that the restorer has already confirmed the issue is CLOSED and
+        skipped. The marker is checked only when ``status == "closed"`` so
+        the #789 path (status ``"closed"`` but issue OPEN, marker absent)
+        still fetches and re-activates. When the skip fires for an issue
+        whose status is not yet ``"closed"`` (e.g. ``"reviewing"``), the
+        restorer converges the status to ``"closed"`` and strips active
+        labels -- mirroring reconcile's ``state_active_status_issue_closed``
+        -- so the next pass sees ``status == "closed"`` + marker set and
+        short-circuits without a ``gh.issue_view()`` call or a duplicate
+        event. Reconcile preserves unknown keys in issue entries (spread
+        copy), so the marker survives reconcile sweeps; if reconcile
+        normalizes the status away from ``"closed"`` (issue re-opened),
+        the marker check no longer applies and the restorer re-evaluates.
         """
         state = load_state_locked(self.paths.state_file)
-        issue_status = state.get("issues", {}).get(str(issue_number), {}).get("status")
+        issue_entry = state.get("issues", {}).get(str(issue_number), {})
+        issue_status = issue_entry.get("status")
         if issue_status in _REWORK_ALREADY_ROUTED_STATUSES:
+            return None
+        # Local idempotency guard for the closed-issue skip (see docstring):
+        # once the restorer has confirmed a CLOSED issue and recorded the
+        # marker, short-circuit without re-fetching or re-emitting. Gated on
+        # status == "closed" so the #789 repair (status clobbered to "closed"
+        # for an OPEN issue, marker absent) still proceeds.
+        if issue_status == "closed" and issue_entry.get("stranded_skip_closed"):
+            return None
+        try:
+            issue = self.gh.issue_view(issue_number)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "stranded_request_changes restorer for issue %s deferred "
+                "(GitHub issue fetch failed); will retry next pass",
+                issue_number,
+                exc_info=True,
+            )
+            return None
+        if str(issue.get("state") or "OPEN").upper() == "CLOSED":
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                issues = state.setdefault("issues", {})
+                issue_entry = issues.get(str(issue_number), {})
+                issue_entry["stranded_skip_closed"] = True
+                if issue_entry.get("status") != "closed":
+                    issue_entry["status"] = "closed"
+                issues[str(issue_number)] = issue_entry
+                state = self._record_event(
+                    state,
+                    "stranded_request_changes_skipped_issue_closed",
+                    {
+                        "pr_number": int(pr["number"]),
+                        "issue_number": issue_number,
+                        "head_sha": pr.get("headRefOid"),
+                    },
+                )
+                save_state(self.paths.state_file, state)
+            # Strip active labels from the closed issue, mirroring
+            # reconcile's state_active_status_issue_closed: setting
+            # status to "closed" here would prevent that drift kind from
+            # firing (it requires status in ACTIVE_STATE_STATUSES), so the
+            # restorer must do the label cleanup itself to avoid leaving
+            # active labels on a finalized issue.
+            active_labels = label_names(issue) & self.config.labels.active
+            for label in sorted(active_labels):
+                self.gh.remove_issue_label(issue_number, label)
             return None
         return self._route_to_rework(
             pr,
@@ -15723,6 +16106,26 @@ class OrchestratorApp:
 
         candidates.sort(key=lambda item: (item[0], item[1]))
         return candidates
+
+    def _is_stale_ci_request_changes(self, pr_number: int, decision: dict[str, Any]) -> bool:
+        """True when ``decision`` is a request_changes verdict whose only
+        findings cite required checks that are all green on the live head
+        (issue #1111 staleness predicate, network half).
+
+        The pure text-shape check (``required_check_citation_names``) runs
+        first so ``gh pr checks`` is only fetched for the small set of
+        verdicts that could possibly be stale. Checks-unavailable (``None``)
+        fails closed to False — the verdict keeps its normal lifecycle.
+        """
+        required = self.config.auto_merge.required_checks
+        if not required:
+            return False
+        if required_check_citation_names(decision, required) is None:
+            return False
+        checks = self.gh.pr_checks(pr_number)
+        if checks is None:
+            return False
+        return is_stale_ci_verdict(decision, summarize_checks(checks, required))
 
     def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> CarryForwardCheck:
         """Determine whether ``decision``'s verdict can carry forward to the
@@ -16953,6 +17356,7 @@ class OrchestratorApp:
             pr_state=pr_entry_for_janitor if isinstance(pr_entry_for_janitor, dict) else None,
             repo_root=self.repo_root,
             pr_diff=diff,
+            review_decision=self._review_decision(pr_number),
         )
 
         with state_lock(self.paths.state_file):
@@ -17993,6 +18397,7 @@ class OrchestratorApp:
         routed_to_review: list[int] = []
         head_indeterminate: list[int] = []
         no_op_rework_escalated: list[int] = []
+        worker_death_escalated: list[int] = []
         filtered_candidates = []
         for issue in candidates:
             issue_number = int(issue["number"])
@@ -18021,14 +18426,33 @@ class OrchestratorApp:
                 # changes. This is a safety net for cases where the restore
                 # path's escalation didn't stick (race/crash between the
                 # restore and the state write).
+                #
+                # Issue #1134: a worker that died before pushing leaves the
+                # PR head unchanged, but that is NOT a no-op — the worker
+                # may have completed its work and died mid-push with
+                # salvageable stranded commits.  The orphan sweep records
+                # each death in ``worker_death_at``; here we subtract death
+                # redispatches from the total to get the genuine no-op
+                # count.  A death-loop still escalates, but with
+                # ``worker_death_loop`` (triage: "check the worktree for
+                # stranded work") instead of ``no_op_rework_cap_exceeded``
+                # (triage: "worker is spinning").
                 issue_entry = head_check_state.get("issues", {}).get(str(issue_number), {})
                 if isinstance(issue_entry, dict):
                     prior_redispatch = _windowed_redispatch_at(
                         issue_entry,
                         window_minutes=self.config.watchdog.redispatch_window_minutes,
                     )
-                    if len(prior_redispatch) >= self.config.watchdog.max_auto_redispatch:
+                    prior_deaths = _windowed_worker_death_at(
+                        issue_entry,
+                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                    )
+                    no_op_count = max(0, len(prior_redispatch) - len(prior_deaths))
+                    if no_op_count >= self.config.watchdog.max_auto_redispatch:
                         no_op_rework_escalated.append(issue_number)
+                        continue
+                    if len(prior_deaths) >= self.config.watchdog.max_auto_redispatch:
+                        worker_death_escalated.append(issue_number)
                         continue
                 filtered_candidates.append(issue)
                 continue
@@ -18130,6 +18554,84 @@ class OrchestratorApp:
                     "redispatch_escalated",
                 )
 
+        # Issue #1134: escalate worker-death loops separately from no-op
+        # rework loops.  A death loop means the worker keeps dying before
+        # pushing — the work may be complete but stranded in the worktree.
+        # The operator triage for ``worker_death_loop`` is "check the
+        # worktree for stranded commits," not "worker is spinning."
+        # Pre-compute stranded-commits counts outside the state lock because
+        # the git probe touches the filesystem.
+        if worker_death_escalated:
+            stranded_counts: dict[int, int | None] = {}
+            for issue_number in worker_death_escalated:
+                pr_data = pr_by_issue.get(issue_number)
+                if pr_data is None:
+                    stranded_counts[issue_number] = None
+                    continue
+                live_head = pr_data.get("headRefOid")
+                if not live_head:
+                    stranded_counts[issue_number] = None
+                    continue
+                issue_entry = head_check_state.get("issues", {}).get(str(issue_number), {})
+                branch = issue_entry.get("branch_name") if isinstance(issue_entry, dict) else None
+                if not branch:
+                    stranded_counts[issue_number] = None
+                    continue
+                wt_path = worktree_path_for_branch(self.repo_root, branch, self._layout.worktrees)
+                ahead, _err = worktree_ahead_of_sha(wt_path, live_head)
+                stranded_counts[issue_number] = ahead
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for issue_number in worker_death_escalated:
+                    entry = state.get("issues", {}).get(str(issue_number), {})
+                    if not isinstance(entry, dict):
+                        entry = {}
+                    current_status = entry.get("status")
+                    if current_status == "escalated":
+                        continue
+                    prior_deaths = _windowed_worker_death_at(
+                        entry,
+                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                    )
+                    # Issue #783: worker death loop is a process failure,
+                    # not a judgment call -- mechanical.
+                    issue_extra: dict[str, Any] = {
+                        "worker_death_at": prior_deaths,
+                        "dispatched_at": None,
+                    }
+                    stranded = stranded_counts.get(issue_number)
+                    if stranded is not None:
+                        issue_extra["stranded_commits"] = stranded
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="worker_death_loop",
+                        reason_class="mechanical",
+                        issue_extra=issue_extra,
+                    )
+                    event_payload: dict[str, Any] = {
+                        "issue_number": issue_number,
+                        "previous_status": "rework_requested",
+                        "reason": "worker_death_loop",
+                        "worker_death_count": len(prior_deaths),
+                    }
+                    if stranded is not None:
+                        event_payload["stranded_commits"] = stranded
+                    state = append_event(
+                        state,
+                        "session_failed_escalated",
+                        event_payload,
+                        state_path=self.paths.state_file,
+                    )
+                save_state(self.paths.state_file, state)
+            for issue_number in worker_death_escalated:
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "redispatch_escalated",
+                )
+
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
             by_number = {int(issue["number"]): issue for issue in candidates}
@@ -18157,6 +18659,7 @@ class OrchestratorApp:
                 "review_blocked_retry": sorted(review_blocked_retry),
                 "operator_claimed_skipped": sorted(operator_claimed_skipped),
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
+                "worker_death_escalated": sorted(worker_death_escalated),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -18218,6 +18721,7 @@ class OrchestratorApp:
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
+                "worker_death_escalated": sorted(worker_death_escalated),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -18460,6 +18964,7 @@ class OrchestratorApp:
                 "review_blocked_retry": sorted(review_blocked_retry),
                 "operator_claimed_skipped": sorted(operator_claimed_skipped),
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
+                "worker_death_escalated": sorted(worker_death_escalated),
             }
             if gov.enabled or gov.fleet_enabled:
                 data.update(gov.report_fields())
@@ -18975,18 +19480,71 @@ class OrchestratorApp:
         worker whose issue later opens a PR is routed to rework by the
         dead-session reaper lane, not by dispatch.
 
+        Issue #1122: before reaping, inspect the worktree using the same
+        ``inspect_worktree_state`` single enforcement point the reaper lane
+        uses (issue #252). If the worktree is COMPLETED or the worker reported
+        a successful push (``.worker-outcome.json`` with
+        ``push_succeeded=true``), do NOT reap the sidecar or strip labels --
+        leave the sidecar untouched so the reaper lane
+        (``_classify_dead_sessions_and_update_throttle_state``) can salvage the
+        pushed branch on a subsequent pass. Reaping here would destroy the
+        sidecar the reaper lane is keyed off, making salvage impossible and
+        escalating review-ready pushed work to a human.
+
         Returns ``(status, dispatched_at, state)``. The status is
         ``"dispatch_failed"`` so the caller's entry-building frees the slot;
         ``dispatched_at`` is ``None`` because no worker was actually launched.
         """
+        from .worktree import WorktreeState
+
         issue_number = request.issue_number
+
+        # Issue #1122: inspect the worktree before reaping. A completed or
+        # push-succeeded worktree must be left for the reaper lane's salvage
+        # path (_attempt_salvage). Reaping the sidecar here would destroy the
+        # key the reaper lane iterates over, making salvage impossible.
+        phantom_workers = [w for w in iter_workers(sessions_dir) if w.issue_number == issue_number]
+        for w in phantom_workers:
+            worktree_path = Path(w.worktree_path)
+            inspection = inspect_worktree_state(
+                worktree_path,
+                self.config.dispatch.base_ref,
+                self.config.dispatch.injected_paths,
+                self.config.dispatch.materialize_dirs,
+            )
+            worker_outcome = read_worker_outcome(worktree_path)
+            reported_push = (
+                isinstance(worker_outcome, dict)
+                and worker_outcome.get("push_succeeded") is True
+                and worker_outcome.get("pr_created") is False
+            )
+            if inspection.state == WorktreeState.COMPLETED or reported_push:
+                # Preserve the sidecar so the reaper lane can salvage. Do NOT
+                # strip labels -- the issue should stay in its active state
+                # until salvage moves it to pr_open, preventing re-dispatch
+                # into the occupied worktree.
+                state = append_event(
+                    state,
+                    "session_failed_relabeled",
+                    {
+                        "issue_number": issue_number,
+                        "failure_kind": "live_worker_redispatch_averted",
+                        "reason": "phantom_live_worker_completed_work_preserved",
+                        "worktree_state": inspection.state.value,
+                        "reported_push": reported_push,
+                        "removed_labels": [],
+                        "added_ready": False,
+                        "label_write_ok": True,
+                    },
+                    state_path=self.paths.state_file,
+                )
+                return "dispatch_failed", None, state
 
         # Reap the stale sidecar and matching worktree writer marker. Reuse
         # WorkerView.reap_sidecar so the adapter-specific path derivation and
         # session-id-gated marker removal stay in one place.
-        for w in iter_workers(sessions_dir):
-            if w.issue_number == issue_number:
-                w.reap_sidecar(sessions_dir)
+        for w in phantom_workers:
+            w.reap_sidecar(sessions_dir)
 
         # Strip active labels and ensure the ready label is present so the
         # issue becomes dispatchable. This mirrors

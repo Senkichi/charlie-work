@@ -1179,6 +1179,7 @@ class TestAdequacyConfig:
         "*.md",
         "docs/**",
         "examples/**",
+        ".github/workflows/**",
         "*.lock",
         "*.toml",
         "*.cfg",

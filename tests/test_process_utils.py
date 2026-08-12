@@ -226,6 +226,8 @@ def test_kill_process_tree_start_time_verification() -> None:
 
         # Mock _enumerate_child_pids to avoid wmic on Windows
         with patch("charlie_work.process_utils._enumerate_child_pids", return_value=[]):
+            from charlie_work.process_utils import get_process_start_time
+
             # Both assertions below are only meaningful while the child is
             # still alive. If it has already exited, `taskkill /F /PID` exits
             # with a not-found code outside (0, 1), kill_process_tree returns [],
@@ -244,15 +246,52 @@ def test_kill_process_tree_start_time_verification() -> None:
                 "fixture process was already gone before the mismatch case"
             )
 
+            # kill_process_tree can conservatively skip (return []) when
+            # get_process_start_time transiently returns None inside it:
+            # OpenProcess can fail under box load even for a child we spawned,
+            # and the conservative-skip path returns [] before reaching the
+            # start-time comparison. The is_pid_alive probe above does not catch
+            # this because the failure happens *inside* kill_process_tree, not
+            # before it. This is the second race left open after #1097: the
+            # negative case passes vacuously (conservative skip, not mismatch)
+            # and the positive case fails as `assert <pid> in []`.
+            #
+            # The retry distinguishes the two [] causes by re-checking
+            # get_process_start_time *after* the call. If it returns None, the
+            # skip was a transient query failure (retry). If it returns a value,
+            # the [] is the correct result -- start-time mismatch for the
+            # negative case, or the process is gone for the positive case.
+
             # Test 1: Wrong start time should NOT kill
             wrong_start_time = actual_start_time - 1000  # 1000 seconds in the past
-            killed = kill_process_tree(proc.pid, wrong_start_time)
-            assert killed == []  # Should not kill due to start time mismatch
+            deadline_t1 = time.monotonic() + 10.0
+            killed = []
+            while time.monotonic() < deadline_t1:
+                killed = kill_process_tree(proc.pid, wrong_start_time)
+                if killed != []:
+                    break  # unexpected kill -- let the assertion below fail
+                # [] -- could be start-time mismatch (correct) or transient skip
+                if get_process_start_time(proc.pid) is not None:
+                    break  # query works, [] is genuinely from mismatch
+                time.sleep(0.1)  # transient query failure, retry
+            assert killed == [], f"wrong start time must not kill, but got killed={killed}"
             assert is_pid_alive(proc.pid), "mismatched start time must leave the process alive"
 
             # Test 2: Correct start time should kill
-            killed = kill_process_tree(proc.pid, actual_start_time)
-            assert proc.pid in killed  # Should kill the process
+            # Retry while the process is alive: a successful kill makes it dead,
+            # and a transient skip leaves it alive, so the loop converges either
+            # way. The process sleeps 300s, so it will not exit on its own.
+            deadline_t2 = time.monotonic() + 10.0
+            killed = []
+            while time.monotonic() < deadline_t2 and is_pid_alive(proc.pid):
+                killed = kill_process_tree(proc.pid, actual_start_time)
+                if proc.pid in killed:
+                    break
+                time.sleep(0.1)  # transient query failure, retry
+            assert proc.pid in killed, (
+                f"kill_process_tree did not kill {proc.pid} within retry deadline; "
+                f"killed={killed}, alive={is_pid_alive(proc.pid)}"
+            )
 
     finally:
         # Clean up if still alive
