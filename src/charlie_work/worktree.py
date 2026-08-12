@@ -125,9 +125,11 @@ class LiveWorkerRedispatchError(RuntimeError):
 class WorktreeForeignWriterError(RuntimeError):
     """Raised when ``create_worktree`` is about to use a worktree that has a
     live writer marker belonging to a session the orchestrator does not own
-    (e.g. an operator's editor or an out-of-band agent). The launch shim
-    surfaces this as ``failure_kind="worktree_foreign_writer"`` so the issue
-    stays queued and the dispatch event log records the conflict.
+    (e.g. an operator's editor or an out-of-band agent), OR when the target
+    branch is already checked out in a worktree at a foreign path the
+    orchestrator did not create (issue #1118). The launch shim surfaces this
+    as ``failure_kind="worktree_foreign_writer"`` so the issue stays queued
+    and the dispatch event log records the conflict.
     """
 
     def __init__(
@@ -140,10 +142,18 @@ class WorktreeForeignWriterError(RuntimeError):
         self.worktree_path = worktree_path
         self.pid = pid
         self.session_id = session_id
-        super().__init__(
-            f"worktree {worktree_path} has a live foreign writer "
-            f"(pid={pid}, session_id={session_id})"
-        )
+        if pid is None and session_id is None:
+            # Issue #1118: the branch is checked out in a worktree at a path
+            # the orchestrator did not create — no writer marker to inspect.
+            super().__init__(
+                f"worktree {worktree_path} is a foreign checkout the "
+                f"orchestrator did not create; refusing to adopt it"
+            )
+        else:
+            super().__init__(
+                f"worktree {worktree_path} has a live foreign writer "
+                f"(pid={pid}, session_id={session_id})"
+            )
 
 
 # How many lines of git's stderr to carry into a pre-merge failure message.
@@ -678,6 +688,53 @@ def remote_branch_ahead_count(
     count_result = run_captured(
         ["git", "rev-list", "--count", f"{merge_base}..{head_sha}"],
         cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not count_result.ok:
+        return None, f"rev-list failed: {count_result.error or count_result.stderr}"
+    try:
+        return int(count_result.stdout.strip()), None
+    except ValueError:
+        return None, f"rev-list returned non-integer: {count_result.stdout!r}"
+
+
+def worktree_ahead_of_sha(worktree_path: Path, base_sha: str) -> tuple[int | None, str | None]:
+    """Return how many commits the worktree HEAD is ahead of ``base_sha``.
+
+    Used by the rework death-loop escalation (issue #1134) to detect
+    *stranded* work — commits the worker made but never pushed because it
+    died mid-push.  Returns ``(ahead_count, error)``.  ``ahead_count`` is
+    ``None`` when the worktree does not exist, ``base_sha`` is not a known
+    object, or git fails.  A count of ``0`` means the worktree HEAD is at
+    or behind ``base_sha`` (no stranded commits).
+    """
+    if not worktree_path.is_dir():
+        return None, f"worktree does not exist: {worktree_path}"
+
+    head_result = run_captured(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not head_result.ok:
+        return None, f"rev-parse HEAD failed: {head_result.error or head_result.stderr}"
+    head_sha = head_result.stdout.strip()
+
+    if not _object_exists(worktree_path, base_sha):
+        return None, f"base sha not in worktree object store: {base_sha}"
+
+    merge_base_result = run_captured(
+        ["git", "merge-base", base_sha, head_sha],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not merge_base_result.ok:
+        return None, f"merge-base failed: {merge_base_result.error or merge_base_result.stderr}"
+    merge_base = merge_base_result.stdout.strip()
+
+    count_result = run_captured(
+        ["git", "rev-list", "--count", f"{merge_base}..{head_sha}"],
+        cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
     if not count_result.ok:
@@ -1792,6 +1849,52 @@ def is_junction(path: Path) -> bool:
     return os.path.islink(path)
 
 
+def is_live_foreign_worktree(entry: Path, repo_root: Path) -> bool:
+    """Return True if ``entry`` is a live git worktree administered by a
+    repository other than ``repo_root``.
+
+    Worker launch shims provision sibling checkouts of *other* repos inside
+    this repo's worktrees dir (e.g. the ``ci_runners`` worktree the ci-fleet
+    editable resolves against). Such a directory is never in this repo's
+    ``git worktree list``, so the orphan sweep would classify it as residue
+    and delete it out from under running workers (2026-08-09 incident: the
+    08:15:43Z reclaim pass removed the sibling minutes after provisioning).
+
+    A linked worktree's ``.git`` is a *file* containing ``gitdir: <admin>``.
+    The directory is a live foreign worktree when that admin dir exists and
+    is not under this repo's own ``.git``. A dangling gitdir (admin dir gone,
+    e.g. after ``git worktree remove`` failed to delete the tree) is residue
+    and stays sweepable. Unreadable/unresolvable ``.git`` fails closed
+    (treated as foreign): deleting what we cannot classify risks destroying
+    live state, while skipping it merely defers cleanup."""
+    gitfile = entry / ".git"
+    try:
+        if not gitfile.is_file():
+            return False
+        content = gitfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    for line in content.splitlines():
+        if line.startswith("gitdir:"):
+            admin = Path(line.split(":", 1)[1].strip())
+            break
+    else:
+        return True
+    if not admin.is_absolute():
+        admin = entry / admin
+    try:
+        admin = admin.resolve()
+        if not admin.is_dir():
+            return False
+        # ``repo_root/.git`` is a directory for a main checkout; resolve()
+        # canonicalizes both sides so the containment test defeats junctions
+        # and 8.3 short names, same as the ci_fleet containment checks.
+        own_git = (repo_root / ".git").resolve()
+    except OSError:
+        return True
+    return not (admin == own_git or admin.is_relative_to(own_git))
+
+
 def _unlink_reparse_point(path: Path) -> None:
     """Remove a reparse point (Windows junction/symlink) or POSIX symlink.
 
@@ -2551,8 +2654,42 @@ def create_worktree(
         )
 
         if existing_wt:
+            # Issue #1118: refuse to adopt a worktree at a foreign path. The
+            # branch-name lookup above spans ALL registered worktrees, so a
+            # branch checked out by the operator in a different directory
+            # (e.g. .claude/worktrees/<name>) would be silently adopted,
+            # committing the operator's uncommitted edits as worker output.
+            # Only a worktree at the orchestrator's expected path is one we
+            # could have created; anything else is a foreign checkout.
+            existing_wt_path = Path(existing_wt["worktree"])
+            if existing_wt_path != worktree_path:
+                raise WorktreeForeignWriterError(
+                    worktree_path=existing_wt_path,
+                    pid=None,
+                    session_id=None,
+                )
             # Reuse existing worktree: fetch and fast-forward to origin tip
-            worktree_path = Path(existing_wt["worktree"])
+            worktree_path = existing_wt_path
+            # Issue #1118: a dirty worktree at adoption time is an independent
+            # hard stop — never commit tracked modifications the shim did not
+            # itself produce. In recovery mode the dirt is a prior (owned)
+            # worker's partial work, so the check is skipped there.
+            #
+            # The ``.venv`` junction is orchestrator scaffolding (a reparse
+            # point, not worker content), so it is excluded from the dirty
+            # check — a leftover junction from a prior dispatch must not
+            # trigger a false positive here. It is unlinked below when
+            # ``venv_source`` is None.
+            if recovery is None:
+                dirty_injected = injected_paths
+                venv_link = worktree_path / ".venv"
+                if is_junction(venv_link):
+                    dirty_injected = injected_paths + (".venv",)
+                dirty_reason = _worktree_dirty_reason(
+                    worktree_path, dirty_injected, materialize_dirs
+                )
+                if dirty_reason:
+                    raise WorktreeUnsafeError(dirty_reason)
             # Only fetch if origin remote exists (deterministic check)
             if _has_origin_remote(repo_root):
                 # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
@@ -4156,6 +4293,11 @@ def clean_worktrees(
         registered_paths = {Path(wt["worktree"]) for wt in registered_worktrees}
         for child in worktrees_dir.iterdir():
             if not child.is_dir() or child in registered_paths or is_junction(child):
+                continue
+            if is_live_foreign_worktree(child, repo_root):
+                # e.g. the sibling ci_runners checkout worker shims provision
+                # for the ci-fleet editable — another repo's live worktree,
+                # not this repo's residue. Never sweep it.
                 continue
             if dry_run:
                 orphans["planned"].append({"worktree": str(child)})
