@@ -10105,6 +10105,129 @@ def test_detect_and_handle_stalled_reviews_reaps_unclaimed_reviewing_packet(
     )
 
 
+def test_stale_claim_recovery_skipped_logs_when_prompt_path_missing_from_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #708: a reviewing PR whose prompt_path is missing from state must
+    emit a review_stale_claim_recovery_skipped event instead of silently moving
+    on, so a stuck-PR investigation can distinguish "recovery gave up" from
+    "recovery was not needed"."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+
+    # reviewing PR with NO review_dispatch_status and NO prompt_path -- the
+    # stale-claim recovery path's first skip branch.
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "status": "reviewing",
+        }
+        save_state(app.paths.state_file, state)
+
+    # No launch should happen: recovery gave up before reaching dispatch.
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert launched == []
+    state = load_state(app.paths.state_file)
+    # The PR was not reaped -- it stays in its stuck reviewing state with no
+    # dispatch claim, exactly as before #708. The fix is observability, not a
+    # behavior change to the recovery decision itself.
+    assert state["prs"]["100"].get("review_dispatch_status") is None
+
+    skip_events = query_events(app.paths.state_file, kind="review_stale_claim_recovery_skipped")
+    assert len(skip_events) == 1
+    payload = skip_events[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["reason"] == "prompt_path missing from state"
+    assert skip_events[0]["level"] == "warning"
+
+
+def test_stale_claim_recovery_skipped_logs_when_prompt_path_file_gone(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #708: a reviewing PR whose prompt_path points at a file that no
+    longer exists on disk must emit a review_stale_claim_recovery_skipped event
+    (with the path) instead of silently moving on."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+
+    gone_prompt = tmp_path / "deleted-review-prompt.md"
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "status": "reviewing",
+            "prompt_path": str(gone_prompt),
+        }
+        save_state(app.paths.state_file, state)
+
+    assert not gone_prompt.exists()
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(100, "agent/issue-10-fix")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert launched == []
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"].get("review_dispatch_status") is None
+
+    skip_events = query_events(app.paths.state_file, kind="review_stale_claim_recovery_skipped")
+    assert len(skip_events) == 1
+    payload = skip_events[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["reason"] == "prompt_path file does not exist on disk"
+    assert payload["prompt_path"] == str(gone_prompt)
+    assert skip_events[0]["level"] == "warning"
+
+
 def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
     tmp_path: Path,
 ) -> None:

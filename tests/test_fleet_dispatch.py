@@ -2391,6 +2391,7 @@ def test_supervisor_lifecycle_records_nonzero_exit_on_exception(
     assert exit_kwargs["reason"] == "exception"
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -2398,11 +2399,21 @@ def test_supervisor_lifecycle_head_drift_exit_reason(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     tmp_path: Path,
     _patch_self_deploy_for_fleet_tests: dict[str, MagicMock],
 ) -> None:
     """A HEAD-drift restart records reason=head_drift_restart with exit_code=0."""
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mocks = _patch_self_deploy_for_fleet_tests
+    # Issue #604: the head-drift restart exit now probes the watchdog
+    # scheduled task. Mock it to ``armed=None`` (unknown) so the test stays
+    # hermetic -- no real ``schtasks`` subprocess call, no coupling to the
+    # live state of the ``charlie-fleet-pass`` task -- and the alert path
+    # (which fires only on a confirmed ``armed=False``) is not exercised
+    # here. The dedicated watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
     mock_load_config.return_value = OrchestratorConfig(
         supervisor=SupervisorConfig(poll_interval_seconds=5, full_pass_interval_seconds=1)
     )
@@ -2573,6 +2584,7 @@ def test_supervisor_lifecycle_keyboard_interrupt_reason(
     assert exit_kwargs["reason"] == "keyboard_interrupt"
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -2580,11 +2592,21 @@ def test_supervisor_lifecycle_self_deploy_head_move_reason(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     tmp_path: Path,
     _patch_self_deploy_for_fleet_tests: dict[str, MagicMock],
 ) -> None:
     """A self-deploy HEAD move records reason=self_deploy_head_moved with exit_code=0."""
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mocks = _patch_self_deploy_for_fleet_tests
+    # Issue #604: the self-deploy restart exit now probes the watchdog
+    # scheduled task. Mock it to ``armed=None`` (unknown) so the test stays
+    # hermetic -- no real ``schtasks`` subprocess call, no coupling to the
+    # live state of the ``charlie-fleet-pass`` task -- and the alert path
+    # (which fires only on a confirmed ``armed=False``) is not exercised
+    # here. The dedicated watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
     mock_load_config.return_value = OrchestratorConfig(
         supervisor=SupervisorConfig(poll_interval_seconds=5, full_pass_interval_seconds=1)
     )
@@ -2862,6 +2884,7 @@ def test_run_fleet_supervise_self_deploys_before_each_pass(
     assert deploy_mock.call_count == 3
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -2869,6 +2892,7 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -2886,6 +2910,8 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     watchdog, which relaunches a fresh process with the new commit
     actually imported.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
@@ -2895,6 +2921,13 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     )
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()
+    # Issue #604: the self-deploy restart exit now probes the watchdog
+    # scheduled task. Mock it to ``armed=None`` (unknown) so the test stays
+    # hermetic -- no real ``schtasks`` subprocess call, no coupling to the
+    # live state of the ``charlie-fleet-pass`` task -- and the alert path
+    # (which fires only on a confirmed ``armed=False``) is not exercised
+    # here. The dedicated watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     deploy_mock = MagicMock(
         return_value=SelfDeployResult(
@@ -2927,6 +2960,7 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     assert result.data["restart_requested"] is True
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -2934,6 +2968,7 @@ def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -2952,6 +2987,8 @@ def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
     did fail, so ok=False is correct. What must survive is the instruction to
     replace this process.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
@@ -2961,6 +2998,11 @@ def test_zero_pass_bookkeeping_failure_cannot_cancel_a_self_deploy_restart(
     )
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()
+    # Issue #604: mock the watchdog probe so this test does not perform a real
+    # ``schtasks`` subprocess call. ``armed=None`` (unknown) does not trigger
+    # the alert path, keeping the test focused on the bookkeeping-failure
+    # invariant it exists to guard.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     deploy_mock = MagicMock(
         return_value=SelfDeployResult(
@@ -3158,6 +3200,7 @@ def test_run_fleet_supervise_does_not_restart_on_deferred_sync_with_unmoved_head
     assert mock_fleet_loop.call_count == 3
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -3165,6 +3208,7 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -3175,6 +3219,8 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     startup-vs-current HEAD comparison, the daemon would run stale code
     forever (observed 2026-07-23: ~90 minutes of ConfigError crashes).
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
@@ -3184,6 +3230,13 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     )
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()
+    # Issue #604: the head-drift restart exit now probes the watchdog
+    # scheduled task. Mock it to ``armed=None`` (unknown) so the test does
+    # not perform a real ``schtasks`` subprocess call and stays hermetic --
+    # the same pattern used by the self_deploy/read_head_sha/fleet_loop
+    # mocks already applied in this test. The alert path (armed=False) is
+    # covered by the dedicated watchdog-alert tests below.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     deploy_mock = MagicMock(
         return_value=SelfDeployResult(
@@ -3221,6 +3274,293 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
     # have left drift silently non-restarting with every test still green.
     assert result.data["exit_reason"] == "head_drift"
     assert result.data["restart_requested"] is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #604: a restart-requesting exit must verify the watchdog scheduled task
+# is armed, and alert through a non-log channel when it is not. A disabled
+# watchdog turns a clean, well-reported drift/self-deploy exit into a silent
+# indefinite fleet outage (the 2026-07-25 incident).
+# ---------------------------------------------------------------------------
+
+
+def test_probe_fleet_watchdog_parses_enabled_state() -> None:
+    """probe_fleet_watchdog maps the 'Scheduled Task State' field to armed."""
+    from charlie_work.fleet_dispatch import probe_fleet_watchdog
+
+    enabled_output = (
+        "TaskName:                             \\charlie-fleet-pass\n"
+        "Status:                               Ready\n"
+        "Scheduled Task State:                 Enabled\n"
+        "Last Result:                          0\n"
+    )
+    disabled_output = (
+        "TaskName:                             \\charlie-fleet-pass\n"
+        "Status:                               Disabled\n"
+        "Scheduled Task State:                 Disabled\n"
+    )
+
+    calls = iter([enabled_output, disabled_output])
+
+    def _runner_seq(command, *, cwd, timeout_seconds):
+        return RunResult(returncode=0, stdout=next(calls), stderr="")
+
+    with patch("charlie_work.fleet_dispatch.sys") as mock_sys:
+        mock_sys.platform = "win32"
+        probe = probe_fleet_watchdog(run_command=_runner_seq)
+    assert probe.armed is True
+    assert "Enabled" in probe.detail
+
+    with patch("charlie_work.fleet_dispatch.sys") as mock_sys:
+        mock_sys.platform = "win32"
+        probe = probe_fleet_watchdog(run_command=_runner_seq)
+    assert probe.armed is False
+    assert "Disabled" in probe.detail
+
+
+def test_probe_fleet_watchdog_unknown_on_missing_field_and_non_windows() -> None:
+    """An unparseable or non-Windows probe degrades to armed=None, never False."""
+    from charlie_work.fleet_dispatch import probe_fleet_watchdog
+
+    # No 'Scheduled Task State' line -> cannot determine.
+    with patch("charlie_work.fleet_dispatch.sys") as mock_sys:
+        mock_sys.platform = "win32"
+        probe = probe_fleet_watchdog(
+            run_command=lambda command, *, cwd, timeout_seconds: RunResult(
+                returncode=0, stdout="TaskName: \\charlie-fleet-pass\n", stderr=""
+            )
+        )
+    assert probe.armed is None
+
+    # schtasks query failure (task missing) -> unknown, not False.
+    with patch("charlie_work.fleet_dispatch.sys") as mock_sys:
+        mock_sys.platform = "win32"
+        probe = probe_fleet_watchdog(
+            run_command=lambda command, *, cwd, timeout_seconds: RunResult(
+                returncode=1, stdout="", stderr="task not found", error="command exited 1"
+            )
+        )
+    assert probe.armed is None
+
+    # Non-Windows -> not probed, unknown.
+    with patch("charlie_work.fleet_dispatch.sys") as mock_sys:
+        mock_sys.platform = "linux"
+        probe = probe_fleet_watchdog()
+    assert probe.armed is None
+
+
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_alerts_when_watchdog_disabled_on_head_drift(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """A HEAD-drift restart with the watchdog disabled alerts + records an event.
+
+    This is the #604 regression: on 2026-07-25 the drift exit fired correctly
+    but the ``charlie-fleet-pass`` task was ``Enabled=false``, so no relaunch
+    came and the fleet went dark silently. The exit must now surface the
+    disarmed watchdog through a channel that is not the launcher log.
+    """
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5, full_pass_interval_seconds=1, active_cooldown_seconds=7
+        ),
+        notify=NotifyConfig(enabled=True, sink="file"),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        lambda _repo_root, **_kwargs: SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=False,
+            synced=False,
+            from_sha="def456",
+            to_sha="def456",
+            message="already up to date",
+        ),
+    )
+    sha_sequence = iter(["abc123", "def456", "def456"])
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.read_head_sha", lambda _root: next(sha_sequence)
+    )
+    mock_probe.return_value = WatchdogProbe(
+        armed=False, detail="task 'charlie-fleet-pass' is Disabled"
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
+        fc = _FakeClock(auto_advance=1.0)
+        result = run_fleet_supervise(
+            max_passes=5, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(fleet_dir)
+        )
+
+    assert result.data["exit_reason"] == "head_drift"
+    assert result.data["restart_requested"] is True
+    mock_probe.assert_called_once()
+
+    # The alert reached the attention digest (a non-log channel).
+    watchdog_calls = [
+        call for call in mock_emit.call_args_list if call.args[1].adapter_kind == "fleet-watchdog"
+    ]
+    assert len(watchdog_calls) == 1
+    entry = watchdog_calls[0].args[1]
+    assert entry.health == "ERROR"
+    assert watchdog_calls[0].kwargs.get("persistent") is False
+    assert "disabled" in entry.last_log_line
+
+    # And it was durably recorded to the fleet events.db.
+    from charlie_work.supervisor_lifecycle import supervisor_heartbeat_path
+
+    events = query_events(
+        supervisor_heartbeat_path(str(fleet_dir)), kind="supervisor_restart_watchdog_disabled"
+    )
+    assert len(events) == 1
+    assert events[0]["payload"]["exit_reason"] == "head_drift"
+
+
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_no_alert_when_watchdog_armed_or_unknown(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """An armed or unknown watchdog must not false-alarm on a restart exit.
+
+    ``armed=None`` (non-Windows, schtasks missing, task not found) is not
+    proof the watchdog is disarmed, so it must stay quiet -- otherwise every
+    non-Windows restart would page.
+    """
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5, full_pass_interval_seconds=1, active_cooldown_seconds=7
+        ),
+        notify=NotifyConfig(enabled=True, sink="file"),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        lambda _repo_root, **_kwargs: SelfDeployResult(
+            ok=True, pulled=True, changed=False, synced=False, message="already up to date"
+        ),
+    )
+
+    for armed, label in ((True, "armed"), (None, "unknown")):
+        sha_sequence = iter(["abc123", "def456", "def456"])
+        monkeypatch.setattr(
+            "charlie_work.fleet_dispatch.read_head_sha", lambda _root: next(sha_sequence)
+        )
+        mock_probe.return_value = WatchdogProbe(armed=armed, detail=f"task state {label}")
+        with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
+            fc = _FakeClock(auto_advance=1.0)
+            run_fleet_supervise(
+                max_passes=5,
+                clock=fc.now,
+                sleep=fc.sleep,
+                fleet_dir_override=str(tmp_path / "fleet"),
+            )
+        watchdog_calls = [
+            call
+            for call in mock_emit.call_args_list
+            if call.args[1].adapter_kind == "fleet-watchdog"
+        ]
+        assert watchdog_calls == [], f"unexpected watchdog alert when {label}"
+
+
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_alerts_when_watchdog_disabled_on_self_deploy(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """The self-deploy head-moved restart site also alerts when the watchdog is off.
+
+    Both members of RESTART_EXIT_REASONS (self_deploy, head_drift) carry the
+    same watchdog dependency; the verification must not be wired at only one
+    of the two break sites.
+    """
+    from charlie_work.config import NotifyConfig
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
+    cfg = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5, full_pass_interval_seconds=1, active_cooldown_seconds=7
+        ),
+        notify=NotifyConfig(enabled=True, sink="file"),
+    )
+    mock_load_config.return_value = cfg
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        lambda _repo_root, **_kwargs: SelfDeployResult(
+            ok=True,
+            pulled=True,
+            changed=True,
+            synced=False,
+            head_changed=True,
+            from_sha="aaa111",
+            to_sha="bbb222",
+            message="fast-forwarded",
+        ),
+    )
+    # startup_head == current_head so the drift branch does not also fire.
+    monkeypatch.setattr("charlie_work.fleet_dispatch.read_head_sha", lambda _root: "bbb222")
+    mock_probe.return_value = WatchdogProbe(
+        armed=False, detail="task 'charlie-fleet-pass' is Disabled"
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
+        fc = _FakeClock(auto_advance=1.0)
+        result = run_fleet_supervise(
+            max_passes=5, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(fleet_dir)
+        )
+
+    assert result.data["exit_reason"] == "self_deploy"
+    assert result.data["restart_requested"] is True
+    mock_probe.assert_called_once()
+    watchdog_calls = [
+        call for call in mock_emit.call_args_list if call.args[1].adapter_kind == "fleet-watchdog"
+    ]
+    assert len(watchdog_calls) == 1
+    assert watchdog_calls[0].args[1].health == "ERROR"
+    assert watchdog_calls[0].kwargs.get("persistent") is False
+    assert "disabled" in watchdog_calls[0].args[1].last_log_line
+    # Durably recorded to the fleet events.db with the self_deploy reason.
+    from charlie_work.supervisor_lifecycle import supervisor_heartbeat_path
+
+    sd_events = query_events(
+        supervisor_heartbeat_path(str(fleet_dir)), kind="supervisor_restart_watchdog_disabled"
+    )
+    assert len(sd_events) == 1
+    assert sd_events[0]["payload"]["exit_reason"] == "self_deploy"
 
 
 @patch("charlie_work.fleet_dispatch.emit_digest")
@@ -5878,6 +6218,7 @@ def test_fleet_has_configured_repos_false_with_no_registry_file(tmp_path: Path) 
     assert _fleet_has_configured_repos(str(tmp_path / "never-written"), None) is False
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -5885,6 +6226,7 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -5900,7 +6242,17 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
     ``supervisor_zero_pass_alarm`` must fire, at the cycle the persisted
     streak reaches the configured threshold (3) -- not one per restart.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mock_lock.return_value = MagicMock()
+    # Issue #604: every cycle exits via the self-deploy HEAD-moved break,
+    # which now probes the watchdog scheduled task. Mock it to ``armed=None``
+    # (unknown) so every cycle stays hermetic -- no real ``schtasks``
+    # subprocess call, no coupling to the live state of the
+    # ``charlie-fleet-pass`` task -- and the alert path (which fires only on
+    # a confirmed ``armed=False``) is not exercised here. The dedicated
+    # watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     fleet_dir = tmp_path / "fleet"
     isolated_root = tmp_path / "orchestrator-root"
@@ -5969,6 +6321,7 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
             assert alarms[0]["payload"]["consecutive_zero_pass_cycles"] == 3
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -5976,6 +6329,7 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -5984,7 +6338,17 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
     consecutive zero-repo-pass cycles it runs -- that is a configuration
     state, not an incident.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mock_lock.return_value = MagicMock()
+    # Issue #604: every cycle exits via the self-deploy HEAD-moved break,
+    # which now probes the watchdog scheduled task. Mock it to ``armed=None``
+    # (unknown) so every cycle stays hermetic -- no real ``schtasks``
+    # subprocess call, no coupling to the live state of the
+    # ``charlie-fleet-pass`` task -- and the alert path (which fires only on
+    # a confirmed ``armed=False``) is not exercised here. The dedicated
+    # watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     fleet_dir = tmp_path / "fleet"
     isolated_root = tmp_path / "orchestrator-root"
@@ -6037,6 +6401,7 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
     assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -6044,6 +6409,7 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -6051,7 +6417,17 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
     the streak to 0, so a later zero-pass streak has to build back up to the
     threshold instead of alarming immediately off carried-over count.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mock_lock.return_value = MagicMock()
+    # Issue #604: the zero-repo-pass cycles exit via the self-deploy
+    # HEAD-moved break, which now probes the watchdog scheduled task. Mock
+    # it to ``armed=None`` (unknown) so every cycle stays hermetic -- no
+    # real ``schtasks`` subprocess call, no coupling to the live state of
+    # the ``charlie-fleet-pass`` task -- and the alert path (which fires
+    # only on a confirmed ``armed=False``) is not exercised here. The
+    # dedicated watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     fleet_dir = tmp_path / "fleet"
     isolated_root = tmp_path / "orchestrator-root"

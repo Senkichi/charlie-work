@@ -3300,9 +3300,37 @@ def _detect_and_handle_stalled_reviews(
             # the failure timestamp so the next dispatch_reviews pass can retry.
             prompt_path_str = pr_state.get("prompt_path")
             if not prompt_path_str:
+                # Issue #708: record that this PR's stale-claim recovery was
+                # skipped so a future stuck-PR investigation does not require
+                # re-deriving from source whether recovery ran or silently gave
+                # up. log_event writes directly to events.db (not the state.json
+                # events ring) because this skip does not mutate state -- routing
+                # it through sweep_events/_append_sweep_events would only persist
+                # when ``changed`` is set by an unrelated sibling PR in the same
+                # pass, reintroducing the silent-drop under exactly the low-load
+                # conditions where the signal matters most.
+                log_event(
+                    state_file,
+                    "review_stale_claim_recovery_skipped",
+                    {
+                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                        "reason": "prompt_path missing from state",
+                    },
+                    level="warning",
+                )
                 continue
             prompt_path = Path(prompt_path_str)
             if not prompt_path.exists():
+                log_event(
+                    state_file,
+                    "review_stale_claim_recovery_skipped",
+                    {
+                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                        "reason": "prompt_path file does not exist on disk",
+                        "prompt_path": prompt_path_str,
+                    },
+                    level="warning",
+                )
                 continue
 
             decision_value: str | None = "missing"
