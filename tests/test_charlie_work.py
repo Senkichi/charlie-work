@@ -5176,13 +5176,16 @@ def test_dispatch_worker_template_selects_claude_code_variant(tmp_path: Path) ->
 def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None:
     override_dir = tmp_path / "orchestrator-prompts"
     override_dir.mkdir()
-    # The override must carry the no-merge contract markers (issue #714):
-    # _write_worker_prompt's post-render guard rejects a flat override that
-    # drops them.
+    # The override must carry the no-merge contract markers (issue #714) and
+    # the conventional-commit title instruction (issue #715):
+    # _write_worker_prompt's post-render guards reject a flat override that
+    # drops either.
     (override_dir / "worker.md").write_text(
         "REPO-LOCAL #$issue_number\n\n"
         "## No-merge contract\n\n"
-        "Your deliverable ENDS at pushing the branch and opening the PR.\n",
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n\n"
+        "## PR requirements\n\n"
+        "- Title format: Conventional-Commits format (`type(scope): description`).\n",
         encoding="utf-8",
     )
     config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir="orchestrator-prompts"))
@@ -5196,7 +5199,9 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
     assert prompt_path.read_text(encoding="utf-8") == (
         "REPO-LOCAL #123\n\n"
         "## No-merge contract\n\n"
-        "Your deliverable ENDS at pushing the branch and opening the PR.\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n\n"
+        "## PR requirements\n\n"
+        "- Title format: Conventional-Commits format (`type(scope): description`).\n"
     )
 
 

@@ -101,7 +101,12 @@ from .janitor import (
 )
 from .labels import TransitionOutcome, transition
 from .paths import ResolvedLayout, RuntimePaths, resolved_layout
-from .prompts import assert_no_merge_contract, prompt_template_digest, render_prompt
+from .prompts import (
+    assert_conventional_commit_title,
+    assert_no_merge_contract,
+    prompt_template_digest,
+    render_prompt,
+)
 from .reconcile import (
     DriftItem,
     apply_fixes as apply_drift_fixes,
@@ -20393,6 +20398,14 @@ class OrchestratorApp:
         # is caught at the dispatch boundary rather than shipping a worker
         # with no instruction against merging/closing/relabeling its own PR.
         assert_no_merge_contract(prompt, context=f"worker prompt for issue #{issue_number}")
+        # Issue #715: enforce the conventional-commit title instruction on the
+        # *rendered output* so a repo-local flat override that mandates a stale
+        # non-conventional-commit title format (e.g. 'Fix #N: ...') is caught
+        # at the dispatch boundary rather than shipping a worker whose every PR
+        # trips the janitor's _check_title_conventional warning.
+        assert_conventional_commit_title(
+            prompt, context=f"worker prompt for issue #{issue_number}"
+        )
         prompt_path.write_text(prompt, encoding="utf-8")
         return prompt_path
 

@@ -576,6 +576,92 @@ def test_assert_no_merge_contract_accepts_override_with_contract(
     assert_no_merge_contract(prompt)
 
 
+def test_worker_prompts_contain_conventional_commit_title_instruction() -> None:
+    """Verify that worker prompts carry the conventional-commit title instruction (issue #715)."""
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "Conventional-Commits format" in prompt
+
+
+def test_assert_conventional_commit_title_passes_for_package_templates() -> None:
+    """The guard accepts prompts rendered from the package worker templates (issue #715)."""
+    from charlie_work.prompts import assert_conventional_commit_title
+
+    for template_name in ("worker.md", "worker_claude_code.md"):
+        prompt = _render_worker_with_sections(template_name)
+        # Must not raise — the package worker templates all instruct
+        # conventional-commit titles.
+        assert_conventional_commit_title(prompt)
+
+
+def test_assert_conventional_commit_title_rejects_stale_flat_override(
+    tmp_path: Path,
+) -> None:
+    """The guard catches a flat override with a stale title format (issue #715).
+
+    This is the exact scenario the issue describes: a repo-local flat
+    whole-file ``worker.md`` override that mandates ``Fix #$issue_number:
+    <short title>`` instead of Conventional Commits, so every PR the worker
+    opens trips the janitor's ``_check_title_conventional`` warning.
+    """
+    from charlie_work.prompts import (
+        MissingConventionalTitleError,
+        assert_conventional_commit_title,
+    )
+
+    # Simulate job-cannon's stale flat override — the kind the issue says
+    # mandates ``Fix #$issue_number: <short title>``.
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task: Issue #$issue_number\n\n"
+        "## PR requirements\n\n"
+        "- Title format: `Fix #$issue_number: <short title>`.\n"
+        "- Body must include `Closes #$issue_number`.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    assert "Conventional-Commits format" not in prompt
+    assert "Fix #123" in prompt  # $issue_number substituted
+
+    with pytest.raises(MissingConventionalTitleError) as exc_info:
+        assert_conventional_commit_title(prompt, context="worker prompt for issue #123")
+    assert "issue #715" in str(exc_info.value)
+    assert "worker prompt for issue #123" in str(exc_info.value)
+
+
+def test_assert_conventional_commit_title_accepts_override_with_correct_format(
+    tmp_path: Path,
+) -> None:
+    """The guard accepts a flat override that does carry the correct format (issue #715).
+
+    A repo-local override is not inherently wrong — it just must not drop
+    the conventional-commit title instruction.
+    """
+    from charlie_work.prompts import assert_conventional_commit_title
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task: Issue #$issue_number\n\n"
+        "## PR requirements\n\n"
+        "- Title format: Conventional-Commits format (`type(scope): description`).\n"
+        "- Body must include `Closes #$issue_number`.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    # Must not raise — the override carries the conventional-commit title instruction.
+    assert_conventional_commit_title(prompt)
+
+
 def test_review_template_contains_test_adequacy_section_placeholder() -> None:
     """Verify that review.md contains the $test_adequacy_section placeholder (issue #180)."""
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"

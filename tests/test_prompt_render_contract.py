@@ -222,6 +222,37 @@ def test_worker_writer_rejects_flat_override_without_no_merge_contract(
     assert "issue #714" in str(exc_info.value)
 
 
+def test_worker_writer_rejects_flat_override_without_conventional_title(
+    tmp_path: Path,
+) -> None:
+    """Issue #715: ``_write_worker_prompt`` must refuse to write a prompt
+    whose rendered output is missing the conventional-commit title instruction
+    — the exact failure mode a repo-local flat ``worker.md`` override creates
+    when it mandates a stale ``Fix #N: ...`` title format."""
+    from charlie_work.prompts import MissingConventionalTitleError
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    # The override carries the no-merge contract (so the #714 guard passes)
+    # but mandates a stale non-conventional-commit title format.
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\n"
+        "## No-merge contract\n\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n\n"
+        "## PR requirements\n\n"
+        "- Title format: `Fix #$issue_number: <short title>`.\n"
+        "$issue_number $branch_name\n",
+        encoding="utf-8",
+    )
+    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(override_dir)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh=None)
+
+    with pytest.raises(MissingConventionalTitleError) as exc_info:
+        app._write_worker_prompt(_fake_issue())
+    assert "issue #715" in str(exc_info.value)
+
+
 def test_rework_writer_rejects_flat_override_without_no_merge_contract(
     tmp_path: Path,
 ) -> None:
