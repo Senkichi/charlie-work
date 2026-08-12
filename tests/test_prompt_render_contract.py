@@ -29,6 +29,8 @@ import json
 import string
 from pathlib import Path
 
+import pytest
+
 from charlie_work import layout
 from charlie_work.config import OrchestratorConfig, RuntimeConfig
 from charlie_work.paths import runtime_paths
@@ -193,6 +195,59 @@ def test_rework_md_renders_via_real_writer_with_required_changes(tmp_path: Path)
     assert not _unresolved_placeholders_in_output(rendered), (
         "rendered prompt still contains an unresolved $placeholder"
     )
+
+
+def test_worker_writer_rejects_flat_override_without_no_merge_contract(
+    tmp_path: Path,
+) -> None:
+    """Issue #714: ``_write_worker_prompt`` must refuse to write a prompt
+    whose rendered output is missing the no-merge contract — the exact
+    failure mode a repo-local flat ``worker.md`` override creates when it
+    drops the ``$section_no_merge_contract`` reference."""
+    from charlie_work.prompts import MissingNoMergeContractError
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\nGo fix the issue. No safety sections here.\n"
+        "$issue_number $branch_name\n",
+        encoding="utf-8",
+    )
+    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(override_dir)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh=None)
+
+    with pytest.raises(MissingNoMergeContractError) as exc_info:
+        app._write_worker_prompt(_fake_issue())
+    assert "issue #714" in str(exc_info.value)
+
+
+def test_rework_writer_rejects_flat_override_without_no_merge_contract(
+    tmp_path: Path,
+) -> None:
+    """Issue #714: ``_write_rework_prompt`` must refuse to write a rework
+    brief whose rendered output is missing the no-merge contract."""
+    from charlie_work.prompts import MissingNoMergeContractError
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "rework.md").write_text(
+        "# Rework Task\n\nFix the PR. No safety sections here.\n"
+        "$pr_number $pr_title $pr_url $issue_number $branch_name\n",
+        encoding="utf-8",
+    )
+    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(override_dir)))
+    state_file = tmp_path / ".var" / "charlie-work" / "state.json"
+    pr = {
+        "number": 2,
+        "title": "Fake PR title",
+        "url": "https://example.test/pull/2",
+        "headRefName": "agent/issue-1-fake",
+    }
+
+    with pytest.raises(MissingNoMergeContractError) as exc_info:
+        _write_rework_prompt(state_file, pr, 1, "A dispatch note.", config)
+    assert "issue #714" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------

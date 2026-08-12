@@ -101,7 +101,7 @@ from .janitor import (
 )
 from .labels import TransitionOutcome, transition
 from .paths import ResolvedLayout, RuntimePaths, resolved_layout
-from .prompts import prompt_template_digest, render_prompt
+from .prompts import assert_no_merge_contract, prompt_template_digest, render_prompt
 from .reconcile import (
     DriftItem,
     apply_fixes as apply_drift_fixes,
@@ -5557,6 +5557,10 @@ def _write_rework_prompt(
         config,
         repo_root=repo_root,
     )
+    # Issue #714: enforce the no-merge contract on the *rendered output* so a
+    # repo-local flat rework override that drops $section_no_merge_contract is
+    # caught at the dispatch boundary.
+    assert_no_merge_contract(prompt, context=f"rework prompt for PR #{pr_number}")
     prompt_path.write_text(prompt, encoding="utf-8")
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
     # regeneration (when review-decision.json is newer than the brief) can
@@ -20277,6 +20281,11 @@ class OrchestratorApp:
                 "worker_model_tier": self.config.dispatch.worker_model_tier,
             },
         )
+        # Issue #714: enforce the no-merge contract on the *rendered output*
+        # so a repo-local flat override that drops $section_no_merge_contract
+        # is caught at the dispatch boundary rather than shipping a worker
+        # with no instruction against merging/closing/relabeling its own PR.
+        assert_no_merge_contract(prompt, context=f"worker prompt for issue #{issue_number}")
         prompt_path.write_text(prompt, encoding="utf-8")
         return prompt_path
 
