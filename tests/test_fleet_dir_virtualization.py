@@ -198,6 +198,102 @@ def test_touch_repo_is_silent_when_not_virtualized(tmp_path: Path, caplog: Any) 
     assert not any("Fleet dir virtualization" in record.message for record in caplog.records)
 
 
+# ---------------------------------------------------------------------------
+# write-side integration: _run_fleet_allocation_prologue (fleet allocation events)
+# ---------------------------------------------------------------------------
+
+
+def test_allocation_prologue_warns_when_fleet_dir_is_virtualized(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    """The allocation prologue must warn when fleet events would land in a copy.
+
+    Mirrors ``test_touch_repo_warns_when_fleet_dir_is_virtualized``: the guard
+    fires through the real ``warn_fleet_dir_virtualization_on_write``, proving
+    ``_run_fleet_allocation_prologue`` is wired to the guard with
+    ``resolved_fleet_dir`` (the ``fleet_dir()`` path, not a per-repo
+    ``state_dir``). Issue #603 added the call site; this test pins that wiring
+    so a future refactor that drops the call or passes the wrong path is caught.
+    """
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from charlie_work.fleet_dispatch import (
+        _CiFleetDirtyCheck,
+        _run_fleet_allocation_prologue,
+    )
+
+    fleet = tmp_path / "fleet"
+    fleet.mkdir(parents=True, exist_ok=True)
+    redirected = tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work"
+    _patch_resolve_to_diverge(monkeypatch, fleet, redirected)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+
+    # Minimal fleet.json registry with one valid repo root so the prologue
+    # reaches the warn_fleet_dir_virtualization_on_write call site (it only
+    # fires after the anchor-root check passes).
+    (fleet / "fleet.json").write_text(
+        json.dumps(
+            {"version": 1, "repos": {"owner/repo": {"repo_root": str(repo_root)}}},
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    config = SimpleNamespace(
+        runner_allocation=SimpleNamespace(
+            enabled=True, max_running_runners=4, managed_root="C:/test-root"
+        ),
+        supervisor=SimpleNamespace(full_pass_interval_seconds=300),
+        runtime=None,
+        runner_scaling=SimpleNamespace(managed_root="C:/test-root"),
+    )
+
+    # Mock run_allocation_pass so no real CI fleet work runs; the skipped
+    # result exercises the same state_path routing the fix changes without
+    # needing a real runner pool.
+    result = MagicMock(
+        ok=True,
+        skipped=True,
+        notes=("no configured runners",),
+        error=None,
+        started=0,
+        parked=0,
+        results=(),
+        plan=None,
+    )
+    with (
+        patch(
+            "charlie_work.fleet_dispatch.run_allocation_pass",
+            return_value=result,
+        ),
+        patch("charlie_work.fleet_dispatch.GitHub"),
+        patch(
+            "charlie_work.fleet_dispatch._ci_fleet_worktree_dirty",
+            return_value=_CiFleetDirtyCheck(is_dirty=False),
+        ),
+        patch(
+            "charlie_work.fleet_dispatch.warn_fleet_dir_virtualization_on_write",
+            wraps=warn_fleet_dir_virtualization_on_write,
+        ) as warn_spy,
+    ):
+        with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_paths"):
+            _run_fleet_allocation_prologue(str(fleet), config, dry_run=False)
+
+    # The guard was invoked with resolved_fleet_dir (the fleet_dir() path) and
+    # the allocation-events context — proving the call site is wired.
+    warn_spy.assert_called_once_with(fleet, context="writing fleet allocation events")
+    # The real guard fired (via wraps), so the warning reached the logger.
+    assert any(
+        "Fleet dir virtualization" in record.message
+        and "writing fleet allocation events" in record.message
+        for record in caplog.records
+    )
+
+
 # --- _paths_equal semantics (#899) -------------------------------------------
 # The helper's docstring claimed PurePath.__eq__ was case-sensitive on Windows.
 # It is not, and nothing here covered the claim, so it rotted undetected until a
