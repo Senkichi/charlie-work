@@ -14259,11 +14259,16 @@ class OrchestratorApp:
         ``consecutive_failed_merge_attempts``, advancing the state machine
         instead of merely previewing it.
         """
-        # Read-only state snapshot — dry-run never writes, so no lock is
-        # needed.  The idempotency short-circuit's conditional merge_alert
-        # clear is a write and is skipped; the verdict is still accurate
-        # because "already merged" is a read-only fact.
-        state = load_state(self.paths.state_file)
+        # Read-only state snapshot.  Dry-run never writes, but the locked
+        # read helper is still required: ``load_state_locked`` is the single
+        # point of enforcement for read-only ``load_state`` calls outside an
+        # explicit ``state_lock`` block (issue #310, enforced by
+        # ``test_no_unlocked_load_state_in_production_code``).  Holding the
+        # advisory lock during the read also prevents a concurrent writer's
+        # tmp+replace from racing this read.  The idempotency short-circuit's
+        # conditional merge_alert clear is a write and is skipped; the verdict
+        # is still accurate because "already merged" is a read-only fact.
+        state = load_state_locked(self.paths.state_file)
         existing_pr_state = state["prs"].get(str(pr_number), {})
         if existing_pr_state.get("status") == "merged":
             return CommandResult(
