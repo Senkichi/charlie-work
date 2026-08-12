@@ -7660,6 +7660,586 @@ def test_review_queue_carry_forward_records_event(tmp_path: Path) -> None:
     assert payload["carry_forward_tier"] == "patch-id"
 
 
+# --------------------------------------------------------------------------
+# Issue #1111: stale-CI request_changes verdict suppression in review_queue()
+# --------------------------------------------------------------------------
+
+_STALE_CI_REQUIRED = ("Tests passed", "Pre-commit")
+
+_STALE_CI_GREEN_CHECKS = [
+    {"name": "Tests passed", "state": "SUCCESS"},
+    {"name": "Pre-commit", "state": "SUCCESS"},
+]
+
+_STALE_CI_RED_CHECKS = [
+    {"name": "Tests passed", "state": "FAILURE"},
+    {"name": "Pre-commit", "state": "SUCCESS"},
+]
+
+_STALE_CI_CONTAMINATED_REQUIRED_CHANGES = [
+    "Tests passed: .github:18 — Process completed with exit code 1."
+]
+
+
+def _stale_ci_review_queue_app(
+    tmp_path: Path,
+    *,
+    prs: list[dict[str, Any]],
+    checks: list[dict[str, Any]],
+    dry_run: bool = False,
+) -> OrchestratorApp:
+    """Build an OrchestratorApp with a configured ``required_checks`` set and
+    a ``FakeGitHubWithChecks`` fixture, for issue #1111's stale-CI-verdict
+    ``review_queue()`` tests. ``required_check_citation_names``/
+    ``is_stale_ci_verdict`` only fire when ``config.auto_merge.required_checks``
+    is non-empty, which the default ``OrchestratorConfig()`` used by the
+    sibling carry-forward helper does not set."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHubWithChecks(checks=checks)
+    fake_gh.prs = prs
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
+
+
+def _stale_ci_pr(pr_number: int, issue_number: int, head: str) -> dict[str, Any]:
+    return {
+        "number": pr_number,
+        "title": f"Fix #{issue_number}",
+        "url": f"https://example.test/pull/{pr_number}",
+        "headRefName": f"agent/issue-{issue_number}-fix",
+        "baseRefName": "main",
+        "headRefOid": head,
+        "mergeStateStatus": "CLEAN",
+        "body": f"Closes #{issue_number}",
+        "labels": [],
+        "isCrossRepository": False,
+        "state": "OPEN",
+    }
+
+
+def test_review_queue_same_head_stale_ci_requeues_as_stale(tmp_path: Path) -> None:
+    """Issue #1111 (a): a same-head request_changes verdict whose only
+    findings cite required checks that are all green now must be re-queued
+    for a fresh review (decision "stale") with a ``stale_ci_verdict_requeued``
+    event, and must NOT be routed through
+    ``_reroute_stranded_request_changes`` -- that repair would re-drive the
+    SAME (now-nonexistent) failure into a rework worker instead of waiting
+    for the fresh review this path queues."""
+    pr_number = 456
+    issue_number = 123
+    head = "sha-live-head"
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, head)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": head,
+            "decision": "stale",
+            "reviewed_head_sha": head,
+        }
+    ]
+
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_events) == 1
+    assert requeue_events[0]["payload"]["pr_number"] == pr_number
+    assert requeue_events[0]["payload"]["issue_number"] == issue_number
+    assert requeue_events[0]["payload"]["reviewed_head_sha"] == head
+
+    # _reroute_stranded_request_changes must NOT have fired: it would have
+    # transitioned the issue to rework_requested via _route_to_rework.
+    state = load_state(app.paths.state_file)
+    assert state["issues"].get(str(issue_number), {}).get("status") != "rework_requested"
+
+
+def test_review_queue_same_head_not_stale_when_checks_red(tmp_path: Path) -> None:
+    """Issue #1111 control: the identical contaminated-shape verdict, but a
+    required check is still red. ``is_stale_ci_verdict`` must be False, so
+    the pre-#1111 behavior is preserved: the PR is not queued (same-head
+    request_changes verdicts are never queued, stale or not), and the
+    stranded-verdict repair fires normally since the issue was never routed
+    to rework."""
+    pr_number = 456
+    issue_number = 123
+    head = "sha-live-head"
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, head)],
+        checks=_STALE_CI_RED_CHECKS,
+        dry_run=False,
+    )
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert requeue_events == []
+    # Preserved existing behavior: the stranded verdict IS re-routed to rework
+    # because it describes a real (still-red) failure.
+    state = load_state(app.paths.state_file)
+    assert state["issues"][str(issue_number)]["status"] == "rework_requested"
+
+
+def test_review_queue_carry_forward_suppressed_when_stale_ci(tmp_path: Path) -> None:
+    """Issue #1111 (c): carry-forward matches (identical patch-id) but the
+    recorded verdict is stale-CI. The carry-forward must be skipped -- no
+    ``_update_approval_head`` call, no ``verdict_carried_forward_clean_rebase``
+    event -- and the PR falls through to the stale-queue path instead, so a
+    fresh review supersedes the (already-resolved) failure rather than
+    silently re-confirming it on the new head."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, new_head)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    app.gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "packet_head_sha": new_head,
+            "decision": "stale",
+            "reviewed_head_sha": old_head,
+        }
+    ]
+
+    # The decision file must NOT have been carry-forwarded onto the new head.
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == old_head
+    assert "carry_forward_tier" not in decision
+
+    state = load_state(app.paths.state_file)
+    assert "reviewed_head_sha" not in state["prs"].get(str(pr_number), {})
+    carry_events = query_events(app.paths.state_file, kind="verdict_carried_forward_clean_rebase")
+    assert carry_events == []
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_events) == 1
+    assert requeue_events[0]["payload"]["reviewed_head_sha"] == old_head
+
+
+def test_review_queue_same_head_stale_ci_requeue_deduped_per_head(tmp_path: Path) -> None:
+    """Issue #1120: ``review_queue()`` is called multiple times per loop pass
+    (once by ``dispatch_reviews()``, once by
+    ``_record_cross_family_verdicts()``), so the ``stale_ci_verdict_requeued``
+    event double-fires for the same PR/head within one pass. Mirroring the
+    ``stale_ci_gate_pass_head`` fix (PR #1117), the emission is now keyed on
+    ``stale_ci_verdict_requeued_head`` stored in the PR state entry: a second
+    consecutive ``review_queue()`` for the same PR/head must not emit a
+    duplicate."""
+    pr_number = 456
+    issue_number = 123
+    head = "sha-live-head"
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, head)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    first = app.review_queue()
+    second = app.review_queue()
+
+    assert first.ok is True
+    assert second.ok is True
+    # Both calls queue the PR -- the dispatch dedup is separate.
+    assert len(first.data["queue"]) == 1
+    assert len(second.data["queue"]) == 1
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["stale_ci_verdict_requeued_head"] == head
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_events) == 1
+
+
+def test_review_queue_carry_forward_stale_ci_requeue_deduped_per_head(tmp_path: Path) -> None:
+    """Issue #1120 (carry-forward variant): the head-advanced stale-CI
+    requeue emission site must also dedup per live head. A second
+    ``review_queue()`` call for the same PR/live-head must not re-emit."""
+    from charlie_work.janitor import _calculate_patch_id
+
+    diff_text = (
+        "diff --git a/file b/file\n"
+        "index 123..456 100644\n"
+        "--- a/file\n"
+        "+++ b/file\n"
+        "@@ -1,3 +1,4 @@\n"
+        " line1\n"
+        " line2\n"
+        "+line3\n"
+        " line4\n"
+    )
+    patch_id = _calculate_patch_id(diff_text)
+    old_head = "sha-abc123"
+    new_head = "sha-rebased123"
+    pr_number = 456
+    issue_number = 123
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, new_head)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    app.gh.diffs[pr_number] = diff_text
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": patch_id,
+            "carried_forward_from": [],
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    first = app.review_queue()
+    second = app.review_queue()
+
+    assert first.ok is True
+    assert second.ok is True
+    assert len(first.data["queue"]) == 1
+    assert len(second.data["queue"]) == 1
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["stale_ci_verdict_requeued_head"] == new_head
+    requeue_events = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_events) == 1
+
+
+def test_review_queue_stale_ci_requeue_re_emits_after_head_transition(tmp_path: Path) -> None:
+    """Issue #1120: the dedup key is the live head, not a permanent
+    suppression. When the PR advances to a new head, the next
+    ``review_queue()`` call must re-emit ``stale_ci_verdict_requeued`` for
+    the new head transition."""
+    pr_number = 456
+    issue_number = 123
+    head_a = "sha-head-a"
+    head_b = "sha-head-b"
+
+    app = _stale_ci_review_queue_app(
+        tmp_path,
+        prs=[_stale_ci_pr(pr_number, issue_number, head_a)],
+        checks=_STALE_CI_GREEN_CHECKS,
+        dry_run=False,
+    )
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head_a,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head_a,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    first = app.review_queue()
+    assert first.ok is True
+    requeue_after_first = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_after_first) == 1
+
+    # Advance to a new head: update the PR's live head, the packet head, and
+    # the recorded verdict to the new head.
+    app.gh.prs = [_stale_ci_pr(pr_number, issue_number, head_b)]
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head_b,
+        {
+            "decision": "request_changes",
+            "escalated": False,
+            "reviewed_head_sha": head_b,
+            "required_changes": _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        },
+    )
+
+    second = app.review_queue()
+    assert second.ok is True
+    requeue_after_second = query_events(app.paths.state_file, kind="stale_ci_verdict_requeued")
+    assert len(requeue_after_second) == 2
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(pr_number)]["stale_ci_verdict_requeued_head"] == head_b
+
+
+def test_review_no_op_rework_suppressed_when_stale_ci_verdict(tmp_path: Path) -> None:
+    """Issue #1111 (d): review()'s no-op-rework routing must not fire -- and
+    must not burn ``no_op_rework_attempts`` -- when the on-disk verdict is a
+    stale-CI request_changes (contaminated shape, all required checks
+    currently green). Mirrors
+    test_fix_janitor_routing.test_janitor_no_op_rework_routes_to_rework's
+    same-head/same-diff setup, which is what makes ``verdict.is_no_op_rework``
+    True in the first place; the only difference is the recorded verdict's
+    ``required_changes`` shape and a configured, all-green ``required_checks``."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=_STALE_CI_GREEN_CHECKS)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary="Tests passed: .github:18 — Process completed with exit code 1.",
+        required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+    )
+    state = load_state(app.paths.state_file)
+    record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
+    state["issues"]["123"] = record
+    save_state(app.paths.state_file, state)
+
+    # Same head, same diff as the recorded verdict: no actual content change,
+    # so the janitor's no-op-rework signal fires -- but the verdict is
+    # stale-CI, so routing must be suppressed.
+    result = app.review(456)
+
+    assert result.data.get("routed_to_rework") is not True
+    state = load_state(app.paths.state_file)
+    assert state["prs"].get("456", {}).get("no_op_rework_attempts", 0) == 0
+    assert state["issues"]["123"]["status"] != "rework_requested"
+
+
+def test_review_stale_ci_skip_emits_gate_pass_event(tmp_path: Path) -> None:
+    """Issue #1116: when run_janitor's own no-op-rework check is skipped
+    because the recorded verdict is stale-CI (same setup as
+    test_review_no_op_rework_suppressed_when_stale_ci_verdict -- same head,
+    same diff, contaminated required_changes shape, all required checks
+    green), the janitor gate as a whole now PASSES (no no-op failure, no
+    other failure on this green PR) and review() must log a
+    ``stale_ci_verdict_gate_pass`` event via query_events -- log_event writes
+    only to events.db, never state["events"], so that is the only way to
+    observe it. The dry_run=True control mirrors the ``not self.dry_run``
+    guard on the emission site."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=_STALE_CI_GREEN_CHECKS)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary="Tests passed: .github:18 — Process completed with exit code 1.",
+        required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+    )
+    state = load_state(app.paths.state_file)
+    record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
+    state["issues"]["123"] = record
+    save_state(app.paths.state_file, state)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data.get("routed_to_rework") is not True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["janitor_ok"] is True
+
+    gate_pass_events = query_events(app.paths.state_file, kind="stale_ci_verdict_gate_pass")
+    assert len(gate_pass_events) == 1
+    assert gate_pass_events[0]["payload"]["pr_number"] == 456
+    assert gate_pass_events[0]["payload"]["head_sha"] == "sha-abc123"
+
+
+def test_review_stale_ci_skip_no_gate_pass_event_in_dry_run(tmp_path: Path) -> None:
+    """Control for the ``not self.dry_run`` guard on the emission site
+    (workflow.py review(), issue #1116): the identical stale-CI same-head/
+    same-diff scenario must not emit ``stale_ci_verdict_gate_pass`` when the
+    app is running dry."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=_STALE_CI_GREEN_CHECKS)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary="Tests passed: .github:18 — Process completed with exit code 1.",
+        required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+    )
+    state = load_state(app.paths.state_file)
+    record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
+    state["issues"]["123"] = record
+    save_state(app.paths.state_file, state)
+
+    dry_app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    dry_app.review(456)
+
+    assert query_events(app.paths.state_file, kind="stale_ci_verdict_gate_pass") == []
+
+
+def test_review_stale_ci_gate_pass_event_deduped_per_head(tmp_path: Path) -> None:
+    """PR #1117 review finding: the gate re-passes on EVERY orchestrator poll
+    while the PR waits on review-dispatch capacity, so without dedup the
+    ``stale_ci_verdict_gate_pass`` event re-fires each pass (the log-spam
+    pattern review() guards against everywhere else -- cost-spirals.md
+    Finding 2). A second consecutive review() for the same PR/head must not
+    emit a duplicate; the emission is keyed on ``stale_ci_gate_pass_head``
+    stored in the PR state entry."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=_STALE_CI_GREEN_CHECKS)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary="Tests passed: .github:18 — Process completed with exit code 1.",
+        required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+    )
+    state = load_state(app.paths.state_file)
+    record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
+    state["issues"]["123"] = record
+    save_state(app.paths.state_file, state)
+
+    first = app.review(456)
+    second = app.review(456)
+
+    assert first.ok is True
+    assert second.ok is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["stale_ci_gate_pass_head"] == "sha-abc123"
+    gate_pass_events = query_events(app.paths.state_file, kind="stale_ci_verdict_gate_pass")
+    assert len(gate_pass_events) == 1
+
+
+def test_review_no_op_rework_routes_when_prose_finding(tmp_path: Path) -> None:
+    """Issue #1111 control: the same same-head/same-diff no-op setup, but the
+    recorded verdict's finding is real prose rather than a check citation.
+    ``is_stale_ci_verdict`` must be False, so the pre-#1111 no-op-rework
+    routing (and its attempt-burn) is preserved exactly as
+    test_fix_janitor_routing.test_janitor_no_op_rework_routes_to_rework
+    already covers -- reproduced here as the control for the suppression
+    test above rather than relying on cross-file coupling."""
+    config = OrchestratorConfig(auto_merge=AutoMergeConfig(required_checks=_STALE_CI_REQUIRED))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(checks=_STALE_CI_GREEN_CHECKS)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(
+        456,
+        "request_changes",
+        summary="fix A",
+        required_changes=["src/foo.py:42 — off-by-one error in the loop bound."],
+    )
+    state = load_state(app.paths.state_file)
+    record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
+    state["issues"]["123"] = record
+    save_state(app.paths.state_file, state)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert result.data["routed_to_rework"] is True
+    assert result.data["rework_reason"] == "no_op_rework"
+
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["no_op_rework_attempts"] == 1
+
+
 def test_merge_ready_post_update_branch_records_verified_sync_event(
     tmp_path: Path,
 ) -> None:
@@ -12165,6 +12745,20 @@ def test_review_queue_reroutes_stranded_request_changes_and_is_idempotent(
         },
     ]
     app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    # Issue #1123: the restorer now consults the GitHub issue state before
+    # re-activating. The motivating case (issue #789) is a GitHub-OPEN issue
+    # whose state status was clobbered to "closed" by a reconcile bug -- so
+    # the fake must report #649 as OPEN for the repair to fire.
+    app.gh.issues = [
+        {
+            "number": 649,
+            "title": "Fix search",
+            "url": "https://example.test/issues/649",
+            "body": "Search is broken",
+            "labels": [],
+            "state": "OPEN",
+        }
+    ]
     _write_review_packet(
         tmp_path,
         693,
@@ -12217,6 +12811,267 @@ def test_review_queue_reroutes_stranded_request_changes_and_is_idempotent(
     assert state_final["prs"]["693"]["status"] == "rework_requested"
     assert len(state_final["events"]) == events_before_second_pass
     assert app.gh.labels_added == labels_added_before_second_pass
+
+
+def test_review_queue_does_not_reroute_stranded_request_changes_for_closed_issue(
+    tmp_path: Path,
+) -> None:
+    """Issue #1123: the stranded request_changes restorer must never re-activate
+    a CLOSED GitHub issue. The motivating real-world case is jc #1293 / PR #1394:
+    the issue was closed as COMPLETED by the operator, but PR #1394 stayed open
+    with a recorded ``request_changes`` verdict at an unchanged head -- the exact
+    bait the stranded restorer keys on. Without consulting the GitHub issue
+    state, the restorer flips the status back to ``rework_requested`` every pass,
+    the no-op rework cap escalates it, and reconcile's
+    ``state_active_status_issue_closed`` flips it back to "closed" -- a perpetual
+    three-lane loop that emitted 56 bogus escalation events over 1.3 days.
+
+    The fix: the restorer consults ``gh.issue_view`` and skips (emitting a
+    ``stranded_request_changes_skipped_issue_closed`` event) when the linked
+    issue is CLOSED on GitHub, converging the state status to "closed" and
+    recording a ``stranded_skip_closed`` marker so subsequent passes
+    short-circuit without a second ``gh.issue_view()`` call or a duplicate
+    event. A second pass over the same stranded state must not re-emit the
+    skip event or re-fetch the issue.
+    """
+    pr_number = 1394
+    issue_number = 1293
+    head = "2ee42f8d"
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}: some change",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    # The linked issue is CLOSED on GitHub -- the operator closed it as
+    # COMPLETED via a different PR. This is the ground truth the restorer
+    # must consult.
+    app.gh.issues = [
+        {
+            "number": issue_number,
+            "title": f"Issue {issue_number}",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "Some issue",
+            "labels": [],
+            "state": "CLOSED",
+        }
+    ]
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": head,
+            "required_changes": [],
+            "summary": "Real reviewer prose describing a real problem to fix.",
+            "escalated": False,
+        },
+    )
+    # Plant the state status as "closed" -- the value reconcile's
+    # state_active_status_issue_closed writes for a CLOSED GitHub issue.
+    # "closed" is NOT in _REWORK_ALREADY_ROUTED_STATUSES, so the restorer's
+    # idempotency guard does not short-circuit and the bug would fire
+    # (flipping it back to "rework_requested") without the #1123 fix.
+    state = load_state(app.paths.state_file)
+    state["issues"][str(issue_number)] = {"number": issue_number, "status": "closed"}
+    save_state(app.paths.state_file, state)
+
+    # Track gh.issue_view calls to prove the second pass does not re-fetch.
+    issue_view_calls: list[int] = []
+    _original_issue_view = app.gh.issue_view
+
+    def _counting_issue_view(number: int) -> Any:
+        issue_view_calls.append(number)
+        return _original_issue_view(number)
+
+    app.gh.issue_view = _counting_issue_view  # type: ignore[method-assign]
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+    # First pass fetched the issue once to confirm it is CLOSED.
+    assert issue_view_calls == [issue_number]
+
+    state_after = load_state(app.paths.state_file)
+    # The restorer must NOT have re-activated the issue.
+    assert state_after["issues"][str(issue_number)]["status"] == "closed"
+    assert state_after["prs"].get(str(pr_number), {}).get("status") != "rework_requested"
+    # The stranded_skip_closed marker must be set for idempotency.
+    assert state_after["issues"][str(issue_number)].get("stranded_skip_closed") is True
+    # No rework prompt written, no labels added.
+    prompt_path = app.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
+    assert not prompt_path.exists()
+    assert app.gh.labels_added == []
+
+    # A skip event must be recorded for observability.
+    skip_events = query_events(
+        app.paths.state_file, kind="stranded_request_changes_skipped_issue_closed"
+    )
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["pr_number"] == pr_number
+    assert skip_events[0]["payload"]["issue_number"] == issue_number
+    assert skip_events[0]["payload"]["head_sha"] == head
+
+    # No stranded_request_changes_rework_requested event must have fired.
+    rework_events = query_events(
+        app.paths.state_file, kind="stranded_request_changes_rework_requested"
+    )
+    assert rework_events == []
+
+    # --- Second pass: idempotency ---
+    # A subsequent review_queue() call over the same stranded state must not
+    # re-fetch gh.issue_view or re-emit the skip event. The stranded_skip_closed
+    # marker + status == "closed" short-circuits before the fetch.
+    events_before_second_pass = len(
+        query_events(app.paths.state_file, kind="stranded_request_changes_skipped_issue_closed")
+    )
+
+    result_2 = app.review_queue()
+
+    assert result_2.ok is True
+    assert result_2.data["queue"] == []
+    # No additional gh.issue_view call on the second pass.
+    assert issue_view_calls == [issue_number]
+    # No duplicate skip event.
+    skip_events_2 = query_events(
+        app.paths.state_file, kind="stranded_request_changes_skipped_issue_closed"
+    )
+    assert len(skip_events_2) == events_before_second_pass
+    # Status unchanged.
+    state_final = load_state(app.paths.state_file)
+    assert state_final["issues"][str(issue_number)]["status"] == "closed"
+    assert state_final["prs"].get(str(pr_number), {}).get("status") != "rework_requested"
+
+
+def test_review_queue_closed_issue_skip_converges_active_status_and_labels(
+    tmp_path: Path,
+) -> None:
+    """Issue #1123 rework: when the restorer discovers a CLOSED issue whose
+    state status is not yet ``"closed"`` (e.g. ``"reviewing"`` -- still in
+    ACTIVE_STATE_STATUSES), it must converge the status to ``"closed"`` and
+    strip active labels in the same pass, mirroring reconcile's
+    ``state_active_status_issue_closed``. Without status convergence the
+    ``stranded_skip_closed`` marker check (gated on
+    ``status == "closed"``) would not short-circuit on the next pass and the
+    restorer would re-fetch forever. Without label stripping the issue
+    would carry active labels on a finalized state, since setting
+    ``"closed"`` here prevents reconcile's
+    ``state_active_status_issue_closed`` from firing (it requires
+    ``status in ACTIVE_STATE_STATUSES``).
+    """
+    pr_number = 1395
+    issue_number = 1294
+    head = "3ff53f9e"
+    active_label = "agent:in-progress"
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}: another change",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+    (paths.root / "state.json").write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    fake_gh = FakeGitHub()
+    fake_gh.prs = prs
+    # Issue is CLOSED on GitHub but still carries an active label.
+    fake_gh.issues = [
+        {
+            "number": issue_number,
+            "title": f"Issue {issue_number}",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "Some issue",
+            "labels": [{"name": active_label}],
+            "state": "CLOSED",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        head,
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": head,
+            "required_changes": [],
+            "summary": "Real reviewer prose.",
+            "escalated": False,
+        },
+    )
+    # Plant status as "reviewing" -- an ACTIVE_STATE_STATUSES member that is
+    # NOT in _REWORK_ALREADY_ROUTED_STATUSES, so the restorer proceeds past
+    # the early-return and fetches the issue.
+    state = load_state(app.paths.state_file)
+    state["issues"][str(issue_number)] = {"number": issue_number, "status": "reviewing"}
+    save_state(app.paths.state_file, state)
+
+    issue_view_calls: list[int] = []
+    _original_issue_view = app.gh.issue_view
+
+    def _counting_issue_view(number: int) -> Any:
+        issue_view_calls.append(number)
+        return _original_issue_view(number)
+
+    app.gh.issue_view = _counting_issue_view  # type: ignore[method-assign]
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == []
+    assert issue_view_calls == [issue_number]
+
+    state_after = load_state(app.paths.state_file)
+    # Status converged to "closed" and marker set.
+    assert state_after["issues"][str(issue_number)]["status"] == "closed"
+    assert state_after["issues"][str(issue_number)].get("stranded_skip_closed") is True
+    # Active label stripped from the closed issue.
+    assert (issue_number, active_label) in app.gh.labels_removed
+    # No rework routed.
+    assert state_after["prs"].get(str(pr_number), {}).get("status") != "rework_requested"
+    prompt_path = app.paths.prs / f"pr-{pr_number}" / "rework-prompt.md"
+    assert not prompt_path.exists()
+
+    skip_events = query_events(
+        app.paths.state_file, kind="stranded_request_changes_skipped_issue_closed"
+    )
+    assert len(skip_events) == 1
+
+    # Second pass: idempotent -- no re-fetch, no duplicate event, no extra
+    # label removal.
+    labels_removed_before = list(app.gh.labels_removed)
+    result_2 = app.review_queue()
+    assert result_2.ok is True
+    assert issue_view_calls == [issue_number]
+    assert app.gh.labels_removed == labels_removed_before
+    skip_events_2 = query_events(
+        app.paths.state_file, kind="stranded_request_changes_skipped_issue_closed"
+    )
+    assert len(skip_events_2) == 1
 
 
 def test_review_queue_does_not_reroute_escalated_request_changes(tmp_path: Path) -> None:
@@ -14203,6 +15058,381 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
     assert payload["removed_labels"] == []
     assert payload["added_ready"] is False
     assert payload["label_write_ok"] is True
+
+
+def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1122: a phantom live worker whose worktree is COMPLETED (clean,
+    ahead of base) must NOT have its sidecar reaped or labels stripped. The
+    sidecar is the key the reaper lane (``_classify_dead_sessions_and_update
+    _throttle_state``) iterates over to salvage pushed-but-unpublished work via
+    ``_attempt_salvage``. Reaping it here destroys the salvage path and
+    escalates review-ready work to a human.
+    """
+
+    # Set up a real git repo with a completed worktree (commits ahead of base).
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1122)
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=6262,
+            started_at="2026-08-10T11:15:39Z",
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=3_456_789.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:in-progress"},
+            ],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    # Plant a stale claude-code sidecar pointing at the completed worktree.
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": branch,
+                "worktree_path": str(worktree_path),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 6262,
+                "started_at": "2026-08-10T11:15:39Z",
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 3_456_789.0,
+                "session_id": "test-session-1122",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": branch,
+        "worker_pid": 6262,
+        "worker_process_start_time": 3_456_789.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    # The phantom live worker is detected but the sidecar is PRESERVED.
+    assert result.data["phantom_live_worker_count"] == 1
+    assert sidecar_path.exists(), "Sidecar must not be reaped so the reaper lane can salvage"
+
+    # Labels are NOT stripped: the issue stays in-progress until salvage moves
+    # it to pr_open, preventing re-dispatch into the occupied worktree.
+    assert (123, "agent:in-progress") not in fake_gh.labels_removed
+    assert (123, "automated-ready") not in fake_gh.labels_removed
+
+    # A session_failed_relabeled event is emitted with the preservation reason.
+    state = load_state(paths.state_file)
+    preserve_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "session_failed_relabeled"
+        and e["payload"]["issue_number"] == 123
+        and e["payload"]["reason"] == "phantom_live_worker_completed_work_preserved"
+    ]
+    assert len(preserve_events) == 1
+    payload = preserve_events[0]["payload"]
+    assert payload["worktree_state"] == "completed"
+    assert payload["removed_labels"] == []
+    assert payload["added_ready"] is False
+
+
+def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outcome(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1122: a phantom live worker whose ``.worker-outcome.json`` reports
+    ``push_succeeded=true, pr_created=false`` must NOT have its sidecar reaped,
+    even if the worktree inspection does not return COMPLETED (e.g. the worktree
+    was reset or the commits are not visible locally). The outcome file is the
+    durable signal that the worker pushed a branch the orchestrator can salvage.
+    """
+    from charlie_work.config import WORKER_OUTCOME_FILENAME
+
+    # Use a non-git directory so inspect_worktree_state returns UNKNOWN, proving
+    # the outcome-file check fires independently of the worktree-state check.
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    (worktree_path / WORKER_OUTCOME_FILENAME).write_text(
+        json.dumps({"push_succeeded": True, "pr_created": False, "error": "gh unauthenticated"}),
+        encoding="utf-8",
+    )
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=7373,
+            started_at="2026-08-10T11:15:39Z",
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=4_567_890.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:in-progress"},
+            ],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": "agent/issue-123-fix-search",
+                "worktree_path": str(worktree_path),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 7373,
+                "started_at": "2026-08-10T11:15:39Z",
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 4_567_890.0,
+                "session_id": "test-session-7373",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+        "worker_pid": 7373,
+        "worker_process_start_time": 4_567_890.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    assert result.data["phantom_live_worker_count"] == 1
+    assert sidecar_path.exists(), "Sidecar must not be reaped so the reaper lane can salvage"
+
+    # Labels are NOT stripped.
+    assert (123, "agent:in-progress") not in fake_gh.labels_removed
+
+    state = load_state(paths.state_file)
+    preserve_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "session_failed_relabeled"
+        and e["payload"]["issue_number"] == 123
+        and e["payload"]["reason"] == "phantom_live_worker_completed_work_preserved"
+    ]
+    assert len(preserve_events) == 1
+    payload = preserve_events[0]["payload"]
+    assert payload["reported_push"] is True
+
+
+def test_orphaned_worker_sweep_runs_with_watchdog_disabled(tmp_path: Path) -> None:
+    """Issue #1122: ``_detect_and_handle_orphaned_workers`` must run even when
+    ``watchdog.enabled=False``. The watchdog flag controls log-mtime stall
+    detection, not the dead-pid state-keyed recovery (#935 pushed-branch
+    salvage, #417 label reclaim, orphan drift diagnostics). A deployment that
+    disables watchdog must not lose these backstops.
+    """
+    from unittest.mock import patch
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    # Set up a real git repo with a pushed worker branch.
+    remote_repo = tmp_path / "remote"
+    remote_repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--bare", str(remote_repo)], check=True, capture_output=True, text=True
+    )
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for cmd in (
+        ["git", "config", "user.email", "test@example.test"],
+        ["git", "config", "user.name", "Test User"],
+    ):
+        subprocess.run(cmd, cwd=repo_root, check=True, capture_output=True, text=True)
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote_repo)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    branch = "agent/issue-1122-phantom-pid-dispatch-route"
+    subprocess.run(
+        ["git", "checkout", "-b", branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo_root / "fix.txt").write_text("fix\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "fix"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "main"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    # watchdog disabled — the sweep must still run.
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=False, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1122"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "branch_name": branch,
+    }
+    save_state(paths.state_file, state)
+
+    in_progress = config.labels.in_progress
+    pr_open = config.labels.pr_open
+
+    class FakeGitHubForPushedBranch(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(repo_root=repo_root, dry_run=False)
+            self.issues = [
+                {
+                    "number": 1122,
+                    "title": "Phantom-pid dispatch route reaps completed session",
+                    "url": "https://example.test/issues/1122",
+                    "body": "",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = []
+            self.pr_create_return = 8001
+
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForPushedBranch()
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # The #935 salvage backstop fired despite watchdog being disabled: a PR was
+    # opened for the pushed branch and the issue moved to open_passive.
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1122"]
+    assert entry.get("status") == PASSIVE_OPEN_STATUS
+    assert entry.get("pr_number") == 8001
+
+    events = state.get("events", [])
+    open_pr_events = [e for e in events if e.get("kind") == "orphaned_worker_opened_pr"]
+    assert len(open_pr_events) == 1
+    assert open_pr_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_no_pr"
+    assert open_pr_events[0]["payload"]["pr_number"] == 8001
+
+    assert len(fake_gh.prs_created) == 1
+    assert fake_gh.prs_created[0]["head"] == branch
+    assert (1122, in_progress) in fake_gh.labels_removed
+    assert (1122, pr_open) in fake_gh.labels_added
 
 
 def test_janitor_block_writes_no_review_packet(tmp_path: Path) -> None:
@@ -22517,20 +23747,20 @@ def test_classify_dead_rework_session_stale_prompt_does_not_reopen_approved_head
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
 
-def test_classify_dead_rework_session_escalates_at_redispatch_cap(
+def test_classify_dead_rework_session_escalates_at_death_cap(
     tmp_path: Path,
 ) -> None:
-    """Issue #315 review finding 2a: a dead rework worker must be escalated
-    (not restored to rework_requested) once its redispatch_at history hits
-    config.watchdog.max_auto_redispatch, matching the cap semantics the
-    sibling lanes already enforce (workflow.py's no-open-PR dead-session lane
-    and OrchestratorApp.dispatch_rework's success path both escalate when
-    `len(redispatch_at) > max_auto_redispatch`).
+    """Issue #315 review finding 2a + #1134: a dead rework worker must be
+    escalated (not restored to rework_requested) once its death history hits
+    config.watchdog.max_auto_redispatch.  Since every reap from this lane is
+    a worker death (non-terminal failure), the prior redispatches are all
+    deaths — seeded in ``worker_death_at`` to match.  The fourth death trips
+    the death cap and escalates with ``worker_death_loop`` (not
+    ``redispatch_cap_exceeded``), because a death is not a no-op.
 
-    Mutation gate: dropping the
-    `len(redispatch_at) > config.watchdog.max_auto_redispatch` half of
-    _reap_restore_rework_requested's `should_escalate` check makes this test
-    fail (the issue would be restored to rework_requested indefinitely
+    Mutation gate: dropping the ``death_loop`` half of
+    _reap_restore_rework_requested's ``should_escalate`` check makes this
+    test fail (the issue would be restored to rework_requested indefinitely
     instead of escalating).
     """
     import json
@@ -22559,11 +23789,9 @@ def test_classify_dead_rework_session_escalates_at_redispatch_cap(
     # fake_gh.prs[0]["headRefOid"] defaults to "sha-abc123".
 
     now = datetime.now(UTC)
-    # Three recent redispatches, all inside the default 240-minute window --
-    # max_auto_redispatch defaults to 3, so a fourth entry trips the cap.
-    recent_redispatches = [
-        (now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (6, 4, 2)
-    ]
+    # Three recent deaths, all inside the default 240-minute window --
+    # max_auto_redispatch defaults to 3, so a fourth death trips the cap.
+    recent = [(now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (6, 4, 2)]
 
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -22573,7 +23801,8 @@ def test_classify_dead_rework_session_escalates_at_redispatch_cap(
             "worker_pid": 99999,
             "worker_process_start_time": 1234567890.0,
             "branch_name": "agent/issue-123-fix-search",
-            "redispatch_at": recent_redispatches,
+            "redispatch_at": recent,
+            "worker_death_at": recent,  # all prior redispatches were deaths
         }
         # Live request_changes decision matching the current head, so this
         # test isolates the cap check rather than finding 1's gate.
@@ -22616,14 +23845,198 @@ def test_classify_dead_rework_session_escalates_at_redispatch_cap(
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
-    assert entry["escalation_reason"] == "redispatch_cap_exceeded"
+    # Issue #1134: deaths escalate as worker_death_loop, not redispatch_cap_exceeded.
+    assert entry["escalation_reason"] == "worker_death_loop"
     assert len(entry["redispatch_at"]) == 4
+    assert len(entry["worker_death_at"]) == 4
     assert (123, config.labels.human_needed) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
     assert "session_failed_escalated" in event_kinds
     assert "rework_requeued" not in event_kinds
+
+
+def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
+    tmp_path: Path,
+) -> None:
+    """Issue #1134: when there are enough prior *genuine* no-op redispatches
+    (no worker deaths), the no-op cap still fires even though the current
+    reap is a death.  With 4 prior no-op redispatches (no ``worker_death_at``)
+    and cap=3, the reap adds 1 redispatch + 1 death, making no_op_count = 4
+    (5 redispatches - 1 death) which exceeds the cap → ``redispatch_cap_exceeded``.
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+    # Four recent no-op redispatches (no worker_death_at — these were genuine
+    # no-ops from the dispatch path, not deaths).  cap=3, so after the reap
+    # adds 1 redispatch + 1 death: no_op_count = 5-1 = 4 > 3.
+    recent_no_ops = [
+        (now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (8, 6, 4, 2)
+    ]
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": recent_no_ops,
+            # No worker_death_at — these were genuine no-ops.
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text(
+        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        encoding="utf-8",
+    )
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="devin launch failed: rate limit",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "redispatch_cap_exceeded"
+    assert len(entry["redispatch_at"]) == 5
+    # The reap recorded this as a death too, but the no-ops dominate.
+    assert len(entry["worker_death_at"]) == 1
+
+
+def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
+    tmp_path: Path,
+) -> None:
+    """Issue #1134: when both the death count and the no-op count are below
+    the cap, the issue must NOT be escalated — it is restored to
+    rework_requested for re-dispatch.  With 2 prior deaths (cap=3), the reap
+    adds 1 death making death_count=3 (not > 3) and no_op_count=0.
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+    recent = [(now - timedelta(minutes=m)).isoformat().replace("+00:00", "Z") for m in (6, 4)]
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+            "redispatch_at": recent,
+            "worker_death_at": recent,  # both prior redispatches were deaths
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text(
+        "Reached overall message rate limit. Your limit will reset in 0 minutes.\n",
+        encoding="utf-8",
+    )
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="devin launch failed: rate limit",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["123"]
+    # Not escalated — death_count=3 is not > cap(3), no_op_count=0.
+    assert entry["status"] == "rework_requested"
+    assert len(entry["worker_death_at"]) == 3
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
 
 
 def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immediately(
@@ -35916,6 +37329,84 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
     assert recovered_events[0]["payload"]["duration_seconds"] is None
 
 
+def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
+    tmp_path: Path,
+) -> None:
+    """Issue #1108: the dead-pid orphan recovery sweep must reset a
+    ``status=dispatched`` issue with a dead PID and an open PR carrying a
+    ``request_changes`` verdict (head unchanged) to ``rework_requested`` even
+    when ``watchdog.enabled=False``.
+
+    The ``watchdog.enabled`` flag controls log-mtime stall detection
+    (``_detect_stalled_sessions`` / ``_detect_and_handle_stalled_sessions``),
+    not the dead-pid state-keyed recovery in
+    ``_detect_and_handle_orphaned_workers``. A deployment that disables
+    watchdog (e.g. job-cannon, to work around shim log-mtime blindness) must
+    not lose the request_changes → rework_requested transition — without it,
+    issues with dead workers and open PRs sit wedged in ``dispatched``
+    indefinitely with no path to redispatch (the exact 8+ hour stall observed
+    2026-08-09/10 on jc #1358, #1479, et al.).
+    """
+    from unittest.mock import patch
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    # watchdog disabled — the sweep must still run.
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=False, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1108"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1108",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1108"]
+
+    # The sweep fired despite watchdog being disabled: the issue was reset to
+    # rework_requested so dispatch_rework can re-select it.
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    assert recovered_events[0]["payload"]["issue_number"] == 1108
+    assert recovered_events[0]["payload"]["pr_number"] == 100
+    assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
+
+
 def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     """Issue #773: a worker that exited 0 (clean, no-op) must not be reset to
     rework_requested or burn a redispatch attempt, even though its dead PID and
@@ -36142,6 +37633,100 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
     assert payload["pid"] == 99999
     assert payload["exit_code"] == 1
     assert payload["duration_seconds"] == 5.0
+
+
+def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) -> None:
+    """Issue #1134: ``_detect_and_handle_orphaned_workers`` must write
+    ``worker_death_at`` into the issue's state entry (and the
+    ``orphaned_worker_recovered`` event payload) when it recovers a dead
+    rework worker whose PR head has not moved.  The death timestamp is what
+    the no-op cap check in ``_dispatch_rework_impl`` subtracts from the
+    redispatch count to separate genuine no-ops from worker deaths — without
+    it, every death counts as a no-op and produces a false
+    ``no_op_rework_cap_exceeded`` escalation.
+
+    This test exercises the *production* side (the sweep itself writing the
+    timestamp), complementing the existing ``test_dispatch_rework_*`` tests
+    which only seed ``worker_death_at`` directly to exercise the consumption
+    side.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["207"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-207",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-207.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 1,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:00:05Z",
+                "duration_seconds": 5.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry.get("status") == "rework_requested"
+
+    # The sweep must have recorded a worker_death_at timestamp.
+    death_at = entry.get("worker_death_at")
+    assert isinstance(death_at, list)
+    assert len(death_at) == 1
+    assert isinstance(death_at[0], str)
+    # The timestamp must be a valid ISO 8601 string.
+    from datetime import datetime
+
+    datetime.fromisoformat(death_at[0].replace("Z", "+00:00"))
+
+    # The event payload must also carry the death timestamp.
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    payload = recovered_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_with_request_changes"
+    assert payload.get("worker_death_at") == death_at[0]
 
 
 def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
@@ -41562,6 +43147,305 @@ def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
     assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_dispatch_rework_worker_deaths_dont_count_as_no_op(tmp_path: Path) -> None:
+    """Issue #1134: a rework candidate whose redispatch_at count is at the cap
+    but whose redispatches all ended in worker deaths must NOT escalate as
+    no_op_rework_cap_exceeded.  A death is not a no-op — the worker may have
+    completed its work but died before pushing.  When the death count itself
+    reaches the cap, the issue escalates with worker_death_loop instead.
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    # Must NOT be in no_op_rework_escalated — deaths are not no-ops.
+    assert 123 not in result.data.get("no_op_rework_escalated", [])
+    # Must be in worker_death_escalated instead.
+    assert 123 in result.data.get("worker_death_escalated", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worker_death_loop"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_dispatch_rework_mixed_deaths_and_no_ops_no_op_dominates(tmp_path: Path) -> None:
+    """Issue #1134: when there are both deaths and genuine no-ops, the no-op
+    count (total redispatches minus deaths) determines the no-op cap.  With
+    3 redispatches, 1 death, and cap=2, the no-op count is 2 — enough to
+    escalate as no_op_rework_cap_exceeded (the no-ops dominate).
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso, now_iso],
+            "worker_death_at": [now_iso],
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    # no_op_count = 3 - 1 = 2 >= cap(2) → no-op escalation.
+    assert 123 in result.data.get("no_op_rework_escalated", [])
+    assert 123 not in result.data.get("worker_death_escalated", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
+
+
+def test_dispatch_rework_deaths_below_cap_still_dispatched(tmp_path: Path) -> None:
+    """Issue #1134: when both the no-op count and the death count are below
+    the cap, the issue must NOT be escalated — it remains a legitimate
+    dispatch candidate.  With 2 redispatches, 1 death, and cap=2, the no-op
+    count is 1 and the death count is 1 — both below cap.
+    """
+    from datetime import UTC, datetime
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso],
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    from charlie_work.adapters import SessionDispatchResult
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+                pid=99999,
+                process_start_time=datetime.now(UTC).isoformat(),
+            )
+            for request in requests
+        ]
+
+    import charlie_work.workflow as workflow_module
+
+    original = workflow_module.dispatch_sessions
+    workflow_module.dispatch_sessions = fake_dispatch_sessions
+    try:
+        app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+        result = app.dispatch_rework()
+    finally:
+        workflow_module.dispatch_sessions = original
+
+    # Not escalated — both counts below cap.
+    assert 123 not in result.data.get("no_op_rework_escalated", [])
+    assert 123 not in result.data.get("worker_death_escalated", [])
+    # The issue was dispatched (not filtered out).
+    assert result.data.get("selected_count", 0) >= 1
+
+
+def test_dispatch_rework_worker_death_loop_includes_stranded_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1134: when a worker death loop escalates, the escalation payload
+    must include ``stranded_commits`` — the count of commits in the worktree
+    that are ahead of the PR head (salvageable work the worker completed but
+    never pushed).
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import worktree_path_for_branch
+
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    # Create a branch with one commit (the "PR head").
+    run(["git", "branch", "agent/issue-123-fix-search"])
+    pr_head_sha = run(["git", "rev-parse", "main"]).stdout.strip()
+
+    # Create a worktree at the expected path and add a commit to it
+    # (simulating a worker that completed work but died before pushing).
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, "agent/issue-123-fix-search", layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), "agent/issue-123-fix-search"])
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repo_root = repo_root
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+            self.prs[0]["headRefOid"] = pr_head_sha
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert 123 in result.data.get("worker_death_escalated", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worker_death_loop"
+    # stranded_commits must be present and reflect the 1 unpushed commit.
+    assert state["issues"]["123"]["stranded_commits"] == 1
 
 
 def test_windowed_redispatch_at_handles_corrupted_state(tmp_path: Path) -> None:
