@@ -9195,6 +9195,30 @@ class OrchestratorApp:
             branch_prefix=self.config.dispatch.branch_prefix,
         )
 
+        # Issue #617: dry-run must short-circuit before the escalation check,
+        # the packet writes (pr.json, checks.json, diff.patch, review-prompt.md,
+        # review-decision.json), and the rework-budget counter resets
+        # (review_dispatch_attempt_count=0, no_op_rework_attempts=0,
+        # status="reviewing") -- all of which mutate state.json or packet files
+        # and were reachable because review() had no top-level dry_run gate (the
+        # flag only reached the nested _cross_family_for_pr call). Mirror
+        # _dispatch_impl's top-of-function dry-run short-circuit: return the
+        # computed plan, touch nothing. A preview that overwrites a terminal
+        # verdict with "pending" or silently extends a PR's retry budget is
+        # worse than the bug it replaces, so this gate is a single early return
+        # before any branch that has an escalation or state-write arm.
+        if self.dry_run:
+            return CommandResult(
+                True,
+                f"dry-run: would generate review packet for PR #{pr_number}",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "dry_run": True,
+                    "checks_unavailable": False,
+                },
+            )
+
         # Escalation is terminal: once a PR or its linked issue is marked
         # escalated, no further review packet generation or label transitions should
         # occur until a human explicitly de-escalates. This prevents a later loop()
@@ -11472,6 +11496,101 @@ class OrchestratorApp:
                 },
             )
 
+        # Issue #617: dry-run must short-circuit BEFORE the quota-alert marker
+        # write, the rescue partition, and the attempt-cap escalation block --
+        # all of which mutate state.json (or fire a real emit_digest) and sat
+        # strictly before the old dry-run gate at the bottom of this method.
+        # Mirror _dispatch_impl's top-of-function dry-run short-circuit: compute
+        # the would-be selection read-only and return the plan, touching
+        # nothing. A preview that escalates or writes a quota-alert marker is
+        # worse than the bug it replaces, so this gate is a single early return,
+        # not a branch inside the escalation arm.
+        if self.dry_run:
+            quota_state = load_state_locked(self.paths.state_file)
+            if is_reviewer_quota_exhausted(quota_state) and not is_reviewer_probe_ready(
+                quota_state
+            ):
+                return CommandResult(
+                    True,
+                    "review dispatch deferred: reviewer quota exhausted, probe not ready",
+                    {
+                        "selected_count": 0,
+                        "attempted_count": 0,
+                        "failed_count": 0,
+                        "launched_count": 0,
+                        "deferred_reason": "reviewer_quota_probe_backoff",
+                        "recorded_verdicts": recorded_verdicts,
+                        "missed_verdicts": missed_verdicts,
+                    },
+                )
+            probe_mode_dry = bool(
+                is_reviewer_quota_exhausted(quota_state) and is_reviewer_probe_ready(quota_state)
+            )
+            queue_result = self.review_queue()
+            candidates = queue_result.data.get("queue", [])
+            max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
+            escalated_skipped_dry: list[int] = []
+            merge_conflict_routed_dry: list[int] = []
+            for c in candidates:
+                pr_state = quota_state.get("prs", {}).get(str(c["pr"]), {})
+                issue_num_gate = pr_state.get("issue_number") or c.get("issue")
+                issue_state_gate = (
+                    quota_state.get("issues", {}).get(str(issue_num_gate), {})
+                    if issue_num_gate is not None
+                    else {}
+                )
+                if (
+                    pr_state.get("status") == "escalated"
+                    or issue_state_gate.get("status") == "escalated"
+                ):
+                    escalated_skipped_dry.append(c["pr"])
+                    continue
+                if (
+                    str(c.get("mergeable") or "").upper() == "CONFLICTING"
+                    or str(c.get("mergeStateStatus") or "").upper() == "DIRTY"
+                ):
+                    merge_conflict_routed_dry.append(c["pr"])
+                    continue
+            escalated_skipped_set_dry = set(escalated_skipped_dry)
+            merge_conflict_pr_set_dry = set(merge_conflict_routed_dry)
+            dispatchable_dry = [
+                c
+                for c in candidates
+                if c["pr"] not in escalated_skipped_set_dry
+                and c["pr"] not in merge_conflict_pr_set_dry
+                and _is_review_dispatchable(
+                    quota_state, c["pr"], c, max_attempts=max_attempts, now=resolved_now
+                )
+            ]
+            max_local = self.config.review_dispatch.max_local_review_processes
+            max_concurrent = self.config.review_dispatch.max_concurrent_reviews
+            live_count = _count_live_reviews(reviews_dir, self.paths.state_file)
+            requested_limit = limit if limit is not None else len(dispatchable_dry)
+            local_cap = _apply_local_review_cap(requested_limit, max_local, live_count)
+            if max_concurrent > 0:
+                concurrent_available = max(0, max_concurrent - live_count)
+                concurrent_cap = min(local_cap.dispatch_limit, concurrent_available)
+            else:
+                concurrent_cap = local_cap.dispatch_limit
+            dispatch_limit_dry = 1 if probe_mode_dry else concurrent_cap
+            selected_dry = dispatchable_dry[:dispatch_limit_dry]
+            return CommandResult(
+                True,
+                f"dry-run: would dispatch {len(selected_dry)} reviewer(s)",
+                {
+                    "selected_count": len(selected_dry),
+                    "attempted_count": len(selected_dry),
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "deferred_count": len(candidates) - len(selected_dry),
+                    "escalated_skipped": escalated_skipped_dry,
+                    "merge_conflict_routed": merge_conflict_routed_dry,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
+                    **local_cap.report_fields(),
+                },
+            )
+
         # Clear the reviewer quota if any verdicts were recorded from dead
         # reviewers. This is the only proof the quota window is actually open:
         # a process that merely *started* can still die seconds later from an
@@ -11887,22 +12006,6 @@ class OrchestratorApp:
         # In probe mode, only launch one reviewer at a time to test quota.
         dispatch_limit = 1 if probe_mode else concurrent_cap
         selected = dispatchable[:dispatch_limit]
-
-        if self.dry_run:
-            return CommandResult(
-                True,
-                f"dry-run: would dispatch {len(selected)} reviewer(s)",
-                {
-                    "selected_count": len(selected),
-                    "attempted_count": len(selected),
-                    "failed_count": 0,
-                    "launched_count": 0,
-                    "deferred_count": len(candidates) - len(selected),
-                    "escalated_skipped": escalated_skipped,
-                    "merge_conflict_routed": [c["pr"] for c in merge_conflict_routed],
-                    **local_cap.report_fields(),
-                },
-            )
 
         # Claim the selected PRs as pending before launching. This is the only
         # place that writes review_dispatch_pending; the upgrade happens after
