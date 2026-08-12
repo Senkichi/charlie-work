@@ -3433,7 +3433,11 @@ class FakeGitHub:
         commit = self.commits.get(sha)
         if not isinstance(commit, dict):
             return github_module.GitHubRunResult(
-                ok=False, returncode=1, stdout="", stderr="", value=None,
+                ok=False,
+                returncode=1,
+                stdout="",
+                stderr="",
+                value=None,
                 error=f"commit {sha} not found",
             )
         return github_module.GitHubRunResult(

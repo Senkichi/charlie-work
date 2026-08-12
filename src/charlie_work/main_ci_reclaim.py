@@ -195,7 +195,9 @@ def reclaim_superseded_main_ci_runs(
 
     tip_result = gh.commit(default_branch)
     if isinstance(tip_result, GitHubRunResult):
-        tip_commit = tip_result.value if tip_result.ok and isinstance(tip_result.value, dict) else None
+        tip_commit = (
+            tip_result.value if tip_result.ok and isinstance(tip_result.value, dict) else None
+        )
         tip_error = tip_result.error
     elif isinstance(tip_result, dict):
         # Defensive: a non-GitHubRunResult dict (e.g. from a dry-run double

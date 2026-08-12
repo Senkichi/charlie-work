@@ -1084,9 +1084,7 @@ class GitHub:
         # value instead of a GitHubRunResult. Normalize so the contract is
         # uniform -- callers never need to branch on the return type.
         if isinstance(result, dict):
-            return GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=result
-            )
+            return GitHubRunResult(ok=True, returncode=0, stdout="", stderr="", value=result)
         return GitHubRunResult(
             ok=False,
             returncode=0,

@@ -16397,7 +16397,11 @@ class OrchestratorApp:
 
         commit_result = self.gh.commit(new_head_sha)
         if isinstance(commit_result, GitHubRunResult):
-            commit = commit_result.value if commit_result.ok and isinstance(commit_result.value, dict) else None
+            commit = (
+                commit_result.value
+                if commit_result.ok and isinstance(commit_result.value, dict)
+                else None
+            )
         elif isinstance(commit_result, dict):
             commit = commit_result
         else:

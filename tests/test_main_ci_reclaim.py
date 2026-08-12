@@ -100,9 +100,7 @@ class FakeGh:
                 value=None,
                 error=f"commit {sha} not found",
             )
-        return GitHubRunResult(
-            ok=True, returncode=0, stdout="", stderr="", value=commit
-        )
+        return GitHubRunResult(ok=True, returncode=0, stdout="", stderr="", value=commit)
 
     def run(
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
