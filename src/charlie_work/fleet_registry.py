@@ -200,8 +200,14 @@ def count_fleet_live_sessions(
             continue
 
         # Resolve sessions_dir from the registry entry's state_dir
-        # The state_dir is the .var/charlie-work root for that repo
-        state_dir = Path(entry.get("state_dir", ""))
+        # The state_dir is the .var/charlie-work root for that repo.
+        # ``or ""`` (not ``.get(key, default)``): a present-but-null state_dir
+        # returns None from .get — the default only applies when the key is
+        # *absent* — and Path(None) raises TypeError. Same bug class fixed for
+        # repo_root across fleet_dispatch.py; null here behaves like a missing
+        # key (cwd fallback), then the state_dir.exists() / sessions_dir checks
+        # skip + report the repo.
+        state_dir = Path(entry.get("state_dir") or "")
         if not state_dir.exists():
             logger.warning(
                 f"Skipping fleet live-count for {name_with_owner}: state_dir {state_dir} does not exist"
