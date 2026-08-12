@@ -2391,6 +2391,7 @@ def test_supervisor_lifecycle_records_nonzero_exit_on_exception(
     assert exit_kwargs["reason"] == "exception"
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -2398,11 +2399,21 @@ def test_supervisor_lifecycle_head_drift_exit_reason(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     tmp_path: Path,
     _patch_self_deploy_for_fleet_tests: dict[str, MagicMock],
 ) -> None:
     """A HEAD-drift restart records reason=head_drift_restart with exit_code=0."""
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mocks = _patch_self_deploy_for_fleet_tests
+    # Issue #604: the head-drift restart exit now probes the watchdog
+    # scheduled task. Mock it to ``armed=None`` (unknown) so the test stays
+    # hermetic -- no real ``schtasks`` subprocess call, no coupling to the
+    # live state of the ``charlie-fleet-pass`` task -- and the alert path
+    # (which fires only on a confirmed ``armed=False``) is not exercised
+    # here. The dedicated watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
     mock_load_config.return_value = OrchestratorConfig(
         supervisor=SupervisorConfig(poll_interval_seconds=5, full_pass_interval_seconds=1)
     )
@@ -2573,6 +2584,7 @@ def test_supervisor_lifecycle_keyboard_interrupt_reason(
     assert exit_kwargs["reason"] == "keyboard_interrupt"
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -2580,11 +2592,21 @@ def test_supervisor_lifecycle_self_deploy_head_move_reason(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     tmp_path: Path,
     _patch_self_deploy_for_fleet_tests: dict[str, MagicMock],
 ) -> None:
     """A self-deploy HEAD move records reason=self_deploy_head_moved with exit_code=0."""
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mocks = _patch_self_deploy_for_fleet_tests
+    # Issue #604: the self-deploy restart exit now probes the watchdog
+    # scheduled task. Mock it to ``armed=None`` (unknown) so the test stays
+    # hermetic -- no real ``schtasks`` subprocess call, no coupling to the
+    # live state of the ``charlie-fleet-pass`` task -- and the alert path
+    # (which fires only on a confirmed ``armed=False``) is not exercised
+    # here. The dedicated watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
     mock_load_config.return_value = OrchestratorConfig(
         supervisor=SupervisorConfig(poll_interval_seconds=5, full_pass_interval_seconds=1)
     )
@@ -6196,6 +6218,7 @@ def test_fleet_has_configured_repos_false_with_no_registry_file(tmp_path: Path) 
     assert _fleet_has_configured_repos(str(tmp_path / "never-written"), None) is False
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -6203,6 +6226,7 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -6218,7 +6242,17 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
     ``supervisor_zero_pass_alarm`` must fire, at the cycle the persisted
     streak reaches the configured threshold (3) -- not one per restart.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mock_lock.return_value = MagicMock()
+    # Issue #604: every cycle exits via the self-deploy HEAD-moved break,
+    # which now probes the watchdog scheduled task. Mock it to ``armed=None``
+    # (unknown) so every cycle stays hermetic -- no real ``schtasks``
+    # subprocess call, no coupling to the live state of the
+    # ``charlie-fleet-pass`` task -- and the alert path (which fires only on
+    # a confirmed ``armed=False``) is not exercised here. The dedicated
+    # watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     fleet_dir = tmp_path / "fleet"
     isolated_root = tmp_path / "orchestrator-root"
@@ -6287,6 +6321,7 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
             assert alarms[0]["payload"]["consecutive_zero_pass_cycles"] == 3
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -6294,6 +6329,7 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -6302,7 +6338,17 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
     consecutive zero-repo-pass cycles it runs -- that is a configuration
     state, not an incident.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mock_lock.return_value = MagicMock()
+    # Issue #604: every cycle exits via the self-deploy HEAD-moved break,
+    # which now probes the watchdog scheduled task. Mock it to ``armed=None``
+    # (unknown) so every cycle stays hermetic -- no real ``schtasks``
+    # subprocess call, no coupling to the live state of the
+    # ``charlie-fleet-pass`` task -- and the alert path (which fires only on
+    # a confirmed ``armed=False``) is not exercised here. The dedicated
+    # watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     fleet_dir = tmp_path / "fleet"
     isolated_root = tmp_path / "orchestrator-root"
@@ -6355,6 +6401,7 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
     assert query_events(state_path, kind="supervisor_zero_pass_alarm") == []
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -6362,6 +6409,7 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
@@ -6369,7 +6417,17 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
     the streak to 0, so a later zero-pass streak has to build back up to the
     threshold instead of alarming immediately off carried-over count.
     """
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
     mock_lock.return_value = MagicMock()
+    # Issue #604: the zero-repo-pass cycles exit via the self-deploy
+    # HEAD-moved break, which now probes the watchdog scheduled task. Mock
+    # it to ``armed=None`` (unknown) so every cycle stays hermetic -- no
+    # real ``schtasks`` subprocess call, no coupling to the live state of
+    # the ``charlie-fleet-pass`` task -- and the alert path (which fires
+    # only on a confirmed ``armed=False``) is not exercised here. The
+    # dedicated watchdog-alert tests cover that path.
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     fleet_dir = tmp_path / "fleet"
     isolated_root = tmp_path / "orchestrator-root"
