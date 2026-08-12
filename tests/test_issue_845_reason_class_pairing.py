@@ -6,9 +6,13 @@ Issue #845: when a dispatch failure was non-terminal, the ``else`` branch in
 ``_maybe_deescalate_mechanical`` sweep into treating a later escalation as
 mechanical when it should be judgment.
 
-The fix introduces a single chokepoint in ``state.py`` -- ``set_escalation``
-and ``clear_escalation`` -- and routes the affected call sites through it so
-the two fields are written and cleared as an atomic pair.
+The fix consolidates every escalation behind ``workflow._escalate_issue`` and
+clearing behind ``state.clear_escalation``, so the two fields are written and
+cleared as an atomic pair and a terminal status cannot be written without a
+reason.
+
+Issue #981: ``state.set_escalation`` was the pre-#750 half-write helper and is
+now dead code; these tests exercise ``_escalate_issue`` instead.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -26,10 +31,9 @@ from charlie_work.state import (
     clear_escalation,
     load_state,
     save_state,
-    set_escalation,
     state_lock,
 )
-from charlie_work.workflow import OrchestratorApp
+from charlie_work.workflow import OrchestratorApp, _escalate_issue
 
 from test_charlie_work import FakeGitHub
 
@@ -69,22 +73,38 @@ def _fake_dispatch_sessions_factory(failure_kind: str | None):
     return fake_dispatch_sessions
 
 
-def test_set_escalation_and_clear_escalation_pair_fields() -> None:
-    """``set_escalation`` writes both fields; ``clear_escalation`` removes both."""
-    entry: dict[str, object] = {"number": 123, "status": "escalated"}
+def test_escalate_issue_and_clear_escalation_pair_fields() -> None:
+    """``_escalate_issue`` writes status and the paired fields;
+    ``clear_escalation`` removes the paired fields."""
+    state: dict[str, Any] = {
+        "issues": {"123": {"number": 123, "status": "rework_requested"}},
+        "prs": {},
+    }
 
-    set_escalation(entry, reason="some_reason", reason_class="mechanical")
-    assert entry["escalation_reason"] == "some_reason"
-    assert entry["reason_class"] == "mechanical"
+    state = _escalate_issue(
+        state,
+        123,
+        reason="some_reason",
+        reason_class="mechanical",
+    )
+    issue = state["issues"]["123"]
+    assert issue["status"] == "escalated"
+    assert issue["escalation_reason"] == "some_reason"
+    assert issue["reason_class"] == "mechanical"
 
-    clear_escalation(entry)
-    assert "escalation_reason" not in entry
-    assert "reason_class" not in entry
+    clear_escalation(issue)
+    assert "escalation_reason" not in issue
+    assert "reason_class" not in issue
 
     clear_escalation({})  # safe on empty dicts
 
     with pytest.raises(ValueError):
-        set_escalation({}, reason="x", reason_class="invalid")
+        _escalate_issue(
+            {"issues": {"1": {"number": 1}}, "prs": {}},
+            1,
+            reason="x",
+            reason_class="invalid",
+        )
 
 
 def test_state_integrity_no_paired_field_without_the_other() -> None:
