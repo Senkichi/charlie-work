@@ -46,7 +46,7 @@ from ci_fleet.charlie_work_adapter import (
     scale_down_idle_runners,
 )
 from .state import state_lock, utc_now
-from .subprocess_runner import no_console_window_kwargs, run_captured
+from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
     EXIT_RESTART_REQUESTED,
@@ -59,6 +59,7 @@ from .supervisor_lifecycle import (
     record_prior_abnormal_exit,
     record_supervisor_exit,
     record_supervisor_started,
+    supervisor_heartbeat_path,
     update_supervisor_heartbeat,
 )
 from .workflow import DEFERRED_BY_CONCURRENCY_REASON_PREFIX, CommandResult, OrchestratorApp
@@ -2052,6 +2053,170 @@ RESTART_EXIT_REASONS = frozenset({"self_deploy", "head_drift"})
 _PASS_SUMMARY_REASON_MAX_CHARS = 500
 
 
+# Windows scheduled-task name that relaunches the fleet supervisor wrapper
+# (scripts/fleet-pass.ps1 -> ``fleet supervise-loop``). The supervisor's
+# restart-requesting exits (HEAD drift, self-deploy head-moved) rely on this
+# task's 5-minute trigger to eventually relaunch a fresh wrapper after the
+# in-process relaunch bound (supervise_loop) retires. Kept as a constant in
+# lockstep with ``scripts/heartbeat_check.py``'s ``FLEET_TASK_NAME``: both
+# refer to the same external Task Scheduler entry. There is no shared module
+# because charlie_work must not import from scripts/ (and scripts/
+# deliberately does not import charlie_work), so the two constants are
+# synchronized by convention and by the matching name. A single external
+# identifier is not the "manual list" kind of hardcoding the global rules
+# warn against -- it has one value and one source of truth (the task XML).
+_FLEET_WATCHDOG_TASK_NAME = "charlie-fleet-pass"
+
+# Event kind recorded when a restart-requesting exit discovers the watchdog
+# scheduled task is disabled (issue #604). Error level: a disabled watchdog
+# turns a correct, well-reported restart exit into a silent indefinite fleet
+# outage -- the exact condition the supervisor's own restart exit exists to
+# prevent, now made visible somewhere other than the log.
+_SUPERVISOR_RESTART_WATCHDOG_DISABLED = "supervisor_restart_watchdog_disabled"
+
+
+@dataclass(frozen=True)
+class WatchdogProbe:
+    """Result of probing whether the fleet watchdog scheduled task is armed.
+
+    ``armed`` is ``True`` when the task exists and is Enabled, ``False`` when
+    it exists but is Disabled, and ``None`` when the probe could not
+    determine either (non-Windows platform, ``schtasks`` missing, task not
+    found, or unparseable output). ``detail`` carries a short
+    human-readable status used in log lines and event payloads.
+    """
+
+    armed: bool | None
+    detail: str
+
+
+def probe_fleet_watchdog(
+    *,
+    task_name: str = _FLEET_WATCHDOG_TASK_NAME,
+    run_command: Callable[..., RunResult] = run_captured,
+    timeout_seconds: int = 15,
+) -> WatchdogProbe:
+    """Probe whether the fleet watchdog scheduled task is armed (Enabled).
+
+    The supervisor's restart-requesting exits (HEAD drift, self-deploy
+    head-moved) exit cleanly expecting a watchdog relaunch. This probe
+    verifies the watchdog is actually armed before trusting that assumption:
+    a disabled scheduled task turns a correct, well-reported restart exit
+    into a silent indefinite fleet outage (issue #604: the 2026-07-25
+    outage where ``charlie-fleet-pass`` was ``Enabled=false``, so a clean
+    drift exit was followed by no relaunch at all).
+
+    Windows-only by construction: ``schtasks`` does not exist on other
+    platforms, so the probe returns ``armed=None`` there rather than
+    blocking the exit or false-alarming. Never raises -- a probe failure
+    degrades to ``armed=None`` (unknown), and callers only alert on a
+    confirmed ``armed=False``.
+
+    The "Scheduled Task State" field is parsed in preference to "Status":
+    the latter reads ``Running``/``Ready``/``Disabled`` and conflates the
+    task's enabled state with whether an instance is currently running,
+    while "Scheduled Task State" is exactly the Enabled/Disabled flag the
+    restart exit depends on.
+    """
+    if sys.platform != "win32":
+        return WatchdogProbe(
+            None, f"not probed (schtasks is Windows-only; platform={sys.platform})"
+        )
+    res = run_command(
+        ["schtasks", "/query", "/tn", task_name, "/fo", "LIST", "/v"],
+        cwd=orchestrator_root(),
+        timeout_seconds=timeout_seconds,
+    )
+    if not res.ok:
+        detail = (res.stderr or res.error or "").strip()
+        return WatchdogProbe(
+            None,
+            f"schtasks query for {task_name!r} failed: {detail}"
+            if detail
+            else f"schtasks query for {task_name!r} failed",
+        )
+    for line in (res.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Scheduled Task State:"):
+            state = stripped.split(":", 1)[1].strip()
+            if state.lower() == "enabled":
+                return WatchdogProbe(True, f"task {task_name!r} is Enabled")
+            if state.lower() == "disabled":
+                return WatchdogProbe(False, f"task {task_name!r} is Disabled")
+            return WatchdogProbe(
+                None, f"task {task_name!r} Scheduled Task State={state!r} (unrecognized)"
+            )
+    return WatchdogProbe(None, f"could not parse 'Scheduled Task State' for {task_name!r}")
+
+
+def _alert_watchdog_not_armed(
+    probe: WatchdogProbe,
+    *,
+    exit_reason: str,
+    notify_config: Any,
+    notify_enabled: bool,
+    fleet_dir_override: str | None,
+    now_str: str,
+) -> None:
+    """Surface a confirmed-disarmed watchdog on a restart-requesting exit.
+
+    Called from both restart break sites (``self_deploy`` and
+    ``head_drift``) only when :func:`probe_fleet_watchdog` returned
+    ``armed=False``. Alerts through two channels that are *not* the
+    launcher log: the fleet attention digest (operator-facing, the same
+    sink self-deploy failures use) and the fleet-level ``events.db``
+    (queryable via ``query_events``). Best-effort and never raises -- an
+    instrumentation failure must not break the exit path, mirroring
+    ``record_supervisor_exit``.
+
+    ``armed=None`` (unknown: non-Windows, schtasks missing, task not found)
+    deliberately does NOT alert: it cannot prove the watchdog is disarmed,
+    and alerting on every non-Windows restart would be a permanent false
+    alarm. The gap it leaves (a missing task on Windows) is caught by
+    ``scripts/heartbeat_check.py``'s ``check_runners`` on its own cadence.
+    """
+    print(
+        f"[{now_str}] watchdog not armed: {probe.detail}; "
+        f"restart exit (reason={exit_reason}) will not be relaunching the "
+        f"fleet -- the scheduled task is disabled, so this clean exit turns "
+        f"into a silent outage unless the task is re-enabled",
+        flush=True,
+    )
+    try:
+        log_event(
+            supervisor_heartbeat_path(fleet_dir_override),
+            _SUPERVISOR_RESTART_WATCHDOG_DISABLED,
+            {
+                "exit_reason": exit_reason,
+                "task": _FLEET_WATCHDOG_TASK_NAME,
+                "detail": probe.detail,
+            },
+            repo="fleet",
+        )
+    except OSError as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to log watchdog-not-armed event: %s", exc)
+
+    if notify_config is not None and notify_enabled:
+        _emit_fleet_transition(
+            notify_config,
+            AttentionEntry(
+                issue_number=-1,
+                adapter_kind="fleet-watchdog",
+                health="ERROR",
+                previous_health=None,
+                last_log_line=(
+                    f"fleet watchdog scheduled task "
+                    f"{_FLEET_WATCHDOG_TASK_NAME!r} is disabled; supervisor "
+                    f"exited for restart (reason={exit_reason}) but nothing "
+                    f"will relaunch it -- re-enable the task to restore the fleet"
+                ),
+                pid=os.getpid(),
+            ),
+            fleet_dir_override,
+            persistent=False,
+        )
+
+
 def run_fleet_supervise(
     *,
     fleet_dir_override: str | None = None,
@@ -2343,6 +2508,20 @@ def run_fleet_supervise(
                 )
                 exit_reason = "self_deploy"
                 _exit_reason = "self_deploy_head_moved"
+                # Issue #604: this exit assumes the watchdog scheduled task is
+                # armed and will relaunch the fleet. Verify it before trusting
+                # that -- a disabled task turns this clean restart exit into a
+                # silent indefinite outage. Alert (not just log) when it is not.
+                watchdog = probe_fleet_watchdog()
+                if watchdog.armed is False:
+                    _alert_watchdog_not_armed(
+                        watchdog,
+                        exit_reason=exit_reason,
+                        notify_config=notify_config,
+                        notify_enabled=notify_enabled,
+                        fleet_dir_override=fleet_dir_override,
+                        now_str=now_str,
+                    )
                 break
 
             # Independent drift check: even when self_deploy reports "already
@@ -2364,6 +2543,22 @@ def run_fleet_supervise(
                 )
                 exit_reason = "head_drift"
                 _exit_reason = "head_drift_restart"
+                # Issue #604: same watchdog-armed verification as the
+                # self-deploy restart site above. The drift exit is the one
+                # that bit on 2026-07-25: the task was ``Enabled=false``, so
+                # this clean, well-reported exit was followed by no relaunch
+                # at all. Alert through a non-log channel when the watchdog
+                # the exit depends on is not armed.
+                watchdog = probe_fleet_watchdog()
+                if watchdog.armed is False:
+                    _alert_watchdog_not_armed(
+                        watchdog,
+                        exit_reason=exit_reason,
+                        notify_config=notify_config,
+                        notify_enabled=notify_enabled,
+                        fleet_dir_override=fleet_dir_override,
+                        now_str=now_str,
+                    )
                 break
 
             pass_result = fleet_loop(
