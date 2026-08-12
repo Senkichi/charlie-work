@@ -1425,6 +1425,7 @@ def real_activity_probe_for(
         now,
         view.log_path,
         config.watchdog,
+        worker_kind=view.adapter_kind,
     )
 
 
