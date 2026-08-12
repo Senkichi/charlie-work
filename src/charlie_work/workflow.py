@@ -19,6 +19,7 @@ from .adapters import (
     SessionDispatchResult,
     SessionRequest,
     dispatch_sessions,
+    manifest_adapter_label,
     write_session_manifest,
     write_session_results,
 )
@@ -6963,6 +6964,17 @@ class OrchestratorApp:
         api_config = self.config.api_worker
         # Budget status from the on-disk spend ledger (atomic load with
         # corrupt-file recovery; missing file = empty ledger).
+        #
+        # Known asymmetry (issue #626, part 2): unlike ``live_api_sessions``
+        # below, ``budget`` is computed once per pass and read unchanged for
+        # every issue. A batch can collectively commit past the daily cap
+        # because each issue's preflight sees the same stale snapshot. This is
+        # accepted rather than fixed inline because per-session cost is not
+        # knowable up front (unlike concurrency, where a simple in-place
+        # increment works). The in-flight budget kill (#484/#582) bounds the
+        # overshoot after the fact. A per-pass cap on api routes when remaining
+        # budget is below a multiple of typical session cost is the recorded
+        # follow-up if the overshoot becomes a problem in practice.
         ledger = _api_load_ledger(_api_ledger_path(self.paths.state_file.parent))
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         budget = _api_budget_status(ledger, api_config.budget, today)
@@ -7071,8 +7083,11 @@ class OrchestratorApp:
 
         # Write combined manifest and results reflecting all sessions in the
         # pass. Per-group dispatch_sessions calls each overwrite these files;
-        # this final write is the authoritative on-disk artifact.
-        write_session_manifest(manifest_path, session_requests, adapter="mixed")
+        # this final write is the authoritative on-disk artifact. The adapter
+        # label is derived from the actual partition: a homogeneous batch is
+        # labeled with its single kind, not "mixed" (issue #626).
+        label = manifest_adapter_label(set(groups))
+        write_session_manifest(manifest_path, session_requests, adapter=label)
         write_session_results(results_path, all_results)
         return all_results
 
@@ -19419,12 +19434,29 @@ class OrchestratorApp:
                     rescue_requests,
                 )
             )
-        # _dispatch_partitioned and dispatch_sessions each overwrite
-        # manifest/results on each call; rewrite once more with the combined
-        # batch so the on-disk observability files
-        # (session-manifest.json/session-results.json) reflect the full pass,
-        # not just the last sub-call.
-        write_session_manifest(manifest_path, session_requests, adapter=self.config.devin.adapter)
+        # When both normal and rescue tiers dispatched, each sub-call's
+        # write_session_manifest/write_session_results overwrote the files with
+        # only its subset. Rewrite once with the combined batch so the on-disk
+        # observability files reflect the full pass. The adapter label is
+        # derived from the actual partition (normal routing kinds + the rescue
+        # kind "claude-code") via manifest_adapter_label — a homogeneous batch
+        # is labeled with its single kind, not the default adapter name
+        # (issue #626). When only one tier ran, its sub-call already wrote the
+        # correct manifest, so the combined manifest write is skipped (it was
+        # redundant and, before #626, used the wrong label).
+        if normal_requests and rescue_requests:
+            # When api routing is enabled, adapter_choices has an entry for
+            # every non-rescue issue. When disabled (adapter_choices empty),
+            # all normal issues used the default adapter via the single-group
+            # path in _dispatch_partitioned.
+            if adapter_choices:
+                combined_kinds = {adapter_choices[r.issue_number].kind for r in normal_requests}
+            else:
+                combined_kinds = {self.config.devin.adapter}
+            combined_kinds.add("claude-code")
+            write_session_manifest(
+                manifest_path, session_requests, adapter=manifest_adapter_label(combined_kinds)
+            )
         write_session_results(results_path, dispatch_results)
 
         successful_issue_numbers = {

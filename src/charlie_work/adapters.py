@@ -198,6 +198,20 @@ def _launch_staggered(
     return results
 
 
+def manifest_adapter_label(kinds: set[str]) -> str:
+    """Derive the manifest ``adapter`` label from the set of adapter kinds in a pass.
+
+    One kind → that kind (a homogeneous batch is labeled honestly, not as
+    ``"mixed"``). More than one kind → ``"mixed"``. This is the single point
+    of label derivation for session manifests (issue #626): both
+    ``_dispatch_partitioned`` and the rework combined-manifest write go through
+    this helper so the label always reflects the actual partition.
+    """
+    if len(kinds) == 1:
+        return next(iter(kinds))
+    return "mixed"
+
+
 def write_session_manifest(
     path: Path, requests: list[SessionRequest], *, adapter: str = "manual"
 ) -> None:
