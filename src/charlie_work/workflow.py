@@ -3463,6 +3463,25 @@ def _detect_and_handle_stalled_reviews(
                     except (OSError, json.JSONDecodeError):
                         decision_value = "invalid"
             if decision_value not in ("pending", "missing", "invalid", None):
+                # Issue #734: the decision_path gate is the second of three
+                # silent skip paths in stale-claim recovery. A PR whose review
+                # already produced a verdict (e.g. ``request_changes``) but is
+                # still in ``reviewing`` status is passed over every pass with
+                # no trace -- the verdict was never acted upon, and without this
+                # event nobody can tell recovery considered the PR and declined.
+                # Same ``log_event`` / ``review_stale_claim_recovery_skipped``
+                # pattern as the prompt_path skips above (issue #708): writes
+                # directly to events.db because this skip does not mutate state.
+                log_event(
+                    state_file,
+                    "review_stale_claim_recovery_skipped",
+                    {
+                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                        "reason": "decision_already_recorded",
+                        "decision": decision_value,
+                    },
+                    level="warning",
+                )
                 continue
 
             prompt_mtime = prompt_path.stat().st_mtime
@@ -3475,6 +3494,25 @@ def _detect_and_handle_stalled_reviews(
             if not is_claim_stale(
                 packet_age, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
             ):
+                # Issue #734: the packet-age gate is the third silent skip path.
+                # The packet is not stale yet, so recovery defers to a future
+                # pass. This is normal flow control, not a failure -- but the
+                # issue requires all three exits to be observable so a stuck-PR
+                # investigation can confirm recovery ran and chose to defer
+                # rather than silently doing nothing. ``level="info"`` because
+                # this is expected behavior (the packet simply is not old
+                # enough), unlike the other two skips which indicate a PR that
+                # recovery cannot help.
+                log_event(
+                    state_file,
+                    "review_stale_claim_recovery_skipped",
+                    {
+                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                        "reason": "packet_not_stale",
+                        "packet_age": packet_age,
+                    },
+                    level="info",
+                )
                 continue
 
             state["prs"][pr_key] = {
