@@ -799,6 +799,71 @@ def test_watchdog_kills_when_heartbeat_from_prior_pid_after_grace(tmp_path: Path
     assert payload["pid"] == 11111
 
 
+def test_watchdog_kills_when_no_heartbeat_at_all_after_grace(tmp_path: Path) -> None:
+    """Full loop: a child that never writes a heartbeat is killed after grace.
+
+    This is the exact path the round-2 review found was silently broken:
+    ``_kill`` formatted ``age_seconds`` with ``:.0f`` even when it was
+    ``None`` (no heartbeat file → no ``last_beat_at`` → ``age_seconds``
+    stays ``None``), raising ``TypeError`` *before* ``process.kill()`` was
+    reached. The watchdog's ``_run`` loop swallows the exception, so the
+    wedged child was never killed and no event was recorded — the very
+    capability (killing a child that wedges before its first heartbeat)
+    this PR was built to add.
+
+    Here the heartbeat path points at a file that is never written. The
+    clock advances past ``WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS`` so
+    ``_is_wedged`` returns ``(True, None)``, and ``_kill`` must format
+    ``age=None`` as ``unknown`` (not crash), reach ``process.kill()``, set
+    ``_killed``, and record the event with ``pid=None``.
+    """
+    start = datetime.now(UTC)
+    late = start + timedelta(seconds=WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS + 1)
+    # No heartbeat file is written at all — the path simply does not exist.
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    process = FakeProcess(poll_results=[None], pid=22222, block_until_killed=True)
+    process._wait_return = 1
+    log_messages: list[str] = []
+    event_calls: list[tuple[Any, ...]] = []
+
+    def fake_log_event(state_path: Any, kind: str, payload: Any, **kwargs: Any) -> None:
+        event_calls.append((state_path, kind, payload, kwargs))
+
+    clock = _make_clock(start, late)
+
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        poll_interval_seconds=0.01,
+        clock=clock,
+        log=log_messages.append,
+        sleep_func=lambda _: None,
+        log_event_fn=fake_log_event,
+    )
+    thread = wd.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive(), "watchdog thread did not terminate"
+
+    # The child was actually killed — the TypeError used to abort _kill
+    # before process.kill() was ever called.
+    assert process.killed is True
+    assert process.kill_count == 1
+    assert wd.killed is True
+    # The kill was logged loudly, with ``age=unknown`` (not a crash).
+    assert any("wedge-watchdog" in m for m in log_messages)
+    assert any("age=unknown" in m for m in log_messages)
+    assert any("Terminating" in m for m in log_messages)
+    # An event was recorded with the registered kind and pid=None (no
+    # heartbeat → no pid to report).
+    assert len(event_calls) == 1
+    _path, kind, payload, kwargs = event_calls[0]
+    assert kind == WEDGE_KILL_EVENT_KIND
+    assert kwargs.get("repo") == "fleet"
+    assert payload["pid"] is None
+    assert payload["age_seconds"] is None
+    assert payload["last_beat_at"] is None
+
+
 def test_watchdog_kill_failure_does_not_set_killed_and_continues(tmp_path: Path) -> None:
     """When ``process.kill()`` raises, ``_killed`` stays False and the loop continues.
 

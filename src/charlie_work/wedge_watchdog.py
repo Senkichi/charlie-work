@@ -349,9 +349,16 @@ class WedgeWatchdog:
         last_beat_dt = _parse_iso(last_beat)
         if last_beat_dt is not None:
             age_seconds = (self._clock() - last_beat_dt).total_seconds()
+        # ``age_seconds`` is ``None`` when there is no heartbeat at all (the
+        # first-beat grace window expired with no file) or when the heartbeat
+        # lacks a parseable ``last_beat_at``. Formatting ``None`` with ``:.0f``
+        # raises ``TypeError`` *before* ``process.kill()`` is reached, silently
+        # defeating the exact no-heartbeat wedge case this watchdog exists to
+        # kill — so render ``unknown`` instead of formatting the value.
+        age_display = f"{age_seconds:.0f}s" if age_seconds is not None else "unknown"
         message = (
             f"wedge-watchdog: supervisor child pid={pid} heartbeat stale "
-            f"({last_beat}); age={age_seconds:.0f}s exceeds threshold="
+            f"({last_beat}); age={age_display} exceeds threshold="
             f"{threshold_seconds:.0f}s ({self._stale_multiplier}x "
             f"max_pass_runtime_seconds={pass_timeout}s). Terminating so the "
             f"scheduled task's next tick relaunches a fresh daemon."
