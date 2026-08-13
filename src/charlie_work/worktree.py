@@ -1997,6 +1997,29 @@ def _is_git_tracked(repo_root: Path, path: Path) -> bool:
     return result.ok
 
 
+# Path components and suffixes that must never be materialized into a worktree.
+# ``.git`` is the repo metadata directory. ``__pycache__`` and ``*.pyc`` are
+# compiled Python bytecode — interpreter-version-specific, regenerable, and a
+# drift signal when stale mixed-version .pyc files propagate across machines
+# or interpreter upgrades (issue #711).
+_MATERIALIZED_EXCLUDED_DIR_PARTS: frozenset[str] = frozenset({".git", "__pycache__"})
+_MATERIALIZED_EXCLUDED_FILE_SUFFIXES: tuple[str, ...] = (".pyc",)
+
+
+def _is_materialize_excluded(path: Path) -> bool:
+    """Return True if *path* should be skipped during directory materialization.
+
+    Excludes ``.git`` / ``__pycache__`` directory components anywhere in the
+    path, and ``*.pyc`` files (compiled bytecode).  This is the single
+    enforcement point for the materialization exclusion set — both the file
+    copy loop and the empty-subdirectory recreation loop in
+    ``_materialize_directory`` route through here.
+    """
+    if any(part in _MATERIALIZED_EXCLUDED_DIR_PARTS for part in path.parts):
+        return True
+    return path.suffix in _MATERIALIZED_EXCLUDED_FILE_SUFFIXES
+
+
 def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) -> tuple[str, ...]:
     """Copy files from ``repo_root / dir_path`` into the worktree.
 
@@ -2008,6 +2031,11 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
     appear as working-tree dirt in ``git status`` or CI-parity clean-tree
     gates. Empty source subdirectories are recreated in the target (matching
     the behaviour of the previous ``shutil.copytree`` implementation).
+
+    Compiled Python bytecode (``__pycache__/`` directories and ``*.pyc`` files)
+    is never materialized — it is interpreter-version-specific, regenerable on
+    first import, and propagating stale mixed-version ``.pyc`` files into
+    worktrees is a drift signal with no upside (issue #711).
 
     Returns a tuple of worktree-relative paths (forward-slash normalized) that
     were written, derived from the materializer's own manifest.
@@ -2029,7 +2057,7 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
 
     written: list[str] = []
     for src_file in source_files:
-        if ".git" in src_file.parts:
+        if _is_materialize_excluded(src_file):
             continue
 
         if source.is_file():
@@ -2056,7 +2084,7 @@ def _materialize_directory(repo_root: Path, worktree_path: Path, dir_path: str) 
     if source.is_dir():
         target_root.mkdir(parents=True, exist_ok=True)
         for src_dir in source.rglob("*"):
-            if not src_dir.is_dir() or ".git" in src_dir.parts:
+            if not src_dir.is_dir() or _is_materialize_excluded(src_dir):
                 continue
             rel = src_dir.relative_to(source_root)
             (target_root / rel).mkdir(parents=True, exist_ok=True)
