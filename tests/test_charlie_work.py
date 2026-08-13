@@ -14303,6 +14303,12 @@ def test_detect_and_handle_stalled_reviews_skips_terminal_pr_reaps_sidecar(
     sidecar_100.write_text(json.dumps(_sidecar(100, old_started)), encoding="utf-8")
     sidecar_200 = reviews_dir / "issue-200.claude.json"
     sidecar_200.write_text(json.dumps(_sidecar(200, old_started)), encoding="utf-8")
+    # PR 200 is the non-terminal PR that should get the normal reap-to-failed
+    # treatment. Give it a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path). Without this the
+    # log read would fail and classify as UNDETERMINED (issue #1069), which
+    # rolls back instead of failing — not the path this test exercises.
+    (reviews_dir / "issue-200.claude.log").write_text("ordinary crash output\n", encoding="utf-8")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
     monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
@@ -14448,6 +14454,12 @@ def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
         "adapter_kind": "claude-code",
     }
     (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    # Give the reviewer a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path that calls
+    # _remove_review_checkout_with_warning). Without this the log read would
+    # fail and classify as UNDETERMINED (issue #1069), which uses a different
+    # checkout-removal path — not the warning path this test exercises.
+    (reviews_dir / "issue-100.claude.log").write_text("ordinary crash output\n", encoding="utf-8")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
     monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: False)
