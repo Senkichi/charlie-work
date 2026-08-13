@@ -102,6 +102,64 @@ def assert_conventional_commit_title(prompt: str, *, context: str = "worker prom
         raise MissingConventionalTitleError(context, missing)
 
 
+# Markers that must appear in every rendered worker/rework prompt's execution
+# contract.  Issue #717: a repo-local flat whole-file override of ``worker.md``
+# or ``rework.md`` can silently drop the ``$section_execution_contract``
+# reference, dispatching workers with a blanket "never run the full local suite"
+# prohibition and no carve-out for contract-changing diffs (public function
+# signature/return shape, exception type/message consumed elsewhere, DB schema,
+# or module re-export).  Those are exactly the changes whose blast radius
+# extends outside the files they touched, which is why the package's execution
+# contract singles them out for a mandatory full-suite run before push rather
+# than deferring entirely to CI.  These markers are checked against the
+# *rendered output* — not the template source — at the dispatch boundary.
+EXECUTION_CONTRACT_MARKERS: tuple[str, ...] = (
+    "Execution contract (self-detect from your diff)",
+    "run the **FULL suite** locally at the final head before pushing",
+)
+
+
+class MissingExecutionContractError(RuntimeError):
+    """A rendered worker/rework prompt is missing the execution contract.
+
+    Issue #717: a repo-local flat whole-file override of ``worker.md`` or
+    ``rework.md`` can silently drop the ``$section_execution_contract``
+    reference, dispatching workers with no escalation trigger for
+    contract-changing diffs.  A worker changing a public function's signature
+    or return shape, an exception type a caller depends on, a DB schema, or a
+    module re-export can then ship with only the targeted/changed test files
+    run locally — exactly the class of change whose blast radius extends
+    outside the files it touched.  This post-render guard catches that drift
+    at the dispatch boundary — the single point of enforcement — rather than
+    relying on every consumer repo's override to remember the section.
+    """
+
+    def __init__(self, context: str, missing: tuple[str, ...]) -> None:
+        self.context = context
+        self.missing = missing
+        super().__init__(
+            f"{context} is missing the execution contract (issue #717): "
+            f"required marker(s) not found: {', '.join(missing)}. "
+            f"A repo-local flat override may have dropped the "
+            f"$section_execution_contract reference, leaving a blanket "
+            f"'never run the full local suite' prohibition with no "
+            f"carve-out for contract-changing diffs."
+        )
+
+
+def assert_execution_contract(prompt: str, *, context: str = "worker prompt") -> None:
+    """Verify a rendered worker/rework prompt carries the execution contract.
+
+    Checks the *rendered output* (not the template source) so that a
+    repo-local flat override that drops the ``$section_execution_contract``
+    reference is caught regardless of how the override was structured.
+    """
+
+    missing = tuple(m for m in EXECUTION_CONTRACT_MARKERS if m not in prompt)
+    if missing:
+        raise MissingExecutionContractError(context, missing)
+
+
 class PromptTemplateError(RuntimeError):
     """A prompt template references placeholders that nothing supplies.
 
