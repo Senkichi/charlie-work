@@ -3529,13 +3529,19 @@ def _detect_and_handle_stalled_reviews(
             # Issue #748: an unclaimed packet is a transient startup race, not
             # a terminal failure. ``review()`` generated the packet but
             # ``dispatch_reviews`` has not claimed it yet; this sweep marks it
-            # ``review_dispatch_failed`` so the next dispatch pass retries --
-            # and it does, typically within seconds (median 16s, 24/28 events
-            # under 1 minute, measured against events.db). Routing this through
-            # ``append_event`` directly with ``level="warning"`` (instead of
-            # ``sweep_events``) mirrors the two ``provider_throttled*`` paths
-            # above and keeps it out of the ``_append_sweep_events`` batcher,
-            # which deliberately does not classify levels (see its comment).
+            # ``review_dispatch_failed`` so the next dispatch pass retries.
+            # Measured against events.db (81 unclaimed events, 2026-07-23 to
+            # 2026-08-13): 31/81 (38%) recovered via ``review_dispatch_claim``
+            # with a median of 19s (27/31 under 60s); the remaining 50/81 were
+            # handled by fallback mechanisms (orphaned-worker routing, stale-
+            # claim reaping, escalation) rather than the normal dispatch path.
+            # In neither case is the packet stuck -- the sweep's
+            # ``review_dispatch_failed`` transition guarantees a retry path.
+            # Routing this through ``append_event`` directly with
+            # ``level="warning"`` (instead of ``sweep_events``) mirrors the two
+            # ``provider_throttled*`` paths above and keeps it out of the
+            # ``_append_sweep_events`` batcher, which deliberately does not
+            # classify levels (see its comment).
             unclaimed_payload = {
                 "pr_number": int(pr_key) if pr_key.isdigit() else None,
                 "status": "unclaimed",
