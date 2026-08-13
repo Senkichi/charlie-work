@@ -4898,7 +4898,10 @@ def test_allocation_prologue_anchors_on_a_live_repo_and_passes_config_through(
     kwargs = pass_mock.call_args.kwargs
     assert kwargs["managed_root_fallback"] == "C:/fallback-root"
     assert kwargs["fleet_dir_override"] == str(fleet_dir)
-    assert kwargs["state_path"] == repo / ".var" / "charlie-work" / "state.json"
+    # Issue #603: the state_path is the fleet-level path, not the anchor
+    # repo's per-repo state.json. Host-wide allocation events go to the
+    # fleet-level events.db, not whichever repo sorted first in the registry.
+    assert kwargs["state_path"] == fleet_dir / "state.json"
     assert kwargs["dry_run"] is True
     # The driving interval is threaded from the caller's resolved config so the
     # state file records the cadence the daemon actually used (issue #606).
@@ -5029,8 +5032,10 @@ def test_allocation_prologue_records_a_delegated_skip(tmp_path: Path) -> None:
 
     # And a genuine events.db row, not just the in-memory digest -- this is
     # the actual durable record the issue's evidence section was about.
-    state_path = layout.state_file_path(state_dir)
-    rows = query_events(state_path, kind="runner_allocation_skipped")
+    # Issue #603: the row lands in the fleet-level events.db, not the anchor
+    # repo's per-repo database.
+    fleet_state_path = fleet_dir / "state.json"
+    rows = query_events(fleet_state_path, kind="runner_allocation_skipped")
     assert len(rows) == 1
     assert rows[0]["payload"]["reason"] == "no configured runners found under C:/actions-runners"
     assert rows[0]["payload"]["dry_run"] is False
@@ -5069,10 +5074,12 @@ def test_allocation_prologue_records_a_delegated_skip_with_no_notes(tmp_path: Pa
 def test_allocation_prologue_delegated_skip_tolerates_no_anchor_state(tmp_path: Path) -> None:
     """A registry entry with no recorded ``state_dir`` must not crash.
 
-    ``anchor_state`` is ``None`` whenever the anchor repo's registry entry has
-    no ``state_dir`` on file yet (e.g. its very first pass). The digest event
-    must still be recorded even though there is nowhere to durably log the
-    events.db row for this pass.
+    Pre-#603, ``anchor_state`` was ``None`` whenever the anchor repo's registry
+    entry had no ``state_dir`` on file yet (e.g. its very first pass), so the
+    durable events.db row was skipped and only the in-memory digest survived.
+    Post-#603, the event-store path is derived from ``fleet_dir()``, not from
+    the anchor's ``state_dir``, so the decline is always durably recorded in
+    the fleet-level events.db regardless of the registry entry's state_dir.
     """
     fleet_dir = tmp_path / "fleet"
     repo = _make_repo(tmp_path, "anchor", api_worker=None)
@@ -5093,6 +5100,99 @@ def test_allocation_prologue_delegated_skip_tolerates_no_anchor_state(tmp_path: 
 
     assert [event["type"] for event in events] == ["runner_allocation_skipped"]
     assert events[0]["reason"] == "declined"
+
+    # Issue #603: the durable record lands in the fleet-level events.db even
+    # though the anchor entry has no state_dir — the path no longer depends on
+    # the registry entry that supplied the gh anchor.
+    fleet_state_path = fleet_dir / "state.json"
+    rows = query_events(fleet_state_path, kind="runner_allocation_skipped")
+    assert len(rows) == 1
+    assert rows[0]["payload"]["reason"] == "declined"
+
+
+def test_allocation_prologue_routes_events_to_fleet_store_not_anchor_repo(
+    tmp_path: Path,
+) -> None:
+    """Issue #603: host-wide allocation events land in the fleet-level events.db.
+
+    Pre-fix, ``_run_fleet_allocation_prologue`` derived ``state_path`` from the
+    same registry entry that supplied the gh anchor — the first entry with a
+    valid ``repo_root``. The anchor and the event-store path are independent
+    concerns: the anchor only needs auth and a valid directory (the pass
+    addresses every repo by explicit slug), whereas ``state_path`` decides
+    which repo's ``events.db`` records the host-wide allocation event. So the
+    audit trail for a host-wide action landed in whichever repo happened to
+    sort first in the registry, and moved if the registry order changed.
+
+    Post-fix, the event-store path is ``fleet_dir() / "state.json"``, so
+    ``log_event`` writes to ``fleet_dir() / "events.db"`` — the same
+    fleet-level store ``supervisor_lifecycle`` already writes host-wide events
+    to. The per-repo databases are disjoint from it by event scope.
+
+    This test registers two repos with distinct ``state_dir`` paths, runs the
+    prologue, and verifies:
+    1. The allocation event is in the fleet-level events.db.
+    2. Neither per-repo events.db contains the allocation event.
+    3. The gh anchor is still derived from the first valid repo root.
+    """
+    fleet_dir = tmp_path / "fleet"
+    repo_a = _make_repo(tmp_path, "alpha", api_worker=None)
+    repo_b = _make_repo(tmp_path, "beta", api_worker=None)
+    state_dir_a = repo_a / ".var" / "charlie-work"
+    state_dir_b = repo_b / ".var" / "charlie-work"
+    _make_fleet_json(
+        tmp_path,
+        fleet_dir,
+        {
+            "owner/alpha": {
+                "repo_root": str(repo_a),
+                "state_dir": str(state_dir_a),
+            },
+            "owner/beta": {
+                "repo_root": str(repo_b),
+                "state_dir": str(state_dir_b),
+            },
+        },
+    )
+
+    # Use a skipped result so the prologue's own log_event call writes a
+    # durable ``runner_allocation_skipped`` row — ``run_allocation_pass`` is
+    # mocked, so the ``runner_allocation`` event it would normally write
+    # never reaches the DB. The skipped path exercises the same state_path
+    # routing the fix changes.
+    result = AllocationPassResult(ok=True, skipped=True, notes=("no configured runners",))
+    with (
+        patch("charlie_work.fleet_dispatch.run_allocation_pass", return_value=result) as pass_mock,
+        patch("charlie_work.fleet_dispatch.GitHub") as gh_mock,
+    ):
+        _run_fleet_allocation_prologue(
+            str(fleet_dir), _allocation_config(enabled=True), dry_run=False
+        )
+
+    # The gh anchor is still the first valid repo root — that concern is
+    # unchanged. Only the event-store path was decoupled.
+    assert gh_mock.call_args.kwargs["repo_root"] == repo_a
+
+    # The state_path passed to run_allocation_pass is the fleet-level path,
+    # not repo_a's per-repo state.json.
+    assert pass_mock.call_args.kwargs["state_path"] == fleet_dir / "state.json"
+
+    # The allocation skip event is in the fleet-level events.db, not in
+    # either per-repo database. This is the core assertion of #603: the
+    # audit trail no longer lands in whichever repo sorted first.
+    fleet_state_path = fleet_dir / "state.json"
+    fleet_rows = query_events(fleet_state_path, kind="runner_allocation_skipped")
+    assert len(fleet_rows) == 1
+    assert fleet_rows[0]["payload"]["reason"] == "no configured runners"
+
+    for per_repo_state in (
+        layout.state_file_path(state_dir_a),
+        layout.state_file_path(state_dir_b),
+    ):
+        per_repo_rows = query_events(per_repo_state, kind="runner_allocation_skipped")
+        assert per_repo_rows == [], (
+            f"host-wide allocation event leaked into per-repo events.db at {per_repo_state}"
+        )
 
 
 def test_allocation_prologue_warns_when_the_config_lacks_the_section(
@@ -5312,8 +5412,10 @@ def test_allocation_prologue_forces_dry_run_when_ci_fleet_is_dirty(
     assert pass_mock.call_args.kwargs["dry_run"] is True
     assert any(e["type"] == "ci_fleet_worktree_dirty" for e in events)
 
-    state_path = layout.state_file_path(state_dir)
-    rows = query_events(state_path, kind="ci_fleet_worktree_dirty")
+    # Issue #603: the guard event lands in the fleet-level events.db, not the
+    # anchor repo's per-repo database.
+    fleet_state_path = fleet_dir / "state.json"
+    rows = query_events(fleet_state_path, kind="ci_fleet_worktree_dirty")
     assert len(rows) == 1
     assert rows[0]["payload"]["dirty_paths"] == [" M src/planner.py"]
     assert rows[0]["payload"]["dry_run_forced"] is True
