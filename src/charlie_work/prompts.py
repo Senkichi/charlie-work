@@ -155,6 +155,64 @@ def _unresolved(template_text: str, available: set[str]) -> set[str]:
     return set(Template(template_text).get_identifiers()) - available
 
 
+def _missing_placeholders(
+    template_text: str, sections: Mapping[str, str], available: set[str]
+) -> set[str]:
+    """Placeholders ``template_text`` (plus referenced section partials) needs
+    that ``available`` does not cover.
+
+    Shared by ``render_prompt``'s strict mode and the standalone
+    :func:`unsupplied_placeholders` startup/CI check so the two cannot drift
+    apart on what counts as an unresolved placeholder. Only section partials
+    the template actually references can ship a broken placeholder -- unused
+    partials are resolved at render time but never reach the output, so a
+    stale one must not block an unrelated render.
+    """
+    template = Template(template_text)
+    missing = _unresolved(template_text, available)
+    for key in set(template.get_identifiers()) & set(sections):
+        missing |= _unresolved(sections[key], available)
+    return missing
+
+
+def unsupplied_placeholders(
+    template_name: str,
+    supplied_keys: Iterable[str],
+    *,
+    search_dirs: Sequence[Path] = (),
+) -> set[str]:
+    """Placeholders the resolved template references that nothing supplies.
+
+    Pure static check (issue #713): resolve ``template_name`` the way dispatch
+    would -- a repo-local override in ``search_dirs`` wins over the package
+    default, per filename -- expand every ``$section_*`` partial it references,
+    and return the set of ``$placeholder``s the result needs that are neither in
+    ``supplied_keys`` nor discovered as a section variable on disk. An empty
+    return means the template is safe to render.
+
+    This is the *subset* direction the issue specifies: an override legitimately
+    uses fewer placeholders than the writer supplies (job-cannon's ``worker.md``
+    uses 6 of the writer's 8 keys), so the check fails only when the template
+    reaches for a placeholder the writer never provides -- the exact shape of
+    the #713 crash, where a flat ``rework.md`` override kept referencing
+    ``$review_summary`` after the writer renamed its slot to ``$dispatch_note`` /
+    ``$required_changes_section``. The reverse direction (every supplied key
+    used) is not an error; at most a lint.
+
+    No dispatch, no worker, no network: this reads template and section files
+    off disk only, so it can run at supervisor startup and in CI to catch a
+    drifting override *before* it crashes a live dispatch with an uncaught
+    :class:`PromptTemplateError`.
+    """
+    from .prompt_sections import section_variables
+
+    template_path = resolve_template(template_name, search_dirs)
+    template_text = template_path.read_text(encoding="utf-8")
+    sections = section_variables(search_dirs=tuple(search_dirs))
+    available = set(supplied_keys) | set(sections)
+    return _missing_placeholders(template_text, sections, available)
+
+
 def render_prompt(
     template_name: str,
     values: Mapping[str, object],
@@ -179,13 +237,7 @@ def render_prompt(
     merged = {**sections, **values}
     safe_values = {key: str(value) for key, value in merged.items()}
     if strict:
-        available = set(merged)
-        missing = _unresolved(template_text, available)
-        # Only section partials the template actually references can ship a
-        # broken placeholder -- unused partials are resolved below but never
-        # reach the output, so a stale one must not block an unrelated render.
-        for key in set(template.get_identifiers()) & set(sections):
-            missing |= _unresolved(sections[key], available)
+        missing = _missing_placeholders(template_text, sections, set(merged))
         if missing:
             raise PromptTemplateError(template_path, missing)
     # Render section partials first: each partial's internal $placeholders are
