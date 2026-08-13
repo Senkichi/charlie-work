@@ -1794,7 +1794,16 @@ class GitHubLike(Protocol):
     without subclassing the frozen dataclass (issue #593).
     """
 
-    dry_run: bool = False
+    # Declared as a read-only property, not a settable attribute, so the
+    # frozen ``GitHub`` dataclass (whose ``dry_run`` field is immutable)
+    # satisfies the protocol. A plain ``dry_run: bool`` annotation would
+    # require a *writable* attribute, which a frozen dataclass cannot provide
+    # — that mismatch was the root cause of every ``GitHub``-vs-``GitHubLike``
+    # ``reportArgumentType`` error in src/ (issue #733). Test doubles that set
+    # ``self.dry_run`` in ``__init__`` still satisfy a read-only property: a
+    # settable attribute is a superset of a read-only one.
+    @property
+    def dry_run(self) -> bool: ...
 
     def run(
         self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
