@@ -335,6 +335,88 @@ def test_cli_verdict_isolates_fleet_registry(
         assert real_fleet_json.read_text(encoding="utf-8") == real_before
 
 
+def test_cli_dry_run_does_not_write_fleet_registry_through_build_app(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #618: ``--dry-run`` through ``build_app`` must not create or mutate
+    the fleet registry.
+
+    The ``verdict`` command dispatches through ``build_app``, which calls
+    ``touch_repo(..., dry_run=args.dry_run)``.  Main's #1157 refactor once
+    silently dropped the ``dry_run=`` kwarg from that call site; this test
+    ensures a future refactor cannot do the same without a test failing; the
+    registry must not be created or bumped when ``--dry-run`` is set.
+    """
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+    summary = repo / "summary.md"
+    summary.write_text("lgtm", encoding="utf-8")
+
+    # The autouse _isolate_fleet_registry fixture points
+    # CHARLIE_WORK_FLEET_DIR at tmp_path / "fleet"; resolve it explicitly so
+    # the assertion is against the same path touch_repo would write to.
+    fleet_json = Path(tmp_path / "fleet" / "fleet.json")
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "--dry-run",
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "approved",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+
+    assert rc == 0
+    assert not fleet_json.exists(), (
+        "fleet.json must not be created in dry-run mode (build_app/touch_repo "
+        "dropped the dry_run= kwarg)"
+    )
+
+
+def test_cli_dry_run_does_not_write_fleet_registry_through_doctor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #618: ``--dry-run`` through ``run_doctor_command`` must not create
+    or mutate the fleet registry.
+
+    The ``doctor`` command dispatches through ``run_doctor_command``, which
+    calls ``touch_repo(..., dry_run=args.dry_run)`` — the second call site in
+    cli.py.  This test ensures that call site is also gated, so a refactor
+    that drops the kwarg from either site is caught.
+    """
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    repo = _make_repo(tmp_path)
+
+    # Avoid running the real doctor checks — we only care about whether
+    # touch_repo wrote the registry.
+    monkeypatch.setattr(cli, "run_doctor", lambda *a, **k: (True, []))
+
+    fleet_json = Path(tmp_path / "fleet" / "fleet.json")
+
+    rc = cli.main(
+        [
+            "--repo",
+            str(repo),
+            "--dry-run",
+            "doctor",
+        ]
+    )
+
+    assert rc == 0
+    assert not fleet_json.exists(), (
+        "fleet.json must not be created in dry-run mode (doctor/touch_repo "
+        "dropped the dry_run= kwarg)"
+    )
+
+
 def test_cli_spec_review_missing_file_exits_nonzero(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
