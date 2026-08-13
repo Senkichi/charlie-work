@@ -105,6 +105,7 @@ from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import (
     PromptTemplateError,
     assert_conventional_commit_title,
+    assert_execution_contract,
     assert_no_merge_contract,
     prompt_template_digest,
     render_prompt,
@@ -3463,6 +3464,25 @@ def _detect_and_handle_stalled_reviews(
                     except (OSError, json.JSONDecodeError):
                         decision_value = "invalid"
             if decision_value not in ("pending", "missing", "invalid", None):
+                # Issue #734: the decision_path gate is the second of three
+                # silent skip paths in stale-claim recovery. A PR whose review
+                # already produced a verdict (e.g. ``request_changes``) but is
+                # still in ``reviewing`` status is passed over every pass with
+                # no trace -- the verdict was never acted upon, and without this
+                # event nobody can tell recovery considered the PR and declined.
+                # Same ``log_event`` / ``review_stale_claim_recovery_skipped``
+                # pattern as the prompt_path skips above (issue #708): writes
+                # directly to events.db because this skip does not mutate state.
+                log_event(
+                    state_file,
+                    "review_stale_claim_recovery_skipped",
+                    {
+                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                        "reason": "decision_already_recorded",
+                        "decision": decision_value,
+                    },
+                    level="warning",
+                )
                 continue
 
             prompt_mtime = prompt_path.stat().st_mtime
@@ -3475,6 +3495,25 @@ def _detect_and_handle_stalled_reviews(
             if not is_claim_stale(
                 packet_age, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
             ):
+                # Issue #734: the packet-age gate is the third silent skip path.
+                # The packet is not stale yet, so recovery defers to a future
+                # pass. This is normal flow control, not a failure -- but the
+                # issue requires all three exits to be observable so a stuck-PR
+                # investigation can confirm recovery ran and chose to defer
+                # rather than silently doing nothing. ``level="info"`` because
+                # this is expected behavior (the packet simply is not old
+                # enough), unlike the other two skips which indicate a PR that
+                # recovery cannot help.
+                log_event(
+                    state_file,
+                    "review_stale_claim_recovery_skipped",
+                    {
+                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                        "reason": "packet_not_stale",
+                        "packet_age": packet_age,
+                    },
+                    level="info",
+                )
                 continue
 
             state["prs"][pr_key] = {
@@ -5907,6 +5946,10 @@ def _write_rework_prompt(
     # repo-local flat rework override that drops $section_no_merge_contract is
     # caught at the dispatch boundary.
     assert_no_merge_contract(prompt, context=f"rework prompt for PR #{pr_number}")
+    # Issue #717: enforce the execution-contract escalation trigger on the
+    # *rendered output* so a repo-local flat rework override that drops
+    # $section_execution_contract is caught at the dispatch boundary.
+    assert_execution_contract(prompt, context=f"rework prompt for PR #{pr_number}")
     prompt_path.write_text(prompt, encoding="utf-8")
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
     # regeneration (when review-decision.json is newer than the brief) can
@@ -21047,6 +21090,15 @@ class OrchestratorApp:
         assert_conventional_commit_title(
             prompt, context=f"worker prompt for issue #{issue_number}"
         )
+        # Issue #717: enforce the execution-contract escalation trigger on the
+        # *rendered output* so a repo-local flat override that drops
+        # $section_execution_contract — leaving a blanket "never run the full
+        # local suite" prohibition with no carve-out for contract-changing diffs
+        # (public function signature/return shape, exception type/message
+        # consumed elsewhere, DB schema, or module re-export) — is caught at the
+        # dispatch boundary rather than shipping a worker who can change a
+        # contract surface and push without ever exercising the wider suite.
+        assert_execution_contract(prompt, context=f"worker prompt for issue #{issue_number}")
         # Issue #618: the dry-run dispatch branch promises "skip all state
         # writes, label transitions, and file mutations" — mkdir + write_text
         # here would violate that, and for a dead-worker recovery candidate
