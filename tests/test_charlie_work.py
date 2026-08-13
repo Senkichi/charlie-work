@@ -13722,6 +13722,113 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
     assert len(captured) == 1
 
 
+def test_loop_dead_session_notifies_when_watchdog_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #706: when ``watchdog.enabled=False``, ``_detect_stalled_sessions``
+    returns ``[]`` (it is gated on watchdog), so the stalled-session notify path
+    never fires. But dead workers ARE still reaped by
+    ``_classify_dead_sessions_and_update_throttle_state`` (which is NOT
+    watchdog-gated). The loop must feed those reaped dead-session transitions
+    into the notify digest so an operator monitoring
+    ``notify/digest.jsonl`` gets signal instead of a permanently empty file.
+    """
+    from charlie_work.devin_shell import SessionRecord, _sidecar_path as devin_sidecar_path
+
+    issue_number = 706
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(
+            enabled=False,
+            stall_minutes=20,
+            # Pin to 0 so the dead-session lane reaps immediately rather than
+            # deferring for max_inconclusive_probe_deferrals passes (a bare
+            # test environment has no real sessions.db, so the probe is always
+            # inconclusive).
+            max_inconclusive_probe_deferrals=0,
+        ),
+        notify=NotifyConfig(enabled=True, sink="file", file_path=""),
+        cross_family=CrossFamilyConfig(enabled=False),
+        review_dispatch=ReviewDispatchConfig(enabled=False),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+
+    # Seed state so the dead-session lane has a dispatched issue to reap.
+    with state_lock(paths.state_file):
+        save_state(
+            paths.state_file,
+            {
+                "version": 1,
+                "issues": {
+                    str(issue_number): {
+                        "status": "dispatched",
+                        "branch_name": f"agent/issue-{issue_number}-test",
+                        "worker_pid": 99999,
+                        "worker_process_start_time": 1234567890.0,
+                    }
+                },
+                "prs": {},
+                "events": [],
+            },
+        )
+
+    # Create a dead session sidecar (non-existent PID).
+    sessions_dir = paths.root / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / f"issue-{issue_number}.log"
+    log_path.write_text("Session log\n", encoding="utf-8")
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch=f"agent/issue-{issue_number}-test",
+        worktree_path="/tmp/worktree-706",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=99999,  # Non-existent PID → dead
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # FakeGitHub with the issue present (so the dead-session lane can relabel).
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": issue_number,
+            "title": "Test issue 706",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "Test",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.emit_digest",
+        lambda notify_config, digest: captured.append(digest),
+    )
+
+    result = app.loop(limit=0)
+
+    assert result.ok is True
+    # The dead session was reaped and a DEAD transition was emitted to notify.
+    dead_digests = [d for d in captured if any(t.health == "DEAD" for t in d.transitions)]
+    assert len(dead_digests) == 1, (
+        f"Expected exactly one DEAD notify digest, got {len(dead_digests)} (captured: {captured})"
+    )
+    transition = dead_digests[0].transitions[0]
+    assert transition.issue_number == issue_number
+    assert transition.health == "DEAD"
+    # The sidecar was reaped (proving the dead-session lane ran).
+    assert not sidecar_path.exists()
+
+
 def test_clear_reviewer_quota_drops_alerted_at() -> None:
     """clear_reviewer_quota must also pop alerted_at so a later exhaustion
     episode alerts again instead of staying silently suppressed."""
