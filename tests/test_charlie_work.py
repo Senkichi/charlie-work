@@ -5176,16 +5176,21 @@ def test_dispatch_worker_template_selects_claude_code_variant(tmp_path: Path) ->
 def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None:
     override_dir = tmp_path / "orchestrator-prompts"
     override_dir.mkdir()
-    # The override must carry the no-merge contract markers (issue #714) and
-    # the conventional-commit title instruction (issue #715):
+    # The override must carry the no-merge contract markers (issue #714),
+    # the conventional-commit title instruction (issue #715), and the
+    # execution-contract escalation trigger (issue #717):
     # _write_worker_prompt's post-render guards reject a flat override that
-    # drops either.
+    # drops any of these.
     (override_dir / "worker.md").write_text(
         "REPO-LOCAL #$issue_number\n\n"
         "## No-merge contract\n\n"
         "Your deliverable ENDS at pushing the branch and opening the PR.\n\n"
         "## PR requirements\n\n"
-        "- Title format: Conventional-Commits format (`type(scope): description`).\n",
+        "- Title format: Conventional-Commits format (`type(scope): description`).\n\n"
+        "**Execution contract (self-detect from your diff):** the default is "
+        "the targeted command. Only if the diff changes any public function "
+        "signature/return shape, run the **FULL suite** locally at the final "
+        "head before pushing.\n",
         encoding="utf-8",
     )
     config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir="orchestrator-prompts"))
@@ -5201,7 +5206,11 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
         "## No-merge contract\n\n"
         "Your deliverable ENDS at pushing the branch and opening the PR.\n\n"
         "## PR requirements\n\n"
-        "- Title format: Conventional-Commits format (`type(scope): description`).\n"
+        "- Title format: Conventional-Commits format (`type(scope): description`).\n\n"
+        "**Execution contract (self-detect from your diff):** the default is "
+        "the targeted command. Only if the diff changes any public function "
+        "signature/return shape, run the **FULL suite** locally at the final "
+        "head before pushing.\n"
     )
 
 
@@ -10257,6 +10266,123 @@ def test_stale_claim_recovery_skipped_logs_when_prompt_path_file_gone(
     assert payload["reason"] == "prompt_path file does not exist on disk"
     assert payload["prompt_path"] == str(gone_prompt)
     assert skip_events[0]["level"] == "warning"
+
+
+def test_stale_claim_recovery_skipped_logs_when_decision_already_recorded(
+    tmp_path: Path,
+) -> None:
+    """Issue #734: a reviewing PR whose decision_path already holds a verdict
+    (e.g. ``request_changes``) is silently passed over by stale-claim recovery
+    on every pass -- the verdict was never acted upon, but without an event
+    nobody can tell recovery considered the PR and declined. This is the second
+    of the three silent skip paths identified in #734."""
+    from datetime import timedelta
+
+    from charlie_work.workflow import _detect_and_handle_stalled_reviews
+
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    # Create a valid prompt_path on disk and a decision file with a verdict.
+    pr_dir = tmp_path / "prs" / "pr-100"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = pr_dir / "review-prompt.md"
+    prompt_path.write_text("review prompt", encoding="utf-8")
+    decision_path = pr_dir / "review-decision.json"
+    decision_path.write_text(json.dumps({"decision": "request_changes"}), encoding="utf-8")
+
+    # Age the packet so the stale-claim timeout is satisfied -- the skip must
+    # come from the decision gate, not from the packet-age gate.
+    old_mtime = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(prompt_path, (old_mtime, old_mtime))
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "status": "reviewing",
+            "prompt_path": str(prompt_path),
+            "decision_path": str(decision_path),
+        }
+        save_state(state_file, state)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    state = load_state(state_file)
+    # The PR was not reaped -- recovery declined because a verdict exists.
+    assert state["prs"]["100"].get("review_dispatch_status") is None
+
+    skip_events = query_events(state_file, kind="review_stale_claim_recovery_skipped")
+    assert len(skip_events) == 1
+    payload = skip_events[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["reason"] == "decision_already_recorded"
+    assert payload["decision"] == "request_changes"
+    assert skip_events[0]["level"] == "warning"
+
+
+def test_stale_claim_recovery_skipped_logs_when_packet_not_stale(
+    tmp_path: Path,
+) -> None:
+    """Issue #734: a reviewing PR whose packet is not yet past the stale-claim
+    timeout is silently skipped on every pass until it becomes stale. This is
+    the third of the three silent skip paths identified in #734. The event is
+    info-level (not warning) because this is expected flow control -- the
+    packet simply is not old enough yet -- unlike the other two skips which
+    indicate a PR recovery cannot help."""
+    from charlie_work.workflow import _detect_and_handle_stalled_reviews
+
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+
+    # Create a valid prompt_path on disk with NO decision file (decision_value
+    # defaults to "missing", which passes the decision gate). The packet is
+    # fresh -- not aged -- so the stale-claim timeout is not met.
+    pr_dir = tmp_path / "prs" / "pr-100"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    prompt_path = pr_dir / "review-prompt.md"
+    prompt_path.write_text("review prompt", encoding="utf-8")
+
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"]["100"] = {
+            "number": 100,
+            "issue_number": 10,
+            "status": "reviewing",
+            "prompt_path": str(prompt_path),
+            "decision_path": str(pr_dir / "review-decision.json"),
+        }
+        save_state(state_file, state)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    state = load_state(state_file)
+    assert state["prs"]["100"].get("review_dispatch_status") is None
+
+    skip_events = query_events(state_file, kind="review_stale_claim_recovery_skipped")
+    assert len(skip_events) == 1
+    payload = skip_events[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["reason"] == "packet_not_stale"
+    assert "packet_age" in payload
+    assert skip_events[0]["level"] == "info"
 
 
 def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
