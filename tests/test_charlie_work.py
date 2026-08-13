@@ -13722,6 +13722,113 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
     assert len(captured) == 1
 
 
+def test_loop_dead_session_notifies_when_watchdog_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #706: when ``watchdog.enabled=False``, ``_detect_stalled_sessions``
+    returns ``[]`` (it is gated on watchdog), so the stalled-session notify path
+    never fires. But dead workers ARE still reaped by
+    ``_classify_dead_sessions_and_update_throttle_state`` (which is NOT
+    watchdog-gated). The loop must feed those reaped dead-session transitions
+    into the notify digest so an operator monitoring
+    ``notify/digest.jsonl`` gets signal instead of a permanently empty file.
+    """
+    from charlie_work.devin_shell import SessionRecord, _sidecar_path as devin_sidecar_path
+
+    issue_number = 706
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(
+            enabled=False,
+            stall_minutes=20,
+            # Pin to 0 so the dead-session lane reaps immediately rather than
+            # deferring for max_inconclusive_probe_deferrals passes (a bare
+            # test environment has no real sessions.db, so the probe is always
+            # inconclusive).
+            max_inconclusive_probe_deferrals=0,
+        ),
+        notify=NotifyConfig(enabled=True, sink="file", file_path=""),
+        cross_family=CrossFamilyConfig(enabled=False),
+        review_dispatch=ReviewDispatchConfig(enabled=False),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    (paths.root).mkdir(parents=True, exist_ok=True)
+
+    # Seed state so the dead-session lane has a dispatched issue to reap.
+    with state_lock(paths.state_file):
+        save_state(
+            paths.state_file,
+            {
+                "version": 1,
+                "issues": {
+                    str(issue_number): {
+                        "status": "dispatched",
+                        "branch_name": f"agent/issue-{issue_number}-test",
+                        "worker_pid": 99999,
+                        "worker_process_start_time": 1234567890.0,
+                    }
+                },
+                "prs": {},
+                "events": [],
+            },
+        )
+
+    # Create a dead session sidecar (non-existent PID).
+    sessions_dir = paths.root / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / f"issue-{issue_number}.log"
+    log_path.write_text("Session log\n", encoding="utf-8")
+    sidecar_path = devin_sidecar_path(sessions_dir, issue_number)
+    record = SessionRecord(
+        issue_number=issue_number,
+        branch=f"agent/issue-{issue_number}-test",
+        worktree_path="/tmp/worktree-706",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=99999,  # Non-existent PID → dead
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    # FakeGitHub with the issue present (so the dead-session lane can relabel).
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": issue_number,
+            "title": "Test issue 706",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "Test",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.emit_digest",
+        lambda notify_config, digest: captured.append(digest),
+    )
+
+    result = app.loop(limit=0)
+
+    assert result.ok is True
+    # The dead session was reaped and a DEAD transition was emitted to notify.
+    dead_digests = [d for d in captured if any(t.health == "DEAD" for t in d.transitions)]
+    assert len(dead_digests) == 1, (
+        f"Expected exactly one DEAD notify digest, got {len(dead_digests)} (captured: {captured})"
+    )
+    transition = dead_digests[0].transitions[0]
+    assert transition.issue_number == issue_number
+    assert transition.health == "DEAD"
+    # The sidecar was reaped (proving the dead-session lane ran).
+    assert not sidecar_path.exists()
+
+
 def test_clear_reviewer_quota_drops_alerted_at() -> None:
     """clear_reviewer_quota must also pop alerted_at so a later exhaustion
     episode alerts again instead of staying silently suppressed."""
@@ -21850,6 +21957,267 @@ def test_dry_run_dispatch_dependency_gate_filter(tmp_path: Path) -> None:
     blocked_entries = {entry["issue"]: entry["blockers"] for entry in result.data["blocked"]}
     assert 100 in blocked_entries
     assert blocked_entries[100] == [200]
+
+
+# --- Issue #618: dry-run local-write sites -----------------------------------
+
+
+def test_dry_run_dispatch_does_not_write_worker_prompt(tmp_path: Path) -> None:
+    """Issue #618-A: dry-run dispatch must not write worker-prompt.md or create
+    issue directories. The dry-run block promises "skip all state writes, label
+    transitions, and file mutations" — ``_write_worker_prompt`` used to
+    ``mkdir`` + ``write_text`` unconditionally inside it.
+    """
+    config = OrchestratorConfig(
+        labels=LabelConfig(),
+        dispatch=DispatchConfig(),
+        devin=DevinConfig(),
+        claude_code=ClaudeCodeConfig(),
+        runtime=RuntimeConfig(),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    initial_state = {
+        "issues": {},
+        "prs": {},
+        "events": [],
+        "generated_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, initial_state)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(
+        repo_root=tmp_path,
+        paths=paths,
+        config=config,
+        gh=fake_gh,
+        dry_run=True,
+    )
+
+    # Close the default PR so the issue is dispatchable
+    app.gh.prs[0]["state"] = "CLOSED"
+    result = app.dispatch()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+
+    # The issue directory and worker-prompt.md must NOT exist after dry-run
+    issue_dir = paths.issues / "issue-123"
+    assert not issue_dir.exists(), "dry-run dispatch must not create issue directories"
+    assert not (issue_dir / "worker-prompt.md").exists(), (
+        "dry-run dispatch must not write worker-prompt.md"
+    )
+
+
+def test_dry_run_dispatch_preserves_existing_worker_prompt(tmp_path: Path) -> None:
+    """Issue #618-A: for a dead-worker recovery candidate (previous status
+    ``dispatched``, same branch), dry-run dispatch must not overwrite the
+    prompt a crashed worker was launched with — that is the forensic record
+    the preview was meant to inspect.
+    """
+    config = OrchestratorConfig(
+        labels=LabelConfig(),
+        dispatch=DispatchConfig(),
+        devin=DevinConfig(),
+        claude_code=ClaudeCodeConfig(),
+        runtime=RuntimeConfig(),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed state with a "dispatched" issue on the same branch the dry-run
+    # would use — this makes the candidate a dead-worker recovery target.
+    branch_name = f"{config.dispatch.branch_prefix}-123-fix-search"
+    initial_state = {
+        "issues": {
+            "123": {
+                "number": 123,
+                "status": "dispatched",
+                "branch_name": branch_name,
+            }
+        },
+        "prs": {},
+        "events": [],
+        "generated_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, initial_state)
+
+    # Plant the forensic prompt from the crashed worker
+    issue_dir = paths.issues / "issue-123"
+    issue_dir.mkdir(parents=True, exist_ok=True)
+    forensic_prompt = issue_dir / "worker-prompt.md"
+    original_content = "# ORIGINAL CRASHED WORKER PROMPT\nDo not overwrite me."
+    forensic_prompt.write_text(original_content, encoding="utf-8")
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(
+        repo_root=tmp_path,
+        paths=paths,
+        config=config,
+        gh=fake_gh,
+        dry_run=True,
+    )
+
+    # Close the default PR so the issue is dispatchable (dead worker, no open PR)
+    app.gh.prs[0]["state"] = "CLOSED"
+    result = app.dispatch()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    # The recovery flag should be set for this candidate
+    assert result.data["sessions"][0]["recovery"] is not None
+
+    # The forensic prompt must be untouched
+    assert forensic_prompt.read_text(encoding="utf-8") == original_content
+
+
+def test_touch_repo_dry_run_does_not_write_fleet_registry(tmp_path: Path) -> None:
+    """Issue #618-B: ``touch_repo`` with ``dry_run=True`` must not create or
+    update the fleet registry. Running a ``--dry-run`` command from a worktree
+    would otherwise repoint the fleet's registry entry at the worktree path.
+    """
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh = FakeGitHub(repo_root=repo_root)
+    fleet_dir = tmp_path / "fleet"
+
+    registry = touch_repo(str(fleet_dir), repo_root, paths, gh, dry_run=True)
+
+    # The registry should be empty (no write occurred)
+    assert registry == {"version": 1, "repos": {}}
+    # The fleet.json file must NOT exist
+    assert not (fleet_dir / "fleet.json").exists()
+
+
+def test_touch_repo_dry_run_preserves_existing_registry(tmp_path: Path) -> None:
+    """Issue #618-B: ``touch_repo`` with ``dry_run=True`` must not bump
+    ``last_seen`` or repoint ``repo_root`` for an already-registered repo.
+    """
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    paths = runtime_paths(repo_root, ".var/charlie-work")
+
+    class FakeGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "owner/repo"
+
+    gh = FakeGitHub(repo_root=repo_root)
+    fleet_dir = tmp_path / "fleet"
+
+    # First call (real) registers the repo
+    touch_repo(str(fleet_dir), repo_root, paths, gh)
+    fleet_json = fleet_dir / "fleet.json"
+    assert fleet_json.exists()
+    original = json.loads(fleet_json.read_text(encoding="utf-8"))
+    original_last_seen = original["repos"]["owner/repo"]["last_seen"]
+
+    # Second call from a DIFFERENT path (e.g. a worktree) with dry_run=True
+    worktree_root = tmp_path / "worktree"
+    worktree_root.mkdir(parents=True, exist_ok=True)
+    worktree_paths = runtime_paths(worktree_root, ".var/charlie-work")
+    gh_wt = FakeGitHub(repo_root=worktree_root)
+
+    touch_repo(str(fleet_dir), worktree_root, worktree_paths, gh_wt, dry_run=True)
+
+    # The registry must be unchanged — repo_root not repointed, last_seen not bumped
+    after = json.loads(fleet_json.read_text(encoding="utf-8"))
+    assert after == original
+    assert after["repos"]["owner/repo"]["repo_root"] == str(repo_root)
+    assert after["repos"]["owner/repo"]["last_seen"] == original_last_seen
+
+
+def test_dry_run_intake_does_not_write_files_or_state(tmp_path: Path) -> None:
+    """Issue #618-C: ``intake()`` in dry-run must not create issue dirs, write
+    issue.json/worker-prompt.md, add labels, or merge state.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    initial_state = {
+        "issues": {},
+        "prs": {},
+        "events": [],
+        "generated_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, initial_state)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    result = app.intake()
+
+    assert result.ok is True
+    assert "dry-run" in result.message.lower()
+    assert len(result.data["issues"]) == 1
+    assert result.data["issues"][0]["issue"] == 123
+
+    # No issue directory, issue.json, or worker-prompt.md
+    issue_dir = paths.issues / "issue-123"
+    assert not issue_dir.exists()
+    assert not (issue_dir / "issue.json").exists()
+    assert not (issue_dir / "worker-prompt.md").exists()
+
+    # No labels added
+    assert fake_gh.labels_added == []
+
+    # State unchanged
+    with state_lock(paths.state_file):
+        final_state = load_state(paths.state_file)
+    assert final_state["issues"] == {}
+    assert final_state["events"] == []
+
+
+def test_dry_run_spec_review_does_not_write_state_or_run_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #618-D: ``spec_review`` in dry-run must not invoke the cross-family
+    model subprocess, write the report, create the reviews directory, or record
+    a state event.
+    """
+    spec = tmp_path / "SPEC.md"
+    spec.write_text("# My spec\nclaims", encoding="utf-8")
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    initial_state = {
+        "issues": {},
+        "prs": {},
+        "events": [],
+        "generated_at": "2024-01-01T00:00:00Z",
+    }
+    save_state(paths.state_file, initial_state)
+
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+
+    subprocess_calls: list[Any] = []
+
+    def fake_run(*args, **kwargs):
+        subprocess_calls.append(args[0] if args else kwargs)
+        raise AssertionError("subprocess.run should not be called in dry-run mode")
+
+    monkeypatch.setattr("charlie_work.cross_family.subprocess.run", fake_run)
+
+    result = app.spec_review(spec)
+
+    # Dry-run preview succeeded
+    assert result.ok is True
+    assert "dry-run" in result.message.lower()
+    # No subprocess invoked
+    assert len(subprocess_calls) == 0
+    # No reviews directory created
+    assert not paths.cross_family.exists()
+    # No state event recorded
+    with state_lock(paths.state_file):
+        final_state = load_state(paths.state_file)
+    assert final_state["events"] == []
 
 
 def test_cli_main_maps_github_error_to_exit_2(monkeypatch, capsys) -> None:
@@ -41414,7 +41782,9 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     # state-lock guard is only reachable on the non-dry-run path.  The state
     # lock is the first thing that path hits, so no side effects occur before
     # the StateLockBusy exception.
-    if method_name == "merge_ready":
+    # Issue #618: intake's dry-run gate also sits above the state_lock —
+    # dry-run skips the state merge entirely, so the lock guard never fires.
+    if method_name in ("merge_ready", "intake"):
         app.dry_run = False
 
     state_path = paths.state_file
@@ -41453,7 +41823,9 @@ def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="devin-shell"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=True)
+    # Issue #618: dry_run=False so the state_lock block is reached — in dry-run
+    # the state write is correctly skipped, so the lock guard never fires.
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub(), dry_run=False)
 
     spec_path = tmp_path / "spec.md"
     spec_path.write_text("# spec\n", encoding="utf-8")
@@ -41475,7 +41847,7 @@ def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
         return CrossFamilyResult(ok=True, report_path=str(tmp_path / "report.md"), model="test")
 
     monkeypatch.setattr(
-        "charlie_work.cross_family.run_cross_family_review",
+        "charlie_work.workflow.run_cross_family_review",
         fake_run_cross_family_review,
     )
 

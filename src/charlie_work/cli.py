@@ -562,7 +562,7 @@ def bootstrap_command(args: argparse.Namespace) -> CommandContext:
 
 def build_app(args: argparse.Namespace) -> OrchestratorApp:
     ctx = bootstrap_command(args)
-    touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh)
+    touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh, dry_run=args.dry_run)
     return OrchestratorApp(
         ctx.repo_root,
         ctx.paths,
@@ -600,7 +600,7 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
             {"checks": [check.to_dict()]},
         )
     config_path = find_config_path(ctx.repo_root, args.config)
-    touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh)
+    touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh, dry_run=args.dry_run)
     ok, checks = run_doctor(
         ctx.repo_root,
         ctx.paths,
