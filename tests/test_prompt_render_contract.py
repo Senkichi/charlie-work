@@ -253,6 +253,42 @@ def test_worker_writer_rejects_flat_override_without_conventional_title(
     assert "issue #715" in str(exc_info.value)
 
 
+def test_worker_writer_rejects_flat_override_without_execution_contract(
+    tmp_path: Path,
+) -> None:
+    """Issue #717: ``_write_worker_prompt`` must refuse to write a prompt
+    whose rendered output is missing the execution-contract escalation trigger
+    — the exact failure mode a repo-local flat ``worker.md`` override creates
+    when it drops the ``$section_execution_contract`` reference, leaving a
+    blanket "never run the full local suite" prohibition with no carve-out for
+    contract-changing diffs."""
+    from charlie_work.prompts import MissingExecutionContractError
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    # The override carries the no-merge contract (so the #714 guard passes)
+    # and the conventional-commit title instruction (so the #715 guard passes),
+    # but drops the execution-contract carve-out.
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\n"
+        "## No-merge contract\n\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n\n"
+        "## PR requirements\n\n"
+        "- Title format: Conventional-Commits format (`type(scope): description`).\n"
+        "Never run the full local suite as your gate -- CI runs the full "
+        "matrix on push and is the sole authority on wider regressions.\n"
+        "$issue_number $branch_name\n",
+        encoding="utf-8",
+    )
+    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(override_dir)))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, gh=None)
+
+    with pytest.raises(MissingExecutionContractError) as exc_info:
+        app._write_worker_prompt(_fake_issue())
+    assert "issue #717" in str(exc_info.value)
+
+
 def test_rework_writer_rejects_flat_override_without_no_merge_contract(
     tmp_path: Path,
 ) -> None:
@@ -279,6 +315,41 @@ def test_rework_writer_rejects_flat_override_without_no_merge_contract(
     with pytest.raises(MissingNoMergeContractError) as exc_info:
         _write_rework_prompt(state_file, pr, 1, "A dispatch note.", config)
     assert "issue #714" in str(exc_info.value)
+
+
+def test_rework_writer_rejects_flat_override_without_execution_contract(
+    tmp_path: Path,
+) -> None:
+    """Issue #717: ``_write_rework_prompt`` must refuse to write a rework
+    brief whose rendered output is missing the execution-contract escalation
+    trigger."""
+    from charlie_work.prompts import MissingExecutionContractError
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    # The override carries the no-merge contract (so the #714 guard passes)
+    # but drops the execution-contract carve-out.
+    (override_dir / "rework.md").write_text(
+        "# Rework Task\n\n"
+        "## No-merge contract\n\n"
+        "Your deliverable ENDS at pushing the branch and opening the PR.\n"
+        "Never run the full local suite as your gate -- CI runs the full "
+        "matrix on push and is the sole authority on wider regressions.\n"
+        "$pr_number $pr_title $pr_url $issue_number $branch_name\n",
+        encoding="utf-8",
+    )
+    config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(override_dir)))
+    state_file = tmp_path / ".var" / "charlie-work" / "state.json"
+    pr = {
+        "number": 2,
+        "title": "Fake PR title",
+        "url": "https://example.test/pull/2",
+        "headRefName": "agent/issue-1-fake",
+    }
+
+    with pytest.raises(MissingExecutionContractError) as exc_info:
+        _write_rework_prompt(state_file, pr, 1, "A dispatch note.", config)
+    assert "issue #717" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
