@@ -1941,7 +1941,11 @@ def test_run_fleet_supervise_pass_summary_guards_missing_message(
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
     assert summary_lines
-    assert "3 failed" in summary_lines[0]
+    # Issue #738: non-fatal ok=False conditions are "with conditions", not
+    # "failed" -- the three repos here have no ``errored`` flag, so they land
+    # in the conditions bucket and the errored count stays at zero.
+    assert "3 with conditions" in summary_lines[0]
+    assert "0 errored" in summary_lines[0]
     # No dangling empty reason marker when every message is absent -- check
     # only the text after "fleet pass N:" so the leading "[HH:MM:SS]"
     # timestamp bracket (unrelated to the reason suffix) is not confused for it.
@@ -1975,12 +1979,202 @@ def test_run_fleet_supervise_pass_summary_silent_when_all_ok(
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
     assert summary_lines
-    assert "0 failed" in summary_lines[0]
+    # Issue #738: a fully healthy pass reports zero errored and zero
+    # conditions, not a single "0 failed" blob.
+    assert "0 errored" in summary_lines[0]
+    assert "0 with conditions" in summary_lines[0]
     # No reason suffix at all when nothing failed -- check only the text after
     # "fleet pass N:" so the leading "[HH:MM:SS]" timestamp bracket is not
     # confused for a (nonexistent) reason marker.
     after_prefix = summary_lines[0].split("fleet pass 1:", 1)[1]
     assert "[" not in after_prefix
+
+
+def _mixed_fleet_result(
+    conditions: dict[str, str | None] | None = None,
+    errored: dict[str, str | None] | None = None,
+    ok: dict[str, dict[str, Any]] | None = None,
+) -> CommandResult:
+    """A fleet pass with explicit errored / with-conditions / ok buckets.
+
+    Mirrors the shape ``fleet_loop`` returns after issue #738: the exception
+    path sets ``errored: True`` on the result data, while non-fatal
+    ``ok=False`` conditions from ``app.loop()`` do not. This helper lets a
+    test plant each bucket independently so the headline split is exercised
+    in isolation.
+    """
+    repos: dict[str, dict[str, Any]] = {}
+    for key, msg in (conditions or {}).items():
+        repos[key] = {"ok": False, "message": msg}
+    for key, msg in (errored or {}).items():
+        repos[key] = {"ok": False, "message": msg, "errored": True}
+    for key, data in (ok or {}).items():
+        entry = {"ok": True}
+        entry.update(data)
+        repos[key] = entry
+    return CommandResult(
+        False,
+        "fleet pass complete",
+        {"repos": repos, "digest": {"count": 0, "events": []}},
+    )
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_splits_errored_from_conditions(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #738: the headline must separate lane crashes from non-fatal conditions.
+
+    A pass with one crashed repo (``errored: True``) and one repo that
+    completed with a non-fatal condition (``ok=False``, no ``errored``) must
+    produce ``1 errored, 1 with conditions`` -- not the old ``2 failed`` that
+    painted both red and gated nothing.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _mixed_fleet_result(
+        conditions={"owner/repo1": "loop completed with 2 PR error(s)"},
+        errored={"owner/repo2": "fleet pass error: RuntimeError: boom"},
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines
+    line = summary_lines[0]
+    assert "1 errored" in line, f"crashed repo must count as errored: {line!r}"
+    assert "1 with conditions" in line, f"non-fatal repo must count as conditions: {line!r}"
+    # The old undifferentiated "failed" count must not appear.
+    assert "2 failed" not in line, f"old red-everywhere count must be gone: {line!r}"
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_all_errored(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #738: a pass where every repo crashed reports N errored, 0 conditions.
+
+    This is the genuine-outage case the old gauge could not distinguish from
+    a routine pass -- two repos both crashing is now unambiguously ``2 errored``.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _mixed_fleet_result(
+        errored={
+            "owner/repo1": "fleet pass error: RuntimeError: boom",
+            "owner/repo2": "fleet pass error: ConfigError: bad",
+        }
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines
+    line = summary_lines[0]
+    assert "2 errored" in line
+    assert "0 with conditions" in line
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_logs_non_ok_reason_at_warning(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #738: every non-ok repo's reason must be emitted at WARNING.
+
+    The exception path already logs via ``logger.exception`` inside
+    ``fleet_loop``; this covers the non-fatal ``ok=False`` conditions from
+    ``app.loop()`` that were previously silent in the supervisor log. The
+    reason must be recoverable from the log after the fact, not just from the
+    deduped/truncated summary suffix.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _mixed_fleet_result(
+        conditions={"owner/repo1": "loop completed with 2 PR error(s)"},
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
+        run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "owner/repo1" in r.getMessage() and "loop completed with 2 PR error(s)" in r.getMessage()
+        for r in warnings
+    ), f"non-ok repo reason must be logged at WARNING, got: {[r.getMessage() for r in warnings]!r}"
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_final_summary_splits_errored_from_conditions(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+) -> None:
+    """Issue #738: the final supervisor summary line also splits the counts.
+
+    The aggregate ``fleet supervisor complete`` line used the same
+    ``total_failed_repos`` counter as the per-pass headline and had the same
+    defect. It must now report ``N errored, N with conditions`` instead of
+    ``N failed repo(s)``.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _mixed_fleet_result(
+        conditions={"owner/repo1": "loop completed with 1 PR error(s)"},
+        errored={"owner/repo2": "fleet pass error: RuntimeError: boom"},
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    assert "1 errored" in result.message
+    assert "1 with conditions" in result.message
+    assert "failed repo(s)" not in result.message
+    # The return data carries the split counters alongside the legacy sum.
+    assert result.data["total_errored_repos"] == 1
+    assert result.data["total_conditions_repos"] == 1
+    assert result.data["total_failed_repos"] == 2
 
 
 def test_run_fleet_supervise_loop_reports_ok_on_a_clean_child_exit() -> None:
