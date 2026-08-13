@@ -7471,10 +7471,13 @@ class OrchestratorApp:
                 failed.append({"issue": issue_number, "error": str(exc)})
                 continue
             issue_dir = self.paths.issues / f"issue-{issue_number}"
-            issue_dir.mkdir(parents=True, exist_ok=True)
             issue_json = issue_dir / "issue.json"
-            self._write_json(issue_json, full_issue)
-            prompt_path = self._write_worker_prompt(full_issue)
+            # Issue #618: in dry-run, skip all file mutations (issue dir,
+            # issue.json, worker-prompt.md) — the preview must not touch disk.
+            if not self.dry_run:
+                issue_dir.mkdir(parents=True, exist_ok=True)
+                self._write_json(issue_json, full_issue)
+            prompt_path = self._write_worker_prompt(full_issue, dry_run=self.dry_run)
 
             # Check for prose-only dependencies (issue #225)
             body_text = full_issue.get("body", "")
@@ -7484,11 +7487,12 @@ class OrchestratorApp:
             # If prose-only dependencies exist without structured blockers, label for human attention
             if has_prose_deps and not has_structured_blockers:
                 prose_only_deps_issues.append(issue_number)
-                try:
-                    self.gh.add_issue_label(issue_number, self.config.labels.prose_only_deps)
-                except Exception:
-                    # Label add failure is non-blocking for intake
-                    pass
+                if not self.dry_run:
+                    try:
+                        self.gh.add_issue_label(issue_number, self.config.labels.prose_only_deps)
+                    except Exception:
+                        # Label add failure is non-blocking for intake
+                        pass
 
             written.append(
                 {
@@ -7500,40 +7504,43 @@ class OrchestratorApp:
                     "updated_at": full_issue.get("updatedAt"),
                 }
             )
-        # Single lock for all state updates
-        with state_lock(self.paths.state_file):
-            state = load_state(self.paths.state_file)
-            for entry in written:
-                issue_number = entry["issue"]
-                # Merge-update, never replace: intake used to clobber dispatch
-                # status recorded by earlier passes (production-confirmed).
-                state["issues"][str(issue_number)] = {
-                    **state["issues"].get(str(issue_number), {}),
-                    "number": issue_number,
-                    "title": entry["title"],
-                    "url": entry["url"],
-                    "labels": entry["labels"],
-                    "prompt_path": entry["prompt_path"],
-                    "updated_at": entry["updated_at"],
-                }
-            for failure in failed:
+        # Single lock for all state updates — skipped in dry-run (issue #618)
+        if not self.dry_run:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for entry in written:
+                    issue_number = entry["issue"]
+                    # Merge-update, never replace: intake used to clobber dispatch
+                    # status recorded by earlier passes (production-confirmed).
+                    state["issues"][str(issue_number)] = {
+                        **state["issues"].get(str(issue_number), {}),
+                        "number": issue_number,
+                        "title": entry["title"],
+                        "url": entry["url"],
+                        "labels": entry["labels"],
+                        "prompt_path": entry["prompt_path"],
+                        "updated_at": entry["updated_at"],
+                    }
+                for failure in failed:
+                    state = self._record_event(
+                        state,
+                        "intake_failed",
+                        {"issue_number": failure["issue"], "error": failure["error"]},
+                    )
+                if prose_only_deps_issues:
+                    state = self._record_event(
+                        state,
+                        "intake_prose_only_deps",
+                        {"issue_numbers": sorted(prose_only_deps_issues)},
+                    )
                 state = self._record_event(
-                    state,
-                    "intake_failed",
-                    {"issue_number": failure["issue"], "error": failure["error"]},
+                    state, "intake", {"issue_count": len(issues), "failed_count": len(failed)}
                 )
-            if prose_only_deps_issues:
-                state = self._record_event(
-                    state,
-                    "intake_prose_only_deps",
-                    {"issue_numbers": sorted(prose_only_deps_issues)},
-                )
-            state = self._record_event(
-                state, "intake", {"issue_count": len(issues), "failed_count": len(failed)}
-            )
-            save_state(self.paths.state_file, state)
+                save_state(self.paths.state_file, state)
         message = "intake complete"
-        if failed:
+        if self.dry_run:
+            message = f"dry-run: would intake {len(written)} issue(s)"
+        elif failed:
             message = f"intake completed with {len(failed)} failure(s)"
         if prose_only_deps_issues:
             message += (
@@ -8119,7 +8126,9 @@ class OrchestratorApp:
                     if choice.kind == "api":
                         template = self.config.api_worker.worker_template
 
-                prompt_path = self._write_worker_prompt(full_issue, template=template)
+                prompt_path = self._write_worker_prompt(
+                    full_issue, template=template, dry_run=True
+                )
 
                 # Check if this is a dead-worker recovery (same logic as real dispatch)
                 recovery_record: dict[str, Any] | None = None
@@ -12292,6 +12301,26 @@ class OrchestratorApp:
         """
         pr_number = int(candidate["pr"])
         issue_number = candidate.get("issue")
+
+        # Issue #618: short-circuit in dry-run BEFORE any writes or mutations.
+        # Threading dry_run to run_cross_family_review alone is actively
+        # harmful here: the dry-run branch returns a synthetic failure
+        # (ok=False), which drives this function into its escalation arm and
+        # would mark a PR escalated during a preview. The short-circuit
+        # avoids the mkdir, the cross-family subprocess, the state/label
+        # escalation write, and the PR comment entirely.
+        if self.dry_run:
+            return CommandResult(
+                True,
+                f"dry-run: would run rescue review for PR #{pr_number}",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "rescue_review_decision": "dry-run",
+                    "dry_run": True,
+                },
+            )
+
         pr = self.gh.pr_view(pr_number)
         head_sha = str(pr.get("headRefOid") or "")
         branch = str(pr.get("headRefName") or "")
@@ -14766,7 +14795,11 @@ class OrchestratorApp:
         artifact_text = path.read_text(encoding="utf-8")
         cfg = self.config.cross_family
         reviews_dir = self.paths.cross_family
-        reviews_dir.mkdir(parents=True, exist_ok=True)
+        # Issue #618: skip directory creation in dry-run — the cross-family
+        # model is not invoked (dry_run=True below), so no prompt/report is
+        # written into this directory.
+        if not self.dry_run:
+            reviews_dir.mkdir(parents=True, exist_ok=True)
         slug = slugify(path.stem)
         prompt_text = self._render(
             "cross_family_spec_review.md",
@@ -14780,13 +14813,31 @@ class OrchestratorApp:
             prompt_path=reviews_dir / f"spec-{slug}-prompt.md",
             report_path=reviews_dir / f"spec-{slug}-review.md",
             timeout_seconds=cfg.timeout_seconds,
+            dry_run=self.dry_run,
         )
-        with state_lock(self.paths.state_file):
-            state = load_state(self.paths.state_file)
-            state = self._record_event(
-                state, "spec_review", {"artifact": str(path), "ok": result.ok, "model": cfg.model}
+        # Issue #618: gate the state write — dry-run must not record events
+        # or mutate state.json.
+        if not self.dry_run:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                state = self._record_event(
+                    state,
+                    "spec_review",
+                    {"artifact": str(path), "ok": result.ok, "model": cfg.model},
+                )
+                save_state(self.paths.state_file, state)
+        if self.dry_run:
+            return CommandResult(
+                True,
+                f"dry-run: would run spec cross-family review for {path}",
+                {
+                    "artifact": str(path),
+                    "report_path": result.report_path,
+                    "model": cfg.model,
+                    "ok": False,
+                    "dry_run": True,
+                },
             )
-            save_state(self.paths.state_file, state)
         return CommandResult(
             result.ok,
             "spec cross-family review complete"
@@ -20681,10 +20732,11 @@ class OrchestratorApp:
             sanitize=defang_closing_keywords,
         )
 
-    def _write_worker_prompt(self, issue: dict[str, Any], *, template: str | None = None) -> Path:
+    def _write_worker_prompt(
+        self, issue: dict[str, Any], *, template: str | None = None, dry_run: bool = False
+    ) -> Path:
         issue_number = int(issue["number"])
         issue_dir = self.paths.issues / f"issue-{issue_number}"
-        issue_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = issue_dir / "worker-prompt.md"
         prompt = self._render(
             template or self.config.dispatch.worker_template,
@@ -20719,7 +20771,17 @@ class OrchestratorApp:
         assert_conventional_commit_title(
             prompt, context=f"worker prompt for issue #{issue_number}"
         )
-        prompt_path.write_text(prompt, encoding="utf-8")
+        # Issue #618: the dry-run dispatch branch promises "skip all state
+        # writes, label transitions, and file mutations" — mkdir + write_text
+        # here would violate that, and for a dead-worker recovery candidate
+        # (previous status "dispatched", same branch) would silently overwrite
+        # the prompt a crashed worker was launched with, destroying the
+        # forensic record the preview was meant to inspect. The assertions
+        # above are validation on the rendered text, not file mutations, so
+        # they stay — a broken template should fail the preview too.
+        if not dry_run:
+            issue_dir.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(prompt, encoding="utf-8")
         return prompt_path
 
     def _write_rework_prompt(

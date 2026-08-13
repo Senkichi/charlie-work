@@ -78,6 +78,8 @@ def touch_repo(
     repo_root: Path,
     paths: RuntimePaths,
     gh: GitHubLike,
+    *,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Register or update a repo in the fleet registry.
 
@@ -94,15 +96,21 @@ def touch_repo(
     registration is silently skipped — the command proceeds normally and
     the registry is not updated for that invocation (errors-as-values invariant).
 
+    When ``dry_run`` is True, the registry is read but never written: the
+    entry is not created, updated, or bumped. This prevents a ``--dry-run``
+    command run from a worktree from repointing the fleet's registry entry
+    for that repo at the worktree path (issue #618).
+
     Args:
         fleet_dir_override: Optional override for the fleet directory path.
         repo_root: The repository root path.
         paths: The RuntimePaths for this repo.
         gh: The GitHub client instance.
+        dry_run: If True, skip the registry write entirely.
 
     Returns:
         The updated registry dict (or the unchanged registry if registration
-        was skipped due to gh error).
+        was skipped due to gh error or dry-run).
     """
     # Resolve nameWithOwner — best-effort, skip on failure
     try:
@@ -114,6 +122,13 @@ def touch_repo(
         return _load_registry(fleet_json_path)
 
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
+
+    # Issue #618: in dry-run the registry must not be mutated. Running a
+    # --dry-run command from a worktree would otherwise repoint the fleet's
+    # registry entry for this repo at the worktree path, and bump last_seen
+    # so the real repo root looks stale. Return the current registry unchanged.
+    if dry_run:
+        return _load_registry(fleet_json_path)
 
     # Issue #624: a virtualized fleet dir forks a private copy on this write,
     # so registering a repo would land where the fleet supervisor never reads.
