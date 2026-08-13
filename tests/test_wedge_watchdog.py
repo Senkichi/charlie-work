@@ -11,7 +11,7 @@ import json
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import patch
 
 from charlie_work.fleet_dispatch import (
@@ -21,6 +21,7 @@ from charlie_work.fleet_dispatch import (
 from charlie_work.wedge_watchdog import (
     WEDGE_KILL_DEFAULT_PASS_TIMEOUT_SECONDS,
     WEDGE_KILL_EVENT_KIND,
+    WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS,
     WEDGE_KILL_STALE_MULTIPLIER,
     WedgeWatchdog,
 )
@@ -39,6 +40,15 @@ class FakeProcess:
     non-``None`` poll result so the watchdog's next ``poll()`` sees a dead
     child (mirroring real ``Popen`` semantics where ``kill`` is followed by
     ``poll`` returning the exit code).
+
+    ``pid`` defaults to ``12345`` to match the heartbeat's pid in
+    ``_write_heartbeat``, so existing tests where the heartbeat and process
+    belong to the same supervisor pass the pid-correlation check. Set a
+    different ``pid`` to simulate a stale heartbeat from a prior supervisor.
+
+    ``kill_raises`` makes ``kill()`` raise ``OSError`` instead of
+    terminating, simulating a kill failure (e.g. the process already died
+    and was reaped by another thread, or a permission error).
     """
 
     def __init__(
@@ -46,6 +56,8 @@ class FakeProcess:
         poll_results: list[int | None] | None = None,
         *,
         block_until_killed: bool = False,
+        pid: int = 12345,
+        kill_raises: bool = False,
     ) -> None:
         self._poll_results = list(poll_results) if poll_results else [None]
         self.killed = False
@@ -53,6 +65,8 @@ class FakeProcess:
         self._wait_return: int = 0
         self._block_until_killed = block_until_killed
         self._killed_event = threading.Event()
+        self.pid = pid
+        self._kill_raises = kill_raises
 
     def wait(self) -> int:
         if self._block_until_killed:
@@ -65,6 +79,8 @@ class FakeProcess:
         return 0
 
     def kill(self) -> None:
+        if self._kill_raises:
+            raise OSError("simulated kill failure")
         self.killed = True
         self.kill_count += 1
         self._killed_event.set()
@@ -75,6 +91,24 @@ class FakeProcess:
 
 def _iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _make_clock(start: datetime, late: datetime) -> Callable[[], datetime]:
+    """Return a clock that yields ``start`` once then ``late`` forever.
+
+    The first call (in ``WedgeWatchdog.__init__``) captures the child's
+    start time; subsequent calls (in ``_elapsed_since_start``) return
+    ``late`` so the grace window is exceeded.
+    """
+    state = {"first": True}
+
+    def _clock() -> datetime:
+        if state["first"]:
+            state["first"] = False
+            return start
+        return late
+
+    return _clock
 
 
 def _write_heartbeat(
@@ -316,6 +350,203 @@ def test_threshold_does_not_false_kill_on_a_healthy_long_pass(tmp_path: Path) ->
 
 
 # ---------------------------------------------------------------------------
+# PID-correlation unit tests (issue #728 rework: stale heartbeat from a
+# prior supervisor pid must not be treated as a liveness signal for the
+# watched child)
+# ---------------------------------------------------------------------------
+
+
+def test_is_wedged_false_when_heartbeat_from_prior_pid_within_grace(tmp_path: Path) -> None:
+    """A stale heartbeat from a *different* pid is not this child's signal.
+
+    Within the first-beat grace window the current child may not have
+    written its own heartbeat yet, so the on-disk heartbeat (from a prior
+    supervisor with a null ``exited_at`` — i.e. the prior one was killed)
+    must not trigger a kill.
+    """
+    now = datetime.now(UTC)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(now - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+        pid=11111,  # prior supervisor
+    )
+    process = FakeProcess(pid=22222)  # current child — different pid
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        clock=lambda: now,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    wedged, heartbeat = wd._is_wedged()
+    assert wedged is False
+    assert heartbeat is not None
+    assert heartbeat["pid"] == 11111  # the stale heartbeat is returned for diagnostics
+
+
+def test_is_wedged_false_when_heartbeat_from_prior_pid_clean_exit_within_grace(
+    tmp_path: Path,
+) -> None:
+    """A prior supervisor's clean-exit heartbeat (``exited_at`` set) is also
+    not a liveness signal for the current child.
+
+    The ``exited_at`` check must not fire before the pid-correlation check:
+    the prior supervisor exited cleanly, but that tells us nothing about the
+    current child, which may not have written its own heartbeat yet.
+    """
+    now = datetime.now(UTC)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(now - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+        exited_at=_iso(now),
+        pid=11111,  # prior supervisor, clean exit
+    )
+    process = FakeProcess(pid=22222)  # current child — different pid
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        clock=lambda: now,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    wedged, _heartbeat = wd._is_wedged()
+    assert wedged is False
+
+
+def test_is_wedged_true_when_heartbeat_from_prior_pid_after_grace(tmp_path: Path) -> None:
+    """After the grace window, a child that never wrote its own heartbeat is wedged.
+
+    The on-disk heartbeat is still from a prior pid, but the grace window
+    has expired — the current child has been alive long enough without
+    writing a matching heartbeat that it is wedged at startup.
+    """
+    start = datetime.now(UTC)
+    late = start + timedelta(seconds=WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS + 1)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(start - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+        pid=11111,  # prior supervisor
+    )
+    process = FakeProcess(pid=22222)  # current child — different pid
+    # First clock() call (in __init__) returns start; subsequent calls
+    # return late so _elapsed_since_start exceeds the grace window.
+    clock = _make_clock(start, late)
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        clock=clock,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    wedged, heartbeat = wd._is_wedged()
+    assert wedged is True
+    assert heartbeat is not None
+    assert heartbeat["pid"] == 11111  # stale heartbeat returned for kill diagnostics
+
+
+def test_is_wedged_true_when_prior_pid_heartbeat_clean_exit_after_grace(
+    tmp_path: Path,
+) -> None:
+    """After grace, a prior pid's clean-exit heartbeat does not protect the child.
+
+    The ``exited_at`` on the stale heartbeat is from the *prior* supervisor's
+    clean exit. The pid-correlation check must fire *before* the ``exited_at``
+    check: after the grace window, the current child (different pid) has been
+    alive long enough without its own heartbeat, so it is wedged — regardless
+    of what the prior supervisor's exit record says. The original pre-rework
+    code checked ``exited_at`` first and returned False, falsely clearing the
+    current child based on a different process's exit.
+    """
+    start = datetime.now(UTC)
+    late = start + timedelta(seconds=WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS + 1)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(start - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+        exited_at=_iso(start),
+        pid=11111,  # prior supervisor, clean exit
+    )
+    process = FakeProcess(pid=22222)  # current child — different pid
+    clock = _make_clock(start, late)
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        clock=clock,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    wedged, heartbeat = wd._is_wedged()
+    assert wedged is True
+    assert heartbeat is not None
+    assert heartbeat["pid"] == 11111
+
+
+def test_is_wedged_true_when_no_heartbeat_after_grace(tmp_path: Path) -> None:
+    """No heartbeat file at all after the grace window → wedged at startup.
+
+    A child that crashes on startup is caught by ``process.poll()``; a child
+    that wedges before writing its first heartbeat is not. The grace window
+    bounds how long we wait before treating the absence as a wedge.
+    """
+    start = datetime.now(UTC)
+    late = start + timedelta(seconds=WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS + 1)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    process = FakeProcess(pid=22222)
+    clock = _make_clock(start, late)
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        clock=clock,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    wedged, heartbeat = wd._is_wedged()
+    assert wedged is True
+    assert heartbeat is None  # no file at all
+
+
+def test_is_wedged_uses_matching_pid_heartbeat_for_staleness(tmp_path: Path) -> None:
+    """When the heartbeat pid matches the child pid, normal staleness applies.
+
+    This confirms the pid-correlation check does not short-circuit the
+    existing staleness logic for a matching heartbeat.
+    """
+    now = datetime.now(UTC)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(now - timedelta(seconds=1000)),
+        max_pass_runtime_seconds=300,
+        pid=22222,  # matches the process
+    )
+    process = FakeProcess(pid=22222)
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        clock=lambda: now,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    wedged, heartbeat = wd._is_wedged()
+    assert wedged is True
+    assert heartbeat is not None
+    assert heartbeat["pid"] == 22222
+
+
+# ---------------------------------------------------------------------------
 # Integration tests for WedgeWatchdog._run (the daemon-thread loop)
 # ---------------------------------------------------------------------------
 
@@ -443,6 +674,203 @@ def test_watchdog_stops_immediately_if_child_already_exited(tmp_path: Path) -> N
 
     assert process.killed is False
     assert wd.killed is False
+
+
+# ---------------------------------------------------------------------------
+# Integration tests for PID correlation and kill failure (issue #728 rework)
+# ---------------------------------------------------------------------------
+
+
+def test_watchdog_does_not_kill_when_heartbeat_from_prior_pid_within_grace(
+    tmp_path: Path,
+) -> None:
+    """Full loop: a stale heartbeat from a prior pid does not kill a fresh child.
+
+    The heartbeat on disk is from pid 11111 (prior supervisor, killed — null
+    ``exited_at``), the watched child is pid 22222. Within the grace window
+    the watchdog must not kill — the child hasn't written its own heartbeat
+    yet, and the prior heartbeat is not its liveness signal.
+    """
+    now = datetime.now(UTC)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(now - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+        pid=11111,
+    )
+    # Alive for two polls, then exits on its own.
+    process = FakeProcess(poll_results=[None, None, 0], pid=22222)
+
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        poll_interval_seconds=0.01,
+        clock=lambda: now,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    thread = wd.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    assert process.killed is False
+    assert wd.killed is False
+
+
+def test_watchdog_does_not_kill_when_prior_pid_heartbeat_has_clean_exit(
+    tmp_path: Path,
+) -> None:
+    """Full loop: a prior supervisor's clean-exit heartbeat does not kill.
+
+    The ``exited_at`` on the stale heartbeat is from the *prior* supervisor's
+    clean exit. The pid-correlation check must fire before the ``exited_at``
+    check so the current child is not falsely cleared by a different
+    process's exit record.
+    """
+    now = datetime.now(UTC)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(now - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+        exited_at=_iso(now),
+        pid=11111,
+    )
+    process = FakeProcess(poll_results=[None, None, 0], pid=22222)
+
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        poll_interval_seconds=0.01,
+        clock=lambda: now,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    thread = wd.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    assert process.killed is False
+    assert wd.killed is False
+
+
+def test_watchdog_kills_when_heartbeat_from_prior_pid_after_grace(tmp_path: Path) -> None:
+    """Full loop: after the grace window, a child with no matching heartbeat is killed."""
+    start = datetime.now(UTC)
+    late = start + timedelta(seconds=WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS + 1)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(start - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+        pid=11111,
+    )
+    process = FakeProcess(poll_results=[None], pid=22222, block_until_killed=True)
+    process._wait_return = 1
+    event_calls: list[tuple[Any, ...]] = []
+
+    def fake_log_event(state_path: Any, kind: str, payload: Any, **kwargs: Any) -> None:
+        event_calls.append((state_path, kind, payload, kwargs))
+
+    clock = _make_clock(start, late)
+
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        poll_interval_seconds=0.01,
+        clock=clock,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=fake_log_event,
+    )
+    thread = wd.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    assert process.killed is True
+    assert wd.killed is True
+    # The kill event records the stale (prior-pid) heartbeat for diagnostics.
+    assert len(event_calls) == 1
+    _path, kind, payload, _kwargs = event_calls[0]
+    assert kind == WEDGE_KILL_EVENT_KIND
+    assert payload["pid"] == 11111
+
+
+def test_watchdog_kill_failure_does_not_set_killed_and_continues(tmp_path: Path) -> None:
+    """When ``process.kill()`` raises, ``_killed`` stays False and the loop continues.
+
+    The watchdog attempts to kill, ``kill()`` raises ``OSError``, the loop
+    continues monitoring. On the next poll the child has exited on its own,
+    so the watchdog returns without setting ``_killed``.
+    """
+    now = datetime.now(UTC)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(now - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+    )
+    # Alive on first poll (triggers kill attempt), then exits on its own.
+    process = FakeProcess(poll_results=[None, 0], kill_raises=True)
+
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        poll_interval_seconds=0.01,
+        clock=lambda: now,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    thread = wd.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    assert process.kill_count == 0  # kill() raised, never succeeded
+    assert wd.killed is False  # kill did not succeed
+
+
+def test_watchdog_retries_kill_after_failure(tmp_path: Path) -> None:
+    """After a failed kill, the watchdog retries and succeeds on the second attempt."""
+    now = datetime.now(UTC)
+    hb_path = tmp_path / "supervisor-heartbeat.json"
+    _write_heartbeat(
+        hb_path,
+        last_beat_at=_iso(now - timedelta(seconds=9999)),
+        max_pass_runtime_seconds=300,
+    )
+    # First kill raises, second succeeds. Three polls: alive, alive (retry), then
+    # kill pushes a dead poll.
+    process = FakeProcess(poll_results=[None, None], kill_raises=True)
+    # Make the second kill succeed by clearing kill_raises after the first attempt.
+    original_kill = process.kill
+
+    def kill_then_succeed() -> None:
+        if process._kill_raises:
+            process._kill_raises = False
+            raise OSError("simulated kill failure")
+        original_kill()
+
+    process.kill = kill_then_succeed  # type: ignore[method-assign]
+
+    wd = WedgeWatchdog(
+        process,  # type: ignore[arg-type]
+        hb_path,
+        poll_interval_seconds=0.01,
+        clock=lambda: now,
+        log=lambda _: None,
+        sleep_func=lambda _: None,
+        log_event_fn=lambda *a, **k: None,
+    )
+    thread = wd.start()
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    assert process.kill_count == 1  # second kill succeeded
+    assert wd.killed is True
 
 
 # ---------------------------------------------------------------------------

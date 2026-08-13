@@ -87,6 +87,27 @@ WEDGE_KILL_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
 # per-pass work.
 WEDGE_KILL_POLL_INTERVAL_SECONDS = 60.0
 
+# Grace window (seconds) for the watched child's first heartbeat. The
+# heartbeat sidecar is written by the child on startup
+# (``record_supervisor_started``), but there is a window between ``Popen``
+# returning and that first write: Python interpreter startup, imports,
+# config load, and supervisor-lock acquisition. During that window the
+# on-disk heartbeat (if any) is stale residue from a *prior* supervisor
+# with a different pid. If the watchdog treated that stale heartbeat as a
+# liveness signal for the fresh child, it would either false-kill a healthy
+# child (stale heartbeat is old) or false-clear a wedged child (stale
+# heartbeat is fresh) — reproducing the original fail-open bug from #728.
+#
+# Instead, while the heartbeat's pid does not match the watched child's
+# pid, the watchdog waits. After this grace window expires with no
+# matching heartbeat, the child is treated as wedged at startup (a
+# crashed child is caught by ``process.poll()``; a child that wedges
+# before its first beat is not). 300 s is generous for startup + imports
+# + lock acquisition (typically seconds) but bounded well below the
+# 90-minute staleness threshold so a startup-wedged child is killed in
+# minutes, not hours.
+WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS = 300.0
+
 
 def _parse_iso(value: str | None) -> datetime | None:
     """Parse an ISO-8601 timestamp (with ``Z`` or ``+00:00`` suffix) to UTC."""
@@ -123,6 +144,7 @@ class WedgeWatchdog:
         stale_multiplier: int = WEDGE_KILL_STALE_MULTIPLIER,
         default_pass_timeout_seconds: int = WEDGE_KILL_DEFAULT_PASS_TIMEOUT_SECONDS,
         poll_interval_seconds: float = WEDGE_KILL_POLL_INTERVAL_SECONDS,
+        first_beat_grace_seconds: float = WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS,
         clock: Callable[[], datetime] | None = None,
         log: Callable[[str], None] | None = None,
         sleep_func: Callable[[float], None] | None = None,
@@ -133,11 +155,17 @@ class WedgeWatchdog:
         self._stale_multiplier = stale_multiplier
         self._default_pass_timeout_seconds = default_pass_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
+        self._first_beat_grace_seconds = first_beat_grace_seconds
         self._clock = clock if clock is not None else lambda: datetime.now(UTC)
         self._log = log if log is not None else lambda msg: print(msg, flush=True)
         self._sleep = sleep_func if sleep_func is not None else time.sleep
         self._log_event_fn = log_event_fn if log_event_fn is not None else log_event
         self._killed = False
+        # Captured at construction time (right after Popen returns) so the
+        # first-beat grace window is measured from the child's actual start,
+        # not from the first poll (which is one ``poll_interval_seconds``
+        # later). See ``_is_wedged`` for why this matters.
+        self._child_started_at = self._clock()
 
     @property
     def killed(self) -> bool:
@@ -194,19 +222,62 @@ class WedgeWatchdog:
             return None
         return data if isinstance(data, dict) else None
 
+    def _elapsed_since_start(self) -> float:
+        """Seconds since the watchdog began watching this child."""
+        return (self._clock() - self._child_started_at).total_seconds()
+
     def _is_wedged(self) -> tuple[bool, dict[str, Any] | None]:
         """Return ``(wedged, heartbeat)``.
 
-        ``wedged`` is True only when the child is alive, the heartbeat has a
-        parseable ``last_beat_at``, the heartbeat does not record a clean exit
-        (``exited_at`` is null — a clean-exiting child will be reaped by
-        ``process.poll()`` momentarily), and the heartbeat age exceeds the
-        derived threshold. Returns the heartbeat dict alongside the verdict so
-        the caller can include its fields in the kill log/event.
+        ``wedged`` is True only when the child is alive and one of these
+        holds:
+
+        - The heartbeat's ``pid`` matches the watched child's pid, the
+          heartbeat has a parseable ``last_beat_at``, the heartbeat does
+          not record a clean exit (``exited_at`` is null), and the
+          heartbeat age exceeds the derived threshold.
+        - The heartbeat's ``pid`` does **not** match the watched child
+          (or there is no heartbeat file at all), and the first-beat
+          grace window has expired — the child has been alive long enough
+          without writing its own heartbeat that it is wedged at startup.
+
+        The pid correlation is the fix for the fail-open bug the original
+        issue (#728) was about: without it, a stale heartbeat left by a
+        *prior* supervisor (different pid) is treated as this child's
+        liveness signal. A stale-but-old prior heartbeat false-kills a
+        healthy fresh child; a stale-but-fresh prior heartbeat
+        false-clears a child that wedged before its first beat. Both are
+        eliminated by refusing to act on a heartbeat whose pid is not the
+        watched child's pid, with a bounded grace window for the child's
+        first beat.
+
+        Returns the heartbeat dict alongside the verdict so the caller
+        can include its fields in the kill log/event.
         """
         heartbeat = self._read_heartbeat()
+        child_pid = self._process.pid
         if heartbeat is None:
+            # No heartbeat file at all. Within the grace window the child
+            # may simply not have written it yet. After the grace window,
+            # the child has been alive long enough without writing any
+            # heartbeat that it is wedged at startup — a crashed child is
+            # caught by ``process.poll()``, but a child that wedges before
+            # its first beat is not.
+            if self._elapsed_since_start() > self._first_beat_grace_seconds:
+                return True, None
             return False, None
+        # Correlate the heartbeat to the watched child. A heartbeat from a
+        # different (prior) pid is stale residue, not a liveness signal for
+        # this child. The prior supervisor may have crashed (null
+        # ``exited_at``) or exited cleanly (``exited_at`` set) — either
+        # way, its heartbeat tells us nothing about *this* child.
+        heartbeat_pid = heartbeat.get("pid")
+        if heartbeat_pid is not None and child_pid is not None and heartbeat_pid != child_pid:
+            if self._elapsed_since_start() > self._first_beat_grace_seconds:
+                return True, heartbeat
+            return False, heartbeat
+        # The heartbeat is from this child (or pid is unknown on either
+        # side — conservative fallback to the pre-correlation behavior).
         if heartbeat.get("exited_at"):
             # The supervisor recorded a clean exit; ``process.poll()`` will
             # catch it on the next iteration. Do not kill a self-exiting child.
@@ -224,6 +295,13 @@ class WedgeWatchdog:
 
         Never raises — an unexpected exception inside the thread is logged and
         swallowed so the wrapper's ``process.wait()`` is never disturbed.
+
+        If ``_kill`` reports that ``process.kill()`` raised, the loop
+        *continues* rather than returning: the child is still alive and
+        still wedged, so the next iteration re-checks ``process.poll()``
+        (the child may have died on its own) and retries the kill. This
+        avoids silently reporting success (``self._killed = True``) for a
+        kill that never happened.
         """
         try:
             while True:
@@ -234,14 +312,16 @@ class WedgeWatchdog:
                     # main thread is about to return.
                     return
                 wedged, heartbeat = self._is_wedged()
-                if not wedged or heartbeat is None:
+                if not wedged:
                     continue
-                self._kill(heartbeat)
-                return
+                if self._kill(heartbeat):
+                    return
+                # Kill failed (``process.kill()`` raised). Continue
+                # monitoring — the child is still alive and still wedged.
         except Exception:
             logger.exception("WedgeWatchdog: unexpected error in monitor loop")
 
-    def _kill(self, heartbeat: dict[str, Any]) -> None:
+    def _kill(self, heartbeat: dict[str, Any] | None) -> bool:
         """Terminate the wedged child, log loudly, and record an event.
 
         ``process.kill()`` is used rather than ``terminate()`` because a
@@ -252,10 +332,18 @@ class WedgeWatchdog:
         ``exited_at=null``, and the next supervisor start detects the
         abnormal exit via ``detect_prior_abnormal_exit``. This event is the
         explicit record that the kill was deliberate, not a mystery crash.
+
+        Returns ``True`` only when ``process.kill()`` succeeded (and sets
+        ``self._killed``). Returns ``False`` when ``kill()`` raised — the
+        caller must continue monitoring rather than treating the child as
+        killed. ``heartbeat`` may be ``None`` when the wedge verdict came
+        from the first-beat grace window expiring with no heartbeat file
+        at all; the log/event payload then reports ``pid=None``.
         """
-        pid = heartbeat.get("pid")
-        last_beat = heartbeat.get("last_beat_at")
-        pass_timeout = self._derive_pass_timeout(heartbeat)
+        hb = heartbeat if heartbeat is not None else {}
+        pid = hb.get("pid")
+        last_beat = hb.get("last_beat_at")
+        pass_timeout = self._derive_pass_timeout(hb)
         threshold_seconds = self._stale_multiplier * pass_timeout
         age_seconds: float | None = None
         last_beat_dt = _parse_iso(last_beat)
@@ -289,4 +377,6 @@ class WedgeWatchdog:
             self._process.kill()
         except Exception:
             logger.exception("WedgeWatchdog: failed to kill process pid=%s", pid)
+            return False
         self._killed = True
+        return True
