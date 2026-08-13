@@ -48,6 +48,7 @@ from .config import (
     DispatchConfig,
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
+    ReviewDispatchConfig,
 )
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
@@ -485,6 +486,25 @@ class LocalReviewCapResult:
             "live_review_count": self.live_count,
             "available_review_slots": self.available_slots,
         }
+
+
+@dataclass(frozen=True)
+class ReviewDispatchSelection:
+    """Read-only result of selecting review-dispatch candidates (issue #617).
+
+    Shared by the dry-run and real ``dispatch_reviews`` branches so the two
+    cannot diverge. The real branch additionally runs attempt-cap escalation
+    (a state mutation) separately; at-cap PRs are filtered by
+    ``_is_review_dispatchable`` regardless of escalation status, so the
+    ``dispatchable`` list is stable across that mutation.
+    """
+
+    escalated_skipped: list[int]
+    merge_conflict_routed: list[dict[str, Any]]
+    dispatchable: list[dict[str, Any]]
+    local_cap: LocalReviewCapResult
+    dispatch_limit: int
+    selected: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -1914,6 +1934,95 @@ def _is_review_dispatchable(
 
     # Unknown status: treat as free so we don't silently orphan PRs.
     return True
+
+
+def _select_review_dispatch_candidates(
+    candidates: list[dict[str, Any]],
+    state: dict[str, Any],
+    review_dispatch_config: ReviewDispatchConfig,
+    reviews_dir: Path,
+    state_file: Path,
+    resolved_now: datetime,
+    limit: int | None,
+    probe_mode: bool,
+) -> ReviewDispatchSelection:
+    """Read-only selection of review-dispatch candidates (issue #617 rework).
+
+    Single source of truth for the PR-selection logic shared by the dry-run
+    and real ``dispatch_reviews`` branches, so the two cannot diverge:
+    - escalated-skip (PRs/issues already at ``"escalated"`` status)
+    - merge-conflict routing (CONFLICTING/DIRTY PRs, with live-reviewer
+      protection so a mid-session reviewer is not routed to rework)
+    - dispatchable-list construction (filtered by ``_is_review_dispatchable``)
+    - local/concurrent cap computation and final selection
+
+    Entirely read-only: never mutates ``state`` or writes to ``state_file``.
+    The real branch's attempt-cap escalation (which mutates state) runs
+    separately; at-cap PRs are filtered by ``_is_review_dispatchable``
+    regardless of whether they have already been escalated, so the
+    ``dispatchable`` list is stable across that mutation.
+
+    ``candidates`` must already have rescue-marked PRs excluded — this
+    function does not re-check ``rescue_attempted``. The dry-run branch
+    excludes them via a read-only state check (not ``_partition_rescue_candidates``,
+    which has real side effects); the real branch excludes them via
+    ``_partition_rescue_candidates`` before calling this helper.
+    """
+    max_attempts = review_dispatch_config.max_review_dispatch_attempts
+    escalated_skipped: list[int] = []
+    merge_conflict_routed: list[dict[str, Any]] = []
+    for c in candidates:
+        pr_state = state.get("prs", {}).get(str(c["pr"]), {})
+        issue_num_gate = pr_state.get("issue_number") or c.get("issue")
+        issue_state_gate = (
+            state.get("issues", {}).get(str(issue_num_gate), {})
+            if issue_num_gate is not None
+            else {}
+        )
+        if pr_state.get("status") == "escalated" or issue_state_gate.get("status") == "escalated":
+            escalated_skipped.append(c["pr"])
+            continue
+        if (
+            str(c.get("mergeable") or "").upper() == "CONFLICTING"
+            or str(c.get("mergeStateStatus") or "").upper() == "DIRTY"
+        ):
+            if pr_state.get(
+                "review_dispatch_status"
+            ) == "review_dispatch_dispatched" and _reviewer_pid_alive(pr_state):
+                # Same live-reviewer protection as the attempt-cap path: do
+                # not route to rework while a reviewer is mid-session.
+                continue
+            merge_conflict_routed.append(c)
+            continue
+    escalated_skipped_set = set(escalated_skipped)
+    merge_conflict_pr_set = {c["pr"] for c in merge_conflict_routed}
+    dispatchable = [
+        c
+        for c in candidates
+        if c["pr"] not in escalated_skipped_set
+        and c["pr"] not in merge_conflict_pr_set
+        and _is_review_dispatchable(state, c["pr"], c, max_attempts=max_attempts, now=resolved_now)
+    ]
+    max_local = review_dispatch_config.max_local_review_processes
+    max_concurrent = review_dispatch_config.max_concurrent_reviews
+    live_count = _count_live_reviews(reviews_dir, state_file)
+    requested_limit = limit if limit is not None else len(dispatchable)
+    local_cap = _apply_local_review_cap(requested_limit, max_local, live_count)
+    if max_concurrent > 0:
+        concurrent_available = max(0, max_concurrent - live_count)
+        concurrent_cap = min(local_cap.dispatch_limit, concurrent_available)
+    else:
+        concurrent_cap = local_cap.dispatch_limit
+    dispatch_limit = 1 if probe_mode else concurrent_cap
+    selected = dispatchable[:dispatch_limit]
+    return ReviewDispatchSelection(
+        escalated_skipped=escalated_skipped,
+        merge_conflict_routed=merge_conflict_routed,
+        dispatchable=dispatchable,
+        local_cap=local_cap,
+        dispatch_limit=dispatch_limit,
+        selected=selected,
+    )
 
 
 # Language-tag group accepts any tag (not just ``json``), mirroring the fix in
@@ -11527,67 +11636,46 @@ class OrchestratorApp:
                 is_reviewer_quota_exhausted(quota_state) and is_reviewer_probe_ready(quota_state)
             )
             queue_result = self.review_queue()
-            candidates = queue_result.data.get("queue", [])
-            max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
-            escalated_skipped_dry: list[int] = []
-            merge_conflict_routed_dry: list[int] = []
-            for c in candidates:
-                pr_state = quota_state.get("prs", {}).get(str(c["pr"]), {})
-                issue_num_gate = pr_state.get("issue_number") or c.get("issue")
-                issue_state_gate = (
-                    quota_state.get("issues", {}).get(str(issue_num_gate), {})
-                    if issue_num_gate is not None
-                    else {}
-                )
-                if (
-                    pr_state.get("status") == "escalated"
-                    or issue_state_gate.get("status") == "escalated"
-                ):
-                    escalated_skipped_dry.append(c["pr"])
-                    continue
-                if (
-                    str(c.get("mergeable") or "").upper() == "CONFLICTING"
-                    or str(c.get("mergeStateStatus") or "").upper() == "DIRTY"
-                ):
-                    merge_conflict_routed_dry.append(c["pr"])
-                    continue
-            escalated_skipped_set_dry = set(escalated_skipped_dry)
-            merge_conflict_pr_set_dry = set(merge_conflict_routed_dry)
-            dispatchable_dry = [
-                c
-                for c in candidates
-                if c["pr"] not in escalated_skipped_set_dry
-                and c["pr"] not in merge_conflict_pr_set_dry
-                and _is_review_dispatchable(
-                    quota_state, c["pr"], c, max_attempts=max_attempts, now=resolved_now
-                )
-            ]
-            max_local = self.config.review_dispatch.max_local_review_processes
-            max_concurrent = self.config.review_dispatch.max_concurrent_reviews
-            live_count = _count_live_reviews(reviews_dir, self.paths.state_file)
-            requested_limit = limit if limit is not None else len(dispatchable_dry)
-            local_cap = _apply_local_review_cap(requested_limit, max_local, live_count)
-            if max_concurrent > 0:
-                concurrent_available = max(0, max_concurrent - live_count)
-                concurrent_cap = min(local_cap.dispatch_limit, concurrent_available)
-            else:
-                concurrent_cap = local_cap.dispatch_limit
-            dispatch_limit_dry = 1 if probe_mode_dry else concurrent_cap
-            selected_dry = dispatchable_dry[:dispatch_limit_dry]
+            all_candidates = queue_result.data.get("queue", [])
+            # Issue #617 rework: exclude rescue-marked PRs from the dry-run
+            # candidate computation via a read-only state check, NOT a call
+            # to _partition_rescue_candidates (which has real side effects:
+            # it runs cross-family reviews, records verdicts, and escalates).
+            # A rescue-marked PR must never appear in the preview as a normal
+            # dispatch/escalation candidate — the real branch routes it
+            # through _process_rescue_review instead.
+            rescue_marked_dry: list[dict[str, Any]] = []
+            candidates_dry: list[dict[str, Any]] = []
+            for c in all_candidates:
+                if quota_state.get("prs", {}).get(str(c["pr"]), {}).get("rescue_attempted"):
+                    rescue_marked_dry.append(c)
+                else:
+                    candidates_dry.append(c)
+            selection = _select_review_dispatch_candidates(
+                candidates_dry,
+                quota_state,
+                self.config.review_dispatch,
+                reviews_dir,
+                self.paths.state_file,
+                resolved_now,
+                limit,
+                probe_mode_dry,
+            )
             return CommandResult(
                 True,
-                f"dry-run: would dispatch {len(selected_dry)} reviewer(s)",
+                f"dry-run: would dispatch {len(selection.selected)} reviewer(s)",
                 {
-                    "selected_count": len(selected_dry),
-                    "attempted_count": len(selected_dry),
+                    "selected_count": len(selection.selected),
+                    "attempted_count": len(selection.selected),
                     "failed_count": 0,
                     "launched_count": 0,
-                    "deferred_count": len(candidates) - len(selected_dry),
-                    "escalated_skipped": escalated_skipped_dry,
-                    "merge_conflict_routed": merge_conflict_routed_dry,
+                    "deferred_count": len(all_candidates) - len(selection.selected),
+                    "escalated_skipped": selection.escalated_skipped,
+                    "merge_conflict_routed": [c["pr"] for c in selection.merge_conflict_routed],
+                    "rescue_marked_excluded": [c["pr"] for c in rescue_marked_dry],
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
-                    **local_cap.report_fields(),
+                    **selection.local_cap.report_fields(),
                 },
             )
 
@@ -11745,95 +11833,75 @@ class OrchestratorApp:
                 },
             )
 
-        # Filter out PRs that are already claimed or still have a live reviewer.
-        # Also escalate PRs that have exhausted their dispatch attempt budget.
-        # Route merge-conflicting PRs to rework instead of dispatching a reviewer
-        # (issue #1497): a CONFLICTING PR sitting in ``agent:reviewing`` with a
-        # current packet would otherwise be dispatched every pass, but the
-        # reviewer's verdict cannot merge — and if the PR never reaches the
-        # merge lane (e.g. no verdict is ever recorded), ``review()``'s own
-        # janitor-gate conflict route never runs either, so the PR sits in
-        # ``agent:reviewing`` forever with zero dispatch events. Routing here
-        # mirrors ``review()``'s janitor-gate merge-conflict path
-        # (``_route_janitor_gate_failure_to_rework`` with ``reason="merge_conflict"``),
-        # including the same attempt cap and escalation to ``agent:human-needed``.
+        # Issue #617 rework: the PR-selection logic (escalated-skip,
+        # merge-conflict routing, dispatchable-list construction,
+        # local/concurrent cap computation) is shared with the dry-run branch
+        # via _select_review_dispatch_candidates, so the two copies cannot
+        # diverge. The read-only selection runs first; the attempt-cap
+        # escalation (which mutates state) runs separately below. At-cap PRs
+        # are filtered by _is_review_dispatchable regardless of whether they
+        # have already been escalated, so the dispatchable list is stable
+        # across the escalation mutation.
+        #
+        # Route merge-conflicting PRs to rework instead of dispatching a
+        # reviewer (issue #1497): a CONFLICTING PR sitting in
+        # ``agent:reviewing`` with a current packet would otherwise be
+        # dispatched every pass, but the reviewer's verdict cannot merge —
+        # and if the PR never reaches the merge lane (e.g. no verdict is
+        # ever recorded), ``review()``'s own janitor-gate conflict route
+        # never runs either, so the PR sits in ``agent:reviewing`` forever
+        # with zero dispatch events. Routing here mirrors ``review()``'s
+        # janitor-gate merge-conflict path
+        # (``_route_janitor_gate_failure_to_rework`` with
+        # ``reason="merge_conflict"``), including the same attempt cap and
+        # escalation to ``agent:human-needed``.
         max_attempts = self.config.review_dispatch.max_review_dispatch_attempts
-        escalated_for_labels: list[tuple[int, int | None]] = []
-        escalated_skipped: list[int] = []
-        merge_conflict_routed: list[dict[str, Any]] = []
         # Issue #586's repair set used to be collected here, from the PRs this
         # candidate loop skipped. Issue #1088: that made the sweep unreachable,
         # because this loop runs below the ``review_dispatch.enabled`` early
         # return and both deployed fleets run that flag false -- the set was
         # always empty. The repair now derives its own subjects from state in
         # ``_repair_escalated_labels()``, called above that early return.
+        selection_state = load_state_locked(self.paths.state_file)
+        selection = _select_review_dispatch_candidates(
+            candidates,
+            selection_state,
+            self.config.review_dispatch,
+            reviews_dir,
+            self.paths.state_file,
+            resolved_now,
+            limit,
+            probe_mode,
+        )
+        escalated_skipped = selection.escalated_skipped
+        merge_conflict_routed = selection.merge_conflict_routed
+        dispatchable = selection.dispatchable
+        local_cap = selection.local_cap
+        selected = selection.selected
+
+        # Escalate PRs whose dispatch attempt count has reached the cap.
+        # These PRs are stuck (every reviewer died without a verdict) and
+        # must not be re-dispatched indefinitely. Mark them escalated so a
+        # human can intervene, mirroring the rework-cycle escalation pattern.
+        # The shared helper already classified escalated-skip and
+        # merge-conflict-routed PRs read-only; this loop only considers the
+        # remaining candidates, skipping live in-flight reviewers (issue
+        # #573) so a mid-session verdict is not orphaned. Escalation gate
+        # (issue #575): an already-escalated PR is in ``escalated_skipped``
+        # and skipped here too, so an issue escalated by an independent path
+        # does not get a second bogus "max_review_dispatch_attempts_exceeded"
+        # escalation on top of it.
+        escalated_for_labels: list[tuple[int, int | None]] = []
+        escalated_skipped_set = set(escalated_skipped)
+        merge_conflict_pr_set = {c["pr"] for c in merge_conflict_routed}
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            # Escalate PRs whose dispatch attempt count has reached the cap.
-            # These PRs are stuck (every reviewer died without a verdict) and
-            # must not be re-dispatched indefinitely. Mark them escalated so a
-            # human can intervene, mirroring the rework-cycle escalation pattern.
             changed = False
             for c in candidates:
+                if c["pr"] in escalated_skipped_set or c["pr"] in merge_conflict_pr_set:
+                    continue
                 pr_key = str(c["pr"])
                 pr_state = state["prs"].get(pr_key, {})
-                # Escalation gate (issue #575): a PR whose pr-state status is
-                # "escalated", or whose linked issue's state status is
-                # "escalated", is awaiting a human and must never be
-                # re-dispatched or re-escalated -- record_review's escalation
-                # guard (~line 6823) refuses the verdict anyway, so dispatching
-                # here only burns provider quota on a session whose result is
-                # thrown away and then silently lost (the live incident behind
-                # this fix: issue #480/PR #540). This must run BEFORE the
-                # attempt-cap escalation below too: an issue that gets
-                # escalated by an independent path (not this attempt-cap
-                # branch) while its PR is already sitting at the cap must not
-                # trigger a second, bogus "max_review_dispatch_attempts_exceeded"
-                # escalation on top of it. No per-pass event is emitted for the
-                # skip itself (see review_dispatch_escalated below for the
-                # human-facing signal) because this condition holds every pass
-                # while a human has not yet resolved the escalation; emitting a
-                # duplicate event each pass would spam the event log.
-                issue_num_gate = pr_state.get("issue_number") or c.get("issue")
-                issue_state_gate = (
-                    state["issues"].get(str(issue_num_gate), {})
-                    if issue_num_gate is not None
-                    else {}
-                )
-                if (
-                    pr_state.get("status") == "escalated"
-                    or issue_state_gate.get("status") == "escalated"
-                ):
-                    escalated_skipped.append(c["pr"])
-                    continue
-                # Issue #1497: a merge-conflicting PR in the review queue must
-                # not be dispatched — a reviewer verdict on a CONFLICTING branch
-                # cannot merge, and the PR may never reach ``review()``'s own
-                # janitor-gate conflict route (which only fires from the merge
-                # lane for approved PRs whose head moved). Collect it here for
-                # routing outside the lock; ``_route_janitor_gate_failure_to_
-                # rework`` acquires its own ``state_lock`` and calls
-                # ``transition()`` (GitHub API), so it cannot run inside this
-                # critical section. The escalation gate above already filtered
-                # out escalated PRs; a live in-flight reviewer is left alone
-                # (the live-reviewer check below) so its verdict is not
-                # orphaned.
-                if (
-                    str(c.get("mergeable") or "").upper() == "CONFLICTING"
-                    or str(c.get("mergeStateStatus") or "").upper() == "DIRTY"
-                ):
-                    if pr_state.get(
-                        "review_dispatch_status"
-                    ) == "review_dispatch_dispatched" and _reviewer_pid_alive(pr_state):
-                        # Same live-reviewer protection as the attempt-cap
-                        # path: do not route to rework while a reviewer is
-                        # mid-session — the verdict may still clear the
-                        # conflict (e.g. a request_changes that prompts a
-                        # rebase). Let the review finish first.
-                        continue
-                    merge_conflict_routed.append(c)
-                    continue
-                attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 if pr_state.get(
                     "review_dispatch_status"
                 ) == "review_dispatch_dispatched" and _reviewer_pid_alive(pr_state):
@@ -11847,6 +11915,7 @@ class OrchestratorApp:
                     # a death is dispositioned by the stalled sweep, after
                     # which the cap escalates honestly on a dead claim.
                     continue
+                attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 if attempt_count >= max_attempts and pr_state.get("status") != "escalated":
                     issue_num = pr_state.get("issue_number") or c.get("issue")
                     state = _escalate_issue(
@@ -11879,24 +11948,6 @@ class OrchestratorApp:
                     escalated_for_labels.append((int(c["pr"]), issue_num))
             if changed:
                 save_state(self.paths.state_file, state)
-            # The escalation gate above already filtered out escalated
-            # candidates (and recorded them in escalated_skipped) before any
-            # attempt-count or claim mutation ran for them; here we only need
-            # to exclude those same PR numbers so this second pass over
-            # candidates doesn't re-select them via _is_review_dispatchable.
-            # Merge-conflict candidates (issue #1497) are excluded here too —
-            # they are routed to rework outside the lock below, not dispatched.
-            escalated_skipped_set = set(escalated_skipped)
-            merge_conflict_pr_set = {c["pr"] for c in merge_conflict_routed}
-            dispatchable = [
-                c
-                for c in candidates
-                if c["pr"] not in escalated_skipped_set
-                and c["pr"] not in merge_conflict_pr_set
-                and _is_review_dispatchable(
-                    state, c["pr"], c, max_attempts=max_attempts, now=resolved_now
-                )
-            ]
 
         # Apply the human-needed label edge for each fresh escalation, outside
         # the state lock (transition() makes GitHub API calls). This was the
@@ -11991,21 +12042,6 @@ class OrchestratorApp:
                             "rescue_dispatched": routed.data.get("rescue_dispatched", False),
                         }
                     )
-
-        # Apply the local and provider-token caps. 0 means unlimited for both.
-        max_local = self.config.review_dispatch.max_local_review_processes
-        max_concurrent = self.config.review_dispatch.max_concurrent_reviews
-        live_count = _count_live_reviews(reviews_dir, self.paths.state_file)
-        requested_limit = limit if limit is not None else len(dispatchable)
-        local_cap = _apply_local_review_cap(requested_limit, max_local, live_count)
-        if max_concurrent > 0:
-            concurrent_available = max(0, max_concurrent - live_count)
-            concurrent_cap = min(local_cap.dispatch_limit, concurrent_available)
-        else:
-            concurrent_cap = local_cap.dispatch_limit
-        # In probe mode, only launch one reviewer at a time to test quota.
-        dispatch_limit = 1 if probe_mode else concurrent_cap
-        selected = dispatchable[:dispatch_limit]
 
         # Claim the selected PRs as pending before launching. This is the only
         # place that writes review_dispatch_pending; the upgrade happens after

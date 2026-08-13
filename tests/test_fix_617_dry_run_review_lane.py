@@ -147,6 +147,52 @@ def test_dispatch_reviews_dry_run_does_not_write_quota_alert_marker(
     assert not (state.get("reviewer_quota") or {}).get("alerted_at")
 
 
+def test_dispatch_reviews_dry_run_excludes_rescue_marked_pr(
+    tmp_path: Path,
+) -> None:
+    """A rescue-marked PR must NOT appear in the dry-run preview as a normal
+    dispatch/escalation candidate. Pre-fix, the dry-run branch did not
+    exclude rescue-marked PRs before computing the selection, so a
+    rescue-marked PR could be reported as a normal dispatch candidate —
+    a misreport, since the real branch routes it through
+    ``_process_rescue_review`` instead. The fix excludes rescue-marked PRs
+    via a read-only state check (not ``_partition_rescue_candidates``,
+    which has real side effects)."""
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    _write_review_packet(paths, 456, "sha-abc123")
+    # Seed the PR as rescue-marked (the durable marker that _partition_rescue_candidates
+    # and _process_rescue_review route on).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {"number": 123, "status": "reviewing"}
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "rescue_attempted": True,
+            "rescue_cause": "request_changes",
+        }
+        save_state(paths.state_file, state)
+
+    state_before = load_state(paths.state_file)
+    result = app.dispatch_reviews()
+    state_after = load_state(paths.state_file)
+
+    assert result.ok is True
+    # The rescue-marked PR must be reported as excluded, not as a dispatch
+    # or escalation candidate.
+    assert 456 in result.data["rescue_marked_excluded"]
+    assert 456 not in result.data.get("escalated_skipped", [])
+    assert 456 not in result.data.get("merge_conflict_routed", [])
+    assert result.data["selected_count"] == 0
+    # No state mutation: the dry-run must not have run a real rescue review.
+    assert state_after == state_before
+
+
 def test_dispatch_reviews_dry_run_reports_merge_conflict_routed(
     tmp_path: Path,
 ) -> None:
