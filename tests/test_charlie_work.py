@@ -20061,6 +20061,89 @@ def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
 
 
+def test_merge_ready_emits_merge_succeeded_on_fleet_merge(tmp_path: Path) -> None:
+    """Issue #747: the merge lane emitted events for every outcome except
+    success, so merge throughput was unobservable from events.db. A successful
+    fleet direct-merge must emit exactly one ``merge_succeeded`` event carrying
+    ``pr_number``, ``issue_number``, ``actor='fleet'``, the merge method, and a
+    ``merged_at`` timestamp, and the state.json prs entry must gain
+    ``merged_at`` so merge latency is computable retrospectively."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is True
+    state = load_state(paths.state_file)
+    pr_entry = state["prs"]["456"]
+    assert pr_entry["status"] == "merged"
+    assert pr_entry["merged"] is True
+    # state.json merged entry gains a merged_at timestamp (issue #747).
+    assert "merged_at" in pr_entry
+    assert pr_entry["merged_at"]
+    # Exactly one terminal success event, carrying the actor attribution.
+    success_events = [e for e in state["events"] if e["kind"] == "merge_succeeded"]
+    assert len(success_events) == 1
+    payload = success_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["actor"] == "fleet"
+    assert payload["merge_method"] == config.auto_merge.strategy
+    assert payload["merged_at"] == pr_entry["merged_at"]
+
+
+def test_merge_ready_does_not_emit_merge_succeeded_when_merge_skipped(
+    tmp_path: Path,
+) -> None:
+    """Issue #747 negative control: ``merge_succeeded`` must NOT fire when the
+    merge is skipped (no approval -> not mergeable), so the event distinguishes
+    'emitted' from 'always emitted'."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # No approval decision -> PR is not merged (skipped).
+    result = app.merge_ready(456)
+
+    assert result.data["merged"] is False
+    state = load_state(paths.state_file)
+    success_events = [e for e in state["events"] if e["kind"] == "merge_succeeded"]
+    assert success_events == []
+
+
+def test_merge_ready_mergequeue_handoff_does_not_emit_merge_succeeded(
+    tmp_path: Path,
+) -> None:
+    """Issue #747 negative control: the Aviator mergequeue handoff is a skip of
+    the fleet's own merge (the fleet applies a label; Aviator merges
+    asynchronously). ``merge_succeeded`` with actor='fleet' must NOT fire,
+    because the fleet did not perform the merge -- this is what makes
+    fleet-merged and externally-merged PRs distinguishable by the event."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is False
+    assert result.data["mergequeue_label_applied"] is True
+    state = load_state(paths.state_file)
+    success_events = [e for e in state["events"] if e["kind"] == "merge_succeeded"]
+    assert success_events == []
+
+
 def test_merge_ready_dry_run_does_not_merge_or_persist(tmp_path: Path) -> None:
     """Issue #614: under --dry-run, merge_ready must not call merge_pr, must
     not write status='merged' to state.json, and must return the computed

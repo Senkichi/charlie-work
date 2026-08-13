@@ -3674,6 +3674,11 @@ def _reap_orphaned_review_checkouts(
         new_pr_state["number"] = pr_number
         if gh_state == "MERGED":
             new_pr_state["status"] = "merged"
+            # Issue #747: stamp ``merged_at`` only on a genuine non-merged ->
+            # merged transition so re-reaping a PR already recorded as merged
+            # does not overwrite the original observation time.
+            if pr_state.get("status") != "merged":
+                new_pr_state["merged_at"] = utc_now()
         else:
             # Record the terminal closed state so a future pass does not
             # re-query.  Always overwrite — a stale "reviewing" status left
@@ -7928,13 +7933,20 @@ class OrchestratorApp:
                         pr_number = int(pr["number"])
                         pr_key = str(pr_number)
                         pr_entry = state["prs"].get(pr_key, {})
-                        state["prs"][pr_key] = {
+                        _new_pr_state = {
                             **pr_entry,
                             "number": pr_number,
                             "status": "merged",
                             "merged": True,
                             "issue_number": issue_number,
                         }
+                        # Issue #747: stamp ``merged_at`` only on a genuine
+                        # non-merged -> merged transition so the original
+                        # observation time is preserved across re-finalization
+                        # passes and existing entries are never back-dated.
+                        if pr_entry.get("status") != "merged":
+                            _new_pr_state["merged_at"] = utc_now()
+                        state["prs"][pr_key] = _new_pr_state
                 if issue_pr_map:
                     state = self._record_event(
                         state,
@@ -8610,11 +8622,17 @@ class OrchestratorApp:
             for pr_number in merged_pr_bound_pr_numbers:
                 _pr_key = str(pr_number)
                 _pr_entry = state["prs"].get(_pr_key, {})
-                state["prs"][_pr_key] = {
+                _bound_pr_state = {
                     **_pr_entry,
                     "status": "merged",
                     "merged": True,
                 }
+                # Issue #747: stamp ``merged_at`` only on a genuine non-merged
+                # -> merged transition; preserve the original observation time
+                # on entries already recorded as merged.
+                if _pr_entry.get("status") != "merged":
+                    _bound_pr_state["merged_at"] = utc_now()
+                state["prs"][_pr_key] = _bound_pr_state
             if merged_pr_bound_pr_numbers:
                 save_state(self.paths.state_file, state)
             # Record a flag timestamp so operators/tooling (e.g. a doctor
@@ -14238,6 +14256,10 @@ class OrchestratorApp:
         )
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
+        # Issue #747: timestamp of the fleet's own merge_pr success (None until
+        # the direct-merge branch runs and succeeds). Used for the
+        # ``merge_succeeded`` event payload and the ``merged_at`` state field.
+        _merged_at: str | None = None
         branch_deleted: bool | None = None
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
@@ -14341,6 +14363,12 @@ class OrchestratorApp:
                     admin=self.config.auto_merge.admin,
                     merge_flags=self.config.auto_merge.merge_flags,
                 )
+                # Issue #747: stamp ``merged_at`` at the irreversible step so
+                # merge throughput/latency are computable from state.json.
+                # Existing merged entries are not back-dated — this only fires
+                # on a genuine non-merged -> merged transition (merge_pr just
+                # succeeded), so the timestamp is the real merge time.
+                _merged_at = utc_now()
                 with state_lock(self.paths.state_file):
                     state = load_state(self.paths.state_file)
                     state["prs"][str(pr_number)] = {
@@ -14349,6 +14377,7 @@ class OrchestratorApp:
                         "issue_number": issue_number,
                         "status": "merged",
                         "merged": True,
+                        "merged_at": _merged_at,
                         "consecutive_failed_merge_attempts": 0,
                     }
                     if issue_number is not None:
@@ -14726,6 +14755,28 @@ class OrchestratorApp:
                     "cancel_superseded_runs_results": cancel_results,
                 },
             )
+            # Issue #747: emit a dedicated terminal success event on the
+            # fleet's own direct-merge path. ``merge_output`` is truthy only
+            # when ``merge_pr`` actually ran and succeeded (it stays None for
+            # mergequeue handoffs, deferrals, conflicts, and skipped/deferred
+            # passes), so this fires exactly once per real fleet merge and is
+            # silent on every other outcome — the negative control the issue
+            # requires. ``actor="fleet"`` distinguishes these from
+            # externally-merged PRs, which are recorded by
+            # ``finalize_externally_merged`` / ``merged_outside_orchestrator``
+            # and never emit this kind.
+            if merge_output:
+                state = self._record_event(
+                    state,
+                    "merge_succeeded",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "actor": "fleet",
+                        "merge_method": self.config.auto_merge.strategy,
+                        "merged_at": _merged_at,
+                    },
+                )
             save_state(self.paths.state_file, state)
         data = {
             "pr": pr_number,

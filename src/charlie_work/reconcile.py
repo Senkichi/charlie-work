@@ -49,6 +49,7 @@ from .state import (
     append_event,
     is_claim_stale,
     set_throttled_until,
+    utc_now,
     without_review_dispatch_claim,
 )
 from .worktree import (
@@ -2046,6 +2047,14 @@ def apply_fixes(
                 }
                 if item.issue_number is not None:
                     new_pr_state["issue_number"] = item.issue_number
+                # Issue #747: ``merged_outside_orchestrator`` drift only fires
+                # when ``state_status != "merged"`` (detect_drift, above), so
+                # this is always a genuine non-merged -> merged transition.
+                # Stamp ``merged_at`` so externally-merged entries get the
+                # same timestamp field as fleet-merged ones; existing merged
+                # entries are never back-dated because they never reach here.
+                if existing_pr.get("status") != "merged":
+                    new_pr_state["merged_at"] = utc_now()
                 new_prs[pr_key] = new_pr_state
 
                 if repo_root is not None:
