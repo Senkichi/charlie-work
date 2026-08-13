@@ -662,6 +662,96 @@ def test_assert_conventional_commit_title_accepts_override_with_correct_format(
     assert_conventional_commit_title(prompt)
 
 
+def test_worker_prompts_contain_execution_contract() -> None:
+    """Verify that worker/rework prompts carry the execution-contract carve-out (issue #717)."""
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        assert "Execution contract (self-detect from your diff)" in prompt
+        assert "run the **FULL suite** locally at the final head before pushing" in prompt
+
+
+def test_assert_execution_contract_passes_for_package_templates() -> None:
+    """The guard accepts prompts rendered from the package templates (issue #717)."""
+    from charlie_work.prompts import assert_execution_contract
+
+    for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
+        prompt = _render_worker_with_sections(template_name)
+        # Must not raise — the package templates all reference
+        # $section_execution_contract.
+        assert_execution_contract(prompt)
+
+
+def test_assert_execution_contract_rejects_flat_override_without_carve_out(
+    tmp_path: Path,
+) -> None:
+    """The guard catches a flat override that drops the execution contract (issue #717).
+
+    This is the exact scenario the issue describes: a repo-local flat
+    whole-file ``worker.md`` override that states the blanket "never run the
+    full local suite" prohibition with no carve-out for contract-changing diffs
+    — the kind job-cannon shipped before PR #1564 migrated it to package
+    templates.
+    """
+    from charlie_work.prompts import (
+        MissingExecutionContractError,
+        assert_execution_contract,
+    )
+
+    # Simulate a flat override that carries no execution-contract carve-out —
+    # the kind job-cannon shipped before PR #1564 migrated it to package
+    # templates.
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task\n\n"
+        "Never run the full local suite as your gate -- CI runs the full "
+        "~90-file matrix on push and is the sole authority on wider "
+        "regressions. No exception clause here.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    assert "Execution contract (self-detect from your diff)" not in prompt
+    assert "run the **FULL suite** locally at the final head before pushing" not in prompt
+
+    with pytest.raises(MissingExecutionContractError) as exc_info:
+        assert_execution_contract(prompt, context="worker prompt for issue #123")
+    assert "issue #717" in str(exc_info.value)
+    assert "worker prompt for issue #123" in str(exc_info.value)
+
+
+def test_assert_execution_contract_accepts_override_with_carve_out(
+    tmp_path: Path,
+) -> None:
+    """The guard accepts a flat override that does carry the carve-out (issue #717).
+
+    A repo-local override is not inherently wrong — it just must not drop the
+    execution-contract escalation trigger for contract-changing diffs.
+    """
+    from charlie_work.prompts import assert_execution_contract
+
+    override_dir = tmp_path / "prompts"
+    override_dir.mkdir()
+    (override_dir / "worker.md").write_text(
+        "# Worker Task: Issue #$issue_number\n\n"
+        "**Execution contract (self-detect from your diff):** the default is "
+        "the targeted command. Only if the diff changes any public function "
+        "signature/return shape, run the **FULL suite** locally at the final "
+        "head before pushing.\n",
+        encoding="utf-8",
+    )
+    prompt = render_prompt(
+        "worker.md",
+        ISSUE_VALUES,
+        search_dirs=(override_dir,),
+    )
+    # Must not raise — the override carries the execution-contract carve-out.
+    assert_execution_contract(prompt)
+
+
 def test_review_template_contains_test_adequacy_section_placeholder() -> None:
     """Verify that review.md contains the $test_adequacy_section placeholder (issue #180)."""
     prompts_dir = Path(__file__).resolve().parents[1] / "src" / "charlie_work" / "prompts"
