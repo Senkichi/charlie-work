@@ -217,8 +217,16 @@ def test_provider_throttled_turn_limit_counted_is_warning(tmp_path: Path) -> Non
     assert len(errors) == 0
 
 
-def test_unclaimed_review_packet_stays_error(tmp_path: Path) -> None:
-    """A never-claimed review packet remains error, not reclassified as warning."""
+def test_unclaimed_review_packet_is_warning(tmp_path: Path) -> None:
+    """A never-claimed review packet is warning, not error (issue #748).
+
+    An unclaimed packet is a transient startup race: ``review()`` generated the
+    packet but ``dispatch_reviews`` has not claimed it yet. The sweep marks it
+    ``review_dispatch_failed`` so the next dispatch pass retries -- and it does,
+    typically within seconds (median 16s, 24/28 events under 1 minute, measured
+    against events.db). This is a recovery signal, not a terminal failure, so
+    it must be ``warning`` not ``error``.
+    """
     repo_root, reviews_dir, config, state_file, _ = _seed_unclaimed(tmp_path, 100)
 
     _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
@@ -228,16 +236,16 @@ def test_unclaimed_review_packet_stays_error(tmp_path: Path) -> None:
         kind="review_dispatch_stalled",
         level="warning",
     )
-    assert len(warnings) == 0
+    assert len(warnings) == 1
+    assert warnings[0]["payload"].get("status") == "unclaimed"
+    assert warnings[0]["level"] == "warning"
 
     errors = query_events(
         state_file,
         kind="review_dispatch_stalled",
         level="error",
     )
-    assert len(errors) == 1
-    assert errors[0]["payload"].get("status") == "unclaimed"
-    assert errors[0]["level"] == "error"
+    assert len(errors) == 0
 
 
 def test_dead_reviewer_without_throttle_stays_error(tmp_path: Path) -> None:
