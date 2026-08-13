@@ -8,6 +8,28 @@ from pathlib import Path
 from charlie_work.github import GitHub, GitHubLike
 
 
+def test_githublike_protocol_dry_run_is_read_only_property() -> None:
+    """GitHubLike.dry_run must be a read-only property, not a settable attribute.
+
+    The concrete ``GitHub`` class is a frozen dataclass, so its ``dry_run``
+    field is immutable. If the protocol declared ``dry_run`` as a settable
+    attribute (``dry_run: bool``), Pyright would consider ``GitHub``
+    incompatible with ``GitHubLike`` because a frozen field is read-only —
+    every call site passing a ``GitHub`` where ``GitHubLike`` is annotated
+    would be a ``reportArgumentType`` error (issue #733).
+
+    A ``@property`` declaration makes the protocol require only a *readable*
+    ``dry_run``, which the frozen dataclass field satisfies. Test doubles that
+    set ``self.dry_run`` in ``__init__`` still satisfy a read-only property
+    (settable is a superset of read-only).
+    """
+    raw = inspect.getattr_static(GitHubLike, "dry_run")
+    assert isinstance(raw, property), (
+        f"GitHubLike.dry_run must be a read-only property so the frozen "
+        f"GitHub dataclass satisfies the protocol; got {type(raw).__name__}"
+    )
+
+
 def test_githublike_protocol_declares_branch_protection() -> None:
     """GitHubLike must declare ``branch_protection`` so ``GitHubLike``-typed
     ``self.gh`` can call it unguardedly without a pyright error.
