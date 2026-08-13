@@ -1029,6 +1029,56 @@ def test_apply_fixes_merged_outside_orchestrator_transitions_labels() -> None:
     assert new_state["prs"]["1"]["status"] == "merged"
 
 
+def test_apply_fixes_merged_outside_orchestrator_stamps_and_preserves_merged_at() -> None:
+    """Issue #747: ``apply_fixes`` must stamp ``merged_at`` when a PR transitions
+    non-merged -> merged via the ``merged_outside_orchestrator`` drift fix, and
+    must preserve an existing ``merged_at`` unchanged when the PR is already
+    recorded as merged. The latter is the issue-still-active re-run path, where
+    ``detect_drift`` re-emits the drift item even though state status is already
+    ``'merged'`` (see reconcile.detect_drift: ``state_status != "merged" or
+    issue_still_active``); the ``merged_at`` guard stops that re-run from
+    back-dating the original observation time."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    drift = [
+        DriftItem(
+            kind="merged_outside_orchestrator",
+            issue_number=10,
+            pr_number=1,
+            detail="PR #1 merged outside orchestrator",
+            fix_actions=("mark state prs[1].status = 'merged'",),
+        )
+    ]
+
+    # Genuine transition: prior status is not 'merged' -> merged_at is stamped.
+    state = empty_state()
+    state["prs"]["1"] = {"status": "reviewing"}
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["1"]["status"] == "merged"
+    stamped = new_state["prs"]["1"].get("merged_at")
+    assert stamped is not None
+    assert stamped  # non-empty ISO 8601 timestamp
+    # The stamp is a real 'Z'-suffixed utc_now() value, not a stale literal.
+    assert stamped.endswith("Z")
+
+    # Re-run where the PR is already recorded as merged (the issue-still-active
+    # path, where detect_drift re-emits the drift despite status == 'merged'):
+    # the original merged_at must be preserved unchanged, never back-dated.
+    # Derived from the real clock (one day in the past) so no date-window
+    # filter can ever rot this seed.
+    original_merged_at = (
+        (datetime.now(UTC) - timedelta(days=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state2 = empty_state()
+    state2["prs"]["1"] = {"status": "merged", "merged_at": original_merged_at}
+    new_state2 = apply_fixes(gh, state2, drift, config)
+    assert new_state2["prs"]["1"]["status"] == "merged"
+    assert new_state2["prs"]["1"]["merged_at"] == original_merged_at
+
+
 def test_apply_fixes_contradiction_removes_active_labels_directly() -> None:
     config = OrchestratorConfig()
     gh = FakeGitHub(prs=[], issues=[])

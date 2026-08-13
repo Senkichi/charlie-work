@@ -13526,6 +13526,15 @@ class OrchestratorApp:
                     if field_name in ("review_dispatch_attempt_count", "request_changes_count"):
                         continue
                     updated.pop(field_name, None)
+            elif pr_status_target == "merged":
+                # Issue #747: stamp ``merged_at`` only on a genuine non-merged
+                # -> merged transition (the same pattern as the other five
+                # merged_at sites) so an unescalate that re-observes a PR
+                # already recorded as merged does not back-date the original
+                # observation time. ``entry`` is the pre-reset entry, so its
+                # ``status`` is the prior state, not the target just assigned.
+                if entry.get("status") != "merged":
+                    updated["merged_at"] = utc_now()
             return updated
 
         issue_status_action: str = "leave"
