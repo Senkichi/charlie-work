@@ -234,3 +234,165 @@ def test_undetermined_does_not_block_throttle_backoff_in_same_wave(tmp_path: Pat
     assert quota.get("throttled_until")
     assert quota.get("probe_after")
     assert quota.get("consecutive_probe_failures") == 1
+
+
+def test_persistent_unreadable_log_terminates_via_streak_bound(tmp_path: Path) -> None:
+    """A PR whose reviewer log is persistently unreadable/empty across many
+    sweeps must eventually reach a terminal state rather than redispatching
+    forever with no cap and no backoff (review finding on PR #1161: the
+    original #1069 fix decremented the attempt counter on every UNDETERMINED
+    death but, unlike the throttle path, did not arm fleet-wide backoff — so
+    the attempt cap never fired and the PR looped indefinitely).
+
+    The bound: a per-PR ``review_log_unreadable_streak`` counts consecutive
+    UNDETERMINED deaths. The first N (``max_consecutive_review_log_unreadable``)
+    are transient — roll back and decrement. After N, the death becomes a
+    counted failure (attempt counter NOT decremented) so the existing
+    ``max_review_dispatch_attempts`` cap converges and escalates.
+
+    This test simulates the dispatch → death → stalled-sweep cycle manually
+    (the dispatch path is a method on OrchestratorApp; the stalled sweep is
+    the standalone function under test) and proves the PR reaches
+    ``review_dispatch_failed`` with ``attempt_count >= max_attempts`` in a
+    finite number of sweeps.
+    """
+    max_streak = 2
+    max_attempts = 3
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(
+            enabled=True,
+            max_consecutive_review_log_unreadable=max_streak,
+            max_review_dispatch_attempts=max_attempts,
+        )
+    )
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+
+    started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    pr_number = 100
+
+    def _redispatch(attempt_count: int) -> None:
+        """Simulate what dispatch_reviews does: claim the PR as dispatched
+        and increment the attempt counter."""
+        with state_lock(state_file):
+            st = load_state(state_file)
+            st["prs"][str(pr_number)] = {
+                **st["prs"].get(str(pr_number), {}),
+                "number": pr_number,
+                "review_dispatch_status": "review_dispatch_dispatched",
+                "review_dispatched_at": started,
+                "review_dispatch_pending_at": None,
+                "review_dispatch_failed_at": None,
+                "reviewer_pid": 999999999,
+                "reviewer_process_start_time": 1.0,
+                "review_dispatch_attempt_count": attempt_count,
+            }
+            save_state(state_file, st)
+
+    # Seed the first dispatch.
+    _redispatch(attempt_count=1)
+
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    # Log never created → every read raises OSError → UNDETERMINED every sweep.
+
+    max_sweeps = 20  # safety bound — must terminate well before this
+    reached_terminal = False
+    transient_rollback_count = 0
+    persistent_failure_count = 0
+
+    for sweep in range(max_sweeps):
+        # Re-write the sidecar each sweep — the stalled sweep reaps it.
+        _write_sidecar(reviews_dir, pr_number, tmp_path, log_path)
+        assert not log_path.exists()  # confirms the read will fail
+
+        _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+        state = load_state(state_file)
+        pr_state = state["prs"][str(pr_number)]
+        status = pr_state.get("review_dispatch_status")
+        attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+        streak = int(pr_state.get("review_log_unreadable_streak", 0))
+
+        if streak <= max_streak:
+            # Transient phase: rolled back (status None), attempt decremented.
+            assert status is None, (
+                f"sweep {sweep}: streak {streak} <= {max_streak} should roll back, "
+                f"got status={status!r}"
+            )
+            transient_rollback_count += 1
+        else:
+            # Persistent phase: counted failure, attempt NOT decremented.
+            assert status == "review_dispatch_failed", (
+                f"sweep {sweep}: streak {streak} > {max_streak} should fail, got status={status!r}"
+            )
+            persistent_failure_count += 1
+
+        # Check for terminal state: attempt_count >= max_attempts means the
+        # dispatch cap blocks further dispatch and the escalation check fires.
+        if attempt_count >= max_attempts and status == "review_dispatch_failed":
+            reached_terminal = True
+            break
+
+        # Simulate re-dispatch for the next cycle.
+        _redispatch(attempt_count=attempt_count + 1)
+
+    assert reached_terminal, (
+        f"PR did not reach a terminal state after {max_sweeps} sweeps — "
+        f"unbounded loop (the streak bound failed to terminate)."
+    )
+
+    # Verify the phase transition actually happened (not all transient, not
+    # all persistent — the bound switches from rollback to counted-failure).
+    assert transient_rollback_count == max_streak, (
+        f"expected {max_streak} transient rollbacks, got {transient_rollback_count}"
+    )
+    assert persistent_failure_count >= 1, "expected at least one persistent counted failure"
+
+    # Final state: terminal failure at the attempt cap.
+    state = load_state(state_file)
+    pr_state = state["prs"][str(pr_number)]
+    assert pr_state.get("review_dispatch_status") == "review_dispatch_failed"
+    assert int(pr_state.get("review_dispatch_attempt_count", 0)) >= max_attempts
+
+    # Fleet-wide backoff was never armed — UNDETERMINED never arms backoff
+    # (that is the whole point of the distinct third state).
+    quota = state.get("reviewer_quota", {})
+    assert not quota.get("throttled_until")
+    assert not quota.get("probe_after")
+
+
+def test_streak_resets_on_definitive_not_throttled_outcome(tmp_path: Path) -> None:
+    """If a PR had a streak of UNDETERMINED deaths and then a reviewer dies
+    with a readable, non-throttle log (NOT_THROTTLED), the streak must reset
+    to 0. A subsequent UNDETERMINED death starts a fresh streak rather than
+    accumulating toward the persistent threshold from the prior epoch
+    (issue #1069 streak-reset invariant).
+    """
+    repo_root, reviews_dir, config, state_file = _seed(tmp_path, attempt_count=1)
+
+    # Pre-seed a streak of 2 (just below the default threshold of 3).
+    with state_lock(state_file):
+        st = load_state(state_file)
+        st["prs"]["100"]["review_log_unreadable_streak"] = 2
+        save_state(state_file, st)
+
+    # Now the reviewer dies with a readable, non-throttle log → NOT_THROTTLED.
+    log_path = reviews_dir / "issue-100-review.claude.log"
+    log_path.write_text("ordinary crash output, no throttle marker\n", encoding="utf-8")
+    _write_sidecar(reviews_dir, 100, tmp_path, log_path)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    state = load_state(state_file)
+    pr_state = state["prs"]["100"]
+    # NOT_THROTTLED → counted failure.
+    assert pr_state.get("review_dispatch_status") == "review_dispatch_failed"
+    # Streak reset to 0.
+    assert pr_state.get("review_log_unreadable_streak") == 0
