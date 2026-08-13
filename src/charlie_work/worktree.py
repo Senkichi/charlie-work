@@ -93,6 +93,32 @@ class WorktreeProbeFailedError(RuntimeError):
     """
 
 
+# Never pushed; charlie-work owns this namespace exclusively (same convention
+# as attempt_refs.ATTEMPT_REF_PREFIX). A rescue ref preserves worker-authored
+# dirty content immediately before a worktree reset that would destroy it, so
+# a correct ``WorktreeUnsafeError`` refusal becomes recoverable instead of
+# terminal (issue #849).
+RESCUE_REF_PREFIX = "refs/charlie/rescue"
+
+
+@dataclass(frozen=True)
+class RescueCapture:
+    """Result of capturing worktree work to a rescue ref before a reset.
+
+    A rescue ref preserves worker-authored dirty content (tracked modifications
+    + untracked files, excluding orchestrator scaffolding) so that a correct
+    refusal to reset a worktree is recoverable instead of terminal (issue #849).
+
+    ``ref_name``/``commit_sha`` are None when capture failed (``error`` set).
+    Callers must treat capture failure as a hard refusal — the reset must NOT
+    proceed if the work could not be preserved.
+    """
+
+    ref_name: str | None
+    commit_sha: str | None
+    error: str | None = None
+
+
 class LiveWorkerRedispatchError(RuntimeError):
     """Raised when a recovery/redispatch path is about to destroy a worktree
     but the recorded worker process is still alive (or sessions.db shows fresh
@@ -276,6 +302,11 @@ class WorktreeInfo:
     # real, recoverable merge conflict against the base ref. None for every
     # non-rework worktree and for a clean rework pre-merge.
     rework_conflict: ReworkMergeConflict | None = None
+    # Set when a worktree reset was permitted only after capturing the dirty
+    # working tree to a rescue ref (issue #849). None when no capture was
+    # needed (the worktree was safe to reset) or when capture failed (the
+    # reset was refused and WorktreeUnsafeError was raised instead).
+    rescue_capture: RescueCapture | None = None
 
 
 class WorktreeState(str, Enum):
@@ -1436,6 +1467,117 @@ def _worker_authored_dirty(
     return False
 
 
+def _capture_worktree_work_to_rescue_ref(
+    repo_root: Path,
+    worktree_path: Path,
+    issue_number: int | None,
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
+) -> RescueCapture:
+    """Capture worker-authored dirty content to a rescue ref (issue #849).
+
+    Stages all worktree changes — tracked modifications, deletions, and
+    untracked files — except orchestrator scaffolding (``injected_paths``,
+    ``materialize_dirs``, and ``.venv``), creates a tree from the resulting
+    index, wraps it in a commit with the worktree's current ``HEAD`` as
+    parent, and saves it to ``refs/charlie/rescue/issue-<n>-<timestamp>``.
+
+    The index is restored to ``HEAD`` after the tree is captured, so the
+    worktree's staging state is unchanged regardless of capture outcome.
+
+    Never raises: every git invocation goes through ``run_captured`` (errors
+    as values). A capture failure returns a ``RescueCapture`` with ``error``
+    set — the caller must refuse the reset in that case, exactly as today.
+    """
+    # Build exclusion pathspecs. ``.venv`` is always excluded: it is either a
+    # junction into the shared virtualenv (following it would add every other
+    # worktree's venv contents) or a local venv that is not worker content.
+    exclusions: list[str] = [":(exclude).venv"]
+    for p in (*injected_paths, *materialize_dirs):
+        normalized = str(p).replace("\\", "/").strip("/")
+        if normalized:
+            exclusions.append(f":(exclude){normalized}")
+
+    add_result = run_captured(
+        ["git", "add", "-A", "--", ".", *exclusions],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+
+    tree_sha: str | None = None
+    if add_result.ok:
+        tree_result = run_captured(
+            ["git", "write-tree"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if tree_result.ok and tree_result.stdout.strip():
+            tree_sha = tree_result.stdout.strip()
+
+    # Always restore the index to HEAD so the worktree's staging state is
+    # unchanged.  This runs whether or not the tree was captured: a failed
+    # ``git add`` may have left a partially-staged index, and ``git reset
+    # --mixed HEAD`` unstages everything without touching the working tree.
+    run_captured(
+        ["git", "reset", "--mixed", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+
+    if tree_sha is None:
+        detail = add_result.error or add_result.stderr or "unknown error"
+        return RescueCapture(
+            ref_name=None,
+            commit_sha=None,
+            error=f"capture failed at add/write-tree stage: {detail}",
+        )
+
+    head_result = run_captured(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not head_result.ok or not head_result.stdout.strip():
+        return RescueCapture(
+            ref_name=None,
+            commit_sha=None,
+            error=f"capture failed: cannot resolve HEAD: "
+            f"{head_result.error or head_result.stderr}",
+        )
+    head_sha = head_result.stdout.strip()
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    issue_part = f"issue-{issue_number}" if issue_number is not None else "issue-unknown"
+    ref_name = f"{RESCUE_REF_PREFIX}/{issue_part}-{timestamp}"
+
+    commit_result = run_captured(
+        ["git", "commit-tree", tree_sha, "-p", head_sha, "-m", f"rescue: {issue_part}"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not commit_result.ok or not commit_result.stdout.strip():
+        return RescueCapture(
+            ref_name=None,
+            commit_sha=None,
+            error=f"capture failed at commit-tree: {commit_result.error or commit_result.stderr}",
+        )
+    commit_sha = commit_result.stdout.strip()
+
+    update_result = run_captured(
+        ["git", "update-ref", ref_name, commit_sha],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not update_result.ok:
+        return RescueCapture(
+            ref_name=None,
+            commit_sha=commit_sha,
+            error=f"capture failed at update-ref: {update_result.error or update_result.stderr}",
+        )
+
+    return RescueCapture(ref_name=ref_name, commit_sha=commit_sha)
+
+
 def _is_confirmed_missing_ref(result: RunResult) -> bool:
     """True only when ``git rev-parse --verify -q <ref>`` ran to completion and
     definitively reported that ``<ref>`` does not resolve to a single
@@ -2426,6 +2568,7 @@ def create_worktree(
     reclaimed: str | None = None
     attempt_snapshot: AttemptSnapshot | None = None
     rework_conflict: ReworkMergeConflict | None = None
+    rescue_capture: RescueCapture | None = None
 
     def _snapshot_before_delete(target_branch: str) -> None:
         """Best-effort attempt-tip snapshot immediately before a branch reset.
@@ -2440,6 +2583,57 @@ def create_worktree(
         attempt_snapshot = snapshot_attempt_ref(
             repo_root, target_branch, issue_number, base_ref=resolved_base_ref
         )
+
+    def _emit_rescue_event(capture: RescueCapture, unsafe_reason: str, wt_path: Path) -> None:
+        """Best-effort: record a ``worktree_rescue_captured`` event (issue #849).
+
+        Deferred import so worktree.py never hard-depends on instrumentation's
+        own import chain (ci_fleet at module bottom). A missing state_file
+        (no config) or an instrumentation I/O error is silently skipped —
+        the rescue ref itself is the durable artifact, not the event.
+        """
+        if state_file is None:
+            return
+        try:
+            from .instrumentation import log_event
+
+            log_event(
+                state_file,
+                "worktree_rescue_captured",
+                {
+                    "issue_number": issue_number,
+                    "rescue_ref": capture.ref_name,
+                    "commit_sha": capture.commit_sha,
+                    "worktree_path": str(wt_path),
+                    "reason": unsafe_reason,
+                },
+            )
+        except Exception:  # noqa: BLE001 — instrumentation is best-effort
+            pass
+
+    def _capture_or_raise(
+        check_path: Path, unsafe_reason: str, capture_injected: tuple[str, ...]
+    ) -> None:
+        """Attempt rescue capture before refusing a reset (issue #849).
+
+        If capture succeeds, records it on the enclosing ``rescue_capture``
+        and returns — the reset is permitted because the work is now durable
+        on a ref. If capture fails, raises ``WorktreeUnsafeError`` exactly as
+        today — capture failure must never downgrade the safety property.
+        """
+        nonlocal rescue_capture
+        capture = _capture_worktree_work_to_rescue_ref(
+            repo_root,
+            check_path,
+            issue_number,
+            capture_injected,
+            materialize_dirs,
+        )
+        if capture.error is None and capture.ref_name is not None:
+            rescue_capture = capture
+            _emit_rescue_event(capture, unsafe_reason, check_path)
+            return
+        raise WorktreeUnsafeError(unsafe_reason)
 
     def _raise_if_unsafe_to_reset(target_path: Path | None = None) -> None:
         """Hard-refuse to reset if the worktree/branch contains local work."""
@@ -2486,7 +2680,12 @@ def create_worktree(
                     probe_result="live_writer_at_unsafe_evaluation",
                     inconclusive_probe_deferred_count=0,
                 )
-        raise WorktreeUnsafeError(reason)
+        # Issue #849: before refusing, attempt to capture the work durably
+        # onto a rescue ref. If capture succeeds, the reset is permitted
+        # (the work is preserved on a ref, so resetting destroys nothing).
+        # If capture fails, the refusal stands — capture failure must never
+        # downgrade the safety property.
+        _capture_or_raise(check_path, reason, injected_paths)
 
     if recovery is not None:
         # Validate that the recovery record matches the requested branch
@@ -2780,7 +2979,7 @@ def create_worktree(
                     worktree_path, dirty_injected, materialize_dirs
                 )
                 if dirty_reason:
-                    raise WorktreeUnsafeError(dirty_reason)
+                    _capture_or_raise(worktree_path, dirty_reason, dirty_injected)
             # Only fetch if origin remote exists (deterministic check)
             if _has_origin_remote(repo_root):
                 # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
@@ -2805,7 +3004,7 @@ def create_worktree(
                             worktree_path, injected_paths, materialize_dirs
                         )
                         if dirty_reason:
-                            raise WorktreeUnsafeError(dirty_reason)
+                            _capture_or_raise(worktree_path, dirty_reason, injected_paths)
                         _snapshot_before_delete(branch)
                         base_branch = (
                             resolved_base_ref[len("origin/") :]
@@ -2870,6 +3069,7 @@ def create_worktree(
                 reclaimed=reclaimed,
                 attempt_snapshot=attempt_snapshot,
                 rework_conflict=rework_conflict,
+                rescue_capture=rescue_capture,
             )
         else:
             # No existing worktree: attach to existing branch (no -b flag)
@@ -3065,6 +3265,7 @@ def create_worktree(
         attempt_snapshot=attempt_snapshot,
         materialized_paths=tuple(materialized_paths),
         rework_conflict=rework_conflict,
+        rescue_capture=rescue_capture,
     )
 
 
