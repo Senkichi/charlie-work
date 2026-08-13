@@ -106,6 +106,7 @@ from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import (
     PromptTemplateError,
     assert_conventional_commit_title,
+    assert_execution_contract,
     assert_no_merge_contract,
     prompt_template_digest,
     render_prompt,
@@ -6096,6 +6097,10 @@ def _write_rework_prompt(
     # repo-local flat rework override that drops $section_no_merge_contract is
     # caught at the dispatch boundary.
     assert_no_merge_contract(prompt, context=f"rework prompt for PR #{pr_number}")
+    # Issue #717: enforce the execution-contract escalation trigger on the
+    # *rendered output* so a repo-local flat rework override that drops
+    # $section_execution_contract is caught at the dispatch boundary.
+    assert_execution_contract(prompt, context=f"rework prompt for PR #{pr_number}")
     prompt_path.write_text(prompt, encoding="utf-8")
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
     # regeneration (when review-decision.json is newer than the brief) can
@@ -21246,6 +21251,15 @@ class OrchestratorApp:
         assert_conventional_commit_title(
             prompt, context=f"worker prompt for issue #{issue_number}"
         )
+        # Issue #717: enforce the execution-contract escalation trigger on the
+        # *rendered output* so a repo-local flat override that drops
+        # $section_execution_contract — leaving a blanket "never run the full
+        # local suite" prohibition with no carve-out for contract-changing diffs
+        # (public function signature/return shape, exception type/message
+        # consumed elsewhere, DB schema, or module re-export) — is caught at the
+        # dispatch boundary rather than shipping a worker who can change a
+        # contract surface and push without ever exercising the wider suite.
+        assert_execution_contract(prompt, context=f"worker prompt for issue #{issue_number}")
         # Issue #618: the dry-run dispatch branch promises "skip all state
         # writes, label transitions, and file mutations" — mkdir + write_text
         # here would violate that, and for a dead-worker recovery candidate
