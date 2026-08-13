@@ -587,7 +587,7 @@ def _run_fleet_allocation_prologue(
     # lands the events alongside the supervisor lifecycle events already there.
     # See ``supervisor_lifecycle.py:18-20`` for the same call convention.
     resolved_fleet_dir = fleet_dir(override=fleet_dir_override)
-    fleet_state_path = resolved_fleet_dir / "state.json"
+    fleet_state_path = layout.state_file_path(resolved_fleet_dir)
 
     full_pass_interval_seconds = getattr(
         getattr(global_config, "supervisor", None),
