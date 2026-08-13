@@ -1868,6 +1868,84 @@ def test_no_config_flag_is_allowed(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
+# bootstrap_command / CommandContext (issue #705)
+# --------------------------------------------------------------------------
+
+
+def test_bootstrap_command_returns_frozen_context_with_all_four_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """bootstrap_command bundles repo_root, config, paths, gh in one call (#705).
+
+    The four-call sequence (find_repo_root -> load_layered_config ->
+    runtime_paths -> GitHub) was previously duplicated across every command
+    handler.  This test pins that the single shared helper returns a frozen
+    dataclass whose fields are mutually consistent: gh.repo_root matches
+    ctx.repo_root, paths is derived from the same config's state_dir, and the
+    context is immutable.
+    """
+    repo = _fake_repo(tmp_path / "charlie-work")
+    config = OrchestratorConfig()
+
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo_arg, explicit=False: repo)
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+
+    args = cli.build_parser().parse_args(["--repo", str(repo), "roll-call"])
+    ctx = cli.bootstrap_command(args)
+
+    assert isinstance(ctx, cli.CommandContext)
+    assert ctx.repo_root == repo
+    assert ctx.config is config
+    # paths must be derived from the same config's state_dir against repo_root
+    expected_paths = runtime_paths(repo, config.runtime.state_dir)
+    assert ctx.paths == expected_paths
+    # gh must be constructed with the same repo_root and config.runtime
+    assert isinstance(ctx.gh, _FakeGitHub)
+
+
+def test_command_context_is_frozen(tmp_path: Path) -> None:
+    """CommandContext must be a frozen dataclass (CLAUDE.md invariant)."""
+    import dataclasses
+
+    repo = _fake_repo(tmp_path / "charlie-work")
+    ctx = cli.CommandContext(
+        repo_root=repo,
+        config=OrchestratorConfig(),
+        paths=runtime_paths(repo, OrchestratorConfig().runtime.state_dir),
+        gh=_FakeGitHub(),
+    )
+    assert dataclasses.is_dataclass(ctx)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        ctx.repo_root = tmp_path  # type: ignore[misc]
+
+
+def test_bootstrap_command_includes_config_repo_misroute_guard(
+    tmp_path: Path,
+) -> None:
+    """bootstrap_command inherits _assert_config_repo_matches (issue #895).
+
+    Previously only build_app checked that --config does not point into a
+    different repo's work tree.  Centralizing the bootstrap means every command
+    handler now gets this guard, not just the ones that happened to call
+    build_app.  This test verifies the guard fires through bootstrap_command.
+    """
+    repo_a = _fake_repo(tmp_path / "charlie-work")
+    repo_b = _fake_repo(tmp_path / "job-cannon")
+    foreign_config = repo_b / "orchestrator.config.yaml"
+    foreign_config.write_text("runtime:\n  state_dir: .var/charlie-work\n", encoding="utf-8")
+
+    args = cli.build_parser().parse_args(
+        ["--repo", str(repo_a), "--config", str(foreign_config), "roll-call"]
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        cli.bootstrap_command(args)
+    assert str(repo_b) in str(excinfo.value)
+    assert "--repo" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
 # runners shadow-status (issue #909)
 # --------------------------------------------------------------------------
 
