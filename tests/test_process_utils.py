@@ -300,6 +300,72 @@ def test_kill_process_tree_start_time_verification() -> None:
             proc.wait()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only: taskkill return-code race")
+def test_kill_process_tree_records_kill_when_taskkill_returncode_unexpected() -> None:
+    """taskkill can return codes outside (0, 1) even when it kills the process.
+
+    Under CI box load, ``taskkill /F /T /PID`` may exit with a code like 128
+    even though it successfully terminated the target.  The old code only
+    recorded the PID as killed when ``returncode in (0, 1)``, so the caller
+    saw ``killed=[]`` for a dead process — a phantom miss that broke retry
+    loops and tests alike.  The fix verifies the process is actually dead
+    via ``is_pid_alive`` after taskkill, recording the kill regardless of
+    the return code.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=False,
+    )
+    try:
+        import time
+
+        # Wait for the child to be alive before proceeding.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if is_pid_alive(proc.pid):
+                break
+            time.sleep(0.1)
+        if not is_pid_alive(proc.pid):
+            pytest.skip("fixture process failed to start")
+
+        from charlie_work.process_utils import get_process_start_time
+
+        actual_start_time = get_process_start_time(proc.pid)
+        if actual_start_time is None:
+            pytest.skip("could not read fixture process start time")
+
+        # Simulate taskkill returning an unexpected exit code (e.g. 128)
+        # while the process is actually dead. We patch subprocess.run to
+        # first kill the process for real (so is_pid_alive returns False),
+        # then report a non-(0,1) return code.
+        def fake_run(*args: Any, **kwargs: Any) -> Any:
+            # Only intercept the taskkill call; let everything else through.
+            if args and isinstance(args[0], list) and "taskkill" in args[0]:
+                # Kill the process for real so is_pid_alive sees it dead.
+                proc.terminate()
+                proc.wait()
+                return subprocess.CompletedProcess(
+                    args=args[0], returncode=128, stdout="", stderr=""
+                )
+            return subprocess.run(*args, **kwargs)
+
+        with patch("charlie_work.process_utils.subprocess.run", side_effect=fake_run):
+            with patch("charlie_work.process_utils._enumerate_child_pids", return_value=[]):
+                killed = kill_process_tree(proc.pid, actual_start_time)
+
+        assert proc.pid in killed, (
+            f"kill_process_tree must record the PID as killed when the process "
+            f"is dead even if taskkill returned an unexpected exit code; "
+            f"killed={killed}"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test")
 def test_kill_process_tree_own_group_guard_posix() -> None:
     """Test that kill_process_tree refuses to kill its own process group on POSIX."""
