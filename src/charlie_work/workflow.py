@@ -18528,6 +18528,38 @@ class OrchestratorApp:
                 "terminal_reason": entry.get("terminal_reason"),
             }
 
+        # Issue #706: feed reaped dead-session transitions into the notify
+        # digest. ``_detect_stalled_sessions`` is gated on
+        # ``watchdog.enabled`` (it returns ``[]`` immediately when watchdog is
+        # off), so a deployment that disables watchdog -- e.g. to work around
+        # a shim log-mtime blindness, as job-cannon does -- gets zero stalled
+        # entries and the notify sink never fires, even though dead workers
+        # ARE reaped by ``_classify_dead_sessions_and_update_throttle_state``
+        # above (which is NOT watchdog-gated; see issue #1122). Without this,
+        # an operator monitoring ``notify/digest.jsonl`` gets zero signal
+        # silently -- the exact symptom in #706. ``setdefault`` preserves any
+        # stalled transition already recorded for the same issue (the stall
+        # lane's post-mortem terminal_tool/terminal_reason are richer than the
+        # reaped entry's failure_kind); in practice the two are mutually
+        # exclusive (a session is either alive-stalled or dead-reaped, not
+        # both), so this only fills in for sessions the watchdog-gated
+        # read-only detection skipped.
+        for reaped_entry in reaped:
+            reaped_issue = reaped_entry.get("issue_number")
+            if reaped_issue is None:
+                continue
+            health_transitions.setdefault(
+                reaped_issue,
+                {
+                    "adapter_kind": reaped_entry.get("adapter_kind", "unknown"),
+                    "health": "DEAD",
+                    "last_log_line": None,
+                    "pid": reaped_entry.get("pid"),
+                    "terminal_tool": None,
+                    "terminal_reason": reaped_entry.get("failure_kind"),
+                },
+            )
+
         # Emit notification digest if there are health transitions
         if health_transitions and self.config.notify.enabled:
             digest = _build_attention_digest(
