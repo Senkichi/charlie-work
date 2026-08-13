@@ -873,6 +873,17 @@ def test_fleet_loop_unclassified_exception_isolated(
     # The exception type must be part of the surfaced message (diagnosability).
     assert "RuntimeError" in result.data["repos"]["owner/repo1"]["message"]
 
+    # Issue #738: the genuine lane-crash path (this test's RuntimeError raised
+    # inside app.loop()) must set ``errored: True`` on the per-repo result data
+    # at its point of origin in fleet_loop's ``except Exception`` handler, so
+    # the supervisor headline can split "errored" from "completed with
+    # conditions". The downstream headline-split tests plant this flag via a
+    # synthetic fixture; this assertion verifies the flag is actually set by
+    # the real exception path, not just honored when present.
+    assert result.data["repos"]["owner/repo1"].get("errored") is True
+    # The successful repo must not carry the marker.
+    assert "errored" not in result.data["repos"]["owner/repo2"]
+
     # Verify overall result is False (one repo failed)
     assert result.ok is False
 
