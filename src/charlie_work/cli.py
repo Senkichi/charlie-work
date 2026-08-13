@@ -34,6 +34,7 @@ from .github import (
     linked_issue_number,
 )
 from . import layout
+from .dirty_tree import check_working_tree_clean
 from .logging_setup import configure_logging
 from .instrumentation import query_events
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -435,6 +436,16 @@ def build_parser() -> argparse.ArgumentParser:
             "patterns (if given) are only reported informationally."
         ),
     )
+    migrate_parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help=(
+            "Override the pre-flight clean-tree gate (issue #729): --apply refuses to "
+            "run when the tracked working tree differs from HEAD, since the command "
+            "executes the working tree while CI only reviewed the committed tree. Pass "
+            "this flag only for deliberate local testing on a dirty tree."
+        ),
+    )
     _add_dry_run(migrate_parser)
 
     tripwire = subparsers.add_parser(
@@ -767,6 +778,7 @@ def run_migrate_state_dir_command(
     planner=gather_migration_inputs,
     actuator=apply_state_dir_migration,
     quiescence_checker=check_quiescence,
+    dirty_tree_checker=check_working_tree_clean,
 ) -> CommandResult:
     """Plan, and with ``--apply``, actuate a legacy state-dir move.
 
@@ -788,6 +800,14 @@ def run_migrate_state_dir_command(
     no built-in default list (CLAUDE.md rule 9: no embedded manual lists), so
     ``--apply`` with none given is refused rather than silently skipping the
     check.
+
+    Clean-tree gate (issue #729): ``--apply`` also refuses when the tracked
+    working tree differs from ``HEAD``, because the command executes the
+    working tree while CI only reviewed the committed tree -- a guard neutered
+    only in the working tree is invisible to every review and test run that
+    validated the commit. ``--allow-dirty`` overrides this for deliberate
+    local testing. Plan-only and dry-run paths never reach this gate, since
+    iterating on a plan against a dirty tree is the normal development loop.
     """
     ctx = bootstrap_command(args)
 
@@ -867,6 +887,31 @@ def run_migrate_state_dir_command(
             f"{rendered}\nrefusing to apply: fleet is not quiescent\n{report.summary}",
             data,
         )
+
+    # Issue #729: the command executes the working tree, but CI only reviewed
+    # the committed tree. Refuse to actuate when the tracked working tree
+    # differs from HEAD, naming the divergent paths so the operator sees *what*
+    # changed rather than just being blocked. ``--allow-dirty`` overrides this
+    # for deliberate local testing. A probe that cannot determine cleanliness
+    # (git failed) is also refused -- fail-closed, never silently proceed.
+    if not args.allow_dirty:
+        dirty = dirty_tree_checker(repo_root=ctx.repo_root)
+        if not dirty.ok:
+            return CommandResult(
+                False,
+                f"{rendered}\nrefusing to apply: {dirty.error}",
+                data,
+            )
+        if not dirty.clean:
+            paths = "\n".join(f"  {p}" for p in dirty.dirty_paths)
+            return CommandResult(
+                False,
+                f"{rendered}\nrefusing to apply: tracked working tree differs from "
+                f"HEAD ({len(dirty.dirty_paths)} path(s)); the command executes the "
+                f"working tree but CI only reviewed the committed tree:\n{paths}\n"
+                "pass --allow-dirty to override for deliberate local testing",
+                data,
+            )
 
     outcome = actuator(plan)
     data = {**data, "applied": outcome.ok, "moved": list(outcome.moved)}
