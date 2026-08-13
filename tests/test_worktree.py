@@ -2969,6 +2969,56 @@ def test_materialize_directory_preserves_empty_subdirectories(tmp_path: Path) ->
     assert (worktree_path / ".devin" / "config.json").read_text(encoding="utf-8") == "{}\n"
 
 
+def test_materialize_directory_excludes_pycache_and_pyc(tmp_path: Path) -> None:
+    """_materialize_directory must not copy __pycache__/ dirs or *.pyc files.
+
+    Compiled bytecode is interpreter-version-specific and regenerable on first
+    import.  Propagating stale mixed-version .pyc files (e.g. cpython-312 and
+    cpython-313 side by side) into worktrees is a drift signal with no upside
+    (issue #711).
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    # Source .devin with a hooks subdir containing real source plus stale
+    # mixed-version bytecode — mirroring the job-cannon layout from issue #711.
+    hooks = repo_root / ".devin" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "require_ci_clean.py").write_text("# hook\n", encoding="utf-8")
+
+    pycache = hooks / "__pycache__"
+    pycache.mkdir()
+    (pycache / "require_ci_clean.cpython-312.pyc").write_bytes(b"\x00\x32")
+    (pycache / "require_ci_clean.cpython-313.pyc").write_bytes(b"\x00\x33")
+
+    # A loose .pyc outside __pycache__ (some tools emit these) must also be
+    # excluded.
+    (hooks / "stray.cpython-313.pyc").write_bytes(b"\x00\x13")
+
+    # A normal sibling file must still be copied.
+    (repo_root / ".devin" / "config.json").write_text("{}\n", encoding="utf-8")
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+
+    written = _materialize_directory(repo_root, worktree_path, ".devin")
+
+    # Real source and config are materialized.
+    assert (worktree_path / ".devin" / "hooks" / "require_ci_clean.py").exists()
+    assert (worktree_path / ".devin" / "config.json").exists()
+    assert ".devin/hooks/require_ci_clean.py" in written
+    assert ".devin/config.json" in written
+
+    # __pycache__ directory is not created in the target at all.
+    assert not (worktree_path / ".devin" / "hooks" / "__pycache__").exists()
+
+    # No .pyc file appears anywhere in the materialized tree.
+    assert not list((worktree_path / ".devin").rglob("*.pyc"))
+
+    # No .pyc path is in the written manifest.
+    assert not any(p.endswith(".pyc") for p in written)
+
+
 def test_create_worktree_with_materialize_dirs(tmp_path: Path) -> None:
     """create_worktree should materialize specified directories."""
     repo_root = tmp_path / "repo"
