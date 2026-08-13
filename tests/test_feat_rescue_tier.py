@@ -776,3 +776,50 @@ def test_rescue_marker_routes_correctly_even_when_rescue_disabled_in_config(
     # marker alone must still route this issue through the rescue adapter.
     assert settings.adapter == "claude-code"
     assert settings.config.claude_code.model == "claude-opus-4-1"
+
+
+# --- Issue #618-D: dry-run short-circuit for _process_rescue_review -----------
+
+
+def test_process_rescue_review_dry_run_short_circuits_without_escalating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #618-D: ``_process_rescue_review`` in dry-run must short-circuit
+    BEFORE any writes or mutations. Threading ``dry_run`` to
+    ``run_cross_family_review`` alone is harmful: the dry-run branch returns a
+    synthetic failure (``ok=False``), which drives the function into its
+    escalation arm and would mark a PR escalated during a preview.
+    """
+    config = OrchestratorConfig(rescue=RescueConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    _seed_pr_state(paths, 456, 123, rescue_attempted=True, rescue_cause="rework_cycle_cap")
+
+    # If the short-circuit fails, run_cross_family_review would be called.
+    # Plant a sentinel that raises if the function is reached at all.
+    def _must_not_run(**kwargs):
+        raise AssertionError("run_cross_family_review must not be called in dry-run")
+
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _must_not_run)
+
+    result = app._process_rescue_review({"pr": 456, "issue": 123})
+
+    # The dry-run result should indicate success (the preview itself worked)
+    assert result.ok is True
+    assert "dry-run" in result.message.lower()
+    assert result.data["rescue_review_decision"] == "dry-run"
+
+    # No state mutation — the PR must NOT be escalated
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"].get("status") != "escalated"
+    assert state["issues"].get("123", {}).get("status") != "escalated"
+
+    # No escalation event recorded
+    assert _events(state, "rescue_review_escalated") == []
+
+    # No escalation label added
+    assert (123, config.labels.human_needed) not in fake_gh.labels_added
+
+    # No PR comment posted (no pr_dir created)
+    assert not (paths.prs / "pr-456").exists()

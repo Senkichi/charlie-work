@@ -523,7 +523,7 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
-    touch_repo(args.fleet_dir, repo_root, paths, gh)
+    touch_repo(args.fleet_dir, repo_root, paths, gh, dry_run=args.dry_run)
     return OrchestratorApp(
         repo_root, paths, config, gh, dry_run=args.dry_run, fleet_dir_override=args.fleet_dir
     )
@@ -554,7 +554,7 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
         )
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
-    touch_repo(args.fleet_dir, repo_root, paths, gh)
+    touch_repo(args.fleet_dir, repo_root, paths, gh, dry_run=args.dry_run)
     ok, checks = run_doctor(
         repo_root,
         paths,
