@@ -41782,9 +41782,12 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     # state-lock guard is only reachable on the non-dry-run path.  The state
     # lock is the first thing that path hits, so no side effects occur before
     # the StateLockBusy exception.
+    # Issue #617: review() now has the same shape — its dry-run gate sits
+    # above the state_lock and returns a read-only plan without acquiring
+    # the lock.
     # Issue #618: intake's dry-run gate also sits above the state_lock —
     # dry-run skips the state merge entirely, so the lock guard never fires.
-    if method_name in ("merge_ready", "intake"):
+    if method_name in ("merge_ready", "review", "intake"):
         app.dry_run = False
 
     state_path = paths.state_file

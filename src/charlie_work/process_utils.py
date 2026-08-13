@@ -570,8 +570,16 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
                 text=True,
                 **no_console_window_kwargs(),
             )
-            # taskkill returns 0 for success, 1 for "process not found" (which is fine)
-            if result.returncode in (0, 1):
+            # taskkill returns 0 for success, 1 for "process not found" (which
+            # is fine). But the return code is not a reliable kill signal under
+            # load: taskkill can return codes outside (0, 1) even when it
+            # successfully terminates the process (e.g., when the process is
+            # already exiting, or under box contention). Without the liveness
+            # fallback below, callers that retry on [] (and tests that assert
+            # ``pid in killed``) see a phantom miss: the process is dead but
+            # ``kill_process_tree`` reported []. Verify the process is actually
+            # dead rather than trusting the return code alone.
+            if result.returncode in (0, 1) or not is_pid_alive(pid):
                 killed_pids.append(pid)
                 # taskkill /T kills children but doesn't list them reliably
                 # Add enumerated children to the killed list
