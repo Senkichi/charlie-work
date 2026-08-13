@@ -25,6 +25,7 @@ from charlie_work.fleet_paths import fleet_dir
 from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
 from charlie_work.quiesce import QuiesceReport
+from charlie_work.dirty_tree import DirtyTreeReport
 from charlie_work.state_migration import MigrationChild, MigrationOutcome, MigrationPlan
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.workflow import CommandResult
@@ -1642,6 +1643,11 @@ def _migrate_args(repo: Path, *extra: str) -> argparse.Namespace:
     return cli.build_parser().parse_args(["--repo", str(repo), "migrate-state-dir", *extra])
 
 
+def _clean_tree(**_kwargs: Any) -> DirtyTreeReport:
+    """A dirty-tree checker stub that always reports a clean working tree."""
+    return DirtyTreeReport(ok=True, dirty_paths=())
+
+
 def test_migrate_state_dir_parser_defaults_plan_only_and_apply_flips_it() -> None:
     """Requirement 1: acting requires the explicit ``--apply`` opt-in."""
     parser = cli.build_parser()
@@ -1651,9 +1657,13 @@ def test_migrate_state_dir_parser_defaults_plan_only_and_apply_flips_it() -> Non
     assert plan_only.src is None
     assert plan_only.dst is None
     assert plan_only.quiesce_patterns is None
+    assert plan_only.allow_dirty is False
 
     applied = parser.parse_args(["migrate-state-dir", "--apply"])
     assert applied.apply is True
+
+    allow_dirty = parser.parse_args(["migrate-state-dir", "--apply", "--allow-dirty"])
+    assert allow_dirty.allow_dirty is True
 
 
 def test_migrate_state_dir_src_equals_dst_reports_already_migrated_without_planning(
@@ -1802,6 +1812,7 @@ def test_migrate_state_dir_apply_refuses_when_plan_has_blocked_children(tmp_path
         args,
         planner=lambda **kwargs: plan,
         quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=_clean_tree,
     )
 
     assert result.ok is False
@@ -1880,11 +1891,141 @@ def test_migrate_state_dir_apply_happy_path_actuates_when_quiescent(tmp_path: Pa
         args,
         planner=lambda **kwargs: _fake_migration_plan(tmp_path),
         quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=_clean_tree,
         actuator=lambda plan_arg: outcome,
     )
 
     assert result.ok is True
     assert "moved 1 children" in result.message
+
+
+def test_migrate_state_dir_apply_refuses_when_working_tree_is_dirty(tmp_path: Path) -> None:
+    """Issue #729: ``--apply`` executes the working tree, but CI only reviewed
+    the committed tree. Refuse to actuate when the tracked working tree differs
+    from HEAD, naming the divergent paths so the operator sees *what* changed.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+    dirty = DirtyTreeReport(ok=True, dirty_paths=("src/charlie_work/state_migration.py",))
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=lambda **kwargs: dirty,
+        actuator=_refuse_to_call,
+    )
+
+    assert result.ok is False
+    assert "refusing to apply" in result.message
+    assert "tracked working tree differs from HEAD" in result.message
+    assert "src/charlie_work/state_migration.py" in result.message
+    assert "--allow-dirty" in result.message
+    assert result.data["applied"] is False
+
+
+def test_migrate_state_dir_apply_refuses_when_dirty_tree_probe_fails(tmp_path: Path) -> None:
+    """Issue #729: a probe that cannot determine cleanliness is not evidence of
+    cleanliness -- fail closed, never silently proceed. The refusal message
+    carries the probe's error so the operator can diagnose the git failure.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+    probe_failed = DirtyTreeReport(
+        ok=False, error="could not check working tree cleanliness: git status failed"
+    )
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=lambda **kwargs: probe_failed,
+        actuator=_refuse_to_call,
+    )
+
+    assert result.ok is False
+    assert "refusing to apply" in result.message
+    assert "could not check working tree cleanliness" in result.message
+    assert result.data["applied"] is False
+
+
+def test_migrate_state_dir_apply_allow_dirty_overrides_clean_tree_gate(tmp_path: Path) -> None:
+    """Issue #729: ``--allow-dirty`` is the explicit override for deliberate
+    local testing on a dirty tree. With it set, a dirty working tree does NOT
+    block actuation -- the operator opted in.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--allow-dirty",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+    dirty = DirtyTreeReport(ok=True, dirty_paths=("src/charlie_work/state_migration.py",))
+    outcome = MigrationOutcome(ok=True, moved=("issues",))
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=lambda **kwargs: dirty,
+        actuator=lambda plan_arg: outcome,
+    )
+
+    assert result.ok is True
+    assert "moved 1 children" in result.message
+
+
+def test_migrate_state_dir_plan_only_does_not_check_dirty_tree(tmp_path: Path) -> None:
+    """Issue #729: plan-only paths stay usable on a dirty tree -- iterating on
+    a plan is the normal development loop, so the clean-tree gate must not fire
+    without ``--apply``.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(repo, "--src", str(src), "--dst", str(dst))
+    assert args.apply is False
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        dirty_tree_checker=lambda **kwargs: DirtyTreeReport(
+            ok=True, dirty_paths=("src/charlie_work/state_migration.py",)
+        ),
+        actuator=_refuse_to_call,
+    )
+
+    assert result.ok is True
+    assert "plan only" in result.message
 
 
 def _fake_repo(root: Path) -> Path:
