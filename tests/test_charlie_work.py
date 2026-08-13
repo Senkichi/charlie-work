@@ -3197,6 +3197,13 @@ class FakeGitHub:
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
 
     def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+        # Issue #882: match the production shape. GitHubCLI.merged_prs_for_issue
+        # always returns a MergedPRSearchResult carrying ``.ok``; the base fake
+        # used to return a plain list, which only worked because the sole
+        # consumer reads defensively via ``getattr(merged_prs, "ok", True)``.
+        # Returning the typed wrapper here keeps the fake and the real thing
+        # agreeing, so a future caller that reads ``.ok`` directly does not pass
+        # tests here and AttributeError in production.
         matched = []
         for pr in self.prs:
             if pr.get("state", "OPEN").upper() != "MERGED":
@@ -3208,7 +3215,7 @@ class FakeGitHub:
             )
             if bound == issue_number:
                 matched.append(pr)
-        return matched
+        return github_module._MergedPRSearchResult(matched, ok=True)
 
     def pr_view(self, number: int):
         # Return the PR matching the requested number
@@ -3705,6 +3712,35 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
         )
         results.add(proc.stdout.strip())
     assert len(results) == 1, f"merge_base varied across hash seeds: {results}"
+
+
+def test_base_fake_github_merged_prs_for_issue_returns_typed_result() -> None:
+    """Issue #882 regression guard.
+
+    Production ``GitHubCLI.merged_prs_for_issue`` always returns a
+    ``MergedPRSearchResult`` carrying ``.ok``. The base ``FakeGitHub`` used to
+    return a plain ``list`` with no ``.ok`` attribute, so it silently disagreed
+    with the real thing -- only inert because the sole consumer reads
+    defensively via ``getattr(merged_prs, "ok", True)``. A future caller that
+    reads ``.ok`` directly would pass tests against this fake and raise
+    ``AttributeError`` in production.
+
+    Pin the typed shape on the base fake so the fake and the real thing agree.
+    """
+    fake_gh = FakeGitHub()
+    # The default PR ships OPEN; flip it to MERGED so it matches.
+    fake_gh.prs[0]["state"] = "MERGED"
+
+    result = fake_gh.merged_prs_for_issue(123, "agent/issue-")
+
+    assert isinstance(result, github_module.MergedPRSearchResult)
+    assert result.ok is True
+    assert [pr["number"] for pr in result] == [456]
+    # An empty search must still carry the typed shape (ok=True, not a bare []).
+    empty = fake_gh.merged_prs_for_issue(999, "agent/issue-")
+    assert isinstance(empty, github_module.MergedPRSearchResult)
+    assert empty.ok is True
+    assert list(empty) == []
 
 
 def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> None:
