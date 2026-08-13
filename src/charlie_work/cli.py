@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ import yaml
 
 from . import CLI_NAME
 from .closing_keyword_gate import find_unexpected_closing_references
-from .config import ConfigError, find_config_path
+from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
     compute_api_worker_fleet_report,
@@ -36,7 +37,7 @@ from . import layout
 from .logging_setup import configure_logging
 from .instrumentation import query_events
 from .notify import AttentionDigest, AttentionEntry, emit_digest
-from .paths import RepoNotFoundError, find_repo_root, resolved_layout, runtime_paths
+from .paths import RepoNotFoundError, RuntimePaths, find_repo_root, resolved_layout, runtime_paths
 from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
@@ -517,21 +518,62 @@ def _assert_config_repo_matches(config_arg: Path | None, repo_root: Path) -> Non
     )
 
 
-def build_app(args: argparse.Namespace) -> OrchestratorApp:
+@dataclass(frozen=True)
+class CommandContext:
+    """The four bootstrap artifacts every command handler needs (issue #705).
+
+    Centralizes the ``find_repo_root`` -> ``load_layered_config`` ->
+    ``runtime_paths`` -> ``GitHub(...)`` sequence so a new command handler
+    cannot get the bootstrap order or arguments wrong — there is only one
+    way to call it. Frozen to match the project invariant that config/value
+    objects are immutable.
+    """
+
+    repo_root: Path
+    config: OrchestratorConfig
+    paths: RuntimePaths
+    gh: GitHub
+
+
+def bootstrap_command(args: argparse.Namespace) -> CommandContext:
+    """Run the four-call CLI bootstrap once, returning a frozen context.
+
+    This is the single shared entry point for the
+    ``find_repo_root`` -> ``_assert_config_repo_matches`` ->
+    ``load_layered_config`` -> ``runtime_paths`` -> ``GitHub(...)`` sequence
+    that every command handler needs (issue #705).  Previously each handler
+    reproduced the calls independently, with no compiler or test enforcing
+    the order — a new handler that forgot one call silently bootstrapped
+    against the wrong repo root / config layer / runtime paths.
+
+    ``_assert_config_repo_matches`` (issue #895) is included here so every
+    command inherits the config-vs-state misroute guard, not only
+    ``build_app``.  ``run_runners_allocate`` is the one exception: it uses
+    ``require_global=True`` with custom error handling and cannot use this
+    helper.
+    """
     repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
     _assert_config_repo_matches(args.config, repo_root)
     config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
-    touch_repo(args.fleet_dir, repo_root, paths, gh, dry_run=args.dry_run)
+    return CommandContext(repo_root=repo_root, config=config, paths=paths, gh=gh)
+
+
+def build_app(args: argparse.Namespace) -> OrchestratorApp:
+    ctx = bootstrap_command(args)
+    touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh, dry_run=args.dry_run)
     return OrchestratorApp(
-        repo_root, paths, config, gh, dry_run=args.dry_run, fleet_dir_override=args.fleet_dir
+        ctx.repo_root,
+        ctx.paths,
+        ctx.config,
+        ctx.gh,
+        dry_run=args.dry_run,
+        fleet_dir_override=args.fleet_dir,
     )
 
 
 def run_doctor_command(args: argparse.Namespace) -> CommandResult:
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config_path = find_config_path(repo_root, args.config)
     # #6-G: doctor exists to diagnose a broken repo, so it must not itself
     # crash on the exact condition it is meant to diagnose (e.g. the
     # unknown-config-key ConfigError that silently killed the cw fleet lane
@@ -540,8 +582,13 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
     # `except (ConfigError, ValueError)` handler, which prints to stderr and
     # exits 2 with no machine-readable finding at all.
     try:
-        config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+        ctx = bootstrap_command(args)
     except ConfigError as exc:
+        # bootstrap_command calls find_repo_root before the failing call, so
+        # re-running it here for the error-message path is safe and
+        # deterministic.  Doctor is not performance-sensitive.
+        repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
+        config_path = find_config_path(repo_root, args.config)
         check = DoctorCheck(
             name="config file",
             ok=False,
@@ -552,15 +599,14 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
             "doctor: 1 finding(s), at least one blocking",
             {"checks": [check.to_dict()]},
         )
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
-    touch_repo(args.fleet_dir, repo_root, paths, gh, dry_run=args.dry_run)
+    config_path = find_config_path(ctx.repo_root, args.config)
+    touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh, dry_run=args.dry_run)
     ok, checks = run_doctor(
-        repo_root,
-        paths,
-        config,
+        ctx.repo_root,
+        ctx.paths,
+        ctx.config,
         config_path,
-        gh,
+        ctx.gh,
         adapter_probe=args.adapter_probe,
         live=args.live,
         fleet_dir_override=args.fleet_dir,
@@ -577,17 +623,14 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
 
 
 def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
-    state = load_state_locked(paths.state_file)
+    ctx = bootstrap_command(args)
+    state = load_state_locked(ctx.paths.state_file)
     result = clean_worktrees(
-        repo_root,
-        resolved_layout(config, repo_root).worktrees,
+        ctx.repo_root,
+        resolved_layout(ctx.config, ctx.repo_root).worktrees,
         state,
-        config,
-        gh,
+        ctx.config,
+        ctx.gh,
         dry_run=args.dry_run,
     )
     return CommandResult(result.ok, result.message, result.data)
@@ -615,15 +658,13 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
     scans PR body + every commit message with no negation awareness (issue
     #790; PR #788's own commit text is the regression fixture proving this).
     """
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
+    ctx = bootstrap_command(args)
 
-    pr = gh.pr_view(args.pr, fields=CLOSING_KEYWORD_PR_FIELDS)
+    pr = ctx.gh.pr_view(args.pr, fields=CLOSING_KEYWORD_PR_FIELDS)
     if not pr:
         return CommandResult(False, f"closing-keyword-check: could not fetch PR #{args.pr}", {})
 
-    commits = gh.pr_commits(args.pr)
+    commits = ctx.gh.pr_commits(args.pr)
     if commits is None:
         return CommandResult(
             False, f"closing-keyword-check: could not fetch commits for PR #{args.pr}", {}
@@ -633,7 +674,7 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
     intended = linked_issue_number(
         pr,
         is_cross_repository=pr.get("isCrossRepository"),
-        branch_prefix=config.dispatch.branch_prefix,
+        branch_prefix=ctx.config.dispatch.branch_prefix,
     )
 
     findings = find_unexpected_closing_references(
@@ -748,16 +789,15 @@ def run_migrate_state_dir_command(
     ``--apply`` with none given is refused rather than silently skipping the
     check.
     """
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    ctx = bootstrap_command(args)
 
     src_root = (
-        _resolve_migration_root(args.src, repo_root)
+        _resolve_migration_root(args.src, ctx.repo_root)
         if args.src is not None
-        else runtime_paths(repo_root, config.runtime.state_dir).root
+        else ctx.paths.root
     )
     dst_root = (
-        _resolve_migration_root(args.dst, repo_root)
+        _resolve_migration_root(args.dst, ctx.repo_root)
         if args.dst is not None
         # ``.resolve()`` here (not just in ``layout.default_state_root``) matters:
         # ``runtime_paths`` above resolves symlinks/junctions in the *whole* src
@@ -767,7 +807,7 @@ def run_migrate_state_dir_command(
         # producing a same-place migration plan instead of the intended
         # already-migrated short-circuit. Safe on a not-yet-created dst: Path
         # .resolve() does not require the path to exist.
-        else layout.default_state_root(repo_root).resolve()
+        else layout.default_state_root(ctx.repo_root).resolve()
     )
 
     if _migration_path_key(src_root) == _migration_path_key(dst_root):
@@ -784,7 +824,7 @@ def run_migrate_state_dir_command(
 
     patterns = tuple(args.quiesce_patterns) if args.quiesce_patterns else ()
 
-    plan = planner(repo_root=repo_root, src_root=src_root, dst_root=dst_root)
+    plan = planner(repo_root=ctx.repo_root, src_root=src_root, dst_root=dst_root)
     rendered = _render_migration_plan(plan)
     data = {
         "src_root": str(plan.src_root),
@@ -1111,22 +1151,18 @@ def run_runners_status(args: argparse.Namespace) -> CommandResult:
 
     Returns an error if the runner_scaling feature is not enabled.
     """
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    ctx = bootstrap_command(args)
 
-    if not config.runner_scaling.enabled:
+    if not ctx.config.runner_scaling.enabled:
         return CommandResult(
             ok=False,
             message="runner_scaling feature is not enabled in config",
             data={},
         )
 
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=args.dry_run)
-
     try:
         pool_state = observe_runner_pool(
-            gh, config.runner_scaling, state_dir=paths.root, dry_run=args.dry_run
+            ctx.gh, ctx.config.runner_scaling, state_dir=ctx.paths.root, dry_run=args.dry_run
         )
         formatted = format_runner_pool_state(pool_state)
         return CommandResult(
@@ -1223,9 +1259,7 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
         evaluate as evaluate_shadow_gate,
     )
 
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    ctx = bootstrap_command(args)
 
     data: dict[str, Any] = {}
 
@@ -1236,7 +1270,7 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
     # created -- sqlite3.connect() would otherwise create an empty file the
     # instant query_events() opened it, which is not a "read-only reporter"
     # for a store that was never written.
-    events_db_path = paths.root / "events.db"
+    events_db_path = ctx.paths.root / "events.db"
     events_db_found = events_db_path.exists()
     data["events_db"] = {"path": str(events_db_path), "found": events_db_found}
 
@@ -1258,7 +1292,7 @@ def run_runners_shadow_status(args: argparse.Namespace) -> CommandResult:
         # live corpus is ~2000 runner_allocation rows, trivial to scan, and a
         # limit risks missing the latest prologue row behind a burst of cli
         # rows within the window.
-        allocation_events = query_events(paths.state_file, kind="runner_allocation")
+        allocation_events = query_events(ctx.paths.state_file, kind="runner_allocation")
         for event in reversed(allocation_events):  # most recent (highest id) first
             source = event.get("payload", {}).get("source")
             if source == UNATTENDED_ALLOCATION_SOURCE and prologue_event is None:
@@ -1418,10 +1452,9 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
     is the only thing allowed to decide which listeners run"). The guard
     enforces that invariant at one boundary rather than documenting it.
     """
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
+    ctx = bootstrap_command(args)
 
-    if not config.runner_scaling.enabled:
+    if not ctx.config.runner_scaling.enabled:
         return CommandResult(
             ok=False,
             message="runner_scaling feature is not enabled in config",
@@ -1436,7 +1469,7 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
     # the single controller; --force is the explicit escape hatch for a
     # deliberate manual recovery that allocate cannot do.
     force = getattr(args, "force", False)
-    if config.runner_allocation.enabled and not force:
+    if ctx.config.runner_allocation.enabled and not force:
         return CommandResult(
             ok=False,
             message=(
@@ -1448,14 +1481,14 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
             data={"runner_allocation_enabled": True},
         )
 
-    if not config.runner_scaling.managed_root:
+    if not ctx.config.runner_scaling.managed_root:
         return CommandResult(
             ok=False,
             message="runner_scaling.managed_root is not configured",
             data={},
         )
 
-    managed_root = Path(config.runner_scaling.managed_root)
+    managed_root = Path(ctx.config.runner_scaling.managed_root)
     if not managed_root.exists():
         return CommandResult(
             ok=False,
@@ -1468,8 +1501,8 @@ def run_runners_ensure_started(args: argparse.Namespace) -> CommandResult:
 
     started_count, messages = ensure_runners_started(
         managed_root,
-        config.runner_scaling.runner_dir_prefix,
-        config.runner_scaling,
+        ctx.config.runner_scaling.runner_dir_prefix,
+        ctx.config.runner_scaling,
         dry_run=dry_run,
     )
 
@@ -1492,25 +1525,23 @@ def run_runners_scale_down(args: argparse.Namespace) -> CommandResult:
 
     Returns an error if the runner_scaling feature is not enabled.
     """
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    ctx = bootstrap_command(args)
 
-    if not config.runner_scaling.enabled:
+    if not ctx.config.runner_scaling.enabled:
         return CommandResult(
             ok=False,
             message="runner_scaling feature is not enabled in config",
             data={},
         )
 
-    if not config.runner_scaling.managed_root:
+    if not ctx.config.runner_scaling.managed_root:
         return CommandResult(
             ok=False,
             message="runner_scaling.managed_root is not configured",
             data={},
         )
 
-    managed_root = Path(config.runner_scaling.managed_root)
+    managed_root = Path(ctx.config.runner_scaling.managed_root)
     if not managed_root.exists():
         return CommandResult(
             ok=False,
@@ -1521,14 +1552,12 @@ def run_runners_scale_down(args: argparse.Namespace) -> CommandResult:
     # Use subparser-specific dry_run flag if available, otherwise fall back to global
     dry_run = getattr(args, "dry_run", False)
 
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
-
     removed_count, errors = scale_down_idle_runners(
         managed_root,
-        config.runner_scaling.runner_dir_prefix,
-        gh,
-        config.runner_scaling,
-        paths.root,
+        ctx.config.runner_scaling.runner_dir_prefix,
+        ctx.gh,
+        ctx.config.runner_scaling,
+        ctx.paths.root,
         dry_run=dry_run,
     )
 
@@ -1552,11 +1581,9 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
 
     Returns an error if the runner_scaling feature is not enabled.
     """
-    repo_root = find_repo_root(args.repo, explicit=args.repo is not None)
-    config = load_layered_config(repo_root, args.config, fleet_dir_override=args.fleet_dir)
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    ctx = bootstrap_command(args)
 
-    if not config.runner_scaling.enabled:
+    if not ctx.config.runner_scaling.enabled:
         return CommandResult(
             ok=False,
             message="runner_scaling feature is not enabled in config",
@@ -1567,17 +1594,17 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
     dry_run = getattr(args, "dry_run", False)
     fleet_wide = getattr(args, "fleet_wide", False)
 
-    gh = GitHub(repo_root=repo_root, runtime=config.runtime, dry_run=dry_run)
-
     # Observe current pool state
-    state = observe_runner_pool(gh, config.runner_scaling, state_dir=paths.root, dry_run=dry_run)
+    state = observe_runner_pool(
+        ctx.gh, ctx.config.runner_scaling, state_dir=ctx.paths.root, dry_run=dry_run
+    )
 
     # Load fleet-wide totals if requested
     fleet_totals: FleetTotals | None = None
     skipped_repos: list[str] = []
     if fleet_wide:
         total_runners, total_busy_runners, skipped_repos = count_fleet_runners(
-            args.fleet_dir, runtime=config.runtime
+            args.fleet_dir, runtime=ctx.config.runtime
         )
         fleet_totals = FleetTotals(
             total_runners=total_runners,
@@ -1585,15 +1612,15 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
         )
 
     # Check cooldown and idle duration
-    in_cooldown = is_in_cooldown(paths.root, config.runner_scaling.cooldown_minutes)
+    in_cooldown = is_in_cooldown(ctx.paths.root, ctx.config.runner_scaling.cooldown_minutes)
     is_idle_for_duration = is_pool_idle_for_minutes(
-        paths.root, config.runner_scaling.idle_scale_down_minutes
+        ctx.paths.root, ctx.config.runner_scaling.idle_scale_down_minutes
     )
 
     # Run the pure decision function
     decision = decide_autoscale(
         state,
-        config.runner_scaling,
+        ctx.config.runner_scaling,
         fleet_totals=fleet_totals,
         in_cooldown=in_cooldown,
         is_idle_for_duration=is_idle_for_duration,
@@ -1634,18 +1661,18 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
         # Requires ci_runners #92 merged and deployed: the currently installed
         # ci_fleet.provision_runner does not yet accept these kwargs.
         result = provision_runner(
-            gh,
-            config.runner_scaling,
+            ctx.gh,
+            ctx.config.runner_scaling,
             state.busy_runners,
             dry_run=False,
-            reserved_threads=config.runner_allocation.reserved_threads,
-            threads_per_slot=config.runner_allocation.threads_per_slot,
+            reserved_threads=ctx.config.runner_allocation.reserved_threads,
+            threads_per_slot=ctx.config.runner_allocation.threads_per_slot,
         )
         if result.ok:
             # Record scale event
             from ci_fleet.charlie_work_adapter import record_scale_event
 
-            record_scale_event(paths.root, "up")
+            record_scale_event(ctx.paths.root, "up")
             return CommandResult(
                 ok=True,
                 message=f"autoscale: scaled up by {decision.count} - {decision.reason}",
@@ -1675,7 +1702,7 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
                 },
             )
     elif decision.action == ScaleAction.DOWN:
-        managed_root = Path(config.runner_scaling.managed_root)
+        managed_root = Path(ctx.config.runner_scaling.managed_root)
         if not managed_root.exists():
             return CommandResult(
                 ok=False,
@@ -1685,10 +1712,10 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
 
         removed_count, errors = scale_down_idle_runners(
             managed_root,
-            config.runner_scaling.runner_dir_prefix,
-            gh,
-            config.runner_scaling,
-            paths.root,
+            ctx.config.runner_scaling.runner_dir_prefix,
+            ctx.gh,
+            ctx.config.runner_scaling,
+            ctx.paths.root,
             dry_run=False,
         )
         return CommandResult(
