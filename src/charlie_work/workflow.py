@@ -102,10 +102,13 @@ from .janitor import (
 from .labels import TransitionOutcome, transition
 from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import (
+    PromptTemplateError,
     assert_conventional_commit_title,
     assert_no_merge_contract,
     prompt_template_digest,
     render_prompt,
+    resolve_template,
+    unsupplied_placeholders,
 )
 from .reconcile import (
     DriftItem,
@@ -5059,6 +5062,128 @@ def _rework_prompt_search_dirs(
     return (path,)
 
 
+# Issue #713: canonical key sets each prompt writer supplies to
+# ``render_prompt`` -- the explicit ``values`` dict, excluding the dynamic
+# ``$section_*`` partials ``section_variables`` discovers on disk. Used by
+# ``check_prompt_template_drift`` to fail fast -- at supervisor startup and
+# in CI -- when a repo-local flat whole-file override references a
+# placeholder the writer no longer provides. This is the durable,
+# structural fix for the bug class where job-cannon's flat ``rework.md``
+# override kept ``$review_summary`` after commit 5844c34 (PR #661) renamed
+# the writer's slot to ``$dispatch_note`` / ``$required_changes_section``:
+# ``render_prompt``'s strict mode catches the crash at dispatch time, but
+# nothing caught it *before* dispatch, so it stayed live-armed on a running
+# process until the next rework dispatch actually fired.
+#
+# The subset direction is deliberate: an override legitimately uses fewer
+# placeholders than the writer supplies (job-cannon's ``worker.md`` uses 6
+# of these 8 worker keys), so the check fails only when the template reaches
+# for a placeholder the writer never provides -- never when it merely
+# ignores one the writer does. The reverse direction (every supplied key
+# used) is not an error; at most a lint.
+#
+# Kept honest against the real writers by the registry-drift guard in
+# ``tests/test_prompt_template_drift_check.py``, which monkeypatches
+# ``render_prompt`` to capture the keys the writer actually passes and
+# asserts these frozensets match exactly.
+WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
+    # OrchestratorApp._write_worker_prompt -- the literal ``values`` dict
+    # passed to ``self._render`` (see the writer below in this file).
+    {
+        "issue_number",
+        "issue_title",
+        "issue_url",
+        "issue_body",
+        "issue_body_block",
+        "issue_comments",
+        "branch_name",
+        "worker_model_tier",
+    }
+)
+REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
+    # _render_rework_prompt -- the literal ``values`` dict passed to
+    # ``render_prompt`` (see the writer below in this file).
+    {
+        "pr_number",
+        "pr_title",
+        "pr_url",
+        "issue_number",
+        "dispatch_note",
+        "dispatch_note_block",
+        "required_changes_section",
+        "branch_name",
+    }
+)
+
+
+class PromptOverrideDriftError(RuntimeError):
+    """One or more configured prompt templates reference placeholders their
+    writer does not supply (issue #713).
+
+    Raised at supervisor startup (and asserted in CI) by
+    :func:`check_prompt_template_drift` so a repo-local flat whole-file
+    override that drifted out of sync with the orchestrator's writer -- e.g.
+    a flat ``rework.md`` still referencing ``$review_summary`` after the
+    writer renamed it to ``$dispatch_note`` -- fails fast before any
+    dispatch, instead of staying live-armed until the next dispatch crashes
+    with an uncaught :class:`PromptTemplateError`.
+    """
+
+    def __init__(self, errors: Sequence["PromptTemplateError"]) -> None:
+        self.errors = tuple(errors)
+        details = "; ".join(str(error) for error in self.errors)
+        super().__init__(
+            f"prompt template drift detected (issue #713); refusing to start: {details}"
+        )
+
+
+def check_prompt_template_drift(
+    config: OrchestratorConfig, *, search_dirs: Sequence[Path] = ()
+) -> list[PromptTemplateError]:
+    """Static placeholder-subset check for every configured prompt template.
+
+    For each template dispatch will render -- the configured worker/rework
+    templates from ``DispatchConfig`` and ``ApiWorkerConfig`` -- resolve it the
+    way dispatch would (repo-local override first, then the package default)
+    and assert every ``$placeholder`` it references (after expanding the
+    ``$section_*`` partials it pulls in) is a subset of the key set the
+    corresponding writer supplies together with the section variables
+    discovered on disk. Returns a list of :class:`PromptTemplateError` values,
+    one per drifting template; an empty list means every configured template
+    is safe to render.
+
+    Pure static check: no dispatch, no worker, no network. It reads template
+    and section files off disk only, so it runs at supervisor startup
+    (``OrchestratorApp.__init__``) and in CI -- catching the #713 bug class
+    (a flat override armed with a stale placeholder) before it can crash a
+    live dispatch.
+
+    A configured template name that resolves to no file (a typo, or a custom
+    name neither the override nor the package ships) is skipped here: that is
+    a separate config error dispatch surfaces as a ``FileNotFoundError``, not
+    placeholder drift, and conflating the two would muddy the drift report.
+    """
+    pairs: list[tuple[str, frozenset[str]]] = [
+        (config.dispatch.worker_template, WORKER_PROMPT_KEYS),
+        (config.dispatch.rework_template, REWORK_PROMPT_KEYS),
+        (config.api_worker.worker_template, WORKER_PROMPT_KEYS),
+        (config.api_worker.rework_template, REWORK_PROMPT_KEYS),
+    ]
+    errors: list[PromptTemplateError] = []
+    seen: set[str] = set()
+    for template_name, keys in pairs:
+        if template_name in seen:
+            continue
+        seen.add(template_name)
+        resolved = resolve_template(template_name, search_dirs)
+        if not resolved.is_file():
+            continue
+        missing = unsupplied_placeholders(template_name, keys, search_dirs=search_dirs)
+        if missing:
+            errors.append(PromptTemplateError(resolved, missing))
+    return errors
+
+
 def _annotation_to_required_change(check_name: str, annotation: dict[str, Any]) -> str | None:
     """Format a single GitHub check-run annotation as a ``required_changes`` entry.
 
@@ -6875,6 +7000,18 @@ class OrchestratorApp:
         else:
             self.prompt_dirs = ()
         self.paths.ensure()
+
+        # Issue #713: fail fast at startup if any configured prompt template
+        # (repo-local override or package default) references a placeholder its
+        # writer does not supply. A flat whole-file override that drifted out of
+        # sync -- e.g. a stale ``$review_summary`` after the writer renamed it to
+        # ``$dispatch_note`` -- would otherwise stay live-armed until the next
+        # dispatch crashes with an uncaught PromptTemplateError (which is not
+        # caught anywhere in src/). This mirrors the gh field-list self-check
+        # below: a pure static gate that runs before any dispatch/review work.
+        drift_errors = check_prompt_template_drift(self.config, search_dirs=self.prompt_dirs)
+        if drift_errors:
+            raise PromptOverrideDriftError(drift_errors)
 
         # Startup self-check: validate gh --json field lists against the
         # installed CLI. Fail fast before any dispatch/review/merge work.
