@@ -562,17 +562,32 @@ def _run_fleet_allocation_prologue(
     # Any existing repo root works as the gh working directory: the allocation
     # pass addresses every repo by explicit owner/name slug, so the cwd's git
     # identity is irrelevant. Only auth and a valid directory are needed.
+    #
+    # The gh anchor and the event-store path are independent concerns (issue
+    # #603): the anchor only needs auth and a valid directory, whereas the
+    # state_path decides which events.db records the host-wide allocation
+    # event. Deriving state_path from the same registry entry that supplied the
+    # anchor filed a host-wide fact under whichever repo happened to sort first
+    # in the registry, and moved it when the registry order changed. The
+    # fleet-level store is the correct target — it is the same one
+    # ``supervisor_lifecycle`` already writes host-wide events to, and the
+    # per-repo databases are disjoint from it by event scope.
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
     anchor_root: Path | None = None
-    anchor_state: Path | None = None
     for entry in registry.get("repos", {}).values():
         candidate = Path(entry.get("repo_root") or "")
         if candidate.is_dir():
             anchor_root = candidate
-            state_dir = entry.get("state_dir")
-            anchor_state = layout.state_file_path(Path(state_dir)) if state_dir else None
             break
+
+    # Host-wide allocation events go to the fleet-level events.db, not any
+    # single repo's. ``log_event`` derives the database as
+    # ``state_path.parent / "events.db"``, so a path inside ``fleet_dir()``
+    # lands the events alongside the supervisor lifecycle events already there.
+    # See ``supervisor_lifecycle.py:18-20`` for the same call convention.
+    resolved_fleet_dir = fleet_dir(override=fleet_dir_override)
+    fleet_state_path = layout.state_file_path(resolved_fleet_dir)
 
     full_pass_interval_seconds = getattr(
         getattr(global_config, "supervisor", None),
@@ -595,6 +610,20 @@ def _run_fleet_allocation_prologue(
     runner_scaling = getattr(global_config, "runner_scaling", None)
     gh = GitHub(repo_root=anchor_root, runtime=runtime, dry_run=False)
 
+    # ``fleet_dir()`` is subject to MSIX AppData redirection on this host, so
+    # any write that lands there must go through the same virtualization guard
+    # ``supervisor_lifecycle`` uses for its heartbeat writes (issue #624, see
+    # also #590). The guard is warning-only and never blocks — it names where
+    # the write actually landed so "I deployed it" cannot be reported when the
+    # write forked a private copy invisible to daemons reading the same path
+    # string. Called once before the pass rather than per-event: the first
+    # ``log_event`` call creates the events.db file, and every subsequent write
+    # to it lands in the same directory, so a single probe covers the whole
+    # pass.
+    warn_fleet_dir_virtualization_on_write(
+        resolved_fleet_dir, context="writing fleet allocation events"
+    )
+
     # Issue #927: run_allocation_pass_with_ci_fleet_guard forces dry_run when
     # the editable ci_fleet dependency's src/ tree has uncommitted changes, so
     # this pass plans and reports but never parks or starts a runner. See the
@@ -604,7 +633,7 @@ def _run_fleet_allocation_prologue(
         allocation,
         managed_root_fallback=getattr(runner_scaling, "managed_root", "") or "",
         fleet_dir_override=fleet_dir_override,
-        state_path=anchor_state,
+        state_path=fleet_state_path,
         dry_run=dry_run,
         source=UNATTENDED_ALLOCATION_SOURCE,
         full_pass_interval_seconds=full_pass_interval_seconds,
@@ -664,18 +693,17 @@ def _run_fleet_allocation_prologue(
             )
         )
         logger.info("Fleet allocation prologue: skipped - %s", reason)
-        if anchor_state is not None:
-            # Durable record in events.db, not just the in-memory digest that
-            # feeds notify sinks — mirrors _record_lane_failure_event's
-            # attention-event + log_event pairing just above. anchor_state is
-            # only known once run_allocation_pass has actually been called
-            # (this branch), unlike the earlier pre-flight skips, which
-            # decline before an anchor is resolved.
-            log_event(
-                anchor_state,
-                "runner_allocation_skipped",
-                {"reason": reason, "source": UNATTENDED_ALLOCATION_SOURCE, "dry_run": dry_run},
-            )
+        # Durable record in the fleet-level events.db, not just the in-memory
+        # digest that feeds notify sinks — mirrors _record_lane_failure_event's
+        # attention-event + log_event pairing just above. The fleet-level path
+        # is always available here (it is derived from fleet_dir, not from a
+        # registry entry's state_dir), so a decline is always durably recorded
+        # regardless of which repo anchored the gh client (issue #603).
+        log_event(
+            fleet_state_path,
+            "runner_allocation_skipped",
+            {"reason": reason, "source": UNATTENDED_ALLOCATION_SOURCE, "dry_run": dry_run},
+        )
         return skipped(reason)
 
     # Report the inputs alongside the outcome: "started=0 parked=0" is the correct
