@@ -1342,9 +1342,16 @@ def detect_drift(
                                 # Mark this issue as handled to avoid double-emission with
                                 # issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
                                 issues_handled_by_session_relabel.add(w.issue_number)
-                            elif active_labels and is_completed:
+                            elif active_labels and inspection.ahead_count > 0:
                                 # Issue #252: completed-but-unpublished work takes the salvage
                                 # path (push + PR) instead of re-dispatching.
+                                # Issue #1130: relax from ``is_completed`` to
+                                # ``ahead_count > 0`` — a worktree with
+                                # committed-but-unpushed work plus shim/scaffolding
+                                # dirt (not in ``injected_paths``) classifies as
+                                # PARTIAL, not COMPLETED, but the committed work
+                                # is still salvageable. Salvage pushes the branch
+                                # ref (the committed work), not the working tree.
                                 base_branch = None
                                 if inspection.resolved_base_ref:
                                     base_branch = resolve_base_branch_name(
@@ -1368,7 +1375,7 @@ def detect_drift(
                                         issue_number=w.issue_number,
                                         pr_number=None,
                                         detail=(
-                                            f"issue #{w.issue_number} session has a clean worktree "
+                                            f"issue #{w.issue_number} session has a worktree "
                                             f"with {inspection.ahead_count} unpushed commit(s); "
                                             f"salvaging by pushing branch '{w.branch}' and opening a PR"
                                         ),

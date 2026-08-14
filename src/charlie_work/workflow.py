@@ -6697,38 +6697,79 @@ def _classify_dead_sessions_and_update_throttle_state(
                     issue = None
                 issue_labels = label_names(issue) if issue else set()
                 active_labels = issue_labels & config.labels.active
-                with state_lock(state_file):
-                    state = load_state(state_file)
-                    entry = state["issues"].get(str(w.issue_number), {})
-                    now = datetime.now(UTC)
-                    redispatch_at = _windowed_redispatch_at(
-                        entry, window_minutes=config.watchdog.redispatch_window_minutes
-                    ) + [now.isoformat().replace("+00:00", "Z")]
-                    # Issue #783: a deterministic launch failure kind is a
-                    # process failure, not a judgment call -- mechanical.
-                    state = _escalate_issue(
-                        state,
-                        w.issue_number,
-                        reason=failure_kind,
-                        reason_class="mechanical",
-                        issue_extra={"redispatch_at": redispatch_at},
+
+                # Issue #1130: before escalating a ``worktree_unsafe`` launch
+                # failure, attempt salvage. A ``worktree_unsafe`` failure means
+                # redispatch found the worktree holding unpushed commits — that
+                # is exactly the work salvage exists to recover. Escalating to
+                # a human without attempting the cheap safe action (push the
+                # branch + open a PR) inverts the priority: salvage-the-commit
+                # first, human adjudication only when salvage fails.
+                salvaged_from_unsafe = False
+                if (
+                    failure_kind == "worktree_unsafe"
+                    and repo_root is not None
+                    and w.branch
+                    and active_labels
+                ):
+                    worktrees_dir = resolved_layout(config, repo_root).worktrees
+                    wt_path = worktree_path_for_branch(repo_root, w.branch, worktrees_dir)
+                    unsafe_inspection = inspect_worktree_state(
+                        wt_path,
+                        config.dispatch.base_ref,
+                        config.dispatch.injected_paths,
+                        config.dispatch.materialize_dirs,
                     )
-                    state["issues"][str(w.issue_number)].pop("worker_pid", None)
-                    state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
-                    save_state(state_file, state)
-                    transition(gh, config.labels, w.issue_number, "redispatch_escalated")
-                    state = append_event(
-                        state,
-                        "session_failed_escalated",
-                        {
-                            "issue_number": w.issue_number,
-                            "failure_kind": failure_kind,
-                            "removed_labels": sorted(active_labels),
-                            "redispatch_count": len(redispatch_at),
-                        },
-                        state_path=state_file,
-                    )
-                    save_state(state_file, state)
+                    if unsafe_inspection.ahead_count > 0:
+                        salvaged_from_unsafe, _ = _attempt_salvage(
+                            gh=gh,
+                            config=config,
+                            repo_root=repo_root,
+                            worktree_path=wt_path if wt_path.is_dir() else repo_root,
+                            branch=w.branch,
+                            base_ref=unsafe_inspection.resolved_base_ref
+                            or config.dispatch.base_ref,
+                            issue_number=w.issue_number,
+                            active_labels=active_labels,
+                            issue_labels=issue_labels,
+                            state_file=state_file,
+                            failure_kind=failure_kind,
+                            issue_title=issue.get("title") if issue else None,
+                        )
+
+                if not salvaged_from_unsafe:
+                    with state_lock(state_file):
+                        state = load_state(state_file)
+                        entry = state["issues"].get(str(w.issue_number), {})
+                        now = datetime.now(UTC)
+                        redispatch_at = _windowed_redispatch_at(
+                            entry, window_minutes=config.watchdog.redispatch_window_minutes
+                        ) + [now.isoformat().replace("+00:00", "Z")]
+                        # Issue #783: a deterministic launch failure kind is a
+                        # process failure, not a judgment call -- mechanical.
+                        state = _escalate_issue(
+                            state,
+                            w.issue_number,
+                            reason=failure_kind,
+                            reason_class="mechanical",
+                            issue_extra={"redispatch_at": redispatch_at},
+                        )
+                        state["issues"][str(w.issue_number)].pop("worker_pid", None)
+                        state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
+                        save_state(state_file, state)
+                        transition(gh, config.labels, w.issue_number, "redispatch_escalated")
+                        state = append_event(
+                            state,
+                            "session_failed_escalated",
+                            {
+                                "issue_number": w.issue_number,
+                                "failure_kind": failure_kind,
+                                "removed_labels": sorted(active_labels),
+                                "redispatch_count": len(redispatch_at),
+                            },
+                            state_path=state_file,
+                        )
+                        save_state(state_file, state)
 
             w.reap_sidecar(
                 sessions_dir,
@@ -6925,8 +6966,23 @@ def _classify_dead_sessions_and_update_throttle_state(
 
                 # Issue #252: completed-but-unpublished work takes the salvage
                 # path (push + PR) instead of re-dispatching.
+                # Issue #1130: relax the salvage trigger from ``is_completed``
+                # (clean + ahead) to ``ahead_count > 0`` (ahead, regardless of
+                # working-tree dirt). A worker that dies mid-push leaves a
+                # committed-but-unpushed branch; the worktree may also carry
+                # shim/scaffolding dirt (e.g. ``.devin/`` artifacts) that is
+                # not in ``injected_paths`` and so reads as worker-authored
+                # dirty, classifying the worktree PARTIAL instead of COMPLETED.
+                # Salvage pushes the branch ref (the committed work), not the
+                # working tree — the dirt is irrelevant to the push and survives
+                # in the worktree for later inspection. Without this relaxation
+                # the dead-session lane relabels to ready, the next redispatch
+                # hits the unpushed commits, raises ``worktree_unsafe``, and
+                # escalates to a human without ever attempting the cheap safe
+                # action (salvage-the-commit).
                 salvage_error: str | None = None
-                if is_completed and repo_root is not None:
+                has_salvageable_commits = inspection.ahead_count > 0
+                if has_salvageable_commits and repo_root is not None:
                     salvaged, salvage_error = _attempt_salvage(
                         gh=gh,
                         config=config,
@@ -7034,7 +7090,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                         removed_labels=sorted(active_labels),
                         added_ready=needs_ready,
                         label_write_ok=label_write_ok,
-                        salvage_failed=is_completed,
+                        salvage_failed=has_salvageable_commits,
                         salvage_error=salvage_error,
                         state_path=state_file,
                     )
@@ -21663,14 +21719,18 @@ class OrchestratorApp:
         ``"dispatch_failed"`` so the caller's entry-building frees the slot;
         ``dispatched_at`` is ``None`` because no worker was actually launched.
         """
-        from .worktree import WorktreeState
-
         issue_number = request.issue_number
 
         # Issue #1122: inspect the worktree before reaping. A completed or
         # push-succeeded worktree must be left for the reaper lane's salvage
         # path (_attempt_salvage). Reaping the sidecar here would destroy the
         # key the reaper lane iterates over, making salvage impossible.
+        # Issue #1130: relax the preserve condition from ``COMPLETED`` to
+        # ``ahead_count > 0`` — a worktree with committed-but-unpushed work
+        # that also has shim/scaffolding dirt (not in ``injected_paths``)
+        # classifies as PARTIAL, not COMPLETED, but the committed work is
+        # still salvageable. The reaper lane's salvage condition was relaxed
+        # to match (see ``_classify_dead_sessions_and_update_throttle_state``).
         phantom_workers = [w for w in iter_workers(sessions_dir) if w.issue_number == issue_number]
         for w in phantom_workers:
             worktree_path = Path(w.worktree_path)
@@ -21686,7 +21746,7 @@ class OrchestratorApp:
                 and worker_outcome.get("push_succeeded") is True
                 and worker_outcome.get("pr_created") is False
             )
-            if inspection.state == WorktreeState.COMPLETED or reported_push:
+            if inspection.ahead_count > 0 or reported_push:
                 # Preserve the sidecar so the reaper lane can salvage. Do NOT
                 # strip labels -- the issue should stay in its active state
                 # until salvage moves it to pr_open, preventing re-dispatch
