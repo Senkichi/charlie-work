@@ -14301,6 +14301,40 @@ class OrchestratorApp:
             and (approved or not self.config.auto_merge.require_approved_review)
             and not sync_failed
         )
+        # Issue #840: escalation gate on the merge-execution block. An
+        # approved, green, conflict-free PR whose linked issue (or the PR
+        # itself) is escalated (status == "escalated", i.e. a human has been
+        # asked to intervene via agent:human-needed) must NOT be actually
+        # merged while that flag is up -- even when the specific reason for
+        # escalation is unrelated to mergeability (e.g. a dead request-
+        # changes-fix worker exhausting the watchdog's redispatch cap; real
+        # corpus: issues #592/#648/#606). Silently completing an irreversible
+        # merge while escalated defeats the purpose of raising the flag.
+        #
+        # This is a plain gate on the merge-execution block ONLY -- it does
+        # NOT modify ``can_merge``, so the failed-attempt-alarm counter block
+        # below still sees ``can_merge`` True and zeroes the streak via the
+        # ``elif can_merge:`` branch (a green pass held by escalation is not
+        # a failed pass). Modifying ``can_merge`` itself would make
+        # ``approved and not can_merge`` true, incrementing the counter every
+        # pass and eventually firing a spurious merge_attempt_alarm for a PR
+        # that isn't failing to merge for a mergeability reason -- a
+        # diagnostic regression in the same spirit as the unbounded-counter
+        # bug issue #777(b) fixed for PR #679.
+        #
+        # State is re-read here rather than reusing a flag computed at
+        # function entry: the carry-forward / head_moved / merge-conflict
+        # branches above can each write a new status for this PR/issue
+        # mid-call, so only a read taken at this exact point is trustworthy
+        # (same pattern as the head_moved branch's escalation read above).
+        _escalation_snap = load_state_locked(self.paths.state_file)
+        _pr_escalated, _issue_escalated = _escalation_flags(
+            _escalation_snap.get("prs", {}).get(str(pr_number), {}),
+            _escalation_snap.get("issues", {}).get(str(issue_number), {})
+            if issue_number is not None
+            else None,
+        )
+        escalated_merge_hold = can_merge and (_pr_escalated or _issue_escalated)
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
         # Issue #747: timestamp of the fleet's own merge_pr success (None until
@@ -14313,7 +14347,7 @@ class OrchestratorApp:
         mergequeue_label_applied: bool | None = None
         merge_hold: bool = False
         merge_hold_check_unavailable: bool = False
-        if can_merge and should_merge:
+        if can_merge and should_merge and not escalated_merge_hold:
             mergequeue_label = self.config.auto_merge.mergequeue_label
             if mergequeue_label:
                 # Aviator MergeQueue handoff (task #10): apply the trigger
@@ -14851,12 +14885,15 @@ class OrchestratorApp:
             "mergequeue_label_applied": mergequeue_label_applied,
             "merge_hold": merge_hold,
             "merge_hold_check_unavailable": merge_hold_check_unavailable,
+            "escalated_merge_hold": escalated_merge_hold,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
             message = f"cross-PR revert detected: {cross_pr_revert_reason}"
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
+        elif escalated_merge_hold:
+            message += " (escalated — merge held while agent:human-needed is up)"
         elif merge_hold_check_unavailable:
             message += f" (merge-hold check unavailable for issue #{issue_number} — not handed off to Aviator)"
         elif merge_hold:
@@ -15082,13 +15119,25 @@ class OrchestratorApp:
             and (approved or not self.config.auto_merge.require_approved_review)
             and not sync_failed
         )
+        # Issue #840: mirror the real path's escalation gate so the dry-run
+        # preview accurately reports "would be held" instead of "would merge"
+        # when the PR or its linked issue is escalated. Reuses the read-only
+        # ``state`` snapshot loaded at the top of this dry-run (no mid-call
+        # writes happen in dry-run, unlike the real path's re-read).
+        _pr_escalated, _issue_escalated = _escalation_flags(
+            existing_pr_state,
+            state.get("issues", {}).get(str(issue_number), {})
+            if issue_number is not None
+            else None,
+        )
+        escalated_merge_hold = can_merge and (_pr_escalated or _issue_escalated)
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         mergequeue_label = self.config.auto_merge.mergequeue_label
 
         # Read-only merge-hold check (same condition as the real path).
         merge_hold = False
         merge_hold_check_unavailable = False
-        if can_merge and should_merge:
+        if can_merge and should_merge and not escalated_merge_hold:
             merge_hold = self.config.labels.merge_hold in label_names(pr)
             if not merge_hold and issue_number is not None:
                 try:
@@ -15107,11 +15156,13 @@ class OrchestratorApp:
 
         # Describe what *would* happen so the preview is actionable.
         message = "dry-run: merge readiness evaluated"
-        if can_merge and should_merge and not merge_hold:
+        if can_merge and should_merge and not merge_hold and not escalated_merge_hold:
             if mergequeue_label:
                 message += f" (would hand off to mergequeue label {mergequeue_label!r})"
             else:
                 message += " (would merge)"
+        elif escalated_merge_hold:
+            message += " (escalated — would hold merge while agent:human-needed is up)"
         elif merge_hold:
             message += (
                 f" (merge-hold label {self.config.labels.merge_hold!r} present"
@@ -15159,6 +15210,7 @@ class OrchestratorApp:
                 "mergequeue_label_applied": None,
                 "merge_hold": merge_hold,
                 "merge_hold_check_unavailable": merge_hold_check_unavailable,
+                "escalated_merge_hold": escalated_merge_hold,
                 "dry_run": True,
             },
         )
