@@ -132,7 +132,7 @@ def _fake_issue(number: int = 1) -> dict[str, object]:
 
 def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker.md's real caller is ``OrchestratorApp._write_worker_prompt``
-    (workflow.py:22111-22177), used unmodified whenever
+    (workflow.py:22166-22232), used unmodified whenever
     ``config.dispatch.worker_template`` (default ``"worker.md"``) is
     selected -- see the `intake()` call site at workflow.py:8132.
 
@@ -182,8 +182,8 @@ def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
 
 def test_rework_md_renders_via_real_writer_with_no_prior_decision(tmp_path: Path) -> None:
     """rework.md's real caller is the module-level ``_write_rework_prompt``
-    (workflow.py:6248-6313), which delegates to ``_render_rework_prompt``
-    (workflow.py:6202-6245) for the literal ``values`` dict passed to
+    (workflow.py:6249-6314), which delegates to ``_render_rework_prompt``
+    (workflow.py:6203-6246) for the literal ``values`` dict passed to
     ``render_prompt``. This exercises the no-verdict-on-disk shape
     (``required_changes_section`` resolves to ``""`` -- see
     ``_render_required_changes_section``, workflow.py:5935).
@@ -417,7 +417,7 @@ def test_rework_writer_rejects_flat_override_without_execution_contract(
 # can't hide behind the subset assertion alone.
 # ---------------------------------------------------------------------------
 
-# workflow.py:11131-11149, inside OrchestratorApp.review() -- the literal
+# workflow.py:11139-11156, inside OrchestratorApp.review() -- the literal
 # `values` dict passed to `self._render("review.md", {...})`.
 REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
@@ -436,7 +436,7 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "prior_review_section",
 }
 
-# workflow.py:16225-16236, inside OrchestratorApp._cross_family_for_pr() --
+# workflow.py:16273-16283, inside OrchestratorApp._cross_family_for_pr() --
 # the literal `values` dict passed to `self._render("cross_family_review.md", {...})`.
 CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
@@ -448,7 +448,7 @@ CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "diff_path",
 }
 
-# workflow.py:16102-16105, inside OrchestratorApp.spec_review() -- the
+# workflow.py:16150-16153, inside OrchestratorApp.spec_review() -- the
 # literal `values` dict passed to
 # `self._render("cross_family_spec_review.md", {...})`.
 CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS = {
@@ -488,7 +488,7 @@ def test_pinned_templates_actually_render_against_real_caller_keys() -> None:
 def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
     tmp_path: Path,
 ) -> None:
-    """review.md's real caller (workflow.py:11131-11149, ``OrchestratorApp.review()``)
+    """review.md's real caller (workflow.py:11139-11156, ``OrchestratorApp.review()``)
     is already subset- and render-tested above against *synthetic*
     ``f"<{key}>"`` values. This test additionally builds production-shaped
     values -- real ``Path`` objects for ``pr_json_path``/``diff_path``,
@@ -655,7 +655,7 @@ def test_every_shipped_template_is_covered_by_this_contract() -> None:
 # the corresponding entry here -- the test will tell you if you forget.
 _CITATION_EXPECTATIONS: dict[tuple[int, int], str] = {
     # ``_write_worker_prompt`` definition
-    (22111, 22177): "def _write_worker_prompt",
+    (22166, 22232): "def _write_worker_prompt",
     # ``intake()``'s ``_write_worker_prompt`` call (no template= override)
     (8132, 8132): "self._write_worker_prompt(full_issue",
     # api-worker dispatch path (dry-run preview branch)
@@ -663,17 +663,17 @@ _CITATION_EXPECTATIONS: dict[tuple[int, int], str] = {
     # dispatch loop matching path (real dispatch)
     (9425, 9427): "api_worker.worker_template",
     # ``_write_rework_prompt`` definition
-    (6248, 6313): "def _write_rework_prompt",
+    (6249, 6314): "def _write_rework_prompt",
     # ``_render_rework_prompt`` definition
-    (6202, 6245): "def _render_rework_prompt",
+    (6203, 6246): "def _render_rework_prompt",
     # ``_render_required_changes_section`` definition
     (5935, 5935): "def _render_required_changes_section",
     # ``OrchestratorApp.review()`` values dict for review.md
-    (11131, 11149): '"review.md"',
+    (11139, 11156): '"review.md"',
     # ``_cross_family_for_pr()`` values dict for cross_family_review.md
-    (16225, 16236): '"cross_family_review.md"',
+    (16273, 16283): '"cross_family_review.md"',
     # ``spec_review()`` values dict for cross_family_spec_review.md
-    (16102, 16105): '"cross_family_spec_review.md"',
+    (16150, 16153): '"cross_family_spec_review.md"',
     # ``review()``'s ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
     (10976, 10976): "pr_dir = self.paths.prs",
     # ``OrchestratorApp._render`` definition (the prompt_dirs call)
