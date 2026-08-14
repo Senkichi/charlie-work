@@ -1263,6 +1263,66 @@ def _select_dispatch_candidates(
     return selected, skipped_issue_numbers, deferred_by_concurrency, deferred_by_concurrency_count
 
 
+def _select_rework_candidates(
+    candidates: list[dict[str, Any]],
+    rework_limit: int,
+    only_issues: str | None = None,
+) -> tuple[list[dict[str, Any]], list[int], list[int], int]:
+    """Select rework dispatch candidates under the concurrency cap.
+
+    Mirrors ``_select_dispatch_candidates`` for the fresh-dispatch path, but
+    without the fresh-before-recovery ordering: every rework candidate is
+    already in ``rework_requested`` state, so there is no fresh/recovery split
+    to honor. Selection is a straight ``ordered[:rework_limit]`` cap.
+
+    Args:
+        candidates: Filtered rework candidate issues (each with an open PR).
+        rework_limit: Maximum number of issues to select this pass (already
+            concurrency-governor-clamped by the caller).
+        only_issues: Optional explicit comma-separated issue numbers to select.
+
+    Returns:
+        Tuple of (selected, deferred_by_concurrency_full,
+        deferred_by_concurrency, deferred_by_concurrency_count).
+
+        ``deferred_by_concurrency_full`` is the FULL, untruncated list of every
+        ordered candidate that was not selected -- populated on both the
+        ``only_issues`` path and the automatic path (issue #1014, mirroring
+        #1005 in the fresh-dispatch path; the automatic path used to report
+        this unconditionally as ``[]``, making a saturated governor
+        indistinguishable from an empty backlog). It MUST be fed to
+        ``_build_failure_map`` so every deferred issue keeps its per-issue
+        failures entry.
+
+        ``deferred_by_concurrency`` is the same list truncated to
+        ``_MAX_DEFERRED_CONCURRENCY_EXAMPLES`` entries for the persisted
+        event / ``CommandResult.data`` field -- a standing clamp would
+        otherwise re-emit the full candidate list every pass.
+
+        ``deferred_by_concurrency_count`` is ``len(deferred_by_concurrency_full)``,
+        returned explicitly so callers don't have to re-derive it.
+    """
+    if only_issues:
+        wanted = parse_issue_numbers(only_issues)
+        by_number = {int(issue["number"]): issue for issue in candidates}
+        ordered = [by_number[number] for number in wanted if number in by_number]
+    else:
+        ordered = candidates
+    selected = ordered[:rework_limit]
+    selected_numbers = {int(issue["number"]) for issue in selected}
+    deferred_by_concurrency_full = [
+        int(issue["number"]) for issue in ordered if int(issue["number"]) not in selected_numbers
+    ]
+    deferred_by_concurrency_count = len(deferred_by_concurrency_full)
+    deferred_by_concurrency = deferred_by_concurrency_full[:_MAX_DEFERRED_CONCURRENCY_EXAMPLES]
+    return (
+        selected,
+        deferred_by_concurrency_full,
+        deferred_by_concurrency,
+        deferred_by_concurrency_count,
+    )
+
+
 def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> int:
     """Count the number of currently alive worker sessions across both adapters.
 
@@ -10952,10 +11012,18 @@ class OrchestratorApp:
         # voided it -- which is what "preserve a verdict pinned to a
         # descendant of the snapshot" reduces to once the snapshot itself is
         # kept fresh at commit time.
+        #
+        # Issue #1072: this guard covers ONLY the packet-commit tail exit
+        # (the prompt + decision write below). The two earlier verdict-
+        # writing exits -- the CI-required-check-failure block and the
+        # Tier-1 test-adequacy hard gate -- return through record_review()
+        # before reaching this point. The same head-moved invariant is now
+        # enforced for those exits (and every other record_review() caller)
+        # by the compare-and-swap guard pushed into record_review() itself,
+        # so the invariant holds by construction for all verdict writes from
+        # this method, not just the one this guard happens to sit on.
         live_pr_for_commit = self.gh.pr_view(pr_number)
-        live_head_for_commit = (
-            live_pr_for_commit.get("headRefOid") if isinstance(live_pr_for_commit, dict) else None
-        )
+        live_head_for_commit = live_pr_for_commit.get("headRefOid")
         snapshot_head_for_commit = pr.get("headRefOid")
         if live_head_for_commit is None or live_head_for_commit != snapshot_head_for_commit:
             with state_lock(self.paths.state_file):
@@ -13228,6 +13296,8 @@ class OrchestratorApp:
         reviewed_head: str | None = None,
         required_changes: Sequence[str] | None = None,
         session_metrics: dict[str, Any] | None = None,
+        *,
+        allow_stale_head: bool = False,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -13343,8 +13413,46 @@ class OrchestratorApp:
         # disagrees with the live PR head, require an explicit --reviewed-head
         # choice. When they agree (or no packet exists), preserve the existing
         # packet-first / live-fallback semantics and record where the SHA came from.
+        #
+        # Issue #1072: the #467 check only fired when *no* --reviewed-head was
+        # passed. When an automated caller (review()'s CI-failure exit,
+        # test-adequacy exit, dispatch_reviews, cross-family) passed
+        # --reviewed-head matching the packet head, the check was bypassed and
+        # the verdict was pinned to a head that had moved mid-build. The
+        # compare-and-swap guard added by #1036 covered only review()'s
+        # packet-commit tail exit; the two earlier exits returned through
+        # record_review() and bypassed it. Pushing the guard here — into the
+        # single choke point every verdict write passes through — makes the
+        # invariant hold by construction for every caller, not just the one
+        # exit #1036 happened to guard. The operator CLI (``charlie verdict``)
+        # is the one caller that may legitimately pin to a superseded head
+        # (issue #467's explicit-choice design), so it passes
+        # ``allow_stale_head=True``; every automated caller uses the default
+        # ``False`` and is refused. The failure direction is toward redundant
+        # work (the PR is re-reviewed next pass), never toward authorizing a
+        # merge on the wrong head — ``reviewed_head_sha`` is compared against
+        # the current head by every downstream consumer.
         if reviewed_head is not None:
             if packet_head_sha is not None and reviewed_head == packet_head_sha:
+                if (
+                    not allow_stale_head
+                    and live_head_sha is not None
+                    and packet_head_sha != live_head_sha
+                ):
+                    return CommandResult(
+                        False,
+                        f"reviewed head ({reviewed_head}) matches packet head "
+                        f"({packet_head_sha}) but live PR head has moved to "
+                        f"({live_head_sha}); verdict not recorded — head moved "
+                        "during build, will re-review next pass",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "reason": "head_moved_during_build",
+                            "packet_head_sha": packet_head_sha,
+                            "live_head_sha": live_head_sha,
+                        },
+                    )
                 reviewed_head_sha = reviewed_head
                 reviewed_head_source = "packet"
             elif live_head_sha is not None and reviewed_head == live_head_sha:
@@ -16571,7 +16679,13 @@ class OrchestratorApp:
                     }
                 ]
 
-            self._update_approval_head(
+            # Issue #1072: capture the bool return so telemetry does not
+            # report success for a carry-forward write that was refused
+            # (e.g. _update_approval_head's identity guard rejected a
+            # concurrent verdict change). The branch WAS updated, but the
+            # approval verdict was not carried forward to the new head —
+            # the PR will need re-review. Telemetry-only, no state impact.
+            approval_carried = self._update_approval_head(
                 pr_number,
                 decision,
                 new_head,
@@ -16588,6 +16702,7 @@ class OrchestratorApp:
                     "head_ref": head,
                     "updated": True,
                     "new_head": new_head,
+                    "approval_carry_forward": approval_carried,
                 }
             ]
 
@@ -20413,21 +20528,20 @@ class OrchestratorApp:
 
             dry_candidates = dry_filtered_candidates
 
-            # Apply only_issues filter and concurrency cap (read-only)
-            if only_issues:
-                wanted = parse_issue_numbers(only_issues)
-                by_number = {int(issue["number"]): issue for issue in dry_candidates}
-                dry_selected = [by_number[number] for number in wanted if number in by_number]
-                if len(dry_selected) > rework_limit:
-                    dry_deferred_by_concurrency = [
-                        int(issue["number"]) for issue in dry_selected[rework_limit:]
-                    ]
-                    dry_selected = dry_selected[:rework_limit]
-                else:
-                    dry_deferred_by_concurrency = []
-            else:
-                dry_selected = dry_candidates[:rework_limit]
-                dry_deferred_by_concurrency = []
+            # Apply only_issues filter and concurrency cap (read-only).
+            # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
+            # deferred_by_concurrency uniformly across both the only_issues and
+            # automatic branches -- the automatic branch used to unconditionally
+            # report [] even when the concurrency governor dropped candidates,
+            # making a saturated governor indistinguishable from an empty
+            # backlog. Shares the selection helper with the live branch below
+            # so the two cannot drift.
+            (
+                dry_selected,
+                dry_deferred_by_concurrency_full,
+                dry_deferred_by_concurrency,
+                dry_deferred_by_concurrency_count,
+            ) = _select_rework_candidates(dry_candidates, rework_limit, only_issues=only_issues)
 
             # Compute would-be SessionRequests without state mutation, label
             # transitions, or worker launches. Rework-prompt re-rendering
@@ -20483,11 +20597,12 @@ class OrchestratorApp:
                 "failures": _build_failure_map(
                     [],
                     set(),
-                    dry_deferred_by_concurrency,
+                    dry_deferred_by_concurrency_full,
                     rework_limit,
                     extra_failures=dry_missing_prompt_failures,
                 ),
                 "deferred_by_concurrency": dry_deferred_by_concurrency,
+                "deferred_by_concurrency_count": dry_deferred_by_concurrency_count,
                 "skipped_issue_numbers": sorted(dry_skipped_issue_numbers),
                 "sessions": [asdict(request) for request in dry_session_requests],
                 "adapter_choices": {
@@ -20768,28 +20883,29 @@ class OrchestratorApp:
                     "redispatch_escalated",
                 )
 
-        if only_issues:
-            wanted = parse_issue_numbers(only_issues)
-            by_number = {int(issue["number"]): issue for issue in candidates}
-            selected = [by_number[number] for number in wanted if number in by_number]
-            # Apply concurrency governor cap to explicit issue selection
-            if len(selected) > rework_limit:
-                deferred_by_concurrency = [
-                    int(issue["number"]) for issue in selected[rework_limit:]
-                ]
-                selected = selected[:rework_limit]
-            else:
-                deferred_by_concurrency = []
-        else:
-            selected = candidates[:rework_limit]
-            deferred_by_concurrency = []
+        # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
+        # deferred_by_concurrency uniformly across both the only_issues and
+        # automatic branches -- the automatic branch used to unconditionally
+        # report [] even when the concurrency governor dropped candidates,
+        # making a saturated governor indistinguishable from an empty backlog.
+        # Shares the selection helper with the dry-run branch above so the two
+        # cannot drift.
+        (
+            selected,
+            deferred_by_concurrency_full,
+            deferred_by_concurrency,
+            deferred_by_concurrency_count,
+        ) = _select_rework_candidates(candidates, rework_limit, only_issues=only_issues)
 
         if not selected:
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
-                "failures": _build_failure_map([], set(), deferred_by_concurrency, rework_limit),
+                "failures": _build_failure_map(
+                    [], set(), deferred_by_concurrency_full, rework_limit
+                ),
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "deferred_by_concurrency_count": deferred_by_concurrency_count,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
@@ -20851,8 +20967,11 @@ class OrchestratorApp:
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
-                "failures": _build_failure_map([], set(), deferred_by_concurrency, rework_limit),
+                "failures": _build_failure_map(
+                    [], set(), deferred_by_concurrency_full, rework_limit
+                ),
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "deferred_by_concurrency_count": deferred_by_concurrency_count,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
@@ -21054,7 +21173,7 @@ class OrchestratorApp:
             no_session_failure_map = _build_failure_map(
                 [],
                 set(),
-                deferred_by_concurrency,
+                deferred_by_concurrency_full,
                 rework_limit,
                 extra_failures=missing_prompt_failures,
             )
@@ -21083,9 +21202,22 @@ class OrchestratorApp:
                         "failed_issue_numbers": [],
                         "skipped_issue_numbers": sorted(skipped_issue_numbers),
                         "deferred_by_concurrency": deferred_by_concurrency,
+                        "deferred_by_concurrency_count": deferred_by_concurrency_count,
                         "label_errors": [],
                         "operator_claimed_skipped": sorted(operator_claimed_skipped),
                         "failures": no_session_failure_map,
+                        # Issue #1014 (mirroring #1005): the capacity axis.
+                        # Always present -- gov.report_fields() is safe to call
+                        # unclamped -- and explicit about `clamped` so a reader
+                        # does not have to redo the arithmetic. `dispatch_limit`
+                        # is included explicitly (report_fields() does not carry
+                        # it) because it is the only field that reflects a
+                        # fleet-cap clamp.
+                        "concurrency_governor": {
+                            "clamped": gov.clamped,
+                            "dispatch_limit": gov.dispatch_limit,
+                            **gov.report_fields(),
+                        },
                     },
                     state_path=self.paths.state_file,
                 )
@@ -21095,6 +21227,7 @@ class OrchestratorApp:
                 "selected_count": 0,
                 "failures": no_session_failure_map,
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "deferred_by_concurrency_count": deferred_by_concurrency_count,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
@@ -21358,7 +21491,7 @@ class OrchestratorApp:
             rework_failure_map = _build_failure_map(
                 dispatch_results,
                 failed_issue_numbers,
-                deferred_by_concurrency,
+                deferred_by_concurrency_full,
                 rework_limit,
                 extra_failures={**missing_prompt_failures, **label_error_failures},
             )
@@ -21371,9 +21504,22 @@ class OrchestratorApp:
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "skipped_issue_numbers": sorted(skipped_issue_numbers),
                     "deferred_by_concurrency": deferred_by_concurrency,
+                    "deferred_by_concurrency_count": deferred_by_concurrency_count,
                     "label_errors": sorted(label_errors),
                     "operator_claimed_skipped": sorted(operator_claimed_skipped),
                     "failures": rework_failure_map,
+                    # Issue #1014 (mirroring #1005): the capacity axis.
+                    # Always present -- gov.report_fields() is safe to call
+                    # unclamped -- and explicit about `clamped` so a reader
+                    # does not have to redo the arithmetic. `dispatch_limit`
+                    # is included explicitly (report_fields() does not carry
+                    # it) because it is the only field that reflects a
+                    # fleet-cap clamp.
+                    "concurrency_governor": {
+                        "clamped": gov.clamped,
+                        "dispatch_limit": gov.dispatch_limit,
+                        **gov.report_fields(),
+                    },
                 },
                 state_path=self.paths.state_file,
             )
@@ -21394,6 +21540,7 @@ class OrchestratorApp:
             "failed_count": len(failed_issue_numbers),
             "failures": rework_failure_map,
             "deferred_by_concurrency": deferred_by_concurrency,
+            "deferred_by_concurrency_count": deferred_by_concurrency_count,
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
