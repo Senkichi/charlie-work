@@ -36749,6 +36749,130 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
     assert blocked_events[0]["payload"]["blockers"] == [200]
 
 
+def test_dispatch_reachability_blocker_lookups_are_batched(tmp_path: Path) -> None:
+    """Issue #1110 rework: classify_backlog_reachability runs a per-issue
+    blocker check inside _dispatch_impl. Without warming the pass-scoped
+    cache first (the _prefetch_blocker_data warm-up issue #870 built for
+    exactly this pattern), that check would issue N serial per-issue
+    ``gh api .../dependencies/blocked_by`` calls -- one per ready issue --
+    on every dispatch pass, on a superset of the issue population the
+    dispatch candidate filter already blocker-checks.
+
+    This test asserts the batched path is taken: the GitHub client's
+    batched ``issue_dependencies`` method is called with every ready issue
+    number, and zero per-issue dependency ``run`` calls escape (every
+    lookup resolves from the warm cache). Against the unfixed code (no
+    _prefetch_blocker_data call before reachability) the batch method is
+    never invoked and N serial per-issue ``run`` calls are made instead.
+    """
+    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Three ready issues, each blocked by an open predecessor. The blocker
+    # check inside classify_backlog_reachability runs on every one (they
+    # all pass the label-only gates and reach the dependency-gate else
+    # branch). The dispatch candidate filter also blocker-checks each as a
+    # candidate, so both consumers must read the warm cache.
+    ready_issues = [
+        {
+            "number": 11,
+            "title": "t",
+            "url": "https://example.test/issues/11",
+            "body": "Blocked by #1",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        },
+        {
+            "number": 12,
+            "title": "t",
+            "url": "https://example.test/issues/12",
+            "body": "Blocked by #1",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        },
+        {
+            "number": 13,
+            "title": "t",
+            "url": "https://example.test/issues/13",
+            "body": "Blocked by #2",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        },
+    ]
+    blocker_issues = [
+        {
+            "number": 1,
+            "title": "b",
+            "url": "https://example.test/issues/1",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        },
+        {
+            "number": 2,
+            "title": "b",
+            "url": "https://example.test/issues/2",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        },
+    ]
+
+    class FakeGitHubBatched(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = ready_issues + blocker_issues
+            # Mirror the real GitHubClient's pass-scoped cache so
+            # get_github_issue_dependencies reads/writes it.
+            self._list_cache: dict[tuple[str, Any], Any] = {}
+            self.issue_dependencies_calls: list[list[int]] = []
+            self.dependency_run_calls = 0
+
+        def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
+            # The batched path _prefetch_blocker_data prefers. Mirrors the
+            # real method's warm-cache contract: populate _list_cache so
+            # subsequent per-issue get_github_issue_dependencies calls hit
+            # the cache instead of issuing a live `gh run`.
+            self.issue_dependencies_calls.append(list(issue_numbers))
+            for n in issue_numbers:
+                # No GitHub-native deps in this scenario (blockers are
+                # body-declared); an empty list is a legitimate successful
+                # resolution the real method caches on success.
+                self._list_cache[("issue_dependencies", n)] = []
+            return {n: [] for n in issue_numbers}
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {n for n in issue_numbers if n in {1, 2}}
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            joined = " ".join(args)
+            if "dependencies" in joined:
+                # The per-issue serial path. With the cache warmed by
+                # issue_dependencies, this must never be reached.
+                self.dependency_run_calls += 1
+                return [] if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubBatched()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    result = app.dispatch()
+
+    assert result.ok
+    # The batched dependency fetch ran -- _prefetch_blocker_data was
+    # invoked before reachability's per-issue blocker check.
+    assert len(fake_gh.issue_dependencies_calls) >= 1
+    # Every ready issue number was handed to the batch call in one shot
+    # (the warm-up covers the full ready set, not just candidates).
+    fetched = set(fake_gh.issue_dependencies_calls[0])
+    assert {11, 12, 13}.issubset(fetched)
+    # Zero per-issue serial dependency `gh run` calls escaped: every
+    # dependency lookup (reachability's per-issue check plus the dispatch
+    # candidate filter's per-candidate check) resolved from the warm cache.
+    # Against the unfixed code this is 3 (one serial call per ready issue
+    # from reachability's uncached per-issue check).
+    assert fake_gh.dependency_run_calls == 0
+
+
 def test_status_includes_blocked_section(tmp_path: Path) -> None:
     """Issue #108: status (roll-call) should include blocked section."""
     config = OrchestratorConfig(

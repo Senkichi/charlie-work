@@ -2346,6 +2346,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
                 "terminal_label",
                 "active_label",
                 "operator_claimed",
+                "blocked_by_open_dependency",
                 "unidentified",
             )
             if reachability.get(reason)
