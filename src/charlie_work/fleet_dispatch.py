@@ -22,6 +22,7 @@ from .global_config import describe_config_file, load_layered_config
 from .instrumentation import log_event
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
+from .venv_anchor import verify_interpreter_anchored_editables
 from .supervise import (
     LocalSnapshot,
     orchestrator_root,
@@ -2279,6 +2280,20 @@ def run_fleet_supervise(
     A single ``fleet-supervisor.lock`` in the fleet directory prevents two
     ``charlie fleet supervise`` invocations from overlapping.
     """
+    # Before anything else -- even config load: a repointed editable means the
+    # code below this line is not the reviewed code. Positive violations refuse
+    # startup; abstentions proceed with the reason logged (issue #974).
+    anchor = verify_interpreter_anchored_editables()
+    if not anchor.ok:
+        logger.error("VENV EDITABLE ANCHOR VIOLATION: %s", anchor.detail)
+        log_event(
+            runtime_paths(orchestrator_root(), layout.DEFAULT_STATE_DIR).state_file,
+            "venv_editable_anchor_violation",
+            {"detail": anchor.detail},
+        )
+        return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
+    logger.info("Venv editable anchor: %s", anchor.detail)
+
     try:
         global_config = load_layered_config(
             Path.cwd(),
@@ -2476,6 +2491,7 @@ def run_fleet_supervise(
                 fleet_dir_override=fleet_dir_override,
                 dry_run=dry_run,
                 failure_alarm_threshold=cfg.self_deploy_failure_alarm,
+                pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
             )
             notify_config = getattr(global_config, "notify", None)
             notify_enabled = notify_config is not None and getattr(notify_config, "enabled", False)

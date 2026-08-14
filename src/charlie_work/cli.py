@@ -1020,6 +1020,11 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         state_root=state_root,
         fleet_dir_override=args.fleet_dir,
         dry_run=args.dry_run,
+        pull_ci_fleet=(
+            global_config.supervisor.self_deploy_pull_ci_fleet
+            if global_config is not None
+            else False
+        ),
     )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)

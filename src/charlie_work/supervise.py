@@ -814,6 +814,7 @@ def self_deploy(
     sync_timeout: int = 300,
     dry_run: bool = False,
     failure_alarm_threshold: int = DEFAULT_SELF_DEPLOY_FAILURE_ALARM,
+    pull_ci_fleet: bool = False,
 ) -> SelfDeployResult:
     """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
 
@@ -866,6 +867,7 @@ def self_deploy(
         run_command=run_command,
         pull_timeout=pull_timeout,
         sync_timeout=sync_timeout,
+        pull_ci_fleet=pull_ci_fleet,
     )
     _log_self_deploy_outcome(repo_root, result)
     _record_self_deploy_failure_streak(repo_root, result, threshold=failure_alarm_threshold)
@@ -1062,6 +1064,90 @@ def _repair_lossless_pull_blockers(
     return PullBlockerRepair(cleared=tuple(sorted(cleared)), retained=tuple(sorted(retained)))
 
 
+def _pull_ci_fleet_sibling(
+    repo_root: Path,
+    *,
+    run_command: Callable[..., RunResult],
+    timeout: int,
+) -> None:
+    """FF-pull ``origin/main`` in the declared ``ci-fleet`` sibling checkout.
+
+    Deploy-clone half of issue #552: ``self_deploy`` only ever pulls the
+    orchestrator checkout, so a dedicated daemon layout's editable ``ci_fleet``
+    sibling would otherwise freeze at clone time, silently. Gated by
+    ``supervisor.self_deploy_pull_ci_fleet`` (default false -- in a dev layout
+    the sibling is a working repo whose HEAD must never be moved out from
+    under a session).
+
+    Fail-safe preconditions, checked here rather than trusted from config: the
+    sibling must be on ``main`` with a clean tree, else the pull is skipped
+    and the skip reason recorded. Every outcome -- pulled, unchanged, skipped,
+    failed -- lands in events.db as ``self_deploy_ci_fleet_pull`` so sibling
+    staleness is observable instead of silent; failures additionally log at
+    WARNING. Deliberately excluded from the ``self_deploy_alarm`` failure
+    streak: a sibling wedge bounds staleness but does not block orchestrator
+    deploys, and conflating the two would page at the wrong severity.
+
+    Never raises; the caller's deploy result is already decided.
+    """
+    payload: dict[str, object] = {"ok": False}
+    try:
+        from .ci_fleet_anchor import declared_ci_fleet_root
+
+        declared_src = declared_ci_fleet_root()
+        if declared_src is None:
+            payload["skipped_reason"] = "no declared ci-fleet path source to pull"
+        else:
+            sibling = declared_src.parent
+            branch_res = run_command(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=sibling, timeout_seconds=timeout
+            )
+            status_res = run_command(
+                ["git", "status", "--porcelain"], cwd=sibling, timeout_seconds=timeout
+            )
+            payload["sibling"] = str(sibling)
+            if not branch_res.ok or not status_res.ok:
+                payload["skipped_reason"] = (
+                    f"could not inspect sibling: {branch_res.error or status_res.error}"
+                )
+            elif branch_res.stdout.strip() != "main":
+                payload["skipped_reason"] = (
+                    f"sibling on branch {branch_res.stdout.strip()!r}, not main"
+                )
+            elif status_res.stdout.strip():
+                payload["skipped_reason"] = "sibling tree is dirty"
+            else:
+                before = run_command(
+                    ["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout
+                )
+                pull_res = run_command(
+                    ["git", "pull", "--ff-only", "origin", "main"],
+                    cwd=sibling,
+                    timeout_seconds=timeout,
+                )
+                after = run_command(
+                    ["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout
+                )
+                payload["from_sha"] = before.stdout.strip() if before.ok else None
+                payload["to_sha"] = after.stdout.strip() if after.ok else None
+                if pull_res.ok:
+                    payload["ok"] = True
+                    payload["changed"] = (
+                        before.ok and after.ok and before.stdout.strip() != after.stdout.strip()
+                    )
+                else:
+                    payload["error"] = _command_failure_message(
+                        ["git", "pull", "--ff-only", "origin", "main"],
+                        pull_res,
+                        "ci-fleet sibling pull failed",
+                    )
+    except Exception as exc:  # noqa: BLE001 -- must never fail the deploy that succeeded
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    if not payload["ok"]:
+        logger.warning("ci-fleet sibling pull did not run: %s", payload)
+    log_event(_self_deploy_state_path(repo_root), "self_deploy_ci_fleet_pull", payload)
+
+
 def _self_deploy_attempt(
     repo_root: Path,
     marker_path: Path,
@@ -1070,6 +1156,7 @@ def _self_deploy_attempt(
     run_command: Callable[..., RunResult],
     pull_timeout: int,
     sync_timeout: int,
+    pull_ci_fleet: bool = False,
 ) -> SelfDeployResult:
     """Perform the real (non-preview) pull/diff/sync attempt.
 
@@ -1154,6 +1241,12 @@ def _self_deploy_attempt(
                 ),
             )
         after_sha = after_res.stdout.strip()
+
+        if pull_ci_fleet:
+            # Best-effort and deliberately outside the deploy's ok/error flow:
+            # the orchestrator deploy above already succeeded, and a sibling
+            # that cannot be pulled is bounded staleness, not a failed deploy.
+            _pull_ci_fleet_sibling(repo_root, run_command=run_command, timeout=pull_timeout)
 
         marker = _read_marker(marker_path) if marker_path.exists() else None
         marker_from = marker.get("from_sha") if marker else None
@@ -1305,6 +1398,21 @@ def run_supervised(
     """
     # Import here to avoid circular imports (supervise ← workflow ← supervise)
     from .workflow import CommandResult
+
+    # Same interpreter-anchored refusal as run_fleet_supervise: a repointed
+    # editable means everything below runs unreviewed code (issue #974).
+    from .venv_anchor import verify_interpreter_anchored_editables
+
+    anchor = verify_interpreter_anchored_editables()
+    if not anchor.ok:
+        logger.error("VENV EDITABLE ANCHOR VIOLATION: %s", anchor.detail)
+        log_event(
+            app.paths.state_file,
+            "venv_editable_anchor_violation",
+            {"detail": anchor.detail},
+        )
+        return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
+    logger.info("Venv editable anchor: %s", anchor.detail)
 
     # Single-instance guard
     lock_path = layout.supervisor_lock_path(app.paths.root)
