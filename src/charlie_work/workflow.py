@@ -10763,6 +10763,7 @@ class OrchestratorApp:
                         **existing_pr_state,
                         "janitor_ok": escalated_verdict.ok,
                         "janitor_failures": list(escalated_verdict.failures),
+                        "is_missing_checks_only_block": escalated_verdict.is_missing_checks_only_block,
                     }
                     if failures_changed:
                         fresh_state = self._record_event(
@@ -11088,6 +11089,7 @@ class OrchestratorApp:
                             "status": "janitor_blocked",
                             "janitor_ok": False,
                             "janitor_failures": list(verdict.failures),
+                            "is_missing_checks_only_block": verdict.is_missing_checks_only_block,
                         }
                         if draft_hold_reason_changed:
                             state = self._record_event(
@@ -11157,6 +11159,7 @@ class OrchestratorApp:
                         "janitor_ok": False,
                         "janitor_failures": list(verdict.failures),
                         "draft_ready_error": draft_ready_error,
+                        "is_missing_checks_only_block": verdict.is_missing_checks_only_block,
                     }
                     if error_changed:
                         state = append_event(
@@ -11539,6 +11542,11 @@ class OrchestratorApp:
                     "janitor_ok": False,
                     "janitor_failures": list(verdict.failures),
                     "check_rerun_attempts": verdict.check_rerun_attempts,
+                    # Issue #1133: structured flag so _is_dead_blocker can
+                    # distinguish the transient "checks not reported yet"
+                    # population from durably-stuck janitor_blocked PRs without
+                    # parsing failure-message text.
+                    "is_missing_checks_only_block": verdict.is_missing_checks_only_block,
                 }
                 # At most once per (pr, head_sha): only emit when this head
                 # hasn't already been flagged as never-created.
@@ -11835,6 +11843,7 @@ class OrchestratorApp:
                 **({} if dispatch_disabled else {"status": "reviewing"}),
                 "janitor_ok": True,
                 "janitor_failures": [],
+                "is_missing_checks_only_block": False,
                 "janitor_warnings": list(merged_warnings),
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
@@ -20302,6 +20311,7 @@ class OrchestratorApp:
                     **fresh_pr_entry,
                     "janitor_ok": janitor_verdict.ok,
                     "janitor_failures": list(janitor_verdict.failures),
+                    "is_missing_checks_only_block": janitor_verdict.is_missing_checks_only_block,
                 }
             fresh_issue_entry = fresh_state["issues"].get(issue_key)
             if not isinstance(fresh_issue_entry, dict) or (
@@ -22947,6 +22957,18 @@ class OrchestratorApp:
         blocker issue itself is escalated, or its tracked open PR's status is
         escalated/janitor_blocked. Pure local-state lookup, no GitHub calls --
         this only names an already-known dead end, it never widens one.
+
+        Issue #1133: ``janitor_blocked`` conflates a durably-stuck population
+        (failed checks, merge conflict, body gate, CI-never-created) with a
+        transient one -- a brand-new PR whose required checks simply haven't
+        reported yet, which self-heals within one CI cycle. The transient
+        case is identified structurally by ``is_missing_checks_only_block``
+        (the SOLE janitor failure is "Required check(s) missing") combined
+        with the absence of a ``ci_run_never_created_head`` marker (which
+        would mean CI was confirmed to have never started for this head -- a
+        durable condition). Such a PR is NOT dead: it is actively progressing
+        and will unblock on the next janitor pass once CI reports. The
+        ``escalated`` status stays dead unconditionally.
         """
         issue_entry = state.get("issues", {}).get(str(blocker_number), {})
         if isinstance(issue_entry, dict) and issue_entry.get("status") == "escalated":
@@ -22955,8 +22977,22 @@ class OrchestratorApp:
         if pr is not None:
             pr_number = pr.get("number")
             if pr_number is not None:
-                pr_status = state.get("prs", {}).get(str(pr_number), {}).get("status")
-                if pr_status in ("escalated", "janitor_blocked"):
+                pr_state = state.get("prs", {}).get(str(pr_number), {})
+                pr_status = pr_state.get("status")
+                if pr_status == "escalated":
+                    return True
+                if pr_status == "janitor_blocked":
+                    # Issue #1133: a brand-new PR whose only janitor failure is
+                    # "Required check(s) missing" (checks not reported yet) is
+                    # transient, not dead -- unless ``ci_run_never_created_head``
+                    # is set, which means CI was confirmed to have never started
+                    # for this head (the durable population the alert exists for).
+                    # Branch on the structured flag, never on failure-message
+                    # text (same rule as is_draft_only_block consumers).
+                    if pr_state.get("is_missing_checks_only_block") and not pr_state.get(
+                        "ci_run_never_created_head"
+                    ):
+                        return False
                     return True
         return False
 
