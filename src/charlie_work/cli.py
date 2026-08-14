@@ -2148,6 +2148,12 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
                 summary_file=args.summary_file,
                 comment=args.comment,
                 reviewed_head=args.reviewed_head,
+                # Issue #1072: the operator CLI is the one caller that may
+                # legitimately pin a verdict to a superseded head (issue #467's
+                # explicit-choice design). Automated callers use the default
+                # False and are refused by record_review()'s compare-and-swap
+                # guard when the live head has moved past the packet head.
+                allow_stale_head=True,
             )
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})
