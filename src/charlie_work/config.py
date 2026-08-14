@@ -1328,6 +1328,15 @@ class SupervisorConfig:
     mirrors ``self_deploy_failure_alarm``). 0 disables the alarm. A cycle
     with zero repos configured never counts toward this streak in either
     direction -- that is a configuration state, not an incident (issue #855).
+    ``self_deploy_pull_ci_fleet``: when true, ``self_deploy`` also FF-pulls
+    ``origin/main`` in the declared ``ci-fleet`` sibling checkout after a
+    successful orchestrator pull, but only when that sibling is clean and on
+    ``main``. Default false: in a development layout the sibling is a working
+    repo whose HEAD must never be moved out from under a session. Enable it
+    only for a dedicated deploy clone (issue #552), where the sibling exists
+    solely to be deployed to -- without it the daemon's editable ``ci_fleet``
+    is a silent version freeze, since ``self_deploy`` otherwise only ever
+    pulls the orchestrator checkout.
     """
 
     poll_interval_seconds: int = 20
@@ -1336,6 +1345,7 @@ class SupervisorConfig:
     max_runtime_minutes: int = 0
     max_pass_runtime_seconds: int = 1800
     self_deploy_failure_alarm: int = 3
+    self_deploy_pull_ci_fleet: bool = False
     zero_pass_alarm: int = 3
 
 
@@ -2648,6 +2658,12 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 f"config section 'supervisor' key '{int_key}' must be an int, "
                 f"got {type(value).__name__}"
             )
+    pull_ci_fleet = supervisor_data.get("self_deploy_pull_ci_fleet")
+    if pull_ci_fleet is not None and not isinstance(pull_ci_fleet, bool):
+        raise ConfigError(
+            "config section 'supervisor' key 'self_deploy_pull_ci_fleet' must be "
+            f"a bool, got {type(pull_ci_fleet).__name__}"
+        )
     supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
     post_mortem_data = _section(data, "post_mortem")
     pm_enabled = post_mortem_data.get("enabled")
