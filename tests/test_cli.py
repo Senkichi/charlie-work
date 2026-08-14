@@ -1904,7 +1904,7 @@ def test_migrate_state_dir_apply_happy_path_actuates_when_quiescent(tmp_path: Pa
         "fleet supervise",
     )
     quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
-    outcome = MigrationOutcome(ok=True, moved=("issues",))
+    outcome = MigrationOutcome(ok=True, moved=("issues",), rewritten_paths=7)
 
     result = cli.run_migrate_state_dir_command(
         args,
@@ -1916,6 +1916,87 @@ def test_migrate_state_dir_apply_happy_path_actuates_when_quiescent(tmp_path: Pa
 
     assert result.ok is True
     assert "moved 1 children" in result.message
+    # Issue #735: rewritten_paths is surfaced in both the data dict and the
+    # human-readable message so the operator can see the rewrite happened.
+    assert result.data["rewritten_paths"] == 7
+    assert "rewrote 7 embedded paths" in result.message
+
+
+def test_migrate_state_dir_apply_reports_zero_rewrites_in_message(tmp_path: Path) -> None:
+    """When the rewrite found no embedded paths, the message still carries the
+    ``rewrote 0 embedded paths`` suffix and ``rewritten_paths`` is 0 in data --
+    a migration with no state.json or no embedded paths is a legitimate success.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+    outcome = MigrationOutcome(ok=True, moved=("issues",), rewritten_paths=0)
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=_clean_tree,
+        actuator=lambda plan_arg: outcome,
+    )
+
+    assert result.ok is True
+    assert result.data["rewritten_paths"] == 0
+    assert "rewrote 0 embedded paths" in result.message
+
+
+def test_migrate_state_dir_apply_rewrite_failure_surfaces_in_data_and_message(
+    tmp_path: Path,
+) -> None:
+    """Issue #735: when the state.json path rewrite fails, ``rewritten_paths``
+    is 0 in the data dict and the failure message names the rewrite error --
+    the children already moved, so this is an incomplete migration needing
+    manual attention, not a rollback.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+    outcome = MigrationOutcome(
+        ok=False,
+        moved=("issues",),
+        rewritten_paths=0,
+        error="children moved but state.json path rewrite failed: missing target",
+    )
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=_clean_tree,
+        actuator=lambda plan_arg: outcome,
+    )
+
+    assert result.ok is False
+    assert result.data["rewritten_paths"] == 0
+    assert result.data["applied"] is False
+    assert "migration failed after 1 moved" in result.message
+    assert "path rewrite failed" in result.message
+    assert "missing target" in result.message
 
 
 def test_migrate_state_dir_apply_refuses_when_working_tree_is_dirty(tmp_path: Path) -> None:

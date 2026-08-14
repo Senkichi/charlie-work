@@ -1135,6 +1135,85 @@ def test_walk_and_rewrite_does_not_touch_dict_keys(tmp_path: Path) -> None:
     assert new_data["old-state"] == str(dst_target)
 
 
+def test_walk_and_rewrite_rewrites_path_strings_inside_non_empty_list(tmp_path: Path) -> None:
+    """The list-handling branch of ``_walk_and_rewrite`` must descend into a
+    non-empty list and rewrite path-string elements under ``src_root``.
+
+    Real event payloads store paths inside the ``events`` array -- a list of
+    event dicts whose ``data`` values include path strings like
+    ``reviews_dir`` (see ``workflow._mark_review_checkout_removal_failed``).
+    A walk that only recursed into dicts would miss every path embedded in
+    that list; this test pins the list branch with the exact shape: a list of
+    event dicts, each carrying a path-string value under the old root.
+    """
+    src = tmp_path / "old-state"
+    dst = tmp_path / "new-state"
+    src.mkdir()
+    dst.mkdir()
+    # Two event dicts, each with a ``reviews_dir`` path under src_root -- the
+    # real ``review_checkout_removal_failed`` event payload shape.
+    reviews_dir_1 = src / "dispatches" / "reviews" / "pr-1"
+    reviews_dir_2 = src / "dispatches" / "reviews" / "pr-2"
+    reviews_dir_1.mkdir(parents=True)
+    reviews_dir_2.mkdir(parents=True)
+    dst_reviews_dir_1 = dst / "dispatches" / "reviews" / "pr-1"
+    dst_reviews_dir_2 = dst / "dispatches" / "reviews" / "pr-2"
+    dst_reviews_dir_1.mkdir(parents=True)
+    dst_reviews_dir_2.mkdir(parents=True)
+    data = {
+        "version": 1,
+        "events": [
+            {
+                "kind": "review_checkout_removal_failed",
+                "data": {"reviews_dir": str(reviews_dir_1)},
+            },
+            {
+                "kind": "review_checkout_removal_failed",
+                "data": {"reviews_dir": str(reviews_dir_2)},
+            },
+        ],
+    }
+    new_data, count, error = _walk_and_rewrite(data, src, dst)
+    assert error is None
+    assert count == 2
+    events = new_data["events"]
+    assert len(events) == 2
+    assert events[0]["data"]["reviews_dir"] == str(dst_reviews_dir_1)
+    assert events[1]["data"]["reviews_dir"] == str(dst_reviews_dir_2)
+    # Non-path list elements (e.g. an event with no path) are passed through.
+    assert events[0]["kind"] == "review_checkout_removal_failed"
+
+
+def test_walk_and_rewrite_list_branch_propagates_rewrite_failure(tmp_path: Path) -> None:
+    """A path string inside a list whose rewritten target does not exist must
+    fail the whole walk -- the caller must not save a partially-rewritten tree.
+
+    Exercises the list branch's error-return path (the ``if error is not
+    None: return value, 0, error`` inside the list loop), which a walk that
+    only tested dict-level failures would never reach.
+    """
+    src = tmp_path / "old-state"
+    dst = tmp_path / "new-state"
+    src.mkdir()
+    dst.mkdir()
+    # A path under src_root whose target under dst_root does NOT exist -- the
+    # existence check in ``_try_rewrite_path_string`` must refuse it.
+    bogus = src / "dispatches" / "missing.md"
+    bogus.parent.mkdir(parents=True)
+    data = {
+        "version": 1,
+        "events": [
+            {"kind": "review_checkout_removal_failed", "data": {"reviews_dir": str(bogus)}},
+        ],
+    }
+    new_data, count, error = _walk_and_rewrite(data, src, dst)
+    assert error is not None
+    assert "does not exist" in error
+    assert count == 0
+    # On error, the original value is returned unchanged -- no partial rewrite.
+    assert new_data == data
+
+
 def test_rewrite_state_json_paths_missing_file_is_ok_zero(tmp_path: Path) -> None:
     """A missing state.json is not an error -- nothing to rewrite."""
     state_path = tmp_path / "nonexistent-state.json"
@@ -1222,7 +1301,6 @@ def test_apply_rewrites_embedded_paths_in_state_json(tmp_path: Path) -> None:
     # the old-root string -- the exact-prefix check rejects them.
     for pr_data in rewritten["prs"].values():
         assert str(src_root) in pr_data["title"], "title should be unchanged"
-    assert str(src_root) in rewritten["issues"]["101"]["title"] or True  # no path in title
 
     # Key sets are byte-identical before and after (the walk must not add or
     # drop keys -- mirrors the job-cannon remediation verification).
