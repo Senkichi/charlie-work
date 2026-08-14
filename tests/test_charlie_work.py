@@ -23609,6 +23609,129 @@ def test_worker_rework_reply_is_not_ingested_as_external_finding(
     assert "keep me" in changes
 
 
+def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
+    tmp_path: Path,
+) -> None:
+    """Issue #998 rework: a genuine human comment posted in the gap
+    ``(before, reviewed_at]`` -- after the reviewed head commit landed but
+    before the verdict was written -- is excluded by ``before`` this round
+    and MUST surface as a required_change in the following round.
+
+    The per-round ingestion windows must be contiguous: the next round's
+    ``since`` is this round's persisted ``before`` (not its ``reviewed_at``).
+    Deriving ``since`` from ``reviewed_at`` instead would drop a gap comment
+    forever -- it satisfies ``item_dt <= reviewed_at``, so the lower bound
+    skips it in every subsequent round -- silently violating the
+    fail-toward-ingestion invariant.
+
+    Mutation check: reverting the ``since`` derivation in ``record_review``
+    to ``previous_decision.get("reviewed_at")`` (the merge-base form, without
+    the ``before`` fallback) makes this test fail, because the gap comment is
+    then dropped by ``since`` in round 2 and never surfaces.
+    """
+    # max_rework_cycles bumped past 2 so the second request_changes round does
+    # not escalate -- escalation does not short-circuit required_changes
+    # persistence (the ingestion block runs before the escalation check), but
+    # keeping the verdict non-escalated makes the assertion target unambiguous.
+    config = OrchestratorConfig(review=ReviewConfig(max_rework_cycles=10))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    base = datetime.now(UTC)
+    # Round-1 head commit landed 2 hours ago -- well before the verdict write.
+    round1_commit_dt = base - timedelta(hours=2)
+    # A genuine human finding posted 1 hour ago: strictly AFTER the round-1
+    # head commit (so ``before`` excludes it in round 1) and strictly BEFORE
+    # round-1's reviewed_at (utc_now() during round 1's record_review, i.e.
+    # ~base). This is the (before, reviewed_at] gap that the discontinuity
+    # silently dropped.
+    gap_comment_dt = base - timedelta(hours=1)
+    gap_finding = "Gap comment: the rollback path leaks a file handle on early return."
+
+    round1_sha = "round1-head-sha"
+    fake_gh.pr_head_shas[456] = round1_sha
+    fake_gh.commits[round1_sha] = {
+        "parents": [{"sha": "base-sha"}],
+        "commit": {
+            "author": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": round1_commit_dt.isoformat(),
+            },
+            "committer": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": round1_commit_dt.isoformat(),
+            },
+        },
+    }
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": gap_finding,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": gap_comment_dt.isoformat(),
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Round 1: request_changes. The gap comment is after the round-1 head
+    # commit, so ``before`` excludes it this round -- it must NOT appear yet.
+    r1 = app.record_review(
+        456, "request_changes", summary="round 1", required_changes=["internal-1"]
+    )
+    assert r1.ok is True
+    d1 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
+    assert not any("Gap comment" in c for c in d1["required_changes"]), (
+        "gap comment must be excluded by `before` in round 1 "
+        "(it is strictly after the round-1 head commit)"
+    )
+    # The contiguity fix persists ``before`` so round 2 can derive ``since``
+    # from it. This is the load-bearing persistence the next round reads back.
+    assert d1.get("before") == round1_commit_dt.isoformat(), (
+        "round-1 decision must persist the `before` upper bound for round-2 contiguity"
+    )
+
+    # Round 2: the worker pushed a new head. Its commit lands ~now (after the
+    # gap comment), so ``before_2`` does not exclude the gap comment; and
+    # ``since_2`` = round-1's persisted ``before`` = round1_commit_dt, which is
+    # before the gap comment, so the lower bound does not exclude it either.
+    round2_commit_dt = base
+    round2_sha = "round2-head-sha"
+    fake_gh.pr_head_shas[456] = round2_sha
+    fake_gh.commits[round2_sha] = {
+        "parents": [{"sha": round1_sha}],
+        "commit": {
+            "author": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": round2_commit_dt.isoformat(),
+            },
+            "committer": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": round2_commit_dt.isoformat(),
+            },
+        },
+    }
+
+    r2 = app.record_review(
+        456, "request_changes", summary="round 2", required_changes=["internal-2"]
+    )
+    assert r2.ok is True
+    d2 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
+    changes2 = d2["required_changes"]
+
+    # THE regression assertion: the gap comment surfaces in round 2 rather
+    # than being permanently dropped.
+    assert any("Gap comment" in c for c in changes2), (
+        "human comment in the (before, reviewed_at] gap must surface in the next "
+        "round, not be silently dropped forever"
+    )
+    # The round-2 internal finding survives alongside it.
+    assert "internal-2" in changes2
+
+
 def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
     """AC-3 regression pin, referenced by name in record_review's derivation
     comment. A reject-on-empty-required_changes gate here would recreate the

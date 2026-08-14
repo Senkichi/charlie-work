@@ -5779,14 +5779,15 @@ def _collect_external_findings(
       person, and filtering on that login would drop exactly the findings #950
       exists to ingest. See ``ORCHESTRATOR_COMMENT_MARKER``.
 
-    ``since``, when given, is the previous round's ``reviewed_at`` (an
-    ``utc_now()``-formatted ISO 8601 UTC timestamp, see ``record_review``).
-    An item timestamped at or before ``since`` was already visible -- either
-    surfaced in a prior round's ``required_changes`` or predating review
-    entirely -- so it is skipped. This is what stops a rework loop from
-    re-ingesting the same stale findings on every round: without it,
-    `_write_rework_prompt` buries the one new finding under the full comment
-    history every time.
+    ``since``, when given, is the previous round's *upper* bound -- the
+    ``before`` timestamp that round persisted in ``review-decision.json``
+    (falling back to that round's ``reviewed_at`` only when no ``before`` was
+    recorded; see ``record_review``'s contiguity note). An item timestamped
+    at or before ``since`` was already visible -- either surfaced in a prior
+    round's ``required_changes`` or predating review entirely -- so it is
+    skipped. This is what stops a rework loop from re-ingesting the same stale
+    findings on every round: without it, ``_write_rework_prompt`` buries the
+    one new finding under the full comment history every time.
 
     ``before``, when given, is the *current* round's ``reviewed_head_sha``
     committer-date timestamp (see ``_commit_timestamp``). An item timestamped
@@ -5803,6 +5804,17 @@ def _collect_external_findings(
     not by author: a genuine human comment posted *before* the reviewed head
     is still ingested (asserted positively by
     ``test_worker_rework_reply_is_not_ingested_as_external_finding``).
+
+    Contiguity contract: ``since`` and ``before`` together partition the
+    comment timeline into per-round half-open windows ``(since, before]``, and
+    the next round's ``since`` is this round's persisted ``before``. A comment
+    in the gap ``(before, reviewed_at]`` -- posted after the reviewed head
+    landed but before the verdict was written -- is excluded by ``before``
+    this round and recovered by ``since`` next round. Deriving ``since`` from
+    ``reviewed_at`` instead would drop such a comment forever (it satisfies
+    ``item_dt <= reviewed_at``), violating the fail-toward-ingestion
+    invariant. This is pinned by
+    ``test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round``.
 
     GitHub's list endpoints disagree on which field carries the timestamp --
     issue comments and inline review comments use ``created_at``, top-level
@@ -13238,9 +13250,9 @@ class OrchestratorApp:
         # author identity (the orchestrator and workers both post through user
         # tokens, so identity cannot separate their output from a genuine
         # human's -- see ORCHESTRATOR_COMMENT_MARKER and issue #998):
-        #   * lower bound ``since``  = previous round's reviewed_at -- a comment
-        #     seen once can structurally never come back, so stale prior-round
-        #     findings cannot bury the one live finding;
+        #   * lower bound ``since``  = the previous round's *upper* bound
+        #     (``before``), falling back to its ``reviewed_at`` only when no
+        #     ``before`` was recorded -- see the contiguity note below;
         #   * upper bound ``before`` = the current reviewed_head_sha's committer
         #     date -- a worker's own rework reply is posted *after* the rework
         #     commit it describes (which is the head the reviewer is now
@@ -13254,11 +13266,36 @@ class OrchestratorApp:
         # This block runs after reviewed_head_sha is resolved (and after the
         # --reviewed-head validation that can return early), so the upper bound
         # always reflects the exact head the verdict is pinned to.
+        #
+        # Contiguity across rounds (issue #998 rework): the next round's
+        # ``since`` MUST be this round's ``before``, not this round's
+        # ``reviewed_at``. A genuine human comment posted in the gap
+        # ``(before, reviewed_at]`` -- between the reviewed head commit landing
+        # and the verdict being written -- is excluded by ``before`` this round
+        # (item_dt > before). If the next round used ``reviewed_at`` as its
+        # ``since``, that comment would satisfy ``item_dt <= reviewed_at`` and
+        # be dropped by the lower bound *forever* -- a silent hole in the
+        # window that violates the "fail toward ingestion" invariant above.
+        # Deriving ``since`` from the previous round's persisted ``before``
+        # makes the per-round windows contiguous: every comment falls in
+        # exactly one round's ``(since, before]`` window, so nothing is
+        # permanently lost. The ``reviewed_at`` fallback is only taken when no
+        # ``before`` was recorded -- which happens precisely when the upper
+        # bound was not applied (the commit timestamp could not be resolved),
+        # so nothing was excluded by ``before`` and ``reviewed_at`` remains the
+        # correct lower bound.
+        ingestion_before: str | None = None
         if decision in {"request_changes", "blocked"}:
             previous_decision = self._review_decision(pr_number)
+            previous_before = previous_decision.get("before")
             previous_reviewed_at = previous_decision.get("reviewed_at")
-            since = previous_reviewed_at if isinstance(previous_reviewed_at, str) else None
+            since = (
+                previous_before
+                if isinstance(previous_before, str) and previous_before
+                else (previous_reviewed_at if isinstance(previous_reviewed_at, str) else None)
+            )
             before = _commit_timestamp(self.gh, reviewed_head_sha)
+            ingestion_before = before
             external_findings = _collect_external_findings(
                 self.gh, pr_number, since=since, before=before
             )
@@ -13288,6 +13325,15 @@ class OrchestratorApp:
         # `approved` verdict, passes through with no new key at all.
         if findings_channel is not None:
             decision_payload["findings_channel"] = findings_channel
+        # Persist the ingestion upper bound so the next round's ``since`` can
+        # be derived from it (issue #998 rework: contiguous windowing across
+        # rounds -- see the contiguity note above). Only present when ingestion
+        # actually ran AND the upper bound was resolved; an ``approved`` verdict
+        # has no next ingestion round, and a None ``before`` means the upper
+        # bound was not applied (so there is nothing for the next round's
+        # ``since`` to recover -- it falls back to ``reviewed_at``).
+        if ingestion_before is not None:
+            decision_payload["before"] = ingestion_before
         decision_path = pr_dir / "review-decision.json"
         # Merge-update (never in-place assignment) and persist BEFORE any GitHub
         # label mutation: a label-write failure or crash must not desync the
