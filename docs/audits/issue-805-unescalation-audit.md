@@ -31,11 +31,13 @@ that was never addressed before merge.
 
 ## Headline result
 
-**0 of 7** shipped an unaddressed substantive finding.
+**0 of 7 confirmed** to have shipped an unaddressed substantive finding; **1 of 7
+(PR 585) adjudicated INSUFFICIENT-EVIDENCE** — no reviewer verdict was produced and
+this audit did not independently re-verify the docs-only PR's claims.
 
-All 7 PRs had prior review rounds with substantive findings (request_changes
-verdicts), but every substantive finding was addressed via rework before merge.
-Verified against code at the reviewed SHA and on current `main`.
+Of the 6 adjudicated SPURIOUS, all had prior review rounds with substantive findings
+(request_changes verdicts), and every substantive finding was addressed via rework
+before merge. Verified against code at the reviewed SHA and on current `main`.
 
 | PR  | Issue | Escalation reason | Verdict | Substantive finding | Addressed? |
 |-----|-------|-------------------|---------|---------------------|------------|
@@ -43,7 +45,7 @@ Verified against code at the reviewed SHA and on current `main`.
 | 531 | #525  | max_review_dispatch_attempts_exceeded | SPURIOUS | `event_ring_size: 0` footgun | Yes — rework |
 | 503 | #496  | max_review_dispatch_attempts_exceeded | SPURIOUS | `merge_hold` stripped by every transition | Yes — rework |
 | 584 | #583  | max_review_dispatch_attempts_exceeded | SPURIOUS | (none — operator review) | N/A |
-| 585 | #485  | max_review_dispatch_attempts_exceeded | SPURIOUS | (none — operator review, docs-only) | N/A |
+| 585 | #485  | max_review_dispatch_attempts_exceeded | INSUFFICIENT-EVIDENCE | (none — no reviewer verdict produced) | N/A |
 | 637 | #633  | max_review_dispatch_attempts_exceeded | SPURIOUS | Third call site unguarded | Yes — rework |
 | 630 | #623  | max_review_dispatch_attempts_exceeded | SPURIOUS | `require_global` absent-vs-invalid + merge conflict | Yes — rework |
 
@@ -190,7 +192,7 @@ issue #583 live trace. No substantive finding was raised by the escalating revie
 
 ---
 
-### PR 585 (issue #485) — SPURIOUS
+### PR 585 (issue #485) — INSUFFICIENT-EVIDENCE
 
 **Title:** docs(runbook): api worker operations, provider onboarding, calibration
 
@@ -199,9 +201,10 @@ Unescalated once (event 6143) on 2026-07-26.
 
 **Review body:** `review-comment.md` shows "no verdict produced" — the automated
 reviewer hit the session limit after 1 turn (0 tool calls). No rework-prompt.md
-exists.
+exists. No substantive finding was ever produced by the automated reviewer.
 
-The `review-decision.json` summary is an operator review:
+The `review-decision.json` summary is an operator review (cited as context, not as
+this audit's independent verification):
 
 > PR #585 adds a docs-only 'API worker operations' section to docs/RUNBOOK.md plus
 > one CLAUDE.md invariant line, closing #485. Every concrete technical claim (config
@@ -211,13 +214,16 @@ The `review-decision.json` summary is an operator review:
 > the shipped source in config.py, routing.py, api_worker.py, api_budget.py,
 > claude_code.py, state.py, global_config.py.
 
-**Verification:** This is a docs-only PR (CLAUDE.md + docs/RUNBOOK.md). The operator
-review verified every technical claim against the shipped source. No code changes to
-verify against a reviewed SHA.
+**Audit basis:** No reviewer verdict was ever produced (session limit after 1 turn,
+0 tool calls), so no substantive finding exists to check against code at a reviewed
+SHA or on current `main`. This audit did not independently re-verify the docs-only
+PR's technical claims against the shipped source. The operator's self-report above
+is the operator's verification, not this audit's.
 
-**Verdict: SPURIOUS.** The escalation was mechanical (reviewer session limit). The
-operator manually reviewed and approved with a detailed verification of every
-technical claim. No substantive finding was raised.
+**Verdict: INSUFFICIENT-EVIDENCE.** The escalation was mechanical (reviewer session
+limit). No substantive finding was raised by the automated reviewer, and this audit
+did not independently verify the docs claims. Per issue #805 acceptance criterion 1,
+INSUFFICIENT-EVIDENCE is an acceptable verdict; a manufactured SPURIOUS is not.
 
 ---
 
@@ -300,9 +306,11 @@ The key difference with these 7 PRs: their escalation reason was
 produce a verdict at all (session limits, rate limits). For PRs 540, 531, 503, 637,
 and 630, prior review rounds HAD produced substantive findings, but those findings
 were addressed via rework (rework-prompt.md files exist, and the fixes are verified
-at the reviewed SHAs and on current main). For PRs 584 and 585, the automated
-reviewer never produced a verdict, and the operator manually reviewed and approved
-with detailed verification.
+at the reviewed SHAs and on current main). For PR 584, the automated reviewer never
+produced a verdict, but this audit independently verified the code fix at the
+reviewed SHA and on current main. For PR 585, the automated reviewer never produced
+a verdict, and this audit did not independently re-verify the docs-only PR's claims
+— adjudicated INSUFFICIENT-EVIDENCE.
 
 In contrast, PR 700's escalation was `request_changes_count >= max_rework_cycles` —
 the reviewer DID produce verdicts with substantive findings, but the rework cycle
@@ -311,8 +319,11 @@ the remaining findings.
 
 ## Conclusion
 
-The 627/700 case is an outlier, not a pattern. All 7 of the other manually-unescalated
-merged PRs shipped without unaddressed substantive findings. The escalations were
+The 627/700 case is an outlier, not a pattern. Of the other 7 manually-unescalated
+merged PRs, 6 shipped without unaddressed substantive findings (verified
+independently at the reviewed SHA and on current `main`), and 1 (PR 585) was
+adjudicated INSUFFICIENT-EVIDENCE — no reviewer verdict was produced and this audit
+did not independently re-verify the docs-only PR's claims. The escalations were
 mechanical (reviewer session failures), and where prior reviews had raised
 substantive findings, those findings were addressed via rework before merge.
 
