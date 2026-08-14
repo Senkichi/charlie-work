@@ -30377,6 +30377,162 @@ def test_reap_restore_stalled_long_runtime_not_startup_death(
     assert pr_state["last_rework_failure_kind"] == "stalled"
 
 
+def test_worker_death_bounded_runtime_last_activity_at_fallback(tmp_path: Path) -> None:
+    """Issue #1106: ``_worker_death_bounded_runtime_seconds`` must fall back to
+    the sidecar's ``last_activity_at`` timestamp when the log file is gone
+    (``log_stat()`` returns None).
+
+    The log file may be deleted after the CLI exits (cleanup, tmpfs recycle,
+    operator intervention), but the sidecar's ``last_activity_at`` was updated
+    each pass by ``update_worker_log_stat`` and is frozen at the last observed
+    mtime.  The death-bounded runtime derived from it must be the gap between
+    ``started_at`` and that last-activity timestamp — not 0.0 (which would
+    only be correct when *no* activity was ever recorded).
+
+    Mutation gate: removing the ``last_activity_at`` fallback branch (so the
+    function returns 0.0 when ``log_stat()`` is None) makes this test fail
+    (0.0 != ~5.0).
+    """
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _worker_death_bounded_runtime_seconds
+
+    now = datetime.now(UTC)
+    started_at = now - timedelta(seconds=300)
+    death_at = started_at + timedelta(seconds=5)
+
+    # Log path does not exist — log_stat() will return None.
+    missing_log = tmp_path / "nonexistent" / "issue-123.log"
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,
+        started_at=started_at.isoformat().replace("+00:00", "Z"),
+        process_start_time=started_at.timestamp(),
+        log_path=str(missing_log),
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+        branch="agent/issue-123-fix-search",
+        last_activity_at=death_at.isoformat().replace("+00:00", "Z"),
+    )
+
+    runtime = _worker_death_bounded_runtime_seconds(worker)
+    # The fallback must derive ~5s from last_activity_at, not 0.0.
+    assert runtime == pytest.approx(5.0, abs=0.01)
+
+
+def test_worker_death_bounded_runtime_no_signal_returns_zero(tmp_path: Path) -> None:
+    """Issue #1106: ``_worker_death_bounded_runtime_seconds`` must return 0.0
+    when neither ``log_stat()`` nor ``last_activity_at`` is available — the CLI
+    never wrote anything, which is a startup death by construction.
+
+    Mutation gate: changing the final fallback to return a non-zero value
+    (e.g. ``worker.runtime_seconds()``) makes this test fail.
+    """
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _worker_death_bounded_runtime_seconds
+
+    now = datetime.now(UTC)
+    started_at = now - timedelta(seconds=300)
+
+    missing_log = tmp_path / "nonexistent" / "issue-123.log"
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,
+        started_at=started_at.isoformat().replace("+00:00", "Z"),
+        process_start_time=started_at.timestamp(),
+        log_path=str(missing_log),
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+        branch="agent/issue-123-fix-search",
+        last_activity_at=None,  # no sidecar activity recorded
+    )
+
+    runtime = _worker_death_bounded_runtime_seconds(worker)
+    assert runtime == 0.0
+
+
+def test_dispatch_rework_clears_startup_death_flag_on_new_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106: ``_dispatch_rework_impl``'s new-dispatch-supersedes-clearing
+    block must clear ``last_rework_was_startup_death`` /
+    ``last_rework_failure_kind`` when a fresh rework session is successfully
+    dispatched after a prior startup-death flag was set.
+
+    The stale flag belongs to the *dead* session; the new session is the one
+    whose outcome the next janitor pass will attribute.  If the flag survives
+    the dispatch, a subsequent janitor pass would misattribute the new
+    session's outcome to the old death and skip the cap counter.
+
+    Mutation gate: removing the clearing block at the ``if ok:`` branch in
+    ``_dispatch_rework_impl`` (the ``last_rework_failure_kind`` /
+    ``last_rework_was_startup_death`` reset on the PR state) makes this test
+    fail (the flags stay True/``"launch_failed"`` instead of being cleared).
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    # Seed state: issue in rework_requested, PR carrying a stale startup-death
+    # flag from a prior dead session.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        state["prs"]["456"] = {
+            **state.get("prs", {}).get("456", {}),
+            "number": 456,
+            "issue_number": 123,
+            "last_rework_failure_kind": "launch_failed",
+            "last_rework_was_startup_death": True,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a rework prompt so dispatch can proceed.
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    # The new dispatch must have cleared the stale startup-death flags.
+    assert pr_state["last_rework_was_startup_death"] is False
+    assert pr_state["last_rework_failure_kind"] is None
+
+
 def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
     tmp_path: Path,
 ) -> None:
