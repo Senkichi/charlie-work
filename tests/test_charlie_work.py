@@ -23394,6 +23394,99 @@ def test_human_quote_reply_to_orchestrator_comment_is_still_ingested(
     assert "keep me" in changes
 
 
+def test_worker_rework_reply_is_not_ingested_as_external_finding(
+    tmp_path: Path,
+) -> None:
+    """Issue #998: a worker's own rework reply is machine-generated, posted
+    through the worker's path (no ``ORCHESTRATOR_COMMENT_MARKER``), and posted
+    *after* the rework commit it describes. It must not come back as a
+    "required change" on the next ``request_changes`` verdict -- that would
+    tell the worker to address its own completion report.
+
+    The cutoff is temporal, not identity-based: the worker posts through a
+    user token (same account / ``type=User`` as the human whose findings #950
+    exists to capture), so the upper bound is the ``reviewed_head_sha``'s
+    committer date. A genuine human comment from the *same* account and same
+    ``type=User``, posted *before* the reviewed head, is still ingested --
+    this is the regression any identity-based shortcut would cause, asserted
+    positively rather than assumed.
+
+    Mutation check: disabling the ``before`` upper bound (reverting
+    ``_collect_external_findings`` to its merge-base form) makes this test
+    fail, because the worker reply is then ingested alongside the human
+    finding.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # The rework commit the reviewer is about to read. Its committer date is
+    # the ingestion upper bound. Set it up as the live PR head with full
+    # commit metadata so _commit_timestamp can resolve it.
+    rework_sha = "rework-head-sha"
+    fake_gh.pr_head_shas[456] = rework_sha
+    fake_gh.commits[rework_sha] = {
+        "parents": [{"sha": "base-sha"}],
+        "commit": {
+            "author": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": "2026-08-10T10:00:00Z",
+            },
+            "committer": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": "2026-08-10T10:00:00Z",
+            },
+        },
+    }
+
+    # A genuine human finding from the SAME account and SAME type=User,
+    # posted *before* the reviewed head commit -- must still be ingested.
+    human_finding = "The migration script drops the index without a guard."
+    # The worker pushed the rework at 10:00, then posted its completion reply
+    # at 10:05 -- after the head commit, so outside the ingestion window. This
+    # is exactly the real-world shape from PR #972's comment thread.
+    worker_reply = (
+        "Reworked in rework-head-sha. Summary of the changes addressing each "
+        "point: added the missing rollback path and a regression test."
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": human_finding,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        },
+        {
+            "body": worker_reply,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": "2026-08-10T10:05:00Z",
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.record_review(
+        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    changes = decision["required_changes"]
+
+    # The worker's own rework reply is NOT fed back as a required change.
+    assert not any("Reworked in rework-head-sha" in item for item in changes), (
+        "worker rework reply must not be ingested as an external finding"
+    )
+    # The genuine human finding from the same account/type=User IS ingested.
+    assert any("migration script drops the index" in item for item in changes), (
+        "genuine human comment before the reviewed head must still be ingested"
+    )
+    # The internal finding survives untouched.
+    assert "keep me" in changes
+
+
 def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
     """AC-3 regression pin, referenced by name in record_review's derivation
     comment. A reject-on-empty-required_changes gate here would recreate the

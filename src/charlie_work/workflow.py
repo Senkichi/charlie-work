@@ -5565,8 +5565,10 @@ So provenance travels in the body instead. ``_comment_pr`` stamps this marker;
 invisible in rendered markdown, so the posted comment is unchanged for readers.
 
 Note this covers only comments written by *this* process. A worker's own rework
-reply is machine-generated too and is not stamped here -- see the follow-up
-issue referenced in ``_collect_external_findings``.
+reply is machine-generated too and is not stamped here -- it is excluded from
+ingestion by a *temporal* cutoff instead (issue #998): ``_collect_external_findings``
+drops any comment posted after the reviewed head commit's committer date, and a
+worker's reply is by construction posted after the rework commit it describes.
 """
 
 
@@ -5629,8 +5631,55 @@ def _gh_api_list(gh: GitHubLike, path: str) -> list[dict[str, Any]]:
     return []
 
 
+def _commit_timestamp(gh: GitHubLike, sha: str | None) -> str | None:
+    """Return the committer-date ISO 8601 timestamp of commit ``sha``, or None.
+
+    Wraps ``gh.commit(sha)`` (``gh api repos/{owner}/{repo}/commits/{sha}``) and
+    reads ``commit.committer.date`` -- the moment the commit landed on the
+    branch, which is what the external-findings upper bound (issue #998) needs
+    to compare against comment timestamps. The author date is user-settable and
+    can be backdated, so it is *not* used as the cutoff; the committer date is
+    the GitHub-recorded landing time.
+
+    Errors are returned as ``None``, never raised -- consistent with this
+    repo's errors-as-values invariant. A ``None`` return tells
+    ``_collect_external_findings`` to skip the upper bound entirely (fail
+    toward ingestion): losing a genuine human finding is the expensive
+    direction of this filter, and a missing commit timestamp must not silently
+    drop comments.
+    """
+    if not sha:
+        return None
+    result = gh.commit(sha)
+    value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
+    if not isinstance(value, dict):
+        return None
+    commit = value.get("commit")
+    if not isinstance(commit, dict):
+        return None
+    committer = commit.get("committer")
+    if isinstance(committer, dict):
+        date = committer.get("date")
+        if isinstance(date, str) and date:
+            return date
+    # Fall back to the author date only if the committer date is entirely
+    # absent -- rare, but a squash with a crafted author/committer split could
+    # leave committer empty. Author date is less authoritative (settable) but
+    # still bounds the comment window better than no cutoff at all.
+    author = commit.get("author")
+    if isinstance(author, dict):
+        date = author.get("date")
+        if isinstance(date, str) and date:
+            return date
+    return None
+
+
 def _collect_external_findings(
-    gh: GitHubLike, pr_number: int, *, since: str | None = None
+    gh: GitHubLike,
+    pr_number: int,
+    *,
+    since: str | None = None,
+    before: str | None = None,
 ) -> list[str]:
     """Collect non-bot human feedback from the three external PR surfaces.
 
@@ -5654,21 +5703,35 @@ def _collect_external_findings(
     An item timestamped at or before ``since`` was already visible -- either
     surfaced in a prior round's ``required_changes`` or predating review
     entirely -- so it is skipped. This is what stops a rework loop from
-    re-ingesting the same stale findings (plus the growing pile of a worker's
-    own rework replies) on every round: without it, `_write_rework_prompt`
-    buries the one new finding under the full comment history every time.
+    re-ingesting the same stale findings on every round: without it,
+    `_write_rework_prompt` buries the one new finding under the full comment
+    history every time.
+
+    ``before``, when given, is the *current* round's ``reviewed_head_sha``
+    committer-date timestamp (see ``_commit_timestamp``). An item timestamped
+    strictly after ``before`` is skipped. This is the upper bound that closes
+    issue #998: a worker's own rework reply ("Reworked in <sha>, here is what
+    I changed") is machine-generated, posted through the worker's path (no
+    ``ORCHESTRATOR_COMMENT_MARKER``), and -- critically -- posted *after* the
+    rework commit it describes, which is exactly the head the reviewer is now
+    reading. Cutting ingestion off at that head's commit time drops the reply
+    without any cooperation from the worker's posting path, and it also stops
+    findings the worker has already addressed from being re-presented every
+    round. The same account/``type=User`` constraint that defeated an
+    identity-based fix in #997 applies here too, so the cutoff is temporal,
+    not by author: a genuine human comment posted *before* the reviewed head
+    is still ingested (asserted positively by
+    ``test_worker_rework_reply_is_not_ingested_as_external_finding``).
+
     GitHub's list endpoints disagree on which field carries the timestamp --
     issue comments and inline review comments use ``created_at``, top-level
     review bodies use ``submitted_at`` -- so both are checked per item. An
-    item with neither field (or an unparsable one) is never skipped: losing a
-    genuine finding is the expensive direction of this filter (see
-    ``test_human_quote_reply_to_orchestrator_comment_is_still_ingested``).
-
-    Known gap: a worker's own rework reply ("Reworked in <sha>, here is what I
-    changed") is machine-generated but posted through the worker's path, so it
-    carries no marker and is still ingested if posted after ``since`` -- it
-    would be presented back to the worker as a required change. Tracked
-    separately; fixing it needs a marker on the worker side.
+    item with neither field (or an unparsable one) is never skipped by either
+    bound: losing a genuine finding is the expensive direction of this filter
+    (see ``test_human_quote_reply_to_orchestrator_comment_is_still_ingested``).
+    Likewise, if ``before`` cannot be parsed (or the commit timestamp could
+    not be resolved at the call site) the upper bound is not applied -- the
+    filter fails toward ingestion, never toward silent suppression.
     """
     bodies: list[str] = []
     owner_repo = "{owner}/{repo}"
@@ -5683,14 +5746,17 @@ def _collect_external_findings(
     )
 
     since_dt = _parse_iso_timestamp(since) if since else None
+    before_dt = _parse_iso_timestamp(before) if before else None
 
     for path in surfaces:
         for item in _gh_api_list(gh, path):
             if _is_bot_comment(item) or _is_orchestrator_comment(item):
                 continue
-            if since_dt is not None:
-                item_dt = _parse_iso_timestamp(item.get("created_at") or item.get("submitted_at"))
-                if item_dt is not None and item_dt <= since_dt:
+            item_dt = _parse_iso_timestamp(item.get("created_at") or item.get("submitted_at"))
+            if item_dt is not None:
+                if since_dt is not None and item_dt <= since_dt:
+                    continue
+                if before_dt is not None and item_dt > before_dt:
                     continue
             body = (item.get("body") or "").strip()
             if body:
@@ -13005,30 +13071,6 @@ class OrchestratorApp:
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
 
-        # Issue #950: fold non-bot findings from the PR's own external review
-        # surfaces into the verdict at write time. This is a live fetch at
-        # record_review time, not at render time, so _render_rework_prompt stays
-        # a pure function of the durable verdict file.
-        #
-        # Scoped to comments posted after the previous round's reviewed_at
-        # (when a previous round exists): without a cutoff, every round
-        # re-fetches the PR's *entire* comment history, so stale prior-round
-        # findings and unmarked worker rework replies pile up in
-        # required_changes and bury the one live finding. review-decision.json
-        # is overwritten atomically per round, so the producer input -- an
-        # unbounded fetch -- was the actual defect, not the write.
-        if decision in {"request_changes", "blocked"}:
-            previous_decision = self._review_decision(pr_number)
-            previous_reviewed_at = previous_decision.get("reviewed_at")
-            since = previous_reviewed_at if isinstance(previous_reviewed_at, str) else None
-            external_findings = _collect_external_findings(self.gh, pr_number, since=since)
-            if external_findings:
-                if findings_channel == "vacuous":
-                    effective_required_changes = list(external_findings)
-                else:
-                    effective_required_changes.extend(external_findings)
-                findings_channel = "external"
-
         # reviewed_head_sha/reviewed_patch_id must reflect the packet the reviewer
         # actually read (review()'s pr.json/diff.patch), not a fresh fetch made
         # here at verdict time: a commit landing between packet generation and
@@ -13105,6 +13147,46 @@ class OrchestratorApp:
             reviewed_patch_id = _calculate_patch_id(diff)
             if diff:
                 reviewed_signature = _diff_content_signature(diff)
+
+        # Issue #950 / #998: fold non-bot findings from the PR's own external
+        # review surfaces into the verdict at write time. This is a live fetch
+        # at record_review time, not at render time, so _render_rework_prompt
+        # stays a pure function of the durable verdict file.
+        #
+        # The ingestion window is bounded on both sides by *time*, not by
+        # author identity (the orchestrator and workers both post through user
+        # tokens, so identity cannot separate their output from a genuine
+        # human's -- see ORCHESTRATOR_COMMENT_MARKER and issue #998):
+        #   * lower bound ``since``  = previous round's reviewed_at -- a comment
+        #     seen once can structurally never come back, so stale prior-round
+        #     findings cannot bury the one live finding;
+        #   * upper bound ``before`` = the current reviewed_head_sha's committer
+        #     date -- a worker's own rework reply is posted *after* the rework
+        #     commit it describes (which is the head the reviewer is now
+        #     reading), so it falls outside the window and is not fed back to
+        #     the worker as a "required change". This also closes the
+        #     pre-ORCHESTRATOR_COMMENT_MARKER comment gap (#998 comment): those
+        #     comments predate every future reviewed_head_sha and are excluded
+        #     by the lower bound from the second round on.
+        # Both bounds fail toward ingestion when their timestamp is missing or
+        # unparsable: losing a genuine human finding is the expensive direction.
+        # This block runs after reviewed_head_sha is resolved (and after the
+        # --reviewed-head validation that can return early), so the upper bound
+        # always reflects the exact head the verdict is pinned to.
+        if decision in {"request_changes", "blocked"}:
+            previous_decision = self._review_decision(pr_number)
+            previous_reviewed_at = previous_decision.get("reviewed_at")
+            since = previous_reviewed_at if isinstance(previous_reviewed_at, str) else None
+            before = _commit_timestamp(self.gh, reviewed_head_sha)
+            external_findings = _collect_external_findings(
+                self.gh, pr_number, since=since, before=before
+            )
+            if external_findings:
+                if findings_channel == "vacuous":
+                    effective_required_changes = list(external_findings)
+                else:
+                    effective_required_changes.extend(external_findings)
+                findings_channel = "external"
         decision_payload = {
             "pr_number": pr_number,
             "issue_number": issue_number,
