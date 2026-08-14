@@ -26,7 +26,13 @@ from charlie_work.devin_shell import (
 )
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.state import set_throttled_until
-from charlie_work.worktree import WorktreeInfo, create_worktree, is_junction, remove_worktree
+from charlie_work.worktree import (
+    WorktreeForeignWriterError,
+    WorktreeInfo,
+    create_worktree,
+    is_junction,
+    remove_worktree,
+)
 
 # A tiny fake "devin" CLI: writes its argv to stdout and exits 0. Launched via
 # sys.executable to dodge PATH entirely (mirrors the sys.executable fake-binary
@@ -499,6 +505,61 @@ def test_launch_worktree_creation_failure_yields_error_record(
     payload = json.loads((sessions_dir / "issue-8.json").read_text(encoding="utf-8"))
     assert payload["pid"] is None
     assert payload["error"] is not None
+
+
+def test_launch_worktree_foreign_writer_error_serializes_path_and_writes_clean_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression test for issue #1184.
+
+    ``WorktreeForeignWriterError.worktree_path`` is a ``pathlib.Path``. If the
+    launch shim inserts it into the failure ``SessionRecord`` without
+    ``str()`` coercion, ``json.dump`` raises ``TypeError`` mid-write inside
+    ``_write_json``, stranding a ``.tmp`` file and never producing a readable
+    sidecar or a returned record — the caller instead sees an uncaught
+    exception, which the orchestrator logs as a generic launch failure and
+    burns a rework-cap slot on.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    foreign_path = tmp_path / "foreign-wt"
+
+    def foreign_writer_create_worktree(*args, **kwargs):
+        raise WorktreeForeignWriterError(
+            worktree_path=foreign_path,
+            pid=1234,
+            session_id="abc",
+        )
+
+    monkeypatch.setattr(devin_shell, "create_worktree", foreign_writer_create_worktree)
+
+    # Must not raise: the whole point of the shim is to convert this
+    # exception into a durable error record.
+    record = launch_devin_session(
+        9,
+        "agent/issue-9-foreign",
+        tmp_path / "prompt.md",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+    )
+
+    assert record.failure_kind == "worktree_foreign_writer"
+    assert isinstance(record.worktree_path, str)
+    assert record.worktree_path == str(foreign_path)
+
+    sidecar_path = sessions_dir / "issue-9.json"
+    tmp_sidecar_path = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
+
+    assert sidecar_path.exists()
+    assert not tmp_sidecar_path.exists()
+
+    # json.loads must succeed cleanly — this is the assertion that would
+    # fail (TypeError during json.dump, no file or a stranded .tmp instead)
+    # if the str() coercion were reverted.
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["failure_kind"] == "worktree_foreign_writer"
+    assert payload["worktree_path"] == str(foreign_path)
 
 
 def test_launch_devin_session_passes_rework_flag(
