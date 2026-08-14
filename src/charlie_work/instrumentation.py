@@ -181,6 +181,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervisor_restart_watchdog_disabled": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
+        # The supervisor's startup guard found an editable .pth in the running
+        # interpreter's venv pointing outside the interpreter-derived checkout
+        # (the 2026-08-05 scratch-clone repoint shape). The pass is refused
+        # before config load, so this is terminal for the pass -> error.
+        "venv_editable_anchor_violation": "error",
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
