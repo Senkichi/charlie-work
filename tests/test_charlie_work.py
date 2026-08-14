@@ -3282,6 +3282,12 @@ class FakeGitHub:
                 break
         return True
 
+    def issue_comment(self, number: int, body_file: Path) -> None:
+        """Record issue comments posted by the orchestrator (issue #1000)."""
+        posted = getattr(self, "issue_comments_posted", [])
+        posted.append((number, Path(body_file).read_text(encoding="utf-8")))
+        self.issue_comments_posted = posted
+
     def name_with_owner(self) -> str:
         return "test-owner/test-repo"
 
