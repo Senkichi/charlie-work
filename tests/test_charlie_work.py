@@ -30147,6 +30147,236 @@ def test_reap_restore_sets_startup_death_flag(
     assert state["issues"]["123"]["status"] == "rework_requested"
 
 
+def test_reap_restore_startup_death_stalled_real_pid_under_classification_delay(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106 regression: the realistic calibration incident shape.
+
+    The 2026-08-08 incident was NOT a ``launch_failed`` (pid=None) — the Devin
+    CLI launched, got a real PID, printed "Refusing to run in an untrusted
+    workspace", and exited within seconds.  That is a ``stalled`` session with
+    a real PID.  The orchestrator's classification pass may not run until
+    minutes later (bounded by the polling interval), so the startup-death
+    threshold must be checked against a signal bounded by the CLI's *actual
+    death time* (log mtime), not ``runtime_seconds()`` (``now - started_at``,
+    which measures elapsed time until classification).
+
+    This test seeds a ``stalled`` sidecar with a real PID whose ``started_at``
+    is 300 seconds in the past (simulating classification latency) but whose
+    log file mtime is only 5 seconds after ``started_at`` (the CLI died at 5s).
+    With the death-bounded runtime the session is a 5-second startup death
+    (< 60s threshold); with the old ``runtime_seconds()`` it would be a
+    300-second stall (> 60s) and the exemption would be silently defeated.
+
+    Mutation gate: reverting the call site in ``_reap_restore_rework_requested``
+    back to ``worker.runtime_seconds()`` makes this test fail (the flag stays
+    False instead of being set True).
+    """
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _reap_restore_rework_requested
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+    # The CLI started 300s ago and died 5s later (at 295s ago).  The
+    # classification pass runs "now" — 300s after start, well past the 60s
+    # threshold if measured against the wall clock.
+    started_at = now - timedelta(seconds=300)
+    death_at = started_at + timedelta(seconds=5)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": started_at.timestamp(),
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    # Write the log file with the calibration incident's refusal message and
+    # freeze its mtime at the death moment (5s after start).
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("Refusing to run in an untrusted workspace\n", encoding="utf-8")
+    death_ts = death_at.timestamp()
+    os.utime(log_path, (death_ts, death_ts))
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,  # real PID — the CLI launched before dying
+        started_at=started_at.isoformat().replace("+00:00", "Z"),
+        process_start_time=started_at.timestamp(),
+        log_path=str(log_path),
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        error=None,  # not a launch failure — the CLI ran and exited
+        failure_kind=None,
+        reclaimed=None,
+        branch="agent/issue-123-fix-search",
+    )
+
+    open_prs_by_issue = {
+        123: [
+            {
+                "number": 456,
+                "title": "Fix #123: search",
+                "headRefName": "agent/issue-123-fix-search",
+                "headRefOid": "sha-abc123",
+                "state": "OPEN",
+            }
+        ]
+    }
+
+    _reap_restore_rework_requested(
+        paths.state_file,
+        fake_gh,
+        config,
+        open_prs_by_issue,
+        worker,
+        failure_kind="stalled",
+    )
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    # The death-bounded runtime is ~5s (< 60s threshold) → startup death,
+    # even though 300s elapsed between start and classification.
+    assert pr_state["last_rework_was_startup_death"] is True
+    assert pr_state["last_rework_failure_kind"] == "stalled"
+    # The issue must have been restored to rework_requested (not escalated).
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+
+def test_reap_restore_stalled_long_runtime_not_startup_death(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106 negative case: a ``stalled`` session whose log shows the
+    CLI genuinely ran for minutes must NOT be classified as a startup death,
+    even when the classification pass runs much later.
+
+    The log mtime is 200s after ``started_at`` (the worker ran for 200s before
+    dying), well above the 60s threshold.  The death-bounded runtime correctly
+    exceeds the threshold, so the cap counters should count this session.
+    """
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _reap_restore_rework_requested
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+    started_at = now - timedelta(seconds=600)
+    death_at = started_at + timedelta(seconds=200)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": started_at.timestamp(),
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worker ran for a while then stalled\n", encoding="utf-8")
+    death_ts = death_at.timestamp()
+    os.utime(log_path, (death_ts, death_ts))
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,
+        started_at=started_at.isoformat().replace("+00:00", "Z"),
+        process_start_time=started_at.timestamp(),
+        log_path=str(log_path),
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+        branch="agent/issue-123-fix-search",
+    )
+
+    open_prs_by_issue = {
+        123: [
+            {
+                "number": 456,
+                "title": "Fix #123: search",
+                "headRefName": "agent/issue-123-fix-search",
+                "headRefOid": "sha-abc123",
+                "state": "OPEN",
+            }
+        ]
+    }
+
+    _reap_restore_rework_requested(
+        paths.state_file,
+        fake_gh,
+        config,
+        open_prs_by_issue,
+        worker,
+        failure_kind="stalled",
+    )
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    # 200s death-bounded runtime > 60s threshold → NOT a startup death.
+    assert pr_state["last_rework_was_startup_death"] is False
+    assert pr_state["last_rework_failure_kind"] == "stalled"
+
+
 def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
     tmp_path: Path,
 ) -> None:

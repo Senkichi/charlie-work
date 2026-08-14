@@ -206,6 +206,16 @@ from .routing import AdapterChoice, record_adapter_choice, select_adapter
 # minutes but got stuck) must NOT be misclassified as a startup death, so the
 # bound is set above the worst-case CLI startup time but well below the
 # shortest genuine-work session.
+#
+# The ``runtime_seconds`` passed to ``_is_startup_death`` must be bounded by
+# the worker's *actual process runtime* (time from start to death), NOT by the
+# elapsed time until the orchestrator's classification pass runs.  Using
+# ``WorkerView.runtime_seconds()`` (which is ``now - started_at``) would let
+# ordinary polling latency — the gap between when the CLI died and when the
+# reaper pass classifies it — silently push a 5-second startup death past the
+# 60-second threshold and defeat the exemption.  ``_worker_death_bounded_runtime_seconds``
+# derives the runtime from the log file's last-modified time (frozen at death
+# for a dead process) instead.
 STARTUP_DEATH_THRESHOLD_SECONDS: int = 60
 
 
@@ -215,6 +225,12 @@ def _is_startup_death(failure_kind: str | None, runtime_seconds: float) -> bool:
     Returns True when the session never reached the worker's first tool
     action — the cap counters in ``_route_janitor_gate_failure_to_rework``
     must not count these as no-op/conflict rework attempts (issue #1106).
+
+    ``runtime_seconds`` must be the worker's *death-bounded* runtime (time
+    from ``started_at`` to the last real log activity / death), as computed
+    by ``_worker_death_bounded_runtime_seconds`` — NOT
+    ``WorkerView.runtime_seconds()``, which measures elapsed time until
+    classification and is polluted by polling latency.
     """
     if failure_kind is None:
         return False
@@ -228,6 +244,52 @@ def _is_startup_death(failure_kind: str | None, runtime_seconds: float) -> bool:
     if failure_kind == "stalled" and runtime_seconds < STARTUP_DEATH_THRESHOLD_SECONDS:
         return True
     return False
+
+
+def _worker_death_bounded_runtime_seconds(worker: WorkerView) -> float:
+    """Return the worker's runtime bounded by actual process death.
+
+    This is the signal ``_is_startup_death`` must use instead of
+    ``WorkerView.runtime_seconds()`` (which is ``now - started_at`` and
+    measures elapsed time until the *classification pass*, not until death).
+    A CLI that dies at 5 seconds but is not classified until 300 seconds
+    later must still be recognized as a 5-second startup death, not a
+    300-second stall.
+
+    The death-bounded runtime is derived from the log file's last-modified
+    time: once the CLI process exits, the log stops being written and its
+    mtime freezes at the death moment.  A fresh ``stat()`` of the log file
+    is the most accurate signal; the sidecar's recorded ``last_activity_at``
+    (updated each pass by ``update_worker_log_stat``) is the fallback when
+    the log file is gone.  When neither is available — the CLI never wrote
+    anything, e.g. a ``launch_failed`` that still got a PID — the runtime is
+    0.0, which is a startup death by construction.
+    """
+    from datetime import UTC, datetime
+
+    try:
+        started_at = datetime.fromisoformat(worker.started_at)
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        return 0.0
+
+    # Prefer a fresh stat of the log file — its mtime is frozen at death for
+    # a dead process, so this is the tightest death-bounded signal.
+    death_ts: float | None = None
+    log_stat = worker.log_stat()
+    if log_stat is not None:
+        death_ts = log_stat.st_mtime
+    if death_ts is None and worker.last_activity_at is not None:
+        # Fall back to the sidecar's recorded last-activity timestamp.
+        from .worker import _iso_to_timestamp
+
+        death_ts = _iso_to_timestamp(worker.last_activity_at)
+    if death_ts is None:
+        # No log activity was ever recorded — the CLI never wrote anything,
+        # which is a startup death by construction (runtime 0.0).
+        return 0.0
+    return max(0.0, death_ts - started_at.timestamp())
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -5481,7 +5543,9 @@ def _reap_restore_rework_requested(
             # increment when the session died at CLI startup (before
             # the worker's first tool action) instead of miscounting
             # it as a no-op/conflict rework attempt.
-            startup_death = _is_startup_death(failure_kind, worker.runtime_seconds())
+            startup_death = _is_startup_death(
+                failure_kind, _worker_death_bounded_runtime_seconds(worker)
+            )
             state["prs"][str(pr_number)] = {
                 **state.get("prs", {}).get(str(pr_number), {}),
                 "last_rework_failure_kind": failure_kind,
