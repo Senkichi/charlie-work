@@ -5213,8 +5213,9 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
     override_dir = tmp_path / "orchestrator-prompts"
     override_dir.mkdir()
     # The override must carry the no-merge contract markers (issue #714),
-    # the conventional-commit title instruction (issue #715), and the
-    # execution-contract escalation trigger (issue #717):
+    # the conventional-commit title instruction (issue #715), the
+    # execution-contract escalation trigger (issue #717), and the widened
+    # containment clause markers (issue #1010):
     # _write_worker_prompt's post-render guards reject a flat override that
     # drops any of these.
     (override_dir / "worker.md").write_text(
@@ -5226,7 +5227,9 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
         "**Execution contract (self-detect from your diff):** the default is "
         "the targeted command. Only if the diff changes any public function "
         "signature/return shape, run the **FULL suite** locally at the final "
-        "head before pushing.\n",
+        "head before pushing.\n\n"
+        "**Containment:** All file edits happen in the assigned worktree; "
+        "never modify any path outside the assigned worktree root.\n",
         encoding="utf-8",
     )
     config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir="orchestrator-prompts"))
@@ -5246,7 +5249,9 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
         "**Execution contract (self-detect from your diff):** the default is "
         "the targeted command. Only if the diff changes any public function "
         "signature/return shape, run the **FULL suite** locally at the final "
-        "head before pushing.\n"
+        "head before pushing.\n\n"
+        "**Containment:** All file edits happen in the assigned worktree; "
+        "never modify any path outside the assigned worktree root.\n"
     )
 
 
@@ -23587,6 +23592,227 @@ def test_record_review_derived_with_external_findings_preserves_both(
     assert "did not record a structured findings list" in section
     assert "## Findings posted on the PR itself" in section
     assert "- The migration needs a rollback path before this can land." in section
+
+
+def test_worker_rework_reply_is_not_ingested_as_external_finding(
+    tmp_path: Path,
+) -> None:
+    """Issue #998: a worker's own rework reply is machine-generated, posted
+    through the worker's path (no ``ORCHESTRATOR_COMMENT_MARKER``), and posted
+    *after* the rework commit it describes. It must not come back as a
+    "required change" on the next ``request_changes`` verdict -- that would
+    tell the worker to address its own completion report.
+
+    The cutoff is temporal, not identity-based: the worker posts through a
+    user token (same account / ``type=User`` as the human whose findings #950
+    exists to capture), so the upper bound is the ``reviewed_head_sha``'s
+    committer date. A genuine human comment from the *same* account and same
+    ``type=User``, posted *before* the reviewed head, is still ingested --
+    this is the regression any identity-based shortcut would cause, asserted
+    positively rather than assumed.
+
+    Mutation check: disabling the ``before`` upper bound (reverting
+    ``_collect_external_findings`` to its merge-base form) makes this test
+    fail, because the worker reply is then ingested alongside the human
+    finding.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    # The rework commit the reviewer is about to read. Its committer date is
+    # the ingestion upper bound. Set it up as the live PR head with full
+    # commit metadata so _commit_timestamp can resolve it.
+    rework_sha = "rework-head-sha"
+    fake_gh.pr_head_shas[456] = rework_sha
+    fake_gh.commits[rework_sha] = {
+        "parents": [{"sha": "base-sha"}],
+        "commit": {
+            "author": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": "2026-08-10T10:00:00Z",
+            },
+            "committer": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": "2026-08-10T10:00:00Z",
+            },
+        },
+    }
+
+    # A genuine human finding from the SAME account and SAME type=User,
+    # posted *before* the reviewed head commit -- must still be ingested.
+    human_finding = "The migration script drops the index without a guard."
+    # The worker pushed the rework at 10:00, then posted its completion reply
+    # at 10:05 -- after the head commit, so outside the ingestion window. This
+    # is exactly the real-world shape from PR #972's comment thread.
+    worker_reply = (
+        "Reworked in rework-head-sha. Summary of the changes addressing each "
+        "point: added the missing rollback path and a regression test."
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": human_finding,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        },
+        {
+            "body": worker_reply,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": "2026-08-10T10:05:00Z",
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.record_review(
+        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    # Issue #999: external findings ride in their own field, not required_changes.
+    changes = decision["required_changes"]
+    external = decision.get("external_findings", [])
+
+    # The worker's own rework reply is NOT fed back as an external finding.
+    assert not any("Reworked in rework-head-sha" in item for item in external), (
+        "worker rework reply must not be ingested as an external finding"
+    )
+    # The genuine human finding from the same account/type=User IS ingested
+    # into the external_findings field.
+    assert any("migration script drops the index" in item for item in external), (
+        "genuine human comment before the reviewed head must still be ingested"
+    )
+    # The internal finding survives untouched in required_changes.
+    assert "keep me" in changes
+
+
+def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
+    tmp_path: Path,
+) -> None:
+    """Issue #998 rework: a genuine human comment posted in the gap
+    ``(before, reviewed_at]`` -- after the reviewed head commit landed but
+    before the verdict was written -- is excluded by ``before`` this round
+    and MUST surface as a required_change in the following round.
+
+    The per-round ingestion windows must be contiguous: the next round's
+    ``since`` is this round's persisted ``before`` (not its ``reviewed_at``).
+    Deriving ``since`` from ``reviewed_at`` instead would drop a gap comment
+    forever -- it satisfies ``item_dt <= reviewed_at``, so the lower bound
+    skips it in every subsequent round -- silently violating the
+    fail-toward-ingestion invariant.
+
+    Mutation check: reverting the ``since`` derivation in ``record_review``
+    to ``previous_decision.get("reviewed_at")`` (the merge-base form, without
+    the ``before`` fallback) makes this test fail, because the gap comment is
+    then dropped by ``since`` in round 2 and never surfaces.
+    """
+    # max_rework_cycles bumped past 2 so the second request_changes round does
+    # not escalate -- escalation does not short-circuit required_changes
+    # persistence (the ingestion block runs before the escalation check), but
+    # keeping the verdict non-escalated makes the assertion target unambiguous.
+    config = OrchestratorConfig(review=ReviewConfig(max_rework_cycles=10))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    base = datetime.now(UTC)
+    # Round-1 head commit landed 2 hours ago -- well before the verdict write.
+    round1_commit_dt = base - timedelta(hours=2)
+    # A genuine human finding posted 1 hour ago: strictly AFTER the round-1
+    # head commit (so ``before`` excludes it in round 1) and strictly BEFORE
+    # round-1's reviewed_at (utc_now() during round 1's record_review, i.e.
+    # ~base). This is the (before, reviewed_at] gap that the discontinuity
+    # silently dropped.
+    gap_comment_dt = base - timedelta(hours=1)
+    gap_finding = "Gap comment: the rollback path leaks a file handle on early return."
+
+    round1_sha = "round1-head-sha"
+    fake_gh.pr_head_shas[456] = round1_sha
+    fake_gh.commits[round1_sha] = {
+        "parents": [{"sha": "base-sha"}],
+        "commit": {
+            "author": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": round1_commit_dt.isoformat(),
+            },
+            "committer": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": round1_commit_dt.isoformat(),
+            },
+        },
+    }
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": gap_finding,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": gap_comment_dt.isoformat(),
+        },
+    ]
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Round 1: request_changes. The gap comment is after the round-1 head
+    # commit, so ``before`` excludes it this round -- it must NOT appear yet.
+    r1 = app.record_review(
+        456, "request_changes", summary="round 1", required_changes=["internal-1"]
+    )
+    assert r1.ok is True
+    d1 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
+    assert not any("Gap comment" in c for c in d1["required_changes"]), (
+        "gap comment must be excluded by `before` in round 1 "
+        "(it is strictly after the round-1 head commit)"
+    )
+    # The contiguity fix persists ``before`` so round 2 can derive ``since``
+    # from it. This is the load-bearing persistence the next round reads back.
+    assert d1.get("before") == round1_commit_dt.isoformat(), (
+        "round-1 decision must persist the `before` upper bound for round-2 contiguity"
+    )
+
+    # Round 2: the worker pushed a new head. Its commit lands ~now (after the
+    # gap comment), so ``before_2`` does not exclude the gap comment; and
+    # ``since_2`` = round-1's persisted ``before`` = round1_commit_dt, which is
+    # before the gap comment, so the lower bound does not exclude it either.
+    round2_commit_dt = base
+    round2_sha = "round2-head-sha"
+    fake_gh.pr_head_shas[456] = round2_sha
+    fake_gh.commits[round2_sha] = {
+        "parents": [{"sha": round1_sha}],
+        "commit": {
+            "author": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": round2_commit_dt.isoformat(),
+            },
+            "committer": {
+                "name": "worker",
+                "email": "w@example.test",
+                "date": round2_commit_dt.isoformat(),
+            },
+        },
+    }
+
+    r2 = app.record_review(
+        456, "request_changes", summary="round 2", required_changes=["internal-2"]
+    )
+    assert r2.ok is True
+    d2 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
+    # Issue #999: external findings ride in their own field, not required_changes.
+    changes2 = d2["required_changes"]
+    external2 = d2.get("external_findings", [])
+
+    # THE regression assertion: the gap comment surfaces in round 2 rather
+    # than being permanently dropped.
+    assert any("Gap comment" in c for c in external2), (
+        "human comment in the (before, reviewed_at] gap must surface in the next "
+        "round, not be silently dropped forever"
+    )
+    # The round-2 internal finding survives alongside it.
+    assert "internal-2" in changes2
 
 
 def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
@@ -43216,6 +43442,106 @@ def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None
     result3 = app.dispatch(limit=1)
     assert result3.ok is True
     assert result3.data["selected_count"] == 0
+
+
+def _cross_repo_issue_body() -> str:
+    """Issue body whose every referenced file path is absent from the target repo.
+
+    Mirrors the #1010/#953 scenario: the subject code lives in a sibling repo,
+    so every path the issue references is missing from the repo the worker is
+    dispatched against.
+    """
+    return (
+        "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
+        "`C:/Users/senki/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
+        "`src/charlie_work/suite_coverage.py`. The worker, handed an isolated checkout "
+        "of a repo that does not contain the file it was asked to change, went to "
+        "`C:\\Users\\senki\\repos\\ci_runners` — the **shared main checkout** — and worked there."
+    )
+
+
+def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path) -> None:
+    """Issue #1010 wiring: the real dispatch path escalates (not dispatches) an
+    issue whose referenced file paths are all absent from the target repo.
+
+    Drives ``OrchestratorApp.dispatch`` (the ``_dispatch_impl`` path that decides
+    to escalate instead of dispatch), not ``cross_repo_gate`` in isolation, and
+    asserts the three observable effects of the wiring: the label transition to
+    ``agent:human-needed``, the ``dispatch_cross_repo_escalated`` event, and
+    exclusion from ``session_requests`` (``selected_count == 0``). A regression
+    in the wiring that calls the gate would silently reintroduce the exact bug
+    this PR fixes with every unit test green, so this test exercises the wiring.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # The default fixture PR is open and linked to issue #123, which would
+    # exclude the issue via the open-PR guard; close it so #123 is selectable.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    # Every referenced path is absent from tmp_path (the repo root).
+    fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    # The issue was escalated, not dispatched: no session was requested.
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert 123 in result.data["cross_repo_escalated_issue_numbers"]
+    # No dispatch_results were produced for the escalated issue.
+    assert result.data["dispatch_results"] == []
+
+    # Label transition to human-needed (the redispatch_escalated edge).
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+
+    # The dispatch_cross_repo_escalated event was recorded with the issue number
+    # and a cross_repo_target reason.
+    state = load_state(paths.state_file)
+    escalated_events = [e for e in state["events"] if e["kind"] == "dispatch_cross_repo_escalated"]
+    assert len(escalated_events) == 1
+    assert escalated_events[0]["payload"]["issue_number"] == 123
+    assert "cross_repo_target" in escalated_events[0]["payload"]["reason"]
+
+    # The issue is terminal in state, not left dispatch_pending.
+    assert state["issues"]["123"]["status"] == "escalated"
+
+
+def test_dry_run_dispatch_cross_repo_gate_reports_without_mutating(tmp_path: Path) -> None:
+    """Issue #1010 wiring (dry-run): ``dispatch`` with ``dry_run=True`` reports
+    which issues the cross-repo gate would escalate, without mutating state,
+    labels, or events.
+
+    Drives the dry-run branch of ``_dispatch_impl`` (the path that populates
+    ``cross_repo_escalated_issue_numbers`` in the planning payload), not
+    ``cross_repo_gate`` in isolation.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    app = OrchestratorApp(
+        repo_root=tmp_path,
+        paths=paths,
+        config=config,
+        gh=fake_gh,
+        dry_run=True,
+    )
+
+    result = app.dispatch()
+
+    # The issue is reported as cross-repo escalated and excluded from sessions.
+    assert result.ok is True
+    assert 123 in result.data["cross_repo_escalated_issue_numbers"]
+    assert result.data["selected_count"] == 0
+    session_issue_numbers = {session["issue_number"] for session in result.data["sessions"]}
+    assert 123 not in session_issue_numbers
+
+    # Dry-run must not mutate labels, state, or events.
+    assert (123, "agent:human-needed") not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["issues"] == {}
+    assert state["events"] == []
 
 
 def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:

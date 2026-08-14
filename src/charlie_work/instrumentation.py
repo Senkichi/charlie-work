@@ -148,6 +148,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # head. Terminal for this lane -> error.
         "cross_family_report_regen_exhausted": "error",
         "dispatch_blocked_chain_dead": "error",
+        # Issue #1010: the pre-flight cross-repo gate escalated an issue whose
+        # referenced file paths were all absent from the target repo, ending
+        # its dispatch lane this pass. Terminal for the lane -> error, like the
+        # other *_escalated kinds.
+        "dispatch_cross_repo_escalated": "error",
         "dispatch_failed": "error",
         "fleet_pass_config_error": "error",
         "github_error": "error",
