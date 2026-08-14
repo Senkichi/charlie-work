@@ -322,6 +322,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # outside the self_deploy_alarm streak (a sibling wedge bounds staleness
         # but does not block orchestrator deploys).
         "self_deploy_ci_fleet_pull": "info",
+        "ci_fleet_provenance": "info",
         "review_dispatch": "info",
         "review_dispatch_claim": "info",
         "review_packet": "info",
