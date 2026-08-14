@@ -2335,6 +2335,58 @@ def test_run_fleet_supervise_logs_global_config_provenance(
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_records_ci_fleet_provenance(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #954: the supervisor records ci_fleet's import location + sibling git state.
+
+    The live supervisor imports ci_fleet from an editable working tree, not a
+    commit. This event makes that coupling attributable: it stamps
+    ``ci_fleet.__file__``, the sibling repo's HEAD/branch/dirty-state into the
+    fleet-level events.db at every supervisor start. The event is recorded
+    even when ``declared_ci_fleet_root`` abstains (e.g. from a worktree), so
+    the ``ci_fleet_file`` field is the one fact always present.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(
+        max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+    )
+
+    # The event lands in the fleet-level events.db (sibling of the heartbeat).
+    heartbeat = tmp_path / "supervisor-heartbeat.json"
+    rows = query_events(heartbeat, kind="ci_fleet_provenance")
+    assert rows is not None, "no events.db reader -- the event was not recorded"
+    assert len(rows) == 1, f"expected exactly one ci_fleet_provenance event, got {len(rows)}"
+    payload = rows[0]["payload"]
+    # ci_fleet is importable in this venv, so __file__ is always set.
+    assert payload["ci_fleet_file"] is not None
+    # All fields are present (None is a valid value for the sibling fields
+    # when declared_ci_fleet_root abstains from a worktree).
+    for key in (
+        "sibling_root",
+        "sibling_head",
+        "sibling_branch",
+        "sibling_dirty",
+        "error",
+    ):
+        assert key in payload, f"missing field {key!r} in ci_fleet_provenance payload"
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
 def test_run_fleet_supervise_loud_on_absent_global_layer(
     mock_lock: MagicMock,
