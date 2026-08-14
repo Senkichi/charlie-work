@@ -33,11 +33,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 import pytest
 
+from charlie_work.state import StateLockBusy
 from charlie_work.state_migration import (
     MigrationChild,
     MigrationOutcome,
@@ -1221,6 +1223,74 @@ def test_rewrite_state_json_paths_missing_file_is_ok_zero(tmp_path: Path) -> Non
     assert result.ok is True
     assert result.rewritten == 0
     assert result.error is None
+
+
+def test_rewrite_state_json_paths_returns_ok_false_on_state_lock_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """StateLockBusy from the state lock is caught and returned as ok=False
+    with .error set -- never propagated to the caller.
+
+    Pins the ``except StateLockBusy`` branch in ``_rewrite_state_json_paths``
+    (CLAUDE.md invariant: errors from external processes come back as values,
+    never raised). The branch had zero test coverage; this forces it by
+    monkeypatching ``state_lock`` to raise ``StateLockBusy`` on entry, so the
+    ``with state_lock(...)`` statement never acquires the lock.
+    """
+    src_root = tmp_path / "old-state"
+    dst_root = tmp_path / "new-state"
+    src_root.mkdir()
+    dst_root.mkdir()
+    # A state.json must exist so the function does not short-circuit on the
+    # missing-file early return.
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"version": 1}), encoding="utf-8")
+
+    @contextmanager
+    def raising_lock(path: Path) -> Any:
+        raise StateLockBusy("lock held by another process")
+        yield  # pragma: no cover -- makes this a generator like the real state_lock
+
+    monkeypatch.setattr("charlie_work.state_migration.state_lock", raising_lock)
+
+    result = _rewrite_state_json_paths(state_path, src_root, dst_root)
+
+    assert result.ok is False
+    assert result.rewritten == 0
+    assert result.error is not None
+    assert "could not acquire state lock" in result.error
+
+
+def test_rewrite_state_json_paths_returns_ok_false_on_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OSError during the load/save cycle is caught and returned as ok=False
+    with .error set -- never propagated to the caller.
+
+    Pins the ``except OSError`` branch in ``_rewrite_state_json_paths``
+    (CLAUDE.md invariant: errors from external processes come back as values,
+    never raised). The branch had zero test coverage; this forces it by
+    monkeypatching ``load_state`` to raise ``OSError`` inside the lock, so the
+    I/O error surfaces through the same try/except that guards the save path.
+    """
+    src_root = tmp_path / "old-state"
+    dst_root = tmp_path / "new-state"
+    src_root.mkdir()
+    dst_root.mkdir()
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"version": 1}), encoding="utf-8")
+
+    def raising_load(path: Path) -> dict[str, Any]:
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr("charlie_work.state_migration.load_state", raising_load)
+
+    result = _rewrite_state_json_paths(state_path, src_root, dst_root)
+
+    assert result.ok is False
+    assert result.rewritten == 0
+    assert result.error is not None
+    assert "state rewrite I/O error" in result.error
 
 
 def _make_state_with_embedded_paths(src_root: Path, *, pr_count: int = 1) -> dict[str, Any]:
