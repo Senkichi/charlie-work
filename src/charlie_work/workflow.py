@@ -12433,6 +12433,118 @@ class OrchestratorApp:
 
         return {"recorded": recorded, "missed": missed}
 
+    def _reconcile_stranded_verdicts(self) -> list[dict[str, Any]]:
+        """Ingest completed on-disk verdicts that were never recorded into state.
+
+        Issue #736: a PR may have a complete ``review-decision.json`` on disk
+        (written by ``record_review``) but no ``decision`` key in its state
+        record -- the state update was lost (e.g. a concurrent writer clobbered
+        it, or the verdict file was written by a path that didn't update
+        state). Without this reconciliation, the verdict is stranded: the PR
+        stays in ``status=reviewing`` forever because the only ingestion path
+        that reads ``review-decision.json`` (``_reap_review_verdicts``) requires
+        a live reviewer sidecar, and the stale-claim recovery branch in
+        ``_detect_and_handle_stalled_reviews`` explicitly *skips* PRs whose
+        on-disk verdict is already completed (issue #734's
+        ``decision_already_recorded`` skip). That skip is correct for the
+        stale-claim sweep -- a completed verdict is not a stale claim -- but
+        it leaves the PR with no path to ingest the verdict at all.
+
+        This method closes that gap by scanning every non-terminal PR record
+        for a ``decision_path`` pointing to an existing file with a completed
+        verdict (``approved``/``request_changes``/``blocked``) that is not
+        reflected in ``state.decision``, and ingesting it via
+        ``record_review`` so the normal verdict → rework/merge/blocked route
+        can take over. It runs in ``dispatch_reviews`` ahead of the
+        ``review_dispatch.enabled`` gate (issue #868), so it executes even
+        when review dispatch is disabled fleet-wide -- the exact condition
+        that stranded PR 1343.
+
+        Returns a list of per-PR result dicts for diagnostics.
+        """
+        if self.dry_run:
+            return []
+        results: list[dict[str, Any]] = []
+        state = load_state_locked(self.paths.state_file)
+        for pr_key, pr_state in list(state.get("prs", {}).items()):
+            if not isinstance(pr_state, dict) or not pr_key.isdigit():
+                continue
+            pr_status = pr_state.get("status")
+            # Skip lifecycle-terminal PRs -- a merged/closed PR needs no
+            # verdict ingestion.
+            if pr_status in ("merged", "closed"):
+                continue
+            # Skip if state already carries a completed decision -- the
+            # verdict was already ingested. This covers both the normal case
+            # (decision matches the file) and the case where a later verdict
+            # superseded the file.
+            recorded_decision = pr_state.get("decision")
+            if recorded_decision in ("approved", "request_changes", "blocked"):
+                continue
+            decision_path_str = pr_state.get("decision_path")
+            if not decision_path_str:
+                continue
+            decision_path = Path(decision_path_str)
+            if not decision_path.exists():
+                continue
+            try:
+                with decision_path.open("r", encoding="utf-8") as handle:
+                    decision_data = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(decision_data, dict):
+                continue
+            on_disk_decision = decision_data.get("decision")
+            if on_disk_decision not in ("approved", "request_changes", "blocked"):
+                continue
+            # Stranded verdict found: the on-disk file carries a completed
+            # decision but state has no ``decision`` key. Ingest it via
+            # ``record_review`` so the full state-machine transition (PR
+            # status, issue status, rework prompt, label transition) runs
+            # exactly as if the verdict were freshly rendered.
+            # ``allow_stale_head=True`` because the verdict was already
+            # written against a specific head (``reviewed_head_sha`` in the
+            # file); refusing on head drift would re-strand the verdict
+            # instead of ingesting it.
+            pr_number = int(pr_key)
+            record_result = self.record_review(
+                pr_number,
+                on_disk_decision,
+                summary=decision_data.get("summary", ""),
+                reviewed_head=decision_data.get("reviewed_head_sha"),
+                required_changes=decision_data.get("required_changes"),
+                allow_stale_head=True,
+            )
+            entry: dict[str, Any] = {
+                "pr_number": pr_number,
+                "decision": on_disk_decision,
+                "ok": record_result.ok,
+                "message": record_result.message,
+            }
+            results.append(entry)
+            if record_result.ok:
+                log_event(
+                    self.paths.state_file,
+                    "review_verdict_reconciled",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": decision_data.get("issue_number"),
+                        "decision": on_disk_decision,
+                    },
+                )
+            else:
+                log_event(
+                    self.paths.state_file,
+                    "review_verdict_reconcile_failed",
+                    {
+                        "pr_number": pr_number,
+                        "decision": on_disk_decision,
+                        "reason": record_result.message,
+                    },
+                    level="warning",
+                )
+        return results
+
     def _record_cross_family_verdicts(self) -> list[dict[str, Any]]:
         """Parse cross-family reports and record verdicts for pending PRs.
 
@@ -12879,8 +12991,20 @@ class OrchestratorApp:
         # fix these sweeps sat below the ``enabled`` early return and were
         # unreachable whenever dispatch was disabled.
         verdict_result = {"recorded": [], "missed": []}
+        reconciled_verdicts: list[dict[str, Any]] = []
         if not self.dry_run:
             verdict_result = self._reap_review_verdicts(reviews_dir)
+            # Issue #736: ingest completed on-disk verdicts that were never
+            # recorded into state. This runs BEFORE the stale-claim sweep so
+            # the sweep's ``decision_already_recorded`` skip (issue #734)
+            # never fires for a PR this reconciliation just ingested -- after
+            # ``record_review`` the PR's ``review_dispatch_status`` is
+            # ``review_dispatch_completed`` and the stale-claim branch (which
+            # only matches ``review_dispatch_status is None``) no longer
+            # applies. Like the other sweeps here, this runs ahead of the
+            # ``review_dispatch.enabled`` gate (issue #868) so a stranded
+            # verdict is ingested even when dispatch is disabled fleet-wide.
+            reconciled_verdicts = self._reconcile_stranded_verdicts()
             _detect_and_handle_stalled_reviews(
                 reviews_dir,
                 self.paths.state_file,
@@ -12924,6 +13048,12 @@ class OrchestratorApp:
                     "disabled": True,
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    # Issue #736: stranded-verdict reconciliation runs above
+                    # the gate, so its results are reported on the disabled
+                    # path for the same reason #868 reports the reaper results
+                    # here -- this is the ONLY path the reconciliation runs on
+                    # in a deployed fleet with dispatch disabled.
+                    "reconciled_verdicts": reconciled_verdicts,
                     # Issue #1088: reported on the disabled path for the same
                     # reason #868 reports the reaper results here -- this is the
                     # ONLY path the sweep runs on in a deployed fleet, so a
@@ -12959,6 +13089,7 @@ class OrchestratorApp:
                         "deferred_reason": "reviewer_quota_probe_backoff",
                         "recorded_verdicts": recorded_verdicts,
                         "missed_verdicts": missed_verdicts,
+                        "reconciled_verdicts": reconciled_verdicts,
                     },
                 )
             probe_mode_dry = bool(
@@ -13004,6 +13135,7 @@ class OrchestratorApp:
                     "rescue_marked_excluded": [c["pr"] for c in rescue_marked_dry],
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    "reconciled_verdicts": reconciled_verdicts,
                     **selection.local_cap.report_fields(),
                 },
             )
@@ -13117,6 +13249,7 @@ class OrchestratorApp:
                     "deferred_reason": "reviewer_quota_probe_backoff",
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    "reconciled_verdicts": reconciled_verdicts,
                     "rescue_review_results": deferred_rescue_results,
                 },
             )
@@ -13134,6 +13267,7 @@ class OrchestratorApp:
                     "launched_count": 0,
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    "reconciled_verdicts": reconciled_verdicts,
                 },
             )
 
@@ -13158,6 +13292,7 @@ class OrchestratorApp:
                     "launched_count": 0,
                     "recorded_verdicts": recorded_verdicts,
                     "missed_verdicts": missed_verdicts,
+                    "reconciled_verdicts": reconciled_verdicts,
                     "rescue_review_results": rescue_review_results,
                 },
             )
@@ -13689,6 +13824,7 @@ class OrchestratorApp:
             "merge_conflict_results": merge_conflict_results,
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
+            "reconciled_verdicts": reconciled_verdicts,
             "rescue_review_results": rescue_review_results,
             "escalated_labels_repaired": repaired_labels,
         }
