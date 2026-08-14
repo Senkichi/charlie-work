@@ -41463,6 +41463,116 @@ def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path)
     assert len(events) == 1
 
 
+def test_session_failed_relabeled_payload_requires_reason() -> None:
+    """Issue #978: the shared payload builder makes a relabel event without a
+    ``reason`` unrepresentable -- calling it without ``reason`` raises
+    TypeError, the same property ``_escalate_issue`` gives escalation."""
+    from charlie_work.workflow import _session_failed_relabeled_payload
+
+    # reason is a required keyword-only argument.
+    with pytest.raises(TypeError):
+        _session_failed_relabeled_payload(issue_number=42)  # type: ignore[call-arg]
+
+    # With reason, the payload always carries it; failure_kind is optional.
+    payload = _session_failed_relabeled_payload(issue_number=42, reason="dead_worker_no_open_pr")
+    assert payload["reason"] == "dead_worker_no_open_pr"
+    assert "failure_kind" not in payload
+
+    payload = _session_failed_relabeled_payload(
+        issue_number=42, reason="dead_worker_no_open_pr", failure_kind="stalled"
+    )
+    assert payload["reason"] == "dead_worker_no_open_pr"
+    assert payload["failure_kind"] == "stalled"
+
+
+def test_classify_dead_sessions_relabel_carries_required_reason(tmp_path: Path) -> None:
+    """Issue #978: the dead-worker no-open-PR relabel path must emit a
+    ``session_failed_relabeled`` event whose ``reason`` is always populated.
+    Previously this site passed ``failure_kind`` only (which can be ``None``
+    when classification is inconclusive), producing rows with neither
+    ``reason`` nor a populated ``failure_kind`` -- the "neither field" shape."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 978, dirty=True)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 978, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 978,
+            "title": "Test issue",
+            "url": "https://example.test/issues/978",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 101
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+    # The canonical "why" field is always present -- the "neither field"
+    # shape cannot recur regardless of whether failure_kind was classified.
+    assert events[0]["payload"]["reason"] == "dead_worker_no_open_pr"
+
+
+def test_orphaned_worker_reclaim_carries_required_reason(tmp_path: Path) -> None:
+    """Issue #978: the orphan-sweep reclaim path must emit a
+    ``session_failed_relabeled`` event with ``reason`` populated. This site
+    already used ``reason`` before the fix, but it is now routed through the
+    shared payload builder so the invariant is enforced at one point."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1978"] = {
+        "status": "dispatched",
+        "dispatched_at": "2026-08-01T00:00:00Z",
+        "redispatch_at": ["2026-08-01T00:05:00Z"],
+        "worker_pid": 55555,
+        "worker_process_start_time": 1784000000.0,
+    }
+    save_state(paths.state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 1978,
+            "title": "orphan reclaim",
+            "url": "https://example.test/issues/1978",
+            "body": "",
+            "labels": [
+                {"name": config.labels.in_progress},
+                {"name": config.labels.ready},
+            ],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+    assert events[0]["payload"]["reason"] == "dead_worker_no_open_pr_orphan_sweep"
+
+
 def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> None:
     """Issue #252: a clean worktree with no commits relabels to ready."""
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state

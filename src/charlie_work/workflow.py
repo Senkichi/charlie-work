@@ -729,6 +729,81 @@ def _escalate_issue(
     return state
 
 
+def _session_failed_relabeled_payload(
+    *,
+    issue_number: int,
+    reason: str,
+    failure_kind: str | None = None,
+    removed_labels: list[str] | tuple[str, ...] = (),
+    added_ready: bool = False,
+    label_write_ok: bool = True,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build the payload for a ``session_failed_relabeled`` event.
+
+    Mirrors ``_escalate_issue`` (#750): ``reason`` is keyword-only and
+    required, so a relabel event can never be emitted without saying *why*
+    it fired. ``failure_kind`` is an optional refinement (the classifier's
+    verdict, which may be ``None`` when classification could not determine
+    a kind); when present it is recorded alongside ``reason``, but
+    ``reason`` is the canonical field a reader filters on.
+
+    Every prior call site spelled "why" under a different key --
+    ``reason`` (orphan sweep), ``failure_kind`` only (dead-worker
+    no-open-PR), both (phantom live worker), or English prose in
+    ``detail`` (reconcile) -- so a query on any one key silently missed
+    the rows written by the others. Routing all sites through this
+    builder makes the omission unrepresentable: there is no way to call
+    it without a ``reason``. Issue #978.
+    """
+    payload: dict[str, Any] = {
+        "issue_number": issue_number,
+        "reason": reason,
+        "removed_labels": sorted(removed_labels),
+        "added_ready": added_ready,
+        "label_write_ok": label_write_ok,
+    }
+    if failure_kind is not None:
+        payload["failure_kind"] = failure_kind
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _emit_session_failed_relabeled(
+    state: dict[str, Any],
+    *,
+    issue_number: int,
+    reason: str,
+    failure_kind: str | None = None,
+    removed_labels: list[str] | tuple[str, ...] = (),
+    added_ready: bool = False,
+    label_write_ok: bool = True,
+    state_path: Path | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Emit a ``session_failed_relabeled`` event via the shared payload builder.
+
+    Thin wrapper around :func:`_session_failed_relabeled_payload` plus
+    :func:`append_event`; see the payload builder's docstring for the
+    required-``reason`` invariant (issue #978).
+    """
+    return append_event(
+        state,
+        "session_failed_relabeled",
+        _session_failed_relabeled_payload(
+            issue_number=issue_number,
+            reason=reason,
+            failure_kind=failure_kind,
+            removed_labels=removed_labels,
+            added_ready=added_ready,
+            label_write_ok=label_write_ok,
+            **extra,
+        ),
+        state_path=state_path,
+    )
+
+
 # Statuses that mean an issue already has a rework routed (or an equivalent
 # gate) in flight, or is otherwise spoken for -- shared by every "should I
 # route this PR to rework_requested" check so they cannot drift apart.
@@ -4868,11 +4943,11 @@ def _detect_and_handle_orphaned_workers(
                     sweep_events.append(
                         (
                             "session_failed_relabeled",
-                            {
-                                "issue_number": issue_number,
-                                "reason": "dead_worker_no_open_pr_orphan_sweep",
+                            _session_failed_relabeled_payload(
+                                issue_number=issue_number,
+                                reason="dead_worker_no_open_pr_orphan_sweep",
                                 **reclaim,
-                            },
+                            ),
                         )
                     )
                     if reclaim["label_write_ok"]:
@@ -6861,18 +6936,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # Issue #282: preserve the liveness fingerprint so the
                     # recovery path can verify the worker is dead before removing
                     # the worktree, even after the session is classified as dead.
-                    state = append_event(
+                    state = _emit_session_failed_relabeled(
                         state,
-                        "session_failed_relabeled",
-                        {
-                            "issue_number": w.issue_number,
-                            "failure_kind": failure_kind,
-                            "removed_labels": sorted(active_labels),
-                            "added_ready": needs_ready,
-                            "label_write_ok": label_write_ok,
-                            "salvage_failed": is_completed,
-                            "salvage_error": salvage_error,
-                        },
+                        issue_number=w.issue_number,
+                        reason="dead_worker_no_open_pr",
+                        failure_kind=failure_kind,
+                        removed_labels=sorted(active_labels),
+                        added_ready=needs_ready,
+                        label_write_ok=label_write_ok,
+                        salvage_failed=is_completed,
+                        salvage_error=salvage_error,
                         state_path=state_file,
                     )
                     save_state(state_file, state)
@@ -20941,19 +21014,16 @@ class OrchestratorApp:
                 # strip labels -- the issue should stay in its active state
                 # until salvage moves it to pr_open, preventing re-dispatch
                 # into the occupied worktree.
-                state = append_event(
+                state = _emit_session_failed_relabeled(
                     state,
-                    "session_failed_relabeled",
-                    {
-                        "issue_number": issue_number,
-                        "failure_kind": "live_worker_redispatch_averted",
-                        "reason": "phantom_live_worker_completed_work_preserved",
-                        "worktree_state": inspection.state.value,
-                        "reported_push": reported_push,
-                        "removed_labels": [],
-                        "added_ready": False,
-                        "label_write_ok": True,
-                    },
+                    issue_number=issue_number,
+                    reason="phantom_live_worker_completed_work_preserved",
+                    failure_kind="live_worker_redispatch_averted",
+                    removed_labels=[],
+                    added_ready=False,
+                    label_write_ok=True,
+                    worktree_state=inspection.state.value,
+                    reported_push=reported_push,
                     state_path=self.paths.state_file,
                 )
                 return "dispatch_failed", None, state
@@ -20972,17 +21042,14 @@ class OrchestratorApp:
         issue_labels = label_names(full_issue)
         active_labels = issue_labels & self.config.labels.active
         if not active_labels:
-            state = append_event(
+            state = _emit_session_failed_relabeled(
                 state,
-                "session_failed_relabeled",
-                {
-                    "issue_number": issue_number,
-                    "failure_kind": "live_worker_redispatch_averted",
-                    "reason": "phantom_live_worker_pid_dead",
-                    "removed_labels": [],
-                    "added_ready": False,
-                    "label_write_ok": True,
-                },
+                issue_number=issue_number,
+                reason="phantom_live_worker_pid_dead",
+                failure_kind="live_worker_redispatch_averted",
+                removed_labels=[],
+                added_ready=False,
+                label_write_ok=True,
                 state_path=self.paths.state_file,
             )
             return "dispatch_failed", None, state
@@ -20995,17 +21062,14 @@ class OrchestratorApp:
         if needs_ready:
             if not self.gh.add_issue_label(issue_number, self.config.labels.ready):
                 label_write_ok = False
-        state = append_event(
+        state = _emit_session_failed_relabeled(
             state,
-            "session_failed_relabeled",
-            {
-                "issue_number": issue_number,
-                "failure_kind": "live_worker_redispatch_averted",
-                "reason": "phantom_live_worker_pid_dead",
-                "removed_labels": sorted(active_labels),
-                "added_ready": needs_ready,
-                "label_write_ok": label_write_ok,
-            },
+            issue_number=issue_number,
+            reason="phantom_live_worker_pid_dead",
+            failure_kind="live_worker_redispatch_averted",
+            removed_labels=sorted(active_labels),
+            added_ready=needs_ready,
+            label_write_ok=label_write_ok,
             state_path=self.paths.state_file,
         )
         return "dispatch_failed", None, state
