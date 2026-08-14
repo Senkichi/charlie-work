@@ -2467,6 +2467,14 @@ _LOOP_ERROR_DETAIL_CHARS = 300
 # unbounded payload through the 200-entry event ring.
 _REWORK_ISSUE_FETCH_SKIPPED_MAX_ISSUES = 20
 _REWORK_ISSUE_FETCH_SKIPPED_REASON_CHARS = 300
+# Cap for the distinct-reason set. A single pass can mix failure modes that
+# want opposite operator responses -- one issue 404'd because it was deleted
+# (stop retrying), another timed out transiently (retry). Keeping only the
+# first exception as ``reason`` (issue #970) collapses those into one
+# representative and loses the distinction. This mirrors ``summarize_loop_errors``'
+# ``max_details`` idiom: a small distinct set, capped with an explicit
+# ``reasons_truncated`` count rather than silently dropped.
+_REWORK_ISSUE_FETCH_SKIPPED_MAX_REASONS = 5
 
 
 def _build_rework_issue_fetch_skip_payload(
@@ -2474,6 +2482,7 @@ def _build_rework_issue_fetch_skip_payload(
     *,
     max_issue_numbers: int = _REWORK_ISSUE_FETCH_SKIPPED_MAX_ISSUES,
     reason_chars: int = _REWORK_ISSUE_FETCH_SKIPPED_REASON_CHARS,
+    max_reasons: int = _REWORK_ISSUE_FETCH_SKIPPED_MAX_REASONS,
 ) -> dict[str, Any]:
     """Summarize per-issue ``gh.issue_view`` failures into a bounded payload.
 
@@ -2483,6 +2492,17 @@ def _build_rework_issue_fetch_skip_payload(
     ``issue_numbers_truncated`` count so the record does not understate the
     number of affected issues. The reason uses the first exception as a
     representative root cause.
+
+    ``reasons`` keeps up to ``max_reasons`` *distinct* ``(reason, error_type)``
+    pairs (issue #970). A single pass can mix failure modes that want opposite
+    operator responses -- one issue 404'd because it was deleted (stop
+    retrying), another timed out transiently (retry) -- and a single
+    representative ``reason`` collapses that distinction. Dedup is by
+    ``(reason, error_type)`` so a repeated identical outage does not crowd out
+    a rarer distinct one, matching ``summarize_loop_errors``' ``error_details``
+    shape. ``reason``/``error_type`` are retained as the first representative
+    for backward compatibility with the #940-style consumer that reads a
+    single ``reason``.
     """
     if not failures:
         return {
@@ -2490,6 +2510,8 @@ def _build_rework_issue_fetch_skip_payload(
             "issue_numbers_truncated": 0,
             "reason": "",
             "error_type": "",
+            "reasons": [],
+            "reasons_truncated": 0,
         }
 
     issue_numbers = sorted({issue for issue, _ in failures})
@@ -2498,11 +2520,30 @@ def _build_rework_issue_fetch_skip_payload(
     if len(reason) > reason_chars:
         reason = reason[: reason_chars - 3] + "..."
 
+    # Distinct (reason, error_type) pairs, preserving first-seen order so the
+    # representative above is always ``reasons[0]``. Dedup is on the truncated
+    # reason text + class name, not the raw exception, so two exceptions with
+    # the same message and class count as one root cause.
+    seen: set[tuple[str, str]] = set()
+    distinct: list[dict[str, Any]] = []
+    for _, exc in failures:
+        text = str(exc) or exc.__class__.__name__
+        if len(text) > reason_chars:
+            text = text[: reason_chars - 3] + "..."
+        cls = exc.__class__.__name__
+        key = (text, cls)
+        if key in seen:
+            continue
+        seen.add(key)
+        distinct.append({"reason": text, "error_type": cls})
+
     return {
         "issue_numbers": issue_numbers[:max_issue_numbers],
         "issue_numbers_truncated": max(0, len(issue_numbers) - max_issue_numbers),
         "reason": reason,
         "error_type": representative.__class__.__name__,
+        "reasons": distinct[:max_reasons],
+        "reasons_truncated": max(0, len(distinct) - max_reasons),
     }
 
 
@@ -16738,6 +16779,43 @@ class OrchestratorApp:
         # fresh rework attempt (or re-escalate) immediately, undoing the stall
         # escalation's entire purpose the moment it fires.
         escalation_reason = f"{attempts_key}_stall_exceeded"
+
+        # Surface ``rework_issue_fetch_skipped`` events from this stall window
+        # in the escalation payload (issue #970). The stall escalation exists
+        # to answer "why was this issue never dispatched for rework?", and
+        # ``rework_issue_fetch_skipped`` (issue #939) is the event that records
+        # exactly that -- but until this change the escalation's payload did
+        # not correlate with it, so the signal lived in events.db and was
+        # absent from the one report built to explain the very condition it
+        # describes. Mirrors #940's wiring of ``unauthorized_merge_check_skipped``
+        # into ``tripwire_status`` as ``last_skipped_reason``.
+        #
+        # The window bound is ``stall_since`` -- the stall clock start -- not a
+        # fixed lookback, for the same reason #940 bounds by ``armed_at``: a
+        # skip recorded before the stall began says nothing about why *this*
+        # stall never progressed. Reading events.db here does not compromise
+        # the state-lock section below -- it is local SQLite, independent of
+        # state.json, and ``query_events`` takes no state lock.
+        stall_skips = query_events(
+            self.paths.state_file,
+            kind="rework_issue_fetch_skipped",
+            since=stall_since,
+        )
+        last_skip = stall_skips[-1] if stall_skips else None
+        last_skip_payload = last_skip.get("payload") if isinstance(last_skip, dict) else None
+        last_skip_payload_dict = last_skip_payload if isinstance(last_skip_payload, dict) else {}
+        last_skip_reason = last_skip_payload_dict.get("reason") or None
+        last_skip_issue_numbers = last_skip_payload_dict.get("issue_numbers")
+        last_skip_reasons = last_skip_payload_dict.get("reasons")
+        last_skip_at = last_skip["ts"] if isinstance(last_skip, dict) else None
+        stall_skip_summary = {
+            "rework_fetch_skips": len(stall_skips),
+            "last_rework_fetch_skip_at": last_skip_at,
+            "last_rework_fetch_skip_reason": last_skip_reason,
+            "last_rework_fetch_skip_issue_numbers": last_skip_issue_numbers,
+            "last_rework_fetch_skip_reasons": last_skip_reasons,
+        }
+
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             attempts_so_far = int(state["prs"].get(str(pr_number), {}).get(attempts_key, 0))
@@ -16764,6 +16842,7 @@ class OrchestratorApp:
                     "stalled_minutes": round(elapsed_minutes, 1),
                     "stall_since": stall_since,
                     "head_sha": head_sha,
+                    **stall_skip_summary,
                 },
             )
             save_state(self.paths.state_file, state)
@@ -16776,10 +16855,28 @@ class OrchestratorApp:
                 "add_failures": result.add_failures,
                 "remove_failures": result.remove_failures,
             }
+        message = (
+            f"PR #{pr_number} janitor {reason} rework stalled "
+            f"({round(elapsed_minutes)}m with no progress while {issue_status}); escalated"
+        )
+        # Appended, not substituted, so the base escalation text stays true --
+        # the whole problem is that it reads as a self-contained explanation
+        # on its own while a fetch skip is the actual root cause. Conditioned
+        # on ``stall_skips`` so a stall with no fetch skips is not decorated
+        # with a vacuous "0 passes" clause.
+        if stall_skips:
+            issue_list = last_skip_issue_numbers
+            issue_clause = (
+                f" issue(s) {issue_list}" if isinstance(issue_list, list) and issue_list else ""
+            )
+            message += (
+                f" (warning: {len(stall_skips)} rework pass(es) since {stall_since}"
+                f" could not fetch{issue_clause}; most recent {last_skip_at}"
+                f", reason: {last_skip_reason})"
+            )
         return CommandResult(
             False,
-            f"PR #{pr_number} janitor {reason} rework stalled "
-            f"({round(elapsed_minutes)}m with no progress while {issue_status}); escalated",
+            message,
             {
                 "pr": pr_number,
                 "issue": issue_number,
@@ -16787,6 +16884,7 @@ class OrchestratorApp:
                 "escalated": True,
                 "escalation_reason": "stalled",
                 "label_error": label_error,
+                **stall_skip_summary,
             },
         )
 
