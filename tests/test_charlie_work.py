@@ -33818,6 +33818,35 @@ def test_concurrency_governor_result_open_pr_report_fields_absent_when_disabled(
     assert result.open_pr_enabled is False
 
 
+def test_loop_surfaces_open_pr_backpressure_fields(tmp_path: Path) -> None:
+    """Issue #1129 rework: loop() surfaces the dispatch-scoped open-PR fields.
+
+    The clamp engages inside dispatch() (1 open PR, cap 1 -> dispatch_limit 0);
+    _loop_body's 'prefer the dispatch-scoped governor values' copy loop must
+    lift open_pr_count/open_pr_max to the top-level CommandResult.data exactly
+    like the session-concurrency keys, so a loop() caller sees the backpressure
+    that clamped this pass without digging into data["dispatch"].
+    """
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.loop(merge=False)
+
+    assert result.ok is True
+    # The clamp engaged inside dispatch (dispatch-scoped values present).
+    assert result.data["dispatch"]["open_pr_count"] == 1
+    assert result.data["dispatch"]["open_pr_max"] == 1
+    # And the copy loop lifted them to the top level.
+    assert result.data["open_pr_count"] == 1
+    assert result.data["open_pr_max"] == 1
+
+
 def test_dispatch_config_max_open_agent_prs_validation_int(tmp_path: Path) -> None:
     """Issue #1129: max_open_agent_prs must be an int."""
 

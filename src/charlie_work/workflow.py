@@ -21179,6 +21179,8 @@ class OrchestratorApp:
                 "available_slots",
                 "fleet_concurrency_limit",
                 "fleet_live_session_count",
+                "open_pr_count",
+                "open_pr_max",
             ):
                 if key in data[lane]:
                     data[key] = data[lane][key]
