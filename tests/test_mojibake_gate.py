@@ -231,6 +231,64 @@ def test_deleted_file_is_not_scanned() -> None:
     assert findings == []
 
 
+def test_added_line_starting_with_plus_plus_is_scanned() -> None:
+    # Regression for the "+++" collision bug: an added line whose content
+    # starts with "++" (so the raw diff line is "+++...") must NOT be mistaken
+    # for the "+++ b/path" file header.  The true header requires a trailing
+    # space and is consumed earlier in the loop; this added line has no space
+    # after "+++" (the 4th char is "#") and must be scanned as a normal added
+    # line.
+    #
+    # The added line content is "++#bad " + mojibake em-dash + " here", so the
+    # raw diff line is "+++#bad <mojibake> here".  Before the fix, the
+    # `line.startswith("+++")` guard in the added/context/removed
+    # classification skipped this line entirely (and did not advance the line
+    # counter).
+    diff = (
+        "diff --git a/f.py b/f.py\n"
+        "--- a/f.py\n"
+        "+++ b/f.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        " # ctx\n"
+        "+++#bad " + _MOJIBAKE_EM_DASH + " here\n"
+        " # ctx\n"
+    )
+    findings = find_mojibake_in_diff(diff)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.path == "f.py"
+    assert f.line_number == 2  # second line in the new file
+    assert f.content == "++#bad " + _MOJIBAKE_EM_DASH + " here"
+    assert f.recovered == "++#bad " + _EM_DASH + " here"
+
+
+def test_added_line_starting_with_plus_plus_keeps_line_counter_in_sync() -> None:
+    # The "+++" collision bug also desynced the line counter: the skipped
+    # added line did not advance new_line_number, so subsequent findings in
+    # the same hunk reported wrong line numbers.  This test places a
+    # "++"-prefixed added line (clean, no mojibake) BEFORE a mojibake added
+    # line and asserts the mojibake finding's line number accounts for the
+    # earlier added line.
+    diff = (
+        "diff --git a/f.py b/f.py\n"
+        "--- a/f.py\n"
+        "+++ b/f.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        " # ctx\n"
+        "+++#clean line starting with ++\n"
+        "+#bad " + _MOJIBAKE_EM_DASH + " here\n"
+        " # ctx\n"
+    )
+    findings = find_mojibake_in_diff(diff)
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.path == "f.py"
+    # Line 2 = "+++#clean...", line 3 = "+#bad <mojibake>".
+    # If the counter desynced (the "++" line skipped without advancing),
+    # this would report line 2 instead of 3.
+    assert f.line_number == 3
+
+
 # --- CLI wiring: charlie mojibake-check --base <ref> ---
 
 

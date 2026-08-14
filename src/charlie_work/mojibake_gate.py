@@ -136,9 +136,12 @@ def find_mojibake_in_diff(diff_text: str) -> list[MojibakeFinding]:
     """Scan a unified diff for added lines containing mojibake.
 
     Parses *diff_text* as a unified diff (the output of ``git diff``) and
-    checks every added line (lines starting with ``+`` but not ``+++``) with
-    :func:`is_mojibake`.  Returns a list of findings, one per corrupted added
-    line, in diff order.  An empty list means the diff is clean.
+    checks every added line (lines starting with ``+``) with
+    :func:`is_mojibake`.  The ``+++ b/path`` file header is consumed separately
+    (it requires a trailing space) before this check, so an added line whose
+    content happens to start with ``++`` is correctly treated as an added line,
+    not mistaken for a header.  Returns a list of findings, one per corrupted
+    added line, in diff order.  An empty list means the diff is clean.
 
     The diff is read as UTF-8 text (``git diff`` output is UTF-8 when the
     repository's files are UTF-8, which this repo enforces structurally).
@@ -170,7 +173,14 @@ def find_mojibake_in_diff(diff_text: str) -> list[MojibakeFinding]:
             continue
 
         # Only scan added lines; skip removed lines and context lines.
-        if not line.startswith("+") or line.startswith("+++"):
+        # The true "+++ b/path" file header was already consumed above (it
+        # requires a trailing space), so we must NOT re-check for "+++" here:
+        # an added line whose content starts with "++" (e.g. "+++foo", which
+        # is "+" + content "++foo") would collide with that check and be
+        # silently skipped, desyncing the line counter for the rest of the
+        # hunk.  Any line starting with "+" that reaches this point is an
+        # added line.
+        if not line.startswith("+"):
             # Advance the new-file line counter for context and removed lines
             # so that added-line numbers stay accurate.  Removed lines ("-")
             # do not advance the new-file counter.
