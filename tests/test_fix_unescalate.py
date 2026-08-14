@@ -204,6 +204,38 @@ def test_unescalate_merged_pr_normalizes_status_without_label_edge(tmp_path: Pat
     assert app.gh.labels_removed == []
 
 
+def test_unescalate_merged_pr_stamps_merged_at_on_transition(tmp_path: Path) -> None:
+    """Issue #747: ``unescalate`` normalizing an escalated PR whose live GitHub
+    state is MERGED is a non-merged -> merged transition, so it must stamp
+    ``merged_at`` (the same pattern as the other five merged_at sites) so merge
+    throughput/latency stay computable from state.json regardless of which path
+    finalized the PR. The guard is on the pre-reset entry's status, so a
+    concurrent writer that already flipped the entry to 'merged' between the
+    snapshot and the in-lock apply is not back-dated."""
+    app = _app(tmp_path)
+    app.gh.prs[0]["state"] = "MERGED"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "review_dispatch_attempt_count": 3,
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True
+    state = load_state(app.paths.state_file)
+    pr_entry = state["prs"]["456"]
+    assert pr_entry["status"] == "merged"
+    # merged_at is stamped on the genuine escalated -> merged transition.
+    assert "merged_at" in pr_entry
+    assert pr_entry["merged_at"]
+    assert pr_entry["merged_at"].endswith("Z")
+
+
 def test_unescalate_escalated_issue_with_no_pr_drops_status_and_requeues(tmp_path: Path) -> None:
     app = _app(tmp_path)
     with state_lock(app.paths.state_file):

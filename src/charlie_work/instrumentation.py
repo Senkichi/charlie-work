@@ -279,6 +279,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "merge_conflict_rework_requested": "info",
         "merge_deferred_stale_base": "info",
         "merge_ready": "info",
+        # Issue #747: the merge lane emitted events for every outcome except
+        # success, so merge throughput was unobservable from events.db. This
+        # is the terminal success event, fired exactly once on the fleet's own
+        # direct-merge path (``merge_ready``'s ``merge_pr`` branch). The
+        # ``actor`` payload field distinguishes fleet-merged PRs from
+        # externally-merged PRs, which are recorded by the separate
+        # ``finalize_externally_merged`` / ``merged_outside_orchestrator``
+        # events and never carry this kind.
+        "merge_succeeded": "info",
         "no_op_rework_repair_requested": "info",
         "operator_claim": "info",
         "operator_claim_released": "info",
