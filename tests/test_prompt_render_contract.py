@@ -132,7 +132,7 @@ def _fake_issue(number: int = 1) -> dict[str, object]:
 
 def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker.md's real caller is ``OrchestratorApp._write_worker_prompt``
-    (workflow.py:21991-22057), used unmodified whenever
+    (workflow.py:22046-22112), used unmodified whenever
     ``config.dispatch.worker_template`` (default ``"worker.md"``) is
     selected -- see the `intake()` call site at workflow.py:8121.
 
@@ -417,7 +417,7 @@ def test_rework_writer_rejects_flat_override_without_execution_contract(
 # can't hide behind the subset assertion alone.
 # ---------------------------------------------------------------------------
 
-# workflow.py:11011-11029, inside OrchestratorApp.review() -- the literal
+# workflow.py:11019-11037, inside OrchestratorApp.review() -- the literal
 # `values` dict passed to `self._render("review.md", {...})`.
 REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
@@ -436,7 +436,7 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "prior_review_section",
 }
 
-# workflow.py:16105-16116, inside OrchestratorApp._cross_family_for_pr() --
+# workflow.py:16153-16163, inside OrchestratorApp._cross_family_for_pr() --
 # the literal `values` dict passed to `self._render("cross_family_review.md", {...})`.
 CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
@@ -448,7 +448,7 @@ CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "diff_path",
 }
 
-# workflow.py:15982-15985, inside OrchestratorApp.spec_review() -- the
+# workflow.py:16030-16033, inside OrchestratorApp.spec_review() -- the
 # literal `values` dict passed to
 # `self._render("cross_family_spec_review.md", {...})`.
 CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS = {
@@ -488,7 +488,7 @@ def test_pinned_templates_actually_render_against_real_caller_keys() -> None:
 def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
     tmp_path: Path,
 ) -> None:
-    """review.md's real caller (workflow.py:11011-11029, ``OrchestratorApp.review()``)
+    """review.md's real caller (workflow.py:11019-11037, ``OrchestratorApp.review()``)
     is already subset- and render-tested above against *synthetic*
     ``f"<{key}>"`` values. This test additionally builds production-shaped
     values -- real ``Path`` objects for ``pr_json_path``/``diff_path``,
@@ -655,7 +655,7 @@ def test_every_shipped_template_is_covered_by_this_contract() -> None:
 # the corresponding entry here -- the test will tell you if you forget.
 _CITATION_EXPECTATIONS: dict[tuple[int, int], str] = {
     # ``_write_worker_prompt`` definition
-    (21991, 22057): "def _write_worker_prompt",
+    (22046, 22112): "def _write_worker_prompt",
     # ``intake()``'s ``_write_worker_prompt`` call (no template= override)
     (8121, 8121): "self._write_worker_prompt(full_issue",
     # api-worker dispatch path (dry-run preview branch)
@@ -669,11 +669,11 @@ _CITATION_EXPECTATIONS: dict[tuple[int, int], str] = {
     # ``_render_required_changes_section`` definition
     (5934, 5934): "def _render_required_changes_section",
     # ``OrchestratorApp.review()`` values dict for review.md
-    (11011, 11029): '"review.md"',
+    (11019, 11037): '"review.md"',
     # ``_cross_family_for_pr()`` values dict for cross_family_review.md
-    (16105, 16116): '"cross_family_review.md"',
+    (16153, 16163): '"cross_family_review.md"',
     # ``spec_review()`` values dict for cross_family_spec_review.md
-    (15982, 15985): '"cross_family_spec_review.md"',
+    (16030, 16033): '"cross_family_spec_review.md"',
     # ``review()``'s ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
     (10856, 10856): "pr_dir = self.paths.prs",
     # ``OrchestratorApp._render`` definition (the prompt_dirs call)
