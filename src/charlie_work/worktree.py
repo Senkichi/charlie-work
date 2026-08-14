@@ -2616,10 +2616,19 @@ def create_worktree(
     ) -> None:
         """Attempt rescue capture before refusing a reset (issue #849).
 
-        If capture succeeds, records it on the enclosing ``rescue_capture``
-        and returns — the reset is permitted because the work is now durable
-        on a ref. If capture fails, raises ``WorktreeUnsafeError`` exactly as
-        today — capture failure must never downgrade the safety property.
+        If capture succeeds, records it on the enclosing ``rescue_capture``,
+        cleans the working tree so the captured dirty content cannot survive
+        into a new work session, and returns — the reset is permitted because
+        the work is now durable on a ref. If capture fails, raises
+        ``WorktreeUnsafeError`` exactly as today — capture failure must never
+        downgrade the safety property.
+
+        The working-tree clean is the single enforcement point for the "never
+        commit tracked modifications the shim did not itself produce"
+        invariant on the capture-succeeds path. Without it, a reuse-in-place
+        ``git merge --ff-only`` that doesn't touch the dirty files would leave
+        them in place, silently surviving into the next worker's session
+        (issue #849 rework finding).
         """
         nonlocal rescue_capture
         capture = _capture_worktree_work_to_rescue_ref(
@@ -2632,8 +2641,49 @@ def create_worktree(
         if capture.error is None and capture.ref_name is not None:
             rescue_capture = capture
             _emit_rescue_event(capture, unsafe_reason, check_path)
+            _clean_captured_worktree(check_path, capture_injected)
             return
         raise WorktreeUnsafeError(unsafe_reason)
+
+    def _clean_captured_worktree(wt_path: Path, clean_injected: tuple[str, ...]) -> None:
+        """Reset and clean the working tree after a successful rescue capture.
+
+        The work is already durable on a rescue ref, so discarding the
+        working-tree copy is safe. Tracked modifications are reset to HEAD;
+        untracked files are removed except orchestrator scaffolding
+        (``.venv``, ``clean_injected``, ``materialize_dirs``) — the same
+        exclusions the capture used, so exactly what was captured is
+        discarded and exactly what was excluded is preserved.
+
+        Raises ``RuntimeError`` on failure: a successful capture with a
+        still-dirty tree is a hazardous state that must surface, not be
+        silently left for the next worker to commit.
+        """
+        reset_result = run_captured(
+            ["git", "reset", "--hard", "HEAD"],
+            cwd=wt_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not reset_result.ok:
+            raise RuntimeError(
+                f"Cannot reset worktree after rescue capture: "
+                f"{reset_result.error or reset_result.stderr}"
+            )
+        exclusions: list[str] = [":(exclude).venv"]
+        for p in (*clean_injected, *materialize_dirs):
+            normalized = str(p).replace("\\", "/").strip("/")
+            if normalized:
+                exclusions.append(f":(exclude){normalized}")
+        clean_result = run_captured(
+            ["git", "clean", "-fd", "--", ".", *exclusions],
+            cwd=wt_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not clean_result.ok:
+            raise RuntimeError(
+                f"Cannot clean worktree after rescue capture: "
+                f"{clean_result.error or clean_result.stderr}"
+            )
 
     def _raise_if_unsafe_to_reset(target_path: Path | None = None) -> None:
         """Hard-refuse to reset if the worktree/branch contains local work."""

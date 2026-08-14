@@ -7648,3 +7648,90 @@ def test_rescue_capture_emits_event_retrievable_via_query_events(
 
     # Clean up.
     remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_rework_reuse_capture_cleans_worktree_before_ff(
+    tmp_path: Path,
+) -> None:
+    """Rework finding: rework=True + dirty-worktree + capture-succeeds +
+    ff-only-succeeds-despite-dirt.
+
+    The reuse-in-place branch captures dirty content to a rescue ref, then
+    must clean the working tree before the ff-only merge. Without the clean,
+    a dirty file the ff doesn't touch silently survives into the new work
+    session and can be committed under the next worker's name — the exact
+    hazard the "never commit tracked modifications the shim did not itself
+    produce" invariant exists to prevent.
+
+    This test asserts on the resulting worktree's on-disk state, not just on
+    the rescue ref's content.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo = tmp_path / "repo"
+    _clone_repo(remote_repo, repo)
+
+    branch_name = "agent/issue-849-rework-reuse-clean"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+    # Push the branch so origin knows about it (required for rework reuse).
+    _git(repo, "push", "origin", branch_name)
+
+    # Worker-authored dirty content:
+    # - A tracked modification to README.md (exists in initial commit; the
+    #   ff-only below adds file2.txt and does NOT touch README.md, so without
+    #   the clean the modification would survive the ff).
+    # - An untracked file (also not touched by the ff).
+    dirty_readme = "modified by worker\n"
+    (info1.path / "README.md").write_text(dirty_readme, encoding="utf-8")
+    (info1.path / "worker_untracked.txt").write_text(
+        "untracked worker content\n", encoding="utf-8"
+    )
+
+    # Advance the branch on origin so the local worktree is behind and can
+    # fast-forward. The new commit adds file2.txt — it does NOT touch
+    # README.md, so the ff-only would succeed even with a dirty README.md.
+    _git(remote_repo, "checkout", branch_name)
+    (remote_repo / "file2.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "file2.txt")
+    _git(remote_repo, "commit", "-m", "add file2 on remote")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    # Re-dispatch with rework=True: the existing worktree is dirty, so
+    # _capture_or_raise fires. Capture succeeds → the working tree is
+    # cleaned → the ff-only merge proceeds on a clean tree.
+    info2 = create_worktree(repo, branch_name, rework=True, issue_number=849)
+
+    # Rescue capture is populated.
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    assert info2.rescue_capture.error is None
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # The worktree was reused in-place and fast-forwarded to the origin tip.
+    assert info2.path == info1.path
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+
+    # ON-DISK STATE: the dirty content is GONE from the working tree.
+    # README.md is back to HEAD's version ("hello\n"), not the worker's
+    # modification. Without the fix, this would still be "modified by worker\n".
+    assert (info2.path / "README.md").read_text(encoding="utf-8") == "hello\n"
+
+    # The untracked worker file is gone. Without the fix, it would survive.
+    assert not (info2.path / "worker_untracked.txt").exists()
+
+    # The ff-only brought in file2.txt from the remote.
+    assert (info2.path / "file2.txt").read_text(encoding="utf-8") == "remote change\n"
+
+    # The working tree is clean (no worker-authored dirt survives).
+    status = _git(info2.path, "status", "--porcelain")
+    assert status.stdout.strip() == ""
+
+    # The rescue ref preserved the dirty content byte-for-byte.
+    rescued_readme = _git(repo, "show", f"{rescue_ref}:README.md").stdout
+    assert rescued_readme == dirty_readme
+    rescued_untracked = _git(repo, "show", f"{rescue_ref}:worker_untracked.txt").stdout
+    assert rescued_untracked == "untracked worker content\n"
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
