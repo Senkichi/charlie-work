@@ -5901,6 +5901,36 @@ def _finish_required_changes_section(lines: list[str]) -> str:
     return "\n".join([*lines, _EXTERNAL_FINDINGS_POINTER])
 
 
+_EXTERNAL_FINDINGS_SECTION_INTRO = (
+    "## Findings posted on the PR itself\n"
+    "\n"
+    "These are verified findings a human or peer agent posted on the PR as "
+    "comments, review bodies, or inline review threads -- separate from the "
+    "reviewer's findings above. Address each of them too.\n"
+)
+
+
+def _render_external_findings_section(
+    reviewer_lines: list[str], external_findings: list[str]
+) -> str:
+    """Join the reviewer section and the external-findings section (issue #999).
+
+    External findings render under their own heading, after the reviewer's
+    section, as bullets -- each defanged so a closing keyword in a human
+    comment cannot auto-close the linked issue from the worker's brief.
+
+    The ``_EXTERNAL_FINDINGS_POINTER`` is deliberately *not* appended here.
+    Its body states "none of which reach this brief", which this section
+    makes false: the ingested findings are now rendered inline. Old-shape
+    records (no ``external_findings`` field) never reach this function and
+    keep the pointer exactly as before this fix.
+    """
+    lines = [*reviewer_lines, _EXTERNAL_FINDINGS_SECTION_INTRO]
+    lines.extend(f"- {defang_closing_keywords(item)}" for item in external_findings)
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     """Render the ``$required_changes_section`` for a rework brief.
 
@@ -5937,13 +5967,38 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
 
     Issue #950: when the PR itself carries verified human or peer-agent
     findings (issue comments, review bodies, inline review threads),
-    ``record_review`` folds them into ``required_changes`` and sets
-    ``findings_channel`` to ``"external"``. Verdicts carrying the
-    ``"external"`` marker render as the itemized tier below, but with a
-    description that makes clear the list mixes internal reviewer findings
-    and external PR comments. The ``"external"`` marker is checked before
-    the shape-based tiers so an entirely-external verdict is not mis-binned
-    as ``"derived"``/``"vacuous"``.
+    ``record_review`` ingests them at write time.
+
+    Issue #999: external findings no longer merge into ``required_changes``.
+    They ride in their own ``external_findings`` field, and
+    ``findings_channel`` continues to describe *only* the reviewer's list --
+    so ``"derived"`` is never overwritten and keeps its tier-2 verbatim
+    rendering even when external findings are present. This function renders
+    them under their own heading (``_render_external_findings_section``)
+    after the reviewer's section, instead of appending the
+    ``_EXTERNAL_FINDINGS_POINTER`` (whose "none of which reach this brief"
+    body the inline section makes false).
+
+    Two shapes coexist for backward compatibility:
+
+    * **New shape** (records written after #999, non-vacuous case): the
+      ``external_findings`` field is present and ``findings_channel`` is
+      ``None`` or ``"derived"`` (never ``"external"``). The reviewer's
+      section renders per its marker, then the external section is
+      appended.
+    * **Old shape** (records written before #999, *and* the vacuous-replace
+      case): external findings are already merged into
+      ``required_changes`` with ``findings_channel == "external"`` and no
+      ``external_findings`` field. These render exactly as before this fix
+      -- the itemized tier with the external-aware intro and the pointer --
+      so no content is lost from any verdict already on disk.
+
+    The ``"vacuous"`` case is the one that must NOT become a separate
+    section: a content-free reviewer summary has nothing worth rendering
+    above the external items, so ``record_review`` still *replaces*
+    ``required_changes`` with the external findings (flipping the channel
+    to ``"external"``) and writes no ``external_findings`` field -- the
+    old-shape ``"external"`` path handles it unchanged.
 
     Verdicts carrying the ``"vacuous"`` or ``"derived"`` markers are
     handled explicitly, before the shape-based tiers below:
@@ -5953,7 +6008,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     renders tier 2 verbatim rather than falling into tier 1's bullet list
     (a single derived item wrapped as a one-item bullet would otherwise dump
     an entire multi-paragraph summary onto one line). Verdicts with no
-    marker at all -- every record written before this fix -- fall through
+    marker at all -- every record written before #792 -- fall through
     unchanged to the original shape-based tiers.
 
     Rendered for ``request_changes`` and, defensively, ``blocked`` verdicts
@@ -6005,6 +6060,16 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     raw_summary = decision.get("summary")
     summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
     findings_channel = decision.get("findings_channel")
+    # Issue #999: new-shape records carry external findings in their own
+    # field. Old-shape records (pre-#999, or the vacuous-replace case) have
+    # no such field and render exactly as before this fix.
+    raw_external = decision.get("external_findings")
+    external_findings = (
+        [str(item).strip() for item in raw_external if str(item).strip()]
+        if isinstance(raw_external, list)
+        else []
+    )
+    new_shape = bool(external_findings)
 
     # issue #792: a verdict recorded by the current record_review carries an
     # explicit marker for exactly this distinction -- handle it before the
@@ -6036,6 +6101,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             defang_closing_keywords(summary_text),
             "",
         ]
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and changes:
@@ -6059,6 +6126,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         ]
         lines.extend(f"- {defang_closing_keywords(change)}" for change in changes)
         lines.append("")
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and summary_text:
@@ -6073,6 +6142,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             defang_closing_keywords(summary_text),
             "",
         ]
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if not changes and not summary_text:
@@ -13373,6 +13444,17 @@ class OrchestratorApp:
         # so nothing was excluded by ``before`` and ``reviewed_at`` remains the
         # correct lower bound.
         ingestion_before: str | None = None
+        # Issue #999: external findings no longer merge into
+        # ``required_changes``. They ride in their own ``external_findings``
+        # field so ``findings_channel`` keeps describing *only* the reviewer's
+        # list -- ``"derived"`` is never overwritten and keeps its tier-2
+        # verbatim rendering. The one exception is ``"vacuous"``: a
+        # content-free reviewer summary has nothing worth rendering above the
+        # external items, so that case still *replaces* ``required_changes``
+        # (flipping the channel to ``"external"``) exactly as before #999 --
+        # no ``external_findings`` field is written, and the renderer's
+        # old-shape ``"external"`` path handles it unchanged.
+        recorded_external_findings: list[str] | None = None
         if decision in {"request_changes", "blocked"}:
             previous_decision = self._review_decision(pr_number)
             previous_before = previous_decision.get("before")
@@ -13390,9 +13472,9 @@ class OrchestratorApp:
             if external_findings:
                 if findings_channel == "vacuous":
                     effective_required_changes = list(external_findings)
+                    findings_channel = "external"
                 else:
-                    effective_required_changes.extend(external_findings)
-                findings_channel = "external"
+                    recorded_external_findings = list(external_findings)
         decision_payload = {
             "pr_number": pr_number,
             "issue_number": issue_number,
@@ -13413,6 +13495,12 @@ class OrchestratorApp:
         # `approved` verdict, passes through with no new key at all.
         if findings_channel is not None:
             decision_payload["findings_channel"] = findings_channel
+        # Issue #999: external findings live in their own field, separate
+        # from the reviewer's required_changes. Absent on old-shape records
+        # (pre-#999, or the vacuous-replace case) -- the renderer treats
+        # absence as old-shape and renders exactly as before.
+        if recorded_external_findings is not None:
+            decision_payload["external_findings"] = recorded_external_findings
         # Persist the ingestion upper bound so the next round's ``since`` can
         # be derived from it (issue #998 rework: contiguous windowing across
         # rounds -- see the contiguity note above). Only present when ingestion
@@ -13632,6 +13720,8 @@ class OrchestratorApp:
                 event_payload["session_metrics"] = session_metrics
             if findings_channel is not None:
                 event_payload["findings_channel"] = findings_channel
+            if recorded_external_findings is not None:
+                event_payload["external_findings_count"] = len(recorded_external_findings)
             state = self._record_event(state, "record_review", event_payload)
             if findings_channel == "vacuous":
                 # Distinct from the general "record_review" event (issue
