@@ -33720,6 +33720,42 @@ def test_apply_concurrency_governor_open_pr_backpressure_no_event_when_not_clamp
     assert events == []
 
 
+def test_apply_concurrency_governor_open_pr_backpressure_no_event_under_dry_run(
+    tmp_path: Path,
+) -> None:
+    """Issue #1129 rework: dry-run must not record the dispatch_backpressure event.
+
+    The clamp behavior (dispatch_limit reduction, clamped flag, open_pr_count/
+    open_pr_max on the result) must still engage so a dry-run preview reports
+    the same clamped selected_count a live pass would -- matching the
+    worker_token_missing refusal precedent in _dispatch_impl, where the
+    refusal is NOT dry-run-gated but the durable event/marker writes are.
+    Only the log_event write to events.db is suppressed under dry_run.
+    """
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # Same scenario as test_apply_concurrency_governor_open_pr_backpressure_records_event:
+    # 1 open PR, cap 1 → 0 available, dispatch_limit 5 → clamp to 0.
+    result = app._apply_concurrency_governor(5, apply_open_pr_backpressure=True)
+
+    # The clamp still engages under dry-run (preview must match a live pass).
+    assert result.clamped is True
+    assert result.open_pr_count == 1
+    assert result.open_pr_max == 1
+    assert result.dispatch_limit == 0
+
+    # But no durable event is written to events.db.
+    events = query_events(paths.state_file, kind="dispatch_backpressure")
+    assert events == []
+
+
 def test_apply_concurrency_governor_open_pr_backpressure_combined_with_sessions(
     tmp_path: Path, monkeypatch
 ) -> None:

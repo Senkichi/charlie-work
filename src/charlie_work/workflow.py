@@ -8412,17 +8412,28 @@ class OrchestratorApp:
                 # skip attribution). The governor runs outside the state lock,
                 # so log_event (the low-level write primitive for events
                 # outside state-lock contexts) is used directly.
-                log_event(
-                    self.paths.state_file,
-                    "dispatch_backpressure",
-                    {
-                        "open_pr_count": open_pr_count,
-                        "max_open_agent_prs": open_pr_max,
-                        "requested_limit": dispatch_limit,
-                        "clamped_limit": open_pr_available,
-                    },
-                    repo=self.repo_root.name,
-                )
+                #
+                # Dry-run never writes the event: log_event is a durable
+                # events.db mutation, and a dry-run preview must not record
+                # instrumentation (the same write-suppression discipline as the
+                # worker_token_escalated marker above -- the escalation event
+                # and durable marker stay behind ``not self.dry_run``). The
+                # clamp itself (dispatch_limit/clamped below) is NOT dry-run
+                # gated: a dry-run preview must report the same clamped
+                # selected_count a live pass would, matching the
+                # worker_token_missing refusal precedent in _dispatch_impl.
+                if not self.dry_run:
+                    log_event(
+                        self.paths.state_file,
+                        "dispatch_backpressure",
+                        {
+                            "open_pr_count": open_pr_count,
+                            "max_open_agent_prs": open_pr_max,
+                            "requested_limit": dispatch_limit,
+                            "clamped_limit": open_pr_available,
+                        },
+                        repo=self.repo_root.name,
+                    )
                 dispatch_limit = open_pr_available
                 clamped = True
 
