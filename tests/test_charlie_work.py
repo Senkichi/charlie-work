@@ -16578,6 +16578,7 @@ def test_annotation_to_required_change_full_annotation() -> None:
             "path": "src/charlie_work/workflow.py",
             "start_line": 42,
             "message": "line too long (100 > 99)",
+            "annotation_level": "failure",
         },
     )
     assert entry == "Lint: src/charlie_work/workflow.py:42 — line too long (100 > 99)"
@@ -16585,20 +16586,63 @@ def test_annotation_to_required_change_full_annotation() -> None:
 
 def test_annotation_to_required_change_no_message_returns_none() -> None:
     """Never fabricate a placeholder when GitHub gives no explanatory message."""
-    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "start_line": 1}) is None
-    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "message": ""}) is None
+    assert (
+        _annotation_to_required_change(
+            "Lint", {"path": "src/foo.py", "start_line": 1, "annotation_level": "failure"}
+        )
+        is None
+    )
+    assert (
+        _annotation_to_required_change(
+            "Lint", {"path": "src/foo.py", "message": "", "annotation_level": "failure"}
+        )
+        is None
+    )
+
+
+def test_annotation_to_required_change_non_failure_level_returns_none() -> None:
+    """Issue #993: warning/notice annotations are not required changes -- they
+    are emitted on green runs too (e.g. the actions/checkout Node.js 20
+    deprecation advisory), so surfacing them as rework items sends the worker
+    after unrelated noise. Only ``annotation_level == "failure"`` renders."""
+    warning = {
+        "path": ".github",
+        "start_line": 2,
+        "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
+        "annotation_level": "warning",
+    }
+    notice = {
+        "path": "src/foo.py",
+        "start_line": 1,
+        "message": "consider using X",
+        "annotation_level": "notice",
+    }
+    missing_level = {"path": "src/foo.py", "start_line": 1, "message": "boom"}
+    null_level = {
+        "path": "src/foo.py",
+        "start_line": 1,
+        "message": "boom",
+        "annotation_level": None,
+    }
+    assert _annotation_to_required_change("Lint", warning) is None
+    assert _annotation_to_required_change("Lint", notice) is None
+    assert _annotation_to_required_change("Lint", missing_level) is None
+    assert _annotation_to_required_change("Lint", null_level) is None
 
 
 def test_annotation_to_required_change_missing_path_falls_back_to_message_only() -> None:
     """No path/line data (e.g. a process-level crash) still surfaces the real
     message rather than being dropped -- but with no fabricated location."""
-    entry = _annotation_to_required_change("Tests", {"message": "process exited with code 1"})
+    entry = _annotation_to_required_change(
+        "Tests", {"message": "process exited with code 1", "annotation_level": "failure"}
+    )
     assert entry == "Tests: process exited with code 1"
 
 
 def test_annotation_to_required_change_path_without_line() -> None:
     entry = _annotation_to_required_change(
-        "Lint", {"path": "src/foo.py", "message": "file-level issue"}
+        "Lint",
+        {"path": "src/foo.py", "message": "file-level issue", "annotation_level": "failure"},
     )
     assert entry == "Lint: src/foo.py — file-level issue"
 
@@ -16614,8 +16658,18 @@ def test_required_changes_from_checks_aggregates_annotations_for_failing_check()
     ]
     annotations_by_id = {
         111: [
-            {"path": "src/foo.py", "start_line": 10, "message": "E501 line too long"},
-            {"path": "src/bar.py", "start_line": 20, "message": "F401 unused import"},
+            {
+                "path": "src/foo.py",
+                "start_line": 10,
+                "message": "E501 line too long",
+                "annotation_level": "failure",
+            },
+            {
+                "path": "src/bar.py",
+                "start_line": 20,
+                "message": "F401 unused import",
+                "annotation_level": "failure",
+            },
         ],
     }
     required_changes = _required_changes_from_checks(
@@ -16634,7 +16688,11 @@ def test_required_changes_from_checks_skips_passing_run_of_failed_name() -> None
 
     def fetch(check_run_id: int) -> list[dict[str, Any]]:
         fetched_ids.append(check_run_id)
-        return [{"path": "x.py", "start_line": 1, "message": "boom"}] if check_run_id == 2 else []
+        return (
+            [{"path": "x.py", "start_line": 1, "message": "boom", "annotation_level": "failure"}]
+            if check_run_id == 2
+            else []
+        )
 
     checks = [
         {"name": "Tests", "state": "SUCCESS", "databaseId": 1},
@@ -16720,6 +16778,102 @@ def test_required_changes_from_checks_no_checks_available_degrades_to_empty() ->
 def test_required_changes_from_checks_no_failed_names_degrades_to_empty() -> None:
     checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
     assert _required_changes_from_checks(checks, (), lambda _id: [{"message": "x"}]) == []
+
+
+def test_required_changes_from_checks_filters_warning_level_annotations() -> None:
+    """Issue #993: warning/notice annotations are present on green runs too
+    (e.g. the actions/checkout Node.js 20 deprecation advisory), so they are
+    not required changes. Only failure-level annotations render as entries;
+    the warning is dropped entirely rather than crowding the rework brief
+    with unrelated noise."""
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 111}]
+    annotations = [
+        {
+            "path": ".github",
+            "start_line": 2,
+            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
+            "annotation_level": "warning",
+        },
+        {
+            "path": "src/foo.py",
+            "start_line": 10,
+            "message": "E501 line too long",
+            "annotation_level": "failure",
+        },
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
+    assert required_changes == ["Lint: src/foo.py:10 — E501 line too long"]
+
+
+def test_required_changes_from_checks_appends_link_alongside_failure_annotations() -> None:
+    """Issue #993: the failing run's ``link`` is always appended alongside
+    whatever failure-level annotations rendered -- not only when *zero*
+    annotations rendered. A process-level crash emits a contentless
+    ``"Process completed with exit code 1."`` failure annotation that names
+    no cause; the real cause (e.g. a TLS handshake timeout) lives only in
+    the step log the link reaches. The old ``if entries:`` guard suppressed
+    the link whenever any annotation rendered, so the fallback never fired
+    in the scenario its own docstring named as common."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": 111,
+            "link": "https://github.com/o/r/actions/runs/92297706625",
+        }
+    ]
+    annotations = [
+        {
+            "path": ".github",
+            "start_line": 2,
+            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
+            "annotation_level": "warning",
+        },
+        {
+            "path": ".github",
+            "start_line": 14,
+            "message": "Process completed with exit code 1.",
+            "annotation_level": "failure",
+        },
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
+    # The warning is filtered out; the contentless failure annotation still
+    # renders (it is failure-level and carries a message), and the link is
+    # appended alongside it so the worker can reach the run log where the
+    # real cause lives.
+    assert required_changes == [
+        "Lint: .github:14 — Process completed with exit code 1.",
+        "Lint: failing run — https://github.com/o/r/actions/runs/92297706625",
+    ]
+
+
+def test_required_changes_from_checks_link_fallback_fires_for_contentless_failure_only() -> None:
+    """Issue #993: when the only annotations are non-failure-level (so
+    ``entries`` is empty after filtering), the link fallback still fires
+    with the "no per-line annotations available" wording -- the fallback is
+    not deleted, only its guard is fixed so it no longer requires *zero*
+    annotations of any level."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": 111,
+            "link": "https://github.com/o/r/actions/runs/1",
+        }
+    ]
+    annotations = [
+        {
+            "path": ".github",
+            "start_line": 2,
+            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
+            "annotation_level": "warning",
+        },
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
+    assert required_changes == [
+        "Lint: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://github.com/o/r/actions/runs/1",
+    ]
 
 
 def test_review_ci_failure_with_annotations_populates_required_changes(tmp_path: Path) -> None:
