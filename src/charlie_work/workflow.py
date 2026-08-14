@@ -155,6 +155,7 @@ from .state import (
     defer_reviewer_probe_after,
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     clear_escalation,
+    clear_escalation_on_issue_prs,
     disarm_quota_probe,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
     escalation_reason_class,
@@ -9416,6 +9417,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     clear_escalation(entry)
+                    clear_escalation_on_issue_prs(state, request.issue_number)
                 elif is_live_worker:
                     status = "dispatched"
                     dispatched_at = prev_entry.get("dispatched_at") or utc_now()
@@ -9425,6 +9427,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     clear_escalation(entry)
+                    clear_escalation_on_issue_prs(state, request.issue_number)
                 elif is_phantom_live_worker:
                     # Issue #523: the adapter reported a live worker, but the
                     # recorded PID failed the OS-level liveness + identity
@@ -9451,6 +9454,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     clear_escalation(entry)
+                    clear_escalation_on_issue_prs(state, request.issue_number)
                     entry.pop("worker_pid", None)
                     entry.pop("worker_process_start_time", None)
                 else:
@@ -9507,6 +9511,7 @@ class OrchestratorApp:
                         status = "dispatch_failed"
                         dispatched_at = None
                         clear_escalation(entry)
+                        clear_escalation_on_issue_prs(state, request.issue_number)
                 entry["status"] = status
                 entry["dispatched_at"] = dispatched_at
                 # Store worker PID and process start time for state-based liveness detection
@@ -13672,6 +13677,7 @@ class OrchestratorApp:
                             "merge_alert": "OK",
                         }
                         clear_escalation(issue_entry)
+                        clear_escalation_on_issue_prs(state, issue_number)
                         state["issues"][str(issue_number)] = issue_entry
                     else:
                         # Clear rework_requested status when escalated to prevent selection
@@ -13692,6 +13698,7 @@ class OrchestratorApp:
                         "merge_alert": "OK",
                     }
                     clear_escalation(issue_entry)
+                    clear_escalation_on_issue_prs(state, issue_number)
                     state["issues"][str(issue_number)] = issue_entry
                     # Clear worker PID when issue is approved (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
@@ -13894,6 +13901,10 @@ class OrchestratorApp:
         "reason_class",
         "auto_deescalation_count",
         "deescalation_cap_notified_at",
+        # Issue #1093: the per-escalation-episode marker for the rework
+        # budget reset must clear alongside the escalation it tracks, so a
+        # manual re-arm gives the next sweep clear a clean slate.
+        "rework_budget_reset_for_terminal_since",
         "label_error",
         "worker_pid",
         "worker_process_start_time",
@@ -19289,15 +19300,43 @@ class OrchestratorApp:
 
             cleared_condition = fresh_issue_entry.get("escalation_reason")
             cleared_auto_count = auto_count + 1
+            # Issue #1093: reset the over-cap rework counter once per
+            # escalation episode so the issue gets a fresh rework budget on
+            # the first clear after an escalation.  ``terminal_since`` is
+            # refreshed on every ``_escalate_issue`` call, so it identifies
+            # the current episode; the marker records which episode was
+            # last reset.  A re-escalation produces a new ``terminal_since``,
+            # so the next clear resets again.  Repeated clears within the
+            # same episode (same ``terminal_since``) do not re-reset.
+            current_terminal_since = fresh_issue_entry.get("terminal_since")
+            budget_reset_needed = (
+                "rework_budget_reset_for_terminal_since" not in fresh_issue_entry
+                or fresh_issue_entry.get("rework_budget_reset_for_terminal_since")
+                != current_terminal_since
+            )
             updated_issue_entry = {
                 **fresh_issue_entry,
                 "number": issue_number,
                 "status": PASSIVE_OPEN_STATUS,
                 "auto_deescalation_count": cleared_auto_count,
             }
+            if budget_reset_needed:
+                updated_issue_entry["rework_budget_reset_for_terminal_since"] = (
+                    current_terminal_since
+                )
             clear_escalation(updated_issue_entry)
             updated_issue_entry.pop("label_error", None)
             fresh_state["issues"][issue_key] = updated_issue_entry
+            # Issue #1093: mirror-clear the PR record's escalation fields so
+            # the rework router's short-circuit on
+            # ``existing_pr_state.get("escalation_reason")`` no longer fires
+            # after the sweep clears the issue.  Also reset the over-cap
+            # rework counter on the open PR once per escalation episode.
+            clear_escalation_on_issue_prs(fresh_state, issue_number)
+            if budget_reset_needed:
+                fresh_pr = fresh_state["prs"].get(str(pr_number))
+                if isinstance(fresh_pr, dict):
+                    fresh_pr["request_changes_count"] = 0
             fresh_state = self._record_event(
                 fresh_state,
                 "deescalation_cleared",
@@ -19309,6 +19348,7 @@ class OrchestratorApp:
                     "pr_mergeable": mergeable,
                     "janitor_ok": janitor_verdict.ok,
                     "auto_deescalation_count": cleared_auto_count,
+                    "rework_budget_reset": budget_reset_needed,
                 },
             )
             save_state(self.paths.state_file, fresh_state)

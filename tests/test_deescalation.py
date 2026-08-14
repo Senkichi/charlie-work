@@ -87,6 +87,7 @@ def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
             "number": 456,
             "issue_number": 123,
             "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
         }
         state["issues"]["123"] = {
             "number": 123,
@@ -98,6 +99,7 @@ def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
             "number": 789,
             "issue_number": 124,
             "status": "escalated",
+            "escalation_reason": "merged_pr_mention_flagged",
         }
         state["issues"]["124"] = {
             "number": 124,
@@ -121,6 +123,12 @@ def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
     assert (123, app.config.labels.pr_open) in app.gh.labels_added
     assert (123, app.config.labels.human_needed) in app.gh.labels_removed
 
+    # Issue #1093: the PR record's escalation_reason must be mirror-cleared
+    # alongside the issue's, so the rework router's short-circuit on
+    # existing_pr_state.get("escalation_reason") no longer fires.
+    pr_456 = state["prs"]["456"]
+    assert "escalation_reason" not in pr_456
+
     # The judgment issue on an identically-shaped PR is completely untouched.
     issue_124 = state["issues"]["124"]
     assert issue_124["status"] == "escalated"
@@ -129,6 +137,9 @@ def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
     assert "auto_deescalation_count" not in issue_124
     assert all(num != 124 for (num, _label) in app.gh.labels_added)
     assert all(num != 124 for (num, _label) in app.gh.labels_removed)
+    # The judgment PR's escalation_reason is also untouched.
+    pr_789 = state["prs"]["789"]
+    assert pr_789["escalation_reason"] == "merged_pr_mention_flagged"
 
     cleared = _events(state, "deescalation_cleared")
     assert len(cleared) == 1
@@ -160,6 +171,7 @@ def test_deescalation_sweep_leaves_missing_reason_class_untouched(tmp_path: Path
             "number": 456,
             "issue_number": 123,
             "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
         }
         state["issues"]["123"] = {
             "number": 123,
@@ -206,6 +218,7 @@ def test_deescalation_cap_exhausted_stops_clearing_and_notifies_once(tmp_path: P
             "number": 456,
             "issue_number": 123,
             "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
         }
         state["issues"]["123"] = {
             "number": 123,
@@ -439,6 +452,7 @@ def test_backfill_reason_class_then_clears_green_pr(tmp_path: Path) -> None:
             "number": 456,
             "issue_number": 123,
             "status": "escalated",
+            "escalation_reason": "session_failed_escalated",
             "headRefOid": "sha-abc123",
             "headRefName": "agent/issue-123-fix-search",
             "baseRefName": "main",
@@ -774,7 +788,12 @@ def _escalated_pr_456(app: OrchestratorApp, *, reason: str) -> None:
     """Put issue 123 / PR 456 into a mechanical escalation with ``reason``."""
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
-        state["prs"]["456"] = {"number": 456, "issue_number": 123, "status": "escalated"}
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": reason,
+        }
         state["issues"]["123"] = {
             "number": 123,
             "status": "escalated",
@@ -968,6 +987,7 @@ def test_deescalation_skips_worktree_unsafe_when_worktree_still_dirty(
             "number": 456,
             "issue_number": 123,
             "status": "escalated",
+            "escalation_reason": "worktree_unsafe",
         }
         state["issues"]["123"] = {
             "number": 123,
@@ -1019,6 +1039,7 @@ def test_deescalation_clears_worktree_unsafe_when_worktree_cleaned(
             "number": 456,
             "issue_number": 123,
             "status": "escalated",
+            "escalation_reason": "worktree_unsafe",
         }
         state["issues"]["123"] = {
             "number": 123,
@@ -1037,3 +1058,183 @@ def test_deescalation_clears_worktree_unsafe_when_worktree_cleaned(
     assert issue_123["status"] == PASSIVE_OPEN_STATUS
     assert "escalation_reason" not in issue_123
     assert issue_123["auto_deescalation_count"] == 1
+    # Issue #1093: PR-side escalation_reason mirror-cleared.
+    assert "escalation_reason" not in state["prs"]["456"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #1093: de-escalation clear and the rework router read different
+# halves of the same state.  The sweep cleared the issue-side
+# escalation_reason but never the PR-side one, so the router's short-circuit
+# on existing_pr_state.get("escalation_reason") still fired after a "clear".
+# These tests pin the mirror-clear and the once-per-episode rework-budget
+# reset.
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_mirror_clears_pr_escalation_reason(tmp_path: Path) -> None:
+    """The sweep must clear ``escalation_reason`` on the PR record, not just
+    the issue record.
+
+    Before #1093 the sweep cleared only ``fresh_state["issues"][...]``, leaving
+    the PR carrying a stale ``escalation_reason``.  The downstream router
+    (``_route_janitor_gate_failure_to_rework``) short-circuits on
+    ``existing_pr_state.get("escalation_reason")``, so the issue looked
+    unstuck but routed nowhere.  This test uses the exact scenario from the
+    issue (``no_op_rework_attempts_cap_exceeded``) to prove both halves are
+    cleared.
+    """
+    app = _app(tmp_path)
+    reason = "no_op_rework_attempts_cap_exceeded"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": reason,
+            "no_op_rework_attempts": 4,
+            "request_changes_count": 3,
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": reason,
+            "reason_class": "mechanical",
+            "terminal_since": "2026-08-14T12:00:00Z",
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    # Issue-side: cleared.
+    issue_123 = state["issues"]["123"]
+    assert issue_123["status"] == PASSIVE_OPEN_STATUS
+    assert "escalation_reason" not in issue_123
+    # PR-side: also cleared — this is the #1093 fix.
+    pr_456 = state["prs"]["456"]
+    assert "escalation_reason" not in pr_456
+
+
+def test_sweep_resets_over_cap_rework_counter_on_first_clear(
+    tmp_path: Path,
+) -> None:
+    """The first clear after an escalation resets the over-cap rework counter
+    (``request_changes_count``) on the PR so the issue gets a fresh rework
+    budget (issue #1093 operator ruling).
+    """
+    app = _app(tmp_path)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "no_op_rework_attempts_cap_exceeded",
+            "request_changes_count": 4,
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "no_op_rework_attempts_cap_exceeded",
+            "reason_class": "mechanical",
+            "terminal_since": "2026-08-14T12:00:00Z",
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    pr_456 = state["prs"]["456"]
+    assert pr_456["request_changes_count"] == 0
+    # The episode marker is set on the issue.
+    issue_123 = state["issues"]["123"]
+    assert issue_123["rework_budget_reset_for_terminal_since"] == "2026-08-14T12:00:00Z"
+    # The event records that the budget was reset.
+    cleared = _events(state, "deescalation_cleared")
+    assert cleared[0]["payload"]["rework_budget_reset"] is True
+
+
+def test_sweep_does_not_re_reset_rework_counter_in_same_episode(
+    tmp_path: Path,
+) -> None:
+    """Repeated clears within the same escalation episode do not re-reset the
+    counter (issue #1093 operator ruling).
+
+    Simulated by pre-setting the episode marker to match the current
+    ``terminal_since``: the sweep clears the escalation but treats the budget
+    as already reset for this episode.
+    """
+    app = _app(tmp_path)
+    terminal_since = "2026-08-14T12:00:00Z"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "no_op_rework_attempts_cap_exceeded",
+            "request_changes_count": 2,
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "no_op_rework_attempts_cap_exceeded",
+            "reason_class": "mechanical",
+            "terminal_since": terminal_since,
+            # Marker already set for this episode — budget was already reset.
+            "rework_budget_reset_for_terminal_since": terminal_since,
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    pr_456 = state["prs"]["456"]
+    # Counter NOT reset — already reset for this episode.
+    assert pr_456["request_changes_count"] == 2
+    # Escalation still cleared on both sides.
+    assert "escalation_reason" not in state["issues"]["123"]
+    assert "escalation_reason" not in pr_456
+    cleared = _events(state, "deescalation_cleared")
+    assert cleared[0]["payload"]["rework_budget_reset"] is False
+
+
+def test_sweep_resets_rework_counter_again_after_re_escalation(
+    tmp_path: Path,
+) -> None:
+    """A re-escalation starts a new episode (new ``terminal_since``), so the
+    next sweep clear resets the counter again (issue #1093 operator ruling).
+    """
+    app = _app(tmp_path)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "no_op_rework_attempts_cap_exceeded",
+            "request_changes_count": 5,
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "no_op_rework_attempts_cap_exceeded",
+            "reason_class": "mechanical",
+            "terminal_since": "2026-08-14T15:00:00Z",
+            # Marker from a PREVIOUS episode — different terminal_since.
+            "rework_budget_reset_for_terminal_since": "2026-08-14T12:00:00Z",
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    pr_456 = state["prs"]["456"]
+    # Counter IS reset — new episode.
+    assert pr_456["request_changes_count"] == 0
+    issue_123 = state["issues"]["123"]
+    assert issue_123["rework_budget_reset_for_terminal_since"] == "2026-08-14T15:00:00Z"
+    cleared = _events(state, "deescalation_cleared")
+    assert cleared[0]["payload"]["rework_budget_reset"] is True
