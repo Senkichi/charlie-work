@@ -664,6 +664,16 @@ def empty_state() -> dict[str, Any]:
         "prs": {},
         "events": [],
         "throttled_until": None,  # ISO timestamp when provider throttle cooldown ends
+        # Issue #1001: durable once-only escalation marker for the worker
+        # GitHub token gate. A missing token is a standing condition; the gate
+        # must not emit a worker_token_missing event every loop pass.
+        # fleet_dispatch.fleet_loop constructs a fresh OrchestratorApp per repo
+        # per pass, so an instance-level flag alone resets every pass and
+        # re-escalates indefinitely. This marker persists across reconstruction
+        # and is cleared when the condition resolves (token added), so a future
+        # regression re-escalates. Lives in state.json per the "state lives in
+        # GitHub labels + state.json" invariant.
+        "worker_token_escalated": False,
     }
 
 
@@ -724,6 +734,7 @@ def load_state(path: Path) -> dict[str, Any]:
     data.setdefault("prs", {})
     data.setdefault("events", [])
     data.setdefault("throttled_until", None)  # Backward compatibility
+    data.setdefault("worker_token_escalated", False)  # Issue #1001
     return data
 
 
