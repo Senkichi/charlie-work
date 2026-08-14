@@ -290,6 +290,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "flake_rerun_triggered": "info",
         "fleet_canary": "info",
         "fleet_job_observations": "info",
+        "fleet_lane_completed": "info",
         "head_moved": "info",
         "infra_rerun_triggered": "info",
         "intake": "info",
