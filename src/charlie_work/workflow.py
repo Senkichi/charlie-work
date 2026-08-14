@@ -155,6 +155,7 @@ from .state import (
     defer_reviewer_probe_after,
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     clear_escalation,
+    clear_escalation_on_issue_prs,
     disarm_quota_probe,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
     escalation_reason_class,
@@ -2808,6 +2809,41 @@ def summarize_loop_errors(
         "error_details": details,
         "error_details_truncated": max(0, len(errors) - max_details),
     }
+
+
+# The two statuses that mark an issue as parked in the ``agent:human-needed``
+# sink. Every escalation transition (``_escalate_issue``) sets one of these;
+# the de-escalation sweep selects on the same pair (``_maybe_deescalate_mechanical``).
+# Centralized so the sink census and the sweep cannot drift apart on what
+# "in the sink" means. Issue #1083.
+_SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
+
+
+def sink_census(state: dict[str, Any]) -> set[int]:
+    """Return the set of issue numbers currently parked in the sink.
+
+    The sink is the set of issues whose state entry carries a terminal
+    ``status`` of ``"escalated"`` or ``"blocked"`` -- the in-state mirror of
+    the ``agent:human-needed`` GitHub label. This is a point-in-time census
+    read directly from ``state.json``'s ``issues`` map, deliberately not a
+    GitHub-label query: it is cheap, deterministic, and matches the same
+    source of truth the orchestrator's own de-escalation sweep selects
+    candidates from, so the metric and the sweep agree on the population.
+
+    Used by ``_loop_impl`` to compute the issue #1083 sink metric: a
+    before/after diff around ``_loop_body`` yields arrivals
+    (``after - before``), and the after-set size is the population.
+    """
+    issues = state.get("issues", {})
+    if not isinstance(issues, dict):
+        return set()
+    parked: set[int] = set()
+    for num, entry in issues.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") in _SINK_STATUSES and str(num).isdigit():
+            parked.add(int(num))
+    return parked
 
 
 @dataclass(frozen=True)
@@ -9522,6 +9558,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     clear_escalation(entry)
+                    clear_escalation_on_issue_prs(state, request.issue_number)
                 elif is_live_worker:
                     status = "dispatched"
                     dispatched_at = prev_entry.get("dispatched_at") or utc_now()
@@ -9531,6 +9568,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     clear_escalation(entry)
+                    clear_escalation_on_issue_prs(state, request.issue_number)
                 elif is_phantom_live_worker:
                     # Issue #523: the adapter reported a live worker, but the
                     # recorded PID failed the OS-level liveness + identity
@@ -9557,6 +9595,7 @@ class OrchestratorApp:
                     entry.pop("orphan_drift_at", None)
                     entry.pop("dispatch_failed_at", None)
                     clear_escalation(entry)
+                    clear_escalation_on_issue_prs(state, request.issue_number)
                     entry.pop("worker_pid", None)
                     entry.pop("worker_process_start_time", None)
                 else:
@@ -9613,6 +9652,7 @@ class OrchestratorApp:
                         status = "dispatch_failed"
                         dispatched_at = None
                         clear_escalation(entry)
+                        clear_escalation_on_issue_prs(state, request.issue_number)
                 entry["status"] = status
                 entry["dispatched_at"] = dispatched_at
                 # Store worker PID and process start time for state-based liveness detection
@@ -13826,6 +13866,7 @@ class OrchestratorApp:
                             "merge_alert": "OK",
                         }
                         clear_escalation(issue_entry)
+                        clear_escalation_on_issue_prs(state, issue_number)
                         state["issues"][str(issue_number)] = issue_entry
                     else:
                         # Clear rework_requested status when escalated to prevent selection
@@ -13846,6 +13887,7 @@ class OrchestratorApp:
                         "merge_alert": "OK",
                     }
                     clear_escalation(issue_entry)
+                    clear_escalation_on_issue_prs(state, issue_number)
                     state["issues"][str(issue_number)] = issue_entry
                     # Clear worker PID when issue is approved (worker is done)
                     state["issues"][str(issue_number)].pop("worker_pid", None)
@@ -14048,11 +14090,72 @@ class OrchestratorApp:
         "reason_class",
         "auto_deescalation_count",
         "deescalation_cap_notified_at",
+        # Issue #1093: the per-escalation-episode marker for the rework
+        # budget reset must clear alongside the escalation it tracks, so a
+        # manual re-arm gives the next sweep clear a clean slate.
+        "rework_budget_reset_for_terminal_since",
         "label_error",
         "worker_pid",
         "worker_process_start_time",
         "dispatched_at",
     )
+    # Issue #1093: the de-escalation sweep's once-per-episode rework-budget
+    # reset must zero the per-mechanism PR counter that ACTUALLY gates the
+    # cleared ``escalation_reason``, not a counter belonging to a different
+    # lane.  ``_route_janitor_gate_failure_to_rework`` escalates with reason
+    # ``f"{attempts_key}_cap_exceeded"`` (or ``_stall_exceeded``) and reads
+    # ``attempts_key`` itself on the next pass; ``record_review`` escalates
+    # with ``max_rework_cycles_exceeded`` and reads ``request_changes_count``.
+    # Resetting ``request_changes_count`` for a ``no_op_rework_attempts_*``
+    # clear (the PR's own reproduction scenario) left the real gating counter
+    # untouched, so the router re-escalated on the very next detection -- the
+    # promised "fresh rework budget" never applied to the lane it serves.
+    #
+    # Each lane's counter is reset together with its head-baseline
+    # (``_last_head``) and stall-clock (``_stall_since`` / ``_stall_head``)
+    # companions so the next detection re-baselines instead of inheriting a
+    # stale head/stall snapshot from the exhausted episode.  Escalation
+    # reasons with no per-mechanism rework counter (e.g.
+    # ``session_failed_escalated``, ``worktree_unsafe``) are absent from the
+    # map: there is no rework budget to reset for them, so the clear resets
+    # nothing extra.  ``auto_deescalation_count`` still independently bounds
+    # total clears (Issue #783 hazard (b)), so the per-episode reset cannot
+    # unbound the paid-session loop.
+    _REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]] = {
+        "max_rework_cycles_exceeded": ("request_changes_count", ()),
+        "no_op_rework_attempts_cap_exceeded": (
+            "no_op_rework_attempts",
+            (
+                "no_op_rework_attempts_last_head",
+                "no_op_rework_attempts_stall_since",
+                "no_op_rework_attempts_stall_head",
+            ),
+        ),
+        "no_op_rework_attempts_stall_exceeded": (
+            "no_op_rework_attempts",
+            (
+                "no_op_rework_attempts_last_head",
+                "no_op_rework_attempts_stall_since",
+                "no_op_rework_attempts_stall_head",
+            ),
+        ),
+        "conflict_rework_attempts_cap_exceeded": (
+            "conflict_rework_attempts",
+            (
+                "conflict_rework_attempts_last_head",
+                "conflict_rework_attempts_stall_since",
+                "conflict_rework_attempts_stall_head",
+            ),
+        ),
+        "conflict_rework_attempts_stall_exceeded": (
+            "conflict_rework_attempts",
+            (
+                "conflict_rework_attempts_last_head",
+                "conflict_rework_attempts_stall_since",
+                "conflict_rework_attempts_stall_head",
+            ),
+        ),
+    }
 
     def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> str | None:
         """Re-run the worktree safety check for an issue (issue #849).
@@ -18758,8 +18861,36 @@ class OrchestratorApp:
                 correlation_id=cid,
             )
             record_loop_pass(self.paths.state_file, cid, start_ts)
+            # Issue #1083: snapshot the ``agent:human-needed`` sink before the
+            # pass mutates anything, so arrivals (after - before) and the
+            # post-pass population are a census diff, not an event-kind
+            # allow-list that would have to be maintained in lockstep with
+            # every new escalation call site. Read-only; ``load_state_locked``
+            # (not raw ``load_state``) so the snapshot holds the advisory lock
+            # -- the lint guard in ``test_no_unlocked_load_state_in_production_code``
+            # flags any bare ``load_state`` outside a ``state_lock`` context.
+            sink_before = sink_census(load_state_locked(self.paths.state_file))
             result = self._loop_body(limit, merge=merge, now=now)
             elapsed = time.monotonic() - loop_start
+            sink_after = sink_census(load_state_locked(self.paths.state_file))
+            sink_arrivals = len(sink_after - sink_before)
+            sink_population = len(sink_after)
+            # Sweep clears are the one signal that cannot be derived from the
+            # census diff: a departure may be an operator ``unescalate``, a
+            # merge, or a close, none of which are sweep drainage.
+            # ``deescalation_cleared`` has a single emitter
+            # (``_deescalate_mechanical_issue``) and shares this pass's
+            # correlation ID, so a count by (kind, correlation_id) is the
+            # exact sweep-clear count with no allow-list to drift. Queried
+            # before ``loop_completed`` is emitted so this event is not
+            # self-counted.
+            sink_clears = len(
+                query_events(
+                    self.paths.state_file,
+                    kind="deescalation_cleared",
+                    correlation_id=cid,
+                )
+            )
             log_event(
                 self.paths.state_file,
                 "loop_completed",
@@ -18773,6 +18904,17 @@ class OrchestratorApp:
                     # 21-pass ok=False streak as healthy because no stored artifact
                     # named the PR. Bounded; see summarize_loop_errors.
                     **summarize_loop_errors(result.data.get("errors", [])),
+                    # Issue #1083: autonomy is never reported without its drop
+                    # rate. ``sink_arrivals`` is the first-class failure metric
+                    # (issues dropped to a human this pass); ``sink_clears`` is
+                    # the automated drainage; ``sink_population`` is the
+                    # point-in-time census of parked work. A rise in arrivals
+                    # without a matching rise in clears is the signature of a
+                    # growing sink, and the ratio of clears to population is
+                    # the drainage rate #1093's mirror-clear should move.
+                    "sink_population": sink_population,
+                    "sink_arrivals": sink_arrivals,
+                    "sink_clears": sink_clears,
                 },
                 repo=self.repo_root.name,
                 correlation_id=cid,
@@ -18787,6 +18929,9 @@ class OrchestratorApp:
                 error_count=len(result.data.get("errors", [])),
                 merge_count=len(result.data.get("merges", [])),
                 review_count=len(result.data.get("reviews", [])),
+                sink_population=sink_population,
+                sink_arrivals=sink_arrivals,
+                sink_clears=sink_clears,
             )
             return result
 
@@ -19341,24 +19486,27 @@ class OrchestratorApp:
         than before.
 
         Issue #783 hazard (b) -- unbounded paid-session loop: this method
-        never resets the ORIGINAL per-mechanism attempt/cap counters (e.g.
-        ``redispatch_at``, ``request_changes_count``,
-        ``conflict_rework_attempts``, ``review_dispatch_attempt_count``) --
-        it only clears the escalation-specific fields (``status``,
-        ``escalation_reason``, ``reason_class``). If the same mechanical
-        condition recurs after a clear, the ORIGINAL cap re-trips (usually
-        within one dispatch/review/rework cycle, since that counter was
-        never zeroed), which re-escalates the issue through one of the
-        S1-S14 call sites and re-enters this same accounting. That
-        recurrence also consumes one more slot of
-        ``auto_deescalation_count``, so the two counters compound: the
-        mechanism-specific cap bounds how fast a single recurring failure
-        can re-escalate, and ``auto_deescalation_count``'s cap independently
-        bounds how many times this sweep will ever clear the SAME issue.
-        Neither counter is reset by this method, so neither loop can run
-        forever -- the sweep cannot re-dispatch a paid worker session more
-        than ``max_auto_deescalations`` times for one recurring failure
-        before falling permanently back to human review.
+        resets ONLY the per-mechanism attempt/cap counter that gates the
+        CLEARED ``escalation_reason`` (see
+        ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON``), and only once per
+        escalation episode (tracked via ``rework_budget_reset_for_terminal_since``).
+        It does NOT reset the other lanes' counters, nor the cross-lane
+        bookkeeping that a full ``charlie unescalate`` clears
+        (``redispatch_at``, ``review_dispatch_attempt_count``, etc.). If the
+        same mechanical condition recurs after a clear, the lane's counter
+        has been zeroed so the cap re-trips only after a fresh
+        ``max_attempts``/``max_rework_cycles`` worth of completed-but-still-
+        failing cycles, which re-escalates the issue through one of the
+        S1-S14 call sites and re-enters this same accounting. That recurrence
+        also consumes one more slot of ``auto_deescalation_count``, so the
+        two counters compound: the mechanism-specific cap bounds how fast a
+        single recurring failure can re-escalate, and
+        ``auto_deescalation_count``'s cap independently bounds how many times
+        this sweep will ever clear the SAME issue. The per-episode counter
+        reset cannot unbound the loop because ``auto_deescalation_count``
+        still caps total clears -- the sweep cannot re-dispatch a paid worker
+        session more than ``max_auto_deescalations`` times for one recurring
+        failure before falling permanently back to human review.
 
         A pre-PR dispatch failure (e.g. ``dispatch_failed_cap_exceeded`` --
         the launch never produced a PR at all) has no artifact AC3's
@@ -19508,15 +19656,54 @@ class OrchestratorApp:
 
             cleared_condition = fresh_issue_entry.get("escalation_reason")
             cleared_auto_count = auto_count + 1
+            # Issue #1093: reset the over-cap rework counter once per
+            # escalation episode so the issue gets a fresh rework budget on
+            # the first clear after an escalation.  ``terminal_since`` is
+            # refreshed on every ``_escalate_issue`` call, so it identifies
+            # the current episode; the marker records which episode was
+            # last reset.  A re-escalation produces a new ``terminal_since``,
+            # so the next clear resets again.  Repeated clears within the
+            # same episode (same ``terminal_since``) do not re-reset.
+            current_terminal_since = fresh_issue_entry.get("terminal_since")
+            budget_reset_needed = (
+                "rework_budget_reset_for_terminal_since" not in fresh_issue_entry
+                or fresh_issue_entry.get("rework_budget_reset_for_terminal_since")
+                != current_terminal_since
+            )
             updated_issue_entry = {
                 **fresh_issue_entry,
                 "number": issue_number,
                 "status": PASSIVE_OPEN_STATUS,
                 "auto_deescalation_count": cleared_auto_count,
             }
+            if budget_reset_needed:
+                updated_issue_entry["rework_budget_reset_for_terminal_since"] = (
+                    current_terminal_since
+                )
             clear_escalation(updated_issue_entry)
             updated_issue_entry.pop("label_error", None)
             fresh_state["issues"][issue_key] = updated_issue_entry
+            # Issue #1093: mirror-clear the PR record's escalation fields so
+            # the rework router's short-circuit on
+            # ``existing_pr_state.get("escalation_reason")`` no longer fires
+            # after the sweep clears the issue.  Also reset the per-mechanism
+            # rework counter that ACTUALLY gates the cleared escalation_reason
+            # on the open PR once per escalation episode -- resetting only
+            # ``request_changes_count`` left the no_op/conflict lanes' real
+            # gating counter untouched, so the router re-escalated on the next
+            # detection.  See ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON``.
+            clear_escalation_on_issue_prs(fresh_state, issue_number)
+            if budget_reset_needed:
+                fresh_pr = fresh_state["prs"].get(str(pr_number))
+                if isinstance(fresh_pr, dict):
+                    reset_spec = self._REWORK_BUDGET_RESET_BY_ESCALATION_REASON.get(
+                        cleared_condition
+                    )
+                    if reset_spec is not None:
+                        counter_field, companion_fields = reset_spec
+                        fresh_pr[counter_field] = 0
+                        for _field in companion_fields:
+                            fresh_pr.pop(_field, None)
             fresh_state = self._record_event(
                 fresh_state,
                 "deescalation_cleared",
@@ -19528,6 +19715,7 @@ class OrchestratorApp:
                     "pr_mergeable": mergeable,
                     "janitor_ok": janitor_verdict.ok,
                     "auto_deescalation_count": cleared_auto_count,
+                    "rework_budget_reset": budget_reset_needed,
                 },
             )
             save_state(self.paths.state_file, fresh_state)
