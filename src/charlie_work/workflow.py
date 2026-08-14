@@ -18633,11 +18633,14 @@ class OrchestratorApp:
             # pass mutates anything, so arrivals (after - before) and the
             # post-pass population are a census diff, not an event-kind
             # allow-list that would have to be maintained in lockstep with
-            # every new escalation call site. Read-only; no lock held.
-            sink_before = sink_census(load_state(self.paths.state_file))
+            # every new escalation call site. Read-only; ``load_state_locked``
+            # (not raw ``load_state``) so the snapshot holds the advisory lock
+            # -- the lint guard in ``test_no_unlocked_load_state_in_production_code``
+            # flags any bare ``load_state`` outside a ``state_lock`` context.
+            sink_before = sink_census(load_state_locked(self.paths.state_file))
             result = self._loop_body(limit, merge=merge, now=now)
             elapsed = time.monotonic() - loop_start
-            sink_after = sink_census(load_state(self.paths.state_file))
+            sink_after = sink_census(load_state_locked(self.paths.state_file))
             sink_arrivals = len(sink_after - sink_before)
             sink_population = len(sink_after)
             # Sweep clears are the one signal that cannot be derived from the
