@@ -132,7 +132,7 @@ def _fake_issue(number: int = 1) -> dict[str, object]:
 
 def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker.md's real caller is ``OrchestratorApp._write_worker_prompt``
-    (workflow.py:21991-22057), used unmodified whenever
+    (workflow.py:22021-22087), used unmodified whenever
     ``config.dispatch.worker_template`` (default ``"worker.md"``) is
     selected -- see the `intake()` call site at workflow.py:8121.
 
@@ -436,7 +436,7 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "prior_review_section",
 }
 
-# workflow.py:16105-16116, inside OrchestratorApp._cross_family_for_pr() --
+# workflow.py:16135-16146, inside OrchestratorApp._cross_family_for_pr() --
 # the literal `values` dict passed to `self._render("cross_family_review.md", {...})`.
 CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
@@ -448,7 +448,7 @@ CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "diff_path",
 }
 
-# workflow.py:15982-15985, inside OrchestratorApp.spec_review() -- the
+# workflow.py:16012-16015, inside OrchestratorApp.spec_review() -- the
 # literal `values` dict passed to
 # `self._render("cross_family_spec_review.md", {...})`.
 CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS = {
@@ -655,7 +655,7 @@ def test_every_shipped_template_is_covered_by_this_contract() -> None:
 # the corresponding entry here -- the test will tell you if you forget.
 _CITATION_EXPECTATIONS: dict[tuple[int, int], str] = {
     # ``_write_worker_prompt`` definition
-    (21991, 22057): "def _write_worker_prompt",
+    (22021, 22087): "def _write_worker_prompt",
     # ``intake()``'s ``_write_worker_prompt`` call (no template= override)
     (8121, 8121): "self._write_worker_prompt(full_issue",
     # api-worker dispatch path (dry-run preview branch)
@@ -671,9 +671,9 @@ _CITATION_EXPECTATIONS: dict[tuple[int, int], str] = {
     # ``OrchestratorApp.review()`` values dict for review.md
     (11011, 11029): '"review.md"',
     # ``_cross_family_for_pr()`` values dict for cross_family_review.md
-    (16105, 16116): '"cross_family_review.md"',
+    (16135, 16146): '"cross_family_review.md"',
     # ``spec_review()`` values dict for cross_family_spec_review.md
-    (15982, 15985): '"cross_family_spec_review.md"',
+    (16012, 16015): '"cross_family_spec_review.md"',
     # ``review()``'s ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
     (10856, 10856): "pr_dir = self.paths.prs",
     # ``OrchestratorApp._render`` definition (the prompt_dirs call)

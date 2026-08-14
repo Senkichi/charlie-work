@@ -14583,6 +14583,7 @@ class OrchestratorApp:
         check_failure_routed = False
         cross_pr_revert_detected = False
         cross_pr_revert_routed = False
+        cross_pr_revert_undetermined = False
         cross_pr_revert_reason: str | None = None
         issue_status: str | None = None
         label_error: dict[str, Any] | None = None
@@ -14937,9 +14938,18 @@ class OrchestratorApp:
             # reverts it has a clean PR diff but would silently undo the base
             # change when squash-merged. Detect by enumerating branch commits not
             # on base and matching `Revert "..."` subjects against base commits.
+            # The gate returns a three-state verdict (issue #1068): a confirmed
+            # revert routes to rework; an "undetermined" result (the gate could
+            # not verify — transient git failure) fails closed and blocks merge
+            # without routing, since the gate's whole purpose is to block a
+            # specific bad merge and a false negative would ship it unflagged.
             if not sync_failed:
-                cross_pr_revert_reason = detect_cross_pr_revert(pr, self.repo_root)
-                if cross_pr_revert_reason:
+                cross_pr_revert_verdict = detect_cross_pr_revert(pr, self.repo_root)
+                cross_pr_revert_reason = cross_pr_revert_verdict.reason
+                if cross_pr_revert_verdict.undetermined:
+                    cross_pr_revert_undetermined = True
+                    sync_failed = True
+                elif cross_pr_revert_verdict.revert_detected:
                     cross_pr_revert_detected = True
                     sync_failed = True
                     if issue_number is not None:
@@ -15473,6 +15483,13 @@ class OrchestratorApp:
                             f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
                             f"cross-PR revert — {revert_detail}"
                         )
+                    elif cross_pr_revert_undetermined:
+                        pass_str = "pass" if new_attempts == 1 else "passes"
+                        merge_attempt_warning = (
+                            f"PR #{pr_number} approved but unmergeable for {new_attempts} {pass_str}: "
+                            f"cross-PR revert gate could not verify (fail closed) — "
+                            f"{cross_pr_revert_reason}"
+                        )
                     elif mergequeue_handoff_failed:
                         pass_str = "pass" if new_attempts == 1 else "passes"
                         merge_attempt_warning = (
@@ -15629,6 +15646,7 @@ class OrchestratorApp:
             "cross_pr_revert_detected": cross_pr_revert_detected,
             "cross_pr_revert_reason": cross_pr_revert_reason,
             "cross_pr_revert_routed": cross_pr_revert_routed,
+            "cross_pr_revert_undetermined": cross_pr_revert_undetermined,
             "mergequeue_label_applied": mergequeue_label_applied,
             "merge_hold": merge_hold,
             "merge_hold_check_unavailable": merge_hold_check_unavailable,
@@ -15637,6 +15655,8 @@ class OrchestratorApp:
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
             message = f"cross-PR revert detected: {cross_pr_revert_reason}"
+        elif cross_pr_revert_undetermined:
+            message = f"cross-PR revert gate undetermined: {cross_pr_revert_reason}"
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
         elif escalated_merge_hold:
@@ -15725,6 +15745,7 @@ class OrchestratorApp:
         sync_failed = False
         merge_conflict = False
         cross_pr_revert_detected = False
+        cross_pr_revert_undetermined = False
         cross_pr_revert_reason: str | None = None
 
         if approved:
@@ -15829,10 +15850,16 @@ class OrchestratorApp:
                         )
 
             # Cross-PR revert detection (read-only). The rework routing write
-            # is skipped under dry-run.
+            # is skipped under dry-run. The three-state verdict (issue #1068)
+            # mirrors the real path: undetermined fails closed (blocks merge)
+            # without routing, since no revert was confirmed.
             if not sync_failed:
-                cross_pr_revert_reason = detect_cross_pr_revert(pr, self.repo_root)
-                if cross_pr_revert_reason:
+                cross_pr_revert_verdict = detect_cross_pr_revert(pr, self.repo_root)
+                cross_pr_revert_reason = cross_pr_revert_verdict.reason
+                if cross_pr_revert_verdict.undetermined:
+                    cross_pr_revert_undetermined = True
+                    sync_failed = True
+                elif cross_pr_revert_verdict.revert_detected:
                     cross_pr_revert_detected = True
                     sync_failed = True
 
@@ -15919,6 +15946,8 @@ class OrchestratorApp:
             message += " (merge conflict — would route to rework on threshold)"
         elif cross_pr_revert_detected:
             message += f" (cross-PR revert: {cross_pr_revert_reason})"
+        elif cross_pr_revert_undetermined:
+            message += f" (cross-PR revert gate undetermined — would block merge: {cross_pr_revert_reason})"
         elif checks_unavailable:
             message = "dry-run: checks unavailable (gh failure)"
         elif merge_hold_check_unavailable:
@@ -15954,6 +15983,7 @@ class OrchestratorApp:
                 "cross_pr_revert_detected": cross_pr_revert_detected,
                 "cross_pr_revert_reason": cross_pr_revert_reason,
                 "cross_pr_revert_routed": False,
+                "cross_pr_revert_undetermined": cross_pr_revert_undetermined,
                 "mergequeue_label_applied": None,
                 "merge_hold": merge_hold,
                 "merge_hold_check_unavailable": merge_hold_check_unavailable,

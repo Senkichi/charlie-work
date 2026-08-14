@@ -22,6 +22,7 @@ from charlie_work.janitor import (
     detect_cross_pr_revert,
     is_stale_ci_verdict,
     JANITOR_PR_KEYS,
+    CrossPrRevertVerdict,
     JanitorVerdict,
     check_operator_containment,
     check_stub_tests,
@@ -3350,7 +3351,12 @@ def test_no_op_rework_warns_on_flag_like_base_ref_sha_match(
 def test_detect_cross_pr_revert_skips_invalid_head_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A flag-like headRefName must not reach ``git fetch origin <head> <base>``."""
+    """A flag-like headRefName must not reach ``git fetch origin <head> <base>``.
+
+    Ref validation fails before any subprocess call, so the gate could not
+    verify — it returns ``undetermined`` (fail closed, issue #1068), not a
+    silent ``None`` that would be indistinguishable from "verified clean".
+    """
     from charlie_work import janitor as janitor_module
 
     repo_root = tmp_path / "repo"
@@ -3365,13 +3371,20 @@ def test_detect_cross_pr_revert_skips_invalid_head_ref(
     monkeypatch.setattr(janitor_module.subprocess, "run", _fail_if_called)
 
     result = detect_cross_pr_revert(pr, repo_root)
-    assert result is None
+    assert isinstance(result, CrossPrRevertVerdict)
+    assert result.undetermined is True
+    assert result.revert_detected is False
+    assert result.reason is not None
 
 
 def test_detect_cross_pr_revert_skips_invalid_base_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A flag-like baseRefName must not reach ``git fetch origin <head> <base>``."""
+    """A flag-like baseRefName must not reach ``git fetch origin <head> <base>``.
+
+    Ref validation fails before any subprocess call, so the gate could not
+    verify — it returns ``undetermined`` (fail closed, issue #1068).
+    """
     from charlie_work import janitor as janitor_module
 
     repo_root = tmp_path / "repo"
@@ -3386,13 +3399,16 @@ def test_detect_cross_pr_revert_skips_invalid_base_ref(
     monkeypatch.setattr(janitor_module.subprocess, "run", _fail_if_called)
 
     result = detect_cross_pr_revert(pr, repo_root)
-    assert result is None
+    assert isinstance(result, CrossPrRevertVerdict)
+    assert result.undetermined is True
+    assert result.revert_detected is False
+    assert result.reason is not None
 
 
 def test_detect_cross_pr_revert_warns_on_invalid_ref(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A ref validation failure must be logged, not silently treated as no revert."""
+    """A ref validation failure must be logged and fail closed, not silently pass."""
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / ".git").mkdir()
@@ -3402,11 +3418,200 @@ def test_detect_cross_pr_revert_warns_on_invalid_ref(
     with caplog.at_level(logging.WARNING, logger="charlie_work.janitor"):
         result = detect_cross_pr_revert(pr, repo_root)
 
-    assert result is None
+    assert isinstance(result, CrossPrRevertVerdict)
+    assert result.undetermined is True
+    assert result.revert_detected is False
+    assert result.reason is not None
     assert any(
         "detect_cross_pr_revert" in record.message and "not a valid git ref name" in record.message
         for record in caplog.records
     )
+
+
+# --- issue #1068: "could not verify" must not fold into "verified clean" -------
+#
+# detect_cross_pr_revert previously returned None for BOTH "verified clean" and
+# every transient-git-failure path (fetch/rev-list/log non-zero exit, OSError,
+# ref validation, per-commit subject-fetch `continue`). The caller could not
+# tell them apart, so a silent cross-PR revert could merge undetected. These
+# tests pin the three-state CrossPrRevertVerdict: failure paths return
+# ``undetermined`` (fail closed), a complete clean scan returns a no-flag
+# verdict, and structural skips (no repo_root, allow-revert marker) stay clean.
+
+
+class _FakeProc:
+    """Minimal stand-in for subprocess.CompletedProcess used by the gate."""
+
+    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _repo_with_git(tmp_path: Path) -> Path:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / ".git").mkdir()
+    return repo_root
+
+
+def test_detect_cross_pr_revert_fetch_failure_is_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-zero ``git fetch`` exit is a transient failure, not "verified clean"."""
+    from charlie_work import janitor as janitor_module
+
+    repo_root = _repo_with_git(tmp_path)
+    pr = _green_pr()
+
+    def _fake_run(*_args: object, **_kwargs: object) -> _FakeProc:
+        return _FakeProc(returncode=1, stderr="fatal: could not read ref")
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _fake_run)
+
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result.undetermined is True
+    assert result.revert_detected is False
+    assert result.reason is not None
+    assert "git fetch" in result.reason
+
+
+def test_detect_cross_pr_revert_revlist_failure_is_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-zero ``git rev-list`` exit is a transient failure, not "verified clean"."""
+    from charlie_work import janitor as janitor_module
+
+    repo_root = _repo_with_git(tmp_path)
+    pr = _green_pr()
+
+    calls: list[list[str]] = []
+
+    def _fake_run(args: list[str], *_a: object, **_kw: object) -> _FakeProc:
+        calls.append(list(args))
+        if args[:2] == ["git", "fetch"]:
+            return _FakeProc(returncode=0)
+        if args[:2] == ["git", "rev-list"]:
+            return _FakeProc(returncode=1, stderr="fatal: bad rev")
+        return _FakeProc()
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _fake_run)
+
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result.undetermined is True
+    assert result.revert_detected is False
+    assert result.reason is not None
+    assert "rev-list" in result.reason
+
+
+def test_detect_cross_pr_revert_subject_fetch_failure_is_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A per-commit ``git log`` subject-fetch failure mid-scan is undetermined.
+
+    The previous shape ``continue``d past the failed commit and fell through to
+    a final ``None`` — a false negative indistinguishable from "verified clean".
+    """
+    from charlie_work import janitor as janitor_module
+
+    repo_root = _repo_with_git(tmp_path)
+    pr = _green_pr()
+
+    def _fake_run(args: list[str], *_a: object, **_kw: object) -> _FakeProc:
+        if args[:2] == ["git", "fetch"]:
+            return _FakeProc(returncode=0)
+        if args[:2] == ["git", "rev-list"]:
+            return _FakeProc(returncode=0, stdout="deadbeefdeadbeef\n")
+        if args[:2] == ["git", "log"] and "--format=%s" in args:
+            return _FakeProc(returncode=1, stderr="fatal: bad object")
+        return _FakeProc()
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _fake_run)
+
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result.undetermined is True
+    assert result.revert_detected is False
+    assert result.reason is not None
+    assert "mid-scan" in result.reason
+
+
+def test_detect_cross_pr_revert_oserror_is_undetermined_and_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An OSError (disk hiccup / missing binary) is undetermined and logged.
+
+    The previous shape returned None here with NO logging at all — the
+    highest-invisibility failure path.
+    """
+    from charlie_work import janitor as janitor_module
+
+    repo_root = _repo_with_git(tmp_path)
+    pr = _green_pr()
+
+    def _raise_oserror(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _raise_oserror)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.janitor"):
+        result = detect_cross_pr_revert(pr, repo_root)
+
+    assert result.undetermined is True
+    assert result.revert_detected is False
+    assert result.reason is not None
+    assert "OSError" in result.reason
+    assert any(
+        "detect_cross_pr_revert" in r.message and "OSError" in r.message for r in caplog.records
+    )
+
+
+def test_detect_cross_pr_revert_clean_scan_is_verified_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete scan that finds no revert returns a clean (no-flag) verdict."""
+    from charlie_work import janitor as janitor_module
+
+    repo_root = _repo_with_git(tmp_path)
+    pr = _green_pr()
+
+    def _fake_run(args: list[str], *_a: object, **_kw: object) -> _FakeProc:
+        if args[:2] == ["git", "fetch"]:
+            return _FakeProc(returncode=0)
+        if args[:2] == ["git", "rev-list"]:
+            return _FakeProc(returncode=0, stdout="cafebabecafebabe\n")
+        if args[:2] == ["git", "log"] and "--format=%s" in args:
+            return _FakeProc(returncode=0, stdout="feat: add search\n")
+        return _FakeProc()
+
+    monkeypatch.setattr(janitor_module.subprocess, "run", _fake_run)
+
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result.undetermined is False
+    assert result.revert_detected is False
+    assert result.reason is None
+
+
+def test_detect_cross_pr_revert_no_repo_root_is_verified_clean(
+    tmp_path: Path,
+) -> None:
+    """No repo_root is a structural skip — the gate is inapplicable, not failed."""
+    pr = _green_pr()
+    result = detect_cross_pr_revert(pr, None)
+    assert result.undetermined is False
+    assert result.revert_detected is False
+    assert result.reason is None
+
+
+def test_detect_cross_pr_revert_allow_marker_is_verified_clean(
+    tmp_path: Path,
+) -> None:
+    """An explicit allow-revert marker overrides the gate (verified clean)."""
+    repo_root = _repo_with_git(tmp_path)
+    pr = _green_pr(body="Closes #123\n\nallow-revert: intentional revert of feature C")
+    result = detect_cross_pr_revert(pr, repo_root)
+    assert result.undetermined is False
+    assert result.revert_detected is False
+    assert result.reason is None
 
 
 # --------------------------------------------------------------------------

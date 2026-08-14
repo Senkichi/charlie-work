@@ -1049,12 +1049,43 @@ def _get_unpushed_commit_info(
         return None
 
 
+@dataclass(frozen=True)
+class CrossPrRevertVerdict:
+    """Outcome of the cross-PR revert gate (issue #1068).
+
+    Three mutually exclusive states. Consumers must branch on the structured
+    flags, never on ``reason`` text — mirroring the ``JanitorVerdict``
+    convention.
+
+    - ``revert_detected``: the PR branch contains a revert of a base commit.
+      ``reason`` carries the blocking message; the caller routes to rework.
+    - ``undetermined``: the gate could not complete verification (transient
+      local-git failure — ``git fetch``/``git rev-list``/``git log`` non-zero
+      exit, ``OSError``, ref validation, or a per-commit subject/match fetch
+      that failed mid-scan). ``reason`` carries a diagnostic. The caller must
+      treat this as NOT verified and block merge — never advance toward merge
+      on an unverified gate, since the gate's whole purpose is to catch a
+      specific bad merge (issue #390). This mirrors ``_check_no_op_rework``,
+      which emits an explicit warning on verify-failure and does not treat
+      failure as pass; the previous shape folded "could not verify" into the
+      same ``None`` as "verified clean", silently disabling the gate.
+    - neither flag (``reason`` is ``None``): verified clean — no cross-PR base
+      revert was found after a complete scan, the gate was structurally
+      inapplicable (no ``repo_root``, no git directory, no head/base refs), or
+      an ``allow-revert:`` marker explicitly overrides the gate.
+    """
+
+    reason: str | None
+    revert_detected: bool = False
+    undetermined: bool = False
+
+
 def detect_cross_pr_revert(
     pr: dict[str, Any],
     repo_root: Path | None,
     allow_marker: str = "allow-revert",
-) -> str | None:
-    """Return a blocking reason if the PR branch would silently revert a base commit.
+) -> CrossPrRevertVerdict:
+    """Return a verdict on whether the PR branch would silently revert a base commit.
 
     Enumerates non-merge commits on the PR branch that are not reachable from
     the base. A commit whose subject is ``Revert "<original>"`` and whose
@@ -1064,15 +1095,18 @@ def detect_cross_pr_revert(
     marker line in the PR body suppresses the block so legitimate intentional
     reverts can be merged.
 
-    Returns ``None`` when no revert is detected, an ``allow-revert:`` marker
-    line is present, or the local git history required to decide is unavailable.
+    Returns a :class:`CrossPrRevertVerdict` with three mutually exclusive
+    states (see that class's docstring). The caller must branch on the
+    structured flags: ``revert_detected`` routes to rework, ``undetermined``
+    blocks merge without routing (the gate could not verify — fail closed),
+    and a clean verdict (no flags) may proceed.
     """
     if not repo_root:
-        return None
+        return CrossPrRevertVerdict(reason=None)
 
     repo_root_path = Path(repo_root)
     if not repo_root_path.is_dir() or not (repo_root_path / ".git").exists():
-        return None
+        return CrossPrRevertVerdict(reason=None)
 
     body = str(pr.get("body") or "")
     # Require a structural marker line: "allow-revert:" followed by a reason.
@@ -1082,12 +1116,12 @@ def detect_cross_pr_revert(
         re.IGNORECASE | re.MULTILINE,
     )
     if marker_re.search(body):
-        return None
+        return CrossPrRevertVerdict(reason=None)
 
     head_ref = pr.get("headRefName")
     base_ref = pr.get("baseRefName")
     if not head_ref or not base_ref:
-        return None
+        return CrossPrRevertVerdict(reason=None)
 
     try:
         # Validate ref names before they reach git argv (issue #659). Both
@@ -1105,7 +1139,24 @@ def detect_cross_pr_revert(
             **hidden_console_kwargs(),
         )
         if fetch.returncode != 0:
-            return None
+            # Could not verify: a transient local-git failure (e.g. an
+            # unfetched origin ref) is indistinguishable from "verified clean"
+            # if folded into None. Fail closed (issue #1068).
+            logger.warning(
+                "detect_cross_pr_revert could not verify: git fetch origin %s %s "
+                "failed (exit %d): %s",
+                head_ref,
+                base_ref,
+                fetch.returncode,
+                (fetch.stderr or "").strip(),
+            )
+            return CrossPrRevertVerdict(
+                reason=(
+                    f"cross-PR revert gate could not verify: git fetch origin "
+                    f"{head_ref} {base_ref} failed (exit {fetch.returncode})"
+                ),
+                undetermined=True,
+            )
 
         commits = subprocess.run(
             [
@@ -1122,8 +1173,24 @@ def detect_cross_pr_revert(
             **no_console_window_kwargs(),
         )
         if commits.returncode != 0:
-            return None
+            logger.warning(
+                "detect_cross_pr_revert could not verify: git rev-list failed (exit %d): %s",
+                commits.returncode,
+                (commits.stderr or "").strip(),
+            )
+            return CrossPrRevertVerdict(
+                reason=(
+                    f"cross-PR revert gate could not verify: git rev-list failed "
+                    f"(exit {commits.returncode})"
+                ),
+                undetermined=True,
+            )
 
+        # Track whether any per-commit verification step failed mid-scan. A
+        # non-zero exit on a subject/match fetch means that commit was never
+        # verified, so a "no revert found" result is a false negative, not a
+        # clean verdict (issue #1068).
+        verification_incomplete = False
         for sha in commits.stdout.strip().splitlines():
             if not sha:
                 continue
@@ -1136,6 +1203,13 @@ def detect_cross_pr_revert(
                 **no_console_window_kwargs(),
             )
             if subject_proc.returncode != 0:
+                logger.warning(
+                    "detect_cross_pr_revert could not verify: git log subject "
+                    "fetch for commit %s failed (exit %d)",
+                    sha[:12],
+                    subject_proc.returncode,
+                )
+                verification_incomplete = True
                 continue
             subject = subject_proc.stdout.strip()
             if subject.startswith('Revert "') and subject.endswith('"'):
@@ -1157,6 +1231,13 @@ def detect_cross_pr_revert(
                     **no_console_window_kwargs(),
                 )
                 if match_proc.returncode != 0:
+                    logger.warning(
+                        "detect_cross_pr_revert could not verify: git log --grep "
+                        "for original subject %r on base failed (exit %d)",
+                        original,
+                        match_proc.returncode,
+                    )
+                    verification_incomplete = True
                     continue
                 for base_sha in match_proc.stdout.strip().splitlines():
                     if not base_sha:
@@ -1170,23 +1251,53 @@ def detect_cross_pr_revert(
                         **no_console_window_kwargs(),
                     )
                     if base_subject_proc.returncode != 0:
+                        logger.warning(
+                            "detect_cross_pr_revert could not verify: git log "
+                            "subject fetch for base commit %s failed (exit %d)",
+                            base_sha[:12],
+                            base_subject_proc.returncode,
+                        )
+                        verification_incomplete = True
                         continue
                     if base_subject_proc.stdout.strip() == original:
-                        return (
-                            f"PR branch contains revert commit {sha[:12]} ({subject}) which "
-                            f"would silently undo base commit {base_sha[:12]}; add an explicit "
-                            f"'{allow_marker}: <reason>' line to the PR body to proceed"
+                        return CrossPrRevertVerdict(
+                            reason=(
+                                f"PR branch contains revert commit {sha[:12]} ({subject}) which "
+                                f"would silently undo base commit {base_sha[:12]}; add an explicit "
+                                f"'{allow_marker}: <reason>' line to the PR body to proceed"
+                            ),
+                            revert_detected=True,
                         )
     except ValueError as exc:
-        # Ref validation failed (issue #659). The function returns None for a
-        # false negative, so a diagnostic is required to distinguish this from
-        # "no revert detected".
-        logger.warning("detect_cross_pr_revert ref validation failed: %s", exc)
-        return None
-    except OSError:
-        return None
+        # Ref validation failed (issue #659). Could not verify — fail closed
+        # (issue #1068): the previous shape returned None, indistinguishable
+        # from "verified clean".
+        logger.warning("detect_cross_pr_revert could not verify: ref validation failed: %s", exc)
+        return CrossPrRevertVerdict(
+            reason=f"cross-PR revert gate could not verify: ref validation failed: {exc}",
+            undetermined=True,
+        )
+    except OSError as exc:
+        # Could not verify — fail closed (issue #1068). The previous shape
+        # returned None here with no logging at all, so a disk hiccup or
+        # missing binary was silently treated as "verified clean".
+        logger.warning("detect_cross_pr_revert could not verify: OSError: %s", exc)
+        return CrossPrRevertVerdict(
+            reason=f"cross-PR revert gate could not verify: OSError: {exc}",
+            undetermined=True,
+        )
 
-    return None
+    if verification_incomplete:
+        return CrossPrRevertVerdict(
+            reason=(
+                "cross-PR revert gate could not verify: a per-commit git log "
+                "fetch failed mid-scan; the branch was not fully checked for "
+                "cross-PR reverts"
+            ),
+            undetermined=True,
+        )
+
+    return CrossPrRevertVerdict(reason=None)
 
 
 def iter_diff_files(diff: str) -> Iterator[tuple[str, bool, list[str]]]:
