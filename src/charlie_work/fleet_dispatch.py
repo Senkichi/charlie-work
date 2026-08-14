@@ -23,6 +23,7 @@ from .instrumentation import log_event
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
 from .venv_anchor import verify_interpreter_anchored_editables
+from .ci_fleet_anchor import ci_fleet_provenance_snapshot
 from .supervise import (
     LocalSnapshot,
     orchestrator_root,
@@ -2253,6 +2254,34 @@ def _alert_watchdog_not_armed(
         )
 
 
+def _record_ci_fleet_provenance(state_path: Path) -> None:
+    """Record the resolved ``ci_fleet`` import location + sibling git state to events.db.
+
+    Issue #954: the live supervisor imports ``ci_fleet`` from an editable
+    working tree, not a commit. This is the "accept the coupling and
+    instrument it" half -- it converts a silent hazard into an attributable
+    one by stamping ``ci_fleet.__file__``, the sibling repo's HEAD, branch,
+    and dirty-state into the fleet-level ``events.db`` at every supervisor
+    start. Best-effort and never raises: a probe failure lands in the event
+    payload's ``error`` field, and a ``log_event`` failure is swallowed by
+    ``log_event`` itself.
+    """
+    snapshot = ci_fleet_provenance_snapshot()
+    log_event(
+        state_path,
+        "ci_fleet_provenance",
+        {
+            "ci_fleet_file": snapshot.ci_fleet_file,
+            "sibling_root": snapshot.sibling_root,
+            "sibling_head": snapshot.sibling_head,
+            "sibling_branch": snapshot.sibling_branch,
+            "sibling_dirty": snapshot.sibling_dirty,
+            "error": snapshot.error,
+        },
+        repo="fleet",
+    )
+
+
 def run_fleet_supervise(
     *,
     fleet_dir_override: str | None = None,
@@ -2425,6 +2454,16 @@ def run_fleet_supervise(
         full_pass_interval_seconds=full_pass_interval,
         max_pass_runtime_seconds=cfg.max_pass_runtime_seconds,
     )
+
+    # Record where ci_fleet was actually imported from plus the sibling
+    # repo's HEAD and dirty-state (issue #954). The venv anchor check above
+    # refuses a repointed install, but neither it nor declared_ci_fleet_root
+    # records what the running process *actually loaded* -- and the editable
+    # .pth means that is whatever is saved in the sibling working tree,
+    # committed or not. This does not prevent anything; it makes the coupling
+    # attributable when something breaks. Best-effort: a probe failure is
+    # recorded in the event payload, never propagated to the supervisor path.
+    _record_ci_fleet_provenance(supervisor_heartbeat_path(fleet_dir_override))
 
     # Exit tracking: ``_exit_code`` is 0 for every in-control clean exit (drain,
     # max_runtime, max_passes, HEAD-drift restart, self-deploy restart,

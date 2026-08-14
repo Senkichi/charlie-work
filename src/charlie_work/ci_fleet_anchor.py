@@ -79,9 +79,18 @@ local path dependency at all, and the resolved root not existing.
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["declared_ci_fleet_root", "repo_root"]
+from .subprocess_runner import RunResult, run_captured
+
+__all__ = [
+    "CiFleetProvenanceSnapshot",
+    "ci_fleet_provenance_snapshot",
+    "declared_ci_fleet_root",
+    "repo_root",
+]
 
 #: The dependency name as it appears in ``[tool.uv.sources]``. This has to be
 #: spelled out because it *is* the identity of the thing being located; there
@@ -126,3 +135,149 @@ def declared_ci_fleet_root() -> Path | None:
     if not expected.is_dir():
         return None
     return expected
+
+
+#: Timeout for the sibling ``git`` probes. A local rev-parse / porcelain is
+#: sub-second in practice; this is a backstop against a wedged index lock --
+#: same value as ``dirty_tree._STATUS_TIMEOUT_SECONDS``.
+_PROVENANCE_TIMEOUT_SECONDS = 30
+
+
+@dataclass(frozen=True)
+class CiFleetProvenanceSnapshot:
+    """What ``ci_fleet`` the supervisor actually imported, recorded once at startup (#954).
+
+    The live supervisor imports ``ci_fleet`` through an editable ``.pth`` that
+    prepends the sibling repo's ``src`` to ``sys.path``, so it runs whatever is
+    *saved* in that working tree -- committed or not. ``declared_ci_fleet_root``
+    and ``venv_anchor`` check that the install has not been repointed, but
+    neither records what the running process actually loaded. This snapshot
+    closes that observability gap: it does not *prevent* anything, it makes the
+    coupling *attributable* when something breaks. See issue #954's "Accept the
+    coupling and instrument it" option -- the cheap, do-now half that makes the
+    real fix's absence visible.
+
+    Fields:
+    - ``ci_fleet_file``: ``ci_fleet.__file__`` -- where the module actually
+      loaded from. ``None`` if ``ci_fleet`` could not be imported.
+    - ``sibling_root``: the sibling checkout root (``declared_ci_fleet_root()
+      .parent``), or ``None`` if no local path dependency is declared /
+      resolvable (e.g. running from a worktree that is not a sibling of the
+      real checkout -- the same abstention as ``declared_ci_fleet_root``).
+    - ``sibling_head``: ``git rev-parse HEAD`` in the sibling, or ``None`` if
+      the probe could not run.
+    - ``sibling_branch``: ``git rev-parse --abbrev-ref HEAD`` in the sibling,
+      or ``None`` if the probe could not run.
+    - ``sibling_dirty``: whether the sibling's tracked working tree differs
+      from HEAD (``git status --porcelain --untracked-files=no`` non-empty).
+      ``None`` if the probe could not run.
+    - ``error``: a structural failure message (git probe failure or import
+      error), or ``None``. A ``None`` sibling_root with ``error=None`` is an
+      abstention, not a failure -- same vocabulary as ``declared_ci_fleet_root``.
+    """
+
+    ci_fleet_file: str | None
+    sibling_root: str | None
+    sibling_head: str | None
+    sibling_branch: str | None
+    sibling_dirty: bool | None
+    error: str | None = None
+
+
+def ci_fleet_provenance_snapshot(
+    *,
+    run_command: Callable[..., RunResult] | None = None,
+    timeout: int = _PROVENANCE_TIMEOUT_SECONDS,
+) -> CiFleetProvenanceSnapshot:
+    """Capture the resolved ``ci_fleet`` import location and sibling repo git state.
+
+    Returns a value, never raises -- a startup instrumentation probe must not
+    break the supervisor's entry path. ``run_command`` is injectable for tests
+    (defaults to :func:`run_captured`); production callers pass nothing.
+
+    Abstention mirrors :func:`declared_ci_fleet_root`: when no local path
+    dependency is declared or the resolved root does not exist (e.g. a
+    worktree that is not a sibling of the real checkout), the sibling fields
+    are ``None`` and ``error`` is ``None`` -- the honest answer is "from here
+    we cannot tell", not "something is wrong".
+    """
+    if run_command is None:
+        run_command = run_captured
+
+    ci_fleet_file: str | None = None
+    try:
+        import ci_fleet  # noqa: PLC0415 -- deferred so a missing dep does not crash import
+
+        ci_fleet_file = getattr(ci_fleet, "__file__", None)
+    except Exception as exc:  # noqa: BLE001 -- probe must report, never crash
+        return CiFleetProvenanceSnapshot(
+            ci_fleet_file=None,
+            sibling_root=None,
+            sibling_head=None,
+            sibling_branch=None,
+            sibling_dirty=None,
+            error=f"import ci_fleet raised {type(exc).__name__}: {exc}",
+        )
+
+    declared_src = declared_ci_fleet_root()
+    if declared_src is None:
+        # Abstention, not failure: same condition declared_ci_fleet_root
+        # abstains on (no declared path source, or unresolvable from a
+        # worktree). ci_fleet_file is still recorded -- it is the one fact
+        # available without the sibling.
+        return CiFleetProvenanceSnapshot(
+            ci_fleet_file=ci_fleet_file,
+            sibling_root=None,
+            sibling_head=None,
+            sibling_branch=None,
+            sibling_dirty=None,
+        )
+
+    sibling = declared_src.parent
+    try:
+        head_res = run_command(["git", "rev-parse", "HEAD"], cwd=sibling, timeout_seconds=timeout)
+        branch_res = run_command(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=sibling,
+            timeout_seconds=timeout,
+        )
+        status_res = run_command(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=sibling,
+            timeout_seconds=timeout,
+        )
+    except Exception as exc:  # noqa: BLE001 -- probe must report, never crash startup
+        return CiFleetProvenanceSnapshot(
+            ci_fleet_file=ci_fleet_file,
+            sibling_root=str(sibling),
+            sibling_head=None,
+            sibling_branch=None,
+            sibling_dirty=None,
+            error=f"git probe raised {type(exc).__name__}: {exc}",
+        )
+
+    sibling_head = head_res.stdout.strip() if head_res.ok else None
+    sibling_branch = branch_res.stdout.strip() if branch_res.ok else None
+    sibling_dirty = bool(status_res.stdout.strip()) if status_res.ok else None
+
+    error: str | None = None
+    if not head_res.ok or not branch_res.ok or not status_res.ok:
+        failed = [
+            f"git {cmd[1]}: {res.error or res.stderr or 'exit %s' % res.returncode}"
+            for cmd, res in (
+                (["git", "rev-parse", "HEAD"], head_res),
+                (["git", "rev-parse", "--abbrev-ref", "HEAD"], branch_res),
+                (["git", "status", "--porcelain"], status_res),
+            )
+            if not res.ok
+        ]
+        error = "; ".join(failed)
+
+    return CiFleetProvenanceSnapshot(
+        ci_fleet_file=ci_fleet_file,
+        sibling_root=str(sibling),
+        sibling_head=sibling_head,
+        sibling_branch=sibling_branch,
+        sibling_dirty=sibling_dirty,
+        error=error,
+    )

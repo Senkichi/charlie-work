@@ -56,6 +56,7 @@ class _FakePaths:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.prs = root / "prs"
+        self.state_file = root / "state.json"
 
 
 class FakeApp:
