@@ -8618,7 +8618,12 @@ class OrchestratorApp:
                             )
                             state["worker_token_escalated"] = True
                             save_state(self.paths.state_file, state)
-            if self.config.dispatch.require_worker_github_token and not self.dry_run:
+            # The refusal itself is NOT dry-run-gated: a dry-run preview must
+            # report the same deferral a live pass would take (matching the
+            # fleet_lock_held / graphql_rate_limit deferral precedent in this
+            # function). Only the escalation event / durable marker writes
+            # above stay behind ``not self.dry_run``.
+            if self.config.dispatch.require_worker_github_token:
                 return CommandResult(
                     True,
                     "dispatch deferred: no sanctioned worker GitHub token "

@@ -529,6 +529,61 @@ def test_dispatch_refuses_when_require_flag_on_and_no_token(tmp_path: Path) -> N
     assert "placeholder" not in result.message
 
 
+def test_dispatch_refuses_under_dry_run_when_require_flag_on_and_no_token(
+    tmp_path: Path,
+) -> None:
+    """Regression for the reviewer's required change #1 on PR #1196: the
+    refusal must NOT be suppressed under ``dry_run``.
+
+    Before the fix, the refusal condition was
+    ``require_worker_github_token and not self.dry_run``, so a dry-run
+    preview with the require-flag on and no token silently fell through to
+    dispatch instead of reporting the same deferral a live pass would take
+    — a dry-run preview that lies about what a live pass would do. With the
+    ``and not self.dry_run`` removed, dispatch must still report
+    ``deferred_reason == "worker_token_missing"`` and
+    ``selected_count == 0`` under dry-run.
+
+    It must also confirm the dry-run read-only contract still holds for the
+    require-flag-on path specifically: no ``worker_token_missing`` event and
+    no durable ``worker_token_escalated`` marker are written to state.json,
+    since the escalation event/marker writes stay gated on
+    ``not self.dry_run`` (only the refusal itself lost that gate).
+    """
+    from charlie_work.workflow import OrchestratorApp
+
+    config = _config(adapter="devin-shell", require_token=True)
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    fake_gh.prs[0]["state"] = "CLOSED"
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["deferred_reason"] == "worker_token_missing"
+    assert result.data["selected_count"] == 0
+    assert result.data["attempted_count"] == 0
+    assert result.data["sessions"] == []
+    # The refusal message names the remediation, no token value leaked.
+    assert "devin.worker_env" in result.message or "claude_code.worker_env" in result.message
+    assert "ghp_" not in result.message
+    assert "placeholder" not in result.message
+
+    # No state mutation under dry-run: no escalation event, and the durable
+    # marker stays at its schema default (False) — dry-run never sets it
+    # (state.setdefault("worker_token_escalated", False) is the schema
+    # default applied on every load_state call, not a write made by this
+    # gate; only an explicit ``True`` would indicate this dry-run pass
+    # mutated it).
+    state = load_state(paths.state_file)
+    events = _events_of_kind(state, "worker_token_missing")
+    assert len(events) == 0, "dry-run must not write the escalation event"
+    assert state.get("worker_token_escalated") is False, (
+        "dry-run must not set the durable worker_token_escalated marker"
+    )
+
+
 def test_dispatch_proceeds_when_require_flag_on_and_token_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
