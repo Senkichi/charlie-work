@@ -5623,13 +5623,20 @@ def _annotation_to_required_change(check_name: str, annotation: dict[str, Any]) 
     """Format a single GitHub check-run annotation as a ``required_changes`` entry.
 
     Returns ``None`` -- never a fabricated placeholder -- when the annotation
-    carries no message; a bare location with no explanation is not
-    actionable. ``path``/``start_line`` are appended when present, but their
-    absence does not sink the entry: the message alone is still real,
-    GitHub-sourced reviewer content, so it renders as ``"<check>: <message>"``
-    rather than being dropped.
+    carries no message or is not failure-level. A bare location with no
+    explanation is not actionable, and ``warning``/``notice`` annotations are
+    not required changes: they are emitted on green runs too (e.g. the
+    ``actions/checkout@v4`` Node.js 20 deprecation advisory is present on
+    every run of this workflow), so surfacing them as rework items sends the
+    worker after unrelated noise (issue #993). Only
+    ``annotation_level == "failure"`` renders. ``path``/``start_line`` are
+    appended when present, but their absence does not sink the entry: the
+    message alone is still real, GitHub-sourced reviewer content, so it
+    renders as ``"<check>: <message>"`` rather than being dropped.
     """
     if not isinstance(annotation, dict):
+        return None
+    if str(annotation.get("annotation_level") or "").strip() != "failure":
         return None
     message = str(annotation.get("message") or "").strip()
     if not message:
@@ -5675,18 +5682,26 @@ def _required_changes_from_checks(
 
     Returns an empty list -- never a fabricated file/line -- only when
     ``checks`` is unavailable or no name in ``failed_required_checks`` is
-    actually failing per ``_is_failing_run``. For each failing check that
-    resolves to a check-run id but whose annotations are empty or unusable
-    (common for a process-level crash with no per-line findings), or that
-    has no resolvable check-run id at all (e.g. a non-Actions status check),
-    this falls back to the check's own ``link`` -- real, GitHub-sourced data
-    already present on every entry in ``checks`` (``PR_CHECKS_FIELDS``
-    always requests it) -- so the rework brief still points the worker at
-    the failing run instead of only naming the check. ``record_review``'s
-    caller passes this straight through as ``required_changes``; the
-    ``_render_required_changes_section`` tier-2 "CI failed on X" summary
-    fallback only fires when this list comes back fully empty, which now
-    only happens when GitHub gave us neither annotations nor a link.
+    actually failing per ``_is_failing_run``. For each failing check, the
+    failure-level annotations (warnings/notices are filtered out by
+    ``_annotation_to_required_change``, issue #993) render as entries, and
+    the check's own ``link`` -- real, GitHub-sourced data already present on
+    every entry in ``checks`` (``PR_CHECKS_FIELDS`` always requests it) --
+    is **always** appended alongside them. A process-level crash emits a
+    contentless ``"Process completed with exit code 1."`` failure annotation
+    that names no cause; the real cause (e.g. a TLS handshake timeout) lives
+    only in the step log the link reaches. Appending the link unconditionally
+    -- rather than only when *no* annotations rendered -- removes the need to
+    predict which annotations are informative: a worker that can reach the
+    run log can find a transient-cause failure that no annotation names, and
+    one that cannot, cannot. When no failure-level annotations rendered, the
+    link line carries the "no per-line annotations available" wording so the
+    worker knows to look at the run log rather than search for a missing
+    file/line. ``record_review``'s caller passes this straight through as
+    ``required_changes``; the ``_render_required_changes_section`` tier-2
+    "CI failed on X" summary fallback only fires when this list comes back
+    fully empty, which now only happens when GitHub gave us neither
+    failure-level annotations nor a link.
     """
     if not checks or not failed_required_checks:
         return []
@@ -5708,11 +5723,13 @@ def _required_changes_from_checks(
             if isinstance(check_run_id, int)
             else []
         )
-        if entries:
-            required_changes.extend(entries)
-            continue
+        required_changes.extend(entries)
         link = str(check.get("link") or "").strip()
-        if link:
+        if not link:
+            continue
+        if entries:
+            required_changes.append(f"{name}: failing run — {link}")
+        else:
             required_changes.append(
                 f"{name}: no per-line annotations available from GitHub; "
                 f"inspect the failing run at {link}"
