@@ -748,30 +748,30 @@ def _resolve_symbols(tree: ast.Module) -> dict[str, tuple[int, int]]:
     return {name: spans[0] for name, spans in occurrences.items() if len(spans) == 1}
 
 
-def test_workflow_py_citations_are_not_stale() -> None:
-    """Every ``workflow.py::<Symbol.path>`` citation in this file must resolve
-    to exactly one function/method/class in workflow.py, and the marker
-    substring(s) registered for it in ``_CITATION_EXPECTATIONS`` must appear
-    somewhere in that symbol's source span.
+def _collect_citation_failures(
+    source_lines: list[str],
+    expectations: dict[str, tuple[str, ...]],
+    symbol_spans: dict[str, tuple[int, int]],
+    wf_lines: list[str],
+) -> list[str]:
+    """Core citation-check logic behind ``test_workflow_py_citations_are_not_stale``,
+    factored out so its failure branches can be exercised directly with
+    synthetic inputs -- ``test_collect_citation_failures_flags_unresolved_symbol``
+    and ``test_collect_citation_failures_flags_stale_line_citation`` below --
+    without mutating this file or workflow.py to force a real failure.
 
-    This is the structural guard for issue #1054's recurrence, now anchored
-    to symbols instead of absolute line numbers (issue #1213) -- see the
-    module comment above ``_CITATION_EXPECTATIONS`` for the full #1054 /
-    #1045 / #1205 / #1213 lineage. Anchoring to a symbol makes a citation
-    survive unrelated workflow.py edits (this guard's whole point), but that
-    is not the same as the citation being *right*: the marker check still
-    catches a citation that resolves cleanly but points at the wrong code.
+    ``source_lines`` plays the role of this file's own source (scanned for
+    citations and old-style line anchors); ``expectations`` plays
+    ``_CITATION_EXPECTATIONS``; ``symbol_spans`` plays the workflow.py AST
+    resolution from ``_resolve_symbols``; ``wf_lines`` plays workflow.py's
+    source lines. The real test below calls this with the real four inputs
+    and its behavior is unchanged from before this refactor.
     """
-    wf_lines, wf_tree = _workflow_py_source()
-    symbol_spans = _resolve_symbols(wf_tree)
-    this_file = Path(__file__)
-    this_src = this_file.read_text(encoding="utf-8").splitlines()
-
     failures: list[str] = []
 
     # No old-style line-anchored citation may remain -- #1213 replaced the
     # whole form, not just the stale instances that prompted it.
-    for line_no, line in enumerate(this_src, 1):
+    for line_no, line in enumerate(source_lines, 1):
         if _STALE_LINE_CITATION_RE.search(line):
             failures.append(
                 f"line {line_no}: found an old-style absolute-line-number "
@@ -785,11 +785,11 @@ def test_workflow_py_citations_are_not_stale() -> None:
     # added a citation without registering what it should contain.
     found: set[str] = set()
 
-    for line_no, line in enumerate(this_src, 1):
+    for line_no, line in enumerate(source_lines, 1):
         for match in _CITATION_RE.finditer(line):
             symbol = match.group(1)
             found.add(symbol)
-            markers = _CITATION_EXPECTATIONS.get(symbol)
+            markers = expectations.get(symbol)
             if markers is None:
                 failures.append(
                     f"line {line_no}: citation workflow.py::{symbol} has no "
@@ -822,7 +822,7 @@ def test_workflow_py_citations_are_not_stale() -> None:
     # the file -- that means a citation was removed but the expectation was
     # left behind, or the symbol name was changed without updating the
     # expectation table.
-    orphaned = set(_CITATION_EXPECTATIONS) - found
+    orphaned = set(expectations) - found
     for symbol in sorted(orphaned):
         failures.append(
             f"_CITATION_EXPECTATIONS has entry for workflow.py::{symbol} but "
@@ -830,7 +830,116 @@ def test_workflow_py_citations_are_not_stale() -> None:
             f"the expectation"
         )
 
+    return failures
+
+
+def test_workflow_py_citations_are_not_stale() -> None:
+    """Every ``workflow.py::<Symbol.path>`` citation in this file must resolve
+    to exactly one function/method/class in workflow.py, and the marker
+    substring(s) registered for it in ``_CITATION_EXPECTATIONS`` must appear
+    somewhere in that symbol's source span.
+
+    This is the structural guard for issue #1054's recurrence, now anchored
+    to symbols instead of absolute line numbers (issue #1213) -- see the
+    module comment above ``_CITATION_EXPECTATIONS`` for the full #1054 /
+    #1045 / #1205 / #1213 lineage. Anchoring to a symbol makes a citation
+    survive unrelated workflow.py edits (this guard's whole point), but that
+    is not the same as the citation being *right*: the marker check still
+    catches a citation that resolves cleanly but points at the wrong code.
+    """
+    wf_lines, wf_tree = _workflow_py_source()
+    symbol_spans = _resolve_symbols(wf_tree)
+    this_file = Path(__file__)
+    this_src = this_file.read_text(encoding="utf-8").splitlines()
+
+    failures = _collect_citation_failures(this_src, _CITATION_EXPECTATIONS, symbol_spans, wf_lines)
+
     assert not failures, (
         "stale or missing workflow.py symbol citations (issue #1054/#1213 "
         "recurrence guard):\n" + "\n".join(failures)
     )
+
+
+def test_resolve_symbols_drops_ambiguous_duplicate_qualname() -> None:
+    """``_resolve_symbols`` must drop a qualname defined more than once
+    rather than silently resolving it to whichever definition it saw first,
+    while still resolving an unambiguous sibling symbol correctly.
+
+    Uses a small synthetic module (not workflow.py) so the ambiguous case
+    doesn't require mutating real production code to construct.
+    """
+    source = (
+        "def foo():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def foo():\n"
+        "    return 2\n"
+        "\n"
+        "\n"
+        "def unique_top_level():\n"
+        "    return 3\n"
+    )
+    tree = ast.parse(source)
+
+    spans = _resolve_symbols(tree)
+
+    assert "foo" not in spans, (
+        "a qualname defined twice (duplicate top-level `def foo`) must be "
+        "dropped as ambiguous, not resolved to either definition"
+    )
+
+    assert "unique_top_level" in spans
+    start, end = spans["unique_top_level"]
+    source_lines = source.splitlines()
+    assert source_lines[start - 1].strip() == "def unique_top_level():"
+    assert source_lines[end - 1].strip() == "return 3"
+
+
+def test_collect_citation_failures_flags_unresolved_symbol() -> None:
+    """The unresolved/renamed-symbol failure branch of
+    ``test_workflow_py_citations_are_not_stale`` (empty ``symbol_spans.get``)
+    must produce a failure naming the citation, not silently pass.
+
+    The fake citation is assembled from separate pieces at runtime (see
+    ``symbol``/``citation`` below) rather than written as one contiguous
+    literal in this file's source: a contiguous literal would itself be
+    picked up by the real guard's own citation scan
+    (``test_workflow_py_citations_are_not_stale``) when it reads this file,
+    and fail because no matching entry exists in ``_CITATION_EXPECTATIONS``.
+    Assembling at runtime produces the joined string only in memory, which
+    is what this synthetic test needs, without leaving a matching literal in
+    the scanned source text.
+    """
+    symbol = "Nonexistent" + ".symbol"
+    citation = "workflow.py::" + symbol
+    source_lines = [f"# see {citation} for details"]
+    expectations = {symbol: ("some marker",)}
+    symbol_spans: dict[str, tuple[int, int]] = {}  # simulates a renamed/removed symbol
+    wf_lines: list[str] = []
+
+    failures = _collect_citation_failures(source_lines, expectations, symbol_spans, wf_lines)
+
+    assert len(failures) == 1
+    assert "does not resolve to exactly one function/method/class" in failures[0]
+    assert symbol in failures[0]
+
+
+def test_collect_citation_failures_flags_stale_line_citation() -> None:
+    """``_STALE_LINE_CITATION_RE`` must actually fire and fail the guard when
+    a line-anchored old-style module-plus-line-number citation is present --
+    not merely fail to fire on today's (already-converted) citations.
+
+    The stale citation string is assembled from separate pieces at runtime
+    for the same reason as the previous test: a contiguous literal here
+    would trip the real guard's own stale-line-citation scan when it reads
+    this file.
+    """
+    stale_citation = "workflow.py:" + "123"
+    source_lines = [f"# old style: {stale_citation}"]
+
+    failures = _collect_citation_failures(source_lines, {}, {}, [])
+
+    assert len(failures) == 1
+    assert "old-style absolute-line-number citation" in failures[0]
+    assert stale_citation in failures[0]
