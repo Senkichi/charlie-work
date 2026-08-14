@@ -114,6 +114,56 @@ def test_merge_authorize_preserves_existing_review_verdict(tmp_path: Path) -> No
     assert decision["authorized_override"]["authorized_sha"] == "sha-abc123"
 
 
+def test_authorized_override_survives_subsequent_record_review(tmp_path: Path) -> None:
+    """Regression test for issue #934 review finding: ``record_review`` builds a
+    fresh ``decision_payload`` and overwrites ``review-decision.json`` in full,
+    so an ``authorized_override`` written by ``merge_authorize`` would be
+    silently discarded — resurrecting the false-positive tripwire finding this
+    PR exists to eliminate. The override must survive a later ``record_review``
+    call for the same PR (a plausible sequential scenario, not just a race:
+    issue #934's own 'pending review' use case is a reviewer re-recording a
+    verdict after the operator already authorized)."""
+    app, paths, _ = _merge_check_app(tmp_path)
+
+    # 1. Operator records an authorization at the live head.
+    auth_result = app.merge_authorize(456, "CI green, stale decision overridden", by="senkichi")
+    assert auth_result.ok is True
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    with decision_path.open("r", encoding="utf-8") as handle:
+        decision = json.load(handle)
+    override_before = decision["authorized_override"]
+    assert override_before["authorized_sha"] == "sha-abc123"
+    assert override_before["reason"] == "CI green, stale decision overridden"
+
+    # 2. A reviewer subsequently records a verdict for the same PR. This is the
+    #    sequential (not racy) scenario: the operator authorized, then a review
+    #    round completes and record_review overwrites the decision file.
+    review_result = app.record_review(456, "approved", summary="lgtm after rebase")
+    assert review_result.ok is True
+
+    # 3. The override must survive the full-file overwrite.
+    with decision_path.open("r", encoding="utf-8") as handle:
+        decision = json.load(handle)
+    assert decision["decision"] == "approved"
+    assert "authorized_override" in decision, (
+        "record_review's full-file overwrite discarded the authorized_override "
+        "written by merge_authorize — the tripwire finding this PR exists to "
+        "eliminate would resurrect"
+    )
+    override_after = decision["authorized_override"]
+    assert override_after["authorized_sha"] == "sha-abc123"
+    assert override_after["reason"] == "CI green, stale decision overridden"
+    assert override_after["by"] == "senkichi"
+
+    # 4. The surviving override must still authorize via merge_check — proving
+    #    the preserved override is structurally valid, not just present as a
+    #    stale key.
+    check_result = app.merge_check(456)
+    assert check_result.ok is True
+    assert check_result.data["reason"] == "authorized_override"
+
+
 def test_merge_authorize_creates_decision_file_when_absent(tmp_path: Path) -> None:
     """If no review-decision.json exists, one is created with just the
     override — the reviewer verdict is absent, and the override is the

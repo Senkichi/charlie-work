@@ -13110,6 +13110,27 @@ class OrchestratorApp:
             # enforcement) to surface required_changes, so the decision file
             # must be on disk first. A label-write failure or crash after this
             # point leaves a durable verdict and a brief consistent with it.
+            #
+            # Issue #934: ``decision_payload`` is a fresh dict that would
+            # silently discard an ``authorized_override`` written by
+            # ``merge_authorize``. The read-modify-write here is inside the
+            # ``state_lock`` (which ``merge_authorize`` also holds), so re-reading
+            # the file at this point is atomic against concurrent writers. Carry
+            # the override forward so a subsequent ``record_review`` for the same
+            # PR does not resurrect the false-positive tripwire finding this PR
+            # exists to eliminate.
+            if decision_path.exists():
+                try:
+                    with decision_path.open("r", encoding="utf-8") as _handle:
+                        _existing_decision = json.load(_handle)
+                    if isinstance(_existing_decision, dict) and isinstance(
+                        _existing_decision.get("authorized_override"), dict
+                    ):
+                        decision_payload["authorized_override"] = _existing_decision[
+                            "authorized_override"
+                        ]
+                except (OSError, json.JSONDecodeError):
+                    pass
             self._write_json(decision_path, decision_payload)
             if decision == "request_changes" and not escalated:
                 rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
@@ -13867,35 +13888,36 @@ class OrchestratorApp:
             )
 
         decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
-        # Merge-update the override into the existing decision record. If the
-        # file is absent or unparseable, start from an empty base — the
-        # override is the authorization, and the reviewer verdict (if any) is
-        # preserved when it exists.
-        if decision_path.exists():
-            try:
-                with decision_path.open("r", encoding="utf-8") as handle:
-                    existing = json.load(handle)
-                if not isinstance(existing, dict):
-                    existing = {}
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-        else:
-            existing = {}
-
         override_payload = {
             "by": by,
             "reason": reason,
             "authorized_sha": authorized_sha,
             "authorized_at": utc_now(),
         }
-        updated = {**existing, "authorized_override": override_payload}
 
         with state_lock(self.paths.state_file):
+            # Merge-update the override into the existing decision record. If
+            # the file is absent or unparseable, start from an empty base — the
+            # override is the authorization, and the reviewer verdict (if any)
+            # is preserved when it exists. The read is inside the ``state_lock``
+            # (which ``record_review`` also holds) so the read-modify-write is
+            # genuinely atomic against concurrent writers — a TOCTOU where
+            # ``record_review`` overwrites the file between this read and the
+            # write below would silently discard the override (issue #934
+            # review finding).
+            if decision_path.exists():
+                try:
+                    with decision_path.open("r", encoding="utf-8") as handle:
+                        existing = json.load(handle)
+                    if not isinstance(existing, dict):
+                        existing = {}
+                except (OSError, json.JSONDecodeError):
+                    existing = {}
+            else:
+                existing = {}
+            updated = {**existing, "authorized_override": override_payload}
             # Write the decision file atomically (CLAUDE.md invariant: all JSON
-            # state writes use temp-file + replace). The state_lock guards the
-            # event recording below; the decision file write is inside it so a
-            # concurrent ``record_review`` cannot overwrite the override between
-            # the read-merge-write here and the event log.
+            # state writes use temp-file + replace).
             self._write_json(decision_path, updated)
             state = load_state(self.paths.state_file)
             state = self._record_event(
