@@ -4805,6 +4805,48 @@ def _detect_and_handle_orphaned_workers(
             if route_result is not None:
                 pre_review_routed.add(issue_number)
 
+    # Issue #1128: for dead workers that already have an OPEN PR with no
+    # review verdict yet (``last_decision`` is null/absent), pre-compute the
+    # issue's live GitHub labels outside the state lock. The second-lock
+    # sweep uses these to transition the issue from ``agent:in-progress`` to
+    # ``agent:pr-open`` -- the same LabelConfig-driven swap the
+    # ``orphaned_worker_opened_pr`` lane uses -- so review dispatch can claim
+    # the salvage PR. Without this, the ``dead_worker_unsafe_to_auto_reset``
+    # branch advanced no label and the issue sat on ``agent:in-progress``
+    # indefinitely, asserting a live worker the reconciler had just confirmed
+    # dead. ``pr_by_issue`` only contains OPEN PRs (``gh pr list --state
+    # open``), so presence there is the "PR is OPEN" precondition.
+    pr_orphan_unreviewed_details: dict[int, dict[str, Any]] = {}
+    pr_orphans_unreviewed = [
+        n
+        for n in orphaned_issues
+        if n in pr_by_issue
+        and not state_snapshot.get("prs", {})
+        .get(str(int(pr_by_issue[n]["number"])), {})
+        .get("decision")
+    ]
+    if pr_orphans_unreviewed:
+        # ``issues_by_number`` is only populated above when there were
+        # no-open-PR orphans; build it here when this lane is the sole
+        # consumer so the label read stays a single bulk ``issue_list`` call.
+        if not issues_by_number:
+            for issue in gh.issue_list(state="open"):
+                number = issue.get("number")
+                if number is not None:
+                    issues_by_number[int(number)] = issue
+        for issue_number in pr_orphans_unreviewed:
+            issue = issues_by_number.get(issue_number)
+            if issue is None:
+                # Issue not open/visible -- cannot safely mutate labels;
+                # the conservative drift path below handles it.
+                continue
+            issue_labels = label_names(issue)
+            active_labels = issue_labels & config.labels.active
+            pr_orphan_unreviewed_details[issue_number] = {
+                "issue_labels": issue_labels,
+                "active_labels": active_labels,
+            }
+
     # Handle orphaned workers. Head-advanced request_changes findings are
     # collected and routed to the review lane outside the state lock (review()
     # itself acquires the lock and may call transition()).
@@ -5067,6 +5109,20 @@ def _detect_and_handle_orphaned_workers(
                     # whose PR state does not carry ``rework_requested`` has
                     # no evidence a post-approval rework lane dispatched this
                     # worker, so auto-resetting would be a guess.
+                    #
+                    # Issue #1128: when the dead worker has an OPEN PR with no
+                    # review verdict yet (``last_decision`` is null/absent),
+                    # the "unsafe to auto-reset" judgment stays -- the PR
+                    # carries the work, so re-dispatching would duplicate it --
+                    # but leaving the issue on ``agent:in-progress`` makes the
+                    # state machine assert a live worker the reconciler just
+                    # confirmed dead, and review dispatch (which keys off
+                    # ``agent:pr-open``) never sees the salvage PR. Transition
+                    # to ``pr-open`` via the same LabelConfig-driven swap the
+                    # ``orphaned_worker_opened_pr`` lane uses. On label write
+                    # failure, fall through to the conservative drift path so
+                    # the next pass re-attempts rather than resetting the
+                    # worker.
                     pr_state_status = pr_state.get("status")
                     if (
                         last_decision == "approved"
@@ -5140,8 +5196,64 @@ def _detect_and_handle_orphaned_workers(
                                 )
                             )
                     else:
-                        # Genuinely unclassifiable decision - surface as
-                        # drift once.
+                        # Not the #1109 approved+rework_requested classified
+                        # case. This branch covers two populations that share
+                        # one fingerprinted drift fallback below:
+                        #   (a) #1128: ``last_decision`` is None (open PR, no
+                        #       review verdict yet) -- try advancing to
+                        #       ``pr-open``; on label-write failure or missing
+                        #       details, fall through to the shared drift.
+                        #   (b) genuinely unclassifiable decisions -- fall
+                        #       through to the shared drift directly.
+                        if last_decision is None:
+                            details = pr_orphan_unreviewed_details.get(issue_number)
+                            if details is not None:
+                                active_labels = details["active_labels"]
+                                issue_labels = details["issue_labels"]
+                                label_write_ok = True
+                                for label in sorted(active_labels):
+                                    if not gh.remove_issue_label(issue_number, label):
+                                        label_write_ok = False
+                                if config.labels.pr_open not in issue_labels:
+                                    if not gh.add_issue_label(issue_number, config.labels.pr_open):
+                                        label_write_ok = False
+                                if label_write_ok:
+                                    entry["status"] = PASSIVE_OPEN_STATUS
+                                    entry["dispatched_at"] = None
+                                    # Clear any prior drift fingerprint so a
+                                    # later regression on this issue re-surfaces.
+                                    entry["orphan_drift_fingerprint"] = None
+                                    entry["orphan_drift_at"] = None
+                                    sweep_events.append(
+                                        (
+                                            "orphaned_worker_advanced_to_pr_open",
+                                            {
+                                                "issue_number": issue_number,
+                                                "pr_number": pr_number,
+                                                "previous_status": "dispatched",
+                                                "new_status": PASSIVE_OPEN_STATUS,
+                                                "reason": "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr",
+                                                "removed_labels": sorted(active_labels),
+                                                "pid": terminal_pid,
+                                                "exit_code": terminal_exit_code,
+                                                "duration_seconds": terminal_duration_seconds,
+                                                "label_write_ok": True,
+                                            },
+                                        )
+                                    )
+                                    state["issues"][str(issue_number)] = entry
+                                    continue
+                                # Label write failed -- fall through to the
+                                # fingerprinted drift path so the next pass
+                                # re-attempts the transition (the drift
+                                # fingerprint gates only re-emission of the
+                                # diagnostic, not the transition retry above,
+                                # which runs first on every pass).
+                        # Genuinely unclassifiable decision, or #1128 label-
+                        # write failure -- surface as drift once. One shared
+                        # fingerprinted fallback for both lanes (#1109 keeps
+                        # its own classified branch above; this covers
+                        # everything else).
                         fingerprint = _drift_fingerprint(
                             reason="dead_worker_unsafe_to_auto_reset",
                             last_decision=last_decision or "",

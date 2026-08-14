@@ -45383,6 +45383,317 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     )
 
 
+def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) -> None:
+    """Issue #1128: a dead worker with an OPEN, unreviewed PR (no decision)
+    must be advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
+    dispatch can claim the salvage PR.  Before the fix this cell advanced no
+    label and the issue sat on ``agent:in-progress`` indefinitely.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    in_progress = config.labels.in_progress
+    pr_open = config.labels.pr_open
+
+    state = load_state(paths.state_file)
+    state["issues"]["1578"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # No ``decision`` key -- the PR has not been reviewed yet.
+    state["prs"]["1585"] = {
+        "reviewed_head_sha": None,
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1578,
+                    "title": "Salvage wedge",
+                    "url": "https://example.test/issues/1578",
+                    "body": "Dead worker with open unreviewed PR",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = [
+                {
+                    "number": 1585,
+                    "title": "Salvaged work for #1578",
+                    "url": "https://example.test/pull/1585",
+                    "headRefName": "agent/issue-1578-salvage-wedge",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-deadbeef",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #1578\n\nTests: regression coverage added.",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1578"]
+    assert entry["status"] == PASSIVE_OPEN_STATUS, (
+        f"expected open_passive, got {entry['status']!r}"
+    )
+    assert entry.get("dispatched_at") is None
+
+    events = state.get("events", [])
+    advance_events = [e for e in events if e.get("kind") == "orphaned_worker_advanced_to_pr_open"]
+    assert len(advance_events) == 1
+    payload = advance_events[0]["payload"]
+    assert payload["pr_number"] == 1585
+    assert payload["previous_status"] == "dispatched"
+    assert payload["new_status"] == PASSIVE_OPEN_STATUS
+    assert payload["reason"] == "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr"
+    assert payload["label_write_ok"] is True
+    assert in_progress in payload["removed_labels"]
+
+    # No drift should be emitted -- the transition succeeded.
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert drift_events == []
+
+    # The label swap mirrors the orphaned_worker_opened_pr lane.
+    assert (1578, in_progress) in fake_gh.labels_removed
+    assert (1578, pr_open) in fake_gh.labels_added
+
+    # A second pass must not re-advance or re-emit (status is no longer
+    # dispatched, so the sweep skips it entirely).
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    advance_events = [e for e in events if e.get("kind") == "orphaned_worker_advanced_to_pr_open"]
+    assert len(advance_events) == 1, "advance must not be re-emitted on the second pass"
+
+
+def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
+    tmp_path: Path,
+) -> None:
+    """Issue #1128: when the label write fails, the sweep must keep the
+    conservative drift behavior (stay ``dispatched``, emit drift once) so the
+    next pass re-attempts the transition rather than resetting the worker.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    in_progress = config.labels.in_progress
+
+    state = load_state(paths.state_file)
+    state["issues"]["1578"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["1585"] = {
+        "reviewed_head_sha": None,
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1578,
+                    "title": "Salvage wedge",
+                    "url": "https://example.test/issues/1578",
+                    "body": "Dead worker with open unreviewed PR",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = [
+                {
+                    "number": 1585,
+                    "title": "Salvaged work for #1578",
+                    "url": "https://example.test/pull/1585",
+                    "headRefName": "agent/issue-1578-salvage-wedge",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-deadbeef",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #1578\n\nTests: regression coverage added.",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            # Simulate a transient GitHub API failure on the label removal.
+            return False
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1578"]
+    # Label write failed -- status must stay dispatched so the next pass
+    # re-attempts rather than leaving the issue in a half-transitioned state.
+    assert entry["status"] == "dispatched"
+
+    events = state.get("events", [])
+    advance_events = [e for e in events if e.get("kind") == "orphaned_worker_advanced_to_pr_open"]
+    assert advance_events == [], "no advance event on label-write failure"
+    drift_events = [
+        e
+        for e in events
+        if e.get("kind") == "orphaned_worker_drift"
+        and e["payload"].get("reason") == "dead_worker_unsafe_to_auto_reset"
+    ]
+    assert len(drift_events) == 1, "conservative drift must be emitted on failure"
+
+
+def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
+    tmp_path: Path,
+) -> None:
+    """Issue #1128 rework after merge with #1109: an issue that could plausibly
+    match both lanes -- ``last_decision`` is None (the #1128 condition) while
+    ``pr_state.status`` is ``"rework_requested"`` (part of the #1109 condition) --
+    must go through the #1128 advance-to-pr-open lane, NOT the #1109
+    auto-reset-to-rework_requested lane.
+
+    The ``if``/``else`` structure keys the #1109 lane on
+    ``last_decision == "approved"``; a PR with no decision but a
+    ``rework_requested`` status is an inconsistent state that the #1109 guard
+    correctly rejects (no evidence an approved review dispatched this worker).
+    The #1128 lane then advances it to ``pr-open`` so review can assess it,
+    rather than guessing a re-dispatch.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    in_progress = config.labels.in_progress
+    pr_open = config.labels.pr_open
+
+    state = load_state(paths.state_file)
+    state["issues"]["1578"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # No ``decision`` key (last_decision will be None), but PR-state status
+    # is ``rework_requested`` -- this is the "plausibly matches both" edge.
+    state["prs"]["1585"] = {
+        "status": "rework_requested",
+        "reviewed_head_sha": None,
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1578,
+                    "title": "Both-lanes edge",
+                    "url": "https://example.test/issues/1578",
+                    "body": "Unreviewed PR with rework_requested status",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = [
+                {
+                    "number": 1585,
+                    "title": "Salvaged work for #1578",
+                    "url": "https://example.test/pull/1585",
+                    "headRefName": "agent/issue-1578-both-lanes-edge",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-deadbeef",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #1578\n\nTests: regression coverage added.",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1578"]
+
+    # Must advance to pr-open (#1128 lane), NOT reset to rework_requested
+    # (#1109 lane).
+    assert entry["status"] == PASSIVE_OPEN_STATUS, (
+        f"expected open_passive (#1128 lane), got {entry['status']!r}"
+    )
+
+    events = state.get("events", [])
+    advance_events = [e for e in events if e.get("kind") == "orphaned_worker_advanced_to_pr_open"]
+    assert len(advance_events) == 1, "#1128 advance must fire"
+    assert (
+        advance_events[0]["payload"]["reason"]
+        == "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr"
+    )
+
+    # #1109 lane must NOT fire -- no recovered event, no clean_exit_no_op drift.
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert recovered_events == [], "#1109 auto-reset must not misfire on a None-decision PR"
+
+    clean_exit_drifts = [
+        e
+        for e in events
+        if e.get("kind") == "orphaned_worker_drift"
+        and e["payload"].get("reason") == "dead_worker_clean_exit_no_op"
+    ]
+    assert clean_exit_drifts == [], "#1109 clean-exit-no-op drift must not misfire"
+
+    # The label swap mirrors the #1128 lane.
+    assert (1578, in_progress) in fake_gh.labels_removed
+    assert (1578, pr_open) in fake_gh.labels_added
+
+
 def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> None:
     """Issue #457: dispatch_rework must not run the orphaned-worker sweep, which is
     already run once per pass by loop(), to avoid duplicate drift events."""
