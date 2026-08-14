@@ -29848,6 +29848,703 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
     assert state["prs"]["456"]["conflict_rework_attempts"] == 1
 
 
+def test_startup_death_does_not_consume_conflict_rework_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106: a rework session that dies at CLI startup (before the
+    worker's first tool action) must NOT consume the PR's no-op/conflict
+    rework cap.  The cap counters should only count sessions that actually
+    ran and produced no useful change.
+
+    This test seeds a PR state with ``last_rework_was_startup_death=True``
+    (the flag _reap_restore_rework_requested sets when a dead session is
+    classified as a startup death) and verifies that
+    _route_janitor_gate_failure_to_rework requeues without incrementing
+    ``conflict_rework_attempts``.
+
+    Mutation gate: removing the startup-death check in
+    _route_janitor_gate_failure_to_rework makes this test fail (the counter
+    increments to 1 instead of staying at 0).
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Seed the PR state with the startup-death flag, simulating a dead
+    # rework session that was reaped by _reap_restore_rework_requested.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state.get("prs", {}).get("456", {}),
+            "number": 456,
+            "issue_number": 123,
+            "last_rework_failure_kind": "launch_failed",
+            "last_rework_was_startup_death": True,
+        }
+        # Issue must NOT be in a pending rework state, so the wrapper
+        # reaches the counter-increment path (the startup-death check
+        # is right before it).
+        state["issues"]["123"] = {
+            **state.get("issues", {}).get("123", {}),
+            "number": 123,
+            "status": "needs_review",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    # The startup-death requeue must NOT have incremented the cap.
+    assert state["prs"]["456"].get("conflict_rework_attempts", 0) == 0
+    # The issue must have been routed back to rework_requested.
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # The startup-death flags must have been cleared.
+    assert state["prs"]["456"]["last_rework_was_startup_death"] is False
+    assert state["prs"]["456"]["last_rework_failure_kind"] is None
+
+
+def test_startup_death_does_not_consume_no_op_rework_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106: same as the conflict-rework variant, but for the no-op
+    rework cap.  A startup-dead session requeued via the no-op-rework path
+    must not increment ``no_op_rework_attempts``.
+    """
+    config = OrchestratorConfig(
+        review=ReviewConfig(max_no_op_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Force issue status to "reviewing" (the orphaned/stuck shape the
+    # no-op route exists for — same as test_janitor_no_op_rework_routes_
+    # to_rework in test_fix_janitor_routing.py).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state.get("issues", {}).get("123", {}),
+            "number": 123,
+            "status": "reviewing",
+        }
+        # Seed the startup-death flag so the janitor gate's startup-death
+        # check fires before the counter increment.
+        state["prs"]["456"] = {
+            **state.get("prs", {}).get("456", {}),
+            "last_rework_failure_kind": "launch_failed",
+            "last_rework_was_startup_death": True,
+        }
+        save_state(paths.state_file, state)
+
+    # Same head, same diff as the recorded verdict: no actual content change,
+    # so the janitor's no-op-rework signal fires and routes through
+    # _route_janitor_gate_failure_to_rework with attempts_key=
+    # "no_op_rework_attempts".
+    result = app.review(456)
+    assert result is not None
+    assert result.ok is True
+    assert result.data["routed_to_rework"] is True
+    assert result.data.get("startup_death_requeue") is True
+
+    state = load_state(paths.state_file)
+    # The startup-death requeue must NOT have incremented the no-op cap.
+    assert state["prs"]["456"].get("no_op_rework_attempts", 0) == 0
+    # The issue must have been routed back to rework_requested.
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # The startup-death flags must have been cleared.
+    assert state["prs"]["456"]["last_rework_was_startup_death"] is False
+    assert state["prs"]["456"]["last_rework_failure_kind"] is None
+
+
+def test_non_startup_death_still_consumes_conflict_rework_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106 regression guard: a session that genuinely ran and died
+    (NOT a startup death — e.g. ``stalled`` with a long runtime) must STILL
+    consume the conflict rework cap.  The startup-death exemption must not
+    be over-broad.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Seed the PR state with a NON-startup death (stalled, but the flag
+    # is False — the session ran long enough to be a genuine no-op).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state.get("prs", {}).get("456", {}),
+            "number": 456,
+            "issue_number": 123,
+            "last_rework_failure_kind": "stalled",
+            "last_rework_was_startup_death": False,
+        }
+        state["issues"]["123"] = {
+            **state.get("issues", {}).get("123", {}),
+            "number": 123,
+            "status": "needs_review",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    # A non-startup death MUST still increment the cap.
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+
+def test_is_startup_death_classification() -> None:
+    """Issue #1106: unit test for the _is_startup_death classifier itself.
+
+    ``launch_failed`` is always a startup death (the process never
+    launched).  ``stalled`` is a startup death only under the threshold
+    (the CLI exited before the worker did real work); a longer runtime
+    means the worker genuinely ran and got stuck.  Unknown/None failure
+    kinds are never startup deaths.
+    """
+    from charlie_work.workflow import (
+        STARTUP_DEATH_THRESHOLD_SECONDS,
+        _is_startup_death,
+    )
+
+    assert _is_startup_death("launch_failed", 0.0) is True
+    assert _is_startup_death("launch_failed", 999.0) is True
+    assert _is_startup_death("stalled", 1.0) is True
+    assert _is_startup_death("stalled", float(STARTUP_DEATH_THRESHOLD_SECONDS)) is False
+    assert _is_startup_death("stalled", float(STARTUP_DEATH_THRESHOLD_SECONDS) + 1) is False
+    assert _is_startup_death(None, 0.0) is False
+    assert _is_startup_death("worker_blocked", 0.0) is False
+    assert _is_startup_death("rate_limited", 1.0) is False
+
+
+def test_reap_restore_sets_startup_death_flag(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106: _reap_restore_rework_requested must record the
+    startup-death classification in the PR state so the janitor gate can
+    consult it on the next pass.
+
+    Uses a ``launch_failed`` sidecar (pid=None, error set) — the simplest
+    startup-death signature.
+    """
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("Refusing to run in an untrusted workspace\n", encoding="utf-8")
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,  # launch-failure sidecar
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="devin launch failed: untrusted workspace",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    # The startup-death flag must be set for a launch_failed session.
+    assert pr_state["last_rework_was_startup_death"] is True
+    assert pr_state["last_rework_failure_kind"] == "launch_failed"
+    # The issue must have been restored to rework_requested.
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+
+def test_reap_restore_startup_death_stalled_real_pid_under_classification_delay(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106 regression: the realistic calibration incident shape.
+
+    The 2026-08-08 incident was NOT a ``launch_failed`` (pid=None) — the Devin
+    CLI launched, got a real PID, printed "Refusing to run in an untrusted
+    workspace", and exited within seconds.  That is a ``stalled`` session with
+    a real PID.  The orchestrator's classification pass may not run until
+    minutes later (bounded by the polling interval), so the startup-death
+    threshold must be checked against a signal bounded by the CLI's *actual
+    death time* (log mtime), not ``runtime_seconds()`` (``now - started_at``,
+    which measures elapsed time until classification).
+
+    This test seeds a ``stalled`` sidecar with a real PID whose ``started_at``
+    is 300 seconds in the past (simulating classification latency) but whose
+    log file mtime is only 5 seconds after ``started_at`` (the CLI died at 5s).
+    With the death-bounded runtime the session is a 5-second startup death
+    (< 60s threshold); with the old ``runtime_seconds()`` it would be a
+    300-second stall (> 60s) and the exemption would be silently defeated.
+
+    Mutation gate: reverting the call site in ``_reap_restore_rework_requested``
+    back to ``worker.runtime_seconds()`` makes this test fail (the flag stays
+    False instead of being set True).
+    """
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _reap_restore_rework_requested
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+    # The CLI started 300s ago and died 5s later (at 295s ago).  The
+    # classification pass runs "now" — 300s after start, well past the 60s
+    # threshold if measured against the wall clock.
+    started_at = now - timedelta(seconds=300)
+    death_at = started_at + timedelta(seconds=5)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": started_at.timestamp(),
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    # Write the log file with the calibration incident's refusal message and
+    # freeze its mtime at the death moment (5s after start).
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("Refusing to run in an untrusted workspace\n", encoding="utf-8")
+    death_ts = death_at.timestamp()
+    os.utime(log_path, (death_ts, death_ts))
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,  # real PID — the CLI launched before dying
+        started_at=started_at.isoformat().replace("+00:00", "Z"),
+        process_start_time=started_at.timestamp(),
+        log_path=str(log_path),
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        error=None,  # not a launch failure — the CLI ran and exited
+        failure_kind=None,
+        reclaimed=None,
+        branch="agent/issue-123-fix-search",
+    )
+
+    open_prs_by_issue = {
+        123: [
+            {
+                "number": 456,
+                "title": "Fix #123: search",
+                "headRefName": "agent/issue-123-fix-search",
+                "headRefOid": "sha-abc123",
+                "state": "OPEN",
+            }
+        ]
+    }
+
+    _reap_restore_rework_requested(
+        paths.state_file,
+        fake_gh,
+        config,
+        open_prs_by_issue,
+        worker,
+        failure_kind="stalled",
+    )
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    # The death-bounded runtime is ~5s (< 60s threshold) → startup death,
+    # even though 300s elapsed between start and classification.
+    assert pr_state["last_rework_was_startup_death"] is True
+    assert pr_state["last_rework_failure_kind"] == "stalled"
+    # The issue must have been restored to rework_requested (not escalated).
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+
+def test_reap_restore_stalled_long_runtime_not_startup_death(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106 negative case: a ``stalled`` session whose log shows the
+    CLI genuinely ran for minutes must NOT be classified as a startup death,
+    even when the classification pass runs much later.
+
+    The log mtime is 200s after ``started_at`` (the worker ran for 200s before
+    dying), well above the 60s threshold.  The death-bounded runtime correctly
+    exceeds the threshold, so the cap counters should count this session.
+    """
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _reap_restore_rework_requested
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+    started_at = now - timedelta(seconds=600)
+    death_at = started_at + timedelta(seconds=200)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": started_at.timestamp(),
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worker ran for a while then stalled\n", encoding="utf-8")
+    death_ts = death_at.timestamp()
+    os.utime(log_path, (death_ts, death_ts))
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,
+        started_at=started_at.isoformat().replace("+00:00", "Z"),
+        process_start_time=started_at.timestamp(),
+        log_path=str(log_path),
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+        branch="agent/issue-123-fix-search",
+    )
+
+    open_prs_by_issue = {
+        123: [
+            {
+                "number": 456,
+                "title": "Fix #123: search",
+                "headRefName": "agent/issue-123-fix-search",
+                "headRefOid": "sha-abc123",
+                "state": "OPEN",
+            }
+        ]
+    }
+
+    _reap_restore_rework_requested(
+        paths.state_file,
+        fake_gh,
+        config,
+        open_prs_by_issue,
+        worker,
+        failure_kind="stalled",
+    )
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    # 200s death-bounded runtime > 60s threshold → NOT a startup death.
+    assert pr_state["last_rework_was_startup_death"] is False
+    assert pr_state["last_rework_failure_kind"] == "stalled"
+
+
+def test_worker_death_bounded_runtime_last_activity_at_fallback(tmp_path: Path) -> None:
+    """Issue #1106: ``_worker_death_bounded_runtime_seconds`` must fall back to
+    the sidecar's ``last_activity_at`` timestamp when the log file is gone
+    (``log_stat()`` returns None).
+
+    The log file may be deleted after the CLI exits (cleanup, tmpfs recycle,
+    operator intervention), but the sidecar's ``last_activity_at`` was updated
+    each pass by ``update_worker_log_stat`` and is frozen at the last observed
+    mtime.  The death-bounded runtime derived from it must be the gap between
+    ``started_at`` and that last-activity timestamp — not 0.0 (which would
+    only be correct when *no* activity was ever recorded).
+
+    Mutation gate: removing the ``last_activity_at`` fallback branch (so the
+    function returns 0.0 when ``log_stat()`` is None) makes this test fail
+    (0.0 != ~5.0).
+    """
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _worker_death_bounded_runtime_seconds
+
+    now = datetime.now(UTC)
+    started_at = now - timedelta(seconds=300)
+    death_at = started_at + timedelta(seconds=5)
+
+    # Log path does not exist — log_stat() will return None.
+    missing_log = tmp_path / "nonexistent" / "issue-123.log"
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,
+        started_at=started_at.isoformat().replace("+00:00", "Z"),
+        process_start_time=started_at.timestamp(),
+        log_path=str(missing_log),
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+        branch="agent/issue-123-fix-search",
+        last_activity_at=death_at.isoformat().replace("+00:00", "Z"),
+    )
+
+    runtime = _worker_death_bounded_runtime_seconds(worker)
+    # The fallback must derive ~5s from last_activity_at, not 0.0.
+    assert runtime == pytest.approx(5.0, abs=0.01)
+
+
+def test_worker_death_bounded_runtime_no_signal_returns_zero(tmp_path: Path) -> None:
+    """Issue #1106: ``_worker_death_bounded_runtime_seconds`` must return 0.0
+    when neither ``log_stat()`` nor ``last_activity_at`` is available — the CLI
+    never wrote anything, which is a startup death by construction.
+
+    Mutation gate: changing the final fallback to return a non-zero value
+    (e.g. ``worker.runtime_seconds()``) makes this test fail.
+    """
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _worker_death_bounded_runtime_seconds
+
+    now = datetime.now(UTC)
+    started_at = now - timedelta(seconds=300)
+
+    missing_log = tmp_path / "nonexistent" / "issue-123.log"
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,
+        started_at=started_at.isoformat().replace("+00:00", "Z"),
+        process_start_time=started_at.timestamp(),
+        log_path=str(missing_log),
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        error=None,
+        failure_kind=None,
+        reclaimed=None,
+        branch="agent/issue-123-fix-search",
+        last_activity_at=None,  # no sidecar activity recorded
+    )
+
+    runtime = _worker_death_bounded_runtime_seconds(worker)
+    assert runtime == 0.0
+
+
+def test_dispatch_rework_clears_startup_death_flag_on_new_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106: ``_dispatch_rework_impl``'s new-dispatch-supersedes-clearing
+    block must clear ``last_rework_was_startup_death`` /
+    ``last_rework_failure_kind`` when a fresh rework session is successfully
+    dispatched after a prior startup-death flag was set.
+
+    The stale flag belongs to the *dead* session; the new session is the one
+    whose outcome the next janitor pass will attribute.  If the flag survives
+    the dispatch, a subsequent janitor pass would misattribute the new
+    session's outcome to the old death and skip the cap counter.
+
+    Mutation gate: removing the clearing block at the ``if ok:`` branch in
+    ``_dispatch_rework_impl`` (the ``last_rework_failure_kind`` /
+    ``last_rework_was_startup_death`` reset on the PR state) makes this test
+    fail (the flags stay True/``"launch_failed"`` instead of being cleared).
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.root.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    # Seed state: issue in rework_requested, PR carrying a stale startup-death
+    # flag from a prior dead session.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        state["prs"]["456"] = {
+            **state.get("prs", {}).get("456", {}),
+            "number": 456,
+            "issue_number": 123,
+            "last_rework_failure_kind": "launch_failed",
+            "last_rework_was_startup_death": True,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Create a rework prompt so dispatch can proceed.
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    # The new dispatch must have cleared the stale startup-death flags.
+    assert pr_state["last_rework_was_startup_death"] is False
+    assert pr_state["last_rework_failure_kind"] is None
+
+
 def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
     tmp_path: Path,
 ) -> None:
