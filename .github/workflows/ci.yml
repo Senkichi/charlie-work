@@ -378,3 +378,26 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: uv run charlie closing-keyword-check --pr ${{ github.event.pull_request.number }}
+      - name: Mojibake gate (issue 1057)
+        # PR-only: push-to-main has no diff to scan (the branch IS main).
+        #
+        # Same structural rationale as the closing-keyword gate above: a
+        # step of the existing "Lint" job, not a new job, so it rides the
+        # already-required "Lint" context and becomes a de facto blocking
+        # gate the moment a PR branch includes this workflow change -- no
+        # branch-protection edit, no orchestrator.config.yaml or
+        # .aviator/config.yml change, no separate promotion step.
+        #
+        # Scans added lines in the PR diff for cp1252/UTF-8 mojibake --
+        # non-ASCII characters corrupted by a misconfigured editing path
+        # (e.g. em-dashes turned into the a-circumflex/euro/quote sequence).
+        # The detection is derived from the encoding process (reverse the
+        # corruption and check whether the result differs), not a hardcoded
+        # list of bad byte sequences, so it catches any UTF-8/cp1252 round
+        # trip. See src/charlie_work/mojibake_gate.py for the full rationale.
+        #
+        # Uses the three-dot diff (base...HEAD) so only changes on this
+        # branch are scanned. The base SHA is the PR's base branch tip at
+        # the time of the run, available in the workflow event context.
+        if: github.event_name == 'pull_request'
+        run: uv run charlie mojibake-check --base ${{ github.event.pull_request.base.sha }}
