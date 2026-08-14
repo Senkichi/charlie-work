@@ -137,6 +137,44 @@ def test_verify_resolves_full_repo_path(tmp_path: Path) -> None:
     assert verdicts[0].status is CitationStatus.OK
 
 
+def test_verify_resolves_bare_basename_two_levels_deep(tmp_path: Path) -> None:
+    # Regression for the reviewer finding on PR #1199: real source files in
+    # this repo live two levels deep under src/ (src/charlie_work/<name>.py),
+    # but the bare-filename fallback only searched one level. A bare citation
+    # like ``checks.py:415`` -- one of issue #1000's own cited examples -- must
+    # resolve to the real file, not fall through to FILE_MISSING. The fixture
+    # mirrors the real package layout instead of the synthetic one-level tree
+    # the original tests used.
+    checks_lines = [f"line{i}" for i in range(416)]  # index 414 == line 415
+    checks_lines[414] = "TARGET_CHECKS_LINE"
+    _write(tmp_path, "src/charlie_work/checks.py", checks_lines)
+    workflow_lines = [f"line{i}" for i in range(8857)]  # index 8855 == line 8856
+    workflow_lines[8855] = "TARGET_WORKFLOW_LINE"
+    _write(tmp_path, "src/charlie_work/workflow.py", workflow_lines)
+
+    verdicts = verify_citations("checks.py:415 and workflow.py:8856 drifted", tmp_path)
+
+    assert len(verdicts) == 2
+    assert verdicts[0].citation.path == "checks.py"
+    assert verdicts[0].status is CitationStatus.OK
+    assert "TARGET_CHECKS_LINE" in (verdicts[0].current_line_text or "")
+    assert verdicts[1].citation.path == "workflow.py"
+    assert verdicts[1].status is CitationStatus.OK
+    assert "TARGET_WORKFLOW_LINE" in (verdicts[1].current_line_text or "")
+
+
+def test_verify_bare_basename_missing_still_file_missing_two_level_tree(
+    tmp_path: Path,
+) -> None:
+    # The recursive fallback must not turn a genuinely absent file into a false
+    # OK: a bare citation whose basename matches nothing under the source roots
+    # still resolves to FILE_MISSING, even when the tree is shaped like the real
+    # repo (so the index is actually built and queried).
+    _write(tmp_path, "src/charlie_work/workflow.py", ["x", "y", "z"])
+    verdicts = verify_citations("nonexistent.py:10 drifted", tmp_path)
+    assert verdicts[0].status is CitationStatus.FILE_MISSING
+
+
 def test_verify_does_not_raise_on_unreadable_file(tmp_path: Path) -> None:
     # A path that resolves to a directory (not a file) is treated as missing,
     # never as an exception.

@@ -157,27 +157,67 @@ def parse_citations(body: str) -> list[Citation]:
     return out
 
 
-def _resolve(path: str, repo_root: Path) -> Path | None:
+def _build_basename_index(repo_root: Path) -> dict[str, Path]:
+    """Map each bare filename to its first path under the source roots.
+
+    Walks ``src/``, ``scripts/``, and ``tests/`` recursively (bounded to those
+    three roots) and records the first path found for each basename. Real
+    source files in this repo live two levels deep -- ``src/charlie_work/<name>.py``
+    -- so a one-level search misses every one of them. The walk is bounded to
+    the three roots (not the whole tree) to stay cheap and to avoid matching
+    files outside the package tree (build artifacts, vendored deps, etc.).
+
+    Built once per ``verify_citations`` call and reused across every citation,
+    so the cost is one walk per issue body, not one walk per citation. On a
+    duplicate basename the first match (depth-first, deterministic ``rglob``
+    order) wins; that is an acceptable ambiguity -- the prior behavior returned
+    ``None`` (always wrong), and a unique basename is the common case.
+    """
+    index: dict[str, Path] = {}
+    for root in ("src", "scripts", "tests"):
+        base_dir = repo_root / root
+        if not base_dir.is_dir():
+            continue
+        for p in base_dir.rglob("*"):
+            if p.is_file():
+                index.setdefault(p.name, p)
+    return index
+
+
+def _resolve(
+    path: str,
+    repo_root: Path,
+    *,
+    basename_index: dict[str, Path] | None = None,
+) -> Path | None:
     """Resolve ``path`` against ``repo_root``, returning the file if it exists.
 
     Tries the literal path (absolute, or relative to ``repo_root``), then a
     bare-basename fallback (issues often cite ``workflow.py:4746`` without the
-    ``src/charlie_work/`` prefix). Returns ``None`` when no file is found -- the
-    caller treats that as ``FILE_MISSING``.
+    ``src/charlie_work/`` prefix). The fallback first checks one level under the
+    common source roots (cheap, preserves shallow-tree behavior), then falls back
+    to ``basename_index`` -- a recursive index of the source roots -- so a bare
+    citation resolves regardless of nesting depth (``src/charlie_work/<name>.py``
+    as well as ``scripts/<name>.py``). Returns ``None`` when no file is found --
+    the caller treats that as ``FILE_MISSING``.
     """
     p = Path(path)
     if not p.is_absolute():
         p = repo_root / path
     if p.is_file():
         return p
-    # Bare-filename fallback: search one level under the common source roots.
-    # Deliberately shallow -- a recursive walk per citation would be expensive
-    # and a deep match is more likely a false positive than the intended file.
+    # Bare-filename fallback: try one level under the common source roots first
+    # (cheap stat, no walk), then the recursive basename index for files nested
+    # deeper (the real layout: src/charlie_work/<name>.py).
     base = Path(path).name
     for root in ("src", "scripts", "tests"):
         candidate = repo_root / root / base
         if candidate.is_file():
             return candidate
+    if basename_index is not None:
+        hit = basename_index.get(base)
+        if hit is not None and hit.is_file():
+            return hit
     return None
 
 
@@ -214,9 +254,16 @@ def verify_citations(
     # times is read once.
     current_lines_cache: dict[str, list[str]] = {}
     at_commit_cache: dict[str, list[str] | None] = {}
+    # Build the recursive basename index lazily: only when at least one
+    # citation is a bare filename (no directory prefix) that the one-level
+    # fallback might miss. A full-path citation resolves directly, so the walk
+    # is skipped entirely for issues that cite full paths only.
+    basename_index: dict[str, Path] | None = None
+    if any("/" not in c.path and not Path(c.path).is_absolute() for c in citations):
+        basename_index = _build_basename_index(repo_root)
 
     for cite in citations:
-        resolved = _resolve(cite.path, repo_root)
+        resolved = _resolve(cite.path, repo_root, basename_index=basename_index)
         if resolved is None:
             verdicts.append(CitationVerdict(cite, CitationStatus.FILE_MISSING))
             continue
