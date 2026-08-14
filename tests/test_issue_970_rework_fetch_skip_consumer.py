@@ -135,19 +135,24 @@ def test_stall_escalation_surfaces_fetch_skips_in_payload_and_message(
     save_state(app.paths.state_file, state)
 
     # Two fetch-skip passes during the stall window -- the second is the most
-    # recent and must be the one surfaced (not the first).
+    # recent and must be the one surfaced (not the first). Each carries a
+    # populated ``reasons`` list (the shape ``_build_rework_issue_fetch_skip_payload``
+    # produces) so the escalation's ``last_rework_fetch_skip_reasons`` is
+    # exercised in the populated case, not just the None case.
     since_dt = datetime.fromisoformat(stall_since)
     _write_skip_event(
         app.paths,
         (since_dt + timedelta(minutes=10)).isoformat(),
         issue_numbers=[123],
         reason="gh: command not found",
+        reasons=[{"reason": "gh: command not found", "error_type": "GitHubError"}],
     )
     _write_skip_event(
         app.paths,
         (since_dt + timedelta(minutes=30)).isoformat(),
         issue_numbers=[123, 456],
         reason="gh: timeout",
+        reasons=[{"reason": "gh: timeout", "error_type": "GitHubError"}],
     )
 
     result2 = app.review(456)
@@ -162,6 +167,12 @@ def test_stall_escalation_surfaces_fetch_skips_in_payload_and_message(
     assert (
         result2.data["last_rework_fetch_skip_at"] == (since_dt + timedelta(minutes=30)).isoformat()
     )
+    # The distinct-reasons list from the most recent skip's payload is surfaced
+    # verbatim -- a consumer correlating the single ``reason`` with the full
+    # ``reasons`` set relies on this being the last skip's, not the first's.
+    assert result2.data["last_rework_fetch_skip_reasons"] == [
+        {"reason": "gh: timeout", "error_type": "GitHubError"}
+    ]
 
     # The message appends (not substitutes) the warning clause and names the
     # most recent skip, not the first.
@@ -179,6 +190,9 @@ def test_stall_escalation_surfaces_fetch_skips_in_payload_and_message(
     assert payload["rework_fetch_skips"] == 2
     assert payload["last_rework_fetch_skip_reason"] == "gh: timeout"
     assert payload["last_rework_fetch_skip_issue_numbers"] == [123, 456]
+    assert payload["last_rework_fetch_skip_reasons"] == [
+        {"reason": "gh: timeout", "error_type": "GitHubError"}
+    ]
 
 
 def test_stall_escalation_window_excludes_skips_before_stall_since(
@@ -258,6 +272,7 @@ def test_stall_escalation_no_skips_reports_zero_and_omits_warning_clause(
     assert result.data["last_rework_fetch_skip_at"] is None
     assert result.data["last_rework_fetch_skip_reason"] is None
     assert result.data["last_rework_fetch_skip_issue_numbers"] is None
+    assert result.data["last_rework_fetch_skip_reasons"] is None
     assert "could not fetch" not in result.message
     assert "rework stalled" in result.message
 
