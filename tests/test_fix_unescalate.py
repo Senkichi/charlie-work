@@ -518,3 +518,76 @@ def test_unescalate_concurrent_writer_fields_survive_the_write(tmp_path: Path) -
     assert state["prs"]["456"]["concurrent_field"] == "must-survive"
     assert state["issues"]["123"]["concurrent_issue_field"] == "must-survive"
     assert state["prs"]["456"]["status"] == PASSIVE_OPEN_STATUS
+
+
+# --- Issue #849: unescalate worktree safety re-check ---
+
+
+def test_unescalate_refuses_worktree_unsafe_when_worktree_still_dirty(
+    tmp_path: Path,
+) -> None:
+    """Issue #849: ``unescalate`` must refuse to clear a ``worktree_unsafe``
+    escalation while the worktree still has uncommitted worker-authored
+    content. Clearing the label without inspecting the worktree reports
+    success for an operation that changed nothing causal — the next rework
+    dispatch reproduces the escalation deterministically.
+    """
+    import subprocess
+
+    from charlie_work.worktree import worktree_path_for_branch
+
+    branch = "agent/issue-849-unescalate-refuse"
+    # Init a real git repo at tmp_path.
+    subprocess.run(["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test User"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "README.md").write_text("initial\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "README.md"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "initial"], check=True, capture_output=True
+    )
+
+    app = _app(tmp_path)
+    wt_path = worktree_path_for_branch(app.repo_root, branch, app._layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "worktree", "add", str(wt_path), "-b", branch],
+        check=True,
+        capture_output=True,
+    )
+    # Make the worktree dirty.
+    (wt_path / "worker_wip.txt").write_text("uncommitted work\n", encoding="utf-8")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "worktree_unsafe",
+            "reason_class": "mechanical",
+            "branch_name": branch,
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(None, 123, dry_run=False)
+
+    # unescalate refuses to clear — the worktree is still unsafe.
+    assert result.ok is True
+    assert result.data["changed"] is False
+    assert result.data["worktree_still_unsafe"] is True
+
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    # The dirty worktree content survives.
+    assert (wt_path / "worker_wip.txt").read_text(encoding="utf-8") == "uncommitted work\n"
