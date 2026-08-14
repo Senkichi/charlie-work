@@ -258,6 +258,36 @@ def clear_escalation(entry: dict[str, Any]) -> dict[str, Any]:
     return entry
 
 
+def clear_escalation_on_issue_prs(state: dict[str, Any], issue_number: int) -> bool:
+    """Mirror-clear escalation fields on every PR record linked to an issue.
+
+    The escalation write path (``_escalate_issue``) writes
+    ``escalation_reason`` to *both* the issue record and the PR record.
+    Before this helper existed, every ``clear_escalation`` call site cleared
+    the issue-side fields only, leaving a stale ``escalation_reason`` on the
+    PR record.  The downstream rework router
+    (``_route_janitor_gate_failure_to_rework``) short-circuits on
+    ``existing_pr_state.get("escalation_reason")``, so an issue whose
+    escalation was "cleared" still routed nowhere -- a visible stuck state
+    converted into silence (issue #1093).
+
+    This helper is the single-point mirror-clear: call it at every
+    ``clear_escalation`` site that has a resolved issue number, and the PR
+    records stay in sync with the issue record.  ``reason_class`` is also
+    popped (a no-op on PR records, which never carry it, but harmless and
+    keeps the pair symmetric with ``clear_escalation``).
+
+    Mutates PR entries in place inside ``state["prs"]``.  Returns ``True`` if
+    at least one PR record was found and cleared.
+    """
+    cleared_any = False
+    for key, entry in state.get("prs", {}).items():
+        if isinstance(entry, dict) and entry.get("issue_number") == issue_number and key.isdigit():
+            clear_escalation(entry)
+            cleared_any = True
+    return cleared_any
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -634,6 +664,16 @@ def empty_state() -> dict[str, Any]:
         "prs": {},
         "events": [],
         "throttled_until": None,  # ISO timestamp when provider throttle cooldown ends
+        # Issue #1001: durable once-only escalation marker for the worker
+        # GitHub token gate. A missing token is a standing condition; the gate
+        # must not emit a worker_token_missing event every loop pass.
+        # fleet_dispatch.fleet_loop constructs a fresh OrchestratorApp per repo
+        # per pass, so an instance-level flag alone resets every pass and
+        # re-escalates indefinitely. This marker persists across reconstruction
+        # and is cleared when the condition resolves (token added), so a future
+        # regression re-escalates. Lives in state.json per the "state lives in
+        # GitHub labels + state.json" invariant.
+        "worker_token_escalated": False,
     }
 
 
@@ -694,6 +734,7 @@ def load_state(path: Path) -> dict[str, Any]:
     data.setdefault("prs", {})
     data.setdefault("events", [])
     data.setdefault("throttled_until", None)  # Backward compatibility
+    data.setdefault("worker_token_escalated", False)  # Issue #1001
     return data
 
 
