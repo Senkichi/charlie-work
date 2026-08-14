@@ -14018,6 +14018,63 @@ class OrchestratorApp:
         "worker_process_start_time",
         "dispatched_at",
     )
+    # Issue #1093: the de-escalation sweep's once-per-episode rework-budget
+    # reset must zero the per-mechanism PR counter that ACTUALLY gates the
+    # cleared ``escalation_reason``, not a counter belonging to a different
+    # lane.  ``_route_janitor_gate_failure_to_rework`` escalates with reason
+    # ``f"{attempts_key}_cap_exceeded"`` (or ``_stall_exceeded``) and reads
+    # ``attempts_key`` itself on the next pass; ``record_review`` escalates
+    # with ``max_rework_cycles_exceeded`` and reads ``request_changes_count``.
+    # Resetting ``request_changes_count`` for a ``no_op_rework_attempts_*``
+    # clear (the PR's own reproduction scenario) left the real gating counter
+    # untouched, so the router re-escalated on the very next detection -- the
+    # promised "fresh rework budget" never applied to the lane it serves.
+    #
+    # Each lane's counter is reset together with its head-baseline
+    # (``_last_head``) and stall-clock (``_stall_since`` / ``_stall_head``)
+    # companions so the next detection re-baselines instead of inheriting a
+    # stale head/stall snapshot from the exhausted episode.  Escalation
+    # reasons with no per-mechanism rework counter (e.g.
+    # ``session_failed_escalated``, ``worktree_unsafe``) are absent from the
+    # map: there is no rework budget to reset for them, so the clear resets
+    # nothing extra.  ``auto_deescalation_count`` still independently bounds
+    # total clears (Issue #783 hazard (b)), so the per-episode reset cannot
+    # unbound the paid-session loop.
+    _REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, tuple[str, ...]]] = {
+        "max_rework_cycles_exceeded": ("request_changes_count", ()),
+        "no_op_rework_attempts_cap_exceeded": (
+            "no_op_rework_attempts",
+            (
+                "no_op_rework_attempts_last_head",
+                "no_op_rework_attempts_stall_since",
+                "no_op_rework_attempts_stall_head",
+            ),
+        ),
+        "no_op_rework_attempts_stall_exceeded": (
+            "no_op_rework_attempts",
+            (
+                "no_op_rework_attempts_last_head",
+                "no_op_rework_attempts_stall_since",
+                "no_op_rework_attempts_stall_head",
+            ),
+        ),
+        "conflict_rework_attempts_cap_exceeded": (
+            "conflict_rework_attempts",
+            (
+                "conflict_rework_attempts_last_head",
+                "conflict_rework_attempts_stall_since",
+                "conflict_rework_attempts_stall_head",
+            ),
+        ),
+        "conflict_rework_attempts_stall_exceeded": (
+            "conflict_rework_attempts",
+            (
+                "conflict_rework_attempts_last_head",
+                "conflict_rework_attempts_stall_since",
+                "conflict_rework_attempts_stall_head",
+            ),
+        ),
+    }
 
     def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> str | None:
         """Re-run the worktree safety check for an issue (issue #849).
@@ -19248,24 +19305,27 @@ class OrchestratorApp:
         than before.
 
         Issue #783 hazard (b) -- unbounded paid-session loop: this method
-        never resets the ORIGINAL per-mechanism attempt/cap counters (e.g.
-        ``redispatch_at``, ``request_changes_count``,
-        ``conflict_rework_attempts``, ``review_dispatch_attempt_count``) --
-        it only clears the escalation-specific fields (``status``,
-        ``escalation_reason``, ``reason_class``). If the same mechanical
-        condition recurs after a clear, the ORIGINAL cap re-trips (usually
-        within one dispatch/review/rework cycle, since that counter was
-        never zeroed), which re-escalates the issue through one of the
-        S1-S14 call sites and re-enters this same accounting. That
-        recurrence also consumes one more slot of
-        ``auto_deescalation_count``, so the two counters compound: the
-        mechanism-specific cap bounds how fast a single recurring failure
-        can re-escalate, and ``auto_deescalation_count``'s cap independently
-        bounds how many times this sweep will ever clear the SAME issue.
-        Neither counter is reset by this method, so neither loop can run
-        forever -- the sweep cannot re-dispatch a paid worker session more
-        than ``max_auto_deescalations`` times for one recurring failure
-        before falling permanently back to human review.
+        resets ONLY the per-mechanism attempt/cap counter that gates the
+        CLEARED ``escalation_reason`` (see
+        ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON``), and only once per
+        escalation episode (tracked via ``rework_budget_reset_for_terminal_since``).
+        It does NOT reset the other lanes' counters, nor the cross-lane
+        bookkeeping that a full ``charlie unescalate`` clears
+        (``redispatch_at``, ``review_dispatch_attempt_count``, etc.). If the
+        same mechanical condition recurs after a clear, the lane's counter
+        has been zeroed so the cap re-trips only after a fresh
+        ``max_attempts``/``max_rework_cycles`` worth of completed-but-still-
+        failing cycles, which re-escalates the issue through one of the
+        S1-S14 call sites and re-enters this same accounting. That recurrence
+        also consumes one more slot of ``auto_deescalation_count``, so the
+        two counters compound: the mechanism-specific cap bounds how fast a
+        single recurring failure can re-escalate, and
+        ``auto_deescalation_count``'s cap independently bounds how many times
+        this sweep will ever clear the SAME issue. The per-episode counter
+        reset cannot unbound the loop because ``auto_deescalation_count``
+        still caps total clears -- the sweep cannot re-dispatch a paid worker
+        session more than ``max_auto_deescalations`` times for one recurring
+        failure before falling permanently back to human review.
 
         A pre-PR dispatch failure (e.g. ``dispatch_failed_cap_exceeded`` --
         the launch never produced a PR at all) has no artifact AC3's
@@ -19445,13 +19505,24 @@ class OrchestratorApp:
             # Issue #1093: mirror-clear the PR record's escalation fields so
             # the rework router's short-circuit on
             # ``existing_pr_state.get("escalation_reason")`` no longer fires
-            # after the sweep clears the issue.  Also reset the over-cap
-            # rework counter on the open PR once per escalation episode.
+            # after the sweep clears the issue.  Also reset the per-mechanism
+            # rework counter that ACTUALLY gates the cleared escalation_reason
+            # on the open PR once per escalation episode -- resetting only
+            # ``request_changes_count`` left the no_op/conflict lanes' real
+            # gating counter untouched, so the router re-escalated on the next
+            # detection.  See ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON``.
             clear_escalation_on_issue_prs(fresh_state, issue_number)
             if budget_reset_needed:
                 fresh_pr = fresh_state["prs"].get(str(pr_number))
                 if isinstance(fresh_pr, dict):
-                    fresh_pr["request_changes_count"] = 0
+                    reset_spec = self._REWORK_BUDGET_RESET_BY_ESCALATION_REASON.get(
+                        cleared_condition
+                    )
+                    if reset_spec is not None:
+                        counter_field, companion_fields = reset_spec
+                        fresh_pr[counter_field] = 0
+                        for _field in companion_fields:
+                            fresh_pr.pop(_field, None)
             fresh_state = self._record_event(
                 fresh_state,
                 "deescalation_cleared",
