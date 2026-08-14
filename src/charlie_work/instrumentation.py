@@ -181,6 +181,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervisor_restart_watchdog_disabled": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
+        "venv_pth_repair_failed": "error",
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
@@ -240,6 +241,8 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_rate_limit_deferred": "warning",
         "supervise_relaunch_cap_reached": "warning",
         "unauthorized_merge_check_skipped": "warning",
+        "venv_pth_mismatch": "warning",
+        "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",
         # -----------------------------------------------------------------
         # info-level kinds: routine bookkeeping, success, recovery, and

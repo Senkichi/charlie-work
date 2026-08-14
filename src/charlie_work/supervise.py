@@ -352,37 +352,72 @@ def _find_venv_path(repo_root: Path) -> Path | None:
 
 
 def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
-    """Atomically rewrite the project editable ``.pth`` to point at ``repo_root/src``.
+    """Atomically rewrite poisoned editable ``.pth`` lines to their configured roots.
 
-    Scans ``site-packages`` for ``.pth`` files whose names contain a top-level
-    package name from ``repo_root/src``.  Every path line in those files that
-    resolves anywhere other than ``repo_root/src`` is rewritten to the correct
-    absolute path, then the file is replaced atomically via temp-file +
-    ``.replace()``.
+    Scans every ``.pth`` in site-packages (no filename filter -- see
+    :func:`worktree.verify_shared_venv`).  For each path-bearing line that
+    resolves outside all configured checkouts, the correct target is derived
+    from :func:`worktree._configured_editable_roots` by matching the package
+    name embedded in the ``.pth`` filename against the packages each root
+    provides.
+
+    The per-package root is the fix for issue #969 gap 1: the former repair
+    rewrote *every* poisoned line to a single ``main_src`` constant
+    (``repo_root/src``), which is correct for this repo's own packages but is a
+    hard ``ImportError`` for a foreign editable like ``ci_fleet`` -- there is
+    no ``ci_fleet`` package under ``charlie-work/src``.  Widening the
+    verification filter without fixing this first would have auto-written that
+    error as the first statement of every self-deploy attempt.
+
+    When the correct root for a poisoned ``.pth`` cannot be determined (the
+    filename matches no known package, or matches several ambiguously), the
+    file is left untouched and reported as unrepairable.  Refusing to write a
+    wrong root is strictly safer than guessing: a missed repair surfaces as a
+    verification mismatch on re-check, while a wrong repair surfaces as a
+    silent ``ImportError`` that verifies clean because the line now equals a
+    configured root.
     """
     site_packages = worktree._site_packages_dir(venv_path)
     if not site_packages:
         return False, "could not locate site-packages in shared venv"
-    main_src = (repo_root / "src").resolve()
-    package_names = worktree._top_level_package_names(repo_root)
-    project_pth_files = [
-        pth
-        for pth in site_packages.glob("*.pth")
-        if any(name in pth.name for name in package_names)
-    ]
-    if not project_pth_files:
-        return False, "no editable .pth found for project packages"
+    roots = worktree._configured_editable_roots(repo_root)
+    if not roots:
+        return False, "could not derive configured editable roots from repo"
+    # package_name -> src_root, for matching a .pth filename to its target.
+    package_to_root: dict[str, Path] = {}
+    for src_root, package_names in roots:
+        for name in package_names:
+            package_to_root[name] = src_root
 
     repaired_any = False
-    for pth in project_pth_files:
+    unrepairable: list[str] = []
+    for pth in site_packages.glob("*.pth"):
         original = pth.read_text(encoding="utf-8")
         lines = original.splitlines()
+        # First pass: are any lines poisoned, and can we target this .pth?
+        poisoned = False
+        for raw_line in lines:
+            target = worktree._resolve_pth_line(site_packages, raw_line)
+            if target == Path():
+                continue
+            if any(contains(root, target) for root, _ in roots):
+                continue
+            poisoned = True
+            break
+        if not poisoned:
+            continue
+
+        correct_root = _match_pth_to_root(pth, package_to_root)
+        if correct_root is None:
+            unrepairable.append(pth.name)
+            continue
+
         new_lines: list[str] = []
         changed = False
         for raw_line in lines:
             target = worktree._resolve_pth_line(site_packages, raw_line)
-            if target != Path() and target != main_src:
-                new_lines.append(str(main_src))
+            if target != Path() and not any(contains(root, target) for root, _ in roots):
+                new_lines.append(str(correct_root))
                 changed = True
             else:
                 new_lines.append(raw_line)
@@ -400,19 +435,64 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
             return False, f"failed to rewrite {pth.name}: {exc}"
         repaired_any = True
 
+    if unrepairable:
+        return False, (
+            "could not determine correct root for editable .pth: "
+            + ", ".join(sorted(unrepairable))
+        )
     if not repaired_any:
         return False, "editable .pth did not require rewriting"
-    return True, "rewrote editable .pth to point at main checkout src"
+    return True, "rewrote editable .pth targets to configured checkouts"
+
+
+def _match_pth_to_root(pth: Path, package_to_root: dict[str, Path]) -> Path | None:
+    """Return the configured ``src`` root a poisoned ``.pth`` should point at.
+
+    Matches the package name embedded in the ``.pth`` filename (e.g.
+    ``_editable_impl_charlie_work.pth`` -> ``charlie_work``) against the keys of
+    ``package_to_root``.  Only real package names (from
+    :func:`worktree._package_directories`, which excludes loose ``.py`` stems)
+    are in the map, so the substring hazard from the old
+    :func:`worktree._top_level_package_names` filter does not apply.
+
+    Returns ``None`` when zero or more-than-one package names match after
+    longest-name disambiguation, so the caller can refuse to repair rather
+    than write a wrong root (issue #969 gap 1).
+    """
+    matches = sorted(
+        ((name, root) for name, root in package_to_root.items() if name in pth.name),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0][1]
+    # Ambiguous: only accept the longest (most specific) name when it is
+    # strictly longer than the runner-up.  A tie means two packages are
+    # equally plausible and the correct target is genuinely unknown.
+    if len(matches[0][0]) > len(matches[1][0]):
+        return matches[0][1]
+    return None
 
 
 def _check_venv(repo_root: Path) -> SelfDeployResult:
     """Verify the orchestrator venv's editable ``.pth`` and repair on mismatch.
 
     Reads the venv's editable ``.pth`` via ``worktree.verify_shared_venv`` and
-    checks that it resolves to ``repo_root/src``.  On mismatch, logs loudly and
-    atomically rewrites the ``.pth`` text to the correct target.  All errors
-    are returned as values.
+    checks that every path line resolves into a configured checkout.  On
+    mismatch, logs loudly, emits a ``venv_pth_mismatch`` event, and atomically
+    rewrites the ``.pth`` text to the correct per-package target.  A successful
+    repair emits ``venv_pth_repaired``; a failed repair or re-verification
+    emits ``venv_pth_repair_failed``.  All errors are returned as values.
+
+    The events close the observability gap from issue #969 gap 3: across
+    20,727 rows in ``events.db`` zero matched any venv- or pth-related kind,
+    so a silent auto-repair was indistinguishable from never having had a
+    problem -- and a false green (the old filter reporting "repaired" over a
+    still-poisoned foreign editable) left no trace at all.
     """
+    state_path = _self_deploy_state_path(repo_root)
     venv_path = _find_venv_path(repo_root)
     if venv_path is None:
         return SelfDeployResult(
@@ -434,9 +514,19 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
         )
 
     logger.error("ORCHESTRATOR VENV PTH MISMATCH: %s", venv_message)
+    log_event(
+        state_path,
+        "venv_pth_mismatch",
+        {"venv_path": str(venv_path), "detail": venv_message},
+    )
 
     repair_ok, repair_message = _repair_venv_pth(repo_root, venv_path)
     if not repair_ok:
+        log_event(
+            state_path,
+            "venv_pth_repair_failed",
+            {"venv_path": str(venv_path), "detail": repair_message},
+        )
         return SelfDeployResult(
             ok=False,
             pulled=False,
@@ -447,6 +537,14 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
 
     venv_ok, venv_message = worktree.verify_shared_venv(repo_root, venv_path)
     if not venv_ok:
+        log_event(
+            state_path,
+            "venv_pth_repair_failed",
+            {
+                "venv_path": str(venv_path),
+                "detail": f"re-verification failed after repair: {venv_message}",
+            },
+        )
         return SelfDeployResult(
             ok=False,
             pulled=False,
@@ -455,6 +553,11 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
             error=f"venv pth repair did not fix the mismatch: {venv_message}",
         )
 
+    log_event(
+        state_path,
+        "venv_pth_repaired",
+        {"venv_path": str(venv_path), "detail": repair_message},
+    )
     return SelfDeployResult(
         ok=True,
         pulled=False,
