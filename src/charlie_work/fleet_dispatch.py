@@ -2491,6 +2491,7 @@ def run_fleet_supervise(
                 fleet_dir_override=fleet_dir_override,
                 dry_run=dry_run,
                 failure_alarm_threshold=cfg.self_deploy_failure_alarm,
+                pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
             )
             notify_config = getattr(global_config, "notify", None)
             notify_enabled = notify_config is not None and getattr(notify_config, "enabled", False)
