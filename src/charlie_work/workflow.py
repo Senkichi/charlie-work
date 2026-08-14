@@ -315,7 +315,7 @@ class CommandResult:
 
 def _state_lock_busy_result(message: str, **extra: Any) -> CommandResult:
     data: dict[str, Any] = {
-        "skipped": True,
+        "pass_skipped": True,
         "reason": "state_lock_busy",
         "state_lock_busy": True,
     }
@@ -1136,12 +1136,12 @@ _MAX_DEFERRED_CONCURRENCY_EXAMPLES = 5
 
 # Maximum per-worktree skip entries carried in the persisted
 # `worktrees_reclaimed` event payload. Same idiom as
-# `_MAX_DEFERRED_CONCURRENCY_EXAMPLES`: a full count (`skipped`) alongside a
+# `_MAX_DEFERRED_CONCURRENCY_EXAMPLES`: a full count (`skipped_count`) alongside a
 # truncated example list (`skipped_examples`), so a standing backlog of
 # stuck worktrees doesn't re-emit the full list into events.db every
 # interval, while a normal-sized backlog still carries every reason string
 # through (issue #1012 -- clean_worktrees computes a distinct `reason` per
-# skip but the event used to keep only `len(skipped)`).
+# skip but the event used to keep only `skipped_count`).
 _MAX_SKIPPED_WORKTREE_EXAMPLES = 20
 
 # Bound on concurrent `gh` subprocesses spawned by _prefetch_blocker_data() to
@@ -10365,7 +10365,7 @@ class OrchestratorApp:
                 {
                     "pr": pr_number,
                     "issue": issue_number,
-                    "skipped": True,
+                    "pass_skipped": True,
                     "checks_unavailable": escalated_checks is None,
                 },
             )
@@ -16488,7 +16488,7 @@ class OrchestratorApp:
                 return CommandResult(
                     True,
                     "reconcile deferred: supervisor lock held",
-                    {"skipped": True, "reason": "supervisor_lock_held"},
+                    {"pass_skipped": True, "reason": "supervisor_lock_held"},
                 )
         try:
             return self._reconcile_locked(
@@ -18889,7 +18889,7 @@ class OrchestratorApp:
         when the sweep runs, so a maintenance action that left no trace is
         indistinguishable from one that never ran (lesson from #595/#621).
         The event payload carries a bounded ``skipped_examples`` list (each
-        entry's own ``reason`` string) alongside the exact ``skipped`` count,
+        entry's own ``reason`` string) alongside the exact ``skipped_count``,
         plus ``worktrees_registered``/``worktrees_out_of_scope`` -- so a
         worktree stuck for days can be diagnosed from events.db alone,
         without catching the sweep live (issue #1012).
@@ -18962,7 +18962,7 @@ class OrchestratorApp:
             "ok": result.ok,
             "removed": len(result.data.get("removed", [])),
             "planned": len(result.data.get("planned", [])),
-            "skipped": len(skipped_full),
+            "skipped_count": len(skipped_full),
             "failed": len(result.data.get("failed", [])),
             "orphans_removed": len(orphans.get("removed", [])),
             "orphans_planned": len(orphans.get("planned", [])),
@@ -18971,12 +18971,12 @@ class OrchestratorApp:
             # issue #1012: clean_worktrees computes a distinct `reason` per
             # skipped worktree (at least nine distinct strings across the
             # merged/closed-unmerged/liveness gates), but until this fix only
-            # `len(skipped)` reached this durable payload -- "11 skipped" with
+            # `skipped_count` reached this durable payload -- "11 skipped" with
             # no way to tell which reason, or whether a specific stuck
             # worktree was even a candidate. Truncated to
             # `_MAX_SKIPPED_WORKTREE_EXAMPLES` so a standing backlog can't
-            # re-emit the full list into events.db every interval; `skipped`
-            # above is still the exact, untruncated count.
+            # re-emit the full list into events.db every interval;
+            # `skipped_count` above is still the exact, untruncated count.
             "skipped_examples": skipped_full[:_MAX_SKIPPED_WORKTREE_EXAMPLES],
             # Distinguishes "never a candidate" (outside worktrees_dir or off
             # the dispatch branch prefix -- an operator-created worktree, for
@@ -19131,7 +19131,7 @@ class OrchestratorApp:
             state = load_state(state_file)
             state = arm_reconcile_pass(state, next_reconcile_at)
             data = result.data
-            if data.get("skipped"):
+            if data.get("pass_skipped"):
                 state = self._record_event(
                     state,
                     "reconcile_pass_skipped",

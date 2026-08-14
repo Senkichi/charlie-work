@@ -361,10 +361,10 @@ def test_extract_attention_events_nested_loop_skip() -> None:
         {
             "stalled": [],
             "errors": [],
-            "intake": {"skipped": True, "reason": "state_lock_busy"},
+            "intake": {"pass_skipped": True, "reason": "state_lock_busy"},
             "dispatch": {"state_lock_busy": True, "reason": "state_lock_busy"},
             "dispatch_rework": {"deferred_reason": "graphql_rate_limit"},
-            "dispatch_reviews": {"skipped": True, "reason": "state_lock_busy"},
+            "dispatch_reviews": {"pass_skipped": True, "reason": "state_lock_busy"},
         },
     )
 
@@ -1501,7 +1501,7 @@ def test_fleet_loop_skips_repo_when_supervisor_lock_held(
     assert "owner/repo1" in result.data["repos"]
     repo1_data = result.data["repos"]["owner/repo1"]
     assert repo1_data["ok"] is True
-    assert repo1_data["skipped"] is True
+    assert repo1_data["pass_skipped"] is True
     assert repo1_data["reason"] == "supervisor_lock_held"
 
     # repo2 still ran
@@ -1641,7 +1641,7 @@ def test_fleet_loop_work_only_skips_locked_repo(
     assert mock_app.dispatch.call_count == 0
     repo_data = result.data["repos"]["owner/repo1"]
     assert repo_data["ok"] is True
-    assert repo_data["skipped"] is True
+    assert repo_data["pass_skipped"] is True
     assert repo_data["reason"] == "supervisor_lock_held"
 
 

@@ -6023,7 +6023,7 @@ def test_merge_check_does_not_fail_open_when_state_lock_is_held(
 
     assert result.ok is False
     assert result.data["reason"] == "not_approved"
-    assert result.data.get("skipped") is not True
+    assert result.data.get("pass_skipped") is not True
 
 
 def test_merge_ready_branch_delete_failure_never_blocks_labels(tmp_path: Path) -> None:
@@ -33395,7 +33395,7 @@ def test_review_short_circuits_escalated_issue_less_pr(tmp_path: Path) -> None:
 
     # review() must short-circuit and must not touch anything.
     assert review_result.ok is True
-    assert review_result.data.get("skipped") is True
+    assert review_result.data.get("pass_skipped") is True
     assert not fake_gh.labels_added
     assert not fake_gh.labels_removed
 
@@ -33453,7 +33453,7 @@ def test_review_refreshes_janitor_diagnostics_while_issue_escalated(tmp_path: Pa
     result = app.review(456)
 
     assert result.ok is True
-    assert result.data.get("skipped") is True
+    assert result.data.get("pass_skipped") is True
     assert not fake_gh.labels_added
     assert not fake_gh.labels_removed
 
@@ -34449,7 +34449,7 @@ def test_maybe_reclaim_worktrees_runs_and_emits_event(
     assert summary is not None
     assert summary["dry_run"] is False
     assert summary["removed"] == 3
-    assert summary["skipped"] == 1
+    assert summary["skipped_count"] == 1
     state = load_state(app.paths.state_file)
     events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
     assert len(events) == 1
@@ -34470,7 +34470,7 @@ def test_maybe_reclaim_worktrees_event_carries_skip_reasons(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Issue #1012: ``clean_worktrees`` computes a distinct ``reason`` string
-    per skipped worktree, but only ``len(skipped)`` used to reach the durable
+    per skipped worktree, but only ``skipped_count`` used to reach the durable
     ``worktrees_reclaimed`` event. The full reason strings, plus the
     out-of-scope/registered counts, must now survive into the persisted
     payload -- an operator reading events.db, not live output, is the actual
@@ -34521,7 +34521,7 @@ def test_maybe_reclaim_worktrees_event_carries_skip_reasons(
     summary = app._maybe_reclaim_worktrees()
 
     assert summary is not None
-    assert summary["skipped"] == 2
+    assert summary["skipped_count"] == 2
     # The exact reason strings -- not just a count -- reach the summary.
     assert summary["skipped_examples"] == skipped_entries
     assert summary["worktrees_registered"] == 3
@@ -34602,7 +34602,7 @@ def test_maybe_reclaim_worktrees_skip_examples_truncated(
 
     assert summary is not None
     # The exact count is never truncated.
-    assert summary["skipped"] == len(many_skipped)
+    assert summary["skipped_count"] == len(many_skipped)
     # The examples list IS truncated.
     assert len(summary["skipped_examples"]) == _MAX_SKIPPED_WORKTREE_EXAMPLES
     assert summary["skipped_examples"] == many_skipped[:_MAX_SKIPPED_WORKTREE_EXAMPLES]
@@ -34610,7 +34610,7 @@ def test_maybe_reclaim_worktrees_skip_examples_truncated(
     state = load_state(app.paths.state_file)
     events = [e for e in state["events"] if e["kind"] == "worktrees_reclaimed"]
     assert len(events[0]["payload"]["skipped_examples"]) == _MAX_SKIPPED_WORKTREE_EXAMPLES
-    assert events[0]["payload"]["skipped"] == len(many_skipped)
+    assert events[0]["payload"]["skipped_count"] == len(many_skipped)
 
 
 def test_maybe_reclaim_worktrees_advances_schedule_before_sweep(
@@ -42951,7 +42951,7 @@ def test_state_lock_guard_returns_skip_when_lock_held(
     assert result.ok is True
     reason = result.data.get("reason") or result.data.get("deferred_reason")
     assert reason in {"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"}
-    assert result.data.get("skipped") is True or result.data.get("state_lock_busy") is True
+    assert result.data.get("pass_skipped") is True or result.data.get("state_lock_busy") is True
     assert state_path.stat().st_mtime == initial_mtime
     assert state_path.read_text(encoding="utf-8") == initial_content
 
@@ -43002,7 +43002,7 @@ def test_spec_review_state_lock_guard_returns_skip_when_lock_held(
     assert result.ok is True
     reason = result.data.get("reason") or result.data.get("deferred_reason")
     assert reason in {"state_lock_busy", "supervisor_lock_held", "graphql_rate_limit"}
-    assert result.data.get("skipped") is True or result.data.get("state_lock_busy") is True
+    assert result.data.get("pass_skipped") is True or result.data.get("state_lock_busy") is True
     assert state_path.stat().st_mtime == initial_mtime
     assert state_path.read_text(encoding="utf-8") == initial_content
 
