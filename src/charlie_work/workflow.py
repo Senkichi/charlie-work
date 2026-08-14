@@ -50,6 +50,7 @@ from .config import (
     OrchestratorConfig,
     ReviewDispatchConfig,
 )
+from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from . import layout
@@ -7297,6 +7298,13 @@ class OrchestratorApp:
         self.gh = gh
         self.dry_run = dry_run
         self.fleet_dir_override = fleet_dir_override
+        # Issue #1001: once-only escalation flag for the worker-github-token
+        # gate. A missing token is a standing condition; the gate must not
+        # emit an event every loop pass. This instance-level flag persists
+        # across passes within a process lifetime and resets on restart —
+        # which is exactly when config changes (self.config is assigned only
+        # here, never reassigned on a live instance).
+        self._worker_token_escalated = False
         # Make the event ring cap config-driven (issue #525).
         _state.EVENT_RING_SIZE = config.runtime.event_ring_size
         prompts_dir = config.runtime.prompts_dir
@@ -8338,6 +8346,66 @@ class OrchestratorApp:
         ready_issues: list[dict[str, Any]] | None = None,
         merged_prs: _MergedPRListOutcome | None = None,
     ) -> CommandResult:
+        # Issue #1001: worker GitHub token gate. Before dispatching to an
+        # adapter family that routes through sanitize_env's merge, consult the
+        # same predicate doctor._check_worker_github_token uses. If no
+        # worker_env token is configured, escalate once (not per pass) and
+        # either refuse (when dispatch.require_worker_github_token is True) or
+        # warn and proceed (the default, so the gate does not take the fleet
+        # down on a config that has not yet been provisioned — see the issue
+        # #1001 sequencing hazard comment in config.py).
+        #
+        # The escalation fires once for a standing condition via the
+        # instance-level _worker_token_escalated flag (initialized in
+        # __init__), cleared when the condition resolves (all findings ok) or
+        # on process restart (which is when config changes — self.config is
+        # never reassigned on a live instance).
+        token_findings = worker_github_token_findings(self.config)
+        missing_findings = [f for f in token_findings if not f.ok]
+        if missing_findings:
+            if not self._worker_token_escalated:
+                self._worker_token_escalated = True
+                # Record the escalation event once. Payload carries only
+                # config_key names and adapter contexts — never a token value
+                # or prefix (issue #1001 acceptance criterion).
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    state = self._record_event(
+                        state,
+                        "worker_token_missing",
+                        {
+                            "findings": [
+                                {
+                                    "config_key": f.config_key,
+                                    "context": f.context,
+                                }
+                                for f in missing_findings
+                            ],
+                        },
+                        level="warning",
+                    )
+                    save_state(self.paths.state_file, state)
+            if self.config.dispatch.require_worker_github_token and not self.dry_run:
+                return CommandResult(
+                    True,
+                    "dispatch deferred: no sanctioned worker GitHub token "
+                    "(set devin.worker_env / claude_code.worker_env "
+                    "{'GH_TOKEN': '<scoped-PAT>'}; see issue #1001)",
+                    {
+                        "selected_count": 0,
+                        "attempted_count": 0,
+                        "failed_count": 0,
+                        "skipped_issue_numbers": [],
+                        "label_errors": [],
+                        "sessions": [],
+                        "dispatch_results": [],
+                        "deferred_reason": "worker_token_missing",
+                        "missing_config_keys": [f.config_key for f in missing_findings],
+                    },
+                )
+        else:
+            self._worker_token_escalated = False
+
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
         if ready_issues is None:
