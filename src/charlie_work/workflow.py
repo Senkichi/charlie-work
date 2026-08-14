@@ -16131,19 +16131,36 @@ class OrchestratorApp:
                 return "", reaped
             # Reaped a completed result (ok or fail). The report file has been
             # written by ``reap_cross_family_review``. If ok, the section is
-            # ready. If failed, check exhaustion and fall through to relaunch.
+            # ready -- UNLESS the PR's live head has moved on since the review
+            # was launched (the review ran against an earlier head while this
+            # pass's ``pr`` reflects the current one). Re-validate against
+            # ``pr.get("headRefOid")`` with the same predicate the adjacent
+            # reuse path below uses (``report_is_reusable``), so the two
+            # cannot disagree about what counts as stale (issue #1081's
+            # single-definition rule applies here too). If failed, check
+            # exhaustion and fall through to relaunch.
             if reaped.ok:
-                return self._cross_family_section(report_path), reaped
-            # Reaped a failure — the failure stub is already written. Check
-            # exhaustion for the attempt that just completed, then fall through
-            # to the budget claim + relaunch path below.
-            if enforce_regen_budget:
-                self._escalate_cross_family_regen_exhausted(
-                    pr_number=pr_number,
-                    issue_number=issue_number,
-                    head_sha=pr.get("headRefOid"),
-                    report_path=report_path,
-                )
+                reaped_text = ""
+                if report_path.exists() and report_path.stat().st_size > 0:
+                    reaped_text = report_path.read_text(encoding="utf-8")
+                if report_is_reusable(reaped_text, pr.get("headRefOid")):
+                    return self._cross_family_section(report_path), reaped
+                # Stale: the head moved while the review was in flight. Do
+                # NOT serve it — fall through to the idempotent reuse check
+                # below, which reaches the same "unusable" conclusion via the
+                # same predicate and continues on to budget claim + relaunch,
+                # exactly as a failed/unusable report would.
+            else:
+                # Reaped a failure — the failure stub is already written.
+                # Check exhaustion for the attempt that just completed, then
+                # fall through to the budget claim + relaunch path below.
+                if enforce_regen_budget:
+                    self._escalate_cross_family_regen_exhausted(
+                        pr_number=pr_number,
+                        issue_number=issue_number,
+                        head_sha=pr.get("headRefOid"),
+                        report_path=report_path,
+                    )
         # Idempotent: a non-empty, semantically valid SUCCESS report is reused,
         # so repeated review()/loop() passes don't re-burn the cross-family model
         # on the same PR. Failure stubs (headed "(UNAVAILABLE)") and exit-zero

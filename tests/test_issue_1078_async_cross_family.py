@@ -216,13 +216,17 @@ def test_reap_kills_and_reports_timeout(mock_alive: MagicMock, tmp_path: Path) -
     """When the process is alive but the timeout has elapsed, reap kills it
     and writes a failure stub."""
     report_path = tmp_path / "cross-family-review.md"
-    # started_at far in the past so elapsed > timeout
+    # started_at far in the past so elapsed > timeout. expected_start_time is
+    # a distinct, non-None value so the assertion below proves it is actually
+    # threaded through from the marker to kill_process_tree, not merely
+    # defaulting to None on both sides.
     _make_marker(
         report_path,
         pid=12345,
         started_at=time.time() - 1000,
         timeout_seconds=600,
         stdout_content="partial output",
+        expected_start_time=1111111111.5,
     )
 
     with patch("charlie_work.cross_family.kill_process_tree") as mock_kill:
@@ -232,7 +236,11 @@ def test_reap_kills_and_reports_timeout(mock_alive: MagicMock, tmp_path: Path) -
     assert result.pending is False
     assert result.ok is False
     assert "timed out" in (result.error or "")
-    mock_kill.assert_called_once()
+    # expected_start_time must be forwarded so kill_process_tree can re-check
+    # process identity before killing — otherwise a pid recycled by an
+    # unrelated process after the reviewer subprocess exited would be killed
+    # in its place (PID-reuse safety).
+    mock_kill.assert_called_once_with(12345, 1111111111.5)
     # Marker and temp files must be cleaned up.
     assert not _pending_marker_path(report_path).exists()
     assert not _stdout_tmp_path(report_path).exists()
@@ -498,4 +506,155 @@ def test_cross_family_pending_skips_rework_status_flip(tmp_path: Path) -> None:
     # The reviewing label must not have been applied.
     assert (123, app.config.labels.reviewing) not in fake_gh.labels_added, (
         "reviewing label must not be applied when cross_family_pending"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _cross_family_for_pr — reap-success staleness re-validation (#1212 round-3)
+# ---------------------------------------------------------------------------
+
+
+def test_cross_family_for_pr_does_not_serve_stale_reaped_report(tmp_path: Path) -> None:
+    """A review reaped as ``ok=True`` was launched against whatever head was
+    live at launch time. If the PR's head has since advanced, the reaped
+    report is for a diff that is no longer current — ``_cross_family_for_pr``
+    must not silently serve it as this pass's cross-family section. It must
+    re-validate the reaped report's head against the live ``pr["headRefOid"]``
+    (via ``report_is_reusable``, the same predicate the adjacent report-reuse
+    branch a few lines below already applies) and, on mismatch, fall through
+    to a fresh relaunch instead.
+    """
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=True, command=["echo", "{model}"]),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_number = 456
+    pr_dir = paths.prs / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    report_path = pr_dir / "cross-family-review.md"
+
+    # A review was launched against the OLD head and has now completed.
+    # pid=0 is always dead (is_pid_alive returns False for pid <= 0), so
+    # reap_cross_family_review takes the "process exited" branch for real,
+    # with no is_pid_alive mocking needed.
+    _make_marker(
+        report_path,
+        pid=0,
+        started_at=time.time() - 5,
+        timeout_seconds=600,
+        stdout_content=_REAL_BODY,
+        head_ref_oid="sha-old-head",
+    )
+
+    # The live PR has since advanced to a NEW head.
+    live_pr = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
+
+    with patch(
+        "charlie_work.workflow.launch_cross_family_review",
+        return_value=_pending_cf_result(str(report_path)),
+    ) as mock_launch:
+        section, result = app._cross_family_for_pr(
+            pr=live_pr,
+            issue=fake_gh.issues[0],
+            pr_dir=pr_dir,
+            pr_number=pr_number,
+            issue_number=123,
+            diff_path=pr_dir / "diff.patch",
+            enabled=True,
+        )
+
+    # The reaped report was generated against sha-old-head, not the live
+    # sha-new-head — it must not be silently served.
+    assert "BLOCKER" not in section, "stale cross-family section was served"
+    assert section == ""
+    # It must have fallen through to a fresh relaunch rather than returning
+    # the stale reaped result directly.
+    mock_launch.assert_called_once()
+    assert result is not None
+    assert result.pending is True
+
+
+# ---------------------------------------------------------------------------
+# _loop_body's non-already_approved (same-head packet skip) branch — two
+# further cross_family_pending guard sites (#1212 round-3 finding 3)
+# ---------------------------------------------------------------------------
+
+
+def test_cross_family_pending_guards_non_already_approved_branch(tmp_path: Path) -> None:
+    """The ``else`` branch of ``_loop_body`` (the PR has no recorded
+    "approved" decision, so the same-head packet-skip logic runs instead of
+    the already_approved fast path) has its own two ``cross_family_pending``
+    guard sites, in source order:
+
+    1. The not-reached-charge exclusion: ``if not cross_family_current and
+       not review.data.get("cross_family_pending"):
+       self._charge_cross_family_regen_not_reached(...)``. This runs BEFORE
+       the continue below — confirmed by reading workflow.py directly — so a
+       pending cross-family review must not be charged as a "regenerator not
+       reached" pass; it WAS reached, it just has not completed yet.
+    2. The merge-skip continue: ``if review.data.get("cross_family_pending"):
+       continue`` — the old decision (if any) must not drive a merge while
+       the report is still in flight.
+
+    Neither of these two sites was exercised by any existing test: the
+    existing cross_family_pending regression tests cover the
+    already_approved branch (test_cross_family_pending_skips_merge_ready_in_loop_body)
+    and _route_rework_candidate_to_review
+    (test_cross_family_pending_skips_rework_status_flip), but not this
+    same-head-packet-skip branch, despite the PR body's claim that all five
+    guard call sites are "covered by construction."
+    """
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=True, command=["echo", "{model}"]),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_number = 456
+
+    # No decision has been recorded for this PR (no app.record_review call),
+    # so already_approved is False and _loop_body's else branch runs. No
+    # review packet exists yet either, so head_current is False and the
+    # branch proceeds straight into review() rather than the same-head skip.
+
+    merge_ready_calls: list[int] = []
+
+    def _spy_merge_ready(pr_number: int, **kwargs: Any) -> Any:
+        merge_ready_calls.append(pr_number)
+        raise AssertionError(
+            f"merge_ready must not be called when cross_family_pending (PR {pr_number})"
+        )
+
+    report_path = str(paths.prs / f"pr-{pr_number}" / "cross-family-review.md")
+
+    with (
+        patch(
+            "charlie_work.workflow.launch_cross_family_review",
+            return_value=_pending_cf_result(report_path),
+        ),
+        patch("charlie_work.workflow.reap_cross_family_review", return_value=None),
+    ):
+        app.merge_ready = _spy_merge_ready  # type: ignore[method-assign]
+        app.loop(limit=0, merge=False)
+
+    # Guard site 2 (merge-skip continue): merge_ready must never be reached.
+    assert merge_ready_calls == [], (
+        "merge_ready must not be called when cross_family_pending is True "
+        "in the non-already_approved branch"
+    )
+
+    # Guard site 1 (not-reached-charge exclusion): the "regenerator not
+    # reached" counter must remain at 0. If the exclusion were missing (or
+    # the continue ran before the charge, reordering the guards), this pass
+    # -- which DID reach and launch the regenerator -- would have been
+    # miscounted as never having reached it.
+    record = app._cross_family_regen_record(pr_number=pr_number, head_sha="sha-abc123")
+    assert record.get("not_reached", 0) == 0, (
+        "cross_family_pending must exclude the pass from the "
+        "not-reached-charge — the regenerator WAS reached, it just has not "
+        "completed yet"
     )

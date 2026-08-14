@@ -595,8 +595,12 @@ def reap_cross_family_review(
         )
 
     if alive and elapsed >= float(timeout_seconds):
-        # Timeout — kill the process tree and write a failure stub.
-        kill_process_tree(pid)
+        # Timeout — kill the process tree and write a failure stub. Pass
+        # expected_start_time so kill_process_tree re-checks process identity
+        # before killing: if this pid was recycled by an unrelated process
+        # after the reviewer subprocess exited, killing it here would kill
+        # that unrelated process instead.
+        kill_process_tree(pid, expected_start_time)
         partial = ""
         try:
             partial = stdout_path.read_text(encoding="utf-8")
