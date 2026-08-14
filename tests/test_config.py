@@ -15,6 +15,7 @@ from charlie_work.config import (
     DispatchConfig,
     OrchestratorConfig,
     RuntimeConfig,
+    build_config_from_data,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -1614,3 +1615,9 @@ main_ci_reclaim:
     config = load_config(config_file)
     assert config.main_ci_reclaim.enabled is False
     assert config.main_ci_reclaim.workflow_filename == "tests.yml"
+
+
+def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -> None:
+    """Issue #1001: dispatch.require_worker_github_token must be a bool."""
+    with pytest.raises(ConfigError, match="require_worker_github_token.*must be a bool"):
+        build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})

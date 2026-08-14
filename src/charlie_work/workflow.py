@@ -50,6 +50,7 @@ from .config import (
     OrchestratorConfig,
     ReviewDispatchConfig,
 )
+from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from . import layout
@@ -63,7 +64,9 @@ from .cross_family import (
     MalformedCrossFamilyVerdict,
     extract_head_ref_oid,
     extract_report_body,
+    launch_cross_family_review,
     parse_cross_family_verdict,
+    reap_cross_family_review,
     report_is_reusable,
     run_cross_family_review,
 )
@@ -7645,6 +7648,16 @@ class OrchestratorApp:
         self.gh = gh
         self.dry_run = dry_run
         self.fleet_dir_override = fleet_dir_override
+        # Issue #1001: same-instance once-only escalation flag for the
+        # worker-github-token gate. A missing token is a standing condition;
+        # the gate must not emit an event every loop pass. The cross-instance
+        # source of truth is the durable ``worker_token_escalated`` marker in
+        # state.json (fleet_loop rebuilds this app per repo per pass, so an
+        # instance flag alone resets every pass). This in-memory flag is a
+        # same-instance optimization that also suppresses re-entry under
+        # dry-run, where the durable marker is never written. It is cleared
+        # when the condition resolves (all findings ok) alongside the marker.
+        self._worker_token_escalated = False
         # Make the event ring cap config-driven (issue #525).
         _state.EVENT_RING_SIZE = config.runtime.event_ring_size
         prompts_dir = config.runtime.prompts_dir
@@ -8686,6 +8699,115 @@ class OrchestratorApp:
         ready_issues: list[dict[str, Any]] | None = None,
         merged_prs: _MergedPRListOutcome | None = None,
     ) -> CommandResult:
+        # Issue #1001: worker GitHub token gate. Before dispatching to an
+        # adapter family that routes through sanitize_env's merge, consult the
+        # same predicate doctor._check_worker_github_token uses. If no
+        # worker_env token is configured, escalate once (not per pass) and
+        # either refuse (when dispatch.require_worker_github_token is True) or
+        # warn and proceed (the default, so the gate does not take the fleet
+        # down on a config that has not yet been provisioned — see the issue
+        # #1001 sequencing hazard comment in config.py).
+        #
+        # The once-only guarantee must hold across OrchestratorApp
+        # reconstruction: fleet_dispatch.fleet_loop builds a fresh app per
+        # repo per pass, so an instance-level flag alone resets every pass
+        # and re-escalates indefinitely. The durable marker
+        # ``worker_token_escalated`` in state.json is the cross-instance
+        # source of truth; the instance-level ``_worker_token_escalated``
+        # flag (initialized in __init__) is a same-instance optimization
+        # that also covers dry-run, where the durable marker is never
+        # written. The marker is cleared when the condition resolves (all
+        # findings ok), so a future regression re-escalates.
+        token_findings = worker_github_token_findings(self.config)
+        missing_findings = [f for f in token_findings if not f.ok]
+        if missing_findings:
+            if not self._worker_token_escalated:
+                self._worker_token_escalated = True
+                # Record the escalation event once. Payload carries only
+                # config_key names and adapter contexts — never a token
+                # value or prefix (issue #1001 acceptance criterion).
+                #
+                # Dry-run never writes: the escalation event and the
+                # durable marker are state mutations (state_lock +
+                # save_state), so they are gated on ``not self.dry_run``
+                # — the same read-only contract documented at the
+                # merge_ready dry-run gate (~line 15452, "Dry-run never
+                # writes") and modelled on this function's own
+                # top-of-body dry-run short-circuit. The in-memory
+                # once-only flag is still set under dry-run so a dry-run
+                # pass does not re-enter this block on the next pass;
+                # the event and marker are emitted on the first real
+                # (non-dry-run) dispatch. ``self.dry_run`` is fixed at
+                # construction, so a dry-run instance cannot later
+                # "forget" the flag and skip a real write.
+                #
+                # The durable marker is read inside the lock (not before it)
+                # so the cross-instance once-only guarantee holds without an
+                # unlocked load_state — issue #310's
+                # test_no_unlocked_load_state_in_production_code lint forbids
+                # any load_state outside a state_lock block. The in-memory
+                # ``_worker_token_escalated`` flag is the first gate
+                # (same-instance), so the lock is entered at most once per
+                # instance lifetime (the flag's False→True transition); the
+                # inner ``if not state.get(...)`` re-check is the
+                # authoritative cross-instance gate and no-ops when a prior
+                # instance already set the marker.
+                if not self.dry_run:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        if not state.get("worker_token_escalated", False):
+                            state = self._record_event(
+                                state,
+                                "worker_token_missing",
+                                {
+                                    "findings": [
+                                        {
+                                            "config_key": f.config_key,
+                                            "context": f.context,
+                                        }
+                                        for f in missing_findings
+                                    ],
+                                },
+                                level="warning",
+                            )
+                            state["worker_token_escalated"] = True
+                            save_state(self.paths.state_file, state)
+            # The refusal itself is NOT dry-run-gated: a dry-run preview must
+            # report the same deferral a live pass would take (matching the
+            # fleet_lock_held / graphql_rate_limit deferral precedent in this
+            # function). Only the escalation event / durable marker writes
+            # above stay behind ``not self.dry_run``.
+            if self.config.dispatch.require_worker_github_token:
+                return CommandResult(
+                    True,
+                    "dispatch deferred: no sanctioned worker GitHub token "
+                    "(set devin.worker_env / claude_code.worker_env "
+                    "{'GH_TOKEN': '<scoped-PAT>'}; see issue #1001)",
+                    {
+                        "selected_count": 0,
+                        "attempted_count": 0,
+                        "failed_count": 0,
+                        "skipped_issue_numbers": [],
+                        "label_errors": [],
+                        "sessions": [],
+                        "dispatch_results": [],
+                        "deferred_reason": "worker_token_missing",
+                        "missing_config_keys": [f.config_key for f in missing_findings],
+                    },
+                )
+        else:
+            self._worker_token_escalated = False
+            # Condition resolved: clear the durable marker so a future
+            # regression re-escalates. Dry-run never writes — a dry-run pass
+            # that observes a now-healthy config must not mutate the marker
+            # set by a prior real pass (and cannot have set it itself).
+            if not self.dry_run:
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    if state.get("worker_token_escalated", False):
+                        state["worker_token_escalated"] = False
+                        save_state(self.paths.state_file, state)
+
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
         if ready_issues is None:
@@ -11066,6 +11188,24 @@ class OrchestratorApp:
             enabled=cross_family,
             enforce_regen_budget=enforce_regen_budget,
         )
+        # Issue #1078: when the cross-family review is pending (launched async
+        # but not yet reaped), the review packet must NOT go out — the cross-
+        # family section is empty and the reviewer would make a verdict without
+        # the adversarial findings. Defer the packet write to a later pass when
+        # the review is reaped. This returns ok=True (not a failure) with a
+        # ``cross_family_pending`` data flag so ``loop()`` can skip the
+        # not-reached charge and the merge check.
+        if cf_result is not None and cf_result.pending:
+            return CommandResult(
+                True,
+                f"PR #{pr_number}: cross-family review pending, deferring packet",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "cross_family_pending": True,
+                    "ok": True,
+                },
+            )
         prompt_path = pr_dir / "review-prompt.md"
         decision_path = pr_dir / "review-decision.json"
         diff_size_section = _diff_size_section(
@@ -16313,6 +16453,53 @@ class OrchestratorApp:
         if not use or pr.get("isDraft"):
             return "", None
         report_path = pr_dir / "cross-family-review.md"
+        # Issue #1078: the cross-family review is now asynchronous. A previous
+        # pass may have launched a review via ``launch_cross_family_review``
+        # (Popen, non-blocking) and left a ``.pending.json`` marker. Reap it
+        # before deciding whether to launch a new one. This is the single
+        # collection point — the same PR's pending review is reaped here or not
+        # at all.
+        reaped = reap_cross_family_review(report_path=report_path)
+        if reaped is not None:
+            if reaped.pending:
+                # Still running — the review packet must NOT go out yet. Return
+                # a pending result so ``review()`` defers the packet write; the
+                # next pass will reap again. This is what prevents one repo's
+                # reviewer latency from blocking the other repo's lane: the
+                # fleet pass returns from this PR immediately.
+                return "", reaped
+            # Reaped a completed result (ok or fail). The report file has been
+            # written by ``reap_cross_family_review``. If ok, the section is
+            # ready -- UNLESS the PR's live head has moved on since the review
+            # was launched (the review ran against an earlier head while this
+            # pass's ``pr`` reflects the current one). Re-validate against
+            # ``pr.get("headRefOid")`` with the same predicate the adjacent
+            # reuse path below uses (``report_is_reusable``), so the two
+            # cannot disagree about what counts as stale (issue #1081's
+            # single-definition rule applies here too). If failed, check
+            # exhaustion and fall through to relaunch.
+            if reaped.ok:
+                reaped_text = ""
+                if report_path.exists() and report_path.stat().st_size > 0:
+                    reaped_text = report_path.read_text(encoding="utf-8")
+                if report_is_reusable(reaped_text, pr.get("headRefOid")):
+                    return self._cross_family_section(report_path), reaped
+                # Stale: the head moved while the review was in flight. Do
+                # NOT serve it — fall through to the idempotent reuse check
+                # below, which reaches the same "unusable" conclusion via the
+                # same predicate and continues on to budget claim + relaunch,
+                # exactly as a failed/unusable report would.
+            else:
+                # Reaped a failure — the failure stub is already written.
+                # Check exhaustion for the attempt that just completed, then
+                # fall through to the budget claim + relaunch path below.
+                if enforce_regen_budget:
+                    self._escalate_cross_family_regen_exhausted(
+                        pr_number=pr_number,
+                        issue_number=issue_number,
+                        head_sha=pr.get("headRefOid"),
+                        report_path=report_path,
+                    )
         # Idempotent: a non-empty, semantically valid SUCCESS report is reused,
         # so repeated review()/loop() passes don't re-burn the cross-family model
         # on the same PR. Failure stubs (headed "(UNAVAILABLE)") and exit-zero
@@ -16334,9 +16521,8 @@ class OrchestratorApp:
                 )
         # The report is unusable, so the regeneration below is the repair -- and
         # it is the thing the per-head budget exists to bound, because it runs
-        # the cross-family model synchronously for up to timeout_seconds and
-        # unbounded would starve the other repo in the shared sequential loop
-        # (#1078).
+        # the cross-family model for up to timeout_seconds and unbounded would
+        # starve the other repo in the shared sequential loop (#1078).
         #
         # The claim therefore lives HERE, at the model call it bounds, and not
         # at loop()'s staleness check where it used to (issue #1099). review()
@@ -16381,7 +16567,13 @@ class OrchestratorApp:
                 "diff_path": diff_path,
             },
         )
-        result = run_cross_family_review(
+        # Issue #1078: launch asynchronously (Popen, non-blocking) instead of
+        # calling ``run_cross_family_review`` synchronously. The subprocess
+        # runs in the background; a ``.pending.json`` marker is written so the
+        # next pass can reap the result via ``reap_cross_family_review``. This
+        # returns immediately with ``pending=True``, so the fleet pass moves on
+        # to the next repo without waiting for the cross-family model.
+        result = launch_cross_family_review(
             model=cfg.model,
             command=cfg.command,
             repo_root=self.repo_root,
@@ -16392,6 +16584,13 @@ class OrchestratorApp:
             dry_run=self.dry_run,
             head_ref_oid=pr.get("headRefOid"),
         )
+        # If the launch succeeded, the result is pending — the review packet
+        # must not go out yet. If the launch failed immediately (e.g. OSError),
+        # the failure stub is already written; check exhaustion and return the
+        # section so the packet goes out without a cross-family section (same
+        # behaviour as the old synchronous path on launch failure).
+        if result.pending:
+            return "", result
         # Exhaustion is decided HERE, immediately after the model call that
         # spends the budget, because this is the only point at which both facts
         # the escalation asserts are actually observed: the model ran, and the
@@ -20196,6 +20395,13 @@ class OrchestratorApp:
                         review = self.review(pr_number)
                         if self._record_review_or_error(review, errors, reviews):
                             continue
+                        # Issue #1078: if the cross-family review is pending,
+                        # review() returned without writing a packet or resetting
+                        # the decision. The old head's "approved" decision must
+                        # NOT trigger a merge for the new head — skip to the next
+                        # PR and let a later pass reap the review and rebuild.
+                        if review.data.get("cross_family_pending"):
+                            continue
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved" and is_merge_head:
                             merge_result = self.merge_ready(
@@ -20294,11 +20500,17 @@ class OrchestratorApp:
                             )
                         )
                         review = self.review(pr_number)
-                        if not cross_family_current:
+                        if not cross_family_current and not review.data.get(
+                            "cross_family_pending"
+                        ):
                             # review() has now run for the express purpose of
                             # regenerating this report. If it is still unusable
                             # and no attempt was charged, the regenerator was
-                            # never reached (issue #1099).
+                            # never reached (issue #1099). The
+                            # ``cross_family_pending`` guard (#1078) excludes
+                            # the case where the regenerator WAS reached — it
+                            # launched the async review — but the report is not
+                            # yet written because the subprocess is still running.
                             self._charge_cross_family_regen_not_reached(
                                 pr_number=pr_number,
                                 issue_number=issue_number,
@@ -20306,6 +20518,11 @@ class OrchestratorApp:
                                 attempts_before=attempts_before,
                             )
                         if self._record_review_or_error(review, errors, reviews):
+                            continue
+                        # Issue #1078: same guard as the already_approved branch
+                        # above — a pending cross-family review means no packet
+                        # was written, so any existing decision is stale.
+                        if review.data.get("cross_family_pending"):
                             continue
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved" and is_merge_head:
@@ -21851,6 +22068,10 @@ class OrchestratorApp:
         # rework_requested and the existing closed-unmerged issue-side
         # handling (closed_unmerged_pr_active_labels) finalizes it.
         closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
+        # Issue #1078: a pending cross-family review means no packet was written.
+        # The issue must NOT be flipped to "reviewing" — it stays
+        # "rework_requested" for the next pass, same as the routed/blocked cases.
+        cross_family_pending = bool(review_result.data.get("cross_family_pending"))
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -21860,6 +22081,7 @@ class OrchestratorApp:
                 review_result.ok
                 and not routed_to_rework
                 and not closed_unmerged_converged
+                and not cross_family_pending
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "rework_requested"
