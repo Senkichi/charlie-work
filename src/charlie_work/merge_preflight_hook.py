@@ -38,18 +38,36 @@ from typing import Any
 _GH_PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b")
 
 
-def _load_fleet_roots() -> dict[str, Path]:
+def _load_fleet_roots() -> dict[str, Path] | None:
     """Map ``owner/name`` -> local repo root from the fleet registry.
 
-    Returns an empty map on any read failure; callers must treat that as
-    "cannot resolve" (deny for in-repo merges), never as "no fleet".
+    The two failure shapes are deliberately distinct, because they demand
+    opposite answers from an authorization gate:
+
+    - ``None``: the registry file exists but cannot be read or parsed. We
+      cannot confirm *any* repo is outside the fleet, so every merge-shaped
+      call must deny (fail closed) — on both the Bash and MCP paths.
+    - ``{}``: no registry file, or a well-formed registry with no repos.
+      Nothing is fleet-managed, so there is nothing for this hook to guard
+      and merges pass through to the normal permission flow.
+
+    ``fleet_registry._load_registry`` swallows read errors into an empty
+    registry, which would collapse the two shapes; read the file directly.
     """
     from charlie_work import layout
-    from charlie_work.fleet_registry import _load_registry
 
-    registry = _load_registry(layout.fleet_registry_path())
+    path = layout.fleet_registry_path()
+    try:
+        if not path.exists():
+            return {}
+        registry = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(registry, dict):
+        return None
     roots: dict[str, Path] = {}
-    for name, entry in registry.get("repos", {}).items():
+    repos = registry.get("repos")
+    for name, entry in repos.items() if isinstance(repos, dict) else ():
         root = entry.get("repo_root") if isinstance(entry, dict) else None
         if isinstance(root, str) and root:
             roots[name.lower()] = Path(root)
@@ -168,6 +186,15 @@ def _decide(tool_name: str, tool_input: dict[str, Any], cwd: Path) -> str | None
         pr = tool_input.get("pullNumber")
         name = f"{owner}/{repo}".lower() if owner and repo else None
         roots = _load_fleet_roots()
+        if roots is None:
+            # Registry unreadable: cannot confirm this repo is outside the
+            # fleet, so the gate must not answer yes (same contract as the
+            # Bash path).
+            return (
+                "merge_pull_request intercepted but the fleet registry is "
+                "unreadable; cannot verify merge authorization (#894). Fix "
+                "fleet.json or merge via charlie ship-it."
+            )
         if name is None or name not in roots:
             return None  # not a fleet repo — out of scope
         if not isinstance(pr, int) or isinstance(pr, bool):
@@ -189,18 +216,17 @@ def _decide(tool_name: str, tool_input: dict[str, Any], cwd: Path) -> str | None
         return None
 
     roots = _load_fleet_roots()
+    if roots is None:
+        # Registry unreadable: cannot confirm any target is outside the
+        # fleet — even an explicit --repo. The gate must not answer yes.
+        return (
+            "gh pr merge intercepted but the fleet registry is unreadable; "
+            "cannot verify merge authorization (#894). Fix fleet.json or "
+            "merge via charlie ship-it."
+        )
     cwd_repo = _repo_for_cwd(roots, cwd)
     for target in targets:
         name = (target["repo"] or cwd_repo or "").lower() or None
-        if name is None and not roots:
-            # Registry unreadable AND no --repo flag: cannot even tell whether
-            # this is a fleet repo. An authorization gate that cannot tell
-            # must not answer yes.
-            return (
-                "gh pr merge intercepted but the fleet registry is unreadable; "
-                "cannot verify merge authorization (#894). Fix fleet.json or "
-                "merge via charlie ship-it."
-            )
         if name is None or name not in roots:
             continue  # merging outside the fleet — out of scope
         pr = target["pr"]

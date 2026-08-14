@@ -170,21 +170,93 @@ def test_decide_bash_no_pr_number_in_fleet_repo_denies(
     assert "o/repo" in reason
 
 
-def test_decide_bash_empty_registry_no_repo_flag_denies_mentioning_registry(
+def test_decide_bash_unreadable_registry_denies_mentioning_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {})
+    # None = registry exists but cannot be read/parsed -> fail closed.
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: None)
     reason = hook._decide("Bash", {"command": "gh pr merge 1 --squash"}, tmp_path)
     assert reason is not None
     assert "registry" in reason.lower()
 
 
-def test_decide_bash_empty_registry_explicit_out_of_fleet_repo_none(
+def test_decide_bash_unreadable_registry_denies_even_with_explicit_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unreadable registry cannot confirm ANY repo is outside the fleet.
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: None)
+    reason = hook._decide("Bash", {"command": "gh pr merge -R other/repo 1 --squash"}, tmp_path)
+    assert reason is not None
+    assert "registry" in reason.lower()
+
+
+def test_decide_bash_genuinely_empty_fleet_passes_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # {} = no registry file / no repos: nothing fleet-managed, nothing to guard.
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {})
+    assert hook._decide("Bash", {"command": "gh pr merge 1 --squash"}, tmp_path) is None
+    assert (
+        hook._decide("Bash", {"command": "gh pr merge -R other/repo 1 --squash"}, tmp_path) is None
+    )
+
+
+def test_decide_mcp_unreadable_registry_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression for the review finding on PR #1195: the MCP path must honor
+    # the same fail-closed contract as the Bash path when the registry is
+    # unreadable — otherwise a corrupt fleet.json silently disables
+    # enforcement for MCP-initiated merges.
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: None)
+    called: list[Any] = []
+    monkeypatch.setattr(hook, "_run_merge_check", lambda *a: called.append(a) or (True, ""))
+    reason = hook._decide(
+        "mcp__github__merge_pull_request",
+        {"owner": "Senkichi", "repo": "charlie-work", "pullNumber": 5},
+        tmp_path,
+    )
+    assert reason is not None
+    assert "registry" in reason.lower()
+    assert called == []
+
+
+def test_decide_mcp_genuinely_empty_fleet_passes_through(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {})
-    reason = hook._decide("Bash", {"command": "gh pr merge -R other/repo 1 --squash"}, tmp_path)
+    reason = hook._decide(
+        "mcp__github__merge_pull_request",
+        {"owner": "o", "repo": "r", "pullNumber": 5},
+        tmp_path,
+    )
     assert reason is None
+
+
+def test_load_fleet_roots_shapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from charlie_work import layout
+
+    registry = tmp_path / "fleet.json"
+    monkeypatch.setattr(layout, "fleet_registry_path", lambda override=None: registry)
+
+    # Missing file: no fleet configured -> {}.
+    assert hook._load_fleet_roots() == {}
+
+    # Corrupt file: read failure -> None (fail closed).
+    registry.write_text("{not json", encoding="utf-8")
+    assert hook._load_fleet_roots() is None
+
+    # Non-dict JSON: also a read failure.
+    registry.write_text("[]", encoding="utf-8")
+    assert hook._load_fleet_roots() is None
+
+    # Well-formed registry: owner/name lowercased -> repo_root Path.
+    registry.write_text(
+        '{"version": 1, "repos": {"Owner/Repo": {"repo_root": "C:/x/repo"}}}',
+        encoding="utf-8",
+    )
+    roots = hook._load_fleet_roots()
+    assert roots == {"owner/repo": Path("C:/x/repo")}
 
 
 # ---------------------------------------------------------------------------
