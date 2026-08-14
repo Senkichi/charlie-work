@@ -13,9 +13,14 @@ passes via an async ``launch_cross_family_review`` (Popen, non-blocking) +
 2. ``reap_cross_family_review`` correctly distinguishes pending (still
    running), completed (ok), and failed (timeout / empty output) states.
 
-3. The ``fleet_lane_completed`` event is recorded to the fleet-level
-   events.db so per-repo lane liveness is observable without hand-querying
-   each repo's individual events.db.
+3. The ``cross_family_pending`` guard in ``review()`` / ``_loop_body`` /
+   ``_route_rework_candidate_to_review`` correctly skips merge_ready and
+   the rework-status flip when the cross-family review is in flight — the
+   deferred-packet/skip-merge path that the async split introduces.
+
+The ``fleet_lane_completed`` fleet-level event added by this PR is tested in
+``tests/test_fleet_dispatch.py`` alongside the other ``fleet_loop`` event
+tests, not here.
 """
 
 from __future__ import annotations
@@ -27,12 +32,19 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from charlie_work.config import CrossFamilyConfig, DevinConfig, OrchestratorConfig
 from charlie_work.cross_family import (
+    CrossFamilyResult,
     launch_cross_family_review,
     reap_cross_family_review,
     _pending_marker_path,
     _stdout_tmp_path,
 )
+from charlie_work.paths import runtime_paths
+from charlie_work.state import load_state
+from charlie_work.workflow import OrchestratorApp
+
+from test_charlie_work import FakeGitHub
 
 
 # A body with a real severity marker — passes report_body_is_valid.
@@ -345,3 +357,145 @@ def test_launch_does_not_block_on_slow_subprocess(tmp_path: Path) -> None:
     # it does NOT wait for the subprocess. A 5s ceiling is generous and still
     # proves the blocking is gone (the old synchronous path would take 600s).
     assert elapsed < 5.0, f"launch took {elapsed:.1f}s — expected non-blocking"
+
+
+# ---------------------------------------------------------------------------
+# Integration: cross_family_pending guard in _loop_body / review() /
+# _route_rework_candidate_to_review — the deferred-packet/skip-merge path
+# ---------------------------------------------------------------------------
+
+
+def _pending_cf_result(report_path: str) -> CrossFamilyResult:
+    """A CrossFamilyResult that simulates a launched-but-not-yet-reaped review."""
+    return CrossFamilyResult(
+        ok=False,
+        report_path=report_path,
+        model="codex",
+        pending=True,
+        error="cross-family review launched, pending",
+    )
+
+
+def test_cross_family_pending_skips_merge_ready_in_loop_body(tmp_path: Path) -> None:
+    """When ``launch_cross_family_review`` returns ``pending=True``, ``review()``
+    returns ``cross_family_pending=True`` and ``_loop_body``'s already_approved
+    branch must skip ``merge_ready`` — the old head's "approved" decision must
+    NOT trigger a merge for the new head while the cross-family review is in
+    flight. This is the core deferred-packet/skip-merge path introduced by the
+    async split (#1078).
+    """
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=True, command=["echo", "{model}"]),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Record an approved decision at the current head "sha-abc123". This sets
+    # state["prs"]["456"]["decision"]="approved", ["status"]="approved", and
+    # ["reviewed_head_sha"]="sha-abc123" — the already_approved fast path's
+    # preconditions.
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Advance the PR head so already_approved's head_matches is False, forcing
+    # the branch that calls review() → _cross_family_for_pr → launch.
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+
+    report_path = str(paths.prs / "pr-456" / "cross-family-review.md")
+
+    # Spy on merge_ready: any call is a regression — the pending guard must
+    # `continue` before reaching the merge check.
+    merge_ready_calls: list[int] = []
+
+    def _spy_merge_ready(pr_number: int, **kwargs: Any) -> Any:
+        merge_ready_calls.append(pr_number)
+        raise AssertionError(
+            f"merge_ready must not be called when cross_family_pending (PR {pr_number})"
+        )
+
+    with (
+        patch(
+            "charlie_work.workflow.launch_cross_family_review",
+            return_value=_pending_cf_result(report_path),
+        ),
+        patch("charlie_work.workflow.reap_cross_family_review", return_value=None),
+    ):
+        app.merge_ready = _spy_merge_ready  # type: ignore[method-assign]
+        app.loop(limit=0, merge=False)
+
+    assert merge_ready_calls == [], (
+        "merge_ready must not be called when cross_family_pending is True"
+    )
+
+
+def test_cross_family_pending_skips_rework_status_flip(tmp_path: Path) -> None:
+    """When ``launch_cross_family_review`` returns ``pending=True``, ``review()``
+    returns ``cross_family_pending=True`` and ``_route_rework_candidate_to_review``
+    must NOT flip the issue from ``rework_requested`` to ``reviewing`` — no
+    packet was written, so flipping would desync state.json from GitHub reality
+    (labels still say needs-rework, no packet exists) with no automated
+    recovery path. The issue stays ``rework_requested`` for the next pass.
+    """
+    from charlie_work.janitor import _calculate_patch_id
+
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=True, command=["echo", "{model}"]),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Record a request_changes baseline: reviewed_head_sha pins the pre-rework
+    # head, reviewed_patch_id pins the pre-rework patch content. This also
+    # sets issue #123 status to "rework_requested" and adds the needs_rework
+    # label.
+    reviewed_diff = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    fake_gh.diffs[456] = reviewed_diff
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Head advances AND the diff content genuinely changes (different patch-id,
+    # not just a sync-merge) — the condition that makes dispatch_rework route
+    # to _route_rework_candidate_to_review.
+    live_diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    assert _calculate_patch_id(live_diff) != _calculate_patch_id(reviewed_diff), (
+        "fixture must reproduce a genuine content change (distinct patch-ids)"
+    )
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = live_diff
+
+    # A rework prompt must exist so the candidate is dispatch-eligible.
+    pr_dir = paths.prs / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    report_path = str(pr_dir / "cross-family-review.md")
+
+    with (
+        patch(
+            "charlie_work.workflow.launch_cross_family_review",
+            return_value=_pending_cf_result(report_path),
+        ),
+        patch("charlie_work.workflow.reap_cross_family_review", return_value=None),
+    ):
+        result = app.dispatch_rework()
+
+    # The issue must stay rework_requested — NOT flipped to "reviewing".
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested", (
+        "issue must stay rework_requested when cross_family_pending — "
+        "flipping to reviewing would desync state from GitHub labels"
+    )
+    # The routing must not have confirmed it as routed to review (no packet).
+    assert 123 not in result.data.get("routed_to_review", []), (
+        "dispatch_rework must not report the issue as routed to review "
+        "when cross_family_pending prevented a packet write"
+    )
+    # The reviewing label must not have been applied.
+    assert (123, app.config.labels.reviewing) not in fake_gh.labels_added, (
+        "reviewing label must not be applied when cross_family_pending"
+    )
