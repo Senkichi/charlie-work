@@ -87,6 +87,15 @@ class DriftItem:
     # Unused by every other kind.
     throttle_reason: str | None = None
     throttle_adapter_kind: str | None = None
+    # Issue #978: structured "why" for session_failed_relabeled drift items,
+    # so the machine-readable reason is not buried only in the free-text
+    # ``detail`` string. ``reason`` is the canonical path identifier (e.g.
+    # "dead_session_no_open_pr"); ``failure_kind`` is the classifier's
+    # optional refinement (may be None when classification was inconclusive).
+    # Both are threaded into the ``reconcile`` event payload by apply_fixes.
+    # Unused by every other kind.
+    reason: str | None = None
+    failure_kind: str | None = None
 
 
 # State-machine statuses that mean "this issue is in the orchestrator's pipeline".
@@ -1149,6 +1158,8 @@ def detect_drift(
                                             kind="session_failed_relabeled",
                                             issue_number=w.issue_number,
                                             pr_number=None,
+                                            reason="launch_stalled_no_open_pr",
+                                            failure_kind="launch_stalled",
                                             detail=(
                                                 f"issue #{w.issue_number} session launch_stalled "
                                                 f"(hung at shim marker), activity_sources={json.dumps(activity_payload)}, "
@@ -1389,6 +1400,8 @@ def detect_drift(
                                         kind="session_failed_relabeled",
                                         issue_number=w.issue_number,
                                         pr_number=None,
+                                        reason="dead_session_no_open_pr",
+                                        failure_kind=failure_kind,
                                         detail=(
                                             f"issue #{w.issue_number} session died with "
                                             f"{failure_kind or 'unknown failure'}, no open PR, "
@@ -2471,6 +2484,7 @@ def apply_fixes(
                         kind="session_failed_relabeled",
                         issue_number=item.issue_number,
                         pr_number=None,
+                        reason="salvage_failed_fallback",
                         detail=item.detail,
                         fix_actions=tuple(fix_actions),
                         remove_labels=item.remove_labels,
@@ -2500,22 +2514,34 @@ def apply_fixes(
                         kind=item.kind,
                         issue_number=item.issue_number,
                         pr_number=item.pr_number,
+                        reason=item.reason,
+                        failure_kind=item.failure_kind,
                         detail=item.detail,
                         fix_actions=tuple(fix_actions),
                         remove_labels=item.remove_labels,
                         add_labels=item.add_labels,
                     )
 
+        # Issue #978: thread the structured ``reason``/``failure_kind`` onto
+        # the reconcile event payload so the machine-readable "why" is not
+        # buried only in the free-text ``detail`` string. Only included when
+        # the drift item carries them (session_failed_relabeled kinds); other
+        # kinds leave the payload shape unchanged.
+        reconcile_payload: dict[str, Any] = {
+            "kind": item.kind,
+            "issue_number": item.issue_number,
+            "pr_number": item.pr_number,
+            "fix_actions": list(item.fix_actions),
+            "detail": item.detail,
+        }
+        if item.reason is not None:
+            reconcile_payload["reason"] = item.reason
+        if item.failure_kind is not None:
+            reconcile_payload["failure_kind"] = item.failure_kind
         new_state = append_event(
             new_state,
             "reconcile",
-            {
-                "kind": item.kind,
-                "issue_number": item.issue_number,
-                "pr_number": item.pr_number,
-                "fix_actions": list(item.fix_actions),
-                "detail": item.detail,
-            },
+            reconcile_payload,
             state_path=state_path,
         )
 
