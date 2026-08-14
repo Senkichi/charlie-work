@@ -11136,10 +11136,18 @@ class OrchestratorApp:
         # voided it -- which is what "preserve a verdict pinned to a
         # descendant of the snapshot" reduces to once the snapshot itself is
         # kept fresh at commit time.
+        #
+        # Issue #1072: this guard covers ONLY the packet-commit tail exit
+        # (the prompt + decision write below). The two earlier verdict-
+        # writing exits -- the CI-required-check-failure block and the
+        # Tier-1 test-adequacy hard gate -- return through record_review()
+        # before reaching this point. The same head-moved invariant is now
+        # enforced for those exits (and every other record_review() caller)
+        # by the compare-and-swap guard pushed into record_review() itself,
+        # so the invariant holds by construction for all verdict writes from
+        # this method, not just the one this guard happens to sit on.
         live_pr_for_commit = self.gh.pr_view(pr_number)
-        live_head_for_commit = (
-            live_pr_for_commit.get("headRefOid") if isinstance(live_pr_for_commit, dict) else None
-        )
+        live_head_for_commit = live_pr_for_commit.get("headRefOid")
         snapshot_head_for_commit = pr.get("headRefOid")
         if live_head_for_commit is None or live_head_for_commit != snapshot_head_for_commit:
             with state_lock(self.paths.state_file):
@@ -13417,6 +13425,8 @@ class OrchestratorApp:
         reviewed_head: str | None = None,
         required_changes: Sequence[str] | None = None,
         session_metrics: dict[str, Any] | None = None,
+        *,
+        allow_stale_head: bool = False,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -13532,8 +13542,46 @@ class OrchestratorApp:
         # disagrees with the live PR head, require an explicit --reviewed-head
         # choice. When they agree (or no packet exists), preserve the existing
         # packet-first / live-fallback semantics and record where the SHA came from.
+        #
+        # Issue #1072: the #467 check only fired when *no* --reviewed-head was
+        # passed. When an automated caller (review()'s CI-failure exit,
+        # test-adequacy exit, dispatch_reviews, cross-family) passed
+        # --reviewed-head matching the packet head, the check was bypassed and
+        # the verdict was pinned to a head that had moved mid-build. The
+        # compare-and-swap guard added by #1036 covered only review()'s
+        # packet-commit tail exit; the two earlier exits returned through
+        # record_review() and bypassed it. Pushing the guard here — into the
+        # single choke point every verdict write passes through — makes the
+        # invariant hold by construction for every caller, not just the one
+        # exit #1036 happened to guard. The operator CLI (``charlie verdict``)
+        # is the one caller that may legitimately pin to a superseded head
+        # (issue #467's explicit-choice design), so it passes
+        # ``allow_stale_head=True``; every automated caller uses the default
+        # ``False`` and is refused. The failure direction is toward redundant
+        # work (the PR is re-reviewed next pass), never toward authorizing a
+        # merge on the wrong head — ``reviewed_head_sha`` is compared against
+        # the current head by every downstream consumer.
         if reviewed_head is not None:
             if packet_head_sha is not None and reviewed_head == packet_head_sha:
+                if (
+                    not allow_stale_head
+                    and live_head_sha is not None
+                    and packet_head_sha != live_head_sha
+                ):
+                    return CommandResult(
+                        False,
+                        f"reviewed head ({reviewed_head}) matches packet head "
+                        f"({packet_head_sha}) but live PR head has moved to "
+                        f"({live_head_sha}); verdict not recorded — head moved "
+                        "during build, will re-review next pass",
+                        {
+                            "pr": pr_number,
+                            "issue": issue_number,
+                            "reason": "head_moved_during_build",
+                            "packet_head_sha": packet_head_sha,
+                            "live_head_sha": live_head_sha,
+                        },
+                    )
                 reviewed_head_sha = reviewed_head
                 reviewed_head_source = "packet"
             elif live_head_sha is not None and reviewed_head == live_head_sha:
@@ -16759,7 +16807,13 @@ class OrchestratorApp:
                     }
                 ]
 
-            self._update_approval_head(
+            # Issue #1072: capture the bool return so telemetry does not
+            # report success for a carry-forward write that was refused
+            # (e.g. _update_approval_head's identity guard rejected a
+            # concurrent verdict change). The branch WAS updated, but the
+            # approval verdict was not carried forward to the new head —
+            # the PR will need re-review. Telemetry-only, no state impact.
+            approval_carried = self._update_approval_head(
                 pr_number,
                 decision,
                 new_head,
@@ -16776,6 +16830,7 @@ class OrchestratorApp:
                     "head_ref": head,
                     "updated": True,
                     "new_head": new_head,
+                    "approval_carry_forward": approval_carried,
                 }
             ]
 
