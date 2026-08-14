@@ -181,6 +181,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervisor_restart_watchdog_disabled": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
+        # The supervisor's startup guard found an editable .pth in the running
+        # interpreter's venv pointing outside the interpreter-derived checkout
+        # (the 2026-08-05 scratch-clone repoint shape). The pass is refused
+        # before config load, so this is terminal for the pass -> error.
+        "venv_editable_anchor_violation": "error",
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
@@ -241,6 +246,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervise_relaunch_cap_reached": "warning",
         "unauthorized_merge_check_skipped": "warning",
         "worktree_foreign_writer": "warning",
+        # Issue #849: rescue capture preserves work before a reset. Warning
+        # level because it means a worktree had uncommitted work that was
+        # about to be lost — the capture succeeded, but the condition that
+        # triggered it is worth attention.
+        "worktree_rescue_captured": "warning",
         # -----------------------------------------------------------------
         # info-level kinds: routine bookkeeping, success, recovery, and
         # other ordinary lifecycle events
@@ -274,6 +284,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "merge_conflict_rework_requested": "info",
         "merge_deferred_stale_base": "info",
         "merge_ready": "info",
+        # Issue #747: the merge lane emitted events for every outcome except
+        # success, so merge throughput was unobservable from events.db. This
+        # is the terminal success event, fired exactly once on the fleet's own
+        # direct-merge path (``merge_ready``'s ``merge_pr`` branch). The
+        # ``actor`` payload field distinguishes fleet-merged PRs from
+        # externally-merged PRs, which are recorded by the separate
+        # ``finalize_externally_merged`` / ``merged_outside_orchestrator``
+        # events and never carry this kind.
+        "merge_succeeded": "info",
         "no_op_rework_repair_requested": "info",
         "operator_claim": "info",
         "operator_claim_released": "info",
@@ -288,6 +307,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "reconcile_pass_skipped": "info",
         "record_review": "info",
         "rescue_dispatched": "info",
+        # One outcome record per self-deploy sibling-pull attempt (pulled /
+        # unchanged / skipped / failed, discriminated by the payload's ok and
+        # skipped_reason/error fields). Info because the common case is routine
+        # bookkeeping; failures additionally log at WARNING and are deliberately
+        # outside the self_deploy_alarm streak (a sibling wedge bounds staleness
+        # but does not block orchestrator deploys).
+        "self_deploy_ci_fleet_pull": "info",
         "review_dispatch": "info",
         "review_dispatch_claim": "info",
         "review_packet": "info",

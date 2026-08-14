@@ -123,6 +123,8 @@ from .safe_ref import require_valid_sha
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    WorktreeProbeFailedError,
+    _worktree_refuse_to_reset_reason,
     clean_worktrees,
     inspect_worktree_state,
     push_branch,
@@ -726,6 +728,81 @@ def _escalate_issue(
         state["prs"][pr_key] = pr_entry
 
     return state
+
+
+def _session_failed_relabeled_payload(
+    *,
+    issue_number: int,
+    reason: str,
+    failure_kind: str | None = None,
+    removed_labels: list[str] | tuple[str, ...] = (),
+    added_ready: bool = False,
+    label_write_ok: bool = True,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Build the payload for a ``session_failed_relabeled`` event.
+
+    Mirrors ``_escalate_issue`` (#750): ``reason`` is keyword-only and
+    required, so a relabel event can never be emitted without saying *why*
+    it fired. ``failure_kind`` is an optional refinement (the classifier's
+    verdict, which may be ``None`` when classification could not determine
+    a kind); when present it is recorded alongside ``reason``, but
+    ``reason`` is the canonical field a reader filters on.
+
+    Every prior call site spelled "why" under a different key --
+    ``reason`` (orphan sweep), ``failure_kind`` only (dead-worker
+    no-open-PR), both (phantom live worker), or English prose in
+    ``detail`` (reconcile) -- so a query on any one key silently missed
+    the rows written by the others. Routing all sites through this
+    builder makes the omission unrepresentable: there is no way to call
+    it without a ``reason``. Issue #978.
+    """
+    payload: dict[str, Any] = {
+        "issue_number": issue_number,
+        "reason": reason,
+        "removed_labels": sorted(removed_labels),
+        "added_ready": added_ready,
+        "label_write_ok": label_write_ok,
+    }
+    if failure_kind is not None:
+        payload["failure_kind"] = failure_kind
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _emit_session_failed_relabeled(
+    state: dict[str, Any],
+    *,
+    issue_number: int,
+    reason: str,
+    failure_kind: str | None = None,
+    removed_labels: list[str] | tuple[str, ...] = (),
+    added_ready: bool = False,
+    label_write_ok: bool = True,
+    state_path: Path | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Emit a ``session_failed_relabeled`` event via the shared payload builder.
+
+    Thin wrapper around :func:`_session_failed_relabeled_payload` plus
+    :func:`append_event`; see the payload builder's docstring for the
+    required-``reason`` invariant (issue #978).
+    """
+    return append_event(
+        state,
+        "session_failed_relabeled",
+        _session_failed_relabeled_payload(
+            issue_number=issue_number,
+            reason=reason,
+            failure_kind=failure_kind,
+            removed_labels=removed_labels,
+            added_ready=added_ready,
+            label_write_ok=label_write_ok,
+            **extra,
+        ),
+        state_path=state_path,
+    )
 
 
 # Statuses that mean an issue already has a rework routed (or an equivalent
@@ -3567,15 +3644,33 @@ def _detect_and_handle_stalled_reviews(
                 "reviewer_pid": None,
                 "reviewer_process_start_time": None,
             }
-            sweep_events.append(
-                (
-                    "review_dispatch_stalled",
-                    {
-                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
-                        "status": "unclaimed",
-                        "prompt_mtime": packet_age,
-                    },
-                )
+            # Issue #748: an unclaimed packet is a transient startup race, not
+            # a terminal failure. ``review()`` generated the packet but
+            # ``dispatch_reviews`` has not claimed it yet; this sweep marks it
+            # ``review_dispatch_failed`` so the next dispatch pass retries.
+            # Measured against events.db (81 unclaimed events, 2026-07-23 to
+            # 2026-08-13): 31/81 (38%) recovered via ``review_dispatch_claim``
+            # with a median of 19s (27/31 under 60s); the remaining 50/81 were
+            # handled by fallback mechanisms (orphaned-worker routing, stale-
+            # claim reaping, escalation) rather than the normal dispatch path.
+            # In neither case is the packet stuck -- the sweep's
+            # ``review_dispatch_failed`` transition guarantees a retry path.
+            # Routing this through ``append_event`` directly with
+            # ``level="warning"`` (instead of ``sweep_events``) mirrors the two
+            # ``provider_throttled*`` paths above and keeps it out of the
+            # ``_append_sweep_events`` batcher, which deliberately does not
+            # classify levels (see its comment).
+            unclaimed_payload = {
+                "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                "status": "unclaimed",
+                "prompt_mtime": packet_age,
+            }
+            state = append_event(
+                state,
+                "review_dispatch_stalled",
+                unclaimed_payload,
+                state_path=state_file,
+                level="warning",
             )
             changed = True
             stalled.append(
@@ -3753,6 +3848,11 @@ def _reap_orphaned_review_checkouts(
         new_pr_state["number"] = pr_number
         if gh_state == "MERGED":
             new_pr_state["status"] = "merged"
+            # Issue #747: stamp ``merged_at`` only on a genuine non-merged ->
+            # merged transition so re-reaping a PR already recorded as merged
+            # does not overwrite the original observation time.
+            if pr_state.get("status") != "merged":
+                new_pr_state["merged_at"] = utc_now()
         else:
             # Record the terminal closed state so a future pass does not
             # re-query.  Always overwrite — a stale "reviewing" status left
@@ -4720,11 +4820,11 @@ def _detect_and_handle_orphaned_workers(
                     sweep_events.append(
                         (
                             "session_failed_relabeled",
-                            {
-                                "issue_number": issue_number,
-                                "reason": "dead_worker_no_open_pr_orphan_sweep",
+                            _session_failed_relabeled_payload(
+                                issue_number=issue_number,
+                                reason="dead_worker_no_open_pr_orphan_sweep",
                                 **reclaim,
-                            },
+                            ),
                         )
                     )
                     if reclaim["label_write_ok"]:
@@ -5377,13 +5477,20 @@ def _annotation_to_required_change(check_name: str, annotation: dict[str, Any]) 
     """Format a single GitHub check-run annotation as a ``required_changes`` entry.
 
     Returns ``None`` -- never a fabricated placeholder -- when the annotation
-    carries no message; a bare location with no explanation is not
-    actionable. ``path``/``start_line`` are appended when present, but their
-    absence does not sink the entry: the message alone is still real,
-    GitHub-sourced reviewer content, so it renders as ``"<check>: <message>"``
-    rather than being dropped.
+    carries no message or is not failure-level. A bare location with no
+    explanation is not actionable, and ``warning``/``notice`` annotations are
+    not required changes: they are emitted on green runs too (e.g. the
+    ``actions/checkout@v4`` Node.js 20 deprecation advisory is present on
+    every run of this workflow), so surfacing them as rework items sends the
+    worker after unrelated noise (issue #993). Only
+    ``annotation_level == "failure"`` renders. ``path``/``start_line`` are
+    appended when present, but their absence does not sink the entry: the
+    message alone is still real, GitHub-sourced reviewer content, so it
+    renders as ``"<check>: <message>"`` rather than being dropped.
     """
     if not isinstance(annotation, dict):
+        return None
+    if str(annotation.get("annotation_level") or "").strip() != "failure":
         return None
     message = str(annotation.get("message") or "").strip()
     if not message:
@@ -5429,18 +5536,26 @@ def _required_changes_from_checks(
 
     Returns an empty list -- never a fabricated file/line -- only when
     ``checks`` is unavailable or no name in ``failed_required_checks`` is
-    actually failing per ``_is_failing_run``. For each failing check that
-    resolves to a check-run id but whose annotations are empty or unusable
-    (common for a process-level crash with no per-line findings), or that
-    has no resolvable check-run id at all (e.g. a non-Actions status check),
-    this falls back to the check's own ``link`` -- real, GitHub-sourced data
-    already present on every entry in ``checks`` (``PR_CHECKS_FIELDS``
-    always requests it) -- so the rework brief still points the worker at
-    the failing run instead of only naming the check. ``record_review``'s
-    caller passes this straight through as ``required_changes``; the
-    ``_render_required_changes_section`` tier-2 "CI failed on X" summary
-    fallback only fires when this list comes back fully empty, which now
-    only happens when GitHub gave us neither annotations nor a link.
+    actually failing per ``_is_failing_run``. For each failing check, the
+    failure-level annotations (warnings/notices are filtered out by
+    ``_annotation_to_required_change``, issue #993) render as entries, and
+    the check's own ``link`` -- real, GitHub-sourced data already present on
+    every entry in ``checks`` (``PR_CHECKS_FIELDS`` always requests it) --
+    is **always** appended alongside them. A process-level crash emits a
+    contentless ``"Process completed with exit code 1."`` failure annotation
+    that names no cause; the real cause (e.g. a TLS handshake timeout) lives
+    only in the step log the link reaches. Appending the link unconditionally
+    -- rather than only when *no* annotations rendered -- removes the need to
+    predict which annotations are informative: a worker that can reach the
+    run log can find a transient-cause failure that no annotation names, and
+    one that cannot, cannot. When no failure-level annotations rendered, the
+    link line carries the "no per-line annotations available" wording so the
+    worker knows to look at the run log rather than search for a missing
+    file/line. ``record_review``'s caller passes this straight through as
+    ``required_changes``; the ``_render_required_changes_section`` tier-2
+    "CI failed on X" summary fallback only fires when this list comes back
+    fully empty, which now only happens when GitHub gave us neither
+    failure-level annotations nor a link.
     """
     if not checks or not failed_required_checks:
         return []
@@ -5462,11 +5577,13 @@ def _required_changes_from_checks(
             if isinstance(check_run_id, int)
             else []
         )
-        if entries:
-            required_changes.extend(entries)
-            continue
+        required_changes.extend(entries)
         link = str(check.get("link") or "").strip()
-        if link:
+        if not link:
+            continue
+        if entries:
+            required_changes.append(f"{name}: failing run — {link}")
+        else:
             required_changes.append(
                 f"{name}: no per-line annotations available from GitHub; "
                 f"inspect the failing run at {link}"
@@ -6713,18 +6830,16 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # Issue #282: preserve the liveness fingerprint so the
                     # recovery path can verify the worker is dead before removing
                     # the worktree, even after the session is classified as dead.
-                    state = append_event(
+                    state = _emit_session_failed_relabeled(
                         state,
-                        "session_failed_relabeled",
-                        {
-                            "issue_number": w.issue_number,
-                            "failure_kind": failure_kind,
-                            "removed_labels": sorted(active_labels),
-                            "added_ready": needs_ready,
-                            "label_write_ok": label_write_ok,
-                            "salvage_failed": is_completed,
-                            "salvage_error": salvage_error,
-                        },
+                        issue_number=w.issue_number,
+                        reason="dead_worker_no_open_pr",
+                        failure_kind=failure_kind,
+                        removed_labels=sorted(active_labels),
+                        added_ready=needs_ready,
+                        label_write_ok=label_write_ok,
+                        salvage_failed=is_completed,
+                        salvage_error=salvage_error,
                         state_path=state_file,
                     )
                     save_state(state_file, state)
@@ -8007,13 +8122,20 @@ class OrchestratorApp:
                         pr_number = int(pr["number"])
                         pr_key = str(pr_number)
                         pr_entry = state["prs"].get(pr_key, {})
-                        state["prs"][pr_key] = {
+                        _new_pr_state = {
                             **pr_entry,
                             "number": pr_number,
                             "status": "merged",
                             "merged": True,
                             "issue_number": issue_number,
                         }
+                        # Issue #747: stamp ``merged_at`` only on a genuine
+                        # non-merged -> merged transition so the original
+                        # observation time is preserved across re-finalization
+                        # passes and existing entries are never back-dated.
+                        if pr_entry.get("status") != "merged":
+                            _new_pr_state["merged_at"] = utc_now()
+                        state["prs"][pr_key] = _new_pr_state
                 if issue_pr_map:
                     state = self._record_event(
                         state,
@@ -8689,11 +8811,17 @@ class OrchestratorApp:
             for pr_number in merged_pr_bound_pr_numbers:
                 _pr_key = str(pr_number)
                 _pr_entry = state["prs"].get(_pr_key, {})
-                state["prs"][_pr_key] = {
+                _bound_pr_state = {
                     **_pr_entry,
                     "status": "merged",
                     "merged": True,
                 }
+                # Issue #747: stamp ``merged_at`` only on a genuine non-merged
+                # -> merged transition; preserve the original observation time
+                # on entries already recorded as merged.
+                if _pr_entry.get("status") != "merged":
+                    _bound_pr_state["merged_at"] = utc_now()
+                state["prs"][_pr_key] = _bound_pr_state
             if merged_pr_bound_pr_numbers:
                 save_state(self.paths.state_file, state)
             # Record a flag timestamp so operators/tooling (e.g. a doctor
@@ -13405,6 +13533,47 @@ class OrchestratorApp:
         "dispatched_at",
     )
 
+    def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> str | None:
+        """Re-run the worktree safety check for an issue (issue #849).
+
+        Returns a reason string if the issue's worktree is still unsafe to
+        reset, or ``None`` if the worktree is safe (or does not exist). Used
+        by both de-escalation paths (``unescalate`` and
+        ``_deescalate_mechanical_issue``) to refuse clearing a
+        ``worktree_unsafe`` escalation while the underlying cause — a set of
+        bytes on disk — still persists. Without this check, clearing the
+        label reports success for an operation that changed nothing causal,
+        and the next rework dispatch reproduces the escalation deterministically.
+
+        Fails closed: a probe failure (``WorktreeProbeFailedError``) is
+        treated as "still unsafe" so a transient index lock cannot clear a
+        real blocker.
+        """
+        issue_entry = state.get("issues", {}).get(str(issue_number), {})
+        if not isinstance(issue_entry, dict):
+            return None
+        branch = issue_entry.get("branch_name")
+        if not branch or not isinstance(branch, str):
+            return None
+        wt_path = worktree_path_for_branch(self.repo_root, branch, self._layout.worktrees)
+        if not wt_path.is_dir():
+            # No worktree on disk — the blocker is gone (or was never this
+            # issue's worktree). Clearing is safe.
+            return None
+        try:
+            return _worktree_refuse_to_reset_reason(
+                self.repo_root,
+                branch,
+                self.config.dispatch.base_ref,
+                wt_path,
+                self.config.dispatch.injected_paths,
+                self.config.dispatch.materialize_dirs,
+            )
+        except (WorktreeProbeFailedError, RuntimeError):
+            # Fail closed: a probe failure means we cannot confirm safety,
+            # so treat the worktree as still unsafe.
+            return "worktree safety probe failed; cannot confirm clean"
+
     def unescalate(
         self,
         pr_number: int | None = None,
@@ -13522,6 +13691,34 @@ class OrchestratorApp:
                 },
             )
 
+        # Issue #849: a ``worktree_unsafe`` escalation is caused by bytes on
+        # disk, not by a label or a PR state. Clearing the label without
+        # inspecting the worktree reports success for an operation that
+        # changed nothing causal — the next rework dispatch reproduces the
+        # escalation deterministically. Re-run the safety check and refuse to
+        # clear while the worktree still fails it.
+        if (
+            issue_number is not None
+            and issue_stuck
+            and issue_state.get("escalation_reason") == "worktree_unsafe"
+        ):
+            unsafe_reason = self._worktree_still_unsafe(issue_number, state)
+            if unsafe_reason:
+                return CommandResult(
+                    True,
+                    f"issue #{issue_number} escalated as worktree_unsafe; "
+                    f"worktree is still unsafe ({unsafe_reason}) — clearing "
+                    f"the label would change nothing causal. Remove or "
+                    f"commit the worktree work before re-arming.",
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "worktree_still_unsafe": True,
+                        "worktree_unsafe_reason": unsafe_reason,
+                        "changed": False,
+                    },
+                )
+
         # Compute the TRANSFORMATION from the pre-fetch snapshot (for dry_run
         # reporting), then re-apply it to freshly-loaded entries inside the
         # write lock below -- gh.pr_view has real latency, and writing this
@@ -13549,6 +13746,15 @@ class OrchestratorApp:
                     if field_name in ("review_dispatch_attempt_count", "request_changes_count"):
                         continue
                     updated.pop(field_name, None)
+            elif pr_status_target == "merged":
+                # Issue #747: stamp ``merged_at`` only on a genuine non-merged
+                # -> merged transition (the same pattern as the other five
+                # merged_at sites) so an unescalate that re-observes a PR
+                # already recorded as merged does not back-date the original
+                # observation time. ``entry`` is the pre-reset entry, so its
+                # ``status`` is the prior state, not the target just assigned.
+                if entry.get("status") != "merged":
+                    updated["merged_at"] = utc_now()
             return updated
 
         issue_status_action: str = "leave"
@@ -14315,15 +14521,53 @@ class OrchestratorApp:
             and (approved or not self.config.auto_merge.require_approved_review)
             and not sync_failed
         )
+        # Issue #840: escalation gate on the merge-execution block. An
+        # approved, green, conflict-free PR whose linked issue (or the PR
+        # itself) is escalated (status == "escalated", i.e. a human has been
+        # asked to intervene via agent:human-needed) must NOT be actually
+        # merged while that flag is up -- even when the specific reason for
+        # escalation is unrelated to mergeability (e.g. a dead request-
+        # changes-fix worker exhausting the watchdog's redispatch cap; real
+        # corpus: issues #592/#648/#606). Silently completing an irreversible
+        # merge while escalated defeats the purpose of raising the flag.
+        #
+        # This is a plain gate on the merge-execution block ONLY -- it does
+        # NOT modify ``can_merge``, so the failed-attempt-alarm counter block
+        # below still sees ``can_merge`` True and zeroes the streak via the
+        # ``elif can_merge:`` branch (a green pass held by escalation is not
+        # a failed pass). Modifying ``can_merge`` itself would make
+        # ``approved and not can_merge`` true, incrementing the counter every
+        # pass and eventually firing a spurious merge_attempt_alarm for a PR
+        # that isn't failing to merge for a mergeability reason -- a
+        # diagnostic regression in the same spirit as the unbounded-counter
+        # bug issue #777(b) fixed for PR #679.
+        #
+        # State is re-read here rather than reusing a flag computed at
+        # function entry: the carry-forward / head_moved / merge-conflict
+        # branches above can each write a new status for this PR/issue
+        # mid-call, so only a read taken at this exact point is trustworthy
+        # (same pattern as the head_moved branch's escalation read above).
+        _escalation_snap = load_state_locked(self.paths.state_file)
+        _pr_escalated, _issue_escalated = _escalation_flags(
+            _escalation_snap.get("prs", {}).get(str(pr_number), {}),
+            _escalation_snap.get("issues", {}).get(str(issue_number), {})
+            if issue_number is not None
+            else None,
+        )
+        escalated_merge_hold = can_merge and (_pr_escalated or _issue_escalated)
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         merge_output: str | None = None
+        # Issue #747: timestamp of the fleet's own merge_pr success (None until
+        # the direct-merge branch runs and succeeds). Used for the
+        # ``merge_succeeded`` event payload and the ``merged_at`` state field.
+        _merged_at: str | None = None
         branch_deleted: bool | None = None
         update_results: list[dict[str, Any]] | None = None
         cancel_results: dict[str, Any] | None = None
         mergequeue_label_applied: bool | None = None
         merge_hold: bool = False
         merge_hold_check_unavailable: bool = False
-        if can_merge and should_merge:
+        if can_merge and should_merge and not escalated_merge_hold:
             mergequeue_label = self.config.auto_merge.mergequeue_label
             if mergequeue_label:
                 # Aviator MergeQueue handoff (task #10): apply the trigger
@@ -14420,6 +14664,12 @@ class OrchestratorApp:
                     admin=self.config.auto_merge.admin,
                     merge_flags=self.config.auto_merge.merge_flags,
                 )
+                # Issue #747: stamp ``merged_at`` at the irreversible step so
+                # merge throughput/latency are computable from state.json.
+                # Existing merged entries are not back-dated — this only fires
+                # on a genuine non-merged -> merged transition (merge_pr just
+                # succeeded), so the timestamp is the real merge time.
+                _merged_at = utc_now()
                 with state_lock(self.paths.state_file):
                     state = load_state(self.paths.state_file)
                     state["prs"][str(pr_number)] = {
@@ -14428,6 +14678,7 @@ class OrchestratorApp:
                         "issue_number": issue_number,
                         "status": "merged",
                         "merged": True,
+                        "merged_at": _merged_at,
                         "consecutive_failed_merge_attempts": 0,
                     }
                     if issue_number is not None:
@@ -14805,6 +15056,28 @@ class OrchestratorApp:
                     "cancel_superseded_runs_results": cancel_results,
                 },
             )
+            # Issue #747: emit a dedicated terminal success event on the
+            # fleet's own direct-merge path. ``merge_output`` is truthy only
+            # when ``merge_pr`` actually ran and succeeded (it stays None for
+            # mergequeue handoffs, deferrals, conflicts, and skipped/deferred
+            # passes), so this fires exactly once per real fleet merge and is
+            # silent on every other outcome — the negative control the issue
+            # requires. ``actor="fleet"`` distinguishes these from
+            # externally-merged PRs, which are recorded by
+            # ``finalize_externally_merged`` / ``merged_outside_orchestrator``
+            # and never emit this kind.
+            if merge_output:
+                state = self._record_event(
+                    state,
+                    "merge_succeeded",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "actor": "fleet",
+                        "merge_method": self.config.auto_merge.strategy,
+                        "merged_at": _merged_at,
+                    },
+                )
             save_state(self.paths.state_file, state)
         data = {
             "pr": pr_number,
@@ -14832,12 +15105,15 @@ class OrchestratorApp:
             "mergequeue_label_applied": mergequeue_label_applied,
             "merge_hold": merge_hold,
             "merge_hold_check_unavailable": merge_hold_check_unavailable,
+            "escalated_merge_hold": escalated_merge_hold,
         }
         message = "merge readiness evaluated"
         if cross_pr_revert_detected:
             message = f"cross-PR revert detected: {cross_pr_revert_reason}"
         elif checks_unavailable:
             message = "checks unavailable (gh failure)"
+        elif escalated_merge_hold:
+            message += " (escalated — merge held while agent:human-needed is up)"
         elif merge_hold_check_unavailable:
             message += f" (merge-hold check unavailable for issue #{issue_number} — not handed off to Aviator)"
         elif merge_hold:
@@ -15063,13 +15339,25 @@ class OrchestratorApp:
             and (approved or not self.config.auto_merge.require_approved_review)
             and not sync_failed
         )
+        # Issue #840: mirror the real path's escalation gate so the dry-run
+        # preview accurately reports "would be held" instead of "would merge"
+        # when the PR or its linked issue is escalated. Reuses the read-only
+        # ``state`` snapshot loaded at the top of this dry-run (no mid-call
+        # writes happen in dry-run, unlike the real path's re-read).
+        _pr_escalated, _issue_escalated = _escalation_flags(
+            existing_pr_state,
+            state.get("issues", {}).get(str(issue_number), {})
+            if issue_number is not None
+            else None,
+        )
+        escalated_merge_hold = can_merge and (_pr_escalated or _issue_escalated)
         should_merge = self.config.auto_merge.enabled if merge is None else merge
         mergequeue_label = self.config.auto_merge.mergequeue_label
 
         # Read-only merge-hold check (same condition as the real path).
         merge_hold = False
         merge_hold_check_unavailable = False
-        if can_merge and should_merge:
+        if can_merge and should_merge and not escalated_merge_hold:
             merge_hold = self.config.labels.merge_hold in label_names(pr)
             if not merge_hold and issue_number is not None:
                 try:
@@ -15088,11 +15376,13 @@ class OrchestratorApp:
 
         # Describe what *would* happen so the preview is actionable.
         message = "dry-run: merge readiness evaluated"
-        if can_merge and should_merge and not merge_hold:
+        if can_merge and should_merge and not merge_hold and not escalated_merge_hold:
             if mergequeue_label:
                 message += f" (would hand off to mergequeue label {mergequeue_label!r})"
             else:
                 message += " (would merge)"
+        elif escalated_merge_hold:
+            message += " (escalated — would hold merge while agent:human-needed is up)"
         elif merge_hold:
             message += (
                 f" (merge-hold label {self.config.labels.merge_hold!r} present"
@@ -15140,6 +15430,7 @@ class OrchestratorApp:
                 "mergequeue_label_applied": None,
                 "merge_hold": merge_hold,
                 "merge_hold_check_unavailable": merge_hold_check_unavailable,
+                "escalated_merge_hold": escalated_merge_hold,
                 "dry_run": True,
             },
         )
@@ -18374,6 +18665,17 @@ class OrchestratorApp:
             # a live worker is using this issue; not stuck
             return _deescalation_skip("worker_live", issue_number)
 
+        # Issue #849: a ``worktree_unsafe`` escalation is caused by bytes on
+        # disk. Clearing it based on PR-level health (OPEN, not CONFLICTING,
+        # janitor_ok) without inspecting the worktree reports success for an
+        # operation that changed nothing causal — the next rework dispatch
+        # reproduces the escalation deterministically. Re-run the safety
+        # check and skip clearing while the worktree still fails it.
+        if issue_entry.get("escalation_reason") == "worktree_unsafe":
+            unsafe_reason = self._worktree_still_unsafe(issue_number, state)
+            if unsafe_reason:
+                return _deescalation_skip("worktree_still_unsafe", issue_number)
+
         pr = self.gh.pr_view(pr_number)
         pr_state_str = str(pr.get("state") or "").upper()
         # Mirror janitor._check_mergeable's own permissive definition of
@@ -20788,19 +21090,16 @@ class OrchestratorApp:
                 # strip labels -- the issue should stay in its active state
                 # until salvage moves it to pr_open, preventing re-dispatch
                 # into the occupied worktree.
-                state = append_event(
+                state = _emit_session_failed_relabeled(
                     state,
-                    "session_failed_relabeled",
-                    {
-                        "issue_number": issue_number,
-                        "failure_kind": "live_worker_redispatch_averted",
-                        "reason": "phantom_live_worker_completed_work_preserved",
-                        "worktree_state": inspection.state.value,
-                        "reported_push": reported_push,
-                        "removed_labels": [],
-                        "added_ready": False,
-                        "label_write_ok": True,
-                    },
+                    issue_number=issue_number,
+                    reason="phantom_live_worker_completed_work_preserved",
+                    failure_kind="live_worker_redispatch_averted",
+                    removed_labels=[],
+                    added_ready=False,
+                    label_write_ok=True,
+                    worktree_state=inspection.state.value,
+                    reported_push=reported_push,
                     state_path=self.paths.state_file,
                 )
                 return "dispatch_failed", None, state
@@ -20819,17 +21118,14 @@ class OrchestratorApp:
         issue_labels = label_names(full_issue)
         active_labels = issue_labels & self.config.labels.active
         if not active_labels:
-            state = append_event(
+            state = _emit_session_failed_relabeled(
                 state,
-                "session_failed_relabeled",
-                {
-                    "issue_number": issue_number,
-                    "failure_kind": "live_worker_redispatch_averted",
-                    "reason": "phantom_live_worker_pid_dead",
-                    "removed_labels": [],
-                    "added_ready": False,
-                    "label_write_ok": True,
-                },
+                issue_number=issue_number,
+                reason="phantom_live_worker_pid_dead",
+                failure_kind="live_worker_redispatch_averted",
+                removed_labels=[],
+                added_ready=False,
+                label_write_ok=True,
                 state_path=self.paths.state_file,
             )
             return "dispatch_failed", None, state
@@ -20842,17 +21138,14 @@ class OrchestratorApp:
         if needs_ready:
             if not self.gh.add_issue_label(issue_number, self.config.labels.ready):
                 label_write_ok = False
-        state = append_event(
+        state = _emit_session_failed_relabeled(
             state,
-            "session_failed_relabeled",
-            {
-                "issue_number": issue_number,
-                "failure_kind": "live_worker_redispatch_averted",
-                "reason": "phantom_live_worker_pid_dead",
-                "removed_labels": sorted(active_labels),
-                "added_ready": needs_ready,
-                "label_write_ok": label_write_ok,
-            },
+            issue_number=issue_number,
+            reason="phantom_live_worker_pid_dead",
+            failure_kind="live_worker_redispatch_averted",
+            removed_labels=sorted(active_labels),
+            added_ready=needs_ready,
+            label_write_ok=label_write_ok,
             state_path=self.paths.state_file,
         )
         return "dispatch_failed", None, state

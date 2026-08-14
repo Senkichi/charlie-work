@@ -1076,7 +1076,11 @@ def launch_claude_worker(
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
-            worktree_path=getattr(exc, "worktree_path", "")
+            # str() is load-bearing: the exception stores a Path, and an
+            # unserializable field here destroys this whole failure record
+            # mid-json.dump, downgrading the diagnosis to a generic launch
+            # failure that burns the rework cap (issue #1184).
+            worktree_path=str(getattr(exc, "worktree_path", ""))
             if isinstance(exc, WorktreeForeignWriterError)
             else "",
             prompt_path="",

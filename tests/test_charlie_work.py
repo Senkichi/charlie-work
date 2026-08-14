@@ -16578,6 +16578,7 @@ def test_annotation_to_required_change_full_annotation() -> None:
             "path": "src/charlie_work/workflow.py",
             "start_line": 42,
             "message": "line too long (100 > 99)",
+            "annotation_level": "failure",
         },
     )
     assert entry == "Lint: src/charlie_work/workflow.py:42 — line too long (100 > 99)"
@@ -16585,20 +16586,63 @@ def test_annotation_to_required_change_full_annotation() -> None:
 
 def test_annotation_to_required_change_no_message_returns_none() -> None:
     """Never fabricate a placeholder when GitHub gives no explanatory message."""
-    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "start_line": 1}) is None
-    assert _annotation_to_required_change("Lint", {"path": "src/foo.py", "message": ""}) is None
+    assert (
+        _annotation_to_required_change(
+            "Lint", {"path": "src/foo.py", "start_line": 1, "annotation_level": "failure"}
+        )
+        is None
+    )
+    assert (
+        _annotation_to_required_change(
+            "Lint", {"path": "src/foo.py", "message": "", "annotation_level": "failure"}
+        )
+        is None
+    )
+
+
+def test_annotation_to_required_change_non_failure_level_returns_none() -> None:
+    """Issue #993: warning/notice annotations are not required changes -- they
+    are emitted on green runs too (e.g. the actions/checkout Node.js 20
+    deprecation advisory), so surfacing them as rework items sends the worker
+    after unrelated noise. Only ``annotation_level == "failure"`` renders."""
+    warning = {
+        "path": ".github",
+        "start_line": 2,
+        "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
+        "annotation_level": "warning",
+    }
+    notice = {
+        "path": "src/foo.py",
+        "start_line": 1,
+        "message": "consider using X",
+        "annotation_level": "notice",
+    }
+    missing_level = {"path": "src/foo.py", "start_line": 1, "message": "boom"}
+    null_level = {
+        "path": "src/foo.py",
+        "start_line": 1,
+        "message": "boom",
+        "annotation_level": None,
+    }
+    assert _annotation_to_required_change("Lint", warning) is None
+    assert _annotation_to_required_change("Lint", notice) is None
+    assert _annotation_to_required_change("Lint", missing_level) is None
+    assert _annotation_to_required_change("Lint", null_level) is None
 
 
 def test_annotation_to_required_change_missing_path_falls_back_to_message_only() -> None:
     """No path/line data (e.g. a process-level crash) still surfaces the real
     message rather than being dropped -- but with no fabricated location."""
-    entry = _annotation_to_required_change("Tests", {"message": "process exited with code 1"})
+    entry = _annotation_to_required_change(
+        "Tests", {"message": "process exited with code 1", "annotation_level": "failure"}
+    )
     assert entry == "Tests: process exited with code 1"
 
 
 def test_annotation_to_required_change_path_without_line() -> None:
     entry = _annotation_to_required_change(
-        "Lint", {"path": "src/foo.py", "message": "file-level issue"}
+        "Lint",
+        {"path": "src/foo.py", "message": "file-level issue", "annotation_level": "failure"},
     )
     assert entry == "Lint: src/foo.py — file-level issue"
 
@@ -16614,8 +16658,18 @@ def test_required_changes_from_checks_aggregates_annotations_for_failing_check()
     ]
     annotations_by_id = {
         111: [
-            {"path": "src/foo.py", "start_line": 10, "message": "E501 line too long"},
-            {"path": "src/bar.py", "start_line": 20, "message": "F401 unused import"},
+            {
+                "path": "src/foo.py",
+                "start_line": 10,
+                "message": "E501 line too long",
+                "annotation_level": "failure",
+            },
+            {
+                "path": "src/bar.py",
+                "start_line": 20,
+                "message": "F401 unused import",
+                "annotation_level": "failure",
+            },
         ],
     }
     required_changes = _required_changes_from_checks(
@@ -16634,7 +16688,11 @@ def test_required_changes_from_checks_skips_passing_run_of_failed_name() -> None
 
     def fetch(check_run_id: int) -> list[dict[str, Any]]:
         fetched_ids.append(check_run_id)
-        return [{"path": "x.py", "start_line": 1, "message": "boom"}] if check_run_id == 2 else []
+        return (
+            [{"path": "x.py", "start_line": 1, "message": "boom", "annotation_level": "failure"}]
+            if check_run_id == 2
+            else []
+        )
 
     checks = [
         {"name": "Tests", "state": "SUCCESS", "databaseId": 1},
@@ -16720,6 +16778,102 @@ def test_required_changes_from_checks_no_checks_available_degrades_to_empty() ->
 def test_required_changes_from_checks_no_failed_names_degrades_to_empty() -> None:
     checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 5}]
     assert _required_changes_from_checks(checks, (), lambda _id: [{"message": "x"}]) == []
+
+
+def test_required_changes_from_checks_filters_warning_level_annotations() -> None:
+    """Issue #993: warning/notice annotations are present on green runs too
+    (e.g. the actions/checkout Node.js 20 deprecation advisory), so they are
+    not required changes. Only failure-level annotations render as entries;
+    the warning is dropped entirely rather than crowding the rework brief
+    with unrelated noise."""
+    checks = [{"name": "Lint", "state": "FAILURE", "databaseId": 111}]
+    annotations = [
+        {
+            "path": ".github",
+            "start_line": 2,
+            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
+            "annotation_level": "warning",
+        },
+        {
+            "path": "src/foo.py",
+            "start_line": 10,
+            "message": "E501 line too long",
+            "annotation_level": "failure",
+        },
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
+    assert required_changes == ["Lint: src/foo.py:10 — E501 line too long"]
+
+
+def test_required_changes_from_checks_appends_link_alongside_failure_annotations() -> None:
+    """Issue #993: the failing run's ``link`` is always appended alongside
+    whatever failure-level annotations rendered -- not only when *zero*
+    annotations rendered. A process-level crash emits a contentless
+    ``"Process completed with exit code 1."`` failure annotation that names
+    no cause; the real cause (e.g. a TLS handshake timeout) lives only in
+    the step log the link reaches. The old ``if entries:`` guard suppressed
+    the link whenever any annotation rendered, so the fallback never fired
+    in the scenario its own docstring named as common."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": 111,
+            "link": "https://github.com/o/r/actions/runs/92297706625",
+        }
+    ]
+    annotations = [
+        {
+            "path": ".github",
+            "start_line": 2,
+            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
+            "annotation_level": "warning",
+        },
+        {
+            "path": ".github",
+            "start_line": 14,
+            "message": "Process completed with exit code 1.",
+            "annotation_level": "failure",
+        },
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
+    # The warning is filtered out; the contentless failure annotation still
+    # renders (it is failure-level and carries a message), and the link is
+    # appended alongside it so the worker can reach the run log where the
+    # real cause lives.
+    assert required_changes == [
+        "Lint: .github:14 — Process completed with exit code 1.",
+        "Lint: failing run — https://github.com/o/r/actions/runs/92297706625",
+    ]
+
+
+def test_required_changes_from_checks_link_fallback_fires_for_contentless_failure_only() -> None:
+    """Issue #993: when the only annotations are non-failure-level (so
+    ``entries`` is empty after filtering), the link fallback still fires
+    with the "no per-line annotations available" wording -- the fallback is
+    not deleted, only its guard is fixed so it no longer requires *zero*
+    annotations of any level."""
+    checks = [
+        {
+            "name": "Lint",
+            "state": "FAILURE",
+            "databaseId": 111,
+            "link": "https://github.com/o/r/actions/runs/1",
+        }
+    ]
+    annotations = [
+        {
+            "path": ".github",
+            "start_line": 2,
+            "message": "Node.js 20 is deprecated. ... actions/checkout@v4",
+            "annotation_level": "warning",
+        },
+    ]
+    required_changes = _required_changes_from_checks(checks, ("Lint",), lambda _id: annotations)
+    assert required_changes == [
+        "Lint: no per-line annotations available from GitHub; "
+        "inspect the failing run at https://github.com/o/r/actions/runs/1",
+    ]
 
 
 def test_review_ci_failure_with_annotations_populates_required_changes(tmp_path: Path) -> None:
@@ -20214,6 +20368,89 @@ def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
     assert load_state(paths.state_file)["prs"]["456"]["status"] == "merged"
 
 
+def test_merge_ready_emits_merge_succeeded_on_fleet_merge(tmp_path: Path) -> None:
+    """Issue #747: the merge lane emitted events for every outcome except
+    success, so merge throughput was unobservable from events.db. A successful
+    fleet direct-merge must emit exactly one ``merge_succeeded`` event carrying
+    ``pr_number``, ``issue_number``, ``actor='fleet'``, the merge method, and a
+    ``merged_at`` timestamp, and the state.json prs entry must gain
+    ``merged_at`` so merge latency is computable retrospectively."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is True
+    state = load_state(paths.state_file)
+    pr_entry = state["prs"]["456"]
+    assert pr_entry["status"] == "merged"
+    assert pr_entry["merged"] is True
+    # state.json merged entry gains a merged_at timestamp (issue #747).
+    assert "merged_at" in pr_entry
+    assert pr_entry["merged_at"]
+    # Exactly one terminal success event, carrying the actor attribution.
+    success_events = [e for e in state["events"] if e["kind"] == "merge_succeeded"]
+    assert len(success_events) == 1
+    payload = success_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["actor"] == "fleet"
+    assert payload["merge_method"] == config.auto_merge.strategy
+    assert payload["merged_at"] == pr_entry["merged_at"]
+
+
+def test_merge_ready_does_not_emit_merge_succeeded_when_merge_skipped(
+    tmp_path: Path,
+) -> None:
+    """Issue #747 negative control: ``merge_succeeded`` must NOT fire when the
+    merge is skipped (no approval -> not mergeable), so the event distinguishes
+    'emitted' from 'always emitted'."""
+    from charlie_work.config import AutoMergeConfig
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # No approval decision -> PR is not merged (skipped).
+    result = app.merge_ready(456)
+
+    assert result.data["merged"] is False
+    state = load_state(paths.state_file)
+    success_events = [e for e in state["events"] if e["kind"] == "merge_succeeded"]
+    assert success_events == []
+
+
+def test_merge_ready_mergequeue_handoff_does_not_emit_merge_succeeded(
+    tmp_path: Path,
+) -> None:
+    """Issue #747 negative control: the Aviator mergequeue handoff is a skip of
+    the fleet's own merge (the fleet applies a label; Aviator merges
+    asynchronously). ``merge_succeeded`` with actor='fleet' must NOT fire,
+    because the fleet did not perform the merge -- this is what makes
+    fleet-merged and externally-merged PRs distinguishable by the event."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="ok")
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is False
+    assert result.data["mergequeue_label_applied"] is True
+    state = load_state(paths.state_file)
+    success_events = [e for e in state["events"] if e["kind"] == "merge_succeeded"]
+    assert success_events == []
+
+
 def test_merge_ready_dry_run_does_not_merge_or_persist(tmp_path: Path) -> None:
     """Issue #614: under --dry-run, merge_ready must not call merge_pr, must
     not write status='merged' to state.json, and must return the computed
@@ -23640,6 +23877,205 @@ def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -
     # Default config: no --admin
     assert fake_gh.merged_admin_flags == [False]
     assert fake_gh.merged_merge_flags == [()]
+
+
+def test_merge_ready_escalated_issue_blocks_merge_of_otherwise_green_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #840: an approved, green, conflict-free PR whose linked issue is
+    escalated (status == "escalated" / agent:human-needed) for a reason
+    unrelated to this PR's mergeability must NOT be actually merged while
+    that flag is up.
+
+    This is the byte-identical scenario as
+    test_merge_ready_merges_when_head_unchanged_after_approval (immediately
+    above) PLUS an escalated linked issue — proving the escalation gate
+    suppresses the merge that the positive control proves would otherwise
+    fire. The escalation reason is deliberately unrelated to mergeability
+    (redispatch_cap_exceeded — a dead request-changes-fix worker exhausting
+    the watchdog's redispatch cap; real corpus: issues #592/#648/#606).
+    """
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    # Escalate the linked issue for an unrelated reason.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    # The irreversible step must not have happened — assert this FIRST so a
+    # mutation that removes the gate fails on the behavioral bug (the PR
+    # getting merged), not merely on a missing return-data key.
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    # can_merge is still True — the PR is genuinely mergeable. The gate is
+    # on the merge-execution block, not on can_merge itself (see the issue
+    # for why modifying can_merge would cause a counter/alarm regression).
+    assert result.data["can_merge"] is True
+    assert result.data["escalated_merge_hold"] is True
+    # The linked issue's escalated status must be preserved.
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+
+
+def test_merge_ready_escalated_pr_blocks_merge_of_otherwise_green_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #840 (PR-level escalation variant): the escalation gate also
+    fires when the PR's own state entry is escalated, not just the linked
+    issue's."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"].get("456", {}),
+            "status": "escalated",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    assert result.data["can_merge"] is True
+    assert result.data["escalated_merge_hold"] is True
+
+
+def test_merge_ready_escalated_issue_counter_does_not_climb(
+    tmp_path: Path,
+) -> None:
+    """Issue #840: the failed-attempt-alarm counter must NOT spuriously climb
+    for an escalated-but-otherwise-mergeable PR. Because the escalation gate
+    leaves ``can_merge`` True (it gates the merge-execution block, not
+    can_merge), the counter block's ``elif can_merge:`` branch zeroes the
+    streak on every pass — a green pass held by escalation is not a failed
+    pass. A spurious climb would eventually cross ``failed_attempt_alarm``
+    and fire a ``merge_attempt_alarm`` digest for a PR that isn't failing to
+    merge for a mergeability reason (the diagnostic regression the issue
+    calls out as the complication with naively adding an escalation term to
+    can_merge).
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    # Run enough passes to cross the alarm threshold IF the counter were
+    # climbing (which it must not).
+    for _ in range(5):
+        result = app.merge_ready(456, merge=True)
+        # Behavioral assertions first: the PR must not be merged and the
+        # counter must not climb — these are the actual bugs the fix prevents.
+        assert result.data["merged"] is False
+        assert result.data["consecutive_failed_merge_attempts"] == 0
+        assert result.data["merge_attempt_alarm"] is False
+        assert result.data["merge_attempt_warning"] is None
+        assert result.data["escalated_merge_hold"] is True
+
+    assert fake_gh.merged == []
+
+
+def test_merge_ready_escalated_issue_blocks_mergequeue_handoff(
+    tmp_path: Path,
+) -> None:
+    """Issue #840 (mergequeue mode): an escalated PR must not be handed off
+    to the mergequeue either — the mergequeue label add IS the handoff
+    (task #10), and handing off while escalated is the same class of
+    silently-completing-an-action-while-a-human-is-asked-to-intervene as a
+    direct merge."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="ok")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    # Behavioral assertions first: the handoff must not have happened.
+    assert result.data["merged"] is False
+    assert result.data["mergequeue_label_applied"] is None
+    # The mergequeue label must not have been added.
+    assert "mergequeue" not in [label for _, label in fake_gh.labels_added]
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"].get("status") != "mergequeue"
+    assert result.data["can_merge"] is True
+    assert result.data["escalated_merge_hold"] is True
+
+
+def test_merge_ready_dry_run_escalated_issue_reports_hold(tmp_path: Path) -> None:
+    """Issue #840 (dry-run): the dry-run preview must accurately report
+    "would hold" instead of "would merge" when the linked issue is
+    escalated, mirroring the real path's gate."""
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            enabled=False,  # dry-run never merges, but the gate must still report
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.dry_run = True
+
+    app.record_review(456, "approved", summary="lgtm")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    # Behavioral assertion first: the preview must not say "would merge".
+    assert "would merge" not in result.message
+    assert "escalated" in result.message
+    assert result.data["dry_run"] is True
+    assert result.data["can_merge"] is True
+    assert result.data["escalated_merge_hold"] is True
 
 
 def test_merge_ready_passes_admin_flag_when_configured(tmp_path: Path) -> None:
@@ -41250,6 +41686,116 @@ def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path)
     state = json.loads(state_file.read_text(encoding="utf-8"))
     events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
     assert len(events) == 1
+
+
+def test_session_failed_relabeled_payload_requires_reason() -> None:
+    """Issue #978: the shared payload builder makes a relabel event without a
+    ``reason`` unrepresentable -- calling it without ``reason`` raises
+    TypeError, the same property ``_escalate_issue`` gives escalation."""
+    from charlie_work.workflow import _session_failed_relabeled_payload
+
+    # reason is a required keyword-only argument.
+    with pytest.raises(TypeError):
+        _session_failed_relabeled_payload(issue_number=42)  # type: ignore[call-arg]
+
+    # With reason, the payload always carries it; failure_kind is optional.
+    payload = _session_failed_relabeled_payload(issue_number=42, reason="dead_worker_no_open_pr")
+    assert payload["reason"] == "dead_worker_no_open_pr"
+    assert "failure_kind" not in payload
+
+    payload = _session_failed_relabeled_payload(
+        issue_number=42, reason="dead_worker_no_open_pr", failure_kind="stalled"
+    )
+    assert payload["reason"] == "dead_worker_no_open_pr"
+    assert payload["failure_kind"] == "stalled"
+
+
+def test_classify_dead_sessions_relabel_carries_required_reason(tmp_path: Path) -> None:
+    """Issue #978: the dead-worker no-open-PR relabel path must emit a
+    ``session_failed_relabeled`` event whose ``reason`` is always populated.
+    Previously this site passed ``failure_kind`` only (which can be ``None``
+    when classification is inconclusive), producing rows with neither
+    ``reason`` nor a populated ``failure_kind`` -- the "neither field" shape."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 978, dirty=True)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 978, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 978,
+            "title": "Test issue",
+            "url": "https://example.test/issues/978",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 101
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+    # The canonical "why" field is always present -- the "neither field"
+    # shape cannot recur regardless of whether failure_kind was classified.
+    assert events[0]["payload"]["reason"] == "dead_worker_no_open_pr"
+
+
+def test_orphaned_worker_reclaim_carries_required_reason(tmp_path: Path) -> None:
+    """Issue #978: the orphan-sweep reclaim path must emit a
+    ``session_failed_relabeled`` event with ``reason`` populated. This site
+    already used ``reason`` before the fix, but it is now routed through the
+    shared payload builder so the invariant is enforced at one point."""
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1978"] = {
+        "status": "dispatched",
+        "dispatched_at": "2026-08-01T00:00:00Z",
+        "redispatch_at": ["2026-08-01T00:05:00Z"],
+        "worker_pid": 55555,
+        "worker_process_start_time": 1784000000.0,
+    }
+    save_state(paths.state_file, state)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 1978,
+            "title": "orphan reclaim",
+            "url": "https://example.test/issues/1978",
+            "body": "",
+            "labels": [
+                {"name": config.labels.in_progress},
+                {"name": config.labels.ready},
+            ],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(events) == 1
+    assert events[0]["payload"]["reason"] == "dead_worker_no_open_pr_orphan_sweep"
 
 
 def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> None:
