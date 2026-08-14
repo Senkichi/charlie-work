@@ -426,8 +426,25 @@ def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
     assert kill_attempts == []
 
 
-def test_kill_process_tree_enumerates_children() -> None:
-    """Test that kill_process_tree enumerates and includes child PIDs."""
+def test_kill_process_tree_enumerates_children(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Test that kill_process_tree enumerates children and kills the process tree.
+
+    The assertion strategy decouples from ``kill_process_tree``'s internal
+    enumeration *result*, which is best-effort by design (``_enumerate_child_pids``
+    swallows transient CIM/proc failures and returns ``[]``). Under full-suite
+    load the internal single-shot enumeration can fail even when the test's
+    retry-loop enumeration succeeded, so asserting ``child_pid in killed``
+    couples two independent enumerations and flakes (#608, #681, #1064).
+
+    Instead we verify three things:
+    1. The parent PID is in ``killed`` (the kill was reported).
+    2. ``kill_process_tree`` called ``_enumerate_child_pids`` (enumeration was
+       attempted — structural, via spy). Catches a regression that removes the
+       enumeration call.
+    3. Each enumerated child is actually dead (behavioral). ``taskkill /T``
+       (Windows) or ``killpg`` (POSIX) kills the tree regardless of enumeration,
+       so this is the reliable signal that the tree kill worked.
+    """
     # Spawn a real parent process that will spawn a child
     # On POSIX, use start_new_session=True to avoid sharing pytest's process group
     # The parent imports ``sys`` before referencing ``sys.executable``; without it
@@ -499,15 +516,63 @@ def test_kill_process_tree_enumerates_children() -> None:
                 f"cannot assert on the killed set"
             )
 
+        # Spy on ``_enumerate_child_pids`` to verify ``kill_process_tree`` calls
+        # it (structural assertion). The spy is installed AFTER the retry loop
+        # above, which imported ``_enumerate_child_pids`` into a local name --
+        # monkeypatching the module attribute only affects ``kill_process_tree``'s
+        # module-level reference, not the retry loop's already-bound local. This
+        # lets us distinguish ``kill_process_tree``'s internal call from the
+        # retry loop's calls. The internal enumeration's *result* is best-effort
+        # (can return ``[]`` under load), so we assert on the *call*, not the
+        # result -- a regression that removes the enumeration call fails here.
+        import charlie_work.process_utils as _pu
+
+        enumerate_calls: list[int] = []
+        _real_enumerate = _pu._enumerate_child_pids
+
+        def _spy_enumerate(spy_pid: int) -> list[int]:
+            enumerate_calls.append(spy_pid)
+            return _real_enumerate(spy_pid)
+
+        monkeypatch.setattr(_pu, "_enumerate_child_pids", _spy_enumerate)
+
         # Kill the parent process tree
         killed = kill_process_tree(parent_proc.pid, expected_start_time=None)
 
-        # Check that the parent PID is in the killed list
+        # 1. The parent PID must be in the killed list (kill was reported).
         assert parent_proc.pid in killed
 
-        # Check that the enumerated child PIDs are in the killed list
+        # 2. ``kill_process_tree`` must call ``_enumerate_child_pids`` with the
+        #    parent PID (enumeration was attempted). This catches a regression
+        #    that removes or skips the enumeration call -- the structural
+        #    guarantee the test name promises. We do NOT assert on the result
+        #    (which children appear in ``killed``) because that result is
+        #    best-effort and transiently empty under load (#1064).
+        assert parent_proc.pid in enumerate_calls, (
+            f"kill_process_tree did not call _enumerate_child_pids for "
+            f"parent {parent_proc.pid}; enumeration was skipped"
+        )
+
+        # 3. Behavioral assertion: each enumerated child must be actually dead.
+        #    ``taskkill /T`` (Windows) or ``killpg`` (POSIX) kills the tree
+        #    regardless of enumeration, so child liveness is the reliable signal
+        #    that the tree kill worked. A bounded retry accommodates kill-signal
+        #    propagation latency under load. This catches a regression that
+        #    breaks the tree kill (e.g. dropping ``/T`` from ``taskkill``) while
+        #    being immune to the enumeration-result race that flaked the prior
+        #    assertion (``assert child_pid in killed``).
         for child_pid in child_pids:
-            assert child_pid in killed
+            child_dead = False
+            child_deadline = time.monotonic() + 5.0
+            while time.monotonic() < child_deadline:
+                if not is_pid_alive(child_pid):
+                    child_dead = True
+                    break
+                time.sleep(0.1)
+            assert child_dead, (
+                f"child {child_pid} still alive after kill_process_tree; "
+                f"tree kill did not reach the child"
+            )
     finally:
         # Clean up if still alive
         if parent_proc.poll() is None:
