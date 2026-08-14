@@ -5213,8 +5213,9 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
     override_dir = tmp_path / "orchestrator-prompts"
     override_dir.mkdir()
     # The override must carry the no-merge contract markers (issue #714),
-    # the conventional-commit title instruction (issue #715), and the
-    # execution-contract escalation trigger (issue #717):
+    # the conventional-commit title instruction (issue #715), the
+    # execution-contract escalation trigger (issue #717), and the widened
+    # containment clause markers (issue #1010):
     # _write_worker_prompt's post-render guards reject a flat override that
     # drops any of these.
     (override_dir / "worker.md").write_text(
@@ -5226,7 +5227,9 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
         "**Execution contract (self-detect from your diff):** the default is "
         "the targeted command. Only if the diff changes any public function "
         "signature/return shape, run the **FULL suite** locally at the final "
-        "head before pushing.\n",
+        "head before pushing.\n\n"
+        "**Containment:** All file edits happen in the assigned worktree; "
+        "never modify any path outside the assigned worktree root.\n",
         encoding="utf-8",
     )
     config = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir="orchestrator-prompts"))
@@ -5246,7 +5249,9 @@ def test_app_prompts_dir_override_wins_for_worker_prompt(tmp_path: Path) -> None
         "**Execution contract (self-detect from your diff):** the default is "
         "the targeted command. Only if the diff changes any public function "
         "signature/return shape, run the **FULL suite** locally at the final "
-        "head before pushing.\n"
+        "head before pushing.\n\n"
+        "**Containment:** All file edits happen in the assigned worktree; "
+        "never modify any path outside the assigned worktree root.\n"
     )
 
 
@@ -23271,10 +23276,12 @@ def test_record_review_blocked_also_derives_required_changes(tmp_path: Path) -> 
 def test_record_review_folds_external_findings_into_required_changes(
     tmp_path: Path,
 ) -> None:
-    """Issue #950: verified external PR comments, review bodies, and inline
-    review threads are folded into ``review-decision.json`` at record time,
-    with ``findings_channel`` set to ``"external"``. Bot-authored content is
-    filtered using the API ``user.type`` discriminator."""
+    """Issue #950/#999: verified external PR comments, review bodies, and
+    inline review threads are ingested into ``review-decision.json`` at
+    record time. Since #999 they ride in their own ``external_findings``
+    field (separate from the reviewer's ``required_changes``) so
+    ``findings_channel`` keeps describing only the reviewer's list. Bot-
+    authored content is filtered using the API ``user.type`` discriminator."""
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -23294,19 +23301,21 @@ def test_record_review_folds_external_findings_into_required_changes(
     decision = json.loads(
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
-    assert decision["findings_channel"] == "external"
+    # The reviewer provided an itemized list, so findings_channel stays
+    # unset (the derivation block only runs on an empty list) -- it is NOT
+    # flipped to "external" anymore (issue #999).
+    assert "findings_channel" not in decision
     assert decision["summary"] == "The retry wrapper swallows the exception type (Fixes #649)."
-    # Internal finding is preserved.
-    assert "add a regression test" in decision["required_changes"]
-    # Human-authored external findings are folded in.
-    assert any("interactive PR list" in item for item in decision["required_changes"])
-    assert any(
-        "https://github.com/cli/cli/pull/14076" in item for item in decision["required_changes"]
-    )
-    assert any("whole test" in item for item in decision["required_changes"])
+    # Internal finding is preserved untouched in required_changes.
+    assert decision["required_changes"] == ["add a regression test"]
+    # Human-authored external findings ride in their own field.
+    external = decision["external_findings"]
+    assert any("interactive PR list" in item for item in external)
+    assert any("https://github.com/cli/cli/pull/14076" in item for item in external)
+    assert any("whole test" in item for item in external)
     # Bot-authored bodies are skipped via user.type == "Bot".
-    assert not any("v0.83.5" in item for item in decision["required_changes"])
-    assert not any("git.Client wrapper" in item for item in decision["required_changes"])
+    assert not any("v0.83.5" in item for item in external)
+    assert not any("git.Client wrapper" in item for item in external)
 
 
 def test_record_review_external_findings_override_vacuous_summary(
@@ -23369,7 +23378,10 @@ def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path
     )
     assert result1.ok is True
     decision1 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    assert any("retry wrapper" in item for item in decision1["required_changes"])
+    # Issue #999: external findings ride in their own field, not required_changes.
+    assert decision1["required_changes"] == ["fix the internal thing"]
+    external1 = decision1["external_findings"]
+    assert any("retry wrapper" in item for item in external1)
     reviewed_at_round1 = decision1["reviewed_at"]
     assert reviewed_at_round1
 
@@ -23397,12 +23409,14 @@ def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path
     )
     assert result2.ok is True
     decision2 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    changes2 = decision2["required_changes"]
+    # The reviewer's required_changes stay separate from external findings.
+    assert decision2["required_changes"] == ["fix the internal thing, round 2"]
+    external2 = decision2["external_findings"]
 
     # The new, post-round-1 comment is ingested.
-    assert any("regression test for the timeout path" in item for item in changes2)
+    assert any("regression test for the timeout path" in item for item in external2)
     # The stale round-1 comment (already surfaced once) is not re-ingested.
-    assert not any("retry wrapper" in item for item in changes2)
+    assert not any("retry wrapper" in item for item in external2)
 
 
 def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
@@ -23449,14 +23463,14 @@ def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
 
     assert result.ok is True
     decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    changes = decision["required_changes"]
+    # Issue #999: external findings ride in their own field.
+    assert decision["required_changes"] == ["keep me"]
+    external = decision["external_findings"]
 
     # The orchestrator's own echo is filtered out...
-    assert not any("retry wrapper swallows the type" in item for item in changes)
+    assert not any("retry wrapper swallows the type" in item for item in external)
     # ...while a genuine human finding from an identical account type is kept.
-    assert any("rollback path" in item for item in changes)
-    # And the internal finding survives untouched.
-    assert "keep me" in changes
+    assert any("rollback path" in item for item in external)
 
 
 def test_human_quote_reply_to_orchestrator_comment_is_still_ingested(
@@ -23507,13 +23521,77 @@ def test_human_quote_reply_to_orchestrator_comment_is_still_ingested(
 
     assert result.ok is True
     decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    changes = decision["required_changes"]
+    # Issue #999: external findings ride in their own field.
+    assert decision["required_changes"] == ["keep me"]
+    external = decision["external_findings"]
 
     # The human's finding survives even though their comment embeds our marker.
-    assert any("rollback path" in item for item in changes)
+    assert any("rollback path" in item for item in external)
     # Our own unquoted comment is still filtered out.
-    assert not any(item.lstrip().startswith(ORCHESTRATOR_COMMENT_MARKER) for item in changes)
-    assert "keep me" in changes
+    assert not any(item.lstrip().startswith(ORCHESTRATOR_COMMENT_MARKER) for item in external)
+
+
+def test_record_review_derived_with_external_findings_preserves_both(
+    tmp_path: Path,
+) -> None:
+    """Issue #999 core round-trip: a ``derived`` verdict (reviewer produced
+    no itemized list, so the summary was back-derived) that ALSO carries
+    external PR comments must persist the derived summary in
+    ``required_changes`` with ``findings_channel == "derived"`` (NOT
+    overwritten to ``"external"``) and the external findings in their own
+    ``external_findings`` field. The rendered rework brief must show the
+    derived summary verbatim (not as a single bullet) AND the external
+    items as bullets under their own heading.
+
+    Before #999, ``record_review`` merged the external items into
+    ``required_changes`` and flipped the channel to ``"external"``, so the
+    renderer took the itemized path and the multi-paragraph derived summary
+    -- the only representation of what the reviewer wanted changed -- was
+    emitted as one ``- {...}`` bullet.
+    """
+    from charlie_work.workflow import _render_required_changes_section
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    prose = (
+        "The retry wrapper swallows the exception type. Callers cannot "
+        "distinguish a transient failure from a permanent one, so every "
+        "retry loop masks real bugs."
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": "The migration needs a rollback path before this can land.",
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2099-01-01T00:00:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # No itemized required_changes -> record_review derives from summary.
+    result = app.record_review(456, "request_changes", summary=prose, required_changes=None)
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    # The channel stays "derived" -- NOT overwritten to "external".
+    assert decision["findings_channel"] == "derived"
+    # required_changes holds the derived summary, NOT the external item.
+    assert decision["required_changes"] == [prose]
+    # External findings ride in their own field.
+    assert decision["external_findings"] == [
+        "The migration needs a rollback path before this can land."
+    ]
+
+    # The rendered brief shows the derived summary verbatim (not a bullet)
+    # and the external item under its own heading.
+    section = _render_required_changes_section(decision)
+    assert prose in section
+    assert f"- {prose}" not in section
+    assert "did not record a structured findings list" in section
+    assert "## Findings posted on the PR itself" in section
+    assert "- The migration needs a rollback path before this can land." in section
 
 
 def test_worker_rework_reply_is_not_ingested_as_external_finding(
@@ -23595,17 +23673,20 @@ def test_worker_rework_reply_is_not_ingested_as_external_finding(
     decision = json.loads(
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
+    # Issue #999: external findings ride in their own field, not required_changes.
     changes = decision["required_changes"]
+    external = decision.get("external_findings", [])
 
-    # The worker's own rework reply is NOT fed back as a required change.
-    assert not any("Reworked in rework-head-sha" in item for item in changes), (
+    # The worker's own rework reply is NOT fed back as an external finding.
+    assert not any("Reworked in rework-head-sha" in item for item in external), (
         "worker rework reply must not be ingested as an external finding"
     )
-    # The genuine human finding from the same account/type=User IS ingested.
-    assert any("migration script drops the index" in item for item in changes), (
+    # The genuine human finding from the same account/type=User IS ingested
+    # into the external_findings field.
+    assert any("migration script drops the index" in item for item in external), (
         "genuine human comment before the reviewed head must still be ingested"
     )
-    # The internal finding survives untouched.
+    # The internal finding survives untouched in required_changes.
     assert "keep me" in changes
 
 
@@ -23720,11 +23801,13 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     )
     assert r2.ok is True
     d2 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
+    # Issue #999: external findings ride in their own field, not required_changes.
     changes2 = d2["required_changes"]
+    external2 = d2.get("external_findings", [])
 
     # THE regression assertion: the gap comment surfaces in round 2 rather
     # than being permanently dropped.
-    assert any("Gap comment" in c for c in changes2), (
+    assert any("Gap comment" in c for c in external2), (
         "human comment in the (before, reviewed_at] gap must surface in the next "
         "round, not be silently dropped forever"
     )
@@ -43359,6 +43442,106 @@ def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None
     result3 = app.dispatch(limit=1)
     assert result3.ok is True
     assert result3.data["selected_count"] == 0
+
+
+def _cross_repo_issue_body() -> str:
+    """Issue body whose every referenced file path is absent from the target repo.
+
+    Mirrors the #1010/#953 scenario: the subject code lives in a sibling repo,
+    so every path the issue references is missing from the repo the worker is
+    dispatched against.
+    """
+    return (
+        "But **#953's code does not live in this repo.** `suite_coverage.py` is at "
+        "`C:/Users/senki/repos/ci_runners/src/ci_fleet/suite_coverage.py`; there is no "
+        "`src/charlie_work/suite_coverage.py`. The worker, handed an isolated checkout "
+        "of a repo that does not contain the file it was asked to change, went to "
+        "`C:\\Users\\senki\\repos\\ci_runners` — the **shared main checkout** — and worked there."
+    )
+
+
+def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path) -> None:
+    """Issue #1010 wiring: the real dispatch path escalates (not dispatches) an
+    issue whose referenced file paths are all absent from the target repo.
+
+    Drives ``OrchestratorApp.dispatch`` (the ``_dispatch_impl`` path that decides
+    to escalate instead of dispatch), not ``cross_repo_gate`` in isolation, and
+    asserts the three observable effects of the wiring: the label transition to
+    ``agent:human-needed``, the ``dispatch_cross_repo_escalated`` event, and
+    exclusion from ``session_requests`` (``selected_count == 0``). A regression
+    in the wiring that calls the gate would silently reintroduce the exact bug
+    this PR fixes with every unit test green, so this test exercises the wiring.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # The default fixture PR is open and linked to issue #123, which would
+    # exclude the issue via the open-PR guard; close it so #123 is selectable.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    # Every referenced path is absent from tmp_path (the repo root).
+    fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    # The issue was escalated, not dispatched: no session was requested.
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert 123 in result.data["cross_repo_escalated_issue_numbers"]
+    # No dispatch_results were produced for the escalated issue.
+    assert result.data["dispatch_results"] == []
+
+    # Label transition to human-needed (the redispatch_escalated edge).
+    assert (123, "agent:human-needed") in fake_gh.labels_added
+
+    # The dispatch_cross_repo_escalated event was recorded with the issue number
+    # and a cross_repo_target reason.
+    state = load_state(paths.state_file)
+    escalated_events = [e for e in state["events"] if e["kind"] == "dispatch_cross_repo_escalated"]
+    assert len(escalated_events) == 1
+    assert escalated_events[0]["payload"]["issue_number"] == 123
+    assert "cross_repo_target" in escalated_events[0]["payload"]["reason"]
+
+    # The issue is terminal in state, not left dispatch_pending.
+    assert state["issues"]["123"]["status"] == "escalated"
+
+
+def test_dry_run_dispatch_cross_repo_gate_reports_without_mutating(tmp_path: Path) -> None:
+    """Issue #1010 wiring (dry-run): ``dispatch`` with ``dry_run=True`` reports
+    which issues the cross-repo gate would escalate, without mutating state,
+    labels, or events.
+
+    Drives the dry-run branch of ``_dispatch_impl`` (the path that populates
+    ``cross_repo_escalated_issue_numbers`` in the planning payload), not
+    ``cross_repo_gate`` in isolation.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["body"] = _cross_repo_issue_body()
+    app = OrchestratorApp(
+        repo_root=tmp_path,
+        paths=paths,
+        config=config,
+        gh=fake_gh,
+        dry_run=True,
+    )
+
+    result = app.dispatch()
+
+    # The issue is reported as cross-repo escalated and excluded from sessions.
+    assert result.ok is True
+    assert 123 in result.data["cross_repo_escalated_issue_numbers"]
+    assert result.data["selected_count"] == 0
+    session_issue_numbers = {session["issue_number"] for session in result.data["sessions"]}
+    assert 123 not in session_issue_numbers
+
+    # Dry-run must not mutate labels, state, or events.
+    assert (123, "agent:human-needed") not in fake_gh.labels_added
+    state = load_state(paths.state_file)
+    assert state["issues"] == {}
+    assert state["events"] == []
 
 
 def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:

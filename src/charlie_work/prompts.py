@@ -160,6 +160,60 @@ def assert_execution_contract(prompt: str, *, context: str = "worker prompt") ->
         raise MissingExecutionContractError(context, missing)
 
 
+# Markers that must appear in every rendered worker/rework prompt's containment
+# clause.  Issue #1010: the containment clause was scoped to "any other checkout
+# of the repo" — which does not cover a different repo at all.  A dispatched
+# worker edited a sibling repo's shared main checkout, contaminating another
+# agent's PR.  The clause is widened to forbid any path outside the assigned
+# worktree root, and these markers are checked against the *rendered output* —
+# not the template source — at the dispatch boundary so a repo-local flat
+# override that drops ``$section_scope_contract`` or reverts to the old
+# repo-scoped wording is caught before it ships.
+CONTAINMENT_MARKERS: tuple[str, ...] = (
+    "**Containment:**",
+    "any path outside the assigned worktree root",
+)
+
+
+class MissingContainmentError(RuntimeError):
+    """A rendered worker/rework prompt is missing the widened containment clause.
+
+    Issue #1010: the containment clause was scoped to "any other checkout of
+    the repo", which does not cover a different repo.  A repo-local flat
+    whole-file override of ``worker.md`` or ``rework.md`` can silently drop
+    ``$section_scope_contract`` or revert to the old narrow wording,
+    dispatching workers with no effective prohibition against editing a
+    sibling repo's checkout.  This post-render guard catches that drift at
+    the dispatch boundary — the single point of enforcement — rather than
+    relying on every consumer repo's override to carry the widened clause.
+    """
+
+    def __init__(self, context: str, missing: tuple[str, ...]) -> None:
+        self.context = context
+        self.missing = missing
+        super().__init__(
+            f"{context} is missing the widened containment clause (issue #1010): "
+            f"required marker(s) not found: {', '.join(missing)}. "
+            f"A repo-local flat override may have dropped the "
+            f"$section_scope_contract reference or reverted to the old "
+            f"repo-scoped wording."
+        )
+
+
+def assert_containment(prompt: str, *, context: str = "worker prompt") -> None:
+    """Verify a rendered worker/rework prompt carries the widened containment clause.
+
+    Checks the *rendered output* (not the template source) so that a
+    repo-local flat override that drops ``$section_scope_contract`` or
+    reverts to the old repo-scoped wording is caught regardless of how the
+    override was structured.
+    """
+
+    missing = tuple(m for m in CONTAINMENT_MARKERS if m not in prompt)
+    if missing:
+        raise MissingContainmentError(context, missing)
+
+
 class PromptTemplateError(RuntimeError):
     """A prompt template references placeholders that nothing supplies.
 

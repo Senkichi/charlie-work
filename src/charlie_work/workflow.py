@@ -67,6 +67,7 @@ from .cross_family import (
     report_is_reusable,
     run_cross_family_review,
 )
+from .cross_repo_gate import cross_repo_gate
 from .github import (
     GitHub,
     GitHubError,
@@ -105,6 +106,7 @@ from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import (
     PromptTemplateError,
     assert_conventional_commit_title,
+    assert_containment,
     assert_execution_contract,
     assert_no_merge_contract,
     prompt_template_digest,
@@ -5899,6 +5901,36 @@ def _finish_required_changes_section(lines: list[str]) -> str:
     return "\n".join([*lines, _EXTERNAL_FINDINGS_POINTER])
 
 
+_EXTERNAL_FINDINGS_SECTION_INTRO = (
+    "## Findings posted on the PR itself\n"
+    "\n"
+    "These are verified findings a human or peer agent posted on the PR as "
+    "comments, review bodies, or inline review threads -- separate from the "
+    "reviewer's findings above. Address each of them too.\n"
+)
+
+
+def _render_external_findings_section(
+    reviewer_lines: list[str], external_findings: list[str]
+) -> str:
+    """Join the reviewer section and the external-findings section (issue #999).
+
+    External findings render under their own heading, after the reviewer's
+    section, as bullets -- each defanged so a closing keyword in a human
+    comment cannot auto-close the linked issue from the worker's brief.
+
+    The ``_EXTERNAL_FINDINGS_POINTER`` is deliberately *not* appended here.
+    Its body states "none of which reach this brief", which this section
+    makes false: the ingested findings are now rendered inline. Old-shape
+    records (no ``external_findings`` field) never reach this function and
+    keep the pointer exactly as before this fix.
+    """
+    lines = [*reviewer_lines, _EXTERNAL_FINDINGS_SECTION_INTRO]
+    lines.extend(f"- {defang_closing_keywords(item)}" for item in external_findings)
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     """Render the ``$required_changes_section`` for a rework brief.
 
@@ -5935,13 +5967,38 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
 
     Issue #950: when the PR itself carries verified human or peer-agent
     findings (issue comments, review bodies, inline review threads),
-    ``record_review`` folds them into ``required_changes`` and sets
-    ``findings_channel`` to ``"external"``. Verdicts carrying the
-    ``"external"`` marker render as the itemized tier below, but with a
-    description that makes clear the list mixes internal reviewer findings
-    and external PR comments. The ``"external"`` marker is checked before
-    the shape-based tiers so an entirely-external verdict is not mis-binned
-    as ``"derived"``/``"vacuous"``.
+    ``record_review`` ingests them at write time.
+
+    Issue #999: external findings no longer merge into ``required_changes``.
+    They ride in their own ``external_findings`` field, and
+    ``findings_channel`` continues to describe *only* the reviewer's list --
+    so ``"derived"`` is never overwritten and keeps its tier-2 verbatim
+    rendering even when external findings are present. This function renders
+    them under their own heading (``_render_external_findings_section``)
+    after the reviewer's section, instead of appending the
+    ``_EXTERNAL_FINDINGS_POINTER`` (whose "none of which reach this brief"
+    body the inline section makes false).
+
+    Two shapes coexist for backward compatibility:
+
+    * **New shape** (records written after #999, non-vacuous case): the
+      ``external_findings`` field is present and ``findings_channel`` is
+      ``None`` or ``"derived"`` (never ``"external"``). The reviewer's
+      section renders per its marker, then the external section is
+      appended.
+    * **Old shape** (records written before #999, *and* the vacuous-replace
+      case): external findings are already merged into
+      ``required_changes`` with ``findings_channel == "external"`` and no
+      ``external_findings`` field. These render exactly as before this fix
+      -- the itemized tier with the external-aware intro and the pointer --
+      so no content is lost from any verdict already on disk.
+
+    The ``"vacuous"`` case is the one that must NOT become a separate
+    section: a content-free reviewer summary has nothing worth rendering
+    above the external items, so ``record_review`` still *replaces*
+    ``required_changes`` with the external findings (flipping the channel
+    to ``"external"``) and writes no ``external_findings`` field -- the
+    old-shape ``"external"`` path handles it unchanged.
 
     Verdicts carrying the ``"vacuous"`` or ``"derived"`` markers are
     handled explicitly, before the shape-based tiers below:
@@ -5951,7 +6008,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     renders tier 2 verbatim rather than falling into tier 1's bullet list
     (a single derived item wrapped as a one-item bullet would otherwise dump
     an entire multi-paragraph summary onto one line). Verdicts with no
-    marker at all -- every record written before this fix -- fall through
+    marker at all -- every record written before #792 -- fall through
     unchanged to the original shape-based tiers.
 
     Rendered for ``request_changes`` and, defensively, ``blocked`` verdicts
@@ -6003,6 +6060,16 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     raw_summary = decision.get("summary")
     summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
     findings_channel = decision.get("findings_channel")
+    # Issue #999: new-shape records carry external findings in their own
+    # field. Old-shape records (pre-#999, or the vacuous-replace case) have
+    # no such field and render exactly as before this fix.
+    raw_external = decision.get("external_findings")
+    external_findings = (
+        [str(item).strip() for item in raw_external if str(item).strip()]
+        if isinstance(raw_external, list)
+        else []
+    )
+    new_shape = bool(external_findings)
 
     # issue #792: a verdict recorded by the current record_review carries an
     # explicit marker for exactly this distinction -- handle it before the
@@ -6034,6 +6101,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             defang_closing_keywords(summary_text),
             "",
         ]
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and changes:
@@ -6057,6 +6126,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         ]
         lines.extend(f"- {defang_closing_keywords(change)}" for change in changes)
         lines.append("")
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and summary_text:
@@ -6071,6 +6142,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             defang_closing_keywords(summary_text),
             "",
         ]
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if not changes and not summary_text:
@@ -6226,6 +6299,11 @@ def _write_rework_prompt(
     # *rendered output* so a repo-local flat rework override that drops
     # $section_execution_contract is caught at the dispatch boundary.
     assert_execution_contract(prompt, context=f"rework prompt for PR #{pr_number}")
+    # Issue #1010: enforce the widened containment clause on the *rendered
+    # output* so a repo-local flat rework override that drops
+    # $section_scope_contract or reverts to the old repo-scoped wording is
+    # caught at the dispatch boundary.
+    assert_containment(prompt, context=f"rework prompt for PR #{pr_number}")
     prompt_path.write_text(prompt, encoding="utf-8")
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
     # regeneration (when review-decision.json is newer than the brief) can
@@ -8679,10 +8757,19 @@ class OrchestratorApp:
             adapter_choices: dict[int, AdapterChoice] = {}
             api_enabled = self.config.api_worker.enabled
             routing_inputs = self._routing_inputs() if api_enabled else None
+            # Issue #1010: dry-run cross-repo gate — report which issues would
+            # be escalated without mutating state or labels.
+            dry_run_cross_repo_escalated: dict[int, str] = {}
             for issue_number in selected_issue_numbers:
                 full_issue = self.gh.issue_view(issue_number)
                 full_issues[issue_number] = full_issue
                 branch_name = self._branch_name(full_issue)
+
+                # Pre-flight gate: report cross-repo targets without escalating.
+                gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
+                if not gate_result.passed:
+                    dry_run_cross_repo_escalated[issue_number] = gate_result.reason
+                    continue
 
                 template: str | None = None
                 if api_enabled and routing_inputs is not None:
@@ -8731,6 +8818,7 @@ class OrchestratorApp:
                     merged_pr_mention_only_issue_numbers
                 ),
                 "label_errors": [],
+                "cross_repo_escalated_issue_numbers": sorted(dry_run_cross_repo_escalated),
                 "sessions": [asdict(request) for request in session_requests],
                 "adapter_choices": {
                     str(n): {"kind": c.kind, "provider": c.provider, "reason": c.reason}
@@ -9184,10 +9272,22 @@ class OrchestratorApp:
         adapter_choices: dict[int, AdapterChoice] = {}
         api_enabled = self.config.api_worker.enabled
         routing_inputs = self._routing_inputs() if api_enabled else None
+        # Issue #1010: pre-flight cross-repo gate. Issues whose referenced
+        # file paths are all absent from the target repo are escalated to
+        # human-needed instead of dispatching a worker that will wander to a
+        # sibling repo's shared checkout.
+        cross_repo_escalated: dict[int, str] = {}
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
             branch_name = self._branch_name(full_issue)
+
+            # Pre-flight gate: refuse to dispatch when the issue's referenced
+            # code does not exist in this repo (issue #1010).
+            gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
+            if not gate_result.passed:
+                cross_repo_escalated[issue_number] = gate_result.reason
+                continue
 
             # Determine the adapter for this issue (single point of enforcement:
             # routing.select_adapter). The prompt template follows the choice
@@ -9515,6 +9615,61 @@ class OrchestratorApp:
                         )
                         save_state(self.paths.state_file, state)
 
+            # Issue #1010: escalate issues blocked by the cross-repo pre-flight
+            # gate. Their referenced file paths are all absent from the target
+            # repo, so dispatching a worker would send it to a sibling repo's
+            # shared checkout. Escalate to human-needed with a cross_repo_target
+            # reason and record the event — the issue stays in the dispatch
+            # pool's state as escalated, not dispatch_pending.
+            for issue_number, reason in sorted(cross_repo_escalated.items()):
+                prev_entry = state["issues"].get(str(issue_number), {})
+                entry = {
+                    **prev_entry,
+                    "number": issue_number,
+                    "title": full_issues.get(issue_number, {}).get("title"),
+                    "url": full_issues.get(issue_number, {}).get("url"),
+                }
+                entry.pop("dispatch_pending_at", None)
+                entry.pop("label_error", None)
+                state = _escalate_issue(
+                    state,
+                    issue_number,
+                    reason=reason,
+                    reason_class="mechanical",
+                    issue_extra=entry,
+                )
+                state = append_event(
+                    state,
+                    "dispatch_cross_repo_escalated",
+                    {
+                        "issue_number": issue_number,
+                        "reason": reason,
+                    },
+                    state_path=self.paths.state_file,
+                )
+                save_state(self.paths.state_file, state)
+                # Transition labels to human-needed, following the same pattern
+                # as the redispatch_escalated path above.
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "redispatch_escalated",
+                )
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "redispatch_escalated",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+                    escalated_entry = state["issues"].get(str(issue_number), {})
+                    escalated_entry["label_error"] = label_error
+                    state["issues"][str(issue_number)] = escalated_entry
+                    label_errors.append(issue_number)
+                    label_error_failures[issue_number] = _label_error_reason(label_error)
+                    save_state(self.paths.state_file, state)
+
             # Build dispatch-alert transitions for the notify digest. Averted
             # redispatches surface as DISPATCH_AVERTED; a later successful or
             # non-averted dispatch clears the alert back to OK.
@@ -9603,6 +9758,7 @@ class OrchestratorApp:
                     "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "foreign_writer_issue_numbers": sorted(foreign_writer_issue_numbers),
+                    "cross_repo_escalated_issue_numbers": sorted(cross_repo_escalated),
                     "label_errors": sorted(label_errors),
                     "skipped_issue_numbers": skipped_issue_numbers,
                     "deferred_by_concurrency": deferred_by_concurrency,
@@ -9658,6 +9814,8 @@ class OrchestratorApp:
             message += (
                 f" (reaped phantom live worker slots: {sorted(phantom_live_worker_issue_numbers)})"
             )
+        if cross_repo_escalated:
+            message += f" (cross-repo escalated: {sorted(cross_repo_escalated)})"
         data = {
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
@@ -9667,6 +9825,7 @@ class OrchestratorApp:
             "phantom_live_worker_count": len(phantom_live_worker_issue_numbers),
             "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
             "foreign_writer_count": len(foreign_writer_issue_numbers),
+            "cross_repo_escalated_issue_numbers": sorted(cross_repo_escalated),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
             "deferred_by_concurrency_count": deferred_by_concurrency_count,
@@ -13285,6 +13444,17 @@ class OrchestratorApp:
         # so nothing was excluded by ``before`` and ``reviewed_at`` remains the
         # correct lower bound.
         ingestion_before: str | None = None
+        # Issue #999: external findings no longer merge into
+        # ``required_changes``. They ride in their own ``external_findings``
+        # field so ``findings_channel`` keeps describing *only* the reviewer's
+        # list -- ``"derived"`` is never overwritten and keeps its tier-2
+        # verbatim rendering. The one exception is ``"vacuous"``: a
+        # content-free reviewer summary has nothing worth rendering above the
+        # external items, so that case still *replaces* ``required_changes``
+        # (flipping the channel to ``"external"``) exactly as before #999 --
+        # no ``external_findings`` field is written, and the renderer's
+        # old-shape ``"external"`` path handles it unchanged.
+        recorded_external_findings: list[str] | None = None
         if decision in {"request_changes", "blocked"}:
             previous_decision = self._review_decision(pr_number)
             previous_before = previous_decision.get("before")
@@ -13302,9 +13472,9 @@ class OrchestratorApp:
             if external_findings:
                 if findings_channel == "vacuous":
                     effective_required_changes = list(external_findings)
+                    findings_channel = "external"
                 else:
-                    effective_required_changes.extend(external_findings)
-                findings_channel = "external"
+                    recorded_external_findings = list(external_findings)
         decision_payload = {
             "pr_number": pr_number,
             "issue_number": issue_number,
@@ -13325,6 +13495,12 @@ class OrchestratorApp:
         # `approved` verdict, passes through with no new key at all.
         if findings_channel is not None:
             decision_payload["findings_channel"] = findings_channel
+        # Issue #999: external findings live in their own field, separate
+        # from the reviewer's required_changes. Absent on old-shape records
+        # (pre-#999, or the vacuous-replace case) -- the renderer treats
+        # absence as old-shape and renders exactly as before.
+        if recorded_external_findings is not None:
+            decision_payload["external_findings"] = recorded_external_findings
         # Persist the ingestion upper bound so the next round's ``since`` can
         # be derived from it (issue #998 rework: contiguous windowing across
         # rounds -- see the contiguity note above). Only present when ingestion
@@ -13544,6 +13720,8 @@ class OrchestratorApp:
                 event_payload["session_metrics"] = session_metrics
             if findings_channel is not None:
                 event_payload["findings_channel"] = findings_channel
+            if recorded_external_findings is not None:
+                event_payload["external_findings_count"] = len(recorded_external_findings)
             state = self._record_event(state, "record_review", event_payload)
             if findings_channel == "vacuous":
                 # Distinct from the general "record_review" event (issue
@@ -21858,6 +22036,13 @@ class OrchestratorApp:
         # dispatch boundary rather than shipping a worker who can change a
         # contract surface and push without ever exercising the wider suite.
         assert_execution_contract(prompt, context=f"worker prompt for issue #{issue_number}")
+        # Issue #1010: enforce the widened containment clause on the *rendered
+        # output* so a repo-local flat override that drops
+        # $section_scope_contract or reverts to the old repo-scoped wording
+        # (which does not cover a different repo) is caught at the dispatch
+        # boundary rather than shipping a worker with no effective prohibition
+        # against editing a sibling repo's checkout.
+        assert_containment(prompt, context=f"worker prompt for issue #{issue_number}")
         # Issue #618: the dry-run dispatch branch promises "skip all state
         # writes, label transitions, and file mutations" — mkdir + write_text
         # here would violate that, and for a dead-worker recovery candidate
