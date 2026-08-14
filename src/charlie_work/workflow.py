@@ -4363,6 +4363,46 @@ def check_dispatch_staleness(
     return result
 
 
+# Issue #1153: minimum number of zero-artifact attempts (all ``ahead_of_main
+# == 0``) in a post-mortem sidecar before the orphan sweep escalates instead
+# of relabeling to ``automated-ready`` for another redispatch. The first
+# zero-artifact attempt is the initial dispatch; the second is the first
+# redispatch. Escalating before the *second* redispatch (the third attempt
+# overall) means the threshold is 2: two attempts have already produced zero
+# artifacts, so a third would almost certainly do the same.
+_ZERO_ARTIFACT_ESCALATION_THRESHOLD = 2
+
+
+def _is_zero_artifact_dispatch_loop(sessions_dir: Path, issue_number: int) -> bool:
+    """Return True when prior dispatch attempts all produced zero artifacts.
+
+    Issue #1153: an issue whose post-mortem sidecar records ``>= 2`` attempts
+    where *every* attempt's ``ahead_of_main`` is ``0`` is in a zero-artifact
+    dispatch loop -- each worker session ran, produced no commits ahead of
+    the base ref, and was swept as a dead worker with no open PR. The
+    post-mortem file already contains exactly the signal needed
+    (``attempts[].ahead_of_main == 0`` repeated); this helper reads it so the
+    orphan sweep can escalate to ``agent:human-needed`` instead of relabeling
+    to ``automated-ready`` for yet another fruitless redispatch.
+
+    Returns ``False`` when there is no sidecar, fewer than the threshold
+    number of attempts, any attempt has a non-zero ``ahead_of_main``, or any
+    attempt's ``ahead_of_main`` is ``None`` (unknown -- cannot confirm
+    zero-artifact, so do not escalate on ambiguous evidence).
+    """
+    from .post_mortem import read_post_mortem
+
+    record = read_post_mortem(sessions_dir, issue_number)
+    if record is None:
+        return False
+    if len(record.attempts) < _ZERO_ARTIFACT_ESCALATION_THRESHOLD:
+        return False
+    # Every attempt must have a confirmed ahead_of_main == 0. An attempt
+    # with ahead_of_main == None is ambiguous (the count could not be
+    # computed) -- do not escalate on ambiguous evidence.
+    return all(attempt.ahead_of_main == 0 for attempt in record.attempts)
+
+
 def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
@@ -4456,6 +4496,12 @@ def _detect_and_handle_orphaned_workers(
     # have accumulated in state.json over time.
     no_pr_orphans = [n for n in orphaned_issues if n not in pr_by_issue]
     reclaim_results: dict[int, dict[str, Any]] = {}
+    # Issue #1153: issues escalated to ``agent:human-needed`` by the
+    # zero-artifact dispatch loop guard, instead of being relabeled to
+    # ``automated-ready`` for another fruitless redispatch. Keyed by issue
+    # number; each value carries the label-write outcome and the attempt
+    # count that triggered the escalation.
+    zero_artifact_escalations: dict[int, dict[str, Any]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
@@ -4484,6 +4530,30 @@ def _detect_and_handle_orphaned_workers(
             # fall through here without any GitHub call).
             if not active_labels:
                 continue
+
+            # Issue #1153: before relabeling to ``automated-ready`` for
+            # another redispatch, check whether prior attempts all produced
+            # zero artifacts (``ahead_of_main == 0``). A repeated
+            # zero-artifact dispatch loop means each worker session ran,
+            # determined the fix belongs in a sibling repo, hopped to its
+            # worktree, did the work there, and exited with ``ahead_of_main:
+            # 0`` in *this* repo's tree -- swept as a dead worker with no
+            # open PR, relabeled, redispatched, forever. Escalate to
+            # ``agent:human-needed`` instead of burning another dispatch.
+            if _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
+                label_write_ok = True
+                for label in sorted(active_labels):
+                    if not gh.remove_issue_label(issue_number, label):
+                        label_write_ok = False
+                if config.labels.human_needed not in issue_labels:
+                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
+                        label_write_ok = False
+                zero_artifact_escalations[issue_number] = {
+                    "removed_labels": sorted(active_labels),
+                    "label_write_ok": label_write_ok,
+                }
+                continue
+
             needs_ready = config.labels.ready not in issue_labels
             label_write_ok = True
             for label in sorted(active_labels):
@@ -5048,6 +5118,43 @@ def _detect_and_handle_orphaned_workers(
                         )
                     )
                     state["issues"][str(issue_number)] = entry
+                    continue
+
+                # Issue #1153: check whether this issue was escalated to
+                # ``agent:human-needed`` by the zero-artifact dispatch loop
+                # guard (computed above, outside the state lock). If so,
+                # record the escalation in state and emit a visible event --
+                # do NOT fall through to the reclaim path (which would
+                # re-add ``automated-ready`` and trigger another fruitless
+                # redispatch).
+                escalation = zero_artifact_escalations.get(issue_number)
+                if escalation is not None:
+                    # Route through ``_escalate_issue`` so the paired
+                    # ``escalation_reason`` / ``reason_class`` /
+                    # ``terminal_since`` fields are written atomically and
+                    # the #750 structural guard (status="escalated" only
+                    # inside the helper) continues to hold.
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="zero_artifact_dispatch_loop",
+                        reason_class="mechanical",
+                    )
+                    escalated_entry = state["issues"][str(issue_number)]
+                    escalated_entry["orphan_flagged_at"] = utc_now()
+                    state["issues"][str(issue_number)] = escalated_entry
+                    sweep_events.append(
+                        (
+                            "session_failed_escalated",
+                            _session_failed_relabeled_payload(
+                                issue_number=issue_number,
+                                reason="zero_artifact_dispatch_loop",
+                                removed_labels=escalation["removed_labels"],
+                                added_ready=False,
+                                label_write_ok=escalation["label_write_ok"],
+                            ),
+                        )
+                    )
                     continue
 
                 # Issue #417: report (and, on success, resolve) the ground-truth

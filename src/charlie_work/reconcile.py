@@ -1040,6 +1040,38 @@ def detect_drift(
                     )
                 )
 
+            # Issue #1153: a same-repo PR whose closing-keyword reference
+            # resolves to an issue number that does not exist in this repo
+            # (e.g. ``Closes #1497`` where 1497 is a sibling repo's issue)
+            # is invisible to every issue-driven sweep: ``linked_issue_number``
+            # returned a number, so the PR was added to
+            # ``open_prs_by_issue[issue_number]``, but ``issues_by_number``
+            # has no entry for it -- no issue-side normalization, no review
+            # routing, no merge lane ever sees it. The PR silently becomes
+            # ``open_passive`` (if tracked) or is simply never tracked at
+            # all. A resolution failure is a signal, not an absence: surface
+            # it as a distinct drift item so the ``reconcile`` event makes
+            # the cross-repo linkage failure visible to operators and the
+            # janitor, instead of silently demoting the PR to passive.
+            if issue_number is not None and issues_by_number.get(issue_number) is None:
+                drift.append(
+                    DriftItem(
+                        kind="pr_linked_issue_not_in_repo",
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        detail=(
+                            f"PR #{pr_number} has closing reference to issue "
+                            f"#{issue_number}, but no such issue exists in this "
+                            f"repo; the reference likely targets a sibling repo "
+                            f"(cross-repo linkage failure, issue #1153)"
+                        ),
+                        fix_actions=(
+                            f"surface cross-repo linkage failure for PR #{pr_number} "
+                            f"(closing ref issue #{issue_number} not in this repo)",
+                        ),
+                    )
+                )
+
     pr_numbers_on_github = {int(pr["number"]) for pr in prs if pr.get("number") is not None}
     for pr_number_str in state_prs:
         try:
@@ -2340,6 +2372,27 @@ def apply_fixes(
                 pr_key = str(item.pr_number)
                 existing_pr = new_prs.get(pr_key, {})
                 new_prs[pr_key] = {**existing_pr, "status": item.new_status}
+
+        elif item.kind == "pr_linked_issue_not_in_repo":
+            # Issue #1153: a PR whose closing reference targets an issue that
+            # does not exist in this repo (cross-repo linkage failure). Track
+            # the PR in state so it is visible to future sweeps rather than
+            # silently ignored. The ``reconcile`` event emitted below (every
+            # drift item gets one) is the visible signal -- it surfaces the
+            # cross-repo linkage failure to operators and the janitor instead
+            # of silently demoting the PR to ``open_passive``.
+            if item.pr_number is not None:
+                pr_key = str(item.pr_number)
+                existing_pr = new_prs.get(pr_key, {})
+                pr_entry = {**existing_pr, "number": item.pr_number}
+                if item.issue_number is not None:
+                    pr_entry["issue_number"] = item.issue_number
+                # Only set status if the PR is not already tracked with a
+                # meaningful status -- never overwrite an existing active
+                # status with the passive placeholder.
+                if not existing_pr.get("status"):
+                    pr_entry["status"] = PASSIVE_OPEN_STATUS
+                new_prs[pr_key] = pr_entry
 
         elif item.kind == "state_active_status_issue_closed":
             # Issue #259: finalize the state entry and strip any active labels that
