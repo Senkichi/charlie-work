@@ -283,6 +283,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "main_ci_reclaim_cancelled": "info",
         "merge_conflict_rework_requested": "info",
         "merge_deferred_stale_base": "info",
+        # Issue #934: operator-issued authorization to merge a worker PR whose
+        # recorded review decision is stale, absent, or pending. An info-level
+        # audit event: it records an explicit operator action, not a fault --
+        # the tripwire and merge-check read it as authorization, never as an
+        # error. Sibling to ``unauthorized_merge_acknowledged`` (the post-merge
+        # retrospective ack), but emitted at authorization time, before the
+        # merge.
+        "merge_authorized": "info",
         "merge_ready": "info",
         # Issue #747: the merge lane emitted events for every outcome except
         # success, so merge throughput was unobservable from events.db. This
