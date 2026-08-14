@@ -25,6 +25,7 @@ the template was then reverted. This proves the test is not a tautology.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import string
@@ -132,9 +133,10 @@ def _fake_issue(number: int = 1) -> dict[str, object]:
 
 def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker.md's real caller is ``OrchestratorApp._write_worker_prompt``
-    (workflow.py:22109-22175), used unmodified whenever
-    ``config.dispatch.worker_template`` (default ``"worker.md"``) is
-    selected -- see the `intake()` call site at workflow.py:8167.
+    (``workflow.py::OrchestratorApp._write_worker_prompt``), used unmodified
+    whenever ``config.dispatch.worker_template`` (default ``"worker.md"``) is
+    selected -- see the `intake()` call site
+    (``workflow.py::OrchestratorApp.intake``).
 
     Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
     companion literal-absence assertion is non-vacuous: under the default
@@ -157,9 +159,10 @@ def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
 def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker_claude_code.md is rendered by the *same* real writer,
     ``_write_worker_prompt``, with an explicit ``template=`` override --
-    exactly what the api-worker dispatch path at workflow.py:8830-8830
-    (and the matching path in the dispatch loop at workflow.py:9351-9351)
-    does: ``template = self.config.api_worker.worker_template``, then
+    exactly what the api-worker dispatch path (dry-run preview branch) and
+    the matching dispatch-loop path both do, inside
+    ``workflow.py::OrchestratorApp._dispatch_impl``: ``template =
+    self.config.api_worker.worker_template``, then
     ``self._write_worker_prompt(full_issue, template=template)``.
 
     Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
@@ -182,11 +185,12 @@ def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
 
 def test_rework_md_renders_via_real_writer_with_no_prior_decision(tmp_path: Path) -> None:
     """rework.md's real caller is the module-level ``_write_rework_prompt``
-    (workflow.py:6294-6359), which delegates to ``_render_rework_prompt``
-    (workflow.py:6248-6291) for the literal ``values`` dict passed to
-    ``render_prompt``. This exercises the no-verdict-on-disk shape
-    (``required_changes_section`` resolves to ``""`` -- see
-    ``_render_required_changes_section``, workflow.py:5980).
+    (``workflow.py::_write_rework_prompt``), which delegates to
+    ``_render_rework_prompt`` (``workflow.py::_render_rework_prompt``) for
+    the literal ``values`` dict passed to ``render_prompt``. This exercises
+    the no-verdict-on-disk shape (``required_changes_section`` resolves to
+    ``""`` -- see ``_render_required_changes_section``
+    (``workflow.py::_render_required_changes_section``)).
 
     Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
     companion literal-absence assertion is non-vacuous -- see
@@ -417,8 +421,8 @@ def test_rework_writer_rejects_flat_override_without_execution_contract(
 # can't hide behind the subset assertion alone.
 # ---------------------------------------------------------------------------
 
-# workflow.py:11057-11075, inside OrchestratorApp.review() -- the literal
-# `values` dict passed to `self._render("review.md", {...})`.
+# workflow.py::OrchestratorApp.review, the literal `values` dict passed to
+# `self._render("review.md", {...})`.
 REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
     "pr_title",
@@ -436,8 +440,8 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "prior_review_section",
 }
 
-# workflow.py:16151-16162, inside OrchestratorApp._cross_family_for_pr() --
-# the literal `values` dict passed to `self._render("cross_family_review.md", {...})`.
+# workflow.py::OrchestratorApp._cross_family_for_pr, the literal `values`
+# dict passed to `self._render("cross_family_review.md", {...})`.
 CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
     "pr_title",
@@ -448,9 +452,8 @@ CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "diff_path",
 }
 
-# workflow.py:16028-16031, inside OrchestratorApp.spec_review() -- the
-# literal `values` dict passed to
-# `self._render("cross_family_spec_review.md", {...})`.
+# workflow.py::OrchestratorApp.spec_review, the literal `values` dict
+# passed to `self._render("cross_family_spec_review.md", {...})`.
 CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS = {
     "artifact_label",
     "artifact_text",
@@ -488,11 +491,12 @@ def test_pinned_templates_actually_render_against_real_caller_keys() -> None:
 def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
     tmp_path: Path,
 ) -> None:
-    """review.md's real caller (workflow.py:11057-11075, ``OrchestratorApp.review()``)
-    is already subset- and render-tested above against *synthetic*
+    """review.md's real caller (``workflow.py::OrchestratorApp.review``) is
+    already subset- and render-tested above against *synthetic*
     ``f"<{key}>"`` values. This test additionally builds production-shaped
     values -- real ``Path`` objects for ``pr_json_path``/``diff_path``,
-    mirroring workflow.py:10902's ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
+    mirroring the same method's
+    ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
     -- under a non-default ``runtime.state_dir`` override, then asserts the
     rendered prompt contains neither an unresolved placeholder nor the
     default state-dir literal.
@@ -556,10 +560,11 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
     """review.md can also ship as a repo-local override (issue #589's shape).
 
     ``OrchestratorApp.review()`` passes ``self.prompt_dirs`` to
-    ``render_prompt`` (workflow.py:7583). That search-dir list is empty by
-    default, but ``runtime.prompts_dir`` can point at a repo-local template
-    directory, and ``resolve_template`` picks a repo-local ``review.md`` over
-    the package default. This test copies the packaged template into a
+    ``render_prompt`` inside ``workflow.py::OrchestratorApp._render``. That
+    search-dir list is empty by default, but ``runtime.prompts_dir`` can
+    point at a repo-local template directory, and ``resolve_template`` picks
+    a repo-local ``review.md`` over the package default. This test copies
+    the packaged template into a
     temporary override directory and renders from there, asserting the same
     literal-absence as the default-path test above.
     """
@@ -635,124 +640,306 @@ def test_every_shipped_template_is_covered_by_this_contract() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Citation drift guard (issue #1054): the ``workflow.py:N`` and
-# ``workflow.py:N-M`` line citations in this file's docstrings and comments
-# are hand-maintained prose. They have drifted twice already -- issue #740 /
-# PR #1045 fixed a batch of stale citations and *introduced* a new wrong one
-# in the same diff, and a later re-sync (commit 90bb8d8) drifted again as
-# workflow.py grew. This test parses every such citation out of this file and
-# asserts the cited line range in workflow.py contains a marker substring
-# identifying the intended target (a ``def`` line, a specific call, etc.).
-# It fails the moment a citation points at the wrong line, so a future
-# stale-citation fix cannot itself ship a new stale citation unnoticed.
+# Citation drift guard (issues #1054, #1045, #1205, #1213): the
+# ``workflow.py::<Symbol.path>`` references in this file's docstrings and
+# comments are hand-maintained prose pointing at the real production code
+# each test/constant exercises.
+#
+# This guard used to anchor citations to absolute line numbers
+# (``workflow.py:N`` / ``workflow.py:N-M``). That anchoring drifted
+# repeatedly: issue #740 / PR #1045 fixed a batch of stale line citations
+# and *introduced* a new wrong one in the same diff, a later re-sync
+# (commit 90bb8d8) drifted again as workflow.py grew, and #1205 documented
+# yet another instance of a stale-citation fix introducing new staleness.
+# Worse, because nearly every fleet PR touches workflow.py somewhere (a
+# 22k-line file), any insertion *above* a cited line staled every citation
+# below it -- turning this guard into a mechanical CI tax on PRs whose
+# diffs never went near the cited code, rather than a genuine drift signal
+# (#1213).
+#
+# #1213's fix: anchor citations to a **symbol** (a function/method's
+# qualified name, e.g. ``OrchestratorApp._write_worker_prompt``) instead of
+# a line range, resolved dynamically via an AST walk of workflow.py. A
+# symbol's *position* moves around just like any line number does, but the
+# citation now names WHAT is being pointed at rather than WHERE it
+# currently sits, so it survives unrelated insertions anywhere else in the
+# file. The marker-substring check from the original #1054 guard is
+# preserved unchanged in spirit -- it is what still catches a citation
+# pointing at the wrong symbol (a rename, a copy-paste into the wrong
+# docstring, a symbol whose body no longer does what the prose claims).
 # ---------------------------------------------------------------------------
 
-# Each entry maps (start_line, end_line) -> a substring that MUST appear in
-# the cited workflow.py line range. The substrings are chosen to uniquely
-# identify the intended target: function ``def`` lines, specific call
-# expressions, or template-name string literals that only appear at the
-# cited call site. If you add or move a citation in this file, add/update
-# the corresponding entry here -- the test will tell you if you forget.
-_CITATION_EXPECTATIONS: dict[tuple[int, int], str] = {
-    # ``_write_worker_prompt`` definition
-    (22109, 22175): "def _write_worker_prompt",
-    # ``intake()``'s ``_write_worker_prompt`` call (no template= override)
-    (8167, 8167): "self._write_worker_prompt(full_issue",
-    # api-worker dispatch path (dry-run preview branch)
-    (8830, 8830): "api_worker.worker_template",
-    # dispatch loop matching path (real dispatch)
-    (9351, 9351): "api_worker.worker_template",
-    # ``_write_rework_prompt`` definition
-    (6294, 6359): "def _write_rework_prompt",
-    # ``_render_rework_prompt`` definition
-    (6248, 6291): "def _render_rework_prompt",
-    # ``_render_required_changes_section`` definition
-    (5980, 5980): "def _render_required_changes_section",
-    # ``OrchestratorApp.review()`` values dict for review.md
-    (11057, 11075): '"review.md"',
-    # ``_cross_family_for_pr()`` values dict for cross_family_review.md
-    (16151, 16162): '"cross_family_review.md"',
-    # ``spec_review()`` values dict for cross_family_spec_review.md
-    (16028, 16031): '"cross_family_spec_review.md"',
-    # ``review()``'s ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
-    (10902, 10902): "pr_dir = self.paths.prs",
-    # ``OrchestratorApp._render`` definition (the prompt_dirs call)
-    (7583, 7583): "render_prompt(template_name, values, search_dirs=self.prompt_dirs)",
+# Each entry maps a ``workflow.py::<Symbol.path>`` reference to the marker
+# substring(s) that MUST appear somewhere in that symbol's source span
+# (from its `def`/`class` line through its last body line, per
+# ``ast.FunctionDef``/``ast.AsyncFunctionDef``/``ast.ClassDef``
+# ``.lineno``/``.end_lineno``). A symbol cited for more than one thing
+# inside it (e.g. ``OrchestratorApp.review`` is cited both for its
+# ``"review.md"`` render call and its ``pr_dir`` assignment) lists all of
+# its required markers in one tuple. The substrings are chosen to uniquely
+# identify the intended target within the symbol: a specific call
+# expression, an assignment, or a template-name string literal. If you add
+# or move a citation in this file, add/update the corresponding entry here
+# -- the test will tell you if you forget.
+_CITATION_EXPECTATIONS: dict[str, tuple[str, ...]] = {
+    "OrchestratorApp._write_worker_prompt": ("def _write_worker_prompt",),
+    "OrchestratorApp.intake": ("self._write_worker_prompt(full_issue",),
+    # Covers both the api-worker dispatch dry-run preview branch and the
+    # matching dispatch-loop branch -- both live inside this one method.
+    "OrchestratorApp._dispatch_impl": ("api_worker.worker_template",),
+    "_write_rework_prompt": ("def _write_rework_prompt",),
+    "_render_rework_prompt": ("def _render_rework_prompt",),
+    "_render_required_changes_section": ("def _render_required_changes_section",),
+    "OrchestratorApp.review": (
+        '"review.md"',
+        "pr_dir = self.paths.prs",
+    ),
+    "OrchestratorApp._cross_family_for_pr": ('"cross_family_review.md"',),
+    "OrchestratorApp.spec_review": ('"cross_family_spec_review.md"',),
+    "OrchestratorApp._render": (
+        "render_prompt(template_name, values, search_dirs=self.prompt_dirs)",
+    ),
 }
 
-_CITATION_RE = re.compile(r"workflow\.py:(\d+)(?:-(\d+))?")
+# Matches `workflow.py::<Symbol>` / `workflow.py::<Class>.<method>` -- a dotted
+# path of Python identifiers naming the cited function/method/class.
+_CITATION_RE = re.compile(r"workflow\.py::([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)")
+
+# The old absolute-line-number citation form #1213 replaced. Nothing in
+# this file should match this again -- a hit means either a citation that
+# missed the #1213 conversion, or someone reintroducing the line-anchored
+# form the conversion removed on purpose.
+_STALE_LINE_CITATION_RE = re.compile(r"workflow\.py:\d+(?:-\d+)?\b")
 
 
-def _workflow_py_lines() -> list[str]:
-    """Read workflow.py source lines, 1-indexed via list[0] = line 1."""
+def _workflow_py_source() -> tuple[list[str], ast.Module]:
+    """Read workflow.py's source lines and parsed AST."""
     import charlie_work.workflow as workflow_module
 
     src_path = Path(workflow_module.__file__)
-    return src_path.read_text(encoding="utf-8").splitlines()
+    text = src_path.read_text(encoding="utf-8")
+    return text.splitlines(), ast.parse(text)
 
 
-def test_workflow_py_citations_are_not_stale() -> None:
-    """Every ``workflow.py:N`` / ``workflow.py:N-M`` citation in this file
-    must point at a line range whose content matches the expected marker.
+def _resolve_symbols(tree: ast.Module) -> dict[str, tuple[int, int]]:
+    """Map every ``Class.method`` / module-level ``function`` qualified name
+    defined in workflow.py's AST to its ``(lineno, end_lineno)`` span
+    (1-indexed, inclusive), by walking ``ClassDef``/``FunctionDef``/
+    ``AsyncFunctionDef`` nesting.
 
-    This is the structural guard for issue #1054's recurrence: hand-maintained
-    line citations drift whenever workflow.py grows, and a manual re-sync can
-    introduce a new wrong citation in the same diff (as PR #1045 did). The
-    test parses the citations out of this file's own source, looks up the
-    cited range in workflow.py, and asserts the expected substring is present.
+    A name defined more than once (e.g. two classes each with a same-named
+    method, which would collide under this flat qualname scheme) is
+    deliberately dropped from the result rather than resolved to either
+    definition -- the caller reports that as "ambiguous", not as a silent
+    pick of whichever definition happened to be seen first.
     """
-    wf_lines = _workflow_py_lines()
-    this_file = Path(__file__)
-    this_src = this_file.read_text(encoding="utf-8").splitlines()
+    occurrences: dict[str, list[tuple[int, int]]] = {}
 
-    # Collect every citation that appears in this file, paired with the
-    # expected substring from _CITATION_EXPECTATIONS. A citation with no
-    # matching expectation is itself a failure -- it means someone added a
-    # citation without registering what it should point at.
-    found: set[tuple[int, int]] = set()
+    def walk(node: ast.AST, stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                qualname = ".".join(stack + [child.name])
+                occurrences.setdefault(qualname, []).append((child.lineno, child.end_lineno))
+                walk(child, stack + [child.name])
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    return {name: spans[0] for name, spans in occurrences.items() if len(spans) == 1}
+
+
+def _collect_citation_failures(
+    source_lines: list[str],
+    expectations: dict[str, tuple[str, ...]],
+    symbol_spans: dict[str, tuple[int, int]],
+    wf_lines: list[str],
+) -> list[str]:
+    """Core citation-check logic behind ``test_workflow_py_citations_are_not_stale``,
+    factored out so its failure branches can be exercised directly with
+    synthetic inputs -- ``test_collect_citation_failures_flags_unresolved_symbol``
+    and ``test_collect_citation_failures_flags_stale_line_citation`` below --
+    without mutating this file or workflow.py to force a real failure.
+
+    ``source_lines`` plays the role of this file's own source (scanned for
+    citations and old-style line anchors); ``expectations`` plays
+    ``_CITATION_EXPECTATIONS``; ``symbol_spans`` plays the workflow.py AST
+    resolution from ``_resolve_symbols``; ``wf_lines`` plays workflow.py's
+    source lines. The real test below calls this with the real four inputs
+    and its behavior is unchanged from before this refactor.
+    """
     failures: list[str] = []
 
-    for line_no, line in enumerate(this_src, 1):
+    # No old-style line-anchored citation may remain -- #1213 replaced the
+    # whole form, not just the stale instances that prompted it.
+    for line_no, line in enumerate(source_lines, 1):
+        if _STALE_LINE_CITATION_RE.search(line):
+            failures.append(
+                f"line {line_no}: found an old-style absolute-line-number "
+                f"citation ({line.strip()!r}) -- issue #1213 replaced these "
+                f"with `workflow.py::<Symbol.path>` references; convert it "
+                f"instead of reintroducing a line-anchored citation"
+            )
+
+    # Collect every symbol citation that appears in this file. A citation
+    # with no matching expectation is itself a failure -- it means someone
+    # added a citation without registering what it should contain.
+    found: set[str] = set()
+
+    for line_no, line in enumerate(source_lines, 1):
         for match in _CITATION_RE.finditer(line):
-            start = int(match.group(1))
-            end = int(match.group(2)) if match.group(2) else start
-            key = (start, end)
-            found.add(key)
-            expected = _CITATION_EXPECTATIONS.get(key)
-            if expected is None:
+            symbol = match.group(1)
+            found.add(symbol)
+            markers = expectations.get(symbol)
+            if markers is None:
                 failures.append(
-                    f"line {line_no}: citation workflow.py:{start}-{end} has no "
-                    f"entry in _CITATION_EXPECTATIONS -- add one with the marker "
-                    f"substring the cited range must contain"
+                    f"line {line_no}: citation workflow.py::{symbol} has no "
+                    f"entry in _CITATION_EXPECTATIONS -- add one with the "
+                    f"marker substring(s) its span must contain"
                 )
                 continue
-            if end > len(wf_lines) or start < 1:
+            span = symbol_spans.get(symbol)
+            if span is None:
                 failures.append(
-                    f"line {line_no}: citation workflow.py:{start}-{end} is out of "
-                    f"range for workflow.py ({len(wf_lines)} lines)"
+                    f"line {line_no}: citation workflow.py::{symbol} does not "
+                    f"resolve to exactly one function/method/class in "
+                    f"workflow.py -- it was either renamed/removed, or the "
+                    f"name is ambiguous (defined more than once) and needs a "
+                    f"more specific qualified path"
                 )
                 continue
+            start, end = span
             cited_text = "\n".join(wf_lines[start - 1 : end])
-            if expected not in cited_text:
-                failures.append(
-                    f"line {line_no}: citation workflow.py:{start}-{end} expected "
-                    f"to contain {expected!r} but found:\n"
-                    + "\n".join(f"    {i}: {wf_lines[i - 1]}" for i in range(start, end + 1))
-                )
+            for marker in markers:
+                if marker not in cited_text:
+                    failures.append(
+                        f"line {line_no}: citation workflow.py::{symbol} "
+                        f"(currently workflow.py:{start}-{end}) expected to "
+                        f"contain {marker!r} but it does not appear anywhere "
+                        f"in that symbol's source"
+                    )
 
     # Also fail if a registered expectation has no corresponding citation in
     # the file -- that means a citation was removed but the expectation was
-    # left behind, or the citation's line numbers were changed without
-    # updating the expectation table.
-    orphaned = set(_CITATION_EXPECTATIONS) - found
-    for key in sorted(orphaned):
+    # left behind, or the symbol name was changed without updating the
+    # expectation table.
+    orphaned = set(expectations) - found
+    for symbol in sorted(orphaned):
         failures.append(
-            f"_CITATION_EXPECTATIONS has entry for workflow.py:{key[0]}-{key[1]} "
-            f"but no matching citation appears in this file -- update or remove "
+            f"_CITATION_EXPECTATIONS has entry for workflow.py::{symbol} but "
+            f"no matching citation appears in this file -- update or remove "
             f"the expectation"
         )
 
+    return failures
+
+
+def test_workflow_py_citations_are_not_stale() -> None:
+    """Every ``workflow.py::<Symbol.path>`` citation in this file must resolve
+    to exactly one function/method/class in workflow.py, and the marker
+    substring(s) registered for it in ``_CITATION_EXPECTATIONS`` must appear
+    somewhere in that symbol's source span.
+
+    This is the structural guard for issue #1054's recurrence, now anchored
+    to symbols instead of absolute line numbers (issue #1213) -- see the
+    module comment above ``_CITATION_EXPECTATIONS`` for the full #1054 /
+    #1045 / #1205 / #1213 lineage. Anchoring to a symbol makes a citation
+    survive unrelated workflow.py edits (this guard's whole point), but that
+    is not the same as the citation being *right*: the marker check still
+    catches a citation that resolves cleanly but points at the wrong code.
+    """
+    wf_lines, wf_tree = _workflow_py_source()
+    symbol_spans = _resolve_symbols(wf_tree)
+    this_file = Path(__file__)
+    this_src = this_file.read_text(encoding="utf-8").splitlines()
+
+    failures = _collect_citation_failures(this_src, _CITATION_EXPECTATIONS, symbol_spans, wf_lines)
+
     assert not failures, (
-        "stale or missing workflow.py line citations (issue #1054 recurrence "
-        "guard):\n" + "\n".join(failures)
+        "stale or missing workflow.py symbol citations (issue #1054/#1213 "
+        "recurrence guard):\n" + "\n".join(failures)
     )
+
+
+def test_resolve_symbols_drops_ambiguous_duplicate_qualname() -> None:
+    """``_resolve_symbols`` must drop a qualname defined more than once
+    rather than silently resolving it to whichever definition it saw first,
+    while still resolving an unambiguous sibling symbol correctly.
+
+    Uses a small synthetic module (not workflow.py) so the ambiguous case
+    doesn't require mutating real production code to construct.
+    """
+    source = (
+        "def foo():\n"
+        "    return 1\n"
+        "\n"
+        "\n"
+        "def foo():\n"
+        "    return 2\n"
+        "\n"
+        "\n"
+        "def unique_top_level():\n"
+        "    return 3\n"
+    )
+    tree = ast.parse(source)
+
+    spans = _resolve_symbols(tree)
+
+    assert "foo" not in spans, (
+        "a qualname defined twice (duplicate top-level `def foo`) must be "
+        "dropped as ambiguous, not resolved to either definition"
+    )
+
+    assert "unique_top_level" in spans
+    start, end = spans["unique_top_level"]
+    source_lines = source.splitlines()
+    assert source_lines[start - 1].strip() == "def unique_top_level():"
+    assert source_lines[end - 1].strip() == "return 3"
+
+
+def test_collect_citation_failures_flags_unresolved_symbol() -> None:
+    """The unresolved/renamed-symbol failure branch of
+    ``test_workflow_py_citations_are_not_stale`` (empty ``symbol_spans.get``)
+    must produce a failure naming the citation, not silently pass.
+
+    The fake citation is assembled from separate pieces at runtime (see
+    ``symbol``/``citation`` below) rather than written as one contiguous
+    literal in this file's source: a contiguous literal would itself be
+    picked up by the real guard's own citation scan
+    (``test_workflow_py_citations_are_not_stale``) when it reads this file,
+    and fail because no matching entry exists in ``_CITATION_EXPECTATIONS``.
+    Assembling at runtime produces the joined string only in memory, which
+    is what this synthetic test needs, without leaving a matching literal in
+    the scanned source text.
+    """
+    symbol = "Nonexistent" + ".symbol"
+    citation = "workflow.py::" + symbol
+    source_lines = [f"# see {citation} for details"]
+    expectations = {symbol: ("some marker",)}
+    symbol_spans: dict[str, tuple[int, int]] = {}  # simulates a renamed/removed symbol
+    wf_lines: list[str] = []
+
+    failures = _collect_citation_failures(source_lines, expectations, symbol_spans, wf_lines)
+
+    assert len(failures) == 1
+    assert "does not resolve to exactly one function/method/class" in failures[0]
+    assert symbol in failures[0]
+
+
+def test_collect_citation_failures_flags_stale_line_citation() -> None:
+    """``_STALE_LINE_CITATION_RE`` must actually fire and fail the guard when
+    a line-anchored old-style module-plus-line-number citation is present --
+    not merely fail to fire on today's (already-converted) citations.
+
+    The stale citation string is assembled from separate pieces at runtime
+    for the same reason as the previous test: a contiguous literal here
+    would trip the real guard's own stale-line-citation scan when it reads
+    this file.
+    """
+    stale_citation = "workflow.py:" + "123"
+    source_lines = [f"# old style: {stale_citation}"]
+
+    failures = _collect_citation_failures(source_lines, {}, {}, [])
+
+    assert len(failures) == 1
+    assert "old-style absolute-line-number citation" in failures[0]
+    assert stale_citation in failures[0]
