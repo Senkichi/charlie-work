@@ -3650,7 +3650,7 @@ def test_reconcile_fix_deferred_when_supervisor_lock_held(tmp_path: Path) -> Non
         supervisor_lock.release()
 
     assert result.ok is True
-    assert result.data.get("skipped") is True
+    assert result.data.get("pass_skipped") is True
     assert result.data.get("reason") == "supervisor_lock_held"
 
 

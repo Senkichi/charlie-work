@@ -336,7 +336,7 @@ def test_ci_run_never_created_fires_for_an_escalated_pr(tmp_path: Path) -> None:
 
     result = app.review(456)
     assert result.ok is True
-    assert result.data.get("skipped") is True
+    assert result.data.get("pass_skipped") is True
 
     state = load_state(app.paths.state_file)
     events = _events(state, "ci_run_never_created")
@@ -350,7 +350,7 @@ def test_ci_run_never_created_fires_for_an_escalated_pr(tmp_path: Path) -> None:
 
     # Second pass, still escalated, same head: must stay silent.
     result2 = app.review(456)
-    assert result2.data.get("skipped") is True
+    assert result2.data.get("pass_skipped") is True
     state = load_state(app.paths.state_file)
     assert len(_events(state, "ci_run_never_created")) == 1
 
