@@ -257,7 +257,8 @@ class DispatchConfig:
     # provisioned with a token — see the issue #1001 sequencing hazard
     # comment. Flip to True only after an operator has provisioned a scoped
     # token in ``devin.worker_env`` / ``claude_code.worker_env`` and confirmed
-    # workers reach ``gh pr create`` successfully.
+    # workers reach ``gh pr create`` successfully. Issue #1224 tracks that
+    # staged rollout, including the eventual flip of this default to True.
     require_worker_github_token: bool = False
 
     def __post_init__(self) -> None:
