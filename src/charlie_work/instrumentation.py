@@ -323,6 +323,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "no_op_rework_repair_requested": "info",
         "operator_claim": "info",
         "operator_claim_released": "info",
+        # Issue #1128: a dead worker with an OPEN but unreviewed PR is
+        # advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
+        # dispatch can claim the salvage PR. Info-level recovery bookkeeping,
+        # sibling to ``orphaned_worker_opened_pr``.
+        "orphaned_worker_advanced_to_pr_open": "info",
         "orphaned_worker_drift": "info",
         "orphaned_worker_opened_pr": "info",
         "orphaned_worker_recovered": "info",
