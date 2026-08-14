@@ -14360,31 +14360,44 @@ class OrchestratorApp:
             # (a PR could rework forever instead of escalating to a human).
             request_changes_count = int(pr_state.get("request_changes_count", 0))
             if decision == "request_changes":
-                # Rework cap: past max_rework_cycles the evidence says iteration
-                # thrashes (wrong brief or unimplementable criteria) — escalate to
-                # a human instead of dispatching another cycle.
-                escalated = request_changes_count >= self.config.review.max_rework_cycles
-                # Rescue tier (issue #555): a cap exceedance here is one of the
-                # three verdict-driven ("cheap model wasn't good enough")
-                # causes the rescue tier is gated on. If enabled and this PR
-                # has not already spent its one rescue attempt, route to a
-                # bounded Opus rework instead of escalating — never a second
-                # rescue for the same PR (rescue_attempted is durable, cleared
-                # only by `charlie unescalate`).
-                if (
-                    escalated
-                    and self.config.rescue.enabled
-                    and not pr_state.get("rescue_attempted")
-                ):
-                    escalated = False
-                    rescue_dispatched = True
                 # Only count a rework cycle when the PR head has actually advanced.
                 # If the head is unchanged, the prior cycle's attempt was never
-                # delivered (e.g., worker died orphaned), so re-issuing request_changes
-                # should not consume the escalation budget. See issue #208.
+                # delivered (e.g., worker died orphaned), so re-issuing
+                # request_changes should not consume the escalation budget. See
+                # issue #208.
+                #
+                # Issue #1210: the head_advanced guard previously protected only
+                # the counter increment below — the escalation check ran
+                # unconditionally and fired on an at-cap verdict even when the
+                # head was unchanged. Gate the escalation evaluation (and the
+                # rescue tier, which is itself gated on cap exceedance) on
+                # head_advanced as well, so an at-cap verdict on an unchanged
+                # head re-issues request_changes without escalating, mirroring
+                # what already happens below-cap. Keep the existing behavior for
+                # advanced heads.
                 head_advanced = reviewed_head_sha != pr_state.get("reviewed_head_sha")
-                if not escalated and head_advanced:
-                    request_changes_count += 1
+                if head_advanced:
+                    # Rework cap: past max_rework_cycles the evidence says
+                    # iteration thrashes (wrong brief or unimplementable
+                    # criteria) — escalate to a human instead of dispatching
+                    # another cycle.
+                    escalated = request_changes_count >= self.config.review.max_rework_cycles
+                    # Rescue tier (issue #555): a cap exceedance here is one of
+                    # the three verdict-driven ("cheap model wasn't good
+                    # enough") causes the rescue tier is gated on. If enabled
+                    # and this PR has not already spent its one rescue attempt,
+                    # route to a bounded Opus rework instead of escalating —
+                    # never a second rescue for the same PR (rescue_attempted
+                    # is durable, cleared only by `charlie unescalate`).
+                    if (
+                        escalated
+                        and self.config.rescue.enabled
+                        and not pr_state.get("rescue_attempted")
+                    ):
+                        escalated = False
+                        rescue_dispatched = True
+                    if not escalated:
+                        request_changes_count += 1
                 if not escalated:
                     rework_summary = (
                         rescue_helpers.build_rescue_rework_summary(

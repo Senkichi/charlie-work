@@ -24157,6 +24157,88 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
     assert state["prs"]["456"]["reviewed_head_sha"] == "sha-2"
 
 
+def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
+    tmp_path: Path,
+) -> None:
+    """Issue #1210: an at-cap request_changes verdict on an unchanged head must not escalate.
+
+    The head_advanced guard (issue #208) previously protected only the counter
+    increment; the escalation check ran unconditionally and fired on an at-cap
+    verdict even when the head was unchanged (e.g. a worker died orphaned and
+    pushed nothing). Such a round should re-issue request_changes without
+    escalating, mirroring what already happens below-cap. The counter must be
+    unchanged and the PR/issue status must NOT be escalated.
+    """
+    config = OrchestratorConfig(
+        review=ReviewConfig(max_rework_cycles=2),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Step 1: Fresh dispatch
+    app.gh.prs[0]["state"] = "CLOSED"
+    dispatch_result = app.dispatch(limit=1)
+    assert dispatch_result.ok is True
+
+    # Step 2: Drive request_changes_count up to the cap (2) over two advancing heads.
+    fake_gh.pr_head_shas[456] = "sha-1"
+    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    assert review_result_1.ok is True
+    assert review_result_1.data["escalated"] is False
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
+
+    fake_gh.pr_head_shas[456] = "sha-2"
+    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    assert review_result_2.ok is True
+    assert review_result_2.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["request_changes_count"] == 2
+    assert state["prs"]["456"]["reviewed_head_sha"] == "sha-2"
+
+    # Step 3: A request_changes verdict on the SAME head (sha-2) — the worker
+    # died without pushing anything. request_changes_count is already at the
+    # cap. This must NOT escalate and must NOT mutate the counter.
+    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    assert review_result_3.ok is True
+    assert review_result_3.data["escalated"] is False
+
+    state = load_state(paths.state_file)
+    # Counter unchanged — the round consumed no escalation budget.
+    assert state["prs"]["456"]["request_changes_count"] == 2
+    assert state["prs"]["456"]["reviewed_head_sha"] == "sha-2"
+    # PR and issue status must reflect re-issued request_changes, not escalation.
+    assert state["prs"]["456"]["status"] == "request_changes"
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # No human-needed label should have been added by this round.
+    assert (123, "agent:human-needed") not in fake_gh.labels_added
+
+    # Step 4: Sanity — once the head DOES advance, the at-cap verdict escalates
+    # as before (existing behavior preserved for advanced heads).
+    fake_gh.pr_head_shas[456] = "sha-3"
+    review_result_4 = app.record_review(456, "request_changes", summary="fix D")
+    assert review_result_4.ok is True
+    assert review_result_4.data["escalated"] is True
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["request_changes_count"] == 2
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert state["issues"]["123"]["status"] == "escalated"
+
+
 def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> None:
     config = OrchestratorConfig(
         auto_merge=_approved_automerge(), review_dispatch=ReviewDispatchConfig(enabled=True)
