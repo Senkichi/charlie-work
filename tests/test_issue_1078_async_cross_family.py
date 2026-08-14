@@ -616,10 +616,30 @@ def test_cross_family_pending_guards_non_already_approved_branch(tmp_path: Path)
 
     pr_number = 456
 
-    # No decision has been recorded for this PR (no app.record_review call),
-    # so already_approved is False and _loop_body's else branch runs. No
-    # review packet exists yet either, so head_current is False and the
+    # No app.record_review call, so state.json's pr_state has no "decision"
+    # key and already_approved is False -- _loop_body's else branch runs.
+    # No review packet exists yet either, so head_current is False and the
     # branch proceeds straight into review() rather than the same-head skip.
+    #
+    # But an "approved" verdict IS on disk, written directly to
+    # review-decision.json the same way an operator's out-of-band write
+    # would appear (see the comment at the "packet is current" skip a few
+    # lines above this branch in workflow.py) -- deliberately bypassing
+    # app.record_review, which would also set state["prs"]["456"]["decision"]
+    # = "approved" and route into the already_approved branch instead of the
+    # else branch this test targets. _review_decision reads this file
+    # directly (workflow.py's OrchestratorApp._review_decision), so without
+    # the "if review.data.get('cross_family_pending'): continue" guard at
+    # the merge-skip site, the stale approval would drive a merge_ready call
+    # for a PR whose packet was never regenerated for the new head. review()
+    # returns early on cf_result.pending (workflow.py, before it ever
+    # touches review-decision.json), so this file survives the review() call
+    # below untouched.
+    pr_dir = paths.prs / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "summary": "lgtm"}), encoding="utf-8"
+    )
 
     merge_ready_calls: list[int] = []
 
