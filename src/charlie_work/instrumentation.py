@@ -148,6 +148,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # head. Terminal for this lane -> error.
         "cross_family_report_regen_exhausted": "error",
         "dispatch_blocked_chain_dead": "error",
+        # Issue #1010: the pre-flight cross-repo gate escalated an issue whose
+        # referenced file paths were all absent from the target repo, ending
+        # its dispatch lane this pass. Terminal for the lane -> error, like the
+        # other *_escalated kinds.
+        "dispatch_cross_repo_escalated": "error",
         "dispatch_failed": "error",
         "fleet_pass_config_error": "error",
         "github_error": "error",
@@ -289,6 +294,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "main_ci_reclaim_cancelled": "info",
         "merge_conflict_rework_requested": "info",
         "merge_deferred_stale_base": "info",
+        # Issue #934: operator-issued authorization to merge a worker PR whose
+        # recorded review decision is stale, absent, or pending. An info-level
+        # audit event: it records an explicit operator action, not a fault --
+        # the tripwire and merge-check read it as authorization, never as an
+        # error. Sibling to ``unauthorized_merge_acknowledged`` (the post-merge
+        # retrospective ack), but emitted at authorization time, before the
+        # merge.
+        "merge_authorized": "info",
         "merge_ready": "info",
         # Issue #747: the merge lane emitted events for every outcome except
         # success, so merge throughput was unobservable from events.db. This
@@ -320,6 +333,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # outside the self_deploy_alarm streak (a sibling wedge bounds staleness
         # but does not block orchestrator deploys).
         "self_deploy_ci_fleet_pull": "info",
+        "ci_fleet_provenance": "info",
         "review_dispatch": "info",
         "review_dispatch_claim": "info",
         "review_packet": "info",
