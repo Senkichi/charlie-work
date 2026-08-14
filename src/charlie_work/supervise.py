@@ -26,7 +26,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from . import fleet_registry, git_pull_blockers, layout, worktree
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
@@ -351,7 +351,7 @@ def _find_venv_path(repo_root: Path) -> Path | None:
     return None
 
 
-def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
+def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str, list[str]]:
     """Atomically rewrite poisoned editable ``.pth`` lines to their configured roots.
 
     Scans every ``.pth`` in site-packages (no filename filter -- see
@@ -376,20 +376,28 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
     verification mismatch on re-check, while a wrong repair surfaces as a
     silent ``ImportError`` that verifies clean because the line now equals a
     configured root.
+
+    Returns ``(ok, message, repaired_files)``.  ``repaired_files`` lists the
+    ``.pth`` filenames that were successfully rewritten, even when ``ok`` is
+    ``False`` because other files were unrepairable.  This closes the
+    partial-repair-looks-like-no-op gap surfaced in PR #1176 review: a mixed
+    poisoned/unmatchable scenario previously returned ``False`` with a message
+    naming only the unrepairable entries, leaving the files that *were*
+    rewritten indistinguishable from a no-op failure in ``events.db``.
     """
     site_packages = worktree._site_packages_dir(venv_path)
     if not site_packages:
-        return False, "could not locate site-packages in shared venv"
+        return False, "could not locate site-packages in shared venv", []
     roots = worktree._configured_editable_roots(repo_root)
     if not roots:
-        return False, "could not derive configured editable roots from repo"
+        return False, "could not derive configured editable roots from repo", []
     # package_name -> src_root, for matching a .pth filename to its target.
     package_to_root: dict[str, Path] = {}
     for src_root, package_names in roots:
         for name in package_names:
             package_to_root[name] = src_root
 
-    repaired_any = False
+    repaired_files: list[str] = []
     unrepairable: list[str] = []
     for pth in site_packages.glob("*.pth"):
         original = pth.read_text(encoding="utf-8")
@@ -432,17 +440,21 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
             tmp.write_text(new_content, encoding="utf-8")
             tmp.replace(pth)
         except OSError as exc:
-            return False, f"failed to rewrite {pth.name}: {exc}"
-        repaired_any = True
+            return False, f"failed to rewrite {pth.name}: {exc}", repaired_files
+        repaired_files.append(pth.name)
 
     if unrepairable:
-        return False, (
-            "could not determine correct root for editable .pth: "
-            + ", ".join(sorted(unrepairable))
+        return (
+            False,
+            (
+                "could not determine correct root for editable .pth: "
+                + ", ".join(sorted(unrepairable))
+            ),
+            repaired_files,
         )
-    if not repaired_any:
-        return False, "editable .pth did not require rewriting"
-    return True, "rewrote editable .pth targets to configured checkouts"
+    if not repaired_files:
+        return False, "editable .pth did not require rewriting", []
+    return True, "rewrote editable .pth targets to configured checkouts", repaired_files
 
 
 def _match_pth_to_root(pth: Path, package_to_root: dict[str, Path]) -> Path | None:
@@ -520,13 +532,20 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
         {"venv_path": str(venv_path), "detail": venv_message},
     )
 
-    repair_ok, repair_message = _repair_venv_pth(repo_root, venv_path)
+    repair_ok, repair_message, repaired_files = _repair_venv_pth(repo_root, venv_path)
     if not repair_ok:
-        log_event(
-            state_path,
-            "venv_pth_repair_failed",
-            {"venv_path": str(venv_path), "detail": repair_message},
-        )
+        failed_payload: dict[str, Any] = {
+            "venv_path": str(venv_path),
+            "detail": repair_message,
+        }
+        # Record which .pth files WERE successfully rewritten even though the
+        # overall call reports failure (unrepairable entries, or a mid-loop
+        # OSError on a later file).  Without this a partial repair is
+        # indistinguishable from a no-op failure in events.db -- the gap
+        # surfaced in PR #1176 review.
+        if repaired_files:
+            failed_payload["repaired_files"] = repaired_files
+        log_event(state_path, "venv_pth_repair_failed", failed_payload)
         return SelfDeployResult(
             ok=False,
             pulled=False,
@@ -537,14 +556,13 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
 
     venv_ok, venv_message = worktree.verify_shared_venv(repo_root, venv_path)
     if not venv_ok:
-        log_event(
-            state_path,
-            "venv_pth_repair_failed",
-            {
-                "venv_path": str(venv_path),
-                "detail": f"re-verification failed after repair: {venv_message}",
-            },
-        )
+        reverify_payload: dict[str, Any] = {
+            "venv_path": str(venv_path),
+            "detail": f"re-verification failed after repair: {venv_message}",
+        }
+        if repaired_files:
+            reverify_payload["repaired_files"] = repaired_files
+        log_event(state_path, "venv_pth_repair_failed", reverify_payload)
         return SelfDeployResult(
             ok=False,
             pulled=False,
@@ -553,11 +571,13 @@ def _check_venv(repo_root: Path) -> SelfDeployResult:
             error=f"venv pth repair did not fix the mismatch: {venv_message}",
         )
 
-    log_event(
-        state_path,
-        "venv_pth_repaired",
-        {"venv_path": str(venv_path), "detail": repair_message},
-    )
+    repaired_payload: dict[str, Any] = {
+        "venv_path": str(venv_path),
+        "detail": repair_message,
+    }
+    if repaired_files:
+        repaired_payload["repaired_files"] = repaired_files
+    log_event(state_path, "venv_pth_repaired", repaired_payload)
     return SelfDeployResult(
         ok=True,
         pulled=False,
