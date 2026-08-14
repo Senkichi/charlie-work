@@ -1262,6 +1262,66 @@ def _select_dispatch_candidates(
     return selected, skipped_issue_numbers, deferred_by_concurrency, deferred_by_concurrency_count
 
 
+def _select_rework_candidates(
+    candidates: list[dict[str, Any]],
+    rework_limit: int,
+    only_issues: str | None = None,
+) -> tuple[list[dict[str, Any]], list[int], list[int], int]:
+    """Select rework dispatch candidates under the concurrency cap.
+
+    Mirrors ``_select_dispatch_candidates`` for the fresh-dispatch path, but
+    without the fresh-before-recovery ordering: every rework candidate is
+    already in ``rework_requested`` state, so there is no fresh/recovery split
+    to honor. Selection is a straight ``ordered[:rework_limit]`` cap.
+
+    Args:
+        candidates: Filtered rework candidate issues (each with an open PR).
+        rework_limit: Maximum number of issues to select this pass (already
+            concurrency-governor-clamped by the caller).
+        only_issues: Optional explicit comma-separated issue numbers to select.
+
+    Returns:
+        Tuple of (selected, deferred_by_concurrency_full,
+        deferred_by_concurrency, deferred_by_concurrency_count).
+
+        ``deferred_by_concurrency_full`` is the FULL, untruncated list of every
+        ordered candidate that was not selected -- populated on both the
+        ``only_issues`` path and the automatic path (issue #1014, mirroring
+        #1005 in the fresh-dispatch path; the automatic path used to report
+        this unconditionally as ``[]``, making a saturated governor
+        indistinguishable from an empty backlog). It MUST be fed to
+        ``_build_failure_map`` so every deferred issue keeps its per-issue
+        failures entry.
+
+        ``deferred_by_concurrency`` is the same list truncated to
+        ``_MAX_DEFERRED_CONCURRENCY_EXAMPLES`` entries for the persisted
+        event / ``CommandResult.data`` field -- a standing clamp would
+        otherwise re-emit the full candidate list every pass.
+
+        ``deferred_by_concurrency_count`` is ``len(deferred_by_concurrency_full)``,
+        returned explicitly so callers don't have to re-derive it.
+    """
+    if only_issues:
+        wanted = parse_issue_numbers(only_issues)
+        by_number = {int(issue["number"]): issue for issue in candidates}
+        ordered = [by_number[number] for number in wanted if number in by_number]
+    else:
+        ordered = candidates
+    selected = ordered[:rework_limit]
+    selected_numbers = {int(issue["number"]) for issue in selected}
+    deferred_by_concurrency_full = [
+        int(issue["number"]) for issue in ordered if int(issue["number"]) not in selected_numbers
+    ]
+    deferred_by_concurrency_count = len(deferred_by_concurrency_full)
+    deferred_by_concurrency = deferred_by_concurrency_full[:_MAX_DEFERRED_CONCURRENCY_EXAMPLES]
+    return (
+        selected,
+        deferred_by_concurrency_full,
+        deferred_by_concurrency,
+        deferred_by_concurrency_count,
+    )
+
+
 def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> int:
     """Count the number of currently alive worker sessions across both adapters.
 
@@ -20379,27 +20439,14 @@ class OrchestratorApp:
             # automatic branches -- the automatic branch used to unconditionally
             # report [] even when the concurrency governor dropped candidates,
             # making a saturated governor indistinguishable from an empty
-            # backlog.
-            if only_issues:
-                wanted = parse_issue_numbers(only_issues)
-                by_number = {int(issue["number"]): issue for issue in dry_candidates}
-                dry_ordered = [by_number[number] for number in wanted if number in by_number]
-            else:
-                dry_ordered = dry_candidates
-            dry_selected = dry_ordered[:rework_limit]
-            dry_selected_numbers = {int(issue["number"]) for issue in dry_selected}
-            dry_deferred_by_concurrency_full = [
-                int(issue["number"])
-                for issue in dry_ordered
-                if int(issue["number"]) not in dry_selected_numbers
-            ]
-            dry_deferred_by_concurrency_count = len(dry_deferred_by_concurrency_full)
-            # Truncate for display/persistence parity; _build_failure_map below
-            # sees the full list so every deferred issue keeps its per-issue
-            # failures entry.
-            dry_deferred_by_concurrency = dry_deferred_by_concurrency_full[
-                :_MAX_DEFERRED_CONCURRENCY_EXAMPLES
-            ]
+            # backlog. Shares the selection helper with the live branch below
+            # so the two cannot drift.
+            (
+                dry_selected,
+                dry_deferred_by_concurrency_full,
+                dry_deferred_by_concurrency,
+                dry_deferred_by_concurrency_count,
+            ) = _select_rework_candidates(dry_candidates, rework_limit, only_issues=only_issues)
 
             # Compute would-be SessionRequests without state mutation, label
             # transitions, or worker launches. Rework-prompt re-rendering
@@ -20746,25 +20793,14 @@ class OrchestratorApp:
         # automatic branches -- the automatic branch used to unconditionally
         # report [] even when the concurrency governor dropped candidates,
         # making a saturated governor indistinguishable from an empty backlog.
-        if only_issues:
-            wanted = parse_issue_numbers(only_issues)
-            by_number = {int(issue["number"]): issue for issue in candidates}
-            ordered = [by_number[number] for number in wanted if number in by_number]
-        else:
-            ordered = candidates
-        selected = ordered[:rework_limit]
-        selected_numbers = {int(issue["number"]) for issue in selected}
-        deferred_by_concurrency_full = [
-            int(issue["number"])
-            for issue in ordered
-            if int(issue["number"]) not in selected_numbers
-        ]
-        deferred_by_concurrency_count = len(deferred_by_concurrency_full)
-        # Truncate for the persisted event and CommandResult.data; the full
-        # list is passed to _build_failure_map so every deferred issue keeps
-        # its per-issue failures entry (issue #1005 review caught a prior
-        # version of that fix truncating before _build_failure_map).
-        deferred_by_concurrency = deferred_by_concurrency_full[:_MAX_DEFERRED_CONCURRENCY_EXAMPLES]
+        # Shares the selection helper with the dry-run branch above so the two
+        # cannot drift.
+        (
+            selected,
+            deferred_by_concurrency_full,
+            deferred_by_concurrency,
+            deferred_by_concurrency_count,
+        ) = _select_rework_candidates(candidates, rework_limit, only_issues=only_issues)
 
         if not selected:
             data = {

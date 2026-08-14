@@ -31790,6 +31790,179 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
     ]
 
 
+def test_concurrency_governor_zero_rework_dry_run_automatic_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1014: the dry-run (``dry_run=True``) branch of
+    ``_dispatch_rework_impl`` must populate ``deferred_by_concurrency`` and
+    ``deferred_by_concurrency_count`` on the automatic (non-``--issues``)
+    selection path under a concurrency-saturated governor.
+
+    The live-path fix is covered by
+    ``test_concurrency_governor_zero_rework_is_self_explaining``; this test
+    pins the *same* defect in the structurally separate dry-run branch, which
+    no prior test exercised with a saturated governor at all. Before the fix
+    the dry-run automatic path unconditionally reported
+    ``deferred_by_concurrency=[]`` even when candidates existed and were
+    dropped by the clamp -- making a saturated governor indistinguishable
+    from an empty backlog in the planning report.
+
+    Two scenarios:
+
+    1. Repo-cap clamp with 8 candidates, clamped to 0 -- the dry-run report
+       must carry ``deferred_by_concurrency`` (truncated to 5), the full
+       ``deferred_by_concurrency_count`` of 8, and a ``failures`` map covering
+       all 8 deferred issues (fed the FULL list, not the truncated one). No
+       ``dispatch_rework`` event is recorded (dry-run skips all state writes).
+    2. The ``--issues`` dry-run path with 7 explicitly-requested issues, all
+       deferred -- ``_build_failure_map`` must see every deferred issue (all 7
+       keys), not just the truncated 5-item display list.
+    """
+
+    def mock_count_live_one(sessions_dir, state_file=None):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkSaturatedGitHub(FakeGitHub):
+        """FakeGitHub with N rework issues, each with a matching open PR."""
+
+        def __init__(self, count: int, base_number: int = 301) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": base_number + i,
+                    "title": f"Rework {i}",
+                    "url": f"https://example.test/issues/{base_number + i}",
+                    "body": "rework issue",
+                    "labels": [{"name": "agent:needs-rework"}],
+                    "state": "OPEN",
+                }
+                for i in range(count)
+            ]
+            self.prs = [
+                {
+                    "number": 500 + i,
+                    "title": f"Fix #{base_number + i}",
+                    "url": f"https://example.test/pull/{500 + i}",
+                    "headRefName": f"agent/issue-{base_number + i}",
+                    "baseRefName": "main",
+                    "headRefOid": f"sha-{base_number + i}",
+                    "mergeStateStatus": "CLEAN",
+                    "body": f"Closes #{base_number + i}",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+                for i in range(count)
+            ]
+
+    def _seed_rework_state(state_file, numbers):
+        from charlie_work.state import save_state
+
+        save_state(
+            state_file,
+            {
+                "issues": {str(n): {"status": "rework_requested"} for n in numbers},
+                "prs": {},
+                "events": [],
+                "generated_at": "2024-01-01T00:00:00Z",
+            },
+        )
+
+    # --- Scenario 1: automatic path, repo-cap clamp to 0, dry-run ---------
+    # Governor: max_concurrent_sessions=1, one session already live -> 0
+    # available slots. dispatch_limit is clamped to 0 even though 8 issues
+    # are rework-requested. The dry-run report must still surface the 8
+    # deferred issues rather than reporting [].
+    numbers_8 = list(range(301, 309))
+    fake_gh = ReworkSaturatedGitHub(8)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    _seed_rework_state(paths.state_file, numbers_8)
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["concurrency_limit"] == 1
+    assert result.data["live_session_count"] == 1
+    assert result.data["available_slots"] == 0
+    # The automatic dry-run path must populate deferred_by_concurrency, not
+    # report it as unconditionally empty. Truncated to the first 5 for the
+    # data field, with the untruncated total carried separately.
+    assert result.data["deferred_by_concurrency"] == [301, 302, 303, 304, 305]
+    assert result.data["deferred_by_concurrency_count"] == 8
+    # The failures map must cover every deferred issue (all 8), not just the
+    # 5 that made it into the truncated display field -- _build_failure_map
+    # is fed the FULL deferred list.
+    assert sorted(result.data["failures"].keys()) == [
+        301,
+        302,
+        303,
+        304,
+        305,
+        306,
+        307,
+        308,
+    ]
+    # Dry-run skips all state writes, so no dispatch_rework event is recorded.
+    events = query_events(paths.state_file, kind="dispatch_rework")
+    assert len(events) == 0
+    # State itself is untouched by the dry-run pass.
+    with state_lock(paths.state_file):
+        post_state = load_state(paths.state_file)
+    assert all(
+        entry.get("status") == "rework_requested"
+        for entry in post_state.get("issues", {}).values()
+        if isinstance(entry, dict)
+    )
+
+    # --- Scenario 2: --issues dry-run path, 7 deferred (full-vs-truncated) -
+    # _build_failure_map must see every deferred issue, not just the truncated
+    # event examples. Mirrors scenario 4 of the live-path test.
+    issues_tmp_path = tmp_path / "issues_dry"
+    issues_paths = runtime_paths(issues_tmp_path, config.runtime.state_dir)
+    issues_numbers_7 = list(range(401, 408))
+    issues_gh = ReworkSaturatedGitHub(7, base_number=401)
+    issues_app = OrchestratorApp(issues_tmp_path, issues_paths, config, issues_gh, dry_run=True)
+    _seed_rework_state(issues_paths.state_file, issues_numbers_7)
+
+    issues_result = issues_app.dispatch_rework(only_issues="401,402,403,404,405,406,407")
+
+    assert issues_result.ok is True
+    assert issues_result.data["selected_count"] == 0
+    assert issues_result.data["deferred_by_concurrency"] == [401, 402, 403, 404, 405]
+    assert issues_result.data["deferred_by_concurrency_count"] == 7
+    # All 7 deferred issues keep a failures entry -- not just the 5 that made
+    # it into the truncated data field.
+    assert sorted(issues_result.data["failures"].keys()) == [
+        401,
+        402,
+        403,
+        404,
+        405,
+        406,
+        407,
+    ]
+    # Dry-run records no event.
+    issues_events = query_events(issues_paths.state_file, kind="dispatch_rework")
+    assert len(issues_events) == 0
+
+
 def test_concurrency_governor_result_unclamped() -> None:
     """ConcurrencyGovernorResult correctly represents unclamped state."""
     result = ConcurrencyGovernorResult(
