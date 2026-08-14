@@ -21366,7 +21366,15 @@ def test_merge_ready_dry_run_already_merged_is_noop(tmp_path: Path) -> None:
 
 def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) -> None:
     """Issue #614: under --dry-run, an unapproved PR reports can_merge=False
-    without persisting any state."""
+    without persisting any state.
+
+    Issue #1060: the dry-run return payload must also surface the four gate
+    inputs (``summary_ready``, ``approved``, ``require_approved_review``,
+    ``sync_failed``) so the preview has diagnostic parity with the persisted
+    ``merge_ready`` event.  This scenario — checks green but no recorded
+    approval — exercises the ``approved=False`` / ``require_approved_review=True``
+    branch that makes ``can_merge`` False.
+    """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -21377,6 +21385,13 @@ def test_merge_ready_dry_run_unapproved_reports_can_merge_false(tmp_path: Path) 
     assert result.data["can_merge"] is False
     assert result.data["merged"] is False
     assert result.data["dry_run"] is True
+    # Issue #1060: the four gate inputs are spread into the dry-run payload
+    # from the same dict the gate reads, so the preview explains *why*
+    # can_merge is False without needing events.db.
+    assert result.data["summary_ready"] is True
+    assert result.data["approved"] is False
+    assert result.data["require_approved_review"] is True
+    assert result.data["sync_failed"] is False
     # No state was written for this PR.
     assert "456" not in load_state(paths.state_file)["prs"]
 
