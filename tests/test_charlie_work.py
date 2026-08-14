@@ -7630,6 +7630,128 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
     assert "carry_forward_tier" not in decision
 
 
+def test_check_carry_forward_tier1_whitespace_collision_bypasses_tier2(
+    tmp_path: Path,
+) -> None:
+    """Issue #634 audit rework: ``git patch-id --stable`` strips leading
+    whitespace from ``+``/``-`` content lines, so two diffs that differ ONLY
+    in indentation depth produce the identical patch-id.  The tier-1 fast
+    path in ``_check_carry_forward`` (workflow.py:17333-17334) matches on
+    that hash and returns ``"patch-id"`` immediately — it never falls through
+    to the tier-2 line-content signature, which DOES preserve whitespace and
+    WOULD distinguish the two diffs.
+
+    In Python, an indentation-only change can alter control flow (e.g. moving
+    a ``return`` into or out of an ``if`` block).  Carrying forward an
+    approved verdict across such a change without review is a review-gate
+    bypass.  This test documents the vulnerability; the fix is tracked as a
+    follow-up (see audit doc and PR body).
+    """
+    from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
+
+    # Diff reviewed at approval time: indent ``return True`` to 8 spaces.
+    reviewed_diff = (
+        "diff --git a/mod.py b/mod.py\n"
+        "index 0c54d1a..8e25a7e 100644\n"
+        "--- a/mod.py\n"
+        "+++ b/mod.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def f():\n"
+        "-    return True\n"
+        "+        return True\n"
+    )
+    # Live diff: same logical change but indented to 12 spaces instead of 8.
+    # ``git patch-id --stable`` strips leading whitespace, so both produce
+    # the same hash.  The tier-2 signature preserves whitespace verbatim and
+    # differs.
+    live_diff = (
+        "diff --git a/mod.py b/mod.py\n"
+        "index 0c54d1a..f80ba40 100644\n"
+        "--- a/mod.py\n"
+        "+++ b/mod.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def f():\n"
+        "-    return True\n"
+        "+            return True\n"
+    )
+
+    reviewed_patch_id = _calculate_patch_id(reviewed_diff)
+    live_patch_id = _calculate_patch_id(live_diff)
+    assert reviewed_patch_id == live_patch_id, (
+        "two diffs differing only in indentation depth must produce the "
+        "same git patch-id --stable (the vulnerability's precondition)"
+    )
+    assert reviewed_patch_id != "", "sanity: patch-id must be non-empty"
+
+    reviewed_sig = _diff_content_signature(reviewed_diff)
+    live_sig = _diff_content_signature(live_diff)
+    assert reviewed_sig.changed_lines != live_sig.changed_lines, (
+        "tier-2 signatures must differ — tier-2 preserves whitespace and "
+        "WOULD catch the indentation change that tier-1 misses"
+    )
+    assert reviewed_sig.changed_files == live_sig.changed_files
+
+    old_head = "sha-reviewed-head"
+    new_head = "sha-reindented-head"
+    pr_number = 456
+    issue_number = 123
+
+    prs = [
+        {
+            "number": pr_number,
+            "title": f"Fix #{issue_number}",
+            "url": f"https://example.test/pull/{pr_number}",
+            "headRefName": f"agent/issue-{issue_number}-fix",
+            "baseRefName": "main",
+            "headRefOid": new_head,
+            "mergeStateStatus": "CLEAN",
+            "body": f"Closes #{issue_number}",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _review_queue_carry_forward_app(tmp_path, prs=prs)
+    fake_gh = app.gh
+    fake_gh.diffs[pr_number] = live_diff
+
+    _write_review_packet(
+        tmp_path,
+        pr_number,
+        new_head,
+        {
+            "decision": "approved",
+            "reviewed_head_sha": old_head,
+            "reviewed_patch_id": reviewed_patch_id,
+            "reviewed_changed_lines": list(reviewed_sig.changed_lines),
+            "reviewed_changed_files": sorted(reviewed_sig.changed_files),
+            "reviewed_has_binary": reviewed_sig.has_binary,
+            "carried_forward_from": [],
+        },
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    assert result.data["queue"] == [], (
+        "the verdict was carried forward (not reported stale) — this is "
+        "the vulnerability: tier-1 patch-id match short-circuits before "
+        "tier-2 can reject the whitespace-only change"
+    )
+
+    decision = json.loads(
+        (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision["reviewed_head_sha"] == new_head, (
+        "the approved verdict was carried forward to the reindented head "
+        "without review — the review-gate bypass"
+    )
+    assert decision["carry_forward_tier"] == "patch-id", (
+        "carry-forward was via tier-1 (patch-id), NOT tier-2 (line-content) "
+        "— tier-2 was never consulted because tier-1 short-circuited"
+    )
+
+
 def test_update_approval_head_records_event_for_every_tier(tmp_path: Path) -> None:
     """Issue #638: ``_update_approval_head`` must record a carry-forward event
     itself, so a new call site cannot forget it. The event kind is
