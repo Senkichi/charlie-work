@@ -20067,21 +20067,33 @@ class OrchestratorApp:
 
             dry_candidates = dry_filtered_candidates
 
-            # Apply only_issues filter and concurrency cap (read-only)
+            # Apply only_issues filter and concurrency cap (read-only).
+            # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
+            # deferred_by_concurrency uniformly across both the only_issues and
+            # automatic branches -- the automatic branch used to unconditionally
+            # report [] even when the concurrency governor dropped candidates,
+            # making a saturated governor indistinguishable from an empty
+            # backlog.
             if only_issues:
                 wanted = parse_issue_numbers(only_issues)
                 by_number = {int(issue["number"]): issue for issue in dry_candidates}
-                dry_selected = [by_number[number] for number in wanted if number in by_number]
-                if len(dry_selected) > rework_limit:
-                    dry_deferred_by_concurrency = [
-                        int(issue["number"]) for issue in dry_selected[rework_limit:]
-                    ]
-                    dry_selected = dry_selected[:rework_limit]
-                else:
-                    dry_deferred_by_concurrency = []
+                dry_ordered = [by_number[number] for number in wanted if number in by_number]
             else:
-                dry_selected = dry_candidates[:rework_limit]
-                dry_deferred_by_concurrency = []
+                dry_ordered = dry_candidates
+            dry_selected = dry_ordered[:rework_limit]
+            dry_selected_numbers = {int(issue["number"]) for issue in dry_selected}
+            dry_deferred_by_concurrency_full = [
+                int(issue["number"])
+                for issue in dry_ordered
+                if int(issue["number"]) not in dry_selected_numbers
+            ]
+            dry_deferred_by_concurrency_count = len(dry_deferred_by_concurrency_full)
+            # Truncate for display/persistence parity; _build_failure_map below
+            # sees the full list so every deferred issue keeps its per-issue
+            # failures entry.
+            dry_deferred_by_concurrency = dry_deferred_by_concurrency_full[
+                :_MAX_DEFERRED_CONCURRENCY_EXAMPLES
+            ]
 
             # Compute would-be SessionRequests without state mutation, label
             # transitions, or worker launches. Rework-prompt re-rendering
@@ -20137,11 +20149,12 @@ class OrchestratorApp:
                 "failures": _build_failure_map(
                     [],
                     set(),
-                    dry_deferred_by_concurrency,
+                    dry_deferred_by_concurrency_full,
                     rework_limit,
                     extra_failures=dry_missing_prompt_failures,
                 ),
                 "deferred_by_concurrency": dry_deferred_by_concurrency,
+                "deferred_by_concurrency_count": dry_deferred_by_concurrency_count,
                 "skipped_issue_numbers": sorted(dry_skipped_issue_numbers),
                 "sessions": [asdict(request) for request in dry_session_requests],
                 "adapter_choices": {
@@ -20422,28 +20435,40 @@ class OrchestratorApp:
                     "redispatch_escalated",
                 )
 
+        # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
+        # deferred_by_concurrency uniformly across both the only_issues and
+        # automatic branches -- the automatic branch used to unconditionally
+        # report [] even when the concurrency governor dropped candidates,
+        # making a saturated governor indistinguishable from an empty backlog.
         if only_issues:
             wanted = parse_issue_numbers(only_issues)
             by_number = {int(issue["number"]): issue for issue in candidates}
-            selected = [by_number[number] for number in wanted if number in by_number]
-            # Apply concurrency governor cap to explicit issue selection
-            if len(selected) > rework_limit:
-                deferred_by_concurrency = [
-                    int(issue["number"]) for issue in selected[rework_limit:]
-                ]
-                selected = selected[:rework_limit]
-            else:
-                deferred_by_concurrency = []
+            ordered = [by_number[number] for number in wanted if number in by_number]
         else:
-            selected = candidates[:rework_limit]
-            deferred_by_concurrency = []
+            ordered = candidates
+        selected = ordered[:rework_limit]
+        selected_numbers = {int(issue["number"]) for issue in selected}
+        deferred_by_concurrency_full = [
+            int(issue["number"])
+            for issue in ordered
+            if int(issue["number"]) not in selected_numbers
+        ]
+        deferred_by_concurrency_count = len(deferred_by_concurrency_full)
+        # Truncate for the persisted event and CommandResult.data; the full
+        # list is passed to _build_failure_map so every deferred issue keeps
+        # its per-issue failures entry (issue #1005 review caught a prior
+        # version of that fix truncating before _build_failure_map).
+        deferred_by_concurrency = deferred_by_concurrency_full[:_MAX_DEFERRED_CONCURRENCY_EXAMPLES]
 
         if not selected:
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
-                "failures": _build_failure_map([], set(), deferred_by_concurrency, rework_limit),
+                "failures": _build_failure_map(
+                    [], set(), deferred_by_concurrency_full, rework_limit
+                ),
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "deferred_by_concurrency_count": deferred_by_concurrency_count,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
@@ -20505,8 +20530,11 @@ class OrchestratorApp:
             data = {
                 "adapter": self.config.devin.adapter,
                 "selected_count": 0,
-                "failures": _build_failure_map([], set(), deferred_by_concurrency, rework_limit),
+                "failures": _build_failure_map(
+                    [], set(), deferred_by_concurrency_full, rework_limit
+                ),
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "deferred_by_concurrency_count": deferred_by_concurrency_count,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
@@ -20708,7 +20736,7 @@ class OrchestratorApp:
             no_session_failure_map = _build_failure_map(
                 [],
                 set(),
-                deferred_by_concurrency,
+                deferred_by_concurrency_full,
                 rework_limit,
                 extra_failures=missing_prompt_failures,
             )
@@ -20737,9 +20765,22 @@ class OrchestratorApp:
                         "failed_issue_numbers": [],
                         "skipped_issue_numbers": sorted(skipped_issue_numbers),
                         "deferred_by_concurrency": deferred_by_concurrency,
+                        "deferred_by_concurrency_count": deferred_by_concurrency_count,
                         "label_errors": [],
                         "operator_claimed_skipped": sorted(operator_claimed_skipped),
                         "failures": no_session_failure_map,
+                        # Issue #1014 (mirroring #1005): the capacity axis.
+                        # Always present -- gov.report_fields() is safe to call
+                        # unclamped -- and explicit about `clamped` so a reader
+                        # does not have to redo the arithmetic. `dispatch_limit`
+                        # is included explicitly (report_fields() does not carry
+                        # it) because it is the only field that reflects a
+                        # fleet-cap clamp.
+                        "concurrency_governor": {
+                            "clamped": gov.clamped,
+                            "dispatch_limit": gov.dispatch_limit,
+                            **gov.report_fields(),
+                        },
                     },
                     state_path=self.paths.state_file,
                 )
@@ -20749,6 +20790,7 @@ class OrchestratorApp:
                 "selected_count": 0,
                 "failures": no_session_failure_map,
                 "deferred_by_concurrency": deferred_by_concurrency,
+                "deferred_by_concurrency_count": deferred_by_concurrency_count,
                 "routed_to_review": sorted(routed_to_review),
                 "skipped_head_indeterminate": sorted(head_indeterminate),
                 "review_blocked_retry": sorted(review_blocked_retry),
@@ -21012,7 +21054,7 @@ class OrchestratorApp:
             rework_failure_map = _build_failure_map(
                 dispatch_results,
                 failed_issue_numbers,
-                deferred_by_concurrency,
+                deferred_by_concurrency_full,
                 rework_limit,
                 extra_failures={**missing_prompt_failures, **label_error_failures},
             )
@@ -21025,9 +21067,22 @@ class OrchestratorApp:
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "skipped_issue_numbers": sorted(skipped_issue_numbers),
                     "deferred_by_concurrency": deferred_by_concurrency,
+                    "deferred_by_concurrency_count": deferred_by_concurrency_count,
                     "label_errors": sorted(label_errors),
                     "operator_claimed_skipped": sorted(operator_claimed_skipped),
                     "failures": rework_failure_map,
+                    # Issue #1014 (mirroring #1005): the capacity axis.
+                    # Always present -- gov.report_fields() is safe to call
+                    # unclamped -- and explicit about `clamped` so a reader
+                    # does not have to redo the arithmetic. `dispatch_limit`
+                    # is included explicitly (report_fields() does not carry
+                    # it) because it is the only field that reflects a
+                    # fleet-cap clamp.
+                    "concurrency_governor": {
+                        "clamped": gov.clamped,
+                        "dispatch_limit": gov.dispatch_limit,
+                        **gov.report_fields(),
+                    },
                 },
                 state_path=self.paths.state_file,
             )
@@ -21048,6 +21103,7 @@ class OrchestratorApp:
             "failed_count": len(failed_issue_numbers),
             "failures": rework_failure_map,
             "deferred_by_concurrency": deferred_by_concurrency,
+            "deferred_by_concurrency_count": deferred_by_concurrency_count,
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
