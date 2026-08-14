@@ -21774,6 +21774,16 @@ class OrchestratorApp:
         """
         candidates: list[dict[str, Any]] = []
         prefix = self.config.dispatch.branch_prefix
+        # Capture the review-dispatch gate state at detection time so the finding
+        # describes the moment it was made, not the moment it is later read back
+        # (issue #975). Config is mutable and unversioned in events.db, so once
+        # the operator flips ``enabled`` to True, every historical
+        # ``decision: "missing"`` finding becomes permanently ambiguous -- was
+        # the gate off (expected steady state) or on (a genuine bypass)? This
+        # boolean is the only point where the answer is knowable, and it is a
+        # record, not a suppressor: the finding still fires, still pins
+        # ok=False, and still requires an explicit ack.
+        review_dispatch_enabled = self.config.review_dispatch.enabled
         if merged_prs is None:
             try:
                 merged_prs = self.gh.merged_pr_list()
@@ -21851,6 +21861,7 @@ class OrchestratorApp:
                         "decision": decision_value,
                         "reviewed_head_sha": reviewed_head_sha,
                         "live_head_sha": live_head_sha,
+                        "review_dispatch_enabled": review_dispatch_enabled,
                     }
                 )
         reported = self._apply_unauthorized_merge_baseline(candidates)
@@ -22106,6 +22117,7 @@ class OrchestratorApp:
                         "decision": candidate.get("decision"),
                         "reviewed_head_sha": candidate.get("reviewed_head_sha"),
                         "live_head_sha": candidate.get("live_head_sha"),
+                        "review_dispatch_enabled": candidate.get("review_dispatch_enabled"),
                     }
                 state[key] = record
                 for candidate in fresh:
@@ -22119,6 +22131,7 @@ class OrchestratorApp:
                             "decision": candidate.get("decision"),
                             "reviewed_head_sha": candidate.get("reviewed_head_sha"),
                             "live_head_sha": candidate.get("live_head_sha"),
+                            "review_dispatch_enabled": candidate.get("review_dispatch_enabled"),
                         },
                     )
                 save_state(self.paths.state_file, state)
@@ -22178,6 +22191,7 @@ class OrchestratorApp:
                         "issue": detail.get("issue"),
                         "head": detail.get("head"),
                         "decision": detail.get("decision"),
+                        "review_dispatch_enabled": detail.get("review_dispatch_enabled"),
                     }
                 )
             pending.append(entry)
