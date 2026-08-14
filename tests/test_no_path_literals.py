@@ -29,10 +29,14 @@ Allowed files: ``layout.py`` and ``config.py`` (config.py legitimately holds
 path *defaults* for its dataclasses; a follow-up PR replaces several of them
 with sentinels that defer to layout.py).
 
-The well-known name set for Rule 1 is derived from ``layout`` itself -- the
-explicitly-enforced ``_ENFORCED_FILENAMES`` tuple, plus the explicitly-enforced
-``_ENFORCED_DIRNAMES`` tuple -- rather than hand-copied here. A hand-maintained
-duplicate list is exactly the brittleness this whole refactor exists to remove.
+The well-known name set for Rule 1 is derived from ``layout`` itself -- an
+automatic sweep of every ``*_FILENAME`` constant on ``layout`` (minus the
+small, explicit ``_FILENAME_EXCLUSIONS`` set of names too generic for
+exact-string matching), plus the explicitly-enforced ``_ENFORCED_DIRNAMES``
+tuple -- rather than hand-copied here. A hand-maintained duplicate list is
+exactly the brittleness this whole refactor exists to remove: under the old
+``dir(layout)`` sweep a newly added ``*_FILENAME`` constant was protected
+automatically, and this design restores that fail-closed guarantee.
 
 Note what Rule 1 deliberately does *not* cover: the generic per-repo
 subdirectory names (``issues``, ``prs``, ``logs``, ``dispatches``,
@@ -44,8 +48,8 @@ to swap the literal for ``layout.PRS_DIRNAME``, which adds an indirection while
 preventing nothing. Flagging them here would force an allowlist for every
 legitimate composition, which is precisely the hand-maintained list this test
 is supposed to eliminate. ``layout`` decides which names are enforced (via
-``_ENFORCED_FILENAMES`` and ``_ENFORCED_DIRNAMES``); this test only reads that
-decision.
+the ``_FILENAME_EXCLUSIONS`` opt-out set and the ``_ENFORCED_DIRNAMES``
+tuple); this test only reads that decision.
 """
 
 from __future__ import annotations
@@ -74,23 +78,49 @@ _RULE1_ALLOWED_BASENAMES = frozenset({"layout.py"})
 _RULE2_ALLOWED_BASENAMES = frozenset({"layout.py", "config.py"})
 
 
+def _all_filename_constants() -> frozenset[str]:
+    """Every module-level ``*_FILENAME`` string constant on ``layout``.
+
+    Sweeps ``dir(layout)`` for public attributes whose name ends in
+    ``_FILENAME`` and whose value is a ``str``. This is the automatic
+    coverage source: a newly added ``*_FILENAME`` constant appears here with
+    zero author effort, restoring the fail-closed guarantee that a
+    hand-maintained tuple cannot provide (issue #1052).
+    """
+    return frozenset(
+        getattr(layout, name)
+        for name in dir(layout)
+        if name.endswith("_FILENAME")
+        and not name.startswith("_")
+        and isinstance(getattr(layout, name), str)
+    )
+
+
 def _well_known_path_names() -> frozenset[str]:
     """Derive Rule 1's comparison set directly from ``layout``'s own constants.
 
     Two sources, both read from ``layout`` so nothing is hand-copied here:
 
-    * ``layout._ENFORCED_FILENAMES`` -- the filenames ``layout`` itself
-      declares dangerous to re-spell. Deliberately narrower than the full
-      ``*_FILENAME`` set: ``config.yaml`` is too generic to enforce safely by
-      exact string membership;
+    * an automatic sweep of every ``*_FILENAME`` string constant on
+      ``layout`` (see :func:`_all_filename_constants`), minus
+      ``layout._FILENAME_EXCLUSIONS`` -- the small, explicit set of names too
+      generic for exact-string Rule 1 matching (currently just
+      ``GLOBAL_CONFIG_FILENAME`` / ``config.yaml``). This is fail-closed: a
+      newly added ``*_FILENAME`` constant is automatically protected, and the
+      only way to opt out is to add it to ``_FILENAME_EXCLUSIONS`` (a
+      deliberate, visible act -- see
+      :func:`test_every_filename_constant_is_enforced_or_explicitly_excluded`);
     * ``layout._ENFORCED_DIRNAMES`` -- the directory names ``layout`` itself
       declares dangerous to re-spell (``worktrees`` is the one that cost 74
-      uncollected worktrees in production).
+      uncollected worktrees in production). Dirnames are not auto-swept
+      because the generic per-repo subdirectory names (``issues``, ``prs``,
+      ...) are deliberately unenforced; see the module docstring for why.
 
-    Names *not* in those tuples are intentionally absent; see the module
+    Names *not* in those sources are intentionally absent; see the module
     docstring for why enforcing them would require an allowlist.
     """
-    names: set[str] = set(layout._ENFORCED_FILENAMES)
+    names: set[str] = set(_all_filename_constants())
+    names -= set(layout._FILENAME_EXCLUSIONS)
     names.update(layout._ENFORCED_DIRNAMES)
     return frozenset(names)
 
@@ -307,6 +337,34 @@ def test_generic_fleet_config_filename_is_not_rule1_enforced() -> None:
     """
     assert layout.GLOBAL_CONFIG_FILENAME == "config.yaml"
     assert layout.GLOBAL_CONFIG_FILENAME not in WELL_KNOWN_PATH_NAMES
+
+
+def test_every_filename_constant_is_enforced_or_explicitly_excluded() -> None:
+    """Every ``*_FILENAME`` constant on ``layout`` is classified -- fail-closed.
+
+    The enforced filename set is derived by sweeping ``layout`` for
+    ``*_FILENAME`` attributes and subtracting ``_FILENAME_EXCLUSIONS``. By
+    construction every ``*_FILENAME`` constant is therefore either enforced
+    or explicitly excluded. This test pins that property so a future change
+    that breaks the sweep (e.g. filtering on the wrong suffix, or a
+    non-string ``*_FILENAME`` attribute) cannot silently empty the enforced
+    set and turn Rule 1 into a no-op for filenames.
+
+    This is the regression guard for issue #1052: under the previous
+    hand-maintained ``_ENFORCED_FILENAMES`` tuple, a newly added
+    ``*_FILENAME`` constant that nobody remembered to append was silently
+    unprotected and no test caught the omission. With the auto-sweep the
+    omission is impossible -- but only while the sweep itself stays intact,
+    which this assertion enforces.
+    """
+    all_filenames = _all_filename_constants()
+    classified = WELL_KNOWN_PATH_NAMES | set(layout._FILENAME_EXCLUSIONS)
+    unclassified = all_filenames - classified
+    assert not unclassified, (
+        f"unclassified *_FILENAME constants (neither enforced nor excluded): "
+        f"{sorted(unclassified)} -- add to _FILENAME_EXCLUSIONS only if too "
+        f"generic for exact-string Rule 1; otherwise the sweep already covers it"
+    )
 
 
 def test_generic_runtimepaths_dirnames_are_not_enforced() -> None:

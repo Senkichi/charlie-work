@@ -285,30 +285,24 @@ NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 # exists to prevent. If a future consumer inside the package needs that path,
 # add the constant then and update the script to match in the same change.
 
-#: Filenames whose *re-spelling* is a divergence hazard, and which
-#: ``tests/test_no_path_literals.py`` therefore forbids outside this module.
+#: ``*_FILENAME`` constants deliberately *excluded* from Rule 1 enforcement.
 #:
-#: Deliberately narrower than the full set of ``*_FILENAME`` constants.
-#: ``GLOBAL_CONFIG_FILENAME`` (``config.yaml``) is deliberately excluded:
-#: it is a bare, generic name that Rule 1 can only match by exact string
-#: membership, so it would false-positive on any unrelated
-#: ``some_dir / "config.yaml"`` and induce the wrong import. The constants
-#: below are specific enough that a re-spelling elsewhere is almost always a
-#: real divergence hazard.
-_ENFORCED_FILENAMES = (
-    STATE_FILENAME,
-    SUPERVISOR_LOCK_FILENAME,
-    PENDING_SYNC_FILENAME,
-    SELF_DEPLOY_FAILURE_STATE_FILENAME,
-    ZERO_PASS_STREAK_STATE_FILENAME,
-    NOTIFY_DIGEST_FILENAME,
-    SESSION_MANIFEST_FILENAME,
-    SESSION_RESULTS_FILENAME,
-    FLEET_REGISTRY_FILENAME,
-    FLEET_LOCK_FILENAME,
-    FLEET_SUPERVISOR_LOCK_FILENAME,
-    NOTIFY_HEALTH_STATE_FILENAME,
-)
+#: The enforced filename set is derived automatically by
+#: ``tests/test_no_path_literals.py`` -- it sweeps ``layout`` for every
+#: module-level attribute whose name ends in ``_FILENAME`` and whose value is
+#: a ``str``, then subtracts the names listed here. This is fail-closed: a
+#: newly added ``*_FILENAME`` constant receives automatic Rule 1 protection
+#: with zero author effort, and the only way to opt *out* is to append the
+#: name here -- a deliberate, visible act with a test attached (see
+#: ``test_every_filename_constant_is_enforced_or_explicitly_excluded``).
+#:
+#: ``GLOBAL_CONFIG_FILENAME`` (``config.yaml``) is excluded because it is a
+#: bare, generic name that Rule 1 can only match by exact string membership,
+#: so it would false-positive on any unrelated ``some_dir / "config.yaml"``
+#: and induce the wrong import. Every other ``*_FILENAME`` constant is
+#: specific enough that a re-spelling elsewhere is almost always a real
+#: divergence hazard.
+_FILENAME_EXCLUSIONS = (GLOBAL_CONFIG_FILENAME,)
 
 
 def global_config_path(override: str | None = None) -> Path:
