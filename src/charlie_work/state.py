@@ -170,6 +170,12 @@ ESCALATION_REASON_CLASS_BY_EVENT_KIND: Mapping[str, str] = MappingProxyType(
         # attempt-cap kinds above -- no code fix or human judgment call is
         # involved, only a retry budget running out.
         "infra_rerun_escalated": "mechanical",
+        # Issue #1010: the pre-flight cross-repo gate escalated an issue
+        # because every file path it referenced was absent from the target
+        # repo. This is a mechanical dispatch-time determination (a path
+        # existence check), not a human judgment call -- the worker cannot
+        # fix it, and a human re-triages the target repo.
+        "dispatch_cross_repo_escalated": "mechanical",
     }
 )
 DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
