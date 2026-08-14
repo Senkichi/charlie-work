@@ -14,7 +14,7 @@ This PR makes the path rewrite part of the migration itself, so the inconsistent
   - New injectable `state_rewriter` seam on `apply_state_dir_migration` (mirrors the existing `mover` seam) for testability.
   - `_try_rewrite_path_string` uses the existing pure `_is_lexically_contained` / `_relative_parts` helpers (exact-prefix containment, separator- and case-folded) — a string that merely *contains* the old-root token (issue title) or a sibling prefix (`<src>-backup`) is not a hit.
   - A missing `state.json` is not an error (fresh tree, nothing to rewrite): `ok=True, rewritten=0`.
-  - A rewrite failure (a hit whose rewritten target does not exist, a lock timeout, an `OSError`) returns `ok=False` with `moved` listing what was moved — the children have already moved, so this is an incomplete migration needing manual attention, not a rollback point. `StateLockBusy` and `OSError` are caught and returned as values, never raised (CLAUDE.md invariant).
+  - A rewrite failure (a hit whose rewritten target does not exist, a lock timeout, an `OSError`) returns `ok=False` with `moved` listing what was moved — the children have already moved, so this is an incomplete migration needing manual attention, not a rollback point. `StateLockBusy` and `OSError` are caught and returned as values, never raised (CLAUDE.md invariant). The `except StateLockBusy` and `except OSError` branches in `_rewrite_state_json_paths` are covered by `test_rewrite_state_json_paths_returns_ok_false_on_state_lock_busy` and `test_rewrite_state_json_paths_returns_ok_false_on_oserror` (added in rework), which force each branch via monkeypatching and assert the `ok=False`/error-set contract.
 - **`cli.py`** — `run_migrate_state_dir_command` now reports `rewritten_paths` in both the message (`"moved N children, rewrote M embedded paths"`) and the result `data` dict.
 
 This removes the need for both the compat junction and the manual E2 gate, making "migrated" mean the same thing on disk and in state.
@@ -39,9 +39,10 @@ The rewrite is only attempted after the move loop completes without aborting, so
 
 ```
 uv run --extra dev pytest tests/test_state_dir_migration.py tests/test_cli.py -q --tb=short
-........................................................................ [ 50%]
-........................................................................ [100%]
-144 passed
+........................................................................ [ 48%]
+........................................................................ [ 96%]
+......                                                                   [100%]
+150 passed
 ```
 
 ```
@@ -53,6 +54,8 @@ uv run ruff format --check .
 ```
 
 ### Mutation check
+
+#### Round 1 — rewrite call block
 
 Reverted ONLY the fix — the rewrite call block at the end of `apply_state_dir_migration` in `src/charlie_work/state_migration.py` (the `state_path = plan.dst_root / layout.STATE_FILENAME` block through the final `return`) — to its merge-base version (`return MigrationOutcome(ok=True, moved=tuple(moved))`), keeping the new dataclasses and helpers in place.
 
@@ -74,6 +77,25 @@ uv run --extra dev pytest tests/test_state_dir_migration.py -q --tb=short
 ```
 
 The 2 tests that pass against the reverted code (`test_apply_no_state_json_reports_zero_rewrites`, `test_apply_state_json_with_no_embedded_paths_reports_zero`) test the "0 rewrites" case, which is identical with or without the fix — they are not claimed as mutation-check coverage.
+
+#### Round 2 — exception-handling branches in `_rewrite_state_json_paths` (rework)
+
+Reverted ONLY the `except StateLockBusy` / `except OSError` handlers in `_rewrite_state_json_paths` (`src/charlie_work/state_migration.py`, lines 689-692) — replaced the `try`/`except` block with a bare `with state_lock(...):` body so exceptions propagate instead of being caught and returned as `ok=False` values. The two new tests force each branch via monkeypatching `state_lock` (raises `StateLockBusy`) and `load_state` (raises `OSError`).
+
+Run against the reverted code:
+```
+uv run --extra dev pytest tests/test_state_dir_migration.py::test_rewrite_state_json_paths_returns_ok_false_on_state_lock_busy tests/test_state_dir_migration.py::test_rewrite_state_json_paths_returns_ok_false_on_oserror -q --tb=short
+FF                                                                       [100%]
+FAILED tests/test_state_dir_migration.py::test_rewrite_state_json_paths_returns_ok_false_on_state_lock_busy - charlie_work.state.StateLockBusy: lock held by another process
+FAILED tests/test_state_dir_migration.py::test_rewrite_state_json_paths_returns_ok_false_on_oserror - OSError: disk I/O error
+```
+
+Restored the fix and re-ran:
+```
+uv run --extra dev pytest tests/test_state_dir_migration.py -q --tb=short
+............................................................             [100%]
+60 passed
+```
 
 ## Risks / uncertain areas
 
