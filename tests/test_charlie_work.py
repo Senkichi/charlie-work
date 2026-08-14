@@ -13945,7 +13945,13 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
     ``foreign_issue_ref`` instead of failing the pass every 5 minutes
     forever. GitHubNotFoundError from issue_view is caught before the
     general GitHubError handler, so it never lands in result.data["errors"]
-    and does not flip result.ok to False."""
+    and does not flip result.ok to False.
+
+    Issue #1132: before parking, the loop re-probes the issue via REST
+    (``_confirm_foreign_issue_ref``). A confirmed REST 404 still parks, so
+    ``issue_view`` is called twice on the first pass — once inside
+    ``review()`` (the failing GraphQL-equivalent call) and once for the
+    pre-park REST confirmation — and the marker is still written."""
     from charlie_work.config import NotifyConfig
     from charlie_work.github import GitHubNotFoundError
 
@@ -13994,7 +14000,9 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
 
     assert result.ok is True
     assert result.data["errors"] == []
-    assert fake_gh.issue_view_calls == 1
+    # Two issue_view calls on pass 1: review()'s failing call + the #1132
+    # pre-park REST re-probe (which also 404s, confirming the park).
+    assert fake_gh.issue_view_calls == 2
     assert len(captured) == 1
     assert captured[0].transitions[0].health == "FOREIGN_ISSUE_REF"
     assert captured[0].transitions[0].issue_number == 789
@@ -14008,8 +14016,185 @@ def test_loop_parks_foreign_issue_ref_pr(monkeypatch, tmp_path: Path) -> None:
 
     assert result2.ok is True
     assert result2.data["open_tracked_prs"] == 0
-    assert fake_gh.issue_view_calls == 1
+    assert fake_gh.issue_view_calls == 2
     assert len(captured) == 1
+
+
+def test_loop_transient_graphql_repo_resolution_does_not_park(
+    tmp_path: Path,
+) -> None:
+    """Issue #1132: a transient GraphQL repo-resolution failure
+    ("could not resolve to a Repository with the name '...'") raises
+    ``GitHubNotFoundError`` from ``review()``, but the linked issue exists
+    and is resolvable via REST. The pre-park REST re-probe
+    (``_confirm_foreign_issue_ref``) succeeds, so the loop must NOT park the
+    PR — it routes the failure to the retryable ``errors`` path instead,
+    leaving no ``foreign_issue_ref`` marker so the next pass retries
+    normally."""
+    from charlie_work.github import GitHubNotFoundError
+
+    class TransientRepoResolutionGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Issue 1576 exists in this repo (the real observed case). No
+            # ``automated-ready`` label so intake() does not call issue_view
+            # for it before the per-PR loop reaches review().
+            self.issues = [
+                {
+                    "number": 1576,
+                    "title": "Real issue",
+                    "url": "https://example.test/issues/1576",
+                    "body": "real body",
+                    "labels": [],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = [
+                {
+                    "number": 1586,
+                    "title": "Fix #1576",
+                    "url": "https://example.test/pull/1586",
+                    "headRefName": "agent/issue-1576-x",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-1586",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #1576",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+            self._issue_view_calls = 0
+
+        def issue_view(self, number: int):
+            if number == 1576:
+                self._issue_view_calls += 1
+                # First call is from review() — simulates the transient
+                # GraphQL repo-resolution failure that propagated as
+                # GitHubNotFoundError. The second call is the #1132 REST
+                # re-probe, which succeeds (the issue exists).
+                if self._issue_view_calls == 1:
+                    raise GitHubNotFoundError(
+                        "GraphQL: Could not resolve to a Repository with "
+                        "the name 'Senkichi/job-cannon'. (repository)"
+                    )
+                return self.issues[0]
+            return super().issue_view(number)
+
+    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = TransientRepoResolutionGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.loop(limit=0)
+
+    # The transient failure was routed to the retryable errors path, not
+    # parked. result.ok is False because errors is non-empty, but no
+    # foreign_issue_ref marker was written.
+    assert result.ok is False
+    assert any(e["pr"] == 1586 for e in result.data["errors"])
+    state = load_state(app.paths.state_file)
+    assert "foreign_issue_ref" not in (state["prs"].get("1586") or {})
+
+
+def test_loop_foreign_issue_ref_self_heal_clears_stale_marker(
+    tmp_path: Path,
+) -> None:
+    """Issue #1132: a ``foreign_issue_ref`` marker older than the self-heal
+    cadence is re-probed via REST. When the linked issue now resolves, the
+    marker is cleared (with a ``foreign_issue_ref_cleared`` event) and the
+    PR resumes normal per-PR work this pass instead of being skipped
+    forever."""
+    from datetime import UTC, datetime, timedelta
+
+    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    # PR 456 links to issue 123, which exists in the default FakeGitHub.
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Seed a stale wrong park: marker is >24h old.
+    frozen_now = datetime.now(UTC)
+    stale_detected_at = (frozen_now - timedelta(hours=25)).isoformat().replace("+00:00", "Z")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **(state["prs"].get("456") or {}),
+            "number": 456,
+            "foreign_issue_ref": {
+                "issue": 123,
+                "detected_at": stale_detected_at,
+                "reason": "stale wrong park from a transient outage",
+            },
+        }
+        save_state(paths.state_file, state)
+
+    result = app.loop(limit=0, now=frozen_now)
+
+    # The marker was cleared and the PR was processed (not skipped).
+    state = load_state(app.paths.state_file)
+    assert "foreign_issue_ref" not in (state["prs"].get("456") or {})
+    # The PR was not skipped — open_tracked_prs counts it now.
+    assert result.data["open_tracked_prs"] >= 1
+    # A self-heal clear event was emitted.
+    cleared = query_events(paths.state_file, kind="foreign_issue_ref_cleared")
+    assert any(e.get("payload", {}).get("pr_number") == 456 for e in cleared)
+
+
+def test_loop_parked_foreign_prs_visible_in_loop_completed(
+    tmp_path: Path,
+) -> None:
+    """Issue #1132: a parked foreign PR surfaces in the ``loop_completed``
+    event payload (count + PR numbers) so 'PR untouched for days' is
+    attributable from events.db. Previously the early-continue skip emitted
+    nothing."""
+    from charlie_work.github import GitHubNotFoundError
+
+    class ForeignIssueGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+            self.prs = [
+                {
+                    "number": 789,
+                    "title": "Fix #4242: foreign",
+                    "url": "https://example.test/pull/789",
+                    "headRefName": "agent/issue-4242-x",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-789",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #4242",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+
+        def issue_view(self, number: int):
+            if number == 4242:
+                raise GitHubNotFoundError("could not resolve to a Issue with the number 4242.")
+            return super().issue_view(number)
+
+    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ForeignIssueGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pass 1: parks the PR (confirmed 404 via REST re-probe).
+    app.loop(limit=0)
+
+    # Pass 2: the marker skips the PR. The skip must be visible in the
+    # loop_completed event and the CommandResult data.
+    result2 = app.loop(limit=0)
+
+    assert result2.data["parked_foreign_pr_count"] == 1
+    assert result2.data["parked_foreign_prs"] == [789]
+
+    completed = query_events(paths.state_file, kind="loop_completed")
+    last = completed[-1]
+    payload = last.get("payload", {})
+    assert payload.get("parked_foreign_pr_count") == 1
+    assert payload.get("parked_foreign_prs") == [789]
 
 
 def test_loop_dead_session_notifies_when_watchdog_disabled(

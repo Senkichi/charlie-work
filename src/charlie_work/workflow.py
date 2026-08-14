@@ -2659,6 +2659,15 @@ _REWORK_ISSUE_FETCH_SKIPPED_REASON_CHARS = 300
 # ``reasons_truncated`` count rather than silently dropped.
 _REWORK_ISSUE_FETCH_SKIPPED_MAX_REASONS = 5
 
+# Issue #1132: a ``foreign_issue_ref`` park is permanent by construction, so a
+# wrong park (transient GraphQL repo-resolution failure classified as a genuine
+# issue-404) would hold a PR forever. The pre-park REST re-probe
+# (``_confirm_foreign_issue_ref``) prevents most wrong parks, but any that slip
+# through are re-probed on this slow cadence: if the linked issue now resolves,
+# the marker is cleared and the PR resumes normal processing. A wrong park
+# should cost hours, not forever.
+_FOREIGN_ISSUE_REF_SELF_HEAL_HOURS = 24
+
 
 def _build_rework_issue_fetch_skip_payload(
     failures: list[tuple[int, Exception]],
@@ -18916,6 +18925,132 @@ class OrchestratorApp:
             save_state(self.paths.state_file, state)
         return True
 
+    def _confirm_foreign_issue_ref(self, issue_number: int) -> bool:
+        """Re-probe the linked issue via REST to confirm a permanent not-found.
+
+        A GraphQL "could not resolve to a Repository with the name '...'" is a
+        repository-level resolution failure, not an issue-level one: it can be
+        transient (a local/ISP connectivity dip, a GitHub-side TLS
+        placeholder-cert failure) while the issue itself exists and is
+        resolvable. ``GitHubNotFoundError`` conflates the two, so before parking
+        a PR permanently we re-probe the *specific* issue via REST
+        (``gh issue view <number>``). REST and GraphQL are independent
+        endpoints, so a repo-resolution failure in one does not imply the
+        other.
+
+        Returns True only when the REST call also confirms the issue does not
+        exist (a 404) — the one case where parking is correct. Returns False
+        when the issue resolves (the GraphQL failure was transient) or when the
+        re-probe itself fails transiently (treat as retryable, not permanent):
+        in both cases the caller routes to the retryable ``GitHubError`` path
+        instead of parking.
+        """
+        try:
+            self.gh.issue_view(issue_number)
+        except GitHubNotFoundError:
+            return True
+        except GitHubError:
+            # Transient re-probe failure: not evidence the issue is absent.
+            return False
+        return False
+
+    def _clear_foreign_issue_ref(self, pr_number: int, issue_number: int) -> bool:
+        """Remove a ``foreign_issue_ref`` marker under ``state_lock``.
+
+        Returns True if a marker for this (pr, issue) pair was present and
+        removed, False otherwise. Used by the self-heal path (#1132) when a
+        re-probe of a parked marker finds the issue now resolves.
+        """
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            marker = pr_state.get("foreign_issue_ref") or {}
+            if marker.get("issue") != issue_number:
+                return False
+            del pr_state["foreign_issue_ref"]
+            state["prs"][str(pr_number)] = pr_state
+            save_state(self.paths.state_file, state)
+        return True
+
+    def _maybe_self_heal_foreign_issue_ref(
+        self,
+        pr_number: int,
+        issue_number: int,
+        parked: dict[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Re-probe a stale ``foreign_issue_ref`` marker; clear it if healed.
+
+        A park is permanent by construction, so a wrong park would hold a PR
+        forever. On a slow cadence (``_FOREIGN_ISSUE_REF_SELF_HEAL_HOURS``)
+        we re-probe the linked issue via REST. If it now resolves, the marker
+        is cleared (with a ``foreign_issue_ref_cleared`` event) and the PR
+        resumes normal processing this pass. If the issue is still absent,
+        ``detected_at`` is refreshed so the next re-probe is another full
+        interval away (bounds re-probe cost to one REST call per parked PR
+        per interval, even during a sustained outage).
+
+        Returns True if the marker was cleared and the PR should proceed with
+        normal per-PR work this pass; False if the PR should remain parked.
+        """
+        detected_at = parked.get("detected_at")
+        if not detected_at:
+            return False
+        clock = now if now is not None else datetime.now(UTC)
+        try:
+            parked_at = datetime.fromisoformat(str(detected_at).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if (clock - parked_at) < timedelta(hours=_FOREIGN_ISSUE_REF_SELF_HEAL_HOURS):
+            return False
+        # Stale enough to re-probe. A confirmed 404 refreshes the timer; any
+        # other outcome (issue found, or the re-probe itself transiently
+        # failed) clears the marker so the PR is not held on a flaky signal.
+        try:
+            self.gh.issue_view(issue_number)
+        except GitHubNotFoundError:
+            self._refresh_foreign_issue_ref_detected_at(pr_number, issue_number)
+            return False
+        except GitHubError:
+            # Transient re-probe failure: clear the park rather than holding
+            # the PR on a signal that could itself be the outage. The next
+            # pass re-derives the issue normally.
+            pass
+        cleared = self._clear_foreign_issue_ref(pr_number, issue_number)
+        if cleared:
+            log_event(
+                self.paths.state_file,
+                "foreign_issue_ref_cleared",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "reason": "self-heal re-probe resolved the linked issue",
+                },
+                repo=self.repo_root.name,
+            )
+        return cleared
+
+    def _refresh_foreign_issue_ref_detected_at(self, pr_number: int, issue_number: int) -> None:
+        """Reset ``detected_at`` on an existing marker under ``state_lock``.
+
+        Called by the self-heal path when a re-probe re-confirms the issue is
+        absent, so the next re-probe is a full interval away rather than every
+        pass.
+        """
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            marker = pr_state.get("foreign_issue_ref") or {}
+            if marker.get("issue") != issue_number:
+                return
+            pr_state["foreign_issue_ref"] = {
+                **marker,
+                "detected_at": utc_now(),
+            }
+            state["prs"][str(pr_number)] = pr_state
+            save_state(self.paths.state_file, state)
+
     @_guard_state_lock
     def loop(
         self,
@@ -19010,6 +19145,12 @@ class OrchestratorApp:
                     "sink_population": sink_population,
                     "sink_arrivals": sink_arrivals,
                     "sink_clears": sink_clears,
+                    # Issue #1132: surface parked foreign-PR numbers so a PR
+                    # untouched for days is attributable from events.db. The
+                    # early-continue skip previously emitted nothing, making a
+                    # wrong park undiagnosable.
+                    "parked_foreign_pr_count": len(result.data.get("parked_foreign_prs", [])),
+                    "parked_foreign_prs": list(result.data.get("parked_foreign_prs", [])),
                 },
                 repo=self.repo_root.name,
                 correlation_id=cid,
@@ -20278,6 +20419,10 @@ class OrchestratorApp:
         foreign_transitions: dict[int, dict[str, Any]] = {}
         open_tracked_prs = 0
         skipped_reviews = 0
+        # Issue #1132: track parked foreign-PR numbers so the skip is visible
+        # in the ``loop_completed`` payload. Previously a parked PR emitted
+        # zero events and was undiagnosable from events.db.
+        parked_foreign_prs: list[int] = []
         prs = self.gh.pr_list()
         # Snapshot for foreign-PR markers only: markers change at most once
         # per PR, so a single point-in-time read at loop start is sufficient.
@@ -20302,9 +20447,23 @@ class OrchestratorApp:
             if parked.get("issue") == issue_number:
                 # Foreign/unlinked PR: its claimed issue does not exist in this
                 # repo (e.g. opened against the wrong fleet repo). Skip all
-                # per-PR work with zero GitHub calls until the marker is
-                # cleared or the PR's linked-issue ref changes.
-                continue
+                # per-PR work until the marker is cleared or the PR's
+                # linked-issue ref changes.
+                #
+                # Issue #1132: bounded self-heal. A park is permanent by
+                # construction, so a wrong park (transient GraphQL
+                # repo-resolution failure) would hold the PR forever. On a
+                # slow cadence, re-probe the linked issue via REST; if it now
+                # resolves, clear the marker and let this pass process the PR
+                # normally instead of skipping.
+                if self._maybe_self_heal_foreign_issue_ref(
+                    pr_number, issue_number, parked, now=now
+                ):
+                    # Marker cleared — fall through to normal per-PR work.
+                    pass
+                else:
+                    parked_foreign_prs.append(pr_number)
+                    continue
             # Count every PR with a resolvable linked issue (includes skipped ones)
             open_tracked_prs += 1
             is_merge_head = merge_train_head is None or pr_number == merge_train_head
@@ -20475,16 +20634,29 @@ class OrchestratorApp:
                             )
                             self._record_merge_or_error(merge_result, errors, merges)
             except GitHubNotFoundError as exc:
-                # Permanent: the PR's claimed issue (or another object it
-                # references) does not exist in this repo. Park it durably and
-                # alert once instead of failing the pass every 5 minutes
-                # forever — retrying can never succeed.
+                # Issue #1132: ``GitHubNotFoundError`` conflates a genuine
+                # issue-404 (permanent) with a transient GraphQL
+                # repo-resolution failure ("could not resolve to a Repository
+                # with the name '...'") caused by a network dip or a
+                # GitHub-side TLS placeholder-cert failure. The latter can
+                # clear in minutes, but a park is permanent — so before
+                # parking, re-probe the specific issue via REST. Only a
+                # confirmed REST 404 is permanent; otherwise route to the
+                # retryable ``GitHubError`` path (log + errors, retry next
+                # pass) instead of parking the PR invisibly forever.
                 log_event(
                     self.paths.state_file,
                     "github_not_found_error",
                     {"pr_number": pr_number, "issue_number": issue_number, "error": str(exc)},
                     repo=self.repo_root.name,
                 )
+                if not self._confirm_foreign_issue_ref(issue_number):
+                    # The issue resolves via REST (or the re-probe itself was
+                    # transient): treat the GraphQL failure as retryable, not
+                    # permanent. Surface it as a per-PR error so the pass is
+                    # attributable and the PR is retried next pass.
+                    errors.append({"pr": pr_number, "error": str(exc)})
+                    continue
                 if self._mark_foreign_issue_ref(pr_number, issue_number, str(exc)):
                     foreign_transitions[pr_number] = {
                         "adapter_kind": "unknown",
@@ -20582,6 +20754,11 @@ class OrchestratorApp:
             "warnings": warnings,
             "open_tracked_prs": open_tracked_prs,
             "skipped_reviews": skipped_reviews,
+            # Issue #1132: surface parked foreign-PR numbers so a PR untouched
+            # for days is attributable from events.db / loop_completed rather
+            # than invisible (the early-continue previously emitted nothing).
+            "parked_foreign_prs": parked_foreign_prs,
+            "parked_foreign_pr_count": len(parked_foreign_prs),
             "reaped": reaped,
         }
         # Propagate concurrency info from dispatch results
