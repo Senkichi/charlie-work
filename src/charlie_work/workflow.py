@@ -12502,10 +12502,20 @@ class OrchestratorApp:
             # ``record_review`` so the full state-machine transition (PR
             # status, issue status, rework prompt, label transition) runs
             # exactly as if the verdict were freshly rendered.
-            # ``allow_stale_head=True`` because the verdict was already
-            # written against a specific head (``reviewed_head_sha`` in the
-            # file); refusing on head drift would re-strand the verdict
-            # instead of ingesting it.
+            #
+            # ``allow_stale_head`` is left at its default ``False``. In the
+            # actual #736 bug scenario (state write lost, head unchanged),
+            # ``record_review``'s #467/#1072 guard never fires — the packet
+            # head and live head agree — so the flag would be a no-op there.
+            # The flag only changes behavior when the live PR head has
+            # advanced past the packet head (new commits landed while the PR
+            # sat 'reviewing'), which is exactly the case where the verdict
+            # is legitimately stale and must NOT be silently pinned to the
+            # old diff. ``allow_stale_head=True`` is reserved for the
+            # operator ``charlie verdict`` CLI (issue #467's explicit-choice
+            # design); this is an automated caller and uses the default.
+            # A head-drifted stranded verdict is correctly refused this pass
+            # and left for the stale-claim sweep / a fresh review dispatch.
             pr_number = int(pr_key)
             record_result = self.record_review(
                 pr_number,
@@ -12513,7 +12523,6 @@ class OrchestratorApp:
                 summary=decision_data.get("summary", ""),
                 reviewed_head=decision_data.get("reviewed_head_sha"),
                 required_changes=decision_data.get("required_changes"),
-                allow_stale_head=True,
             )
             entry: dict[str, Any] = {
                 "pr_number": pr_number,

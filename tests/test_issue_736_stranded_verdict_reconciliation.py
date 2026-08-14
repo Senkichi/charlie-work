@@ -313,3 +313,73 @@ def test_stranded_verdict_ingested_when_dispatch_enabled(
         e for e in skip_events if e["payload"].get("reason") == "decision_already_recorded"
     ]
     assert len(decision_skips) == 0
+
+
+def test_stranded_verdict_not_ingested_when_live_head_advanced(tmp_path: Path) -> None:
+    """Issue #736 review finding: when the on-disk verdict's
+    ``reviewed_head_sha`` matches the review packet on disk, but the PR's live
+    ``headRefOid`` has since advanced (new commit pushed while status stayed
+    'reviewing'), the verdict is legitimately stale and must NOT be ingested.
+
+    ``record_review``'s #467/#1072 guard refuses to pin a verdict to a
+    superseded head for automated callers (``allow_stale_head`` defaults to
+    ``False``). ``_reconcile_stranded_verdicts`` is an automated caller and
+    must not bypass that guard — doing so would finalize a decision against a
+    diff nobody re-reviewed. The stranded verdict is correctly skipped this
+    pass and left for the stale-claim sweep / a fresh review dispatch.
+    """
+    # The live PR head has advanced to sha-200 (new commit pushed while the
+    # PR sat in 'reviewing'). The review packet and on-disk verdict were
+    # written against sha-100.
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, enabled=False)
+
+    verdict = {
+        "decision": "request_changes",
+        "issue_number": 10,
+        "pr_number": 100,
+        "reviewed_at": (datetime.now(UTC) - timedelta(days=7)).isoformat(),
+        "reviewed_head_sha": "sha-100",
+        "summary": "fix A",
+        "required_changes": ["fix A"],
+    }
+    # _seed_stranded_pr writes the review packet with head_sha="sha-100"
+    # (matching the verdict's reviewed_head_sha), while the live PR head
+    # is "sha-200" — the head-drift shape.
+    _seed_stranded_pr(app, tmp_path, 100, 10, head_sha="sha-100", decision=verdict)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The reconciliation attempted the verdict but record_review refused
+    # because the live head has moved past the packet head.
+    assert len(result.data["reconciled_verdicts"]) == 1
+    assert result.data["reconciled_verdicts"][0]["pr_number"] == 100
+    assert result.data["reconciled_verdicts"][0]["ok"] is False
+
+    state = load_state(app.paths.state_file)
+    # The verdict was NOT ingested — state.decision is absent and the PR
+    # stays in 'reviewing'.
+    assert "decision" not in state["prs"]["100"]
+    assert state["prs"]["100"]["status"] == "reviewing"
+
+    # A reconcile-failed event was emitted.
+    close_db(app.paths.state_file)
+    failed_events = query_events(app.paths.state_file, kind="review_verdict_reconcile_failed")
+    assert len(failed_events) == 1
+    assert failed_events[0]["payload"]["pr_number"] == 100
+    assert failed_events[0]["payload"]["decision"] == "request_changes"
