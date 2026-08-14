@@ -197,6 +197,17 @@ class JanitorVerdict:
     # run for pushed heads; detection added so the janitor gate distinguishes
     # "CI never started" from "CI failed".
     missing_required_checks: tuple[str, ...] = ()
+    # Issue #1133: True only when "Required check(s) missing" is the SOLE
+    # janitor failure -- every other gate (state, mergeable, failed checks,
+    # linked issue, body, draft, no-op-rework, ...) already passed. This is
+    # the transient population: a brand-new PR whose required checks simply
+    # haven't reported yet, which self-heals within one CI cycle. Distinct
+    # from the durable "CI never started" case, which is detected separately
+    # by _detect_ci_run_never_created and recorded as
+    # ``ci_run_never_created_head`` on the PR state. Consumers must branch on
+    # this structured flag, never on the failure-message text -- same rule as
+    # is_draft_only_block/is_check_failure_block above.
+    is_missing_checks_only_block: bool = False
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -407,6 +418,19 @@ def run_janitor(
 
     is_check_failure_block = bool(failed_required_checks) and not failures
 
+    # Issue #1133: mirror the "*_only_block" pattern for the transient
+    # "Required check(s) missing" case. ``failures`` here still excludes the
+    # "Required check(s) failed" message (appended below) but DOES include the
+    # "Required check(s) missing" message (appended in _check_required_checks
+    # above) -- so ``len(failures) == 1`` with non-empty ``missing_required_checks``
+    # means the missing-checks failure is the sole blocker. Co-occurring
+    # unavailable/infra-failed checks, draft, merge conflict, body, etc. all
+    # lengthen ``failures`` and disqualify this flag, correctly leaving them
+    # in the durable (dead) population.
+    is_missing_checks_only_block = (
+        bool(missing_required_checks) and not failed_required_checks and len(failures) == 1
+    )
+
     # issue #841: mirror is_check_failure_block for infra-failed required
     # checks. `failures` at this point still excludes the "Required check(s)
     # failed" message (appended below) but DOES include
@@ -488,6 +512,7 @@ def run_janitor(
         is_draft=is_draft,
         is_draft_only_block=is_draft_only_block,
         missing_required_checks=missing_required_checks,
+        is_missing_checks_only_block=is_missing_checks_only_block,
     )
 
 
