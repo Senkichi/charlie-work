@@ -212,6 +212,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     merge_check.add_argument("pr", type=int, help="PR number to check")
 
+    merge_authorize = subparsers.add_parser(
+        "merge-authorize",
+        help=(
+            "Record an operator's explicit authorization to merge a worker PR "
+            "(issue #934). Writes an authorized_override into the PR's "
+            "review-decision.json, bound to the current head SHA, so the "
+            "tripwire and merge-check read a recorded authorization rather "
+            "than inferring one. Requires --reason; never weakens the control."
+        ),
+    )
+    merge_authorize.add_argument("pr", type=int, help="PR number to authorize")
+    merge_authorize.add_argument(
+        "--reason",
+        default=None,
+        help=(
+            "Why this merge is authorized (e.g. 'CI green, stale decision "
+            "overridden after content review'). Mandatory — a tripwire that "
+            "can be silenced silently is no control, before the merge as "
+            "much as after it."
+        ),
+    )
+    merge_authorize.add_argument(
+        "--by",
+        default=None,
+        help="Operator who authorized the merge (recorded for audit).",
+    )
+    merge_authorize.add_argument(
+        "--sha",
+        default=None,
+        help=(
+            "SHA to bind the authorization to. Defaults to the PR's live "
+            "headRefOid. An authorization that does not name the SHA it "
+            "authorizes reintroduces the rebase-moved-head hole (#802/#804)."
+        ),
+    )
+
     merge_ready = subparsers.add_parser("ship-it")
     merge_ready.add_argument("--pr", type=int, required=True)
     merge_group = merge_ready.add_mutually_exclusive_group()
@@ -2122,6 +2158,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "merge-check":
         return app.merge_check(args.pr)
+    if args.command == "merge-authorize":
+        return app.merge_authorize(args.pr, args.reason or "", by=args.by, sha=args.sha)
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
     if args.command == "tripwire":
