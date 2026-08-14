@@ -24,7 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from charlie_work import cli
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
 from charlie_work.instrumentation import _classify_level
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
@@ -42,8 +42,15 @@ from test_charlie_work import (
 )
 
 
-def _make_app(tmp_path: Path, fake_gh: FakeGitHub, **kwargs) -> tuple[OrchestratorApp, object]:
-    config = OrchestratorConfig()
+def _make_app(
+    tmp_path: Path,
+    fake_gh: FakeGitHub,
+    *,
+    config: OrchestratorConfig | None = None,
+    **kwargs,
+) -> tuple[OrchestratorApp, object]:
+    if config is None:
+        config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.ensure()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, **kwargs)
@@ -396,3 +403,119 @@ def test_ack_clears_the_detected_record_so_a_withdrawn_ack_announces_again(
         "a finding re-detected after its ack was withdrawn must emit a second "
         f"unauthorized_merge_detected event, got {len(events)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# issue #975: review_dispatch_enabled captured at detection time
+# ---------------------------------------------------------------------------
+
+
+def test_unauthorized_merge_detected_records_gate_disabled(tmp_path: Path) -> None:
+    """When review_dispatch.enabled is False the finding records ``False``.
+
+    The default ``OrchestratorConfig()`` has ``review_dispatch.enabled = False``,
+    so a finding made under it must carry ``review_dispatch_enabled: False`` in
+    both the durable record and the ``unauthorized_merge_detected`` event. This
+    is the "gate off, expected steady state" case the issue is about -- without
+    the field it is indistinguishable from a genuine post-arming bypass once the
+    operator later flips ``enabled`` to True.
+    """
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [_merged_worker_pr(1408, 1404, "sha-1408")]
+    app, paths = _make_app(tmp_path, fake_gh)
+    assert app.config.review_dispatch.enabled is False
+    _arm_unauthorized_merge_tripwire(paths)
+
+    app._detect_unauthorized_merges(fake_gh.prs)
+
+    state = load_state(paths.state_file)
+    record = state[UNAUTHORIZED_MERGE_DETECTED_KEY]["1408"]
+    assert record["review_dispatch_enabled"] is False
+
+    events = [e for e in state["events"] if e["kind"] == "unauthorized_merge_detected"]
+    assert events
+    assert events[0]["payload"]["review_dispatch_enabled"] is False
+
+
+def test_unauthorized_merge_detected_records_gate_enabled(tmp_path: Path) -> None:
+    """When review_dispatch.enabled is True the finding records ``True``.
+
+    This is the "gate on, a real bypass" case. The same ``decision: "missing"``
+    payload shape is produced identically by the gate being off and by the gate
+    being on with a review genuinely skipped; ``review_dispatch_enabled`` is the
+    only field that separates them, so both values must round-trip.
+    """
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [_merged_worker_pr(1408, 1404, "sha-1408")]
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+    app, paths = _make_app(tmp_path, fake_gh, config=config)
+    assert app.config.review_dispatch.enabled is True
+    _arm_unauthorized_merge_tripwire(paths)
+
+    app._detect_unauthorized_merges(fake_gh.prs)
+
+    state = load_state(paths.state_file)
+    record = state[UNAUTHORIZED_MERGE_DETECTED_KEY]["1408"]
+    assert record["review_dispatch_enabled"] is True
+
+    events = [e for e in state["events"] if e["kind"] == "unauthorized_merge_detected"]
+    assert events
+    assert events[0]["payload"]["review_dispatch_enabled"] is True
+
+
+def test_unauthorized_merge_detected_gate_value_reflects_detection_time_config(
+    tmp_path: Path,
+) -> None:
+    """The recorded value describes the moment of detection, not a later read.
+
+    Config is mutable: an operator may flip ``enabled`` between passes. The
+    finding recorded on pass 1 must keep the value captured on pass 1, so a
+    later reader of events.db is not lied to about the state of the gate when
+    the merge actually slipped past it.
+    """
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [_merged_worker_pr(1408, 1404, "sha-1408")]
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+    app, paths = _make_app(tmp_path, fake_gh, config=config)
+    _arm_unauthorized_merge_tripwire(paths)
+
+    app._detect_unauthorized_merges(fake_gh.prs)
+
+    # Flip the gate off after the finding was recorded. The durable record and
+    # event are not rewritten -- they keep the detection-time value.
+    app.config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=False))
+
+    state = load_state(paths.state_file)
+    record = state[UNAUTHORIZED_MERGE_DETECTED_KEY]["1408"]
+    assert record["review_dispatch_enabled"] is True, (
+        "the recorded gate value must reflect detection time, not the current config read"
+    )
+    events = [e for e in state["events"] if e["kind"] == "unauthorized_merge_detected"]
+    assert events
+    assert events[0]["payload"]["review_dispatch_enabled"] is True
+
+
+def test_tripwire_status_surfaces_review_dispatch_enabled(tmp_path: Path) -> None:
+    """``charlie tripwire status`` must surface the captured gate value.
+
+    The status command is the read-side consumer of the detected record
+    (issue #933). A field written to the record but not surfaced here would be
+    write-only -- an operator checking pending findings could not see whether
+    each was a gate-off steady-state finding or a genuine bypass without
+    querying events.db directly.
+    """
+    fake_gh = FakeGitHub()
+    fake_gh.issues = []
+    fake_gh.prs = [_merged_worker_pr(1408, 1404, "sha-1408")]
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+    app, paths = _make_app(tmp_path, fake_gh, config=config)
+    _arm_unauthorized_merge_tripwire(paths)
+
+    app._detect_unauthorized_merges(fake_gh.prs)
+
+    result = app.tripwire_status()
+    assert result.data["pending_count"] == 1
+    assert result.data["pending"][0]["review_dispatch_enabled"] is True
