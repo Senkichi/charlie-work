@@ -199,6 +199,101 @@ from .process_utils import (
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
 from .routing import AdapterChoice, record_adapter_choice, select_adapter
 
+# Issue #1106: a rework session that dies at CLI startup (before the worker's
+# first tool action) is not a no-op/conflict rework attempt — the cap counters
+# should only count sessions that *ran* and produced no useful change.  A
+# ``launch_failed`` (process never launched) is always a startup death; a
+# ``stalled`` session that died within this threshold is also a startup death
+# (CLI error, nonzero exit within seconds, empty diff AND empty transcript).
+# The threshold is deliberately generous: a genuine stall (worker ran for
+# minutes but got stuck) must NOT be misclassified as a startup death, so the
+# bound is set above the worst-case CLI startup time but well below the
+# shortest genuine-work session.
+#
+# The ``runtime_seconds`` passed to ``_is_startup_death`` must be bounded by
+# the worker's *actual process runtime* (time from start to death), NOT by the
+# elapsed time until the orchestrator's classification pass runs.  Using
+# ``WorkerView.runtime_seconds()`` (which is ``now - started_at``) would let
+# ordinary polling latency — the gap between when the CLI died and when the
+# reaper pass classifies it — silently push a 5-second startup death past the
+# 60-second threshold and defeat the exemption.  ``_worker_death_bounded_runtime_seconds``
+# derives the runtime from the log file's last-modified time (frozen at death
+# for a dead process) instead.
+STARTUP_DEATH_THRESHOLD_SECONDS: int = 60
+
+
+def _is_startup_death(failure_kind: str | None, runtime_seconds: float) -> bool:
+    """Classify whether a dead rework session died at CLI startup.
+
+    Returns True when the session never reached the worker's first tool
+    action — the cap counters in ``_route_janitor_gate_failure_to_rework``
+    must not count these as no-op/conflict rework attempts (issue #1106).
+
+    ``runtime_seconds`` must be the worker's *death-bounded* runtime (time
+    from ``started_at`` to the last real log activity / death), as computed
+    by ``_worker_death_bounded_runtime_seconds`` — NOT
+    ``WorkerView.runtime_seconds()``, which measures elapsed time until
+    classification and is polluted by polling latency.
+    """
+    if failure_kind is None:
+        return False
+    # ``launch_failed``: the process never launched at all.
+    if failure_kind == "launch_failed":
+        return True
+    # ``stalled`` with a very short runtime: the CLI exited before the
+    # worker did any real work (e.g. "Refusing to run in an untrusted
+    # workspace").  A longer runtime means the worker genuinely ran and
+    # got stuck — that IS a no-op rework attempt the cap should count.
+    if failure_kind == "stalled" and runtime_seconds < STARTUP_DEATH_THRESHOLD_SECONDS:
+        return True
+    return False
+
+
+def _worker_death_bounded_runtime_seconds(worker: WorkerView) -> float:
+    """Return the worker's runtime bounded by actual process death.
+
+    This is the signal ``_is_startup_death`` must use instead of
+    ``WorkerView.runtime_seconds()`` (which is ``now - started_at`` and
+    measures elapsed time until the *classification pass*, not until death).
+    A CLI that dies at 5 seconds but is not classified until 300 seconds
+    later must still be recognized as a 5-second startup death, not a
+    300-second stall.
+
+    The death-bounded runtime is derived from the log file's last-modified
+    time: once the CLI process exits, the log stops being written and its
+    mtime freezes at the death moment.  A fresh ``stat()`` of the log file
+    is the most accurate signal; the sidecar's recorded ``last_activity_at``
+    (updated each pass by ``update_worker_log_stat``) is the fallback when
+    the log file is gone.  When neither is available — the CLI never wrote
+    anything, e.g. a ``launch_failed`` that still got a PID — the runtime is
+    0.0, which is a startup death by construction.
+    """
+    from datetime import UTC, datetime
+
+    try:
+        started_at = datetime.fromisoformat(worker.started_at)
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        return 0.0
+
+    # Prefer a fresh stat of the log file — its mtime is frozen at death for
+    # a dead process, so this is the tightest death-bounded signal.
+    death_ts: float | None = None
+    log_stat = worker.log_stat()
+    if log_stat is not None:
+        death_ts = log_stat.st_mtime
+    if death_ts is None and worker.last_activity_at is not None:
+        # Fall back to the sidecar's recorded last-activity timestamp.
+        from .worker import _iso_to_timestamp
+
+        death_ts = _iso_to_timestamp(worker.last_activity_at)
+    if death_ts is None:
+        # No log activity was ever recorded — the CLI never wrote anything,
+        # which is a startup death by construction (runtime 0.0).
+        return 0.0
+    return max(0.0, death_ts - started_at.timestamp())
+
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
     """Return (total_lines, per_file_stats) from a unified diff.
@@ -4124,6 +4219,43 @@ def _append_sweep_events(
     return state
 
 
+def _get_open_blockers_for_issue(
+    gh: GitHubLike, issue: dict[str, Any]
+) -> tuple[list[int], list[int]]:
+    """Standalone blocker check — the shared core of ``_get_open_blockers``.
+
+    Both the dispatch candidate filter (``_filter_blocked_issues`` via the
+    ``_get_open_blockers`` method) and ``classify_backlog_reachability`` must
+    answer the same question: does this issue have any *open* blockers? This
+    function is the single implementation of that check so the two paths cannot
+    diverge — a dependency-gate change made for dispatch automatically applies
+    to reachability, and vice versa.
+
+    Returns ``(declared_blockers, open_blockers)`` — both sorted lists of issue
+    numbers. ``declared_blockers`` is every blocker mentioned in the issue body
+    or GitHub-native dependencies; ``open_blockers`` is the subset that are
+    currently open. Fail-open: a transient API error resolves to ``([], [])``,
+    so the issue is treated as unblocked (matching the dispatch path's
+    behaviour — a failed lookup does not filter a candidate out).
+    """
+    logger = logging.getLogger(__name__)
+    issue_number = int(issue["number"])
+    body = issue.get("body", "")
+    body_blockers = parse_blockers(body)
+    gh_blockers = get_github_issue_dependencies(gh, issue_number)
+    all_blockers = sorted(set(body_blockers + gh_blockers))
+    if not all_blockers:
+        return [], []
+    open_blockers = gh.are_issues_open(all_blockers)
+    if issue_number in open_blockers:
+        logger.warning(
+            f"Issue #{issue_number} has self-referencing blocker declaration - ignoring"
+        )
+        open_blockers.discard(issue_number)
+        all_blockers.remove(issue_number)
+    return sorted(all_blockers), sorted(open_blockers)
+
+
 def classify_backlog_reachability(
     gh: GitHubLike,
     config: OrchestratorConfig,
@@ -4182,6 +4314,17 @@ def classify_backlog_reachability(
         "terminal_label": 0,
         "active_label": 0,
         "operator_claimed": 0,
+        # Issue #1110: an automated-ready issue with no agent: label that is
+        # blocked by an open predecessor passes every label-only check above
+        # but is permanently (and correctly) unselectable by dispatch, which
+        # applies a further dependency gate (_filter_blocked_issues). Without
+        # this bin those issues were counted ``dispatchable`` by reachability
+        # while being unselectable, producing false dispatch_stale alarms for
+        # a deliberately sequenced cohort tail. ``dispatchable`` now counts
+        # only issues that pass BOTH the label gate and the dependency gate;
+        # this bin holds the issues the dependency gate rejects. The bins
+        # still partition -- every fetched issue lands in exactly one.
+        "blocked_by_open_dependency": 0,
         # An issue with no ``number`` cannot be dispatched or named as an
         # example, but it must still be BINNED rather than skipped: the
         # renderer joins the non-zero reasons, so a backlog of these would
@@ -4219,7 +4362,22 @@ def classify_backlog_reachability(
             elif number in claimed:
                 reason = "operator_claimed"
             else:
-                reason = "dispatchable"
+                # Issue #1110: the label-only checks above mirror
+                # _is_dispatchable, but the dispatch path applies a further
+                # dependency gate (_filter_blocked_issues) that this function
+                # never modeled. Run the same blocker check the dispatch
+                # candidate filter runs and bin dependency-blocked issues
+                # distinctly, so dispatch_staleness can key off the
+                # post-dependency-gate candidate count instead of the
+                # label-only count. Fail-open: a transient API error resolves
+                # to no open blockers (matching dispatch -- a failed lookup
+                # does not filter a candidate out), so the issue bins as
+                # ``dispatchable`` rather than ``blocked_by_open_dependency``.
+                _declared, open_blockers = _get_open_blockers_for_issue(gh, issue)
+                if open_blockers:
+                    reason = "blocked_by_open_dependency"
+                else:
+                    reason = "dispatchable"
         reachability[reason] += 1
         if reason != "dispatchable":
             bucket = examples.setdefault(reason, [])
@@ -4307,6 +4465,15 @@ def check_dispatch_staleness(
     ``recent_issue_numbers`` lets callers short-circuit with the current pass:
     if this pass itself dispatched issues, the most recent non-empty dispatch is
     now and the check returns ``stale: False``.
+
+    Issue #1110: ``stale`` does not fire when every ready issue is blocked by an
+    open dependency (``dispatchable == 0`` and ``blocked_by_open_dependency > 0``).
+    A deliberately sequenced cohort tail (e.g. #887/#888 blocked by an open
+    #886) is permanently -- and correctly -- unselectable by dispatch, so a
+    cadence alarm for it is a false positive that pattern-matches the #944
+    four-day stall this detector exists to catch. The #944 detection stays
+    intact: when ``dispatchable == 0`` and ``blocked_by_open_dependency == 0``
+    (no ready issues at all, e.g. all ``missing_ready``), the alarm still fires.
     """
     result: dict[str, Any] = {
         "stale": False,
@@ -4316,6 +4483,14 @@ def check_dispatch_staleness(
         "threshold_seconds": None,
         "backlog_observed": bool(backlog_reachability.get("observed", False)),
         "backlog_open_total": int(backlog_reachability.get("open_total", 0) or 0),
+        # Issue #1110: surface the post-dependency-gate candidate count so a
+        # reader of the staleness diagnostic can distinguish "nothing ready"
+        # (the #944 case) from "ready but blocked" (the #1110 case) without
+        # cross-referencing the reachability dict.
+        "backlog_dispatchable": int(backlog_reachability.get("dispatchable", 0) or 0),
+        "backlog_blocked_by_open_dependency": int(
+            backlog_reachability.get("blocked_by_open_dependency", 0) or 0
+        ),
         "reason": None,
     }
 
@@ -4351,6 +4526,21 @@ def check_dispatch_staleness(
             result["reason"] = "backlog_not_observed"
         else:
             result["reason"] = "empty_backlog"
+        return result
+
+    # Issue #1110: when every ready issue is blocked by an open dependency,
+    # dispatch is permanently (and correctly) idle -- there is nothing to
+    # dispatch and nothing wrong with the dispatcher. Firing a cadence alarm
+    # here is a false positive that pattern-matches the #944 four-day stall
+    # this detector exists to catch. The ``dispatchable`` count from
+    # classify_backlog_reachability already excludes dependency-blocked issues
+    # (they bin as ``blocked_by_open_dependency``), so ``dispatchable == 0``
+    # with ``blocked_by_open_dependency > 0`` means "ready but blocked", not
+    # "nothing ready". The #944 case (``dispatchable == 0`` and
+    # ``blocked_by_open_dependency == 0``) falls through to the age check below
+    # and still alarms.
+    if result["backlog_dispatchable"] == 0 and result["backlog_blocked_by_open_dependency"] > 0:
+        result["reason"] = "all_ready_blocked_by_dependencies"
         return result
 
     latest = _latest_non_empty_dispatch(state_path)
@@ -4398,6 +4588,10 @@ def _detect_and_handle_orphaned_workers(
     - If last decision was "request_changes" and head advanced, route to the
       review-pending path by calling ``review_callback`` and then flipping the
       issue status to "reviewing"
+    - If last decision was "approved" and the PR state carries
+      ``status="rework_requested"`` (evidence the post-approval rework lane
+      dispatched this worker) and head is unchanged since review, reset to
+      "rework_requested" -- same as the request_changes branch (issue #1109)
     - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
@@ -4863,30 +5057,128 @@ def _detect_and_handle_orphaned_workers(
                                 )
                             )
                 else:
-                    # Not a simple request_changes case - surface as drift once.
-                    fingerprint = _drift_fingerprint(
-                        reason="dead_worker_unsafe_to_auto_reset",
-                        last_decision=last_decision or "",
-                        pr_number=pr_number,
-                    )
-                    if entry.get("orphan_drift_fingerprint") != fingerprint:
-                        entry["orphan_drift_fingerprint"] = fingerprint
-                        entry["orphan_drift_at"] = utc_now()
-                        sweep_events.append(
-                            (
-                                "orphaned_worker_drift",
-                                {
-                                    "issue_number": issue_number,
-                                    "pr_number": pr_number,
-                                    "previous_status": "dispatched",
-                                    "last_decision": last_decision,
-                                    "reason": "dead_worker_unsafe_to_auto_reset",
-                                    "pid": terminal_pid,
-                                    "exit_code": terminal_exit_code,
-                                    "duration_seconds": terminal_duration_seconds,
-                                },
+                    # Not a simple request_changes case.
+                    # Issue #1109: a dead worker on an approved PR is not
+                    # unclassifiable when the post-approval rework lane
+                    # (#674 -> PR #685, plus the merge-conflict and no-op
+                    # rework lanes that share ``_route_to_rework``) dispatched
+                    # it. Those lanes set the PR state status to
+                    # ``rework_requested`` while preserving
+                    # ``decision="approved"``, and the worker is dispatched to
+                    # fix CI/a conflict without re-litigating the review. If
+                    # that worker dies before pushing (head unchanged since
+                    # review), the issue previously wedged in ``dispatched``
+                    # forever because this sweep refused to auto-reset on a
+                    # non-``request_changes`` decision -- no redispatch, no
+                    # cap consumption, invisible to every downstream lane.
+                    # Treat ``decision="approved"`` + PR-state
+                    # ``rework_requested`` + head unchanged as safe to
+                    # auto-reset, mirroring the request_changes branch above
+                    # (including the #773 clean-exit-no-op sub-case so a
+                    # benign exit-0 worker does not burn redispatch attempts).
+                    # ``dead_worker_unsafe_to_auto_reset`` is kept only for
+                    # genuinely unclassifiable decisions -- an approved PR
+                    # whose PR state does not carry ``rework_requested`` has
+                    # no evidence a post-approval rework lane dispatched this
+                    # worker, so auto-resetting would be a guess.
+                    pr_state_status = pr_state.get("status")
+                    if (
+                        last_decision == "approved"
+                        and pr_state_status == "rework_requested"
+                        and reviewed_head_sha
+                        and live_head_sha
+                        and reviewed_head_sha == live_head_sha
+                    ):
+                        if terminal_exit_code == 0:
+                            # Clean exit with no push -- same #773 rationale
+                            # as the request_changes branch: do not spend a
+                            # redispatch attempt on a worker that produced no
+                            # change on this exact head.
+                            fingerprint = _drift_fingerprint(
+                                reason="dead_worker_clean_exit_no_op",
+                                reviewed_head_sha=reviewed_head_sha,
                             )
+                            if entry.get("orphan_drift_fingerprint") == fingerprint:
+                                state["issues"][str(issue_number)] = entry
+                                continue
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "reason": "dead_worker_clean_exit_no_op",
+                                        "decision": "approved",
+                                        "pr_state_status": pr_state_status,
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
+                        else:
+                            # No terminal record, or a non-zero/None exit
+                            # code: safe to reset to rework_requested (PR head
+                            # unchanged since the approved review, and the
+                            # post-approval rework lane dispatched this
+                            # worker). Records this as a worker death with a
+                            # distinct reason so the death counter (issue
+                            # #1134) and the redispatch cap (issue #165) apply
+                            # exactly as they do for request_changes.
+                            entry["status"] = "rework_requested"
+                            entry["dispatched_at"] = None
+                            death_ts = utc_now()
+                            prior_deaths = entry.get("worker_death_at")
+                            if not isinstance(prior_deaths, list):
+                                prior_deaths = []
+                            entry["worker_death_at"] = prior_deaths + [death_ts]
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_recovered",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "new_status": "rework_requested",
+                                        "reason": "dead_worker_with_approved_rework",
+                                        "decision": "approved",
+                                        "pr_state_status": pr_state_status,
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                        "worker_death_at": death_ts,
+                                    },
+                                )
+                            )
+                    else:
+                        # Genuinely unclassifiable decision - surface as
+                        # drift once.
+                        fingerprint = _drift_fingerprint(
+                            reason="dead_worker_unsafe_to_auto_reset",
+                            last_decision=last_decision or "",
+                            pr_number=pr_number,
                         )
+                        if entry.get("orphan_drift_fingerprint") != fingerprint:
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "last_decision": last_decision,
+                                        "reason": "dead_worker_unsafe_to_auto_reset",
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
                 # that the worker pushed but could not create a PR for.
@@ -5459,6 +5751,20 @@ def _reap_restore_rework_requested(
                 entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
+            # Issue #1106: record the failure_kind and startup-death
+            # classification in the PR state so the janitor gate's
+            # _route_janitor_gate_failure_to_rework can skip the cap
+            # increment when the session died at CLI startup (before
+            # the worker's first tool action) instead of miscounting
+            # it as a no-op/conflict rework attempt.
+            startup_death = _is_startup_death(
+                failure_kind, _worker_death_bounded_runtime_seconds(worker)
+            )
+            state["prs"][str(pr_number)] = {
+                **state.get("prs", {}).get(str(pr_number), {}),
+                "last_rework_failure_kind": failure_kind,
+                "last_rework_was_startup_death": startup_death,
+            }
             state = append_event(
                 state,
                 "rework_requeued",
@@ -5470,6 +5776,7 @@ def _reap_restore_rework_requested(
                     "reason": "dead_rework_session_recovered",
                     "has_request_changes": has_request_changes,
                     "has_rework_prompt": has_rework_prompt,
+                    "startup_death": startup_death,
                 },
                 state_path=state_file,
             )
@@ -8824,6 +9131,24 @@ class OrchestratorApp:
             issues = ready_issues
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
         operator_claimed_ready: list[int] = []
+
+        # Issue #1110 rework: classify_backlog_reachability now runs the same
+        # per-issue blocker check the dispatch candidate filter runs (issue
+        # #1110 wired _get_open_blockers_for_issue into its else-branch). That
+        # check calls get_github_issue_dependencies + are_issues_open per issue
+        # -- exactly the N+1 serial `gh` pattern issue #870 built
+        # _prefetch_blocker_data to eliminate. Warm the pass-scoped cache for
+        # every ready issue once, *before* reachability's serial per-issue
+        # lookups run, mirroring how status() warms the cache before its own
+        # classify_backlog_reachability call. ``issues`` here is the
+        # ready-labelled state="all" set; reachability fetches its own open
+        # list, but its blocker check only runs on ready-labelled OPEN issues,
+        # which are a subset of this set, so this warm-up covers every
+        # dependency lookup reachability will make. The later
+        # _filter_blocked_issues(candidates) call below benefits too:
+        # candidates are a further subset, so the cache is already warm for
+        # them as well. Harmless to call twice (second call is a cache hit).
+        self._prefetch_blocker_data(issues)
 
         # Issue #944: observe the UNFILTERED backlog alongside the filtered
         # candidate query above. This does not participate in selection and
@@ -17758,6 +18083,44 @@ class OrchestratorApp:
                     }
                     save_state(self.paths.state_file, state)
                 return None
+        # Issue #1106: if the previous rework session died at CLI startup
+        # (before the worker's first tool action), this is NOT a no-op/conflict
+        # rework attempt — requeue without touching the caps.  The cap counters
+        # should only count sessions that *ran* and produced no useful change.
+        #
+        # ``head_settled`` is True only when ``rework_pending`` is True at this
+        # point — the only ``rework_pending = True`` path that reaches here is
+        # ``settled_new_conflicted_head = True`` (the head moved off the
+        # recorded baseline), which means the worker DID push real content
+        # before dying.  A startup death with no content change never reaches
+        # here via the ``rework_pending = True`` branch (it returns None at the
+        # stall check above), so the flag only matters on the
+        # ``rework_pending = False`` path — the first detection or a re-detection
+        # after the issue status left the pending set.
+        head_settled = rework_pending
+        if existing_pr_state.get("last_rework_was_startup_death") and not head_settled:
+            decision = self._review_decision(pr_number)
+            route_extra_state: dict[str, Any] = {
+                "last_rework_failure_kind": None,
+                "last_rework_was_startup_death": False,
+            }
+            if head_sha:
+                route_extra_state[last_head_key] = head_sha
+            label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
+            return CommandResult(
+                True,
+                f"PR #{pr_number} requeued after startup death "
+                f"({existing_pr_state.get('last_rework_failure_kind')}); "
+                f"{attempts_key} not incremented",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "routed_to_rework": True,
+                    "rework_reason": reason,
+                    "startup_death_requeue": True,
+                    "label_error": label_error,
+                },
+            )
         attempts = int(existing_pr_state.get(attempts_key, 0)) + 1
 
         if (
@@ -17812,6 +18175,9 @@ class OrchestratorApp:
                     attempts_key: attempts,
                     **rescue_helpers.build_rescue_dataclass_kwargs(reason),
                     "rescue_dispatched_at": utc_now(),
+                    # Issue #1106: clear startup-death flags.
+                    "last_rework_failure_kind": None,
+                    "last_rework_was_startup_death": False,
                 }
                 state = self._record_event(
                     state,
@@ -17828,6 +18194,9 @@ class OrchestratorApp:
             route_extra_state: dict[str, Any] = {attempts_key: attempts}
             if head_sha:
                 route_extra_state[last_head_key] = head_sha
+            # Issue #1106: clear startup-death flags.
+            route_extra_state["last_rework_failure_kind"] = None
+            route_extra_state["last_rework_was_startup_death"] = False
             label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
             return CommandResult(
                 True,
@@ -17862,7 +18231,12 @@ class OrchestratorApp:
                     reason=escalation_reason,
                     reason_class="mechanical",
                     pr_number=pr_number,
-                    pr_extra={attempts_key: attempts},
+                    pr_extra={
+                        attempts_key: attempts,
+                        # Issue #1106: clear startup-death flags on escalate.
+                        "last_rework_failure_kind": None,
+                        "last_rework_was_startup_death": False,
+                    },
                 )
                 state = self._record_event(
                     state,
@@ -17918,6 +18292,11 @@ class OrchestratorApp:
                     # from a timestamp accumulated during unrelated history.
                     stall_since_key: None,
                     stall_head_key: None,
+                    # Issue #1106: clear startup-death flags — the head
+                    # settled, so the previous session's death (if any) is
+                    # now accounted for by this attempt.
+                    "last_rework_failure_kind": None,
+                    "last_rework_was_startup_death": False,
                 }
                 state = self._record_event(
                     state,
@@ -17943,6 +18322,10 @@ class OrchestratorApp:
         route_extra_state: dict[str, Any] = {attempts_key: attempts}
         if head_sha:
             route_extra_state[last_head_key] = head_sha
+        # Issue #1106: clear startup-death flags — this attempt is being
+        # counted, so the previous session's death is now accounted for.
+        route_extra_state["last_rework_failure_kind"] = None
+        route_extra_state["last_rework_was_startup_death"] = False
         label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
         return CommandResult(
             True,
@@ -21787,6 +22170,20 @@ class OrchestratorApp:
                     entry.pop("orphan_flagged_at", None)
                     entry.pop("orphan_drift_fingerprint", None)
                     entry.pop("orphan_drift_at", None)
+                    # Issue #1106: a new rework dispatch supersedes any
+                    # prior startup-death classification — the new session
+                    # is the one whose outcome the next janitor pass will
+                    # attribute, so the stale flag must not survive.
+                    dispatched_pr = pr_by_issue.get(request.issue_number)
+                    if dispatched_pr is not None:
+                        dispatched_pr_number = int(dispatched_pr["number"])
+                        pr_state = state.get("prs", {}).get(str(dispatched_pr_number), {})
+                        if pr_state:
+                            state["prs"][str(dispatched_pr_number)] = {
+                                **pr_state,
+                                "last_rework_failure_kind": None,
+                                "last_rework_was_startup_death": False,
+                            }
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
@@ -22404,36 +22801,7 @@ class OrchestratorApp:
             declared_blockers includes all blockers mentioned in the issue body or
             GitHub dependencies. open_blockers is the subset that are currently open.
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-        issue_number = int(issue["number"])
-        body = issue.get("body", "")
-
-        # Parse blockers from issue body
-        body_blockers = parse_blockers(body)
-
-        # Get GitHub native dependencies
-        gh_blockers = get_github_issue_dependencies(self.gh, issue_number)
-
-        # Combine and deduplicate
-        all_blockers = sorted(set(body_blockers + gh_blockers))
-
-        if not all_blockers:
-            return [], []
-
-        # Check which blockers are still open
-        open_blockers = self.gh.are_issues_open(all_blockers)
-
-        # Filter out self-references (malformed markers like "Blocked by #123" on issue #123)
-        if issue_number in open_blockers:
-            logger.warning(
-                f"Issue #{issue_number} has self-referencing blocker declaration - ignoring"
-            )
-            open_blockers.discard(issue_number)
-            all_blockers.remove(issue_number)
-
-        return sorted(all_blockers), sorted(open_blockers)
+        return _get_open_blockers_for_issue(self.gh, issue)
 
     @staticmethod
     def _is_dead_blocker(
