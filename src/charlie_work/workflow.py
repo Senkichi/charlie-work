@@ -68,6 +68,7 @@ from .cross_family import (
     report_is_reusable,
     run_cross_family_review,
 )
+from .cross_repo_gate import cross_repo_gate
 from .github import (
     GitHub,
     GitHubError,
@@ -106,6 +107,7 @@ from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import (
     PromptTemplateError,
     assert_conventional_commit_title,
+    assert_containment,
     assert_execution_contract,
     assert_no_merge_contract,
     prompt_template_digest,
@@ -6227,6 +6229,11 @@ def _write_rework_prompt(
     # *rendered output* so a repo-local flat rework override that drops
     # $section_execution_contract is caught at the dispatch boundary.
     assert_execution_contract(prompt, context=f"rework prompt for PR #{pr_number}")
+    # Issue #1010: enforce the widened containment clause on the *rendered
+    # output* so a repo-local flat rework override that drops
+    # $section_scope_contract or reverts to the old repo-scoped wording is
+    # caught at the dispatch boundary.
+    assert_containment(prompt, context=f"rework prompt for PR #{pr_number}")
     prompt_path.write_text(prompt, encoding="utf-8")
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
     # regeneration (when review-decision.json is newer than the brief) can
@@ -8790,10 +8797,19 @@ class OrchestratorApp:
             adapter_choices: dict[int, AdapterChoice] = {}
             api_enabled = self.config.api_worker.enabled
             routing_inputs = self._routing_inputs() if api_enabled else None
+            # Issue #1010: dry-run cross-repo gate — report which issues would
+            # be escalated without mutating state or labels.
+            dry_run_cross_repo_escalated: dict[int, str] = {}
             for issue_number in selected_issue_numbers:
                 full_issue = self.gh.issue_view(issue_number)
                 full_issues[issue_number] = full_issue
                 branch_name = self._branch_name(full_issue)
+
+                # Pre-flight gate: report cross-repo targets without escalating.
+                gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
+                if not gate_result.passed:
+                    dry_run_cross_repo_escalated[issue_number] = gate_result.reason
+                    continue
 
                 template: str | None = None
                 if api_enabled and routing_inputs is not None:
@@ -8842,6 +8858,7 @@ class OrchestratorApp:
                     merged_pr_mention_only_issue_numbers
                 ),
                 "label_errors": [],
+                "cross_repo_escalated_issue_numbers": sorted(dry_run_cross_repo_escalated),
                 "sessions": [asdict(request) for request in session_requests],
                 "adapter_choices": {
                     str(n): {"kind": c.kind, "provider": c.provider, "reason": c.reason}
@@ -9295,10 +9312,22 @@ class OrchestratorApp:
         adapter_choices: dict[int, AdapterChoice] = {}
         api_enabled = self.config.api_worker.enabled
         routing_inputs = self._routing_inputs() if api_enabled else None
+        # Issue #1010: pre-flight cross-repo gate. Issues whose referenced
+        # file paths are all absent from the target repo are escalated to
+        # human-needed instead of dispatching a worker that will wander to a
+        # sibling repo's shared checkout.
+        cross_repo_escalated: dict[int, str] = {}
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
             branch_name = self._branch_name(full_issue)
+
+            # Pre-flight gate: refuse to dispatch when the issue's referenced
+            # code does not exist in this repo (issue #1010).
+            gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
+            if not gate_result.passed:
+                cross_repo_escalated[issue_number] = gate_result.reason
+                continue
 
             # Determine the adapter for this issue (single point of enforcement:
             # routing.select_adapter). The prompt template follows the choice
@@ -9626,6 +9655,61 @@ class OrchestratorApp:
                         )
                         save_state(self.paths.state_file, state)
 
+            # Issue #1010: escalate issues blocked by the cross-repo pre-flight
+            # gate. Their referenced file paths are all absent from the target
+            # repo, so dispatching a worker would send it to a sibling repo's
+            # shared checkout. Escalate to human-needed with a cross_repo_target
+            # reason and record the event — the issue stays in the dispatch
+            # pool's state as escalated, not dispatch_pending.
+            for issue_number, reason in sorted(cross_repo_escalated.items()):
+                prev_entry = state["issues"].get(str(issue_number), {})
+                entry = {
+                    **prev_entry,
+                    "number": issue_number,
+                    "title": full_issues.get(issue_number, {}).get("title"),
+                    "url": full_issues.get(issue_number, {}).get("url"),
+                }
+                entry.pop("dispatch_pending_at", None)
+                entry.pop("label_error", None)
+                state = _escalate_issue(
+                    state,
+                    issue_number,
+                    reason=reason,
+                    reason_class="mechanical",
+                    issue_extra=entry,
+                )
+                state = append_event(
+                    state,
+                    "dispatch_cross_repo_escalated",
+                    {
+                        "issue_number": issue_number,
+                        "reason": reason,
+                    },
+                    state_path=self.paths.state_file,
+                )
+                save_state(self.paths.state_file, state)
+                # Transition labels to human-needed, following the same pattern
+                # as the redispatch_escalated path above.
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "redispatch_escalated",
+                )
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "redispatch_escalated",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+                    escalated_entry = state["issues"].get(str(issue_number), {})
+                    escalated_entry["label_error"] = label_error
+                    state["issues"][str(issue_number)] = escalated_entry
+                    label_errors.append(issue_number)
+                    label_error_failures[issue_number] = _label_error_reason(label_error)
+                    save_state(self.paths.state_file, state)
+
             # Build dispatch-alert transitions for the notify digest. Averted
             # redispatches surface as DISPATCH_AVERTED; a later successful or
             # non-averted dispatch clears the alert back to OK.
@@ -9714,6 +9798,7 @@ class OrchestratorApp:
                     "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "foreign_writer_issue_numbers": sorted(foreign_writer_issue_numbers),
+                    "cross_repo_escalated_issue_numbers": sorted(cross_repo_escalated),
                     "label_errors": sorted(label_errors),
                     "skipped_issue_numbers": skipped_issue_numbers,
                     "deferred_by_concurrency": deferred_by_concurrency,
@@ -9769,6 +9854,8 @@ class OrchestratorApp:
             message += (
                 f" (reaped phantom live worker slots: {sorted(phantom_live_worker_issue_numbers)})"
             )
+        if cross_repo_escalated:
+            message += f" (cross-repo escalated: {sorted(cross_repo_escalated)})"
         data = {
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
@@ -9778,6 +9865,7 @@ class OrchestratorApp:
             "phantom_live_worker_count": len(phantom_live_worker_issue_numbers),
             "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
             "foreign_writer_count": len(foreign_writer_issue_numbers),
+            "cross_repo_escalated_issue_numbers": sorted(cross_repo_escalated),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
             "deferred_by_concurrency_count": deferred_by_concurrency_count,
@@ -21969,6 +22057,13 @@ class OrchestratorApp:
         # dispatch boundary rather than shipping a worker who can change a
         # contract surface and push without ever exercising the wider suite.
         assert_execution_contract(prompt, context=f"worker prompt for issue #{issue_number}")
+        # Issue #1010: enforce the widened containment clause on the *rendered
+        # output* so a repo-local flat override that drops
+        # $section_scope_contract or reverts to the old repo-scoped wording
+        # (which does not cover a different repo) is caught at the dispatch
+        # boundary rather than shipping a worker with no effective prohibition
+        # against editing a sibling repo's checkout.
+        assert_containment(prompt, context=f"worker prompt for issue #{issue_number}")
         # Issue #618: the dry-run dispatch branch promises "skip all state
         # writes, label transitions, and file mutations" — mkdir + write_text
         # here would violate that, and for a dead-worker recovery candidate
