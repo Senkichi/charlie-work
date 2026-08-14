@@ -93,6 +93,32 @@ def _repo_for_cwd(roots: dict[str, Path], cwd: Path) -> str | None:
 
 _SHELL_SEPARATORS = frozenset({";", "|", "&", "&&", "||", "\n"})
 
+# ``gh pr merge``'s own flag surface, used only to decide whether the token
+# after a flag is the flag's value or a positional argument. This is a UX
+# optimization, not a safety boundary: a flag NOT listed here (new gh release,
+# typo) makes the following positional ambiguous and the invocation fails
+# CLOSED (pr=None -> deny), never open. Staleness degrades to an inconvenient
+# deny that tells the operator to put the PR number first.
+_MERGE_VALUE_FLAGS = frozenset(
+    {"t", "subject", "b", "body", "F", "body-file", "A", "author-email", "match-head-commit"}
+)
+_MERGE_BOOLEAN_FLAGS = frozenset(
+    {
+        "admin",
+        "auto",
+        "disable-auto",
+        "delete-branch",
+        "d",
+        "merge",
+        "m",
+        "squash",
+        "s",
+        "rebase",
+        "r",
+        "help",
+    }
+)
+
 
 def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
     """Extract every ``gh pr merge`` invocation's PR number and ``--repo``.
@@ -148,6 +174,7 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
             idx += 1
             continue
         pr: int | None = None
+        pr_ambiguous = False
         repo: str | None = flag_repo
         i = matched_end
         while i < len(tokens):
@@ -160,9 +187,22 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
                 continue
             if tok.startswith("--repo="):
                 repo = tok.split("=", 1)[1]
-            elif pr is None and re.fullmatch(r"\d+", tok):
+            elif tok.startswith("-"):
+                if "=" in tok or tok.lstrip("-") in _MERGE_BOOLEAN_FLAGS:
+                    pass  # self-contained; the next token is a real argument
+                elif tok.lstrip("-") in _MERGE_VALUE_FLAGS and i + 1 < len(tokens):
+                    i += 2  # consume the flag's value so it can't be read as a PR
+                    continue
+                elif pr is None:
+                    # Unknown flag before the PR number: if it takes a value,
+                    # the next token is that value, and reading it as the PR
+                    # would make merge-check validate the WRONG pull request
+                    # (round-3 review finding). Unknowable here -> ambiguous,
+                    # which the caller treats as fail-closed.
+                    pr_ambiguous = True
+            elif pr is None and not pr_ambiguous and re.fullmatch(r"\d+", tok):
                 pr = int(tok)
-            elif pr is None and tok.startswith("https://github.com/"):
+            elif pr is None and not pr_ambiguous and tok.startswith("https://github.com/"):
                 url_match = re.search(r"/pull/(\d+)", tok)
                 if url_match:
                     pr = int(url_match.group(1))

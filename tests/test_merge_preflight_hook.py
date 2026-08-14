@@ -17,6 +17,8 @@ import pytest
 
 from charlie_work import merge_preflight_hook as hook
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 # ---------------------------------------------------------------------------
 # _parse_gh_merge_targets
@@ -583,3 +585,75 @@ def test_parse_gh_pr_view_merge_is_not_an_invocation() -> None:
 def test_parse_quoted_mention_of_gh_pr_merge_is_not_an_invocation() -> None:
     command = "git commit -m 'about gh pr merge'"
     assert hook._parse_gh_merge_targets(command) == []
+
+
+# ---------------------------------------------------------------------------
+# Round-3 fixes (#1195): value-taking flags before the PR number, and the
+# .claude/settings.json wiring that activates the hook.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_pr"),
+    [
+        ("gh pr merge -t 42 1195", 1195),
+        ("gh pr merge --subject 42 1195", 1195),
+        ("gh pr merge --match-head-commit abc123 8", 8),
+        ("gh pr merge --squash 5", 5),
+        ("gh pr merge -s -d 5", 5),
+        ("gh pr merge --body=hello 7", 7),
+        ("gh pr merge 1195 -t 42", 1195),
+    ],
+)
+def test_parse_known_flags_do_not_shift_the_pr_number(command: str, expected_pr: int) -> None:
+    targets = hook._parse_gh_merge_targets(command)
+    assert targets == [{"pr": expected_pr, "repo": None}]
+
+
+def test_parse_unknown_flag_before_pr_number_is_ambiguous() -> None:
+    # -x is not in _MERGE_VALUE_FLAGS or _MERGE_BOOLEAN_FLAGS, so whether it
+    # consumes "42" as a value is unknowable here. Reading "42" as the PR
+    # would validate the wrong pull request (round-3 review finding) -- the
+    # invocation must fail closed instead.
+    targets = hook._parse_gh_merge_targets("gh pr merge -x 42 1195")
+    assert targets == [{"pr": None, "repo": None}]
+
+
+def test_parse_unknown_flag_suppresses_pr_url_form_too() -> None:
+    command = "gh pr merge --frobnicate 9 https://github.com/o/r/pull/3"
+    targets = hook._parse_gh_merge_targets(command)
+    assert targets == [{"pr": None, "repo": None}]
+
+
+def test_decide_bash_ambiguous_pr_denies_without_running_merge_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {"o/repo": root})
+
+    def _must_not_run(repo_root: Path, pr: int) -> tuple[bool, str]:
+        raise AssertionError("merge-check must not run when the PR number is ambiguous")
+
+    monkeypatch.setattr(hook, "_run_merge_check", _must_not_run)
+    reason = hook._decide("Bash", {"command": "gh pr merge -x 42 1195"}, root)
+    assert reason is not None
+    assert "o/repo" in reason
+
+
+def test_claude_settings_wires_merge_preflight_hook() -> None:
+    settings_path = REPO_ROOT / ".claude" / "settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    pre_tool_use = settings["hooks"]["PreToolUse"]
+    matchers = {entry["matcher"]: entry for entry in pre_tool_use}
+    assert set(matchers) == {"Bash", "mcp__github__merge_pull_request"}
+
+    module_ref = f"-m {hook.__name__}"
+    for matcher, entry in matchers.items():
+        command_hooks = entry["hooks"]
+        assert len(command_hooks) == 1
+        command_hook = command_hooks[0]
+        assert command_hook["type"] == "command"
+        command = command_hook["command"]
+        assert module_ref in command, f"{matcher} hook does not invoke {module_ref!r}"
+        assert command.strip().endswith("|| true"), f"{matcher} hook must fail open on crash"
