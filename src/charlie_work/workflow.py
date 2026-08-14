@@ -4384,6 +4384,10 @@ def _detect_and_handle_orphaned_workers(
     - If last decision was "request_changes" and head advanced, route to the
       review-pending path by calling ``review_callback`` and then flipping the
       issue status to "reviewing"
+    - If last decision was "approved" and the PR state carries
+      ``status="rework_requested"`` (evidence the post-approval rework lane
+      dispatched this worker) and head is unchanged since review, reset to
+      "rework_requested" -- same as the request_changes branch (issue #1109)
     - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
@@ -4849,30 +4853,128 @@ def _detect_and_handle_orphaned_workers(
                                 )
                             )
                 else:
-                    # Not a simple request_changes case - surface as drift once.
-                    fingerprint = _drift_fingerprint(
-                        reason="dead_worker_unsafe_to_auto_reset",
-                        last_decision=last_decision or "",
-                        pr_number=pr_number,
-                    )
-                    if entry.get("orphan_drift_fingerprint") != fingerprint:
-                        entry["orphan_drift_fingerprint"] = fingerprint
-                        entry["orphan_drift_at"] = utc_now()
-                        sweep_events.append(
-                            (
-                                "orphaned_worker_drift",
-                                {
-                                    "issue_number": issue_number,
-                                    "pr_number": pr_number,
-                                    "previous_status": "dispatched",
-                                    "last_decision": last_decision,
-                                    "reason": "dead_worker_unsafe_to_auto_reset",
-                                    "pid": terminal_pid,
-                                    "exit_code": terminal_exit_code,
-                                    "duration_seconds": terminal_duration_seconds,
-                                },
+                    # Not a simple request_changes case.
+                    # Issue #1109: a dead worker on an approved PR is not
+                    # unclassifiable when the post-approval rework lane
+                    # (#674 -> PR #685, plus the merge-conflict and no-op
+                    # rework lanes that share ``_route_to_rework``) dispatched
+                    # it. Those lanes set the PR state status to
+                    # ``rework_requested`` while preserving
+                    # ``decision="approved"``, and the worker is dispatched to
+                    # fix CI/a conflict without re-litigating the review. If
+                    # that worker dies before pushing (head unchanged since
+                    # review), the issue previously wedged in ``dispatched``
+                    # forever because this sweep refused to auto-reset on a
+                    # non-``request_changes`` decision -- no redispatch, no
+                    # cap consumption, invisible to every downstream lane.
+                    # Treat ``decision="approved"`` + PR-state
+                    # ``rework_requested`` + head unchanged as safe to
+                    # auto-reset, mirroring the request_changes branch above
+                    # (including the #773 clean-exit-no-op sub-case so a
+                    # benign exit-0 worker does not burn redispatch attempts).
+                    # ``dead_worker_unsafe_to_auto_reset`` is kept only for
+                    # genuinely unclassifiable decisions -- an approved PR
+                    # whose PR state does not carry ``rework_requested`` has
+                    # no evidence a post-approval rework lane dispatched this
+                    # worker, so auto-resetting would be a guess.
+                    pr_state_status = pr_state.get("status")
+                    if (
+                        last_decision == "approved"
+                        and pr_state_status == "rework_requested"
+                        and reviewed_head_sha
+                        and live_head_sha
+                        and reviewed_head_sha == live_head_sha
+                    ):
+                        if terminal_exit_code == 0:
+                            # Clean exit with no push -- same #773 rationale
+                            # as the request_changes branch: do not spend a
+                            # redispatch attempt on a worker that produced no
+                            # change on this exact head.
+                            fingerprint = _drift_fingerprint(
+                                reason="dead_worker_clean_exit_no_op",
+                                reviewed_head_sha=reviewed_head_sha,
                             )
+                            if entry.get("orphan_drift_fingerprint") == fingerprint:
+                                state["issues"][str(issue_number)] = entry
+                                continue
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "reason": "dead_worker_clean_exit_no_op",
+                                        "decision": "approved",
+                                        "pr_state_status": pr_state_status,
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
+                        else:
+                            # No terminal record, or a non-zero/None exit
+                            # code: safe to reset to rework_requested (PR head
+                            # unchanged since the approved review, and the
+                            # post-approval rework lane dispatched this
+                            # worker). Records this as a worker death with a
+                            # distinct reason so the death counter (issue
+                            # #1134) and the redispatch cap (issue #165) apply
+                            # exactly as they do for request_changes.
+                            entry["status"] = "rework_requested"
+                            entry["dispatched_at"] = None
+                            death_ts = utc_now()
+                            prior_deaths = entry.get("worker_death_at")
+                            if not isinstance(prior_deaths, list):
+                                prior_deaths = []
+                            entry["worker_death_at"] = prior_deaths + [death_ts]
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_recovered",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "new_status": "rework_requested",
+                                        "reason": "dead_worker_with_approved_rework",
+                                        "decision": "approved",
+                                        "pr_state_status": pr_state_status,
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                        "worker_death_at": death_ts,
+                                    },
+                                )
+                            )
+                    else:
+                        # Genuinely unclassifiable decision - surface as
+                        # drift once.
+                        fingerprint = _drift_fingerprint(
+                            reason="dead_worker_unsafe_to_auto_reset",
+                            last_decision=last_decision or "",
+                            pr_number=pr_number,
                         )
+                        if entry.get("orphan_drift_fingerprint") != fingerprint:
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "last_decision": last_decision,
+                                        "reason": "dead_worker_unsafe_to_auto_reset",
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
                 # that the worker pushed but could not create a PR for.
