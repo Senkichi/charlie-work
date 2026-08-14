@@ -780,7 +780,7 @@ def test_dispatch_reviews_keeps_its_state_lock_guard(tmp_path: Path, monkeypatch
     result = app.dispatch_reviews()
 
     assert result.ok is True
-    assert result.data["skipped"] is True
+    assert result.data["pass_skipped"] is True
     assert result.data["reason"] == "state_lock_busy"
     # And nothing was mutated on the way out -- a skip is a skip.
     assert (123, config.labels.human_needed) not in fake_gh.labels_added
