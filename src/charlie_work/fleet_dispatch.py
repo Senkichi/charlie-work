@@ -23,7 +23,7 @@ from .instrumentation import log_event
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
 from .venv_anchor import verify_interpreter_anchored_editables
-from .ci_fleet_anchor import ci_fleet_provenance_snapshot
+from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 from .supervise import (
     LocalSnapshot,
     orchestrator_root,
@@ -2270,14 +2270,7 @@ def _record_ci_fleet_provenance(state_path: Path) -> None:
     log_event(
         state_path,
         "ci_fleet_provenance",
-        {
-            "ci_fleet_file": snapshot.ci_fleet_file,
-            "sibling_root": snapshot.sibling_root,
-            "sibling_head": snapshot.sibling_head,
-            "sibling_branch": snapshot.sibling_branch,
-            "sibling_dirty": snapshot.sibling_dirty,
-            "error": snapshot.error,
-        },
+        ci_fleet_provenance_payload(snapshot),
         repo="fleet",
     )
 

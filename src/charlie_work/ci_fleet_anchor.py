@@ -82,11 +82,13 @@ import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .subprocess_runner import RunResult, run_captured
 
 __all__ = [
     "CiFleetProvenanceSnapshot",
+    "ci_fleet_provenance_payload",
     "ci_fleet_provenance_snapshot",
     "declared_ci_fleet_root",
     "repo_root",
@@ -182,6 +184,27 @@ class CiFleetProvenanceSnapshot:
     sibling_branch: str | None
     sibling_dirty: bool | None
     error: str | None = None
+
+
+def ci_fleet_provenance_payload(snapshot: CiFleetProvenanceSnapshot) -> dict[str, Any]:
+    """Build the ``ci_fleet_provenance`` event payload dict for a snapshot.
+
+    Single source of truth for the event payload shape, shared by
+    ``run_fleet_supervise`` (``fleet_dispatch._record_ci_fleet_provenance``)
+    and ``run_supervised`` (``supervise.py``) so the two supervisors cannot
+    drift on which fields are recorded (#954 review finding: the payload was
+    verbatim-duplicated across the two call sites). Returns exactly the six
+    fields that make the coupling attributable; callers add their own
+    ``log_event`` arguments (e.g. ``repo="fleet"``) around it.
+    """
+    return {
+        "ci_fleet_file": snapshot.ci_fleet_file,
+        "sibling_root": snapshot.sibling_root,
+        "sibling_head": snapshot.sibling_head,
+        "sibling_branch": snapshot.sibling_branch,
+        "sibling_dirty": snapshot.sibling_dirty,
+        "error": snapshot.error,
+    }
 
 
 def ci_fleet_provenance_snapshot(

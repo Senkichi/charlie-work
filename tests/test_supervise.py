@@ -574,6 +574,46 @@ def test_run_supervised_exits_when_drained_first_pass(tmp_path: Path) -> None:
     assert app._call_count == 1
 
 
+def test_run_supervised_records_ci_fleet_provenance(tmp_path: Path) -> None:
+    """Issue #954: run_supervised records ci_fleet provenance to events.db.
+
+    Mirrors ``test_run_fleet_supervise_records_ci_fleet_provenance``: the
+    per-repo supervisor stamps ``ci_fleet.__file__`` plus the sibling repo's
+    HEAD/branch/dirty-state into its ``events.db`` at every start, so the
+    editable-working-tree coupling is attributable rather than silent. The
+    event is recorded before the supervisor lock and loop, so it lands even
+    on a drained single-pass run.
+
+    Review finding for #954: this event-write had no regression test -- only
+    a fixture attribute (``_FakePaths.state_file``) was patched to stop
+    existing tests from breaking. This test asserts the event is actually
+    written with the expected payload via ``query_events``.
+    """
+    app = FakeApp(tmp_path, [_drained_result()])
+    fc = FakeClock()
+    result = run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    assert result.ok is True
+
+    rows = query_events(app.paths.state_file, kind="ci_fleet_provenance")
+    assert rows is not None, "no events.db reader -- the event was not recorded"
+    assert len(rows) == 1, f"expected exactly one ci_fleet_provenance event, got {len(rows)}"
+    payload = rows[0]["payload"]
+    # ci_fleet is importable in this venv, so __file__ is always set.
+    assert payload["ci_fleet_file"] is not None
+    # All six fields from the shared payload helper must be present (None is a
+    # valid value for the sibling fields when declared_ci_fleet_root abstains
+    # from a worktree).
+    for key in (
+        "ci_fleet_file",
+        "sibling_root",
+        "sibling_head",
+        "sibling_branch",
+        "sibling_dirty",
+        "error",
+    ):
+        assert key in payload, f"missing field {key!r} in ci_fleet_provenance payload"
+
+
 def test_run_supervised_infill_freed_slot_triggers_prompt_pass(tmp_path: Path) -> None:
     """A sidecar disappearing (worker exited) triggers a delta → prompt pass
     which dispatches.

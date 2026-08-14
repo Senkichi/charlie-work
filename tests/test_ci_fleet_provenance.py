@@ -13,12 +13,14 @@ except the import-failure simulation.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
 from charlie_work.ci_fleet_anchor import (
     CiFleetProvenanceSnapshot,
+    ci_fleet_provenance_payload,
     ci_fleet_provenance_snapshot,
 )
 from charlie_work.subprocess_runner import RunResult
@@ -155,6 +157,90 @@ def test_git_failure_records_error_and_never_raises(
     assert snapshot.error is not None
     assert "rev-parse" in snapshot.error
     assert "status" in snapshot.error
+
+
+# ---------------------------------------------------------------------------
+# 4b. Import failure — ci_fleet cannot be imported (review finding)
+# ---------------------------------------------------------------------------
+
+
+def test_import_failure_returns_none_file_with_populated_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``import ci_fleet`` raises, the snapshot records the failure, never raises.
+
+    Review finding for #954: the import-failure branch in
+    ``ci_fleet_provenance_snapshot`` had no regression test. Setting
+    ``sys.modules['ci_fleet'] = None`` makes ``import ci_fleet`` raise
+    ``ModuleNotFoundError`` ("import of ci_fleet halted; None in sys.modules"),
+    exercising the ``except`` branch. The snapshot must return
+    ``ci_fleet_file=None`` with a populated ``error`` field rather than
+    propagating -- a startup probe must not break the supervisor's entry path.
+    """
+    monkeypatch.setitem(sys.modules, "ci_fleet", None)
+    snapshot = ci_fleet_provenance_snapshot(run_command=lambda *a, **k: _ok())
+
+    assert snapshot.ci_fleet_file is None
+    assert snapshot.sibling_root is None
+    assert snapshot.sibling_head is None
+    assert snapshot.sibling_branch is None
+    assert snapshot.sibling_dirty is None
+    assert snapshot.error is not None
+    assert "import ci_fleet raised" in snapshot.error
+    # The exception type is named so the failure is diagnosable from the event.
+    assert "ModuleNotFoundError" in snapshot.error
+
+
+# ---------------------------------------------------------------------------
+# 4c. Shared payload helper — single source of truth for the event shape
+# ---------------------------------------------------------------------------
+
+
+def test_provenance_payload_contains_all_six_fields() -> None:
+    """``ci_fleet_provenance_payload`` returns exactly the six attributable fields.
+
+    Review finding for #954: the payload dict was verbatim-duplicated across
+    ``fleet_dispatch._record_ci_fleet_provenance`` and ``supervise.run_supervised``.
+    The shared helper is now the single source of truth; this test pins its
+    shape so a caller that drops or renames a field is caught.
+    """
+    snapshot = CiFleetProvenanceSnapshot(
+        ci_fleet_file="/x/ci_fleet/__init__.py",
+        sibling_root="/x/ci_runners",
+        sibling_head="abc123",
+        sibling_branch="main",
+        sibling_dirty=False,
+        error=None,
+    )
+    payload = ci_fleet_provenance_payload(snapshot)
+    assert payload == {
+        "ci_fleet_file": "/x/ci_fleet/__init__.py",
+        "sibling_root": "/x/ci_runners",
+        "sibling_head": "abc123",
+        "sibling_branch": "main",
+        "sibling_dirty": False,
+        "error": None,
+    }
+
+
+def test_provenance_payload_preserves_error_and_none_fields() -> None:
+    """The payload helper forwards ``None`` and error strings verbatim.
+
+    The abstention and failure shapes both rely on ``None`` sibling fields plus
+    a populated ``error``; the helper must not coerce or drop them.
+    """
+    snapshot = CiFleetProvenanceSnapshot(
+        ci_fleet_file=None,
+        sibling_root=None,
+        sibling_head=None,
+        sibling_branch=None,
+        sibling_dirty=None,
+        error="import ci_fleet raised ModuleNotFoundError: halted",
+    )
+    payload = ci_fleet_provenance_payload(snapshot)
+    assert payload["ci_fleet_file"] is None
+    assert payload["sibling_dirty"] is None
+    assert payload["error"] == "import ci_fleet raised ModuleNotFoundError: halted"
 
 
 # ---------------------------------------------------------------------------

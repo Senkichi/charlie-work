@@ -1419,20 +1419,13 @@ def run_supervised(
     # run_fleet_supervise: the editable .pth means the supervisor runs
     # whatever is saved in the sibling working tree, committed or not.
     # This records, it does not prevent. Best-effort, never raises.
-    from .ci_fleet_anchor import ci_fleet_provenance_snapshot
+    from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 
     provenance = ci_fleet_provenance_snapshot()
     log_event(
         app.paths.state_file,
         "ci_fleet_provenance",
-        {
-            "ci_fleet_file": provenance.ci_fleet_file,
-            "sibling_root": provenance.sibling_root,
-            "sibling_head": provenance.sibling_head,
-            "sibling_branch": provenance.sibling_branch,
-            "sibling_dirty": provenance.sibling_dirty,
-            "error": provenance.error,
-        },
+        ci_fleet_provenance_payload(provenance),
     )
 
     # Single-instance guard
