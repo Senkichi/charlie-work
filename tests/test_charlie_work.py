@@ -32894,6 +32894,215 @@ def test_apply_concurrency_governor_helper_partial_slots(tmp_path: Path, monkeyp
     assert result.dispatch_limit == 1
 
 
+# ---------------------------------------------------------------------------
+# Issue #1129: open-PR backpressure in the dispatch governor
+# ---------------------------------------------------------------------------
+
+
+def test_apply_concurrency_governor_open_pr_backpressure_clamps(tmp_path: Path) -> None:
+    """Issue #1129: fresh dispatch clamped by open agent PR count."""
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Default FakeGitHub has 1 open PR with headRefName "agent/issue-123-fix-search".
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5, apply_open_pr_backpressure=True)
+
+    assert result.open_pr_enabled is True
+    assert result.open_pr_max == 2
+    assert result.open_pr_count == 1
+    # max(0, 2 - 1) = 1 slot available for fresh dispatch
+    assert result.dispatch_limit == 1
+    assert result.clamped is True
+
+
+def test_apply_concurrency_governor_open_pr_backpressure_zero_when_full(tmp_path: Path) -> None:
+    """Issue #1129: fresh dispatch clamped to 0 when open PRs meet the cap."""
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5, apply_open_pr_backpressure=True)
+
+    assert result.open_pr_count == 1
+    assert result.open_pr_max == 1
+    assert result.dispatch_limit == 0
+    assert result.clamped is True
+
+
+def test_apply_concurrency_governor_open_pr_backpressure_off_when_disabled(tmp_path: Path) -> None:
+    """Issue #1129: max_open_agent_prs=0 preserves current behavior."""
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=0, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5, apply_open_pr_backpressure=True)
+
+    assert result.open_pr_enabled is False
+    assert result.open_pr_max == 0
+    assert result.open_pr_count == 0
+    assert result.dispatch_limit == 5
+    assert result.clamped is False
+
+
+def test_apply_concurrency_governor_open_pr_backpressure_exempt_by_default(tmp_path: Path) -> None:
+    """Issue #1129: rework/loop paths (apply_open_pr_backpressure=False) are exempt."""
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Default apply_open_pr_backpressure=False — the rework/loop path.
+    result = app._apply_concurrency_governor(5)
+
+    assert result.open_pr_enabled is False
+    assert result.open_pr_max == 0
+    assert result.open_pr_count == 0
+    assert result.dispatch_limit == 5
+    assert result.clamped is False
+
+
+def test_apply_concurrency_governor_open_pr_backpressure_records_event(tmp_path: Path) -> None:
+    """Issue #1129: dispatch_backpressure event recorded when clamp reduces limit."""
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app._apply_concurrency_governor(5, apply_open_pr_backpressure=True)
+
+    events = query_events(paths.state_file, kind="dispatch_backpressure")
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["open_pr_count"] == 1
+    assert payload["max_open_agent_prs"] == 1
+    assert payload["requested_limit"] == 5
+    assert payload["clamped_limit"] == 0
+
+
+def test_apply_concurrency_governor_open_pr_backpressure_no_event_when_not_clamping(
+    tmp_path: Path,
+) -> None:
+    """Issue #1129: no event when open PRs are below the cap (no clamping)."""
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=10, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # 1 open PR, cap 10 → 9 available, dispatch_limit 5 → no clamp.
+    app._apply_concurrency_governor(5, apply_open_pr_backpressure=True)
+
+    events = query_events(paths.state_file, kind="dispatch_backpressure")
+    assert events == []
+
+
+def test_apply_concurrency_governor_open_pr_backpressure_combined_with_sessions(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1129: open-PR clamp combines with session cap (min of all clamps)."""
+
+    def mock_count_live(sessions_dir, state_file=None):
+        return 1
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_concurrent_sessions=3, max_open_agent_prs=2, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app._apply_concurrency_governor(5, apply_open_pr_backpressure=True)
+
+    # Session cap: max(0, 3 - 1) = 2
+    # Open-PR cap: max(0, 2 - 1) = 1
+    # Effective: min(2, 1) = 1
+    assert result.dispatch_limit == 1
+    assert result.clamped is True
+    assert result.open_pr_count == 1
+
+
+def test_concurrency_governor_result_open_pr_report_fields() -> None:
+    """Issue #1129: report_fields includes open-PR fields when enabled."""
+
+    result = ConcurrencyGovernorResult(
+        clamped=True,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=1,
+        open_pr_count=3,
+        open_pr_max=4,
+    )
+    fields = result.report_fields()
+    assert fields["open_pr_count"] == 3
+    assert fields["open_pr_max"] == 4
+    assert result.open_pr_enabled is True
+
+
+def test_concurrency_governor_result_open_pr_report_fields_absent_when_disabled() -> None:
+    """Issue #1129: report_fields omits open-PR fields when open_pr_max=0."""
+
+    result = ConcurrencyGovernorResult(
+        clamped=False,
+        max_concurrent=0,
+        live_count=0,
+        available_slots=5,
+        dispatch_limit=5,
+    )
+    fields = result.report_fields()
+    assert "open_pr_count" not in fields
+    assert "open_pr_max" not in fields
+    assert result.open_pr_enabled is False
+
+
+def test_dispatch_config_max_open_agent_prs_validation_int(tmp_path: Path) -> None:
+    """Issue #1129: max_open_agent_prs must be an int."""
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text("dispatch:\n  max_open_agent_prs: true\n")
+    with pytest.raises(ConfigError, match="must be an int"):
+        load_config(config_file)
+
+
+def test_dispatch_config_max_open_agent_prs_validation_negative(tmp_path: Path) -> None:
+    """Issue #1129: max_open_agent_prs must be >= 0."""
+
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text("dispatch:\n  max_open_agent_prs: -1\n")
+    with pytest.raises(ConfigError, match="must be >= 0"):
+        load_config(config_file)
+
+
 def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:
     """Issue #85 acceptance criterion 1: state-driven selection works.
 
