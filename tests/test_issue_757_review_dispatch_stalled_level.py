@@ -1,10 +1,13 @@
-"""Regression tests for issue #757: review_dispatch_stalled level classification.
+"""Regression tests for review_dispatch_stalled level classification.
 
-Provider-throttle reasons (``provider_throttled`` and
-``provider_throttled_turn_limit_counted``) are handled backoff, not genuine
-per-PR failures, so their ``review_dispatch_stalled`` events must be logged at
-``warning`` level. Other stalled reasons (unclaimed packet, dead sidecar,
-stale pending/dispatched claims) remain ``error``.
+Issues #757 and #748: ``review_dispatch_stalled`` has six emit sites in
+``_detect_and_handle_stalled_reviews``. Two are benign and reclassified to
+``warning``: provider-throttle reasons (``provider_throttled`` and
+``provider_throttled_turn_limit_counted``, issue #757) and unclaimed packets
+(issue #748 — a transient startup race, not a terminal failure). The
+remaining three — dead sidecar with no throttle signature, stale pending
+claim, and stale dispatched claim — are genuine failures (process death or
+launch crash) and remain ``error``.
 """
 
 from __future__ import annotations
@@ -217,8 +220,18 @@ def test_provider_throttled_turn_limit_counted_is_warning(tmp_path: Path) -> Non
     assert len(errors) == 0
 
 
-def test_unclaimed_review_packet_stays_error(tmp_path: Path) -> None:
-    """A never-claimed review packet remains error, not reclassified as warning."""
+def test_unclaimed_review_packet_is_warning(tmp_path: Path) -> None:
+    """A never-claimed review packet is warning, not error (issue #748).
+
+    An unclaimed packet is a transient startup race: ``review()`` generated the
+    packet but ``dispatch_reviews`` has not claimed it yet. The sweep marks it
+    ``review_dispatch_failed`` so the next dispatch pass retries. Measured
+    against events.db (81 unclaimed events): 31/81 recovered via
+    ``review_dispatch_claim`` (median 19s, 27/31 under 60s); the remaining
+    50/81 were handled by fallback mechanisms. In neither case is the packet
+    stuck, so ``warning`` is the right level -- not ``error`` (terminal) and
+    not ``info`` (normal operation).
+    """
     repo_root, reviews_dir, config, state_file, _ = _seed_unclaimed(tmp_path, 100)
 
     _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
@@ -228,16 +241,16 @@ def test_unclaimed_review_packet_stays_error(tmp_path: Path) -> None:
         kind="review_dispatch_stalled",
         level="warning",
     )
-    assert len(warnings) == 0
+    assert len(warnings) == 1
+    assert warnings[0]["payload"].get("status") == "unclaimed"
+    assert warnings[0]["level"] == "warning"
 
     errors = query_events(
         state_file,
         kind="review_dispatch_stalled",
         level="error",
     )
-    assert len(errors) == 1
-    assert errors[0]["payload"].get("status") == "unclaimed"
-    assert errors[0]["level"] == "error"
+    assert len(errors) == 0
 
 
 def test_dead_reviewer_without_throttle_stays_error(tmp_path: Path) -> None:
@@ -261,4 +274,100 @@ def test_dead_reviewer_without_throttle_stays_error(tmp_path: Path) -> None:
     )
     assert len(errors) == 1
     assert errors[0]["payload"].get("reason") is None
+    assert errors[0]["level"] == "error"
+
+
+def _seed_stale_pending(tmp_path: Path, pr_number: int):
+    """Seed a PR in ``review_dispatch_pending`` past the stale timeout, no sidecar.
+
+    This exercises the second loop's ``pending`` branch (emit site 4): the
+    dispatch launch crashed before writing a sidecar, leaving a stale pending
+    claim with no recoverable process.
+    """
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    stale = datetime.now(UTC) - timedelta(minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES + 5)
+    pending_at = stale.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "review_dispatch_status": "review_dispatch_pending",
+            "review_dispatch_pending_at": pending_at,
+            "reviewer_pid": None,
+            "reviewer_process_start_time": None,
+        }
+        save_state(state_file, state)
+    return repo_root, reviews_dir, config, state_file
+
+
+def test_stale_pending_claim_stays_error(tmp_path: Path) -> None:
+    """A stale pending claim with no sidecar remains error (issue #748).
+
+    Emit site 4: ``review_dispatch_pending`` past the stale timeout with no
+    sidecar means the dispatch launch crashed before writing one. This is a
+    genuine failure (launch crash), not a transient race, so it stays
+    ``error``. Zero occurrences in events.db (2026-07-23 to 2026-08-13), but
+    the code path exists for robustness and must remain ``error`` if it fires.
+    """
+    repo_root, reviews_dir, config, state_file = _seed_stale_pending(tmp_path, 100)
+
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    warnings = query_events(
+        state_file,
+        kind="review_dispatch_stalled",
+        level="warning",
+    )
+    assert len(warnings) == 0
+
+    errors = query_events(
+        state_file,
+        kind="review_dispatch_stalled",
+        level="error",
+    )
+    assert len(errors) == 1
+    assert errors[0]["payload"].get("status") == "pending"
+    assert errors[0]["level"] == "error"
+
+
+def test_stale_dispatched_claim_no_sidecar_stays_error(tmp_path: Path) -> None:
+    """A stale dispatched claim with dead PID and no sidecar remains error (issue #748).
+
+    Emit site 5: ``review_dispatch_dispatched`` past the stale timeout with a
+    dead PID and no sidecar means the reviewer process died after dispatch and
+    its sidecar was lost. This is a genuine failure (process death), not a
+    transient race, so it stays ``error``. Zero occurrences in events.db
+    (2026-07-23 to 2026-08-13), but the code path exists for robustness and
+    must remain ``error`` if it fires.
+    """
+    # _seed creates a dispatched PR with a dead PID (999999999) and a stale
+    # timestamp (1 hour ago). By NOT writing a sidecar, the first loop (which
+    # iterates sidecars) skips this PR, and the second loop processes it
+    # through the ``review_dispatch_dispatched`` stale-claim branch.
+    repo_root, reviews_dir, config, state_file = _seed(tmp_path, [100])
+
+    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+
+    warnings = query_events(
+        state_file,
+        kind="review_dispatch_stalled",
+        level="warning",
+    )
+    assert len(warnings) == 0
+
+    errors = query_events(
+        state_file,
+        kind="review_dispatch_stalled",
+        level="error",
+    )
+    assert len(errors) == 1
+    assert errors[0]["payload"].get("status") == "dispatched"
     assert errors[0]["level"] == "error"
