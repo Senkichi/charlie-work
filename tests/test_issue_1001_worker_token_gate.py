@@ -242,8 +242,12 @@ def test_dispatch_warn_only_escalates_once_and_proceeds(tmp_path: Path) -> None:
 
     Uses dry_run=True so the dispatch proceeds to show what would be
     dispatched without actually creating worktrees or launching workers.
-    The gate fires before the dry-run/real branch split, so the escalation
-    event is emitted regardless.
+    The gate fires before the dry-run/real branch split, so the predicate
+    is evaluated regardless — but the escalation *event write* is a state
+    mutation and is skipped under dry-run (the "dry-run never writes"
+    contract documented at the merge_ready dry-run gate). The once-only
+    live behaviour is covered by
+    ``test_dispatch_warn_only_escalates_once_live``.
     """
     from charlie_work.workflow import OrchestratorApp
 
@@ -251,6 +255,73 @@ def test_dispatch_warn_only_escalates_once_and_proceeds(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    # First dispatch pass: predicate fires, dispatch proceeds, but NO
+    # escalation event is written (dry-run read-only contract).
+    fake_gh.prs[0]["state"] = "CLOSED"
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is True
+    assert result1.data["selected_count"] == 1  # dispatch proceeded
+
+    state = load_state(paths.state_file)
+    events1 = _events_of_kind(state, "worker_token_missing")
+    assert len(events1) == 0, "dry-run must not write the escalation event"
+
+    # Second dispatch pass: still no event (dry-run, and the in-memory
+    # once-only flag is set so the block is not re-entered).
+    from charlie_work.state import load_state as _ls, save_state, state_lock
+
+    with state_lock(paths.state_file):
+        s = _ls(paths.state_file)
+        s["issues"].pop("123", None)
+        save_state(paths.state_file, s)
+
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+
+    state2 = load_state(paths.state_file)
+    events2 = _events_of_kind(state2, "worker_token_missing")
+    assert len(events2) == 0, "dry-run must not write the escalation event"
+
+
+def test_dispatch_warn_only_escalates_once_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live (non-dry-run) counterpart to
+    ``test_dispatch_warn_only_escalates_once_and_proceeds``.
+
+    With no token, ``require_worker_github_token=False`` (default), and
+    ``dry_run=False``, dispatch must escalate once (emit a
+    ``worker_token_missing`` event) and then proceed normally — not refuse.
+    The second pass must NOT re-escalate (once-only via the instance-level
+    ``_worker_token_escalated`` flag).
+
+    ``dispatch_sessions`` is stubbed so no real worker is launched; the
+    issue is still claimed and the escalation event is written.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.workflow import OrchestratorApp
+
+    config = _config(adapter="devin-shell")
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
+
+    def _fake_dispatch_sessions(repo_root, manifest_path, results_path, settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=req.issue_number,
+                issue_title=req.issue_title,
+                prompt_path=req.prompt_path,
+                branch_name=req.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=999,
+            )
+            for req in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
 
     # First dispatch pass: should escalate and proceed.
     fake_gh.prs[0]["state"] = "CLOSED"
@@ -260,7 +331,7 @@ def test_dispatch_warn_only_escalates_once_and_proceeds(tmp_path: Path) -> None:
 
     state = load_state(paths.state_file)
     events1 = _events_of_kind(state, "worker_token_missing")
-    assert len(events1) == 1, "first pass must escalate once"
+    assert len(events1) == 1, "first live pass must escalate once"
     # No token value in the event payload.
     payload_str = json.dumps(events1[0])
     assert "placeholder" not in payload_str
@@ -280,20 +351,44 @@ def test_dispatch_warn_only_escalates_once_and_proceeds(tmp_path: Path) -> None:
 
     state2 = load_state(paths.state_file)
     events2 = _events_of_kind(state2, "worker_token_missing")
-    assert len(events2) == 1, "second pass must not re-escalate"
+    assert len(events2) == 1, "second live pass must not re-escalate"
 
 
-def test_dispatch_escalation_cleared_when_token_added(tmp_path: Path) -> None:
+def test_dispatch_escalation_cleared_when_token_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """When the condition resolves (token added on a new instance), the
     escalation flag resets and no new event fires.
+
+    Uses ``dry_run=False`` so the escalation event is actually written by
+    the first instance (the dry-run read-only contract skips the write
+    under ``dry_run=True``). ``dispatch_sessions`` is stubbed so no real
+    worker is launched.
     """
+    from charlie_work.adapters import SessionDispatchResult
     from charlie_work.workflow import OrchestratorApp
+
+    def _fake_dispatch_sessions(repo_root, manifest_path, results_path, settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=req.issue_number,
+                issue_title=req.issue_title,
+                prompt_path=req.prompt_path,
+                branch_name=req.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=999,
+            )
+            for req in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
 
     # First instance: no token — escalates.
     config_no_token = _config(adapter="devin-shell")
     paths = runtime_paths(tmp_path, config_no_token.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app1 = OrchestratorApp(tmp_path, paths, config_no_token, fake_gh, dry_run=True)
+    app1 = OrchestratorApp(tmp_path, paths, config_no_token, fake_gh, dry_run=False)
     fake_gh.prs[0]["state"] = "CLOSED"
     app1.dispatch(limit=1)
 
@@ -307,7 +402,7 @@ def test_dispatch_escalation_cleared_when_token_added(tmp_path: Path) -> None:
     )
     paths2 = runtime_paths(tmp_path, config_with_token.runtime.state_dir)
     fake_gh2 = FakeGitHub()
-    app2 = OrchestratorApp(tmp_path, paths2, config_with_token, fake_gh2, dry_run=True)
+    app2 = OrchestratorApp(tmp_path, paths2, config_with_token, fake_gh2, dry_run=False)
     assert app2._worker_token_escalated is False
 
     # Clear issue state for re-dispatch.

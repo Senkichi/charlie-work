@@ -8408,23 +8408,37 @@ class OrchestratorApp:
                 # Record the escalation event once. Payload carries only
                 # config_key names and adapter contexts — never a token value
                 # or prefix (issue #1001 acceptance criterion).
-                with state_lock(self.paths.state_file):
-                    state = load_state(self.paths.state_file)
-                    state = self._record_event(
-                        state,
-                        "worker_token_missing",
-                        {
-                            "findings": [
-                                {
-                                    "config_key": f.config_key,
-                                    "context": f.context,
-                                }
-                                for f in missing_findings
-                            ],
-                        },
-                        level="warning",
-                    )
-                    save_state(self.paths.state_file, state)
+                #
+                # Dry-run never writes: the escalation event is a state
+                # mutation (state_lock + save_state), so it is gated on
+                # ``not self.dry_run`` — the same read-only contract
+                # documented at the merge_ready dry-run gate (~line 15452,
+                # "Dry-run never writes") and modelled on this function's
+                # own top-of-body dry-run short-circuit. The in-memory
+                # once-only flag is still set under dry-run so a dry-run
+                # pass does not re-enter this block on the next pass; the
+                # event itself is emitted on the first real (non-dry-run)
+                # dispatch. ``self.dry_run`` is fixed at construction, so a
+                # dry-run instance cannot later "forget" the flag and skip
+                # a real write.
+                if not self.dry_run:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state = self._record_event(
+                            state,
+                            "worker_token_missing",
+                            {
+                                "findings": [
+                                    {
+                                        "config_key": f.config_key,
+                                        "context": f.context,
+                                    }
+                                    for f in missing_findings
+                                ],
+                            },
+                            level="warning",
+                        )
+                        save_state(self.paths.state_file, state)
             if self.config.dispatch.require_worker_github_token and not self.dry_run:
                 return CommandResult(
                     True,
