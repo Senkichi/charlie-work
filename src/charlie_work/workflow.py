@@ -195,6 +195,39 @@ from .process_utils import (
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
 from .routing import AdapterChoice, record_adapter_choice, select_adapter
 
+# Issue #1106: a rework session that dies at CLI startup (before the worker's
+# first tool action) is not a no-op/conflict rework attempt — the cap counters
+# should only count sessions that *ran* and produced no useful change.  A
+# ``launch_failed`` (process never launched) is always a startup death; a
+# ``stalled`` session that died within this threshold is also a startup death
+# (CLI error, nonzero exit within seconds, empty diff AND empty transcript).
+# The threshold is deliberately generous: a genuine stall (worker ran for
+# minutes but got stuck) must NOT be misclassified as a startup death, so the
+# bound is set above the worst-case CLI startup time but well below the
+# shortest genuine-work session.
+STARTUP_DEATH_THRESHOLD_SECONDS: int = 60
+
+
+def _is_startup_death(failure_kind: str | None, runtime_seconds: float) -> bool:
+    """Classify whether a dead rework session died at CLI startup.
+
+    Returns True when the session never reached the worker's first tool
+    action — the cap counters in ``_route_janitor_gate_failure_to_rework``
+    must not count these as no-op/conflict rework attempts (issue #1106).
+    """
+    if failure_kind is None:
+        return False
+    # ``launch_failed``: the process never launched at all.
+    if failure_kind == "launch_failed":
+        return True
+    # ``stalled`` with a very short runtime: the CLI exited before the
+    # worker did any real work (e.g. "Refusing to run in an untrusted
+    # workspace").  A longer runtime means the worker genuinely ran and
+    # got stuck — that IS a no-op rework attempt the cap should count.
+    if failure_kind == "stalled" and runtime_seconds < STARTUP_DEATH_THRESHOLD_SECONDS:
+        return True
+    return False
+
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
     """Return (total_lines, per_file_stats) from a unified diff.
@@ -5346,6 +5379,18 @@ def _reap_restore_rework_requested(
                 entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
+            # Issue #1106: record the failure_kind and startup-death
+            # classification in the PR state so the janitor gate's
+            # _route_janitor_gate_failure_to_rework can skip the cap
+            # increment when the session died at CLI startup (before
+            # the worker's first tool action) instead of miscounting
+            # it as a no-op/conflict rework attempt.
+            startup_death = _is_startup_death(failure_kind, worker.runtime_seconds())
+            state["prs"][str(pr_number)] = {
+                **state.get("prs", {}).get(str(pr_number), {}),
+                "last_rework_failure_kind": failure_kind,
+                "last_rework_was_startup_death": startup_death,
+            }
             state = append_event(
                 state,
                 "rework_requeued",
@@ -5357,6 +5402,7 @@ def _reap_restore_rework_requested(
                     "reason": "dead_rework_session_recovered",
                     "has_request_changes": has_request_changes,
                     "has_rework_prompt": has_rework_prompt,
+                    "startup_death": startup_death,
                 },
                 state_path=state_file,
             )
@@ -17274,6 +17320,44 @@ class OrchestratorApp:
                     }
                     save_state(self.paths.state_file, state)
                 return None
+        # Issue #1106: if the previous rework session died at CLI startup
+        # (before the worker's first tool action), this is NOT a no-op/conflict
+        # rework attempt — requeue without touching the caps.  The cap counters
+        # should only count sessions that *ran* and produced no useful change.
+        #
+        # ``head_settled`` is True only when ``rework_pending`` is True at this
+        # point — the only ``rework_pending = True`` path that reaches here is
+        # ``settled_new_conflicted_head = True`` (the head moved off the
+        # recorded baseline), which means the worker DID push real content
+        # before dying.  A startup death with no content change never reaches
+        # here via the ``rework_pending = True`` branch (it returns None at the
+        # stall check above), so the flag only matters on the
+        # ``rework_pending = False`` path — the first detection or a re-detection
+        # after the issue status left the pending set.
+        head_settled = rework_pending
+        if existing_pr_state.get("last_rework_was_startup_death") and not head_settled:
+            decision = self._review_decision(pr_number)
+            route_extra_state: dict[str, Any] = {
+                "last_rework_failure_kind": None,
+                "last_rework_was_startup_death": False,
+            }
+            if head_sha:
+                route_extra_state[last_head_key] = head_sha
+            label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
+            return CommandResult(
+                True,
+                f"PR #{pr_number} requeued after startup death "
+                f"({existing_pr_state.get('last_rework_failure_kind')}); "
+                f"{attempts_key} not incremented",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "routed_to_rework": True,
+                    "rework_reason": reason,
+                    "startup_death_requeue": True,
+                    "label_error": label_error,
+                },
+            )
         attempts = int(existing_pr_state.get(attempts_key, 0)) + 1
 
         if (
@@ -17328,6 +17412,9 @@ class OrchestratorApp:
                     attempts_key: attempts,
                     **rescue_helpers.build_rescue_dataclass_kwargs(reason),
                     "rescue_dispatched_at": utc_now(),
+                    # Issue #1106: clear startup-death flags.
+                    "last_rework_failure_kind": None,
+                    "last_rework_was_startup_death": False,
                 }
                 state = self._record_event(
                     state,
@@ -17344,6 +17431,9 @@ class OrchestratorApp:
             route_extra_state: dict[str, Any] = {attempts_key: attempts}
             if head_sha:
                 route_extra_state[last_head_key] = head_sha
+            # Issue #1106: clear startup-death flags.
+            route_extra_state["last_rework_failure_kind"] = None
+            route_extra_state["last_rework_was_startup_death"] = False
             label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
             return CommandResult(
                 True,
@@ -17378,7 +17468,12 @@ class OrchestratorApp:
                     reason=escalation_reason,
                     reason_class="mechanical",
                     pr_number=pr_number,
-                    pr_extra={attempts_key: attempts},
+                    pr_extra={
+                        attempts_key: attempts,
+                        # Issue #1106: clear startup-death flags on escalate.
+                        "last_rework_failure_kind": None,
+                        "last_rework_was_startup_death": False,
+                    },
                 )
                 state = self._record_event(
                     state,
@@ -17434,6 +17529,11 @@ class OrchestratorApp:
                     # from a timestamp accumulated during unrelated history.
                     stall_since_key: None,
                     stall_head_key: None,
+                    # Issue #1106: clear startup-death flags — the head
+                    # settled, so the previous session's death (if any) is
+                    # now accounted for by this attempt.
+                    "last_rework_failure_kind": None,
+                    "last_rework_was_startup_death": False,
                 }
                 state = self._record_event(
                     state,
@@ -17459,6 +17559,10 @@ class OrchestratorApp:
         route_extra_state: dict[str, Any] = {attempts_key: attempts}
         if head_sha:
             route_extra_state[last_head_key] = head_sha
+        # Issue #1106: clear startup-death flags — this attempt is being
+        # counted, so the previous session's death is now accounted for.
+        route_extra_state["last_rework_failure_kind"] = None
+        route_extra_state["last_rework_was_startup_death"] = False
         label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
         return CommandResult(
             True,
@@ -21182,6 +21286,20 @@ class OrchestratorApp:
                     entry.pop("orphan_flagged_at", None)
                     entry.pop("orphan_drift_fingerprint", None)
                     entry.pop("orphan_drift_at", None)
+                    # Issue #1106: a new rework dispatch supersedes any
+                    # prior startup-death classification — the new session
+                    # is the one whose outcome the next janitor pass will
+                    # attribute, so the stale flag must not survive.
+                    dispatched_pr = pr_by_issue.get(request.issue_number)
+                    if dispatched_pr is not None:
+                        dispatched_pr_number = int(dispatched_pr["number"])
+                        pr_state = state.get("prs", {}).get(str(dispatched_pr_number), {})
+                        if pr_state:
+                            state["prs"][str(dispatched_pr_number)] = {
+                                **pr_state,
+                                "last_rework_failure_kind": None,
+                                "last_rework_was_startup_death": False,
+                            }
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:

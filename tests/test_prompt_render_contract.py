@@ -132,9 +132,9 @@ def _fake_issue(number: int = 1) -> dict[str, object]:
 
 def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker.md's real caller is ``OrchestratorApp._write_worker_prompt``
-    (workflow.py:21991-22057), used unmodified whenever
+    (workflow.py:22109-22175), used unmodified whenever
     ``config.dispatch.worker_template`` (default ``"worker.md"``) is
-    selected -- see the `intake()` call site at workflow.py:8121.
+    selected -- see the `intake()` call site at workflow.py:8167.
 
     Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
     companion literal-absence assertion is non-vacuous: under the default
@@ -157,8 +157,8 @@ def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
 def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker_claude_code.md is rendered by the *same* real writer,
     ``_write_worker_prompt``, with an explicit ``template=`` override --
-    exactly what the api-worker dispatch path at workflow.py:8784-8788
-    (and the matching path in the dispatch loop at workflow.py:9305-9307)
+    exactly what the api-worker dispatch path at workflow.py:8830-8830
+    (and the matching path in the dispatch loop at workflow.py:9351-9351)
     does: ``template = self.config.api_worker.worker_template``, then
     ``self._write_worker_prompt(full_issue, template=template)``.
 
@@ -182,11 +182,11 @@ def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
 
 def test_rework_md_renders_via_real_writer_with_no_prior_decision(tmp_path: Path) -> None:
     """rework.md's real caller is the module-level ``_write_rework_prompt``
-    (workflow.py:6248-6313), which delegates to ``_render_rework_prompt``
-    (workflow.py:6202-6245) for the literal ``values`` dict passed to
+    (workflow.py:6294-6359), which delegates to ``_render_rework_prompt``
+    (workflow.py:6248-6291) for the literal ``values`` dict passed to
     ``render_prompt``. This exercises the no-verdict-on-disk shape
     (``required_changes_section`` resolves to ``""`` -- see
-    ``_render_required_changes_section``, workflow.py:5934).
+    ``_render_required_changes_section``, workflow.py:5980).
 
     Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
     companion literal-absence assertion is non-vacuous -- see
@@ -417,7 +417,7 @@ def test_rework_writer_rejects_flat_override_without_execution_contract(
 # can't hide behind the subset assertion alone.
 # ---------------------------------------------------------------------------
 
-# workflow.py:11011-11029, inside OrchestratorApp.review() -- the literal
+# workflow.py:11057-11075, inside OrchestratorApp.review() -- the literal
 # `values` dict passed to `self._render("review.md", {...})`.
 REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
@@ -436,7 +436,7 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "prior_review_section",
 }
 
-# workflow.py:16105-16116, inside OrchestratorApp._cross_family_for_pr() --
+# workflow.py:16151-16162, inside OrchestratorApp._cross_family_for_pr() --
 # the literal `values` dict passed to `self._render("cross_family_review.md", {...})`.
 CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "pr_number",
@@ -448,7 +448,7 @@ CROSS_FAMILY_REVIEW_MD_SUPPLIED_KEYS = {
     "diff_path",
 }
 
-# workflow.py:15982-15985, inside OrchestratorApp.spec_review() -- the
+# workflow.py:16028-16031, inside OrchestratorApp.spec_review() -- the
 # literal `values` dict passed to
 # `self._render("cross_family_spec_review.md", {...})`.
 CROSS_FAMILY_SPEC_REVIEW_MD_SUPPLIED_KEYS = {
@@ -488,11 +488,11 @@ def test_pinned_templates_actually_render_against_real_caller_keys() -> None:
 def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
     tmp_path: Path,
 ) -> None:
-    """review.md's real caller (workflow.py:11011-11029, ``OrchestratorApp.review()``)
+    """review.md's real caller (workflow.py:11057-11075, ``OrchestratorApp.review()``)
     is already subset- and render-tested above against *synthetic*
     ``f"<{key}>"`` values. This test additionally builds production-shaped
     values -- real ``Path`` objects for ``pr_json_path``/``diff_path``,
-    mirroring workflow.py:10856's ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
+    mirroring workflow.py:10902's ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
     -- under a non-default ``runtime.state_dir`` override, then asserts the
     rendered prompt contains neither an unresolved placeholder nor the
     default state-dir literal.
@@ -556,7 +556,7 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
     """review.md can also ship as a repo-local override (issue #589's shape).
 
     ``OrchestratorApp.review()`` passes ``self.prompt_dirs`` to
-    ``render_prompt`` (workflow.py:7537). That search-dir list is empty by
+    ``render_prompt`` (workflow.py:7583). That search-dir list is empty by
     default, but ``runtime.prompts_dir`` can point at a repo-local template
     directory, and ``resolve_template`` picks a repo-local ``review.md`` over
     the package default. This test copies the packaged template into a
@@ -655,29 +655,29 @@ def test_every_shipped_template_is_covered_by_this_contract() -> None:
 # the corresponding entry here -- the test will tell you if you forget.
 _CITATION_EXPECTATIONS: dict[tuple[int, int], str] = {
     # ``_write_worker_prompt`` definition
-    (21991, 22057): "def _write_worker_prompt",
+    (22109, 22175): "def _write_worker_prompt",
     # ``intake()``'s ``_write_worker_prompt`` call (no template= override)
-    (8121, 8121): "self._write_worker_prompt(full_issue",
+    (8167, 8167): "self._write_worker_prompt(full_issue",
     # api-worker dispatch path (dry-run preview branch)
-    (8784, 8788): "api_worker.worker_template",
+    (8830, 8830): "api_worker.worker_template",
     # dispatch loop matching path (real dispatch)
-    (9305, 9307): "api_worker.worker_template",
+    (9351, 9351): "api_worker.worker_template",
     # ``_write_rework_prompt`` definition
-    (6248, 6313): "def _write_rework_prompt",
+    (6294, 6359): "def _write_rework_prompt",
     # ``_render_rework_prompt`` definition
-    (6202, 6245): "def _render_rework_prompt",
+    (6248, 6291): "def _render_rework_prompt",
     # ``_render_required_changes_section`` definition
-    (5934, 5934): "def _render_required_changes_section",
+    (5980, 5980): "def _render_required_changes_section",
     # ``OrchestratorApp.review()`` values dict for review.md
-    (11011, 11029): '"review.md"',
+    (11057, 11075): '"review.md"',
     # ``_cross_family_for_pr()`` values dict for cross_family_review.md
-    (16105, 16116): '"cross_family_review.md"',
+    (16151, 16162): '"cross_family_review.md"',
     # ``spec_review()`` values dict for cross_family_spec_review.md
-    (15982, 15985): '"cross_family_spec_review.md"',
+    (16028, 16031): '"cross_family_spec_review.md"',
     # ``review()``'s ``pr_dir = self.paths.prs / f"pr-{pr_number}"``
-    (10856, 10856): "pr_dir = self.paths.prs",
+    (10902, 10902): "pr_dir = self.paths.prs",
     # ``OrchestratorApp._render`` definition (the prompt_dirs call)
-    (7537, 7537): "render_prompt(template_name, values, search_dirs=self.prompt_dirs)",
+    (7583, 7583): "render_prompt(template_name, values, search_dirs=self.prompt_dirs)",
 }
 
 _CITATION_RE = re.compile(r"workflow\.py:(\d+)(?:-(\d+))?")

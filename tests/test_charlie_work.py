@@ -29829,6 +29829,317 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
     assert state["prs"]["456"]["conflict_rework_attempts"] == 1
 
 
+def test_startup_death_does_not_consume_conflict_rework_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106: a rework session that dies at CLI startup (before the
+    worker's first tool action) must NOT consume the PR's no-op/conflict
+    rework cap.  The cap counters should only count sessions that actually
+    ran and produced no useful change.
+
+    This test seeds a PR state with ``last_rework_was_startup_death=True``
+    (the flag _reap_restore_rework_requested sets when a dead session is
+    classified as a startup death) and verifies that
+    _route_janitor_gate_failure_to_rework requeues without incrementing
+    ``conflict_rework_attempts``.
+
+    Mutation gate: removing the startup-death check in
+    _route_janitor_gate_failure_to_rework makes this test fail (the counter
+    increments to 1 instead of staying at 0).
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Seed the PR state with the startup-death flag, simulating a dead
+    # rework session that was reaped by _reap_restore_rework_requested.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state.get("prs", {}).get("456", {}),
+            "number": 456,
+            "issue_number": 123,
+            "last_rework_failure_kind": "launch_failed",
+            "last_rework_was_startup_death": True,
+        }
+        # Issue must NOT be in a pending rework state, so the wrapper
+        # reaches the counter-increment path (the startup-death check
+        # is right before it).
+        state["issues"]["123"] = {
+            **state.get("issues", {}).get("123", {}),
+            "number": 123,
+            "status": "needs_review",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    # The startup-death requeue must NOT have incremented the cap.
+    assert state["prs"]["456"].get("conflict_rework_attempts", 0) == 0
+    # The issue must have been routed back to rework_requested.
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # The startup-death flags must have been cleared.
+    assert state["prs"]["456"]["last_rework_was_startup_death"] is False
+    assert state["prs"]["456"]["last_rework_failure_kind"] is None
+
+
+def test_startup_death_does_not_consume_no_op_rework_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106: same as the conflict-rework variant, but for the no-op
+    rework cap.  A startup-dead session requeued via the no-op-rework path
+    must not increment ``no_op_rework_attempts``.
+    """
+    config = OrchestratorConfig(
+        review=ReviewConfig(max_no_op_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app.record_review(456, "request_changes", summary="fix A")
+
+    # Force issue status to "reviewing" (the orphaned/stuck shape the
+    # no-op route exists for — same as test_janitor_no_op_rework_routes_
+    # to_rework in test_fix_janitor_routing.py).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state.get("issues", {}).get("123", {}),
+            "number": 123,
+            "status": "reviewing",
+        }
+        # Seed the startup-death flag so the janitor gate's startup-death
+        # check fires before the counter increment.
+        state["prs"]["456"] = {
+            **state.get("prs", {}).get("456", {}),
+            "last_rework_failure_kind": "launch_failed",
+            "last_rework_was_startup_death": True,
+        }
+        save_state(paths.state_file, state)
+
+    # Same head, same diff as the recorded verdict: no actual content change,
+    # so the janitor's no-op-rework signal fires and routes through
+    # _route_janitor_gate_failure_to_rework with attempts_key=
+    # "no_op_rework_attempts".
+    result = app.review(456)
+    assert result is not None
+    assert result.ok is True
+    assert result.data["routed_to_rework"] is True
+    assert result.data.get("startup_death_requeue") is True
+
+    state = load_state(paths.state_file)
+    # The startup-death requeue must NOT have incremented the no-op cap.
+    assert state["prs"]["456"].get("no_op_rework_attempts", 0) == 0
+    # The issue must have been routed back to rework_requested.
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # The startup-death flags must have been cleared.
+    assert state["prs"]["456"]["last_rework_was_startup_death"] is False
+    assert state["prs"]["456"]["last_rework_failure_kind"] is None
+
+
+def test_non_startup_death_still_consumes_conflict_rework_cap(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106 regression guard: a session that genuinely ran and died
+    (NOT a startup death — e.g. ``stalled`` with a long runtime) must STILL
+    consume the conflict rework cap.  The startup-death exemption must not
+    be over-broad.
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+            failed_attempt_alarm=1,
+        ),
+        review=ReviewConfig(max_conflict_rework_attempts=2),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: search",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-fix-search",
+            "baseRefName": "main",
+            "headRefOid": "sha-abc123",
+            "mergeStateStatus": "DIRTY",
+            "mergeable": "CONFLICTING",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Seed the PR state with a NON-startup death (stalled, but the flag
+    # is False — the session ran long enough to be a genuine no-op).
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state.get("prs", {}).get("456", {}),
+            "number": 456,
+            "issue_number": 123,
+            "last_rework_failure_kind": "stalled",
+            "last_rework_was_startup_death": False,
+        }
+        state["issues"]["123"] = {
+            **state.get("issues", {}).get("123", {}),
+            "number": 123,
+            "status": "needs_review",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=False)
+    assert result.ok is True
+    assert result.data["merge_conflict"] is True
+
+    state = load_state(paths.state_file)
+    # A non-startup death MUST still increment the cap.
+    assert state["prs"]["456"]["conflict_rework_attempts"] == 1
+
+
+def test_is_startup_death_classification() -> None:
+    """Issue #1106: unit test for the _is_startup_death classifier itself.
+
+    ``launch_failed`` is always a startup death (the process never
+    launched).  ``stalled`` is a startup death only under the threshold
+    (the CLI exited before the worker did real work); a longer runtime
+    means the worker genuinely ran and got stuck.  Unknown/None failure
+    kinds are never startup deaths.
+    """
+    from charlie_work.workflow import (
+        STARTUP_DEATH_THRESHOLD_SECONDS,
+        _is_startup_death,
+    )
+
+    assert _is_startup_death("launch_failed", 0.0) is True
+    assert _is_startup_death("launch_failed", 999.0) is True
+    assert _is_startup_death("stalled", 1.0) is True
+    assert _is_startup_death("stalled", float(STARTUP_DEATH_THRESHOLD_SECONDS)) is False
+    assert _is_startup_death("stalled", float(STARTUP_DEATH_THRESHOLD_SECONDS) + 1) is False
+    assert _is_startup_death(None, 0.0) is False
+    assert _is_startup_death("worker_blocked", 0.0) is False
+    assert _is_startup_death("rate_limited", 1.0) is False
+
+
+def test_reap_restore_sets_startup_death_flag(
+    tmp_path: Path,
+) -> None:
+    """Issue #1106: _reap_restore_rework_requested must record the
+    startup-death classification in the PR state so the janitor gate can
+    consult it on the next pass.
+
+    Uses a ``launch_failed`` sidecar (pid=None, error set) — the simplest
+    startup-death signature.
+    """
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+
+    now = datetime.now(UTC)
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": "agent/issue-123-fix-search",
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-abc123",
+        }
+        save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("Refusing to run in an untrusted workspace\n", encoding="utf-8")
+    sidecar_path = sessions_dir / "issue-123.json"
+    record = SessionRecord(
+        issue_number=123,
+        branch="agent/issue-123-fix-search",
+        worktree_path=str(tmp_path / "worktrees" / "agent-123"),
+        prompt_path=str(paths.prs / "pr-456" / "rework-prompt.md"),
+        command=("devin", "--prompt-file", "rework-prompt.md"),
+        pid=None,  # launch-failure sidecar
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="devin launch failed: untrusted workspace",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config
+    )
+
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    # The startup-death flag must be set for a launch_failed session.
+    assert pr_state["last_rework_was_startup_death"] is True
+    assert pr_state["last_rework_failure_kind"] == "launch_failed"
+    # The issue must have been restored to rework_requested.
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+
 def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
     tmp_path: Path,
 ) -> None:
