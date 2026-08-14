@@ -22998,7 +22998,13 @@ def test_record_review_requires_explicit_head_when_packet_and_live_differ(
     assert json.loads(decision_path.read_text(encoding="utf-8")).get("decision") == "pending"
 
     # Choosing the original packet head records the packet SHA, patch, and source.
-    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-abc123")
+    # Issue #1072: allow_stale_head=True is the operator CLI's explicit exemption
+    # — a human deliberately choosing to pin a verdict to a superseded head.
+    # Automated callers (review() exits, dispatch_reviews) use the default False
+    # and are refused by record_review()'s compare-and-swap guard.
+    result = app.record_review(
+        456, "approved", summary="lgtm", reviewed_head="sha-abc123", allow_stale_head=True
+    )
     assert result.ok is True
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-abc123"
