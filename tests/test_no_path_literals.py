@@ -316,9 +316,15 @@ def test_find_violations_respects_rule2_allowlist() -> None:
 def test_well_known_path_names_is_derived_and_nonempty() -> None:
     """Sanity: the derived set must actually contain layout.py's own names.
 
-    Guards against a rename of layout.py's naming convention (e.g. dropping
-    the ``_FILENAME``/``_DIRNAME`` suffix) silently emptying the comparison
-    set and turning the enforcement tests below into a no-op.
+    The comparison set is read from ``layout._ENFORCED_FILENAMES`` and
+    ``layout._ENFORCED_DIRNAMES`` (see ``_well_known_path_names``), which
+    reference the underlying constants by Python identifier. A rename of one
+    of those constants that is not applied inside the tuple raises a
+    ``NameError`` at import time rather than silently emptying the set, so
+    this test does not need to guard against that mode. What it does guard
+    against is the tuples themselves being emptied or having these specific
+    entries dropped -- which would silently narrow the comparison set and
+    turn the enforcement tests below into a no-op.
     """
     assert layout.SUPERVISOR_LOCK_FILENAME in WELL_KNOWN_PATH_NAMES
     assert layout.WORKTREES_DIRNAME in WELL_KNOWN_PATH_NAMES
