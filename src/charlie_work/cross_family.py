@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .env_sanitize import sanitize_env
+from .process_utils import get_process_start_time, is_pid_alive, kill_process_tree
 from .subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
@@ -214,6 +215,11 @@ class CrossFamilyResult:
     returncode: int | None = None
     error: str | None = None
     reused: bool = False
+    # ``pending`` is True when the review was launched asynchronously via
+    # ``launch_cross_family_review`` and has not yet been reaped. The report
+    # file is not yet written; callers must not treat a pending result as a
+    # failure or an escalation — the review is simply in flight (issue #1078).
+    pending: bool = False
 
 
 def render_command(command: Sequence[str] | str, values: dict[str, str]) -> list[str] | str:
@@ -382,6 +388,248 @@ def _fail(
     report_path.write_text(stub, encoding="utf-8")
     return CrossFamilyResult(
         ok=False, report_path=str(report_path), model=model, returncode=returncode, error=reason
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1078: asynchronous launch/reap for cross-family review
+#
+# The fleet dispatcher iterates repositories sequentially. A synchronous
+# ``run_cross_family_review`` call blocks for up to ``timeout_seconds`` (600s
+# in production), which can consume 2x the ``full_pass_interval_seconds`` (300s)
+# and starve later repos' lanes. The pair below splits the blocking across two
+# fleet passes:
+#
+#   pass N:   ``launch_cross_family_review`` — Popen, write marker, return
+#             immediately with ``pending=True``.
+#   pass N+1: ``reap_cross_family_review`` — check marker, poll process,
+#             collect stdout or kill on timeout, write the report.
+#
+# The marker (``.pending.json``) stores the PID, launch timestamp, timeout,
+# and temp-file paths so the reaper can identify the process across passes.
+# Process identity is validated via ``get_process_start_time`` to avoid acting
+# on a recycled PID.
+# ---------------------------------------------------------------------------
+
+
+def _pending_marker_path(report_path: Path) -> Path:
+    """Sidecar marker path derived from the report path."""
+    return report_path.with_suffix(report_path.suffix + ".pending.json")
+
+
+def _stdout_tmp_path(report_path: Path) -> Path:
+    """Temp stdout path for the async subprocess output."""
+    return report_path.with_suffix(report_path.suffix + ".stdout.tmp")
+
+
+def _stderr_tmp_path(report_path: Path) -> Path:
+    """Temp stderr path for the async subprocess output."""
+    return report_path.with_suffix(report_path.suffix + ".stderr.tmp")
+
+
+def _cleanup_pending(marker_path: Path, stdout_path: Path, stderr_path: Path) -> None:
+    """Remove the marker and temp output files left by a pending review."""
+    for p in (marker_path, stdout_path, stderr_path):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def launch_cross_family_review(
+    *,
+    model: str,
+    command: Sequence[str] | str,
+    repo_root: Path,
+    prompt_text: str,
+    prompt_path: Path,
+    report_path: Path,
+    timeout_seconds: int,
+    dry_run: bool = False,
+    head_ref_oid: str | None = None,
+    popen: Callable[..., subprocess.Popen] | None = None,
+) -> CrossFamilyResult:
+    """Launch a cross-family review asynchronously via ``Popen``.
+
+    Writes the prompt, starts the subprocess with stdout/stderr redirected
+    to temp files, and writes a ``.pending.json`` marker so a later
+    ``reap_cross_family_review`` call can collect the result. Returns
+    immediately with ``pending=True`` — the report file is NOT yet written.
+
+    Never raises: launch failures (OSError) are returned as not-ok, non-pending
+    results with a failure stub written to ``report_path``, matching
+    ``run_cross_family_review``'s contract.
+
+    The in-process retry that ``run_cross_family_review`` performs on
+    transient provider errors is deliberately dropped here — a retry with a
+    90s sleep would re-introduce the blocking this function exists to
+    eliminate. The per-head regeneration budget (``max_regen_attempts``)
+    already bounds retries across passes.
+    """
+    if dry_run:
+        return CrossFamilyResult(
+            ok=False,
+            report_path=str(report_path),
+            model=model,
+            error="DRY-RUN: cross-family review not executed",
+        )
+
+    # Staleness warning — mirrors run_cross_family_review.
+    if report_path.exists() and report_path.stat().st_size > 0:
+        old_text = report_path.read_text(encoding="utf-8")
+        old_head_sha = extract_head_ref_oid(old_text)
+        if old_head_sha and head_ref_oid and old_head_sha != head_ref_oid:
+            old_body = extract_report_body(old_text)
+            if report_body_is_valid(old_body):
+                logger.warning(
+                    "Cross-family report staleness detected: overwriting report "
+                    "for PR head %s with new report for PR head %s.",
+                    old_head_sha[:12],
+                    head_ref_oid[:12],
+                )
+
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt_text, encoding="utf-8")
+
+    rendered = render_command(command, {"model": model, "prompt_path": str(prompt_path)})
+    env = sanitize_env(repo_root)
+    stdout_path = _stdout_tmp_path(report_path)
+    stderr_path = _stderr_tmp_path(report_path)
+    marker_path = _pending_marker_path(report_path)
+
+    spawn = popen if popen is not None else subprocess.Popen
+    try:
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            open(stdout_path, "w", encoding="utf-8") as stdout_file,
+            open(stderr_path, "w", encoding="utf-8") as stderr_file,
+        ):
+            proc = spawn(
+                rendered,
+                cwd=str(repo_root),
+                stdout=stdout_file,
+                stderr=stderr_file,
+                shell=isinstance(rendered, str),
+                env=env,
+                **no_console_window_kwargs(),
+            )
+    except OSError as exc:
+        return _fail(report_path, model, f"cross-family runner failed to start: {exc}")
+
+    expected_start_time = get_process_start_time(proc.pid)
+    marker = {
+        "pid": proc.pid,
+        "started_at": time.time(),
+        "timeout_seconds": timeout_seconds,
+        "model": model,
+        "report_path": str(report_path),
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "head_ref_oid": head_ref_oid,
+        "expected_start_time": expected_start_time,
+    }
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    return CrossFamilyResult(
+        ok=False,
+        report_path=str(report_path),
+        model=model,
+        pending=True,
+        error="cross-family review launched, pending",
+    )
+
+
+def reap_cross_family_review(
+    *,
+    report_path: Path,
+) -> CrossFamilyResult | None:
+    """Reap a pending cross-family review launched by ``launch_cross_family_review``.
+
+    Returns:
+        - ``None`` if no pending marker exists (no review in flight).
+        - ``CrossFamilyResult(pending=True)`` if the process is still running
+          and within the timeout.
+        - ``CrossFamilyResult(ok=True, ...)`` if the process exited and stdout
+          is a valid review; the report file is written.
+        - ``CrossFamilyResult(ok=False, ...)`` if the process timed out, exited
+          with empty/blocked output, or the marker is corrupted; a failure
+          stub is written to ``report_path``.
+
+    Marker and temp files are cleaned up in all terminal cases (ok, fail,
+    timeout). They are left in place while pending.
+    """
+    marker_path = _pending_marker_path(report_path)
+    if not marker_path.exists():
+        return None
+
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Corrupted marker — clean up and treat as no pending review.
+        _cleanup_pending(marker_path, _stdout_tmp_path(report_path), _stderr_tmp_path(report_path))
+        return None
+
+    pid = marker.get("pid")
+    started_at = marker.get("started_at")
+    timeout_seconds = marker.get("timeout_seconds", 600)
+    model = marker.get("model", "unknown")
+    head_ref_oid = marker.get("head_ref_oid")
+    expected_start_time = marker.get("expected_start_time")
+    stdout_path = Path(marker.get("stdout_path", str(_stdout_tmp_path(report_path))))
+    stderr_path = Path(marker.get("stderr_path", str(_stderr_tmp_path(report_path))))
+
+    if pid is None or started_at is None:
+        _cleanup_pending(marker_path, stdout_path, stderr_path)
+        return None
+
+    alive = is_pid_alive(pid, expected_start_time)
+    elapsed = time.time() - float(started_at)
+
+    if alive and elapsed < float(timeout_seconds):
+        return CrossFamilyResult(
+            ok=False,
+            report_path=str(report_path),
+            model=model,
+            pending=True,
+            error="cross-family review still running",
+        )
+
+    if alive and elapsed >= float(timeout_seconds):
+        # Timeout — kill the process tree and write a failure stub.
+        kill_process_tree(pid)
+        partial = ""
+        try:
+            partial = stdout_path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            partial = ""
+        _cleanup_pending(marker_path, stdout_path, stderr_path)
+        return _fail(
+            report_path,
+            model,
+            f"cross-family review timed out after {int(elapsed)}s",
+            partial=partial,
+        )
+
+    # Process has exited — collect stdout and validate.
+    stdout = ""
+    try:
+        stdout = stdout_path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+
+    _cleanup_pending(marker_path, stdout_path, stderr_path)
+
+    if not stdout.strip() or not report_body_is_valid(extract_report_body(stdout)):
+        return _fail(report_path, model, "cross-family review produced empty or blocked report")
+
+    # Write the final report with the standard header.
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(_report(model, stdout, head_ref_oid), encoding="utf-8")
+    return CrossFamilyResult(
+        ok=True,
+        report_path=str(report_path),
+        model=model,
+        returncode=0,
     )
 
 
@@ -623,6 +871,8 @@ __all__ = [
     "MalformedCrossFamilyVerdict",
     "render_command",
     "run_cross_family_review",
+    "launch_cross_family_review",
+    "reap_cross_family_review",
     "extract_report_body",
     "extract_head_ref_oid",
     "report_body_is_valid",

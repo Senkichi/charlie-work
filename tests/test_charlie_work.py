@@ -12198,7 +12198,7 @@ def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkey
         Path(kwargs["report_path"]).write_text(VALID_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     result = app.review(456)
 
@@ -12233,7 +12233,7 @@ def test_review_reuses_existing_cross_family_report(tmp_path: Path, monkeypatch)
         Path(kwargs["report_path"]).write_text(report_content, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     app.review(456)
     app.review(456)
@@ -12247,7 +12247,7 @@ def test_review_no_cross_family_override_skips(tmp_path: Path, monkeypatch) -> N
     def _boom(**kwargs):
         raise AssertionError("cross-family must not run when disabled per call")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _boom)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _boom)
 
     result = app.review(456, cross_family=False)
 
@@ -12265,7 +12265,7 @@ def test_review_skips_cross_family_for_draft_pr(tmp_path: Path, monkeypatch) -> 
     def _boom(**kwargs):
         raise AssertionError("cross-family must not run for a draft PR")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _boom)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _boom)
 
     result = app.review(456)
 
@@ -12422,7 +12422,7 @@ def test_review_does_not_reuse_semantically_empty_cross_family_report(
         Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     report_path = prs_dir / "cross-family-review.md"
@@ -12545,7 +12545,7 @@ def test_review_does_not_reuse_legacy_wrapped_blocked_report(tmp_path: Path, mon
         Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     report_path = prs_dir / "cross-family-review.md"
@@ -13836,7 +13836,7 @@ def test_cross_family_failure_stub_is_not_reused(tmp_path: Path, monkeypatch) ->
         Path(kwargs["report_path"]).write_text("# real findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     result = app.review(456)
 
@@ -13871,7 +13871,7 @@ def test_cross_family_report_invalidated_on_head_sha_change(tmp_path: Path, monk
         Path(kwargs["report_path"]).write_text("# new findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     # Update the PR to have a new head SHA
     app.gh.pr_head_shas[456] = "newheadsha789"
@@ -13908,7 +13908,7 @@ def test_cross_family_report_reused_when_head_sha_unchanged(tmp_path: Path, monk
         Path(kwargs["report_path"]).write_text("# new findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     # The PR still has the same head SHA
     app.gh.pr_head_shas[456] = head_sha
