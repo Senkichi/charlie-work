@@ -3197,6 +3197,13 @@ class FakeGitHub:
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
 
     def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+        # Issue #882: match the production shape. GitHubCLI.merged_prs_for_issue
+        # always returns a MergedPRSearchResult carrying ``.ok``; the base fake
+        # used to return a plain list, which only worked because the sole
+        # consumer reads defensively via ``getattr(merged_prs, "ok", True)``.
+        # Returning the typed wrapper here keeps the fake and the real thing
+        # agreeing, so a future caller that reads ``.ok`` directly does not pass
+        # tests here and AttributeError in production.
         matched = []
         for pr in self.prs:
             if pr.get("state", "OPEN").upper() != "MERGED":
@@ -3208,7 +3215,7 @@ class FakeGitHub:
             )
             if bound == issue_number:
                 matched.append(pr)
-        return matched
+        return github_module._MergedPRSearchResult(matched, ok=True)
 
     def pr_view(self, number: int):
         # Return the PR matching the requested number
@@ -3705,6 +3712,35 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
         )
         results.add(proc.stdout.strip())
     assert len(results) == 1, f"merge_base varied across hash seeds: {results}"
+
+
+def test_base_fake_github_merged_prs_for_issue_returns_typed_result() -> None:
+    """Issue #882 regression guard.
+
+    Production ``GitHubCLI.merged_prs_for_issue`` always returns a
+    ``MergedPRSearchResult`` carrying ``.ok``. The base ``FakeGitHub`` used to
+    return a plain ``list`` with no ``.ok`` attribute, so it silently disagreed
+    with the real thing -- only inert because the sole consumer reads
+    defensively via ``getattr(merged_prs, "ok", True)``. A future caller that
+    reads ``.ok`` directly would pass tests against this fake and raise
+    ``AttributeError`` in production.
+
+    Pin the typed shape on the base fake so the fake and the real thing agree.
+    """
+    fake_gh = FakeGitHub()
+    # The default PR ships OPEN; flip it to MERGED so it matches.
+    fake_gh.prs[0]["state"] = "MERGED"
+
+    result = fake_gh.merged_prs_for_issue(123, "agent/issue-")
+
+    assert isinstance(result, github_module.MergedPRSearchResult)
+    assert result.ok is True
+    assert [pr["number"] for pr in result] == [456]
+    # An empty search must still carry the typed shape (ok=True, not a bare []).
+    empty = fake_gh.merged_prs_for_issue(999, "agent/issue-")
+    assert isinstance(empty, github_module.MergedPRSearchResult)
+    assert empty.ok is True
+    assert list(empty) == []
 
 
 def test_dispatch_writes_worker_prompt_and_session_manifest(tmp_path: Path) -> None:
@@ -23604,6 +23640,205 @@ def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -
     # Default config: no --admin
     assert fake_gh.merged_admin_flags == [False]
     assert fake_gh.merged_merge_flags == [()]
+
+
+def test_merge_ready_escalated_issue_blocks_merge_of_otherwise_green_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #840: an approved, green, conflict-free PR whose linked issue is
+    escalated (status == "escalated" / agent:human-needed) for a reason
+    unrelated to this PR's mergeability must NOT be actually merged while
+    that flag is up.
+
+    This is the byte-identical scenario as
+    test_merge_ready_merges_when_head_unchanged_after_approval (immediately
+    above) PLUS an escalated linked issue — proving the escalation gate
+    suppresses the merge that the positive control proves would otherwise
+    fire. The escalation reason is deliberately unrelated to mergeability
+    (redispatch_cap_exceeded — a dead request-changes-fix worker exhausting
+    the watchdog's redispatch cap; real corpus: issues #592/#648/#606).
+    """
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    # Escalate the linked issue for an unrelated reason.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    # The irreversible step must not have happened — assert this FIRST so a
+    # mutation that removes the gate fails on the behavioral bug (the PR
+    # getting merged), not merely on a missing return-data key.
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    # can_merge is still True — the PR is genuinely mergeable. The gate is
+    # on the merge-execution block, not on can_merge itself (see the issue
+    # for why modifying can_merge would cause a counter/alarm regression).
+    assert result.data["can_merge"] is True
+    assert result.data["escalated_merge_hold"] is True
+    # The linked issue's escalated status must be preserved.
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+
+
+def test_merge_ready_escalated_pr_blocks_merge_of_otherwise_green_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #840 (PR-level escalation variant): the escalation gate also
+    fires when the PR's own state entry is escalated, not just the linked
+    issue's."""
+    config = OrchestratorConfig(auto_merge=_approved_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **state["prs"].get("456", {}),
+            "status": "escalated",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    assert result.data["can_merge"] is True
+    assert result.data["escalated_merge_hold"] is True
+
+
+def test_merge_ready_escalated_issue_counter_does_not_climb(
+    tmp_path: Path,
+) -> None:
+    """Issue #840: the failed-attempt-alarm counter must NOT spuriously climb
+    for an escalated-but-otherwise-mergeable PR. Because the escalation gate
+    leaves ``can_merge`` True (it gates the merge-execution block, not
+    can_merge), the counter block's ``elif can_merge:`` branch zeroes the
+    streak on every pass — a green pass held by escalation is not a failed
+    pass. A spurious climb would eventually cross ``failed_attempt_alarm``
+    and fire a ``merge_attempt_alarm`` digest for a PR that isn't failing to
+    merge for a mergeability reason (the diagnostic regression the issue
+    calls out as the complication with naively adding an escalation term to
+    can_merge).
+    """
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            failed_attempt_alarm=3,
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="lgtm")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    # Run enough passes to cross the alarm threshold IF the counter were
+    # climbing (which it must not).
+    for _ in range(5):
+        result = app.merge_ready(456, merge=True)
+        # Behavioral assertions first: the PR must not be merged and the
+        # counter must not climb — these are the actual bugs the fix prevents.
+        assert result.data["merged"] is False
+        assert result.data["consecutive_failed_merge_attempts"] == 0
+        assert result.data["merge_attempt_alarm"] is False
+        assert result.data["merge_attempt_warning"] is None
+        assert result.data["escalated_merge_hold"] is True
+
+    assert fake_gh.merged == []
+
+
+def test_merge_ready_escalated_issue_blocks_mergequeue_handoff(
+    tmp_path: Path,
+) -> None:
+    """Issue #840 (mergequeue mode): an escalated PR must not be handed off
+    to the mergequeue either — the mergequeue label add IS the handoff
+    (task #10), and handing off while escalated is the same class of
+    silently-completing-an-action-while-a-human-is-asked-to-intervene as a
+    direct merge."""
+    config = OrchestratorConfig(auto_merge=_mergequeue_automerge())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    app.record_review(456, "approved", summary="ok")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    # Behavioral assertions first: the handoff must not have happened.
+    assert result.data["merged"] is False
+    assert result.data["mergequeue_label_applied"] is None
+    # The mergequeue label must not have been added.
+    assert "mergequeue" not in [label for _, label in fake_gh.labels_added]
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"].get("status") != "mergequeue"
+    assert result.data["can_merge"] is True
+    assert result.data["escalated_merge_hold"] is True
+
+
+def test_merge_ready_dry_run_escalated_issue_reports_hold(tmp_path: Path) -> None:
+    """Issue #840 (dry-run): the dry-run preview must accurately report
+    "would hold" instead of "would merge" when the linked issue is
+    escalated, mirroring the real path's gate."""
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=(),
+            require_approved_review=True,
+            enabled=False,  # dry-run never merges, but the gate must still report
+        )
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    app.dry_run = True
+
+    app.record_review(456, "approved", summary="lgtm")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            **state["issues"].get("123", {}),
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        save_state(paths.state_file, state)
+
+    result = app.merge_ready(456, merge=True)
+
+    # Behavioral assertion first: the preview must not say "would merge".
+    assert "would merge" not in result.message
+    assert "escalated" in result.message
+    assert result.data["dry_run"] is True
+    assert result.data["can_merge"] is True
+    assert result.data["escalated_merge_hold"] is True
 
 
 def test_merge_ready_passes_admin_flag_when_configured(tmp_path: Path) -> None:
