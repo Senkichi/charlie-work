@@ -109,7 +109,7 @@ def _well_known_path_names() -> frozenset[str]:
       newly added ``*_FILENAME`` constant is automatically protected, and the
       only way to opt out is to add it to ``_FILENAME_EXCLUSIONS`` (a
       deliberate, visible act -- see
-      :func:`test_every_filename_constant_is_enforced_or_explicitly_excluded`);
+      :func:`test_filename_sweep_rederives_from_dir_layout`);
     * ``layout._ENFORCED_DIRNAMES`` -- the directory names ``layout`` itself
       declares dangerous to re-spell (``worktrees`` is the one that cost 74
       uncollected worktrees in production). Dirnames are not auto-swept
@@ -339,31 +339,92 @@ def test_generic_fleet_config_filename_is_not_rule1_enforced() -> None:
     assert layout.GLOBAL_CONFIG_FILENAME not in WELL_KNOWN_PATH_NAMES
 
 
-def test_every_filename_constant_is_enforced_or_explicitly_excluded() -> None:
-    """Every ``*_FILENAME`` constant on ``layout`` is classified -- fail-closed.
+def test_filename_sweep_rederives_from_dir_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The sweep re-derives from ``dir(layout)`` at call time -- fail-closed teeth.
 
-    The enforced filename set is derived by sweeping ``layout`` for
-    ``*_FILENAME`` attributes and subtracting ``_FILENAME_EXCLUSIONS``. By
-    construction every ``*_FILENAME`` constant is therefore either enforced
-    or explicitly excluded. This test pins that property so a future change
-    that breaks the sweep (e.g. filtering on the wrong suffix, or a
-    non-string ``*_FILENAME`` attribute) cannot silently empty the enforced
-    set and turn Rule 1 into a no-op for filenames.
+    The regression guard for issue #1052. Under the previous hand-maintained
+    ``_ENFORCED_FILENAMES`` tuple, a newly added ``*_FILENAME`` constant that
+    nobody remembered to append was silently unprotected and no test caught
+    the omission. The auto-sweep makes the omission impossible -- but only
+    while the sweep itself stays intact (correct suffix filter, reads
+    ``dir(layout)`` fresh at each call, filters to ``str`` values).
 
-    This is the regression guard for issue #1052: under the previous
-    hand-maintained ``_ENFORCED_FILENAMES`` tuple, a newly added
-    ``*_FILENAME`` constant that nobody remembered to append was silently
-    unprotected and no test caught the omission. With the auto-sweep the
-    omission is impossible -- but only while the sweep itself stays intact,
-    which this assertion enforces.
+    This test proves the sweep has real teeth by injecting a synthetic
+    ``*_FILENAME`` attribute onto ``layout`` at test time and asserting a
+    freshly recomputed sweep picks it up. A broken sweep -- a cached
+    module-level result, a wrong suffix filter, or a narrowed filter that
+    only returns pre-existing constants -- cannot see the synthetic attribute
+    and fails this assertion. This is the "checker teeth" pattern (see
+    :func:`test_find_violations_flags_rule1_hardcoded_path_join`, whose
+    docstring states "A source-scan test that cannot fail is worthless"): a
+    guard that cannot fail against a broken checker is itself worthless.
+
+    The previous version of this test was tautological -- it recomputed the
+    same sweep function it was supposed to be checking, so ``unclassified``
+    was empty by construction and the assertion passed even when the sweep
+    returned ``frozenset()``. That reintroduced, at the test layer, precisely
+    the silent-drift failure mode issue #1052 was filed to eliminate.
+
+    Negative controls prove the filter is selective, not just permissive: a
+    same-suffix non-string attribute and a wrong-suffix string attribute must
+    both be rejected, and the ``_FILENAME_EXCLUSIONS`` opt-out must remove a
+    name from the enforced set at call time.
     """
-    all_filenames = _all_filename_constants()
-    classified = WELL_KNOWN_PATH_NAMES | set(layout._FILENAME_EXCLUSIONS)
-    unclassified = all_filenames - classified
-    assert not unclassified, (
-        f"unclassified *_FILENAME constants (neither enforced nor excluded): "
-        f"{sorted(unclassified)} -- add to _FILENAME_EXCLUSIONS only if too "
-        f"generic for exact-string Rule 1; otherwise the sweep already covers it"
+    probe_value = "synthetic-probe-test.json"
+
+    # Inject a synthetic *_FILENAME string constant that does not exist on
+    # layout at module load. A sweep that re-derives from dir(layout) at
+    # call time must see it; a cached or narrowed sweep cannot.
+    monkeypatch.setattr(layout, "SYNTHETIC_PROBE_FILENAME", probe_value, raising=False)
+
+    swept = _all_filename_constants()
+    assert probe_value in swept, (
+        "sweep did not pick up a synthetic *_FILENAME string attribute added "
+        "after module load -- the sweep is not re-deriving from dir(layout) "
+        "at call time (cached result, wrong suffix filter, or narrowed filter)"
+    )
+
+    # The freshly recomputed well-known set must enforce the synthetic name
+    # (it is not in _FILENAME_EXCLUSIONS), proving new constants get Rule 1
+    # protection automatically -- the fail-closed guarantee from issue #1052.
+    fresh_well_known = _well_known_path_names()
+    assert probe_value in fresh_well_known, (
+        "freshly recomputed well-known set does not enforce the synthetic "
+        "*_FILENAME constant -- the fail-closed guarantee is broken"
+    )
+
+    # The exclusion opt-out must work at call time: adding the probe to
+    # _FILENAME_EXCLUSIONS must remove it from the enforced set. This proves
+    # the opt-out is live (not a dead reference to a stale tuple).
+    monkeypatch.setattr(
+        layout, "_FILENAME_EXCLUSIONS", (*layout._FILENAME_EXCLUSIONS, probe_value)
+    )
+    excluded_well_known = _well_known_path_names()
+    assert probe_value not in excluded_well_known, (
+        "adding the probe to _FILENAME_EXCLUSIONS did not remove it from the "
+        "enforced set -- the opt-out mechanism is not live at call time"
+    )
+    # monkeypatch restores _FILENAME_EXCLUSIONS to its original value at
+    # teardown; no manual reset needed here. The negative controls below
+    # call _all_filename_constants(), which does not read _FILENAME_EXCLUSIONS.
+
+    # Negative control: a *_FILENAME-named attribute that is NOT a str must
+    # be rejected, proving the isinstance filter is live. Without this filter
+    # a Path-valued *_FILENAME constant would pollute the enforced set with a
+    # non-string that Rule 1's exact-match check can never hit.
+    nonstr_value = Path("not-a-str")
+    monkeypatch.setattr(layout, "SYNTHETIC_NONSTR_FILENAME", nonstr_value, raising=False)
+    swept = _all_filename_constants()
+    assert nonstr_value not in swept, (
+        "sweep accepted a non-string *_FILENAME attribute -- isinstance filter is dead"
+    )
+
+    # Negative control: a wrong-suffix string attribute must be rejected,
+    # proving the suffix filter is live (not just returning every attribute).
+    monkeypatch.setattr(layout, "SYNTHETIC_PROBE_FILE", "wrong-suffix.json", raising=False)
+    swept = _all_filename_constants()
+    assert "wrong-suffix.json" not in swept, (
+        "sweep accepted a non-_FILENAME-suffix attribute -- suffix filter is dead"
     )
 
 

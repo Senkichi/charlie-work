@@ -294,7 +294,7 @@ NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 #: newly added ``*_FILENAME`` constant receives automatic Rule 1 protection
 #: with zero author effort, and the only way to opt *out* is to append the
 #: name here -- a deliberate, visible act with a test attached (see
-#: ``test_every_filename_constant_is_enforced_or_explicitly_excluded``).
+#: ``test_filename_sweep_rederives_from_dir_layout``).
 #:
 #: ``GLOBAL_CONFIG_FILENAME`` (``config.yaml``) is excluded because it is a
 #: bare, generic name that Rule 1 can only match by exact string membership,
