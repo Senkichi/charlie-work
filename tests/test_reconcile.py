@@ -2126,6 +2126,81 @@ def test_apply_fixes_session_failed_relabeled_idempotent(tmp_path: Path) -> None
     assert len(reconcile_events) == 1
 
 
+def test_apply_fixes_session_failed_relabeled_carries_structured_reason(
+    tmp_path: Path,
+) -> None:
+    """Issue #978: the ``reconcile`` event for a ``session_failed_relabeled``
+    drift item must carry the machine-readable ``reason``/``failure_kind`` as
+    structured payload fields, not only buried in the free-text ``detail``
+    string. A query on ``json_extract(payload, '$.reason')`` must not return
+    NULL the way it did when the "why" lived only in English prose."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_relabeled",
+            issue_number=42,
+            pr_number=None,
+            reason="dead_session_no_open_pr",
+            failure_kind="rate_limited",
+            detail="issue #42 session died with rate_limited, no open PR",
+            fix_actions=(
+                f"remove label '{config.labels.in_progress}' from issue #42",
+                f"add label '{config.labels.ready}' to issue #42",
+            ),
+            remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.ready,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    payload = reconcile_events[0]["payload"]
+    assert payload["kind"] == "session_failed_relabeled"
+    assert payload["reason"] == "dead_session_no_open_pr"
+    assert payload["failure_kind"] == "rate_limited"
+
+
+def test_apply_fixes_session_failed_relabeled_reason_absent_when_unset(
+    tmp_path: Path,
+) -> None:
+    """Issue #978: a drift item that does not carry ``reason``/``failure_kind``
+    must not produce a reconcile payload with those keys present-as-None. The
+    payload shape for items without structured fields is unchanged."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_relabeled",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 session died, no open PR",
+            fix_actions=(f"remove label '{config.labels.in_progress}' from issue #42",),
+            remove_labels=(config.labels.in_progress,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    payload = reconcile_events[0]["payload"]
+    assert "reason" not in payload
+    assert "failure_kind" not in payload
+
+
 def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel(
     tmp_path: Path,
 ) -> None:
