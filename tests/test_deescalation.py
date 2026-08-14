@@ -57,6 +57,7 @@ from charlie_work.state import (
     save_state,
     state_lock,
 )
+from charlie_work.worktree import worktree_path_for_branch
 from charlie_work.workflow import OrchestratorApp
 
 from test_charlie_work import _second_mergequeue_pr
@@ -903,3 +904,136 @@ def test_skip_reason_vocabulary_is_derived_from_the_branches() -> None:
     # `if not (... and ... and ...)` is what made "0 cleared" unreadable, and
     # only `janitor_blocked` means "the sweep works but the PR is not ready".
     assert {"janitor_blocked", "pr_not_open", "pr_conflicting", "no_open_pr"} <= set(reasons)
+
+
+# --- Issue #849: worktree_unsafe de-escalation safety re-check ---
+
+
+def _init_repo_for_deescalation(tmp_path: Path, branch: str) -> Path:
+    """Init a git repo at tmp_path, create a worktree at the layout-expected
+    path, and leave it dirty so ``_worktree_refuse_to_reset_reason`` returns a
+    reason. Returns the worktree path."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test User"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "README.md").write_text("initial\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "README.md"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "initial"], check=True, capture_output=True
+    )
+
+    app = _app(tmp_path)
+    wt_path = worktree_path_for_branch(app.repo_root, branch, app._layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "worktree", "add", str(wt_path), "-b", branch],
+        check=True,
+        capture_output=True,
+    )
+    # Make the worktree dirty.
+    (wt_path / "worker_wip.txt").write_text("uncommitted work\n", encoding="utf-8")
+    return wt_path
+
+
+def test_deescalation_skips_worktree_unsafe_when_worktree_still_dirty(
+    tmp_path: Path,
+) -> None:
+    """AC5 (automated): ``_deescalate_mechanical_issue`` must NOT clear a
+    ``worktree_unsafe`` escalation while the worktree still has uncommitted
+    worker-authored content. Clearing the label based on PR-level health
+    (OPEN, not CONFLICTING, janitor_ok) without inspecting the worktree
+    reports success for an operation that changed nothing causal — the next
+    rework dispatch reproduces the escalation deterministically (issue #849).
+    """
+    branch = "agent/issue-849-deescalation-skip"
+    wt_path = _init_repo_for_deescalation(tmp_path, branch)
+
+    app = _app(tmp_path)
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "worktree_unsafe",
+            "reason_class": "mechanical",
+            "branch_name": branch,
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    issue_123 = state["issues"]["123"]
+    # The escalation is NOT cleared — the label stays.
+    assert issue_123["status"] == "escalated"
+    assert issue_123["escalation_reason"] == "worktree_unsafe"
+    # No auto-deescalation count bump — the sweep did not act.
+    assert "auto_deescalation_count" not in issue_123
+    # The dirty worktree content survives.
+    assert (wt_path / "worker_wip.txt").read_text(encoding="utf-8") == "uncommitted work\n"
+
+
+def test_deescalation_clears_worktree_unsafe_when_worktree_cleaned(
+    tmp_path: Path,
+) -> None:
+    """AC5 (automated, positive case): once the worktree is cleaned (the
+    blocker is gone), ``_deescalate_mechanical_issue`` proceeds normally and
+    clears the ``worktree_unsafe`` escalation. This proves the check is a
+    gate, not a permanent block — removing the cause unblocks the sweep."""
+    branch = "agent/issue-849-deescalation-clear"
+    _init_repo_for_deescalation(tmp_path, branch)
+
+    app = _app(tmp_path)
+    wt_path = worktree_path_for_branch(app.repo_root, branch, app._layout.worktrees)
+
+    # Remove the dirty worktree — the blocker is gone.
+    import subprocess
+
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "worktree", "remove", "--force", str(wt_path)],
+        check=True,
+        capture_output=True,
+    )
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "worktree_unsafe",
+            "reason_class": "mechanical",
+            "branch_name": branch,
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    issue_123 = state["issues"]["123"]
+    # The escalation IS cleared — the worktree blocker is gone.
+    assert issue_123["status"] == PASSIVE_OPEN_STATUS
+    assert "escalation_reason" not in issue_123
+    assert issue_123["auto_deescalation_count"] == 1
