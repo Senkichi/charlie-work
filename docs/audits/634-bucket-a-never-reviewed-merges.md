@@ -27,7 +27,8 @@ were reviewed for:
 
 Critical findings from the initial parallel review were **independently
 verified** against the live code and, where applicable, empirically tested
-(e.g. the `git patch-id --stable` whitespace claim was tested with real diffs).
+(e.g. the `git patch-id --stable` whitespace claim was tested with real diffs
+that differ only in indentation depth, confirming the collision).
 
 ## PRs audited
 
@@ -149,38 +150,67 @@ bug.
 
 ### #386 — carry forward approved verdict on clean rebase via patch-id
 
-**Verdict: CLEAN.** The carry-forward extension is correct and safe. Two
-critical findings from the initial review were independently verified as **false
-positives**.
+**Verdict: OPEN — one CRITICAL finding confirmed.** The carry-forward
+extension has a review-gate-bypass gap in its tier-1 fast path. One critical
+finding from the initial review was confirmed; one high finding was verified
+as a false positive.
 
-- **Patch-id whitespace collision (CRITICAL → FALSE POSITIVE)**: The initial
-  review claimed `git patch-id --stable` ignores whitespace, allowing two diffs
-  with different Python indentation to produce the same patch-id. This was
-  **empirically tested and refuted**:
+- **Patch-id whitespace collision (CRITICAL → CONFIRMED OPEN)**: The initial
+  review claimed `git patch-id --stable` ignores whitespace on changed-line
+  content, allowing two diffs with different Python indentation to produce the
+  same patch-id. **This was empirically confirmed**:
 
   ```
-  # Diff A: unindent return True (changes Python semantics)
-  -        return True
-  +    return True
-  → patch-id: 3e3514963406ac6eade28f2b08f8407b9c4b502b
+  # Diff A: indent return True to 8 spaces
+  -    return True
+  +        return True
+  → patch-id: 72dfef266732abf40d724cff8fcf1240179dc126
 
-  # Diff B: change return True to return False (different content)
-  -        return True
-  +        return False
-  → patch-id: a868cb9a81345f4eacf028cd10017c595af1ea7d
+  # Diff B: indent return True to 12 spaces (different indentation depth)
+  -    return True
+  +            return True
+  → patch-id: 72dfef266732abf40d724cff8fcf1240179dc126  (IDENTICAL)
   ```
 
-  `git patch-id --stable` hashes the `+`/`-` content lines **including
-  whitespace**. It strips only commit metadata and hunk line-number offsets.
-  Different indentation produces different patch-ids. The attack scenario
-  described in the initial review is not possible.
+  `git patch-id --stable` strips leading whitespace from `+`/`-` content lines
+  before hashing. Two diffs that differ **only in indentation depth** produce
+  the identical patch-id. The earlier version of this audit incorrectly
+  refuted the finding by comparing a whitespace-only change against a content
+  change (True→False) — that test was flawed because it did not isolate the
+  whitespace variable.
+
+  The vulnerability is live in `_check_carry_forward`
+  (`workflow.py:17333-17334`): the tier-1 fast path matches on patch-id and
+  returns `"patch-id"` immediately, **never** falling through to the tier-2
+  line-content signature. The tier-2 signature (`_diff_content_signature` in
+  `janitor.py:272-301`) preserves `+`/`-` line content verbatim including
+  leading whitespace, and WOULD distinguish the two diffs — but it is never
+  consulted when tier-1 matches.
+
+  In Python, an indentation-only change can alter control flow (e.g., moving
+  a `return` into or out of an `if` block). An attacker (or careless author)
+  could push a reindentation that changes semantics, and the approved verdict
+  would carry forward to the unreviewed head without the change ever being
+  reviewed. This is a review-gate bypass.
+
+  A regression test documenting this vulnerability was added:
+  `test_check_carry_forward_tier1_whitespace_collision_bypasses_tier2` in
+  `tests/test_charlie_work.py`. The test confirms that (a) two
+  indentation-only diffs produce the same patch-id, (b) their tier-2
+  signatures differ, and (c) `_check_carry_forward` carries forward via
+  tier-1 without consulting tier-2.
+
+  **Follow-up issue required**: `_check_carry_forward` must be fixed so a
+  tier-1 patch-id match alone is never sufficient to carry forward a verdict
+  without also validating the whitespace-preserving tier-2 content signature.
+  Filed as #1187.
 
 - **Empty patch-id collision (HIGH → FALSE POSITIVE)**: The initial review
   claimed two empty patch-ids could match and carry forward a verdict. The code
-  at `workflow.py:17165` guards with
+  at `workflow.py:17333` guards with
   `if live_patch_id and live_patch_id == reviewed_patch_id` — the
   `if live_patch_id` check means empty/falsy patch-ids short-circuit and never
-  match. Additionally, line 17160 returns early when `reviewed_patch_id` is
+  match. Additionally, line 17328 returns early when `reviewed_patch_id` is
   empty. Empty-patch-id collision is not possible.
 
 - **Stale CI check for approved verdicts (MEDIUM → by design)**: The
@@ -237,11 +267,17 @@ code issue.
 | #578 | CLEAN | 0 | 0 | 0 | 1 | — |
 | #466 | CLEAN | 0 | 0 | 0 | 1 | — |
 | #387 | CLEAN | 0 | 0 | 0 | 1 | 1 (no global cap) |
-| #386 | CLEAN | 0 | 0 | 0 | 0 | 2 (patch-id ws, empty patch-id) |
+| #386 | **OPEN** | **1** | 0 | 0 | 0 | 1 (empty patch-id) |
 | #364 | CLEAN | 0 | 0 | 0 | 0 | — |
 
-**No actionable security or correctness issues found.** All five bucket-A PRs
-are sound. The code that was never reviewed by anything is safe.
+**One actionable Critical finding confirmed (open).** Four of the five
+bucket-A PRs are sound. The fifth (#386) has a live review-gate-bypass gap:
+`_check_carry_forward`'s tier-1 patch-id fast path carries forward an approved
+verdict on a whitespace-only (indentation) change without consulting the
+whitespace-preserving tier-2 signature. In Python, indentation changes can
+alter control flow, so this can carry an approval across a semantically
+different, unreviewed head. A follow-up issue (#1187) has been filed to fix
+`_check_carry_forward` so a tier-1 match alone is never sufficient.
 
 Three LOW-severity observations (none requiring action):
 1. #578: `assert` in production code (unreachable in practice)
@@ -250,11 +286,17 @@ Three LOW-severity observations (none requiring action):
 3. #387: PR title says "definitive" but code routes all check failures
    (documentation imprecision)
 
-Two critical findings from the initial parallel review were independently
-verified as false positives:
-1. #386: `git patch-id --stable` does NOT ignore whitespace in `+`/`-` content
-   lines (empirically tested)
-2. #386: Empty patch-id collision is prevented by the `if live_patch_id` guard
+One critical finding from the initial parallel review was confirmed open:
+1. #386: `git patch-id --stable` strips leading whitespace from `+`/`-`
+   content lines — two diffs differing only in indentation depth produce the
+   identical patch-id. The tier-1 fast path in `_check_carry_forward`
+   (workflow.py:17333-17334) matches on that hash and returns immediately,
+   never consulting the whitespace-preserving tier-2 signature. This is a
+   review-gate bypass for Python (and other indentation-sensitive languages).
+
+One high finding from the initial parallel review was verified as a false
+positive:
+1. #386: Empty patch-id collision is prevented by the `if live_patch_id` guard
 
 ## Buckets B, C, D — no action required
 
