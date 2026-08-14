@@ -21,6 +21,8 @@ from charlie_work import worktree as worktree_module
 from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    RESCUE_REF_PREFIX,
+    RescueCapture,
     WorktreeCleanResult,
     WorktreeCleanGH,
     WorktreeInfo,
@@ -60,6 +62,24 @@ from charlie_work.worktree import (
     _slugify,
     _unlink_reparse_point,
 )
+
+
+def _force_capture_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch rescue capture to always fail so the refusal path is exercised.
+
+    Issue #849 added rescue capture before ``WorktreeUnsafeError`` — when
+    capture succeeds, the reset proceeds and no error is raised. The existing
+    refusal tests below test the safety property that a correct refusal
+    prevents data loss; they must run with capture disabled to exercise the
+    refusal path. The rescue capture path itself is tested by the
+    ``test_rescue_capture_*`` tests at the end of this file.
+    """
+    monkeypatch.setattr(
+        "charlie_work.worktree._capture_worktree_work_to_rescue_ref",
+        lambda *args, **kwargs: RescueCapture(
+            ref_name=None, commit_sha=None, error="forced capture failure for refusal test"
+        ),
+    )
 
 
 def _init_repo(repo_root: Path, bare: bool = False) -> None:
@@ -1505,7 +1525,9 @@ def test_rework_reuse_resets_on_non_ff_different_patch_id(tmp_path: Path) -> Non
     remove_worktree(repo_root, info1.path)
 
 
-def test_rework_reuse_refuses_non_ff_with_dirty_worktree(tmp_path: Path) -> None:
+def test_rework_reuse_refuses_non_ff_with_dirty_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Rework reuse path must refuse to reset an existing worktree that has
     uncommitted modifications and is non-FF diverged from origin."""
     remote_repo = tmp_path / "remote"
@@ -1530,6 +1552,7 @@ def test_rework_reuse_refuses_non_ff_with_dirty_worktree(tmp_path: Path) -> None
     _git(remote_repo, "commit", "--amend", "-m", "add feature (remote)")
     _git(remote_repo, "checkout", "main")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(
             repo_root,
@@ -1665,7 +1688,9 @@ def test_rework_reclaims_detached_worktree_at_target_path(tmp_path: Path) -> Non
     remove_worktree(repo_root, info2.path)
 
 
-def test_rework_reclaim_refuses_dirty_detached_worktree(tmp_path: Path) -> None:
+def test_rework_reclaim_refuses_dirty_detached_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A detached leftover worktree with uncommitted work must not be silently
     clobbered by the by-path reclaim — WorktreeUnsafeError, work survives."""
     repo_root = tmp_path / "repo"
@@ -1676,6 +1701,7 @@ def test_rework_reclaim_refuses_dirty_detached_worktree(tmp_path: Path) -> None:
     _git(info1.path, "checkout", "--detach")
     (info1.path / "dirty.txt").write_text("uncommitted worker edit\n", encoding="utf-8")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, rework=True)
 
@@ -2154,7 +2180,9 @@ def test_recovery_fetch_fallback_on_missing_remote_branch(tmp_path: Path) -> Non
     remove_worktree(repo_root, info2.path)
 
 
-def test_redispatch_refuses_to_reset_with_unpushed_commits(tmp_path: Path) -> None:
+def test_redispatch_refuses_to_reset_with_unpushed_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #257: a redispatch with local commits not on the remote branch
     must hard-refuse to reset the worktree rather than discarding work.
     """
@@ -2175,6 +2203,7 @@ def test_redispatch_refuses_to_reset_with_unpushed_commits(tmp_path: Path) -> No
     _git(info1.path, "commit", "-m", "worker commit before death")
 
     # Redispatch must refuse to reset the worktree because it has local commits.
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has 1 local commit"):
         create_worktree(
             repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=261
@@ -2189,7 +2218,9 @@ def test_redispatch_refuses_to_reset_with_unpushed_commits(tmp_path: Path) -> No
     remove_worktree(repo_root, info1.path)
 
 
-def test_second_redispatch_refuses_with_unpushed_commits(tmp_path: Path) -> None:
+def test_second_redispatch_refuses_with_unpushed_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #257: each redispatch with local commits not on the remote branch
     must hard-refuse to reset; the worktree is left intact.
     """
@@ -2207,6 +2238,7 @@ def test_second_redispatch_refuses_with_unpushed_commits(tmp_path: Path) -> None
     _git(info1.path, "add", "attempt1.txt")
     _git(info1.path, "commit", "-m", "attempt 1 work")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has 1 local commit"):
         create_worktree(
             repo_root, branch_name, base_ref="HEAD", recovery=recovery_record, issue_number=262
@@ -2303,7 +2335,9 @@ def test_recovery_dirty_worktree_salvaged(tmp_path: Path) -> None:
     remove_worktree(repo_root, info2.path)
 
 
-def test_fresh_dispatch_dirty_worktree_refuses_to_reset(tmp_path: Path) -> None:
+def test_fresh_dispatch_dirty_worktree_refuses_to_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #257: Fresh dispatch with a dirty stale worktree must hard-refuse
     to reset rather than discarding uncommitted modifications.
     """
@@ -2330,6 +2364,7 @@ def test_fresh_dispatch_dirty_worktree_refuses_to_reset(tmp_path: Path) -> None:
     assert status_result.stdout.strip()
 
     # Fresh dispatch must refuse to reset the dirty worktree.
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
@@ -2368,7 +2403,9 @@ def test_fresh_dispatch_ignores_injected_only_dirtiness(tmp_path: Path) -> None:
     remove_worktree(repo_root, info2.path)
 
 
-def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(tmp_path: Path) -> None:
+def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #381: worker-authored uncommitted changes still hard-refuse fresh dispatch."""
     remote_repo = tmp_path / "remote"
     _init_repo(remote_repo, bare=True)
@@ -2386,6 +2423,7 @@ def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(tmp_path: Path) 
 
     (info1.path / "worker-change.txt").write_text("worker work\n", encoding="utf-8")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
 
@@ -2562,7 +2600,7 @@ def test_recovery_transient_fetch_failure_via_probe_aborts(tmp_path: Path) -> No
 
 
 def test_fresh_dispatch_dirty_worktree_with_broken_remote_refuses_to_reset(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Issue #257: A dirty worktree must be refused even if the remote is broken.
 
@@ -2595,6 +2633,7 @@ def test_fresh_dispatch_dirty_worktree_with_broken_remote_refuses_to_reset(
     _git(repo_root, "remote", "set-url", "origin", "file:///nonexistent/path")
 
     # Fresh dispatch should refuse to reset the dirty worktree without trying to push.
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
@@ -7222,7 +7261,9 @@ def test_rework_refuses_foreign_worktree_at_unexpected_path(tmp_path: Path) -> N
     _git(repo_root, "worktree", "remove", str(foreign_wt), "--force")
 
 
-def test_rework_refuses_dirty_worktree_at_adoption(tmp_path: Path) -> None:
+def test_rework_refuses_dirty_worktree_at_adoption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #1118: a rework dispatch (non-recovery) must refuse to adopt a
     worktree that is dirty at adoption time — never commit tracked
     modifications the shim did not itself produce.
@@ -7243,6 +7284,7 @@ def test_rework_refuses_dirty_worktree_at_adoption(tmp_path: Path) -> None:
     # worktree directory).
     (info.path / "file.txt").write_text("uncommitted foreign edit\n", encoding="utf-8")
 
+    _force_capture_failure(monkeypatch)
     with pytest.raises(WorktreeUnsafeError):
         create_worktree(repo_root, branch_name, rework=True, worktrees_dir=worktrees_dir)
 
@@ -7418,6 +7460,7 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
         "charlie_work.worktree.is_pid_alive",
         lambda pid, start: False,
     )
+    _force_capture_failure(monkeypatch)
 
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
         create_worktree(
@@ -7437,3 +7480,258 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
 
     # Clean up.
     remove_worktree(repo, info.path, branch=branch_name)
+
+
+# --- Issue #849: rescue capture makes worktree_unsafe refusal recoverable ---
+
+
+def test_rescue_capture_preserves_dirty_worktree_and_permits_reset(
+    tmp_path: Path,
+) -> None:
+    """AC1: a dirty worktree is captured to a rescue ref and create_worktree
+    then succeeds. The captured ref's content matches the pre-reset working
+    tree byte-for-byte, including untracked files."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-849-rescue-ac1"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Worker-authored dirty content: a tracked modification + an untracked file.
+    (info1.path / "README.md").write_text("modified by worker\n", encoding="utf-8")
+    (info1.path / "worker_new_file.txt").write_text(
+        "new untracked worker content\n", encoding="utf-8"
+    )
+
+    pre_reset_readme = (info1.path / "README.md").read_text(encoding="utf-8")
+    pre_reset_new_file = (info1.path / "worker_new_file.txt").read_text(encoding="utf-8")
+
+    # Re-dispatch: the stale dirty worktree triggers _raise_if_unsafe_to_reset,
+    # which captures the work to a rescue ref and then permits the reset.
+    info2 = create_worktree(repo, branch_name, base_ref="origin/main", issue_number=849)
+
+    # create_worktree succeeded (no exception) and rescue_capture is populated.
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    assert info2.rescue_capture.error is None
+    assert info2.rescue_capture.ref_name.startswith(RESCUE_REF_PREFIX)
+
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # The captured ref's tree matches the pre-reset working tree byte-for-byte.
+    rescued_readme = _git(repo, "show", f"{rescue_ref}:README.md").stdout
+    assert rescued_readme == pre_reset_readme
+
+    rescued_new_file = _git(repo, "show", f"{rescue_ref}:worker_new_file.txt").stdout
+    assert rescued_new_file == pre_reset_new_file
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_rescue_capture_failure_still_raises_worktree_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC2: when capture fails, WorktreeUnsafeError is still raised and no
+    reset occurs. Capture failure must never downgrade the safety property."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    branch_name = "agent/issue-849-rescue-ac2"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Worker-authored dirty content.
+    (info1.path / "worker_wip.txt").write_text("work in progress\n", encoding="utf-8")
+
+    # Force capture to fail.
+    monkeypatch.setattr(
+        "charlie_work.worktree._capture_worktree_work_to_rescue_ref",
+        lambda *args, **kwargs: RescueCapture(
+            ref_name=None, commit_sha=None, error="forced capture failure"
+        ),
+    )
+
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+        create_worktree(repo, branch_name, base_ref="origin/main", issue_number=849)
+
+    # No reset occurred — the dirty content survives untouched.
+    assert info1.path.exists()
+    assert (info1.path / "worker_wip.txt").read_text(encoding="utf-8") == "work in progress\n"
+
+    # Clean up.
+    remove_worktree(repo, info1.path, branch=branch_name)
+
+
+def test_rescue_capture_excludes_scaffolding(
+    tmp_path: Path,
+) -> None:
+    """AC3: injected_paths / materialize_dirs scaffolding is excluded from the
+    captured content, consistent with _worker_authored_dirty."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    # Config with an injected path (e.g. a prompt file the orchestrator writes).
+    from charlie_work.config import DispatchConfig, OrchestratorConfig
+
+    config = OrchestratorConfig(dispatch=DispatchConfig(injected_paths=(".charlie-writer.json",)))
+
+    branch_name = "agent/issue-849-rescue-ac3"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main", config=config)
+
+    # Worker-authored file (should be captured).
+    (info1.path / "worker_authored.txt").write_text("worker content\n", encoding="utf-8")
+    # Scaffolding file (should be excluded — HEAD version in the rescue tree).
+    (info1.path / ".charlie-writer.json").write_text('{"injected": true}\n', encoding="utf-8")
+
+    info2 = create_worktree(
+        repo, branch_name, base_ref="origin/main", issue_number=849, config=config
+    )
+
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # Worker-authored file IS in the rescue ref's tree.
+    rescued_worker = _git(repo, "show", f"{rescue_ref}:worker_authored.txt").stdout
+    assert rescued_worker == "worker content\n"
+
+    # Scaffolding file is NOT in the rescue ref's tree with the injected
+    # content — it has HEAD's version (which is absent, since the file was
+    # untracked). The rescue tree should not contain .charlie-writer.json at all.
+    show_result = subprocess.run(
+        ["git", "show", f"{rescue_ref}:.charlie-writer.json"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert show_result.returncode != 0  # file does not exist in the rescue tree
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_rescue_capture_emits_event_retrievable_via_query_events(
+    tmp_path: Path,
+) -> None:
+    """AC4: the emitted event records the rescue ref and is retrievable via
+    query_events."""
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.instrumentation import query_events
+    from charlie_work.paths import runtime_paths
+
+    remote, repo = _init_repo_with_remote(tmp_path)
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(repo, config.runtime.state_dir)
+    state_file = paths.state_file
+
+    branch_name = "agent/issue-849-rescue-ac4"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+
+    # Worker-authored dirty content.
+    (info1.path / "worker_wip.txt").write_text("rescue me\n", encoding="utf-8")
+
+    info2 = create_worktree(
+        repo, branch_name, base_ref="origin/main", issue_number=849, config=config
+    )
+
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # The event is retrievable via query_events.
+    events = query_events(state_file, kind="worktree_rescue_captured")
+    assert len(events) >= 1
+    rescue_events = [e for e in events if e.get("payload", {}).get("rescue_ref") == rescue_ref]
+    assert len(rescue_events) == 1
+    payload = rescue_events[0]["payload"]
+    assert payload["rescue_ref"] == rescue_ref
+    assert payload["issue_number"] == 849
+    assert payload["commit_sha"] is not None
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_rework_reuse_capture_cleans_worktree_before_ff(
+    tmp_path: Path,
+) -> None:
+    """Rework finding: rework=True + dirty-worktree + capture-succeeds +
+    ff-only-succeeds-despite-dirt.
+
+    The reuse-in-place branch captures dirty content to a rescue ref, then
+    must clean the working tree before the ff-only merge. Without the clean,
+    a dirty file the ff doesn't touch silently survives into the new work
+    session and can be committed under the next worker's name — the exact
+    hazard the "never commit tracked modifications the shim did not itself
+    produce" invariant exists to prevent.
+
+    This test asserts on the resulting worktree's on-disk state, not just on
+    the rescue ref's content.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo(remote_repo)
+    repo = tmp_path / "repo"
+    _clone_repo(remote_repo, repo)
+
+    branch_name = "agent/issue-849-rework-reuse-clean"
+    info1 = create_worktree(repo, branch_name, base_ref="origin/main")
+    # Push the branch so origin knows about it (required for rework reuse).
+    _git(repo, "push", "origin", branch_name)
+
+    # Worker-authored dirty content:
+    # - A tracked modification to README.md (exists in initial commit; the
+    #   ff-only below adds file2.txt and does NOT touch README.md, so without
+    #   the clean the modification would survive the ff).
+    # - An untracked file (also not touched by the ff).
+    dirty_readme = "modified by worker\n"
+    (info1.path / "README.md").write_text(dirty_readme, encoding="utf-8")
+    (info1.path / "worker_untracked.txt").write_text(
+        "untracked worker content\n", encoding="utf-8"
+    )
+
+    # Advance the branch on origin so the local worktree is behind and can
+    # fast-forward. The new commit adds file2.txt — it does NOT touch
+    # README.md, so the ff-only would succeed even with a dirty README.md.
+    _git(remote_repo, "checkout", branch_name)
+    (remote_repo / "file2.txt").write_text("remote change\n", encoding="utf-8")
+    _git(remote_repo, "add", "file2.txt")
+    _git(remote_repo, "commit", "-m", "add file2 on remote")
+    remote_tip = _git(remote_repo, "rev-parse", "HEAD").stdout.strip()
+    _git(remote_repo, "checkout", "main")
+
+    # Re-dispatch with rework=True: the existing worktree is dirty, so
+    # _capture_or_raise fires. Capture succeeds → the working tree is
+    # cleaned → the ff-only merge proceeds on a clean tree.
+    info2 = create_worktree(repo, branch_name, rework=True, issue_number=849)
+
+    # Rescue capture is populated.
+    assert info2.rescue_capture is not None
+    assert info2.rescue_capture.ref_name is not None
+    assert info2.rescue_capture.error is None
+    rescue_ref = info2.rescue_capture.ref_name
+
+    # The worktree was reused in-place and fast-forwarded to the origin tip.
+    assert info2.path == info1.path
+    assert _git(info2.path, "rev-parse", "HEAD").stdout.strip() == remote_tip
+
+    # ON-DISK STATE: the dirty content is GONE from the working tree.
+    # README.md is back to HEAD's version ("hello\n"), not the worker's
+    # modification. Without the fix, this would still be "modified by worker\n".
+    assert (info2.path / "README.md").read_text(encoding="utf-8") == "hello\n"
+
+    # The untracked worker file is gone. Without the fix, it would survive.
+    assert not (info2.path / "worker_untracked.txt").exists()
+
+    # The ff-only brought in file2.txt from the remote.
+    assert (info2.path / "file2.txt").read_text(encoding="utf-8") == "remote change\n"
+
+    # The working tree is clean (no worker-authored dirt survives).
+    status = _git(info2.path, "status", "--porcelain")
+    assert status.stdout.strip() == ""
+
+    # The rescue ref preserved the dirty content byte-for-byte.
+    rescued_readme = _git(repo, "show", f"{rescue_ref}:README.md").stdout
+    assert rescued_readme == dirty_readme
+    rescued_untracked = _git(repo, "show", f"{rescue_ref}:worker_untracked.txt").stdout
+    assert rescued_untracked == "untracked worker content\n"
+
+    # Clean up.
+    remove_worktree(repo, info2.path, branch=branch_name)

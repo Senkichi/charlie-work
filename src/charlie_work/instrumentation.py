@@ -246,6 +246,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervise_relaunch_cap_reached": "warning",
         "unauthorized_merge_check_skipped": "warning",
         "worktree_foreign_writer": "warning",
+        # Issue #849: rescue capture preserves work before a reset. Warning
+        # level because it means a worktree had uncommitted work that was
+        # about to be lost — the capture succeeded, but the condition that
+        # triggered it is worth attention.
+        "worktree_rescue_captured": "warning",
         # -----------------------------------------------------------------
         # info-level kinds: routine bookkeeping, success, recovery, and
         # other ordinary lifecycle events

@@ -123,6 +123,8 @@ from .safe_ref import require_valid_sha
 from .worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    WorktreeProbeFailedError,
+    _worktree_refuse_to_reset_reason,
     clean_worktrees,
     inspect_worktree_state,
     push_branch,
@@ -13490,6 +13492,47 @@ class OrchestratorApp:
         "dispatched_at",
     )
 
+    def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> str | None:
+        """Re-run the worktree safety check for an issue (issue #849).
+
+        Returns a reason string if the issue's worktree is still unsafe to
+        reset, or ``None`` if the worktree is safe (or does not exist). Used
+        by both de-escalation paths (``unescalate`` and
+        ``_deescalate_mechanical_issue``) to refuse clearing a
+        ``worktree_unsafe`` escalation while the underlying cause — a set of
+        bytes on disk — still persists. Without this check, clearing the
+        label reports success for an operation that changed nothing causal,
+        and the next rework dispatch reproduces the escalation deterministically.
+
+        Fails closed: a probe failure (``WorktreeProbeFailedError``) is
+        treated as "still unsafe" so a transient index lock cannot clear a
+        real blocker.
+        """
+        issue_entry = state.get("issues", {}).get(str(issue_number), {})
+        if not isinstance(issue_entry, dict):
+            return None
+        branch = issue_entry.get("branch_name")
+        if not branch or not isinstance(branch, str):
+            return None
+        wt_path = worktree_path_for_branch(self.repo_root, branch, self._layout.worktrees)
+        if not wt_path.is_dir():
+            # No worktree on disk — the blocker is gone (or was never this
+            # issue's worktree). Clearing is safe.
+            return None
+        try:
+            return _worktree_refuse_to_reset_reason(
+                self.repo_root,
+                branch,
+                self.config.dispatch.base_ref,
+                wt_path,
+                self.config.dispatch.injected_paths,
+                self.config.dispatch.materialize_dirs,
+            )
+        except (WorktreeProbeFailedError, RuntimeError):
+            # Fail closed: a probe failure means we cannot confirm safety,
+            # so treat the worktree as still unsafe.
+            return "worktree safety probe failed; cannot confirm clean"
+
     def unescalate(
         self,
         pr_number: int | None = None,
@@ -13606,6 +13649,34 @@ class OrchestratorApp:
                     "changed": False,
                 },
             )
+
+        # Issue #849: a ``worktree_unsafe`` escalation is caused by bytes on
+        # disk, not by a label or a PR state. Clearing the label without
+        # inspecting the worktree reports success for an operation that
+        # changed nothing causal — the next rework dispatch reproduces the
+        # escalation deterministically. Re-run the safety check and refuse to
+        # clear while the worktree still fails it.
+        if (
+            issue_number is not None
+            and issue_stuck
+            and issue_state.get("escalation_reason") == "worktree_unsafe"
+        ):
+            unsafe_reason = self._worktree_still_unsafe(issue_number, state)
+            if unsafe_reason:
+                return CommandResult(
+                    True,
+                    f"issue #{issue_number} escalated as worktree_unsafe; "
+                    f"worktree is still unsafe ({unsafe_reason}) — clearing "
+                    f"the label would change nothing causal. Remove or "
+                    f"commit the worktree work before re-arming.",
+                    {
+                        "pr": pr_number,
+                        "issue": issue_number,
+                        "worktree_still_unsafe": True,
+                        "worktree_unsafe_reason": unsafe_reason,
+                        "changed": False,
+                    },
+                )
 
         # Compute the TRANSFORMATION from the pre-fetch snapshot (for dry_run
         # reporting), then re-apply it to freshly-loaded entries inside the
@@ -18495,6 +18566,17 @@ class OrchestratorApp:
         if liveness.live:
             # a live worker is using this issue; not stuck
             return _deescalation_skip("worker_live", issue_number)
+
+        # Issue #849: a ``worktree_unsafe`` escalation is caused by bytes on
+        # disk. Clearing it based on PR-level health (OPEN, not CONFLICTING,
+        # janitor_ok) without inspecting the worktree reports success for an
+        # operation that changed nothing causal — the next rework dispatch
+        # reproduces the escalation deterministically. Re-run the safety
+        # check and skip clearing while the worktree still fails it.
+        if issue_entry.get("escalation_reason") == "worktree_unsafe":
+            unsafe_reason = self._worktree_still_unsafe(issue_number, state)
+            if unsafe_reason:
+                return _deescalation_skip("worktree_still_unsafe", issue_number)
 
         pr = self.gh.pr_view(pr_number)
         pr_state_str = str(pr.get("state") or "").upper()
