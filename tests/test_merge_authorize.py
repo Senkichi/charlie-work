@@ -33,6 +33,7 @@ from pathlib import Path
 
 from charlie_work import cli
 from charlie_work.config import OrchestratorConfig
+from charlie_work.instrumentation import _LEVEL_BY_KIND, close_db, query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
@@ -207,6 +208,48 @@ def test_merge_authorize_reachable_through_cli(tmp_path: Path) -> None:
     result = cli.run_command(app, args)
     assert result.ok is True
     assert result.data["authorized"] is True
+
+
+def test_merge_authorize_records_info_level_event(tmp_path: Path) -> None:
+    """Issue #934 rework finding: ``merge_authorize`` emits a ``merge_authorized``
+    event via ``self._record_event`` (dual-written to ``events.db``). That kind
+    must be registered in ``_LEVEL_BY_KIND`` -- ``test_event_kind_registry_exhaustive``
+    fails the build for any unregistered emit-site kind. An operator
+    authorization is an audit fact, not a fault, so it must classify as
+    ``info`` (sibling to ``unauthorized_merge_acknowledged``), never ``error``
+    or ``warning``.
+
+    The explicit ``_LEVEL_BY_KIND`` membership assertion is load-bearing:
+    ``_classify_level`` defaults unknown kinds to ``"info"``, so the
+    recorded-event level alone would pass even with the registry entry
+    missing. Asserting the kind is a registered key with an ``info`` value
+    makes this test fail against the unfixed (unregistered) code, not just
+    against a releveling.
+    """
+    # The kind must be explicitly registered, not just falling through the
+    # info default.
+    assert "merge_authorized" in _LEVEL_BY_KIND, (
+        "merge_authorized must be registered in _LEVEL_BY_KIND -- an "
+        "unregistered emit-site kind fails test_event_kind_registry_exhaustive"
+    )
+    assert _LEVEL_BY_KIND["merge_authorized"] == "info", (
+        "merge_authorized is an operator audit fact, not a fault -- it "
+        "must classify as info, sibling to unauthorized_merge_acknowledged"
+    )
+
+    app, paths, _ = _merge_check_app(tmp_path)
+    try:
+        result = app.merge_authorize(456, "CI green, stale decision overridden", by="senkichi")
+        assert result.ok is True
+
+        events = query_events(paths.state_file, kind="merge_authorized")
+        assert len(events) == 1
+        event = events[0]
+        assert event["kind"] == "merge_authorized"
+        assert event["level"] == "info"
+        assert event["pr_number"] == 456
+    finally:
+        close_db(paths.state_file)
 
 
 # ---------------------------------------------------------------------------
