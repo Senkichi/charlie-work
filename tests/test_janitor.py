@@ -151,6 +151,54 @@ def test_required_check_missing_blocks() -> None:
     assert any("missing" in f.lower() and "Tests passed" in f for f in verdict.failures)
 
 
+def test_required_check_missing_only_is_missing_checks_only_block() -> None:
+    """Issue #1133: when "Required check(s) missing" is the SOLE janitor
+    failure, the verdict exposes ``is_missing_checks_only_block`` so
+    ``_is_dead_blocker`` can carve out the transient (not-yet-reported-CI)
+    population from the durably-stuck one. Branch on the structured flag,
+    never on the failure-message text.
+    """
+    checks = [{"name": "Lint & Format", "bucket": "pass"}]
+
+    verdict = run_janitor(_green_pr(), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.missing_required_checks == ("Tests passed",)
+    assert verdict.is_missing_checks_only_block is True
+
+
+def test_required_check_missing_with_other_blocker_is_not_missing_checks_only_block() -> None:
+    """Issue #1133: a co-occurring durable failure (merge conflict) disqualifies
+    the transient carve-out -- the PR is durably stuck, not waiting on CI.
+    """
+    checks = [{"name": "Lint & Format", "bucket": "pass"}]
+
+    verdict = run_janitor(
+        _green_pr(mergeable="CONFLICTING"), checks, _config(), repo_root=Path.cwd()
+    )
+
+    assert verdict.ok is False
+    assert verdict.missing_required_checks == ("Tests passed",)
+    assert verdict.is_missing_checks_only_block is False
+
+
+def test_required_check_failed_is_not_missing_checks_only_block() -> None:
+    """Issue #1133: a failed required check (CI ran and failed) is durable,
+    not transient -- ``is_missing_checks_only_block`` must be False.
+    """
+    checks = [
+        {"name": "Tests passed", "state": "FAILURE"},
+        {"name": "Lint & Format", "bucket": "pass"},
+    ]
+
+    verdict = run_janitor(_green_pr(), checks, _config(), repo_root=Path.cwd())
+
+    assert verdict.ok is False
+    assert verdict.failed_required_checks == ("Tests passed",)
+    assert verdict.missing_required_checks == ()
+    assert verdict.is_missing_checks_only_block is False
+
+
 def test_required_checks_unavailable_blocks() -> None:
     verdict = run_janitor(_green_pr(), None, _config(), repo_root=Path.cwd())
 
