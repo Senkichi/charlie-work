@@ -33800,6 +33800,54 @@ def test_dispatch_config_max_open_agent_prs_validation_negative(tmp_path: Path) 
         load_config(config_file)
 
 
+def test_open_pr_backpressure_clamps_dispatch_end_to_end(tmp_path: Path) -> None:
+    """Issue #1129: app.dispatch() (not just _apply_concurrency_governor) clamps
+    fresh-issue dispatch to zero when open agent PRs meet the cap.
+
+    This exercises the _dispatch_impl wiring -- the ``apply_open_pr_backpressure=True``
+    argument on the governor call inside _dispatch_impl. Every other open-PR
+    backpressure test calls ``_apply_concurrency_governor`` directly, so a
+    regression that dropped or flipped that argument would pass all of them
+    undetected. This test mirrors test_fleet_concurrency_governor_clamps_when_fleet_live_at_cap
+    for the fleet governor: it goes through the public ``app.dispatch()`` entry
+    point and asserts on ``result.data`` fields.
+    """
+
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(max_open_agent_prs=1, default_limit=5),
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Default FakeGitHub has issue #123 (automated-ready, OPEN) and one open PR
+    # #456 (headRefName "agent/issue-123-fix-search") linked to #123. #123 is
+    # therefore excluded from candidates (it already has an open PR). Add a
+    # second dispatchable issue #124 with no open PR so there is a genuine
+    # candidate to clamp -- selected_count==0 proves the clamp engaged, not an
+    # empty backlog.
+    fake_gh = FakeGitHub()
+    fake_gh.issues.append(
+        {
+            "number": 124,
+            "title": "Fix telemetry",
+            "url": "https://example.test/issues/124",
+            "body": "Telemetry is broken",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        }
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch()
+
+    # The single open agent PR (#456) fills the max_open_agent_prs=1 cap, so
+    # fresh dispatch is clamped to 0 even though issue #124 is dispatchable.
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    assert result.data["open_pr_count"] == 1
+    assert result.data["open_pr_max"] == 1
+
+
 def test_dispatch_rework_state_driven_selection(tmp_path: Path) -> None:
     """Issue #85 acceptance criterion 1: state-driven selection works.
 
