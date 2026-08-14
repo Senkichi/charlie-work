@@ -1071,7 +1071,7 @@ def _collect_skip_reasons(data: Any) -> set[str]:
 def _add_skip_reasons(data: dict[str, Any], reasons: set[str]) -> None:
     """Add any skip reason present in a flat result dict to the set."""
     skip_reason = data.get("reason") or data.get("deferred_reason")
-    if data.get("skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
+    if data.get("pass_skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
         reasons.add(skip_reason or "state_lock_busy")
 
 
@@ -1784,7 +1784,7 @@ def fleet_loop(
                 per_repo_results[repo_key] = CommandResult(
                     True,
                     "supervisor lock held, skipped",
-                    {"skipped": True, "reason": "supervisor_lock_held"},
+                    {"pass_skipped": True, "reason": "supervisor_lock_held"},
                 )
                 attention_events.append(
                     {
@@ -1959,7 +1959,7 @@ def _is_fleet_pass_active(pass_result: CommandResult) -> bool:
     for repo_data in data.get("repos", {}).values():
         if not isinstance(repo_data, dict):
             continue
-        if repo_data.get("skipped") is True:
+        if repo_data.get("pass_skipped") is True:
             return True
         for section_key in ("dispatch", "dispatch_rework", "dispatch_reviews"):
             section = repo_data.get(section_key) or {}
