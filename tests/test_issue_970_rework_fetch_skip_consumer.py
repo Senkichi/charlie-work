@@ -242,6 +242,83 @@ def test_stall_escalation_window_excludes_skips_before_stall_since(
     assert result.data["last_rework_fetch_skip_reason"] == "in-window outage"
 
 
+def test_stall_escalation_ignores_unrelated_issue_fetch_skips(
+    tmp_path: Path,
+) -> None:
+    """A skip for a *different* issue must not surface in this PR's escalation.
+
+    ``rework_issue_fetch_skipped`` is one event per dispatch pass and bundles
+    every issue that failed to fetch in that pass into one payload's
+    ``issue_numbers`` list. The stall escalation for PR #456 / issue #123 must
+    only correlate with skips whose ``issue_numbers`` contains 123 -- a skip
+    for an unrelated issue (e.g. #789) says nothing about why *this* stall
+    never progressed, and surfacing its reason/issue_numbers would mislead an
+    operator into investigating the wrong failure.
+
+    This is the regression case the round-2 review identified: the original
+    unscoped ``kind``+``since`` query could attribute a different PR's fetch
+    failure to this PR's stall escalation.
+    """
+    app = _conflicting_app(
+        tmp_path,
+        review=ReviewConfig(max_conflict_rework_attempts=2, rework_stall_minutes=60),
+    )
+    _set_decision(app, 456, "request_changes")
+    app.review(456)
+
+    stall_since = (datetime.now(UTC) - timedelta(minutes=61)).isoformat()
+    state = load_state(app.paths.state_file)
+    state["prs"]["456"]["conflict_rework_attempts_stall_since"] = stall_since
+    state["prs"]["456"]["conflict_rework_attempts_stall_head"] = app.gh.prs[0].get("headRefOid")
+    save_state(app.paths.state_file, state)
+
+    since_dt = datetime.fromisoformat(stall_since)
+    # Two skip passes during the stall window, but neither involves the
+    # escalating issue (#123). Both are for an unrelated issue (#789) whose
+    # fetch failed -- issue #123's own fetch always succeeded.
+    _write_skip_event(
+        app.paths,
+        (since_dt + timedelta(minutes=10)).isoformat(),
+        issue_numbers=[789],
+        reason="gh: timeout for 789",
+        reasons=[{"reason": "gh: timeout for 789", "error_type": "GitHubError"}],
+    )
+    _write_skip_event(
+        app.paths,
+        (since_dt + timedelta(minutes=30)).isoformat(),
+        issue_numbers=[789, 999],
+        reason="gh: 404 for 999",
+        reasons=[{"reason": "gh: 404 for 999", "error_type": "GitHubError"}],
+    )
+
+    result = app.review(456)
+
+    assert result.data["escalated"] is True
+    # Zero skips attributable to this issue -- the unrelated issue's failures
+    # must not be counted.
+    assert result.data["rework_fetch_skips"] == 0, (
+        "unrelated issue's fetch skips must not be attributed to this PR's stall escalation"
+    )
+    assert result.data["last_rework_fetch_skip_at"] is None
+    assert result.data["last_rework_fetch_skip_reason"] is None
+    assert result.data["last_rework_fetch_skip_issue_numbers"] is None
+    assert result.data["last_rework_fetch_skip_reasons"] is None
+    # The warning clause must not be appended -- there are no skips for this
+    # issue to describe.
+    assert "could not fetch" not in result.message
+    assert "rework stalled" in result.message
+
+    # The janitor_rework_stalled event payload must also report zero/None.
+    state = load_state(app.paths.state_file)
+    stalled = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
+    assert len(stalled) == 1
+    payload = stalled[0]["payload"]
+    assert payload["rework_fetch_skips"] == 0
+    assert payload["last_rework_fetch_skip_reason"] is None
+    assert payload["last_rework_fetch_skip_issue_numbers"] is None
+    assert payload["last_rework_fetch_skip_reasons"] is None
+
+
 def test_stall_escalation_no_skips_reports_zero_and_omits_warning_clause(
     tmp_path: Path,
 ) -> None:

@@ -17087,11 +17087,30 @@ class OrchestratorApp:
         # stall never progressed. Reading events.db here does not compromise
         # the state-lock section below -- it is local SQLite, independent of
         # state.json, and ``query_events`` takes no state lock.
-        stall_skips = query_events(
+        #
+        # Scope to the escalating ``issue_number``. ``rework_issue_fetch_skipped``
+        # is one event per dispatch pass and bundles every issue that failed to
+        # fetch in that pass into one payload's ``issue_numbers`` list
+        # (``_build_rework_issue_fetch_skip_payload`` collects all
+        # ``failed_issue_fetches``). An unscoped ``kind``+``since`` query would
+        # attribute a *different* PR's/issue's fetch failure to this PR's stall
+        # escalation. The indexed ``issue_number`` column cannot be used for the
+        # filter either: ``_extract_payload_refs`` backfills it with only the
+        # *first* entry of ``issue_numbers``, so an event whose list contains
+        # this issue but not as the first element would be silently missed.
+        # Filter in Python on the full ``issue_numbers`` list instead.
+        raw_skips = query_events(
             self.paths.state_file,
             kind="rework_issue_fetch_skipped",
             since=stall_since,
         )
+        stall_skips = [
+            e
+            for e in raw_skips
+            if isinstance(e, dict)
+            and isinstance(e.get("payload"), dict)
+            and issue_number in (e["payload"].get("issue_numbers") or [])
+        ]
         last_skip = stall_skips[-1] if stall_skips else None
         last_skip_payload = last_skip.get("payload") if isinstance(last_skip, dict) else None
         last_skip_payload_dict = last_skip_payload if isinstance(last_skip_payload, dict) else {}
