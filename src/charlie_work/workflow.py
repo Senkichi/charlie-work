@@ -2778,6 +2778,41 @@ def summarize_loop_errors(
     }
 
 
+# The two statuses that mark an issue as parked in the ``agent:human-needed``
+# sink. Every escalation transition (``_escalate_issue``) sets one of these;
+# the de-escalation sweep selects on the same pair (``_maybe_deescalate_mechanical``).
+# Centralized so the sink census and the sweep cannot drift apart on what
+# "in the sink" means. Issue #1083.
+_SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
+
+
+def sink_census(state: dict[str, Any]) -> set[int]:
+    """Return the set of issue numbers currently parked in the sink.
+
+    The sink is the set of issues whose state entry carries a terminal
+    ``status`` of ``"escalated"`` or ``"blocked"`` -- the in-state mirror of
+    the ``agent:human-needed`` GitHub label. This is a point-in-time census
+    read directly from ``state.json``'s ``issues`` map, deliberately not a
+    GitHub-label query: it is cheap, deterministic, and matches the same
+    source of truth the orchestrator's own de-escalation sweep selects
+    candidates from, so the metric and the sweep agree on the population.
+
+    Used by ``_loop_impl`` to compute the issue #1083 sink metric: a
+    before/after diff around ``_loop_body`` yields arrivals
+    (``after - before``), and the after-set size is the population.
+    """
+    issues = state.get("issues", {})
+    if not isinstance(issues, dict):
+        return set()
+    parked: set[int] = set()
+    for num, entry in issues.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") in _SINK_STATUSES and str(num).isdigit():
+            parked.add(int(num))
+    return parked
+
+
 @dataclass(frozen=True)
 class ReviewSessionOutcome:
     """A reviewer session that ended without producing a structured verdict.
@@ -18722,8 +18757,36 @@ class OrchestratorApp:
                 correlation_id=cid,
             )
             record_loop_pass(self.paths.state_file, cid, start_ts)
+            # Issue #1083: snapshot the ``agent:human-needed`` sink before the
+            # pass mutates anything, so arrivals (after - before) and the
+            # post-pass population are a census diff, not an event-kind
+            # allow-list that would have to be maintained in lockstep with
+            # every new escalation call site. Read-only; ``load_state_locked``
+            # (not raw ``load_state``) so the snapshot holds the advisory lock
+            # -- the lint guard in ``test_no_unlocked_load_state_in_production_code``
+            # flags any bare ``load_state`` outside a ``state_lock`` context.
+            sink_before = sink_census(load_state_locked(self.paths.state_file))
             result = self._loop_body(limit, merge=merge, now=now)
             elapsed = time.monotonic() - loop_start
+            sink_after = sink_census(load_state_locked(self.paths.state_file))
+            sink_arrivals = len(sink_after - sink_before)
+            sink_population = len(sink_after)
+            # Sweep clears are the one signal that cannot be derived from the
+            # census diff: a departure may be an operator ``unescalate``, a
+            # merge, or a close, none of which are sweep drainage.
+            # ``deescalation_cleared`` has a single emitter
+            # (``_deescalate_mechanical_issue``) and shares this pass's
+            # correlation ID, so a count by (kind, correlation_id) is the
+            # exact sweep-clear count with no allow-list to drift. Queried
+            # before ``loop_completed`` is emitted so this event is not
+            # self-counted.
+            sink_clears = len(
+                query_events(
+                    self.paths.state_file,
+                    kind="deescalation_cleared",
+                    correlation_id=cid,
+                )
+            )
             log_event(
                 self.paths.state_file,
                 "loop_completed",
@@ -18737,6 +18800,17 @@ class OrchestratorApp:
                     # 21-pass ok=False streak as healthy because no stored artifact
                     # named the PR. Bounded; see summarize_loop_errors.
                     **summarize_loop_errors(result.data.get("errors", [])),
+                    # Issue #1083: autonomy is never reported without its drop
+                    # rate. ``sink_arrivals`` is the first-class failure metric
+                    # (issues dropped to a human this pass); ``sink_clears`` is
+                    # the automated drainage; ``sink_population`` is the
+                    # point-in-time census of parked work. A rise in arrivals
+                    # without a matching rise in clears is the signature of a
+                    # growing sink, and the ratio of clears to population is
+                    # the drainage rate #1093's mirror-clear should move.
+                    "sink_population": sink_population,
+                    "sink_arrivals": sink_arrivals,
+                    "sink_clears": sink_clears,
                 },
                 repo=self.repo_root.name,
                 correlation_id=cid,
@@ -18751,6 +18825,9 @@ class OrchestratorApp:
                 error_count=len(result.data.get("errors", [])),
                 merge_count=len(result.data.get("merges", [])),
                 review_count=len(result.data.get("reviews", [])),
+                sink_population=sink_population,
+                sink_arrivals=sink_arrivals,
+                sink_clears=sink_clears,
             )
             return result
 

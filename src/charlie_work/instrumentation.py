@@ -56,7 +56,17 @@ Schema::
         elapsed_seconds REAL,
         error_count     INTEGER DEFAULT 0,
         merge_count     INTEGER DEFAULT 0,
-        review_count    INTEGER DEFAULT 0
+        review_count    INTEGER DEFAULT 0,
+        -- Issue #1083: the ``agent:human-needed`` sink metric. Autonomy
+        -- (merge_count/review_count) is never reported without its drop rate:
+        -- ``sink_arrivals`` counts issues that entered the sink this pass,
+        -- ``sink_clears`` counts issues the de-escalation sweep drained, and
+        -- ``sink_population`` is the point-in-time census of parked issues.
+        -- Appended at the end so existing index-based readers (verify_events)
+        -- keep working without re-deriving column positions.
+        sink_population INTEGER DEFAULT 0,
+        sink_arrivals   INTEGER DEFAULT 0,
+        sink_clears     INTEGER DEFAULT 0
     );
 """
 
@@ -118,7 +128,10 @@ CREATE TABLE IF NOT EXISTS loop_passes (
     elapsed_seconds REAL,
     error_count     INTEGER DEFAULT 0,
     merge_count     INTEGER DEFAULT 0,
-    review_count    INTEGER DEFAULT 0
+    review_count    INTEGER DEFAULT 0,
+    sink_population INTEGER DEFAULT 0,
+    sink_arrivals   INTEGER DEFAULT 0,
+    sink_clears     INTEGER DEFAULT 0
 );
 """
 
@@ -626,6 +639,27 @@ def _dedupe_events(db_conn: sqlite3.Connection) -> int:
     return deleted
 
 
+def _add_sink_metric_columns(db_conn: sqlite3.Connection) -> None:
+    """Add the issue #1083 sink-metric columns to ``loop_passes``.
+
+    ``ALTER TABLE … ADD COLUMN`` cannot name a column that already exists, so
+    each addition is guarded by a ``PRAGMA table_info`` check. That makes this
+    idempotent: a database file opened by a newer build (which created the
+    columns via ``CREATE TABLE``) and then handed back to an older build that
+    re-runs this migration is a no-op rather than a crash. The columns are
+    appended at the end of the table so existing index-based readers
+    (``scripts/verify_events.py``) keep working without re-deriving positions.
+    """
+    existing = {row[1] for row in db_conn.execute("PRAGMA table_info(loop_passes)")}
+    if "sink_population" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_population INTEGER DEFAULT 0")
+    if "sink_arrivals" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_arrivals INTEGER DEFAULT 0")
+    if "sink_clears" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_clears INTEGER DEFAULT 0")
+    db_conn.commit()
+
+
 def _run_db_migrations(db_conn: sqlite3.Connection) -> None:
     """Run one-time database migrations guarded by ``PRAGMA user_version``.
 
@@ -640,6 +674,12 @@ def _run_db_migrations(db_conn: sqlite3.Connection) -> None:
         # importer (issue #557). Runs once per database file.
         _dedupe_events(db_conn)
         db_conn.execute("PRAGMA user_version = 1")
+    if version < 2:
+        # Migration v2 (issue #1083): add the sink-metric columns to
+        # ``loop_passes`` for pre-existing databases. New databases get them
+        # from ``CREATE TABLE``; this step brings old files forward.
+        _add_sink_metric_columns(db_conn)
+        db_conn.execute("PRAGMA user_version = 2")
 
 
 def _get_db(state_path: Path) -> sqlite3.Connection | None:
@@ -773,11 +813,22 @@ def record_loop_pass(
     error_count: int = 0,
     merge_count: int = 0,
     review_count: int = 0,
+    sink_population: int = 0,
+    sink_arrivals: int = 0,
+    sink_clears: int = 0,
 ) -> None:
     """Record or update a loop pass summary in the ``loop_passes`` table.
 
     On first call (with ``completed_at=None``) an INSERT is issued.
     On second call (with ``completed_at`` set) an UPDATE is issued.
+
+    The ``sink_*`` keyword arguments (issue #1083) record the
+    ``agent:human-needed`` sink metric alongside autonomy throughput so one
+    is never reported without the other: ``sink_population`` is the
+    point-in-time census of parked issues, ``sink_arrivals`` the count that
+    entered the sink this pass, and ``sink_clears`` the count the
+    de-escalation sweep drained this pass. They default to 0 and are
+    ignored on the INSERT (start-of-pass) call, which only reserves the row.
     """
     conn = _get_db(state_path)
     if conn is None:
@@ -792,15 +843,17 @@ def record_loop_pass(
                 conn.execute(
                     """INSERT OR IGNORE INTO loop_passes
                        (correlation_id, started_at, completed_at, ok,
-                        elapsed_seconds, error_count, merge_count, review_count)
-                       VALUES (?, ?, NULL, NULL, NULL, 0, 0, 0)""",
+                        elapsed_seconds, error_count, merge_count, review_count,
+                        sink_population, sink_arrivals, sink_clears)
+                       VALUES (?, ?, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0)""",
                     (correlation_id, started_at),
                 )
             else:
                 conn.execute(
                     """UPDATE loop_passes
                        SET completed_at = ?, ok = ?, elapsed_seconds = ?,
-                           error_count = ?, merge_count = ?, review_count = ?
+                           error_count = ?, merge_count = ?, review_count = ?,
+                           sink_population = ?, sink_arrivals = ?, sink_clears = ?
                        WHERE correlation_id = ?""",
                     (
                         completed_at,
@@ -809,6 +862,9 @@ def record_loop_pass(
                         error_count,
                         merge_count,
                         review_count,
+                        sink_population,
+                        sink_arrivals,
+                        sink_clears,
                         correlation_id,
                     ),
                 )
