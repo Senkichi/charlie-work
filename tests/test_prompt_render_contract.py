@@ -93,6 +93,33 @@ def _unresolved_placeholders_in_output(rendered: str) -> set[str]:
     return set(string.Template(rendered).get_identifiers())
 
 
+def _assert_no_default_state_dir_literal(rendered: str, *, template_name: str) -> None:
+    """Assert *rendered* output contains no ``layout.DEFAULT_STATE_DIR`` literal.
+
+    Companion to the unresolved-placeholder check: a template that hardcodes
+    the default state-dir path (``.var/charlie-work``) instead of deriving
+    every path from supplied values would silently embed it in worker/rework
+    briefs. Every caller of this helper renders under a non-default
+    ``runtime.state_dir`` override, so any such literal can only come from the
+    template's own prose -- a correctly resolved path would point elsewhere --
+    which is what keeps the assertion non-vacuous (issue #737: rendering under
+    the DEFAULT state_dir would legitimately embed the literal as a correctly
+    resolved path, making a naive check pass regardless of what the template
+    hardcodes).
+
+    Separator-normalized for Windows: ``str(Path)`` yields backslashes, so a
+    rendered path reads ``.var\\charlie-work`` and a forward-slash-only check
+    would pass vacuously on this host.
+    """
+    normalized = rendered.replace("\\", "/")
+    assert layout.DEFAULT_STATE_DIR not in normalized, (
+        f"{template_name} rendered output contains the default state-dir "
+        f"literal {layout.DEFAULT_STATE_DIR!r} despite runtime.state_dir "
+        f"being overridden -- the template must derive every path from "
+        f"supplied values, never hardcode the default"
+    )
+
+
 def _fake_issue(number: int = 1) -> dict[str, object]:
     return {
         "number": number,
@@ -106,8 +133,14 @@ def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
     """worker.md's real caller is ``OrchestratorApp._write_worker_prompt``
     (workflow.py:18563-18589), used unmodified whenever
     ``config.dispatch.worker_template`` (default ``"worker.md"``) is
-    selected -- see the `intake()` call site at workflow.py:7084."""
-    config = OrchestratorConfig()
+    selected -- see the `intake()` call site at workflow.py:7084.
+
+    Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
+    companion literal-absence assertion is non-vacuous: under the default
+    state_dir a correctly resolved path would legitimately embed
+    ``.var/charlie-work``, making a literal check pass regardless of what
+    the template hardcodes."""
+    config = OrchestratorConfig(runtime=RuntimeConfig(state_dir="custom-state"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, gh=None)
 
@@ -117,6 +150,7 @@ def test_worker_md_renders_via_real_writer(tmp_path: Path) -> None:
     assert not _unresolved_placeholders_in_output(rendered), (
         "rendered prompt still contains an unresolved $placeholder"
     )
+    _assert_no_default_state_dir_literal(rendered, template_name="worker.md")
 
 
 def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
@@ -125,8 +159,12 @@ def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
     exactly what the api-worker dispatch path at workflow.py:7727-7729
     (and the matching path in the dispatch loop at workflow.py:8227-8229)
     does: ``template = self.config.api_worker.worker_template``, then
-    ``self._write_worker_prompt(full_issue, template=template)``."""
-    config = OrchestratorConfig()
+    ``self._write_worker_prompt(full_issue, template=template)``.
+
+    Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
+    companion literal-absence assertion is non-vacuous -- see
+    ``test_worker_md_renders_via_real_writer`` for the rationale."""
+    config = OrchestratorConfig(runtime=RuntimeConfig(state_dir="custom-state"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     app = OrchestratorApp(tmp_path, paths, config, gh=None)
 
@@ -138,6 +176,7 @@ def test_worker_claude_code_md_renders_via_real_writer(tmp_path: Path) -> None:
     assert not _unresolved_placeholders_in_output(rendered), (
         "rendered prompt still contains an unresolved $placeholder"
     )
+    _assert_no_default_state_dir_literal(rendered, template_name="worker_claude_code.md")
 
 
 def test_rework_md_renders_via_real_writer_with_no_prior_decision(tmp_path: Path) -> None:
@@ -146,9 +185,16 @@ def test_rework_md_renders_via_real_writer_with_no_prior_decision(tmp_path: Path
     (workflow.py:5205-5248) for the literal ``values`` dict passed to
     ``render_prompt``. This exercises the no-verdict-on-disk shape
     (``required_changes_section`` resolves to ``""`` -- see
-    ``_render_required_changes_section``, workflow.py:4978)."""
-    config = OrchestratorConfig()
-    state_file = tmp_path / ".var" / "charlie-work" / "state.json"
+    ``_render_required_changes_section``, workflow.py:4978).
+
+    Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
+    companion literal-absence assertion is non-vacuous -- see
+    ``test_worker_md_renders_via_real_writer`` for the rationale. The
+    ``state_file`` is threaded through ``runtime_paths`` the way the
+    ``review.md`` test threads its paths, rather than hand-spelling the
+    default ``.var/charlie-work/state.json``."""
+    config = OrchestratorConfig(runtime=RuntimeConfig(state_dir="custom-state"))
+    state_file = runtime_paths(tmp_path, config.runtime.state_dir).state_file
     pr = {
         "number": 2,
         "title": "Fake PR title",
@@ -162,14 +208,19 @@ def test_rework_md_renders_via_real_writer_with_no_prior_decision(tmp_path: Path
     assert not _unresolved_placeholders_in_output(rendered), (
         "rendered prompt still contains an unresolved $placeholder"
     )
+    _assert_no_default_state_dir_literal(rendered, template_name="rework.md")
 
 
 def test_rework_md_renders_via_real_writer_with_required_changes(tmp_path: Path) -> None:
     """Same real writer, but with a ``request_changes`` verdict on disk so
     ``$required_changes_section`` resolves to non-empty content -- proves
-    that branch's rendered text carries no stray placeholder either."""
-    config = OrchestratorConfig()
-    state_file = tmp_path / ".var" / "charlie-work" / "state.json"
+    that branch's rendered text carries no stray placeholder either.
+
+    Rendered under a non-default ``runtime.state_dir`` (issue #737) so the
+    companion literal-absence assertion is non-vacuous -- see
+    ``test_worker_md_renders_via_real_writer`` for the rationale."""
+    config = OrchestratorConfig(runtime=RuntimeConfig(state_dir="custom-state"))
+    state_file = runtime_paths(tmp_path, config.runtime.state_dir).state_file
     pr_dir = state_file.parent / "prs" / "pr-3"
     pr_dir.mkdir(parents=True)
     (pr_dir / "review-decision.json").write_text(
@@ -195,6 +246,7 @@ def test_rework_md_renders_via_real_writer_with_required_changes(tmp_path: Path)
     assert not _unresolved_placeholders_in_output(rendered), (
         "rendered prompt still contains an unresolved $placeholder"
     )
+    _assert_no_default_state_dir_literal(rendered, template_name="rework.md")
 
 
 def test_worker_writer_rejects_flat_override_without_no_merge_contract(
