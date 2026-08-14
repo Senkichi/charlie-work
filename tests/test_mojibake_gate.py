@@ -296,7 +296,9 @@ def test_cli_mojibake_check_reports_git_failure(monkeypatch, tmp_path) -> None:
 
 
 def test_cli_mojibake_check_passes_base_to_git_diff(monkeypatch, tmp_path) -> None:
-    # Verify the --base argument is forwarded to `git diff base...HEAD`.
+    # Verify the --base argument is forwarded to `git diff base..HEAD`.
+    # Two-dot (not three-dot) is used because CI runs against a shallow
+    # clone (fetch-depth: 1) where three-dot cannot resolve the merge-base.
     captured_args: list[list[str]] = []
 
     def fake_run_captured(command, **kwargs):
@@ -310,4 +312,36 @@ def test_cli_mojibake_check_passes_base_to_git_diff(monkeypatch, tmp_path) -> No
     cli_module.run_mojibake_check_command(_cli_args("abc123"))
 
     assert len(captured_args) == 1
-    assert captured_args[0] == ["git", "diff", "abc123...HEAD"]
+    assert captured_args[0] == ["git", "diff", "abc123..HEAD"]
+
+
+def test_cli_mojibake_check_uses_two_dot_not_three_dot(monkeypatch, tmp_path) -> None:
+    # Regression test for the CI failure on PR #1206: the three-dot diff
+    # (base...HEAD) exits 128 in a shallow clone because the merge-base
+    # cannot be resolved without the ancestry chain.  The two-dot diff
+    # (base..HEAD) compares trees directly and works once both commits are
+    # present.  This test asserts the command string contains ".." not
+    # "..." so a regression to three-dot is caught immediately.
+    captured_args: list[list[str]] = []
+
+    def fake_run_captured(command, **kwargs):
+        captured_args.append(command)
+        return _mock_git_diff("")
+
+    monkeypatch.setattr(cli_module, "find_repo_root", lambda repo, explicit: tmp_path)
+    monkeypatch.setattr(cli_module, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(cli_module, "run_captured", fake_run_captured)
+
+    cli_module.run_mojibake_check_command(_cli_args("b4d1bf3c37424ff943f9032020157067e1d28f69"))
+
+    cmd = captured_args[0]
+    assert cmd == [
+        "git",
+        "diff",
+        "b4d1bf3c37424ff943f9032020157067e1d28f69..HEAD",
+    ]
+    # Explicitly assert no three-dot: "..." must not appear in the ref spec.
+    ref_spec = cmd[2]
+    assert "..." not in ref_spec, (
+        f"three-dot diff would fail in shallow clones (CI exit 128); got {ref_spec!r}"
+    )

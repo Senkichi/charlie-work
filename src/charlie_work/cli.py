@@ -463,8 +463,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--base",
         default="origin/main",
         help="Git ref to diff against (default: origin/main). Uses the "
-        "three-dot diff (base...HEAD) so only changes on this branch are "
-        "scanned.",
+        "two-dot diff (base..HEAD) which compares trees directly and works "
+        "in shallow clones (CI uses fetch-depth: 1) where three-dot "
+        "(base...HEAD) cannot resolve the merge-base.",
     )
 
     migrate_parser = subparsers.add_parser(
@@ -803,12 +804,22 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
 def run_mojibake_check_command(args: argparse.Namespace) -> CommandResult:
     """CI gate (issue #1057): fail if the diff introduces mojibake.
 
-    Runs ``git diff <base>...HEAD`` in the repo root and scans every added
+    Runs ``git diff <base>..HEAD`` in the repo root and scans every added
     line for cp1252/UTF-8 mojibake via :func:`find_mojibake_in_diff`.  The
     detection is derived from the encoding process (reverse the corruption
     and check whether the result differs) rather than a hardcoded list of
     bad byte sequences, so it catches any UTF-8/cp1252 round trip -- not
     just the specific em-dash sequence documented in the issue.
+
+    Uses a two-dot diff (``base..HEAD``) rather than three-dot
+    (``base...HEAD``) because CI runs against a shallow clone
+    (``actions/checkout@v5`` with ``fetch-depth: 1``).  Three-dot needs the
+    merge-base of *base* and HEAD, which requires traversing the ancestry
+    chain between them -- impossible when the shallow boundary cuts it.
+    Two-dot compares the two trees directly (no merge-base computation) and
+    works once both commits are present.  The CI workflow fetches the base
+    SHA with ``git fetch --depth 1`` before invoking this command; see the
+    "Mojibake gate" step in ``ci.yml``.
 
     Like the closing-keyword gate, this is deliberately a step of the
     existing "Lint" job (added in ci.yml), not a new job: GitHub reports
@@ -825,7 +836,7 @@ def run_mojibake_check_command(args: argparse.Namespace) -> CommandResult:
 
     base = getattr(args, "base", "origin/main")
     result = run_captured(
-        ["git", "diff", f"{base}...HEAD"],
+        ["git", "diff", f"{base}..HEAD"],
         cwd=ctx.repo_root,
         timeout_seconds=60,
     )
