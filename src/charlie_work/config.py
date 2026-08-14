@@ -249,6 +249,17 @@ class DispatchConfig:
     # fires while the unfiltered backlog is observed to be non-empty. 0
     # disables the check.
     dispatch_staleness_minutes: int = 240
+    # Issue #1001: when True, dispatch refuses to launch workers if no
+    # sanctioned GitHub token is configured in the active adapter's
+    # ``worker_env`` (the same predicate ``doctor._check_worker_github_token``
+    # uses). Defaults False (warn-only: escalate once, dispatch anyway) so the
+    # gate does not take the fleet down on a config that has not yet been
+    # provisioned with a token — see the issue #1001 sequencing hazard
+    # comment. Flip to True only after an operator has provisioned a scoped
+    # token in ``devin.worker_env`` / ``claude_code.worker_env`` and confirmed
+    # workers reach ``gh pr create`` successfully. Issue #1224 tracks that
+    # staged rollout, including the eventual flip of this default to True.
+    require_worker_github_token: bool = False
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -1689,6 +1700,13 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 raise ConfigError(
                     f"config section 'dispatch' key '{_int_key}' must be >= 0, got {_int_value}"
                 )
+    # Issue #1001: bool validation for require_worker_github_token.
+    _rwt = dispatch_data.get("require_worker_github_token")
+    if _rwt is not None and not isinstance(_rwt, bool):
+        raise ConfigError(
+            "config section 'dispatch' key 'require_worker_github_token' must be a bool, "
+            f"got {type(_rwt).__name__}"
+        )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     review_dispatch_data = _section(data, "review_dispatch")
