@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from charlie_work import cli
+from charlie_work import github as github_module
 from charlie_work.config import (
     ConfigError,
     NotifyConfig,
@@ -68,6 +69,24 @@ class _FakeGitHub:
 
     def remove_issue_label(self, number: int, label: str) -> bool:
         return True
+
+    def commit(self, sha: str) -> github_module.GitHubRunResult:
+        # This stub does not model commit metadata, so the committer-date
+        # timestamp cannot be resolved. Returning a failed GitHubRunResult
+        # (errors-as-values invariant) makes _commit_timestamp yield None,
+        # which tells _collect_external_findings to skip the upper bound and
+        # fail toward ingestion -- a no-op here, since ``run`` returns ``[]``
+        # for JSON output so no external comments are ever surfaced. These
+        # tests exercise required_changes derivation, not external-findings
+        # filtering (see test_charlie_work.py for that coverage).
+        return github_module.GitHubRunResult(
+            ok=False,
+            returncode=1,
+            stdout="",
+            stderr="",
+            value=None,
+            error=f"commit {sha} not modeled by _FakeGitHub",
+        )
 
 
 def _make_repo(tmp_path: Path) -> Path:
