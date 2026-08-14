@@ -3650,7 +3650,7 @@ def test_reconcile_fix_deferred_when_supervisor_lock_held(tmp_path: Path) -> Non
         supervisor_lock.release()
 
     assert result.ok is True
-    assert result.data.get("skipped") is True
+    assert result.data.get("pass_skipped") is True
     assert result.data.get("reason") == "supervisor_lock_held"
 
 
@@ -4853,3 +4853,28 @@ def test_reconcile_dry_run_without_fix_still_reports_drift(tmp_path: Path) -> No
 
     after_state = json.loads(paths.state_file.read_text(encoding="utf-8"))
     assert after_state["prs"]["1"]["status"] == "reviewing"
+
+
+def test_apply_fixes_has_no_dry_run_parameter() -> None:
+    """Issue #1051: ``apply_fixes`` must NOT accept a ``dry_run`` parameter.
+
+    The dry-run invariant for ``mop-up --fix`` is enforced at a single point --
+    the ``if fix and not dry_run and drift:`` gate in ``_reconcile_locked``
+    (workflow.py), which short-circuits before ``apply_fixes`` is ever called.
+    Adding a ``dry_run`` parameter to ``apply_fixes`` would create unreachable
+    dead code: the caller guarantees ``dry_run`` is False on every code path
+    that reaches ``apply_fixes``, so any ``dry_run``-conditional branch inside
+    it can never fire from a real CLI invocation. This test locks in the
+    single-point-of-enforcement design so the dead-code pattern is not
+    reintroduced (e.g. by a PR that threads ``dry_run`` into ``apply_fixes``
+    without also restructuring the caller gate to let it through).
+    """
+    import inspect
+
+    sig = inspect.signature(apply_fixes)
+    assert "dry_run" not in sig.parameters, (
+        "apply_fixes must not accept a dry_run parameter (issue #1051): "
+        "the caller-level `not dry_run` gate in _reconcile_locked is the "
+        "single enforcement point; a dry_run param here would be unreachable "
+        "dead code."
+    )

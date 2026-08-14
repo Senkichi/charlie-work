@@ -67,6 +67,7 @@ from .cross_family import (
     report_is_reusable,
     run_cross_family_review,
 )
+from .cross_repo_gate import cross_repo_gate
 from .github import (
     GitHub,
     GitHubError,
@@ -105,6 +106,7 @@ from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import (
     PromptTemplateError,
     assert_conventional_commit_title,
+    assert_containment,
     assert_execution_contract,
     assert_no_merge_contract,
     prompt_template_digest,
@@ -312,7 +314,7 @@ class CommandResult:
 
 def _state_lock_busy_result(message: str, **extra: Any) -> CommandResult:
     data: dict[str, Any] = {
-        "skipped": True,
+        "pass_skipped": True,
         "reason": "state_lock_busy",
         "state_lock_busy": True,
     }
@@ -1133,12 +1135,12 @@ _MAX_DEFERRED_CONCURRENCY_EXAMPLES = 5
 
 # Maximum per-worktree skip entries carried in the persisted
 # `worktrees_reclaimed` event payload. Same idiom as
-# `_MAX_DEFERRED_CONCURRENCY_EXAMPLES`: a full count (`skipped`) alongside a
+# `_MAX_DEFERRED_CONCURRENCY_EXAMPLES`: a full count (`skipped_count`) alongside a
 # truncated example list (`skipped_examples`), so a standing backlog of
 # stuck worktrees doesn't re-emit the full list into events.db every
 # interval, while a normal-sized backlog still carries every reason string
 # through (issue #1012 -- clean_worktrees computes a distinct `reason` per
-# skip but the event used to keep only `len(skipped)`).
+# skip but the event used to keep only `skipped_count`).
 _MAX_SKIPPED_WORKTREE_EXAMPLES = 20
 
 # Bound on concurrent `gh` subprocesses spawned by _prefetch_blocker_data() to
@@ -5646,8 +5648,10 @@ So provenance travels in the body instead. ``_comment_pr`` stamps this marker;
 invisible in rendered markdown, so the posted comment is unchanged for readers.
 
 Note this covers only comments written by *this* process. A worker's own rework
-reply is machine-generated too and is not stamped here -- see the follow-up
-issue referenced in ``_collect_external_findings``.
+reply is machine-generated too and is not stamped here -- it is excluded from
+ingestion by a *temporal* cutoff instead (issue #998): ``_collect_external_findings``
+drops any comment posted after the reviewed head commit's committer date, and a
+worker's reply is by construction posted after the rework commit it describes.
 """
 
 
@@ -5710,8 +5714,55 @@ def _gh_api_list(gh: GitHubLike, path: str) -> list[dict[str, Any]]:
     return []
 
 
+def _commit_timestamp(gh: GitHubLike, sha: str | None) -> str | None:
+    """Return the committer-date ISO 8601 timestamp of commit ``sha``, or None.
+
+    Wraps ``gh.commit(sha)`` (``gh api repos/{owner}/{repo}/commits/{sha}``) and
+    reads ``commit.committer.date`` -- the moment the commit landed on the
+    branch, which is what the external-findings upper bound (issue #998) needs
+    to compare against comment timestamps. The author date is user-settable and
+    can be backdated, so it is *not* used as the cutoff; the committer date is
+    the GitHub-recorded landing time.
+
+    Errors are returned as ``None``, never raised -- consistent with this
+    repo's errors-as-values invariant. A ``None`` return tells
+    ``_collect_external_findings`` to skip the upper bound entirely (fail
+    toward ingestion): losing a genuine human finding is the expensive
+    direction of this filter, and a missing commit timestamp must not silently
+    drop comments.
+    """
+    if not sha:
+        return None
+    result = gh.commit(sha)
+    value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
+    if not isinstance(value, dict):
+        return None
+    commit = value.get("commit")
+    if not isinstance(commit, dict):
+        return None
+    committer = commit.get("committer")
+    if isinstance(committer, dict):
+        date = committer.get("date")
+        if isinstance(date, str) and date:
+            return date
+    # Fall back to the author date only if the committer date is entirely
+    # absent -- rare, but a squash with a crafted author/committer split could
+    # leave committer empty. Author date is less authoritative (settable) but
+    # still bounds the comment window better than no cutoff at all.
+    author = commit.get("author")
+    if isinstance(author, dict):
+        date = author.get("date")
+        if isinstance(date, str) and date:
+            return date
+    return None
+
+
 def _collect_external_findings(
-    gh: GitHubLike, pr_number: int, *, since: str | None = None
+    gh: GitHubLike,
+    pr_number: int,
+    *,
+    since: str | None = None,
+    before: str | None = None,
 ) -> list[str]:
     """Collect non-bot human feedback from the three external PR surfaces.
 
@@ -5730,26 +5781,52 @@ def _collect_external_findings(
       person, and filtering on that login would drop exactly the findings #950
       exists to ingest. See ``ORCHESTRATOR_COMMENT_MARKER``.
 
-    ``since``, when given, is the previous round's ``reviewed_at`` (an
-    ``utc_now()``-formatted ISO 8601 UTC timestamp, see ``record_review``).
-    An item timestamped at or before ``since`` was already visible -- either
-    surfaced in a prior round's ``required_changes`` or predating review
-    entirely -- so it is skipped. This is what stops a rework loop from
-    re-ingesting the same stale findings (plus the growing pile of a worker's
-    own rework replies) on every round: without it, `_write_rework_prompt`
-    buries the one new finding under the full comment history every time.
+    ``since``, when given, is the previous round's *upper* bound -- the
+    ``before`` timestamp that round persisted in ``review-decision.json``
+    (falling back to that round's ``reviewed_at`` only when no ``before`` was
+    recorded; see ``record_review``'s contiguity note). An item timestamped
+    at or before ``since`` was already visible -- either surfaced in a prior
+    round's ``required_changes`` or predating review entirely -- so it is
+    skipped. This is what stops a rework loop from re-ingesting the same stale
+    findings on every round: without it, ``_write_rework_prompt`` buries the
+    one new finding under the full comment history every time.
+
+    ``before``, when given, is the *current* round's ``reviewed_head_sha``
+    committer-date timestamp (see ``_commit_timestamp``). An item timestamped
+    strictly after ``before`` is skipped. This is the upper bound that closes
+    issue #998: a worker's own rework reply ("Reworked in <sha>, here is what
+    I changed") is machine-generated, posted through the worker's path (no
+    ``ORCHESTRATOR_COMMENT_MARKER``), and -- critically -- posted *after* the
+    rework commit it describes, which is exactly the head the reviewer is now
+    reading. Cutting ingestion off at that head's commit time drops the reply
+    without any cooperation from the worker's posting path, and it also stops
+    findings the worker has already addressed from being re-presented every
+    round. The same account/``type=User`` constraint that defeated an
+    identity-based fix in #997 applies here too, so the cutoff is temporal,
+    not by author: a genuine human comment posted *before* the reviewed head
+    is still ingested (asserted positively by
+    ``test_worker_rework_reply_is_not_ingested_as_external_finding``).
+
+    Contiguity contract: ``since`` and ``before`` together partition the
+    comment timeline into per-round half-open windows ``(since, before]``, and
+    the next round's ``since`` is this round's persisted ``before``. A comment
+    in the gap ``(before, reviewed_at]`` -- posted after the reviewed head
+    landed but before the verdict was written -- is excluded by ``before``
+    this round and recovered by ``since`` next round. Deriving ``since`` from
+    ``reviewed_at`` instead would drop such a comment forever (it satisfies
+    ``item_dt <= reviewed_at``), violating the fail-toward-ingestion
+    invariant. This is pinned by
+    ``test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round``.
+
     GitHub's list endpoints disagree on which field carries the timestamp --
     issue comments and inline review comments use ``created_at``, top-level
     review bodies use ``submitted_at`` -- so both are checked per item. An
-    item with neither field (or an unparsable one) is never skipped: losing a
-    genuine finding is the expensive direction of this filter (see
-    ``test_human_quote_reply_to_orchestrator_comment_is_still_ingested``).
-
-    Known gap: a worker's own rework reply ("Reworked in <sha>, here is what I
-    changed") is machine-generated but posted through the worker's path, so it
-    carries no marker and is still ingested if posted after ``since`` -- it
-    would be presented back to the worker as a required change. Tracked
-    separately; fixing it needs a marker on the worker side.
+    item with neither field (or an unparsable one) is never skipped by either
+    bound: losing a genuine finding is the expensive direction of this filter
+    (see ``test_human_quote_reply_to_orchestrator_comment_is_still_ingested``).
+    Likewise, if ``before`` cannot be parsed (or the commit timestamp could
+    not be resolved at the call site) the upper bound is not applied -- the
+    filter fails toward ingestion, never toward silent suppression.
     """
     bodies: list[str] = []
     owner_repo = "{owner}/{repo}"
@@ -5764,14 +5841,17 @@ def _collect_external_findings(
     )
 
     since_dt = _parse_iso_timestamp(since) if since else None
+    before_dt = _parse_iso_timestamp(before) if before else None
 
     for path in surfaces:
         for item in _gh_api_list(gh, path):
             if _is_bot_comment(item) or _is_orchestrator_comment(item):
                 continue
-            if since_dt is not None:
-                item_dt = _parse_iso_timestamp(item.get("created_at") or item.get("submitted_at"))
-                if item_dt is not None and item_dt <= since_dt:
+            item_dt = _parse_iso_timestamp(item.get("created_at") or item.get("submitted_at"))
+            if item_dt is not None:
+                if since_dt is not None and item_dt <= since_dt:
+                    continue
+                if before_dt is not None and item_dt > before_dt:
                     continue
             body = (item.get("body") or "").strip()
             if body:
@@ -5821,6 +5901,36 @@ def _finish_required_changes_section(lines: list[str]) -> str:
     return "\n".join([*lines, _EXTERNAL_FINDINGS_POINTER])
 
 
+_EXTERNAL_FINDINGS_SECTION_INTRO = (
+    "## Findings posted on the PR itself\n"
+    "\n"
+    "These are verified findings a human or peer agent posted on the PR as "
+    "comments, review bodies, or inline review threads -- separate from the "
+    "reviewer's findings above. Address each of them too.\n"
+)
+
+
+def _render_external_findings_section(
+    reviewer_lines: list[str], external_findings: list[str]
+) -> str:
+    """Join the reviewer section and the external-findings section (issue #999).
+
+    External findings render under their own heading, after the reviewer's
+    section, as bullets -- each defanged so a closing keyword in a human
+    comment cannot auto-close the linked issue from the worker's brief.
+
+    The ``_EXTERNAL_FINDINGS_POINTER`` is deliberately *not* appended here.
+    Its body states "none of which reach this brief", which this section
+    makes false: the ingested findings are now rendered inline. Old-shape
+    records (no ``external_findings`` field) never reach this function and
+    keep the pointer exactly as before this fix.
+    """
+    lines = [*reviewer_lines, _EXTERNAL_FINDINGS_SECTION_INTRO]
+    lines.extend(f"- {defang_closing_keywords(item)}" for item in external_findings)
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     """Render the ``$required_changes_section`` for a rework brief.
 
@@ -5857,13 +5967,38 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
 
     Issue #950: when the PR itself carries verified human or peer-agent
     findings (issue comments, review bodies, inline review threads),
-    ``record_review`` folds them into ``required_changes`` and sets
-    ``findings_channel`` to ``"external"``. Verdicts carrying the
-    ``"external"`` marker render as the itemized tier below, but with a
-    description that makes clear the list mixes internal reviewer findings
-    and external PR comments. The ``"external"`` marker is checked before
-    the shape-based tiers so an entirely-external verdict is not mis-binned
-    as ``"derived"``/``"vacuous"``.
+    ``record_review`` ingests them at write time.
+
+    Issue #999: external findings no longer merge into ``required_changes``.
+    They ride in their own ``external_findings`` field, and
+    ``findings_channel`` continues to describe *only* the reviewer's list --
+    so ``"derived"`` is never overwritten and keeps its tier-2 verbatim
+    rendering even when external findings are present. This function renders
+    them under their own heading (``_render_external_findings_section``)
+    after the reviewer's section, instead of appending the
+    ``_EXTERNAL_FINDINGS_POINTER`` (whose "none of which reach this brief"
+    body the inline section makes false).
+
+    Two shapes coexist for backward compatibility:
+
+    * **New shape** (records written after #999, non-vacuous case): the
+      ``external_findings`` field is present and ``findings_channel`` is
+      ``None`` or ``"derived"`` (never ``"external"``). The reviewer's
+      section renders per its marker, then the external section is
+      appended.
+    * **Old shape** (records written before #999, *and* the vacuous-replace
+      case): external findings are already merged into
+      ``required_changes`` with ``findings_channel == "external"`` and no
+      ``external_findings`` field. These render exactly as before this fix
+      -- the itemized tier with the external-aware intro and the pointer --
+      so no content is lost from any verdict already on disk.
+
+    The ``"vacuous"`` case is the one that must NOT become a separate
+    section: a content-free reviewer summary has nothing worth rendering
+    above the external items, so ``record_review`` still *replaces*
+    ``required_changes`` with the external findings (flipping the channel
+    to ``"external"``) and writes no ``external_findings`` field -- the
+    old-shape ``"external"`` path handles it unchanged.
 
     Verdicts carrying the ``"vacuous"`` or ``"derived"`` markers are
     handled explicitly, before the shape-based tiers below:
@@ -5873,7 +6008,7 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     renders tier 2 verbatim rather than falling into tier 1's bullet list
     (a single derived item wrapped as a one-item bullet would otherwise dump
     an entire multi-paragraph summary onto one line). Verdicts with no
-    marker at all -- every record written before this fix -- fall through
+    marker at all -- every record written before #792 -- fall through
     unchanged to the original shape-based tiers.
 
     Rendered for ``request_changes`` and, defensively, ``blocked`` verdicts
@@ -5925,6 +6060,16 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     raw_summary = decision.get("summary")
     summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
     findings_channel = decision.get("findings_channel")
+    # Issue #999: new-shape records carry external findings in their own
+    # field. Old-shape records (pre-#999, or the vacuous-replace case) have
+    # no such field and render exactly as before this fix.
+    raw_external = decision.get("external_findings")
+    external_findings = (
+        [str(item).strip() for item in raw_external if str(item).strip()]
+        if isinstance(raw_external, list)
+        else []
+    )
+    new_shape = bool(external_findings)
 
     # issue #792: a verdict recorded by the current record_review carries an
     # explicit marker for exactly this distinction -- handle it before the
@@ -5956,6 +6101,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             defang_closing_keywords(summary_text),
             "",
         ]
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and changes:
@@ -5979,6 +6126,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         ]
         lines.extend(f"- {defang_closing_keywords(change)}" for change in changes)
         lines.append("")
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if verdict == "request_changes" and summary_text:
@@ -5993,6 +6142,8 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
             defang_closing_keywords(summary_text),
             "",
         ]
+        if new_shape:
+            return _render_external_findings_section(lines, external_findings)
         return _finish_required_changes_section(lines)
 
     if not changes and not summary_text:
@@ -6148,6 +6299,11 @@ def _write_rework_prompt(
     # *rendered output* so a repo-local flat rework override that drops
     # $section_execution_contract is caught at the dispatch boundary.
     assert_execution_contract(prompt, context=f"rework prompt for PR #{pr_number}")
+    # Issue #1010: enforce the widened containment clause on the *rendered
+    # output* so a repo-local flat rework override that drops
+    # $section_scope_contract or reverts to the old repo-scoped wording is
+    # caught at the dispatch boundary.
+    assert_containment(prompt, context=f"rework prompt for PR #{pr_number}")
     prompt_path.write_text(prompt, encoding="utf-8")
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
     # regeneration (when review-decision.json is newer than the brief) can
@@ -8601,10 +8757,19 @@ class OrchestratorApp:
             adapter_choices: dict[int, AdapterChoice] = {}
             api_enabled = self.config.api_worker.enabled
             routing_inputs = self._routing_inputs() if api_enabled else None
+            # Issue #1010: dry-run cross-repo gate — report which issues would
+            # be escalated without mutating state or labels.
+            dry_run_cross_repo_escalated: dict[int, str] = {}
             for issue_number in selected_issue_numbers:
                 full_issue = self.gh.issue_view(issue_number)
                 full_issues[issue_number] = full_issue
                 branch_name = self._branch_name(full_issue)
+
+                # Pre-flight gate: report cross-repo targets without escalating.
+                gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
+                if not gate_result.passed:
+                    dry_run_cross_repo_escalated[issue_number] = gate_result.reason
+                    continue
 
                 template: str | None = None
                 if api_enabled and routing_inputs is not None:
@@ -8653,6 +8818,7 @@ class OrchestratorApp:
                     merged_pr_mention_only_issue_numbers
                 ),
                 "label_errors": [],
+                "cross_repo_escalated_issue_numbers": sorted(dry_run_cross_repo_escalated),
                 "sessions": [asdict(request) for request in session_requests],
                 "adapter_choices": {
                     str(n): {"kind": c.kind, "provider": c.provider, "reason": c.reason}
@@ -9106,10 +9272,22 @@ class OrchestratorApp:
         adapter_choices: dict[int, AdapterChoice] = {}
         api_enabled = self.config.api_worker.enabled
         routing_inputs = self._routing_inputs() if api_enabled else None
+        # Issue #1010: pre-flight cross-repo gate. Issues whose referenced
+        # file paths are all absent from the target repo are escalated to
+        # human-needed instead of dispatching a worker that will wander to a
+        # sibling repo's shared checkout.
+        cross_repo_escalated: dict[int, str] = {}
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
             branch_name = self._branch_name(full_issue)
+
+            # Pre-flight gate: refuse to dispatch when the issue's referenced
+            # code does not exist in this repo (issue #1010).
+            gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
+            if not gate_result.passed:
+                cross_repo_escalated[issue_number] = gate_result.reason
+                continue
 
             # Determine the adapter for this issue (single point of enforcement:
             # routing.select_adapter). The prompt template follows the choice
@@ -9437,6 +9615,61 @@ class OrchestratorApp:
                         )
                         save_state(self.paths.state_file, state)
 
+            # Issue #1010: escalate issues blocked by the cross-repo pre-flight
+            # gate. Their referenced file paths are all absent from the target
+            # repo, so dispatching a worker would send it to a sibling repo's
+            # shared checkout. Escalate to human-needed with a cross_repo_target
+            # reason and record the event — the issue stays in the dispatch
+            # pool's state as escalated, not dispatch_pending.
+            for issue_number, reason in sorted(cross_repo_escalated.items()):
+                prev_entry = state["issues"].get(str(issue_number), {})
+                entry = {
+                    **prev_entry,
+                    "number": issue_number,
+                    "title": full_issues.get(issue_number, {}).get("title"),
+                    "url": full_issues.get(issue_number, {}).get("url"),
+                }
+                entry.pop("dispatch_pending_at", None)
+                entry.pop("label_error", None)
+                state = _escalate_issue(
+                    state,
+                    issue_number,
+                    reason=reason,
+                    reason_class="mechanical",
+                    issue_extra=entry,
+                )
+                state = append_event(
+                    state,
+                    "dispatch_cross_repo_escalated",
+                    {
+                        "issue_number": issue_number,
+                        "reason": reason,
+                    },
+                    state_path=self.paths.state_file,
+                )
+                save_state(self.paths.state_file, state)
+                # Transition labels to human-needed, following the same pattern
+                # as the redispatch_escalated path above.
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "redispatch_escalated",
+                )
+                if result.outcome != TransitionOutcome.APPLIED:
+                    label_error = {
+                        "edge": "redispatch_escalated",
+                        "outcome": result.outcome.value,
+                        "add_failures": result.add_failures,
+                        "remove_failures": result.remove_failures,
+                    }
+                    escalated_entry = state["issues"].get(str(issue_number), {})
+                    escalated_entry["label_error"] = label_error
+                    state["issues"][str(issue_number)] = escalated_entry
+                    label_errors.append(issue_number)
+                    label_error_failures[issue_number] = _label_error_reason(label_error)
+                    save_state(self.paths.state_file, state)
+
             # Build dispatch-alert transitions for the notify digest. Averted
             # redispatches surface as DISPATCH_AVERTED; a later successful or
             # non-averted dispatch clears the alert back to OK.
@@ -9525,6 +9758,7 @@ class OrchestratorApp:
                     "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
                     "failed_issue_numbers": sorted(failed_issue_numbers),
                     "foreign_writer_issue_numbers": sorted(foreign_writer_issue_numbers),
+                    "cross_repo_escalated_issue_numbers": sorted(cross_repo_escalated),
                     "label_errors": sorted(label_errors),
                     "skipped_issue_numbers": skipped_issue_numbers,
                     "deferred_by_concurrency": deferred_by_concurrency,
@@ -9580,6 +9814,8 @@ class OrchestratorApp:
             message += (
                 f" (reaped phantom live worker slots: {sorted(phantom_live_worker_issue_numbers)})"
             )
+        if cross_repo_escalated:
+            message += f" (cross-repo escalated: {sorted(cross_repo_escalated)})"
         data = {
             "selected_count": len(successful_issue_numbers),
             "attempted_count": len(session_requests),
@@ -9589,6 +9825,7 @@ class OrchestratorApp:
             "phantom_live_worker_count": len(phantom_live_worker_issue_numbers),
             "phantom_live_worker_issue_numbers": sorted(phantom_live_worker_issue_numbers),
             "foreign_writer_count": len(foreign_writer_issue_numbers),
+            "cross_repo_escalated_issue_numbers": sorted(cross_repo_escalated),
             "skipped_issue_numbers": skipped_issue_numbers,
             "deferred_by_concurrency": deferred_by_concurrency,
             "deferred_by_concurrency_count": deferred_by_concurrency_count,
@@ -9939,7 +10176,7 @@ class OrchestratorApp:
                 {
                     "pr": pr_number,
                     "issue": issue_number,
-                    "skipped": True,
+                    "pass_skipped": True,
                     "checks_unavailable": escalated_checks is None,
                 },
             )
@@ -13086,30 +13323,6 @@ class OrchestratorApp:
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
 
-        # Issue #950: fold non-bot findings from the PR's own external review
-        # surfaces into the verdict at write time. This is a live fetch at
-        # record_review time, not at render time, so _render_rework_prompt stays
-        # a pure function of the durable verdict file.
-        #
-        # Scoped to comments posted after the previous round's reviewed_at
-        # (when a previous round exists): without a cutoff, every round
-        # re-fetches the PR's *entire* comment history, so stale prior-round
-        # findings and unmarked worker rework replies pile up in
-        # required_changes and bury the one live finding. review-decision.json
-        # is overwritten atomically per round, so the producer input -- an
-        # unbounded fetch -- was the actual defect, not the write.
-        if decision in {"request_changes", "blocked"}:
-            previous_decision = self._review_decision(pr_number)
-            previous_reviewed_at = previous_decision.get("reviewed_at")
-            since = previous_reviewed_at if isinstance(previous_reviewed_at, str) else None
-            external_findings = _collect_external_findings(self.gh, pr_number, since=since)
-            if external_findings:
-                if findings_channel == "vacuous":
-                    effective_required_changes = list(external_findings)
-                else:
-                    effective_required_changes.extend(external_findings)
-                findings_channel = "external"
-
         # reviewed_head_sha/reviewed_patch_id must reflect the packet the reviewer
         # actually read (review()'s pr.json/diff.patch), not a fresh fetch made
         # here at verdict time: a commit landing between packet generation and
@@ -13186,6 +13399,82 @@ class OrchestratorApp:
             reviewed_patch_id = _calculate_patch_id(diff)
             if diff:
                 reviewed_signature = _diff_content_signature(diff)
+
+        # Issue #950 / #998: fold non-bot findings from the PR's own external
+        # review surfaces into the verdict at write time. This is a live fetch
+        # at record_review time, not at render time, so _render_rework_prompt
+        # stays a pure function of the durable verdict file.
+        #
+        # The ingestion window is bounded on both sides by *time*, not by
+        # author identity (the orchestrator and workers both post through user
+        # tokens, so identity cannot separate their output from a genuine
+        # human's -- see ORCHESTRATOR_COMMENT_MARKER and issue #998):
+        #   * lower bound ``since``  = the previous round's *upper* bound
+        #     (``before``), falling back to its ``reviewed_at`` only when no
+        #     ``before`` was recorded -- see the contiguity note below;
+        #   * upper bound ``before`` = the current reviewed_head_sha's committer
+        #     date -- a worker's own rework reply is posted *after* the rework
+        #     commit it describes (which is the head the reviewer is now
+        #     reading), so it falls outside the window and is not fed back to
+        #     the worker as a "required change". This also closes the
+        #     pre-ORCHESTRATOR_COMMENT_MARKER comment gap (#998 comment): those
+        #     comments predate every future reviewed_head_sha and are excluded
+        #     by the lower bound from the second round on.
+        # Both bounds fail toward ingestion when their timestamp is missing or
+        # unparsable: losing a genuine human finding is the expensive direction.
+        # This block runs after reviewed_head_sha is resolved (and after the
+        # --reviewed-head validation that can return early), so the upper bound
+        # always reflects the exact head the verdict is pinned to.
+        #
+        # Contiguity across rounds (issue #998 rework): the next round's
+        # ``since`` MUST be this round's ``before``, not this round's
+        # ``reviewed_at``. A genuine human comment posted in the gap
+        # ``(before, reviewed_at]`` -- between the reviewed head commit landing
+        # and the verdict being written -- is excluded by ``before`` this round
+        # (item_dt > before). If the next round used ``reviewed_at`` as its
+        # ``since``, that comment would satisfy ``item_dt <= reviewed_at`` and
+        # be dropped by the lower bound *forever* -- a silent hole in the
+        # window that violates the "fail toward ingestion" invariant above.
+        # Deriving ``since`` from the previous round's persisted ``before``
+        # makes the per-round windows contiguous: every comment falls in
+        # exactly one round's ``(since, before]`` window, so nothing is
+        # permanently lost. The ``reviewed_at`` fallback is only taken when no
+        # ``before`` was recorded -- which happens precisely when the upper
+        # bound was not applied (the commit timestamp could not be resolved),
+        # so nothing was excluded by ``before`` and ``reviewed_at`` remains the
+        # correct lower bound.
+        ingestion_before: str | None = None
+        # Issue #999: external findings no longer merge into
+        # ``required_changes``. They ride in their own ``external_findings``
+        # field so ``findings_channel`` keeps describing *only* the reviewer's
+        # list -- ``"derived"`` is never overwritten and keeps its tier-2
+        # verbatim rendering. The one exception is ``"vacuous"``: a
+        # content-free reviewer summary has nothing worth rendering above the
+        # external items, so that case still *replaces* ``required_changes``
+        # (flipping the channel to ``"external"``) exactly as before #999 --
+        # no ``external_findings`` field is written, and the renderer's
+        # old-shape ``"external"`` path handles it unchanged.
+        recorded_external_findings: list[str] | None = None
+        if decision in {"request_changes", "blocked"}:
+            previous_decision = self._review_decision(pr_number)
+            previous_before = previous_decision.get("before")
+            previous_reviewed_at = previous_decision.get("reviewed_at")
+            since = (
+                previous_before
+                if isinstance(previous_before, str) and previous_before
+                else (previous_reviewed_at if isinstance(previous_reviewed_at, str) else None)
+            )
+            before = _commit_timestamp(self.gh, reviewed_head_sha)
+            ingestion_before = before
+            external_findings = _collect_external_findings(
+                self.gh, pr_number, since=since, before=before
+            )
+            if external_findings:
+                if findings_channel == "vacuous":
+                    effective_required_changes = list(external_findings)
+                    findings_channel = "external"
+                else:
+                    recorded_external_findings = list(external_findings)
         decision_payload = {
             "pr_number": pr_number,
             "issue_number": issue_number,
@@ -13206,6 +13495,21 @@ class OrchestratorApp:
         # `approved` verdict, passes through with no new key at all.
         if findings_channel is not None:
             decision_payload["findings_channel"] = findings_channel
+        # Issue #999: external findings live in their own field, separate
+        # from the reviewer's required_changes. Absent on old-shape records
+        # (pre-#999, or the vacuous-replace case) -- the renderer treats
+        # absence as old-shape and renders exactly as before.
+        if recorded_external_findings is not None:
+            decision_payload["external_findings"] = recorded_external_findings
+        # Persist the ingestion upper bound so the next round's ``since`` can
+        # be derived from it (issue #998 rework: contiguous windowing across
+        # rounds -- see the contiguity note above). Only present when ingestion
+        # actually ran AND the upper bound was resolved; an ``approved`` verdict
+        # has no next ingestion round, and a None ``before`` means the upper
+        # bound was not applied (so there is nothing for the next round's
+        # ``since`` to recover -- it falls back to ``reviewed_at``).
+        if ingestion_before is not None:
+            decision_payload["before"] = ingestion_before
         decision_path = pr_dir / "review-decision.json"
         # Merge-update (never in-place assignment) and persist BEFORE any GitHub
         # label mutation: a label-write failure or crash must not desync the
@@ -13416,6 +13720,8 @@ class OrchestratorApp:
                 event_payload["session_metrics"] = session_metrics
             if findings_channel is not None:
                 event_payload["findings_channel"] = findings_channel
+            if recorded_external_findings is not None:
+                event_payload["external_findings_count"] = len(recorded_external_findings)
             state = self._record_event(state, "record_review", event_payload)
             if findings_channel == "vacuous":
                 # Distinct from the general "record_review" event (issue
@@ -15983,7 +16289,7 @@ class OrchestratorApp:
                 return CommandResult(
                     True,
                     "reconcile deferred: supervisor lock held",
-                    {"skipped": True, "reason": "supervisor_lock_held"},
+                    {"pass_skipped": True, "reason": "supervisor_lock_held"},
                 )
         try:
             return self._reconcile_locked(
@@ -18384,7 +18690,7 @@ class OrchestratorApp:
         when the sweep runs, so a maintenance action that left no trace is
         indistinguishable from one that never ran (lesson from #595/#621).
         The event payload carries a bounded ``skipped_examples`` list (each
-        entry's own ``reason`` string) alongside the exact ``skipped`` count,
+        entry's own ``reason`` string) alongside the exact ``skipped_count``,
         plus ``worktrees_registered``/``worktrees_out_of_scope`` -- so a
         worktree stuck for days can be diagnosed from events.db alone,
         without catching the sweep live (issue #1012).
@@ -18457,7 +18763,7 @@ class OrchestratorApp:
             "ok": result.ok,
             "removed": len(result.data.get("removed", [])),
             "planned": len(result.data.get("planned", [])),
-            "skipped": len(skipped_full),
+            "skipped_count": len(skipped_full),
             "failed": len(result.data.get("failed", [])),
             "orphans_removed": len(orphans.get("removed", [])),
             "orphans_planned": len(orphans.get("planned", [])),
@@ -18466,12 +18772,12 @@ class OrchestratorApp:
             # issue #1012: clean_worktrees computes a distinct `reason` per
             # skipped worktree (at least nine distinct strings across the
             # merged/closed-unmerged/liveness gates), but until this fix only
-            # `len(skipped)` reached this durable payload -- "11 skipped" with
+            # `skipped_count` reached this durable payload -- "11 skipped" with
             # no way to tell which reason, or whether a specific stuck
             # worktree was even a candidate. Truncated to
             # `_MAX_SKIPPED_WORKTREE_EXAMPLES` so a standing backlog can't
-            # re-emit the full list into events.db every interval; `skipped`
-            # above is still the exact, untruncated count.
+            # re-emit the full list into events.db every interval;
+            # `skipped_count` above is still the exact, untruncated count.
             "skipped_examples": skipped_full[:_MAX_SKIPPED_WORKTREE_EXAMPLES],
             # Distinguishes "never a candidate" (outside worktrees_dir or off
             # the dispatch branch prefix -- an operator-created worktree, for
@@ -18626,7 +18932,7 @@ class OrchestratorApp:
             state = load_state(state_file)
             state = arm_reconcile_pass(state, next_reconcile_at)
             data = result.data
-            if data.get("skipped"):
+            if data.get("pass_skipped"):
                 state = self._record_event(
                     state,
                     "reconcile_pass_skipped",
@@ -21786,6 +22092,13 @@ class OrchestratorApp:
         # dispatch boundary rather than shipping a worker who can change a
         # contract surface and push without ever exercising the wider suite.
         assert_execution_contract(prompt, context=f"worker prompt for issue #{issue_number}")
+        # Issue #1010: enforce the widened containment clause on the *rendered
+        # output* so a repo-local flat override that drops
+        # $section_scope_contract or reverts to the old repo-scoped wording
+        # (which does not cover a different repo) is caught at the dispatch
+        # boundary rather than shipping a worker with no effective prohibition
+        # against editing a sibling repo's checkout.
+        assert_containment(prompt, context=f"worker prompt for issue #{issue_number}")
         # Issue #618: the dry-run dispatch branch promises "skip all state
         # writes, label transitions, and file mutations" — mkdir + write_text
         # here would violate that, and for a dead-worker recovery candidate
