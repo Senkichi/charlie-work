@@ -1306,6 +1306,21 @@ def run_supervised(
     # Import here to avoid circular imports (supervise ← workflow ← supervise)
     from .workflow import CommandResult
 
+    # Same interpreter-anchored refusal as run_fleet_supervise: a repointed
+    # editable means everything below runs unreviewed code (issue #974).
+    from .venv_anchor import verify_interpreter_anchored_editables
+
+    anchor = verify_interpreter_anchored_editables()
+    if not anchor.ok:
+        logger.error("VENV EDITABLE ANCHOR VIOLATION: %s", anchor.detail)
+        log_event(
+            app.paths.state_file,
+            "venv_editable_anchor_violation",
+            {"detail": anchor.detail},
+        )
+        return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
+    logger.info("Venv editable anchor: %s", anchor.detail)
+
     # Single-instance guard
     lock_path = layout.supervisor_lock_path(app.paths.root)
     lock = try_acquire_supervisor_lock(lock_path)
