@@ -2530,6 +2530,46 @@ UNAUTHORIZED_MERGE_ACK_KEY = "unauthorized_merge_acknowledged"
 # Presence here silences the event, never the finding.
 UNAUTHORIZED_MERGE_DETECTED_KEY = "unauthorized_merge_detected"
 
+# Issue #934: an operator who legitimately adjudicates and merges a worker PR
+# whose recorded review decision is stale, absent, or pending has no way to
+# record that adjudication, so every legitimate operator merge becomes a
+# tripwire finding. ``merge_authorize`` writes an ``authorized_override`` into
+# the PR's ``review-decision.json``; the tripwire and ``merge-check`` treat an
+# override whose ``authorized_sha`` matches the live head as explicit
+# authorization. This helper extracts and validates that override from a
+# decision dict so both consumers share one enforcement point.
+#
+# An override that does not name a non-empty SHA or a non-empty reason is not a
+# valid override — it is treated as absent so the control never reads a
+# malformed record as authorization. A control that can be silenced with an
+# empty reason is no control, and an authorization that does not name the SHA
+# it authorizes reintroduces the exact hole (#802/#804: rebase moved the head
+# after the decision was recorded) the SHA-binding exists to close.
+
+
+def _authorized_override_matches(decision: dict[str, Any], live_head_sha: str | None) -> bool:
+    """Return ``True`` if ``decision`` carries a valid override for ``live_head_sha``.
+
+    Shared by ``_detect_unauthorized_merges`` (the post-merge tripwire) and
+    ``merge_check`` (the pre-merge preflight) so the two paths cannot drift on
+    what counts as authorization. Both must answer the same question — "is
+    there an explicit, SHA-bound, reason-bearing authorization for this head?"
+    — or a merge that passes the preflight still trips the post-merge control.
+    """
+    override = decision.get("authorized_override")
+    if not isinstance(override, dict):
+        return False
+    authorized_sha = override.get("authorized_sha")
+    reason = override.get("reason")
+    return (
+        isinstance(authorized_sha, str)
+        and bool(authorized_sha)
+        and authorized_sha == live_head_sha
+        and isinstance(reason, str)
+        and bool(reason.strip())
+    )
+
+
 # Caps for the error detail carried in the `loop_completed` payload. The
 # loop-body `errors` list is unbounded by construction — one entry per PR that
 # raised — and this payload lands in both the capped 200-entry `events` array in
@@ -13307,6 +13347,27 @@ class OrchestratorApp:
             # enforcement) to surface required_changes, so the decision file
             # must be on disk first. A label-write failure or crash after this
             # point leaves a durable verdict and a brief consistent with it.
+            #
+            # Issue #934: ``decision_payload`` is a fresh dict that would
+            # silently discard an ``authorized_override`` written by
+            # ``merge_authorize``. The read-modify-write here is inside the
+            # ``state_lock`` (which ``merge_authorize`` also holds), so re-reading
+            # the file at this point is atomic against concurrent writers. Carry
+            # the override forward so a subsequent ``record_review`` for the same
+            # PR does not resurrect the false-positive tripwire finding this PR
+            # exists to eliminate.
+            if decision_path.exists():
+                try:
+                    with decision_path.open("r", encoding="utf-8") as _handle:
+                        _existing_decision = json.load(_handle)
+                    if isinstance(_existing_decision, dict) and isinstance(
+                        _existing_decision.get("authorized_override"), dict
+                    ):
+                        decision_payload["authorized_override"] = _existing_decision[
+                            "authorized_override"
+                        ]
+                except (OSError, json.JSONDecodeError):
+                    pass
             self._write_json(decision_path, decision_payload)
             if decision == "request_changes" and not escalated:
                 rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
@@ -14008,6 +14069,30 @@ class OrchestratorApp:
                 f"PR #{pr_number}: no live head sha — refusing to authorize",
                 {**base, "authorized": False, "reason": "no_live_head"},
             )
+        # Issue #934: an explicit operator authorization recorded via
+        # ``merge_authorize`` is as authoritative as an approved review
+        # decision. Checked before the missing/invalid/not-approved/head-moved
+        # gates so a valid override authorizes regardless of the recorded
+        # review verdict — that is the whole point, since the override exists
+        # for PRs whose verdict is stale, absent, or pending. A malformed or
+        # SHA-mismatched override falls through to the existing fail-closed
+        # checks below, so this adds a way to record authorization without
+        # adding a way to skip the control.
+        if _authorized_override_matches(decision, live_head_sha):
+            override = decision["authorized_override"]
+            return CommandResult(
+                True,
+                f"PR #{pr_number}: authorized by operator override at head "
+                f"{live_head_sha} (by {override.get('by') or 'unknown'})",
+                {
+                    **base,
+                    "authorized": True,
+                    "reason": "authorized_override",
+                    "authorized_by": override.get("by"),
+                    "authorized_at": override.get("authorized_at"),
+                    "authorized_sha": override.get("authorized_sha"),
+                },
+            )
         if decision_value == "missing":
             return CommandResult(
                 False,
@@ -14039,6 +14124,142 @@ class OrchestratorApp:
             True,
             f"PR #{pr_number}: approved at current head {live_head_sha}",
             {**base, "authorized": True, "reason": "approved_at_head"},
+        )
+
+    def merge_authorize(
+        self,
+        pr_number: int,
+        reason: str,
+        *,
+        by: str | None = None,
+        sha: str | None = None,
+    ) -> CommandResult:
+        """Record an operator's explicit authorization to merge a worker PR (issue #934).
+
+        The unauthorized-merge tripwire (#673) and the ``merge-check`` preflight
+        (#894) both infer authorization from ``decision == "approved"`` and
+        ``reviewed_head_sha == live_head_sha``. An operator who legitimately
+        adjudicates a PR whose recorded decision is stale, absent, or pending —
+        and merges it — has no way to record that adjudication, so every
+        legitimate operator merge becomes a tripwire finding that pins
+        ``ok=False`` on every subsequent pass until someone writes a
+        retrospective ack. The authorized path and the unauthorized path are
+        indistinguishable by construction.
+
+        This writes an ``authorized_override`` into the PR's
+        ``review-decision.json``: ``{by, reason, authorized_sha,
+        authorized_at}``. The tripwire and ``merge-check`` treat an override
+        whose ``authorized_sha`` matches the live head as explicit
+        authorization (via ``_authorized_override_matches``), so the control
+        reads a **recorded** authorization rather than inferring one.
+
+        Properties (from #934):
+
+        - **Does not weaken the control.** This adds a way to *record*
+          authorization; it must not add a way to *skip* the check. An
+          unrecorded merge is still a finding. The override is a field in the
+          decision record, not a bypass — both ``_detect_unauthorized_merges``
+          and ``merge_check`` still run their full logic; they just gain an
+          additional authorization source.
+        - **The reason stays mandatory**, matching ``tripwire ack`` — "a
+          tripwire that can be silenced silently is no control" applies at
+          least as strongly before the merge as after it.
+        - **Bind to the SHA.** Two of the four Class B cases (#802, #804) were
+          flagged specifically because a rebase moved the head after the
+          decision was recorded. The override names the exact SHA it
+          authorizes; a rebase after authorization moves the head and
+          invalidates the override, exactly as it invalidates an approved
+          decision.
+
+        The override is merge-updated into the existing decision record (not a
+        fresh file), so the reviewer's original verdict is preserved alongside
+        the operator's authorization. If no decision file exists, one is
+        created with just the override — the reviewer verdict is absent, and
+        the override is the authorization.
+        """
+        if not reason.strip():
+            return CommandResult(
+                False,
+                "a non-empty --reason is required to record a merge authorization "
+                "(a tripwire that can be silenced silently is no control)",
+                {"pr": pr_number},
+            )
+
+        pr = self.gh.pr_view(pr_number)
+        if not isinstance(pr, dict) or not pr:
+            return CommandResult(
+                False,
+                f"PR #{pr_number}: cannot read PR from GitHub — refusing to authorize",
+                {"pr": pr_number, "authorized": False, "reason": "pr_unreadable"},
+            )
+
+        authorized_sha = sha if sha is not None else pr.get("headRefOid")
+        if not authorized_sha or not isinstance(authorized_sha, str):
+            return CommandResult(
+                False,
+                f"PR #{pr_number}: no head SHA to bind the authorization to "
+                "— refusing to record an unbound override",
+                {"pr": pr_number, "authorized": False, "reason": "no_head_sha"},
+            )
+
+        decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
+        override_payload = {
+            "by": by,
+            "reason": reason,
+            "authorized_sha": authorized_sha,
+            "authorized_at": utc_now(),
+        }
+
+        with state_lock(self.paths.state_file):
+            # Merge-update the override into the existing decision record. If
+            # the file is absent or unparseable, start from an empty base — the
+            # override is the authorization, and the reviewer verdict (if any)
+            # is preserved when it exists. The read is inside the ``state_lock``
+            # (which ``record_review`` also holds) so the read-modify-write is
+            # genuinely atomic against concurrent writers — a TOCTOU where
+            # ``record_review`` overwrites the file between this read and the
+            # write below would silently discard the override (issue #934
+            # review finding).
+            if decision_path.exists():
+                try:
+                    with decision_path.open("r", encoding="utf-8") as handle:
+                        existing = json.load(handle)
+                    if not isinstance(existing, dict):
+                        existing = {}
+                except (OSError, json.JSONDecodeError):
+                    existing = {}
+            else:
+                existing = {}
+            updated = {**existing, "authorized_override": override_payload}
+            # Write the decision file atomically (CLAUDE.md invariant: all JSON
+            # state writes use temp-file + replace).
+            self._write_json(decision_path, updated)
+            state = load_state(self.paths.state_file)
+            state = self._record_event(
+                state,
+                "merge_authorized",
+                {
+                    "pr": pr_number,
+                    "by": by,
+                    "reason": reason,
+                    "authorized_sha": authorized_sha,
+                },
+            )
+            save_state(self.paths.state_file, state)
+
+        return CommandResult(
+            True,
+            f"PR #{pr_number}: recorded operator authorization to merge at head "
+            f"{authorized_sha} (by {by or 'unknown'})",
+            {
+                "pr": pr_number,
+                "authorized": True,
+                "authorized_sha": authorized_sha,
+                "authorized_by": by,
+                "reason": reason,
+                "decision_path": str(decision_path),
+                "state_file": str(self.paths.state_file),
+            },
         )
 
     @_guard_state_lock
@@ -21683,7 +21904,18 @@ class OrchestratorApp:
                 and live_head_sha is not None
                 and reviewed_head_sha == live_head_sha
             )
-            if not approved or not head_matches:
+            # Issue #934: an explicit operator authorization recorded at merge
+            # time is as authoritative as an approved review decision. Without
+            # this, every legitimate operator merge of a worker PR (stale
+            # decision, absent decision, or pending after rebase) becomes a
+            # finding that pins ok=False until someone writes a retrospective
+            # ack. The override is SHA-bound and reason-bearing — see
+            # ``_authorized_override_matches`` — so it does not weaken the
+            # control: an unrecorded merge is still a finding, and a rebase
+            # after authorization invalidates the override exactly as it
+            # invalidates an approved decision.
+            override_authorized = _authorized_override_matches(decision, live_head_sha)
+            if (not approved or not head_matches) and not override_authorized:
                 issue_number = linked_issue_number(
                     pr,
                     is_cross_repository=pr.get("isCrossRepository"),

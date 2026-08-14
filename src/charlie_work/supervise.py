@@ -1414,6 +1414,20 @@ def run_supervised(
         return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
     logger.info("Venv editable anchor: %s", anchor.detail)
 
+    # Record where ci_fleet was actually imported from plus the sibling
+    # repo's HEAD and dirty-state (issue #954). Same instrumentation as
+    # run_fleet_supervise: the editable .pth means the supervisor runs
+    # whatever is saved in the sibling working tree, committed or not.
+    # This records, it does not prevent. Best-effort, never raises.
+    from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
+
+    provenance = ci_fleet_provenance_snapshot()
+    log_event(
+        app.paths.state_file,
+        "ci_fleet_provenance",
+        ci_fleet_provenance_payload(provenance),
+    )
+
     # Single-instance guard
     lock_path = layout.supervisor_lock_path(app.paths.root)
     lock = try_acquire_supervisor_lock(lock_path)
