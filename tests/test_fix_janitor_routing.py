@@ -159,7 +159,7 @@ def test_janitor_conflict_attempts_count_cycles_not_passes(tmp_path: Path) -> No
     # machine.
     app.gh.pr_head_shas[456] = "sha-cycle-4"
     result4 = app.review(456)
-    assert result4.data.get("skipped") is True
+    assert result4.data.get("pass_skipped") is True
     assert "escalated" in result4.message
     state = load_state(app.paths.state_file)
     assert state["prs"]["456"]["conflict_rework_attempts"] == 3
@@ -914,7 +914,7 @@ def test_janitor_conflict_stall_escalation_blocks_reentry_until_unescalated(
     # blocked behind the escalated-issue early return.
     result3 = app.review(456)
     assert result3.ok is True
-    assert result3.data.get("skipped") is True
+    assert result3.data.get("pass_skipped") is True
     assert result3.data.get("routed_to_rework") is not True
 
     state = load_state(app.paths.state_file)
