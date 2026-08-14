@@ -703,9 +703,7 @@ _CITATION_EXPECTATIONS: dict[str, tuple[str, ...]] = {
 
 # Matches `workflow.py::<Symbol>` / `workflow.py::<Class>.<method>` -- a dotted
 # path of Python identifiers naming the cited function/method/class.
-_CITATION_RE = re.compile(
-    r"workflow\.py::([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
-)
+_CITATION_RE = re.compile(r"workflow\.py::([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)")
 
 # The old absolute-line-number citation form #1213 replaced. Nothing in
 # this file should match this again -- a hit means either a citation that
