@@ -34,8 +34,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# ``gh pr merge`` anywhere in a shell command, including after ``&&``/``;``/``|``.
-_GH_PR_MERGE = re.compile(r"\bgh\s+pr\s+merge\b")
+# ``gh ... pr ... merge`` anywhere in a shell command, including after
+# ``&&``/``;``/``|``. gh (cobra) allows global flags interspersed between the
+# words (``gh -R o/r pr merge``, ``gh pr -R o/r merge``), so the intervening
+# tokens are matched too — but never across a shell separator, so a mention
+# followed by an unrelated ``merge`` in a later command does not trip it.
+_GH_PR_MERGE = re.compile(r"\bgh(?:\s+[^\s;|&]+)*?\s+pr(?:\s+[^\s;|&]+)*?\s+merge\b")
 
 
 def _load_fleet_roots() -> dict[str, Path] | None:
@@ -94,11 +98,21 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
     """Extract every ``gh pr merge`` invocation's PR number and ``--repo``.
 
     Detection is token-based, not substring-based: the command is shlex-split
-    and an invocation is three *consecutive* tokens ``gh pr merge``. A mention
-    of the command inside a quoted string (a commit message, an echo) is a
-    single token after splitting and therefore does not match — the first
-    version of this hook denied its own feature commit because the message
-    *described* the command it guards.
+    and an invocation is the words ``gh``, ``pr``, ``merge`` in order with only
+    flag tokens between them (gh's cobra CLI accepts global flags interspersed
+    anywhere — see ``_match_gh_merge``). A mention of the command inside a
+    quoted string (a commit message, an echo) is a single token after splitting
+    and therefore does not match — the first version of this hook denied its
+    own feature commit because the message *described* the command it guards.
+
+    Splitting uses ``punctuation_chars`` so shell separators (``;``, ``&&``,
+    ``|``) become their own tokens instead of gluing onto neighbors (``5;``),
+    which would otherwise let a first invocation's argument scan swallow a
+    second invocation entirely.
+
+    A ``GH_REPO=owner/repo`` assignment token anywhere before an invocation is
+    tracked and applied to invocations that lack an explicit ``-R``/``--repo``,
+    mirroring gh's own precedence (flag > GH_REPO > cwd).
 
     If the command cannot be tokenized (unbalanced quotes), fall back to the
     raw-text regex: a match there yields ``pr=None``, which the caller must
@@ -108,17 +122,34 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
     or the number could not be parsed — the caller must fail closed on that.
     """
     try:
-        tokens = shlex.split(command)
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
     except ValueError:
         return [{"pr": None, "repo": None}] if _GH_PR_MERGE.search(command) else []
 
     targets: list[dict[str, Any]] = []
-    for start in range(len(tokens) - 2):
-        if tokens[start : start + 3] != ["gh", "pr", "merge"]:
+    gh_repo_env: str | None = None
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        # gh's documented GH_REPO override applies to any later gh call in the
+        # same shell command (prefix assignment, ``env``, or ``export``).
+        # Tracking every assignment seen so far and applying the latest is
+        # conservative in the deny direction: it may attribute a repo to an
+        # invocation the shell would not have given it to, never the reverse.
+        env_match = re.fullmatch(r"GH_REPO=(\S+)", tok)
+        if env_match:
+            gh_repo_env = env_match.group(1)
+            idx += 1
+            continue
+        matched_end, flag_repo = _match_gh_pr_merge(tokens, idx)
+        if matched_end is None:
+            idx += 1
             continue
         pr: int | None = None
-        repo: str | None = None
-        i = start + 3
+        repo: str | None = flag_repo
+        i = matched_end
         while i < len(tokens):
             tok = tokens[i]
             if tok in _SHELL_SEPARATORS:
@@ -139,11 +170,58 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
                     if repo_match:
                         repo = repo_match.group(1)
             i += 1
+        # Same precedence as gh itself: explicit flag > GH_REPO > cwd (None).
+        if repo is None:
+            repo = gh_repo_env
         # ``gh`` accepts OWNER/REPO or a full URL for --repo; normalize URLs.
         if repo and repo.startswith("https://github.com/"):
             repo = "/".join(repo.rstrip("/").split("/")[-2:])
         targets.append({"pr": pr, "repo": repo})
+        idx = i
     return targets
+
+
+def _match_gh_pr_merge(tokens: list[str], start: int) -> tuple[int | None, str | None]:
+    """Match a ``gh ... pr ... merge`` invocation starting at ``tokens[start]``.
+
+    gh (cobra) accepts flags interspersed anywhere, so ``gh pr -R o/r merge 5``
+    and ``gh -R o/r pr merge 5`` are both valid invocations — strict 3-token
+    adjacency would silently pass them (round-2 review finding on PR #1195).
+    This skips flag tokens between the words, consuming a value token for the
+    repo flags it understands and capturing it.
+
+    Returns ``(index_after_merge, repo_from_flags)`` on a match, else
+    ``(None, None)``.
+    """
+    if tokens[start] != "gh":
+        return None, None
+    repo: str | None = None
+    i = start + 1
+    for expected_word in ("pr", "merge"):
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok in _SHELL_SEPARATORS:
+                return None, None
+            if tok in ("-R", "--repo") and i + 1 < len(tokens):
+                repo = tokens[i + 1]
+                i += 2
+                continue
+            if tok.startswith("--repo="):
+                repo = tok.split("=", 1)[1]
+                i += 1
+                continue
+            if tok.startswith("-"):
+                # Unknown flag: assume boolean and keep scanning. If it
+                # actually consumed the next word, the worst case is a
+                # spurious match on a merge-shaped command, which errs
+                # toward deny — never toward bypass.
+                i += 1
+                continue
+            break
+        if i >= len(tokens) or tokens[i] != expected_word:
+            return None, None
+        i += 1
+    return i, repo
 
 
 def _run_merge_check(repo_root: Path, pr_number: int) -> tuple[bool, str]:

@@ -502,3 +502,84 @@ def test_decide_mcp_bool_pull_number_in_fleet_repo_denies(
     assert reason is not None
     assert "cannot determine PR number" in reason
     assert called == []
+
+
+# ---------------------------------------------------------------------------
+# Round-2 fixes (#1195): GH_REPO env override and interspersed global flags
+# ---------------------------------------------------------------------------
+
+
+def test_decide_bash_gh_repo_env_override_denied_on_failed_merge_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The reviewer-mandated bypass: GH_REPO=owner/repo was invisible to the
+    # old parser, so a merge into a fleet repo from a cwd outside every fleet
+    # root sailed through undecided. cwd is deliberately outside the fleet
+    # root to prove the target came from GH_REPO, not from cwd resolution.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fleet_root = tmp_path / "repo"
+    fleet_root.mkdir()
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {"senkichi/charlie-work": fleet_root})
+    monkeypatch.setattr(hook, "_run_merge_check", lambda repo_root, pr: (False, "not_approved"))
+    reason = hook._decide(
+        "Bash",
+        {"command": "GH_REPO=senkichi/charlie-work gh pr merge 5"},
+        outside,
+    )
+    assert reason is not None
+    assert "not_approved" in reason
+    assert "#5" in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr -R o/r merge 5",
+        "gh -R o/r pr merge 5",
+        "gh --repo=o/r pr merge 5",
+    ],
+)
+def test_parse_interspersed_global_flags(command: str) -> None:
+    targets = hook._parse_gh_merge_targets(command)
+    assert targets == [{"pr": 5, "repo": "o/r"}]
+
+
+def test_parse_gh_repo_env_overridden_by_explicit_flag() -> None:
+    # Same precedence as gh itself: explicit -R/--repo beats GH_REPO.
+    targets = hook._parse_gh_merge_targets("GH_REPO=a/b gh pr merge 5 -R x/y")
+    assert targets == [{"pr": 5, "repo": "x/y"}]
+
+
+def test_parse_gh_repo_env_via_env_prefix() -> None:
+    targets = hook._parse_gh_merge_targets("env GH_REPO=a/b gh pr merge 7")
+    assert targets == [{"pr": 7, "repo": "a/b"}]
+
+
+def test_parse_multi_invocation_with_gh_repo_env() -> None:
+    command = "gh pr merge 5; GH_REPO=o/r gh pr merge 6"
+    targets = hook._parse_gh_merge_targets(command)
+    assert targets == [
+        {"pr": 5, "repo": None},
+        {"pr": 6, "repo": "o/r"},
+    ]
+
+
+def test_gh_pr_merge_regex_matches_interspersed_flags() -> None:
+    assert hook._GH_PR_MERGE.search("gh -R o/r pr merge 5")
+    assert hook._GH_PR_MERGE.search("gh pr -R o/r merge 5")
+
+
+def test_gh_pr_merge_regex_does_not_match_unrelated_or_across_separator() -> None:
+    assert hook._GH_PR_MERGE.search("gh pr list; git merge main") is None
+    assert hook._GH_PR_MERGE.search("git merge main") is None
+
+
+def test_parse_gh_pr_view_merge_is_not_an_invocation() -> None:
+    # "merge" here is an argument to "view", not the merge subcommand.
+    assert hook._parse_gh_merge_targets("gh pr view merge") == []
+
+
+def test_parse_quoted_mention_of_gh_pr_merge_is_not_an_invocation() -> None:
+    command = "git commit -m 'about gh pr merge'"
+    assert hook._parse_gh_merge_targets(command) == []
