@@ -23271,10 +23271,12 @@ def test_record_review_blocked_also_derives_required_changes(tmp_path: Path) -> 
 def test_record_review_folds_external_findings_into_required_changes(
     tmp_path: Path,
 ) -> None:
-    """Issue #950: verified external PR comments, review bodies, and inline
-    review threads are folded into ``review-decision.json`` at record time,
-    with ``findings_channel`` set to ``"external"``. Bot-authored content is
-    filtered using the API ``user.type`` discriminator."""
+    """Issue #950/#999: verified external PR comments, review bodies, and
+    inline review threads are ingested into ``review-decision.json`` at
+    record time. Since #999 they ride in their own ``external_findings``
+    field (separate from the reviewer's ``required_changes``) so
+    ``findings_channel`` keeps describing only the reviewer's list. Bot-
+    authored content is filtered using the API ``user.type`` discriminator."""
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -23294,19 +23296,21 @@ def test_record_review_folds_external_findings_into_required_changes(
     decision = json.loads(
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
-    assert decision["findings_channel"] == "external"
+    # The reviewer provided an itemized list, so findings_channel stays
+    # unset (the derivation block only runs on an empty list) -- it is NOT
+    # flipped to "external" anymore (issue #999).
+    assert "findings_channel" not in decision
     assert decision["summary"] == "The retry wrapper swallows the exception type (Fixes #649)."
-    # Internal finding is preserved.
-    assert "add a regression test" in decision["required_changes"]
-    # Human-authored external findings are folded in.
-    assert any("interactive PR list" in item for item in decision["required_changes"])
-    assert any(
-        "https://github.com/cli/cli/pull/14076" in item for item in decision["required_changes"]
-    )
-    assert any("whole test" in item for item in decision["required_changes"])
+    # Internal finding is preserved untouched in required_changes.
+    assert decision["required_changes"] == ["add a regression test"]
+    # Human-authored external findings ride in their own field.
+    external = decision["external_findings"]
+    assert any("interactive PR list" in item for item in external)
+    assert any("https://github.com/cli/cli/pull/14076" in item for item in external)
+    assert any("whole test" in item for item in external)
     # Bot-authored bodies are skipped via user.type == "Bot".
-    assert not any("v0.83.5" in item for item in decision["required_changes"])
-    assert not any("git.Client wrapper" in item for item in decision["required_changes"])
+    assert not any("v0.83.5" in item for item in external)
+    assert not any("git.Client wrapper" in item for item in external)
 
 
 def test_record_review_external_findings_override_vacuous_summary(
@@ -23369,7 +23373,10 @@ def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path
     )
     assert result1.ok is True
     decision1 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    assert any("retry wrapper" in item for item in decision1["required_changes"])
+    # Issue #999: external findings ride in their own field, not required_changes.
+    assert decision1["required_changes"] == ["fix the internal thing"]
+    external1 = decision1["external_findings"]
+    assert any("retry wrapper" in item for item in external1)
     reviewed_at_round1 = decision1["reviewed_at"]
     assert reviewed_at_round1
 
@@ -23397,12 +23404,14 @@ def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path
     )
     assert result2.ok is True
     decision2 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    changes2 = decision2["required_changes"]
+    # The reviewer's required_changes stay separate from external findings.
+    assert decision2["required_changes"] == ["fix the internal thing, round 2"]
+    external2 = decision2["external_findings"]
 
     # The new, post-round-1 comment is ingested.
-    assert any("regression test for the timeout path" in item for item in changes2)
+    assert any("regression test for the timeout path" in item for item in external2)
     # The stale round-1 comment (already surfaced once) is not re-ingested.
-    assert not any("retry wrapper" in item for item in changes2)
+    assert not any("retry wrapper" in item for item in external2)
 
 
 def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
@@ -23449,14 +23458,14 @@ def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
 
     assert result.ok is True
     decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    changes = decision["required_changes"]
+    # Issue #999: external findings ride in their own field.
+    assert decision["required_changes"] == ["keep me"]
+    external = decision["external_findings"]
 
     # The orchestrator's own echo is filtered out...
-    assert not any("retry wrapper swallows the type" in item for item in changes)
+    assert not any("retry wrapper swallows the type" in item for item in external)
     # ...while a genuine human finding from an identical account type is kept.
-    assert any("rollback path" in item for item in changes)
-    # And the internal finding survives untouched.
-    assert "keep me" in changes
+    assert any("rollback path" in item for item in external)
 
 
 def test_human_quote_reply_to_orchestrator_comment_is_still_ingested(
@@ -23507,13 +23516,77 @@ def test_human_quote_reply_to_orchestrator_comment_is_still_ingested(
 
     assert result.ok is True
     decision = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
-    changes = decision["required_changes"]
+    # Issue #999: external findings ride in their own field.
+    assert decision["required_changes"] == ["keep me"]
+    external = decision["external_findings"]
 
     # The human's finding survives even though their comment embeds our marker.
-    assert any("rollback path" in item for item in changes)
+    assert any("rollback path" in item for item in external)
     # Our own unquoted comment is still filtered out.
-    assert not any(item.lstrip().startswith(ORCHESTRATOR_COMMENT_MARKER) for item in changes)
-    assert "keep me" in changes
+    assert not any(item.lstrip().startswith(ORCHESTRATOR_COMMENT_MARKER) for item in external)
+
+
+def test_record_review_derived_with_external_findings_preserves_both(
+    tmp_path: Path,
+) -> None:
+    """Issue #999 core round-trip: a ``derived`` verdict (reviewer produced
+    no itemized list, so the summary was back-derived) that ALSO carries
+    external PR comments must persist the derived summary in
+    ``required_changes`` with ``findings_channel == "derived"`` (NOT
+    overwritten to ``"external"``) and the external findings in their own
+    ``external_findings`` field. The rendered rework brief must show the
+    derived summary verbatim (not as a single bullet) AND the external
+    items as bullets under their own heading.
+
+    Before #999, ``record_review`` merged the external items into
+    ``required_changes`` and flipped the channel to ``"external"``, so the
+    renderer took the itemized path and the multi-paragraph derived summary
+    -- the only representation of what the reviewer wanted changed -- was
+    emitted as one ``- {...}`` bullet.
+    """
+    from charlie_work.workflow import _render_required_changes_section
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    prose = (
+        "The retry wrapper swallows the exception type. Callers cannot "
+        "distinguish a transient failure from a permanent one, so every "
+        "retry loop masks real bugs."
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": "The migration needs a rollback path before this can land.",
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2099-01-01T00:00:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # No itemized required_changes -> record_review derives from summary.
+    result = app.record_review(456, "request_changes", summary=prose, required_changes=None)
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    # The channel stays "derived" -- NOT overwritten to "external".
+    assert decision["findings_channel"] == "derived"
+    # required_changes holds the derived summary, NOT the external item.
+    assert decision["required_changes"] == [prose]
+    # External findings ride in their own field.
+    assert decision["external_findings"] == [
+        "The migration needs a rollback path before this can land."
+    ]
+
+    # The rendered brief shows the derived summary verbatim (not a bullet)
+    # and the external item under its own heading.
+    section = _render_required_changes_section(decision)
+    assert prose in section
+    assert f"- {prose}" not in section
+    assert "did not record a structured findings list" in section
+    assert "## Findings posted on the PR itself" in section
+    assert "- The migration needs a rollback path before this can land." in section
 
 
 def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
