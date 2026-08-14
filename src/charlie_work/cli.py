@@ -373,6 +373,18 @@ def build_parser() -> argparse.ArgumentParser:
     autoscale_parser.add_argument(
         "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
     )
+    provision_parser = runners_sub.add_parser(
+        "provision",
+        help=(
+            "Manually provision one new runner when the pool is starved, reusing "
+            "decide_autoscale()'s guardrails (max_runners, RAM headroom, cooldown). "
+            "Scale-up only: never scales down. Issue #826."
+        ),
+    )
+    _add_dry_run(provision_parser)
+    provision_parser.add_argument(
+        "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
+    )
     allocate_parser = runners_sub.add_parser(
         "allocate",
         help=(
@@ -1796,6 +1808,163 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
         )
 
 
+def run_runners_provision(args: argparse.Namespace) -> CommandResult:
+    """Manually provision one new runner when the pool is starved (issue #826).
+
+    Scale-up only. Reuses ``decide_autoscale()``'s guardrails — max_runners,
+    RAM headroom, cooldown, CPU threshold — so the manual trigger cannot
+    bypass a ceiling that the unattended path would respect. Deliberately
+    never scales down: ``provision`` is an "add capacity" button, not a
+    second autoscale. If ``decide_autoscale`` returns ``ScaleAction.DOWN``,
+    the command reports the decision and exits without action.
+
+    Operator ruling (2026-08-13): approved as manual-trigger only, NOT
+    unattended autoscale. ``runner_scaling.enabled`` remaining false (the
+    code default) is a hard refusal — the operator must opt in by setting
+    the ``runner_scaling`` section (``enabled``, ``managed_root``,
+    ``package_zip``) in config before this command can act.
+
+    Provisioning stays on its own cadence and must not start or stop
+    listeners — ``charlie runners allocate`` remains the only controller of
+    which listeners run. This command only adds registrations via
+    ``provision_runner``; it never calls ``scale_down_idle_runners``.
+    """
+    ctx = bootstrap_command(args)
+
+    if not ctx.config.runner_scaling.enabled:
+        return CommandResult(
+            ok=False,
+            message="runner_scaling feature is not enabled in config",
+            data={},
+        )
+
+    dry_run = getattr(args, "dry_run", False)
+    fleet_wide = getattr(args, "fleet_wide", False)
+
+    # Observe current pool state
+    state = observe_runner_pool(
+        ctx.gh, ctx.config.runner_scaling, state_dir=ctx.paths.root, dry_run=dry_run
+    )
+
+    # Load fleet-wide totals if requested — same guardrail source as autoscale
+    fleet_totals: FleetTotals | None = None
+    skipped_repos: list[str] = []
+    if fleet_wide:
+        total_runners, total_busy_runners, skipped_repos = count_fleet_runners(
+            args.fleet_dir, runtime=ctx.config.runtime
+        )
+        fleet_totals = FleetTotals(
+            total_runners=total_runners,
+            total_busy_runners=total_busy_runners,
+        )
+
+    # Check cooldown — a guardrail decide_autoscale also enforces internally,
+    # but surfacing it here lets the operator see the reason without digging
+    # through the decision's ``reason`` string.
+    in_cooldown = is_in_cooldown(ctx.paths.root, ctx.config.runner_scaling.cooldown_minutes)
+
+    # is_idle_for_duration is a scale-down input only. Provision is scale-up
+    # only, so it is always False here — passing True would let decide_autoscale
+    # return DOWN, which this command would then refuse to act on anyway.
+    # Hardcoding False is not a hardcoded element (rule #9): it is the correct
+    # value for an input this command does not use, not a list of things to
+    # manage.
+    decision = decide_autoscale(
+        state,
+        ctx.config.runner_scaling,
+        fleet_totals=fleet_totals,
+        in_cooldown=in_cooldown,
+        is_idle_for_duration=False,
+    )
+
+    # Provision is scale-up only. A DOWN decision is reported but not acted
+    # on — this command must not become a second scale-down path that fights
+    # allocation's hysteresis or autoscale's idle detection.
+    if decision.action == ScaleAction.DOWN:
+        return CommandResult(
+            ok=True,
+            message=(
+                f"provision: scale-down declined (provision is scale-up only) - {decision.reason}"
+            ),
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "declined": True,
+            },
+        )
+
+    # In dry-run mode, return the decision without executing
+    if dry_run or decision.action != ScaleAction.UP:
+        return CommandResult(
+            ok=True,
+            message=f"provision: no action - {decision.reason}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "state": format_runner_pool_state(state),
+                "fleet_totals": {
+                    "total_runners": fleet_totals.total_runners if fleet_totals else 0,
+                    "total_busy_runners": fleet_totals.total_busy_runners if fleet_totals else 0,
+                    "skipped_repos": skipped_repos,
+                }
+                if fleet_totals
+                else None,
+            },
+        )
+
+    # Execute the scale-up
+    from ci_fleet.charlie_work_adapter import provision_runner
+
+    # Affinity knobs sourced from runner_allocation, same as autoscale.
+    # 0/0 (the section's defaults) is a no-op downstream.
+    result = provision_runner(
+        ctx.gh,
+        ctx.config.runner_scaling,
+        state.busy_runners,
+        dry_run=False,
+        reserved_threads=ctx.config.runner_allocation.reserved_threads,
+        threads_per_slot=ctx.config.runner_allocation.threads_per_slot,
+    )
+    if result.ok:
+        from ci_fleet.charlie_work_adapter import record_scale_event
+
+        record_scale_event(ctx.paths.root, "up")
+        return CommandResult(
+            ok=True,
+            message=f"provision: scaled up - {decision.reason}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "provisioning": {
+                    "runner_name": result.runner_name,
+                    "runner_dir": str(result.runner_dir) if result.runner_dir else None,
+                },
+            },
+        )
+    else:
+        return CommandResult(
+            ok=False,
+            message=f"provision: scale up failed - {result.error}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "error": result.error,
+            },
+        )
+
+
 def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
     """Rebalance running runner listeners across repos by live queue demand.
 
@@ -2105,6 +2274,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_runners_scale_down(args)
             elif args.runners_command == "autoscale":
                 result = run_runners_autoscale(args)
+            elif args.runners_command == "provision":
+                result = run_runners_provision(args)
             elif args.runners_command == "allocate":
                 result = run_runners_allocate(args)
             else:
