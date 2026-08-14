@@ -274,6 +274,7 @@ FLEET_REGISTRY_FILENAME = "fleet.json"
 FLEET_LOCK_FILENAME = "fleet.lock"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
+CAPACITY_STARVATION_STATE_FILENAME = "capacity_starvation_state.json"
 
 # The fleet heartbeat state file (``heartbeat-state.json``) also lives in the
 # fleet dir, but is deliberately NOT centralised here. Its sole owner is
@@ -308,6 +309,7 @@ _ENFORCED_FILENAMES = (
     FLEET_LOCK_FILENAME,
     FLEET_SUPERVISOR_LOCK_FILENAME,
     NOTIFY_HEALTH_STATE_FILENAME,
+    CAPACITY_STARVATION_STATE_FILENAME,
 )
 
 
@@ -342,3 +344,16 @@ def fleet_supervisor_lock_path(override: str | None = None) -> Path:
 def notify_health_state_path(override: str | None = None) -> Path:
     """Return the fleet health-notification baseline sidecar path."""
     return fleet_dir(override=override) / NOTIFY_HEALTH_STATE_FILENAME
+
+
+def capacity_starvation_state_path(override: str | None = None) -> Path:
+    """Return the fleet capacity-starvation escalation sidecar path (issue #763).
+
+    Persists per-repo starvation episode start timestamps and an ``escalated``
+    flag so the sustained-window escalation is edge-triggered across supervisor
+    respawns: the escalation fires once per episode when the starvation has
+    persisted for ``runner_capacity_escalation.starvation_escalation_minutes``,
+    not every pass. Lives in the fleet dir alongside the other fleet-level
+    sidecars (``notify_health_state.json``, ``runner-allocation.json``).
+    """
+    return fleet_dir(override=override) / CAPACITY_STARVATION_STATE_FILENAME
