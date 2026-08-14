@@ -8569,51 +8569,55 @@ class OrchestratorApp:
         if missing_findings:
             if not self._worker_token_escalated:
                 self._worker_token_escalated = True
-                # Read the durable marker outside the lock as a best-effort
-                # decision; the authoritative re-check is inside the lock
-                # before writing, so a stale read can at worst enter the
-                # lock block (which then no-ops).
-                durable_escalated = load_state(self.paths.state_file).get(
-                    "worker_token_escalated", False
-                )
-                if not durable_escalated:
-                    # Record the escalation event once. Payload carries only
-                    # config_key names and adapter contexts — never a token
-                    # value or prefix (issue #1001 acceptance criterion).
-                    #
-                    # Dry-run never writes: the escalation event and the
-                    # durable marker are state mutations (state_lock +
-                    # save_state), so they are gated on ``not self.dry_run``
-                    # — the same read-only contract documented at the
-                    # merge_ready dry-run gate (~line 15452, "Dry-run never
-                    # writes") and modelled on this function's own
-                    # top-of-body dry-run short-circuit. The in-memory
-                    # once-only flag is still set under dry-run so a dry-run
-                    # pass does not re-enter this block on the next pass;
-                    # the event and marker are emitted on the first real
-                    # (non-dry-run) dispatch. ``self.dry_run`` is fixed at
-                    # construction, so a dry-run instance cannot later
-                    # "forget" the flag and skip a real write.
-                    if not self.dry_run:
-                        with state_lock(self.paths.state_file):
-                            state = load_state(self.paths.state_file)
-                            if not state.get("worker_token_escalated", False):
-                                state = self._record_event(
-                                    state,
-                                    "worker_token_missing",
-                                    {
-                                        "findings": [
-                                            {
-                                                "config_key": f.config_key,
-                                                "context": f.context,
-                                            }
-                                            for f in missing_findings
-                                        ],
-                                    },
-                                    level="warning",
-                                )
-                                state["worker_token_escalated"] = True
-                                save_state(self.paths.state_file, state)
+                # Record the escalation event once. Payload carries only
+                # config_key names and adapter contexts — never a token
+                # value or prefix (issue #1001 acceptance criterion).
+                #
+                # Dry-run never writes: the escalation event and the
+                # durable marker are state mutations (state_lock +
+                # save_state), so they are gated on ``not self.dry_run``
+                # — the same read-only contract documented at the
+                # merge_ready dry-run gate (~line 15452, "Dry-run never
+                # writes") and modelled on this function's own
+                # top-of-body dry-run short-circuit. The in-memory
+                # once-only flag is still set under dry-run so a dry-run
+                # pass does not re-enter this block on the next pass;
+                # the event and marker are emitted on the first real
+                # (non-dry-run) dispatch. ``self.dry_run`` is fixed at
+                # construction, so a dry-run instance cannot later
+                # "forget" the flag and skip a real write.
+                #
+                # The durable marker is read inside the lock (not before it)
+                # so the cross-instance once-only guarantee holds without an
+                # unlocked load_state — issue #310's
+                # test_no_unlocked_load_state_in_production_code lint forbids
+                # any load_state outside a state_lock block. The in-memory
+                # ``_worker_token_escalated`` flag is the first gate
+                # (same-instance), so the lock is entered at most once per
+                # instance lifetime (the flag's False→True transition); the
+                # inner ``if not state.get(...)`` re-check is the
+                # authoritative cross-instance gate and no-ops when a prior
+                # instance already set the marker.
+                if not self.dry_run:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        if not state.get("worker_token_escalated", False):
+                            state = self._record_event(
+                                state,
+                                "worker_token_missing",
+                                {
+                                    "findings": [
+                                        {
+                                            "config_key": f.config_key,
+                                            "context": f.context,
+                                        }
+                                        for f in missing_findings
+                                    ],
+                                },
+                                level="warning",
+                            )
+                            state["worker_token_escalated"] = True
+                            save_state(self.paths.state_file, state)
             if self.config.dispatch.require_worker_github_token and not self.dry_run:
                 return CommandResult(
                     True,
