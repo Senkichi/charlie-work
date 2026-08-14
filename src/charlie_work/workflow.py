@@ -7416,12 +7416,15 @@ class OrchestratorApp:
         self.gh = gh
         self.dry_run = dry_run
         self.fleet_dir_override = fleet_dir_override
-        # Issue #1001: once-only escalation flag for the worker-github-token
-        # gate. A missing token is a standing condition; the gate must not
-        # emit an event every loop pass. This instance-level flag persists
-        # across passes within a process lifetime and resets on restart —
-        # which is exactly when config changes (self.config is assigned only
-        # here, never reassigned on a live instance).
+        # Issue #1001: same-instance once-only escalation flag for the
+        # worker-github-token gate. A missing token is a standing condition;
+        # the gate must not emit an event every loop pass. The cross-instance
+        # source of truth is the durable ``worker_token_escalated`` marker in
+        # state.json (fleet_loop rebuilds this app per repo per pass, so an
+        # instance flag alone resets every pass). This in-memory flag is a
+        # same-instance optimization that also suppresses re-entry under
+        # dry-run, where the durable marker is never written. It is cleared
+        # when the condition resolves (all findings ok) alongside the marker.
         self._worker_token_escalated = False
         # Make the event ring cap config-driven (issue #525).
         _state.EVENT_RING_SIZE = config.runtime.event_ring_size
@@ -8473,50 +8476,66 @@ class OrchestratorApp:
         # down on a config that has not yet been provisioned — see the issue
         # #1001 sequencing hazard comment in config.py).
         #
-        # The escalation fires once for a standing condition via the
-        # instance-level _worker_token_escalated flag (initialized in
-        # __init__), cleared when the condition resolves (all findings ok) or
-        # on process restart (which is when config changes — self.config is
-        # never reassigned on a live instance).
+        # The once-only guarantee must hold across OrchestratorApp
+        # reconstruction: fleet_dispatch.fleet_loop builds a fresh app per
+        # repo per pass, so an instance-level flag alone resets every pass
+        # and re-escalates indefinitely. The durable marker
+        # ``worker_token_escalated`` in state.json is the cross-instance
+        # source of truth; the instance-level ``_worker_token_escalated``
+        # flag (initialized in __init__) is a same-instance optimization
+        # that also covers dry-run, where the durable marker is never
+        # written. The marker is cleared when the condition resolves (all
+        # findings ok), so a future regression re-escalates.
         token_findings = worker_github_token_findings(self.config)
         missing_findings = [f for f in token_findings if not f.ok]
         if missing_findings:
             if not self._worker_token_escalated:
                 self._worker_token_escalated = True
-                # Record the escalation event once. Payload carries only
-                # config_key names and adapter contexts — never a token value
-                # or prefix (issue #1001 acceptance criterion).
-                #
-                # Dry-run never writes: the escalation event is a state
-                # mutation (state_lock + save_state), so it is gated on
-                # ``not self.dry_run`` — the same read-only contract
-                # documented at the merge_ready dry-run gate (~line 15452,
-                # "Dry-run never writes") and modelled on this function's
-                # own top-of-body dry-run short-circuit. The in-memory
-                # once-only flag is still set under dry-run so a dry-run
-                # pass does not re-enter this block on the next pass; the
-                # event itself is emitted on the first real (non-dry-run)
-                # dispatch. ``self.dry_run`` is fixed at construction, so a
-                # dry-run instance cannot later "forget" the flag and skip
-                # a real write.
-                if not self.dry_run:
-                    with state_lock(self.paths.state_file):
-                        state = load_state(self.paths.state_file)
-                        state = self._record_event(
-                            state,
-                            "worker_token_missing",
-                            {
-                                "findings": [
+                # Read the durable marker outside the lock as a best-effort
+                # decision; the authoritative re-check is inside the lock
+                # before writing, so a stale read can at worst enter the
+                # lock block (which then no-ops).
+                durable_escalated = load_state(self.paths.state_file).get(
+                    "worker_token_escalated", False
+                )
+                if not durable_escalated:
+                    # Record the escalation event once. Payload carries only
+                    # config_key names and adapter contexts — never a token
+                    # value or prefix (issue #1001 acceptance criterion).
+                    #
+                    # Dry-run never writes: the escalation event and the
+                    # durable marker are state mutations (state_lock +
+                    # save_state), so they are gated on ``not self.dry_run``
+                    # — the same read-only contract documented at the
+                    # merge_ready dry-run gate (~line 15452, "Dry-run never
+                    # writes") and modelled on this function's own
+                    # top-of-body dry-run short-circuit. The in-memory
+                    # once-only flag is still set under dry-run so a dry-run
+                    # pass does not re-enter this block on the next pass;
+                    # the event and marker are emitted on the first real
+                    # (non-dry-run) dispatch. ``self.dry_run`` is fixed at
+                    # construction, so a dry-run instance cannot later
+                    # "forget" the flag and skip a real write.
+                    if not self.dry_run:
+                        with state_lock(self.paths.state_file):
+                            state = load_state(self.paths.state_file)
+                            if not state.get("worker_token_escalated", False):
+                                state = self._record_event(
+                                    state,
+                                    "worker_token_missing",
                                     {
-                                        "config_key": f.config_key,
-                                        "context": f.context,
-                                    }
-                                    for f in missing_findings
-                                ],
-                            },
-                            level="warning",
-                        )
-                        save_state(self.paths.state_file, state)
+                                        "findings": [
+                                            {
+                                                "config_key": f.config_key,
+                                                "context": f.context,
+                                            }
+                                            for f in missing_findings
+                                        ],
+                                    },
+                                    level="warning",
+                                )
+                                state["worker_token_escalated"] = True
+                                save_state(self.paths.state_file, state)
             if self.config.dispatch.require_worker_github_token and not self.dry_run:
                 return CommandResult(
                     True,
@@ -8537,6 +8556,16 @@ class OrchestratorApp:
                 )
         else:
             self._worker_token_escalated = False
+            # Condition resolved: clear the durable marker so a future
+            # regression re-escalates. Dry-run never writes — a dry-run pass
+            # that observes a now-healthy config must not mutate the marker
+            # set by a prior real pass (and cannot have set it itself).
+            if not self.dry_run:
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    if state.get("worker_token_escalated", False):
+                        state["worker_token_escalated"] = False
+                        save_state(self.paths.state_file, state)
 
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.

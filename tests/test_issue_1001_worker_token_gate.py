@@ -420,6 +420,87 @@ def test_dispatch_escalation_cleared_when_token_added(
     assert len(_events_of_kind(state2, "worker_token_missing")) == 1, (
         "no new escalation when token is configured"
     )
+    # The durable marker must have been cleared by the resolved-condition
+    # branch so a future regression re-escalates.
+    assert state2.get("worker_token_escalated") is False
+
+
+def test_dispatch_escalation_once_across_app_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The once-only escalation guarantee must hold across
+    OrchestratorApp reconstruction when the condition is still unresolved.
+
+    ``fleet_dispatch.fleet_loop`` builds a fresh ``OrchestratorApp`` per repo
+    per pass, so an instance-level ``_worker_token_escalated`` flag alone
+    resets every pass and would re-escalate indefinitely while the token
+    remains unconfigured. The durable ``worker_token_escalated`` marker in
+    state.json is the cross-instance source of truth: a second instance
+    constructed with the token *still missing* must NOT emit a second
+    ``worker_token_missing`` event.
+
+    This is the regression the round-1 escalate-once design missed —
+    ``test_dispatch_escalation_cleared_when_token_added``'s second instance
+    has a token configured, so it never exercises the still-missing case.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.workflow import OrchestratorApp
+
+    def _fake_dispatch_sessions(repo_root, manifest_path, results_path, settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=req.issue_number,
+                issue_title=req.issue_title,
+                prompt_path=req.prompt_path,
+                branch_name=req.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=999,
+            )
+            for req in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
+
+    # First instance: no token — escalates, sets the durable marker.
+    config_no_token = _config(adapter="devin-shell")
+    paths = runtime_paths(tmp_path, config_no_token.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app1 = OrchestratorApp(tmp_path, paths, config_no_token, fake_gh, dry_run=False)
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app1.dispatch(limit=1)
+
+    state1 = load_state(paths.state_file)
+    assert len(_events_of_kind(state1, "worker_token_missing")) == 1
+    assert state1.get("worker_token_escalated") is True
+
+    # Second instance: token STILL missing (condition unresolved), fresh app
+    # — exactly what fleet_loop produces on the next pass. Must NOT
+    # re-escalate.
+    paths2 = runtime_paths(tmp_path, config_no_token.runtime.state_dir)
+    fake_gh2 = FakeGitHub()
+    app2 = OrchestratorApp(tmp_path, paths2, config_no_token, fake_gh2, dry_run=False)
+    # The fresh instance's in-memory flag starts False; the durable marker
+    # is what suppresses re-escalation.
+    assert app2._worker_token_escalated is False
+
+    # Clear issue state for re-dispatch.
+    from charlie_work.state import load_state as _ls, save_state, state_lock
+
+    with state_lock(paths2.state_file):
+        s = _ls(paths2.state_file)
+        s["issues"].pop("123", None)
+        save_state(paths2.state_file, s)
+
+    fake_gh2.prs[0]["state"] = "CLOSED"
+    app2.dispatch(limit=1)
+
+    state2 = load_state(paths2.state_file)
+    assert len(_events_of_kind(state2, "worker_token_missing")) == 1, (
+        "fresh instance with token still missing must not re-escalate "
+        "(durable marker holds across OrchestratorApp reconstruction)"
+    )
+    assert state2.get("worker_token_escalated") is True
 
 
 # ---------------------------------------------------------------------------
@@ -449,11 +530,20 @@ def test_dispatch_refuses_when_require_flag_on_and_no_token(tmp_path: Path) -> N
 
 
 def test_dispatch_proceeds_when_require_flag_on_and_token_configured(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With require_worker_github_token=True and a token configured, dispatch
     must proceed normally.
+
+    Uses ``dry_run=False`` with ``dispatch_sessions`` stubbed (like the other
+    live tests) so the assertion isolates the require-flag/token-configured
+    behavior from ``dry_run``'s independent suppression of the refusal
+    (``require_worker_github_token and not self.dry_run``). Under
+    ``dry_run=True`` the refusal is skipped regardless of the token, so a
+    dry-run test could not distinguish "token configured, gate passes" from
+    "dry-run suppressed the refusal".
     """
+    from charlie_work.adapters import SessionDispatchResult
     from charlie_work.workflow import OrchestratorApp
 
     config = _config(
@@ -463,7 +553,23 @@ def test_dispatch_proceeds_when_require_flag_on_and_token_configured(
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
+
+    def _fake_dispatch_sessions(repo_root, manifest_path, results_path, settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=req.issue_number,
+                issue_title=req.issue_title,
+                prompt_path=req.prompt_path,
+                branch_name=req.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=999,
+            )
+            for req in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
 
     fake_gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
