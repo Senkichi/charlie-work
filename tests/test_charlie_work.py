@@ -12199,7 +12199,7 @@ def test_review_injects_cross_family_section_when_enabled(tmp_path: Path, monkey
         Path(kwargs["report_path"]).write_text(VALID_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     result = app.review(456)
 
@@ -12234,7 +12234,7 @@ def test_review_reuses_existing_cross_family_report(tmp_path: Path, monkeypatch)
         Path(kwargs["report_path"]).write_text(report_content, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     app.review(456)
     app.review(456)
@@ -12248,7 +12248,7 @@ def test_review_no_cross_family_override_skips(tmp_path: Path, monkeypatch) -> N
     def _boom(**kwargs):
         raise AssertionError("cross-family must not run when disabled per call")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _boom)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _boom)
 
     result = app.review(456, cross_family=False)
 
@@ -12266,7 +12266,7 @@ def test_review_skips_cross_family_for_draft_pr(tmp_path: Path, monkeypatch) -> 
     def _boom(**kwargs):
         raise AssertionError("cross-family must not run for a draft PR")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _boom)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _boom)
 
     result = app.review(456)
 
@@ -12423,7 +12423,7 @@ def test_review_does_not_reuse_semantically_empty_cross_family_report(
         Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     report_path = prs_dir / "cross-family-review.md"
@@ -12546,7 +12546,7 @@ def test_review_does_not_reuse_legacy_wrapped_blocked_report(tmp_path: Path, mon
         Path(kwargs["report_path"]).write_text(VALID_CROSS_FAMILY_REPORT, encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     prs_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     report_path = prs_dir / "cross-family-review.md"
@@ -13837,7 +13837,7 @@ def test_cross_family_failure_stub_is_not_reused(tmp_path: Path, monkeypatch) ->
         Path(kwargs["report_path"]).write_text("# real findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     result = app.review(456)
 
@@ -13872,7 +13872,7 @@ def test_cross_family_report_invalidated_on_head_sha_change(tmp_path: Path, monk
         Path(kwargs["report_path"]).write_text("# new findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     # Update the PR to have a new head SHA
     app.gh.pr_head_shas[456] = "newheadsha789"
@@ -13909,7 +13909,7 @@ def test_cross_family_report_reused_when_head_sha_unchanged(tmp_path: Path, monk
         Path(kwargs["report_path"]).write_text("# new findings", encoding="utf-8")
         return CrossFamilyResult(ok=True, report_path=str(kwargs["report_path"]), model="codex")
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", _fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", _fake_run)
 
     # The PR still has the same head SHA
     app.gh.pr_head_shas[456] = head_sha
@@ -36749,6 +36749,130 @@ def test_blocked_issue_does_not_consume_slot(tmp_path: Path) -> None:
     assert blocked_events[0]["payload"]["blockers"] == [200]
 
 
+def test_dispatch_reachability_blocker_lookups_are_batched(tmp_path: Path) -> None:
+    """Issue #1110 rework: classify_backlog_reachability runs a per-issue
+    blocker check inside _dispatch_impl. Without warming the pass-scoped
+    cache first (the _prefetch_blocker_data warm-up issue #870 built for
+    exactly this pattern), that check would issue N serial per-issue
+    ``gh api .../dependencies/blocked_by`` calls -- one per ready issue --
+    on every dispatch pass, on a superset of the issue population the
+    dispatch candidate filter already blocker-checks.
+
+    This test asserts the batched path is taken: the GitHub client's
+    batched ``issue_dependencies`` method is called with every ready issue
+    number, and zero per-issue dependency ``run`` calls escape (every
+    lookup resolves from the warm cache). Against the unfixed code (no
+    _prefetch_blocker_data call before reachability) the batch method is
+    never invoked and N serial per-issue ``run`` calls are made instead.
+    """
+    config = OrchestratorConfig(devin=DevinConfig(adapter="manual"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Three ready issues, each blocked by an open predecessor. The blocker
+    # check inside classify_backlog_reachability runs on every one (they
+    # all pass the label-only gates and reach the dependency-gate else
+    # branch). The dispatch candidate filter also blocker-checks each as a
+    # candidate, so both consumers must read the warm cache.
+    ready_issues = [
+        {
+            "number": 11,
+            "title": "t",
+            "url": "https://example.test/issues/11",
+            "body": "Blocked by #1",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        },
+        {
+            "number": 12,
+            "title": "t",
+            "url": "https://example.test/issues/12",
+            "body": "Blocked by #1",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        },
+        {
+            "number": 13,
+            "title": "t",
+            "url": "https://example.test/issues/13",
+            "body": "Blocked by #2",
+            "labels": [{"name": "automated-ready"}],
+            "state": "OPEN",
+        },
+    ]
+    blocker_issues = [
+        {
+            "number": 1,
+            "title": "b",
+            "url": "https://example.test/issues/1",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        },
+        {
+            "number": 2,
+            "title": "b",
+            "url": "https://example.test/issues/2",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        },
+    ]
+
+    class FakeGitHubBatched(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = ready_issues + blocker_issues
+            # Mirror the real GitHubClient's pass-scoped cache so
+            # get_github_issue_dependencies reads/writes it.
+            self._list_cache: dict[tuple[str, Any], Any] = {}
+            self.issue_dependencies_calls: list[list[int]] = []
+            self.dependency_run_calls = 0
+
+        def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
+            # The batched path _prefetch_blocker_data prefers. Mirrors the
+            # real method's warm-cache contract: populate _list_cache so
+            # subsequent per-issue get_github_issue_dependencies calls hit
+            # the cache instead of issuing a live `gh run`.
+            self.issue_dependencies_calls.append(list(issue_numbers))
+            for n in issue_numbers:
+                # No GitHub-native deps in this scenario (blockers are
+                # body-declared); an empty list is a legitimate successful
+                # resolution the real method caches on success.
+                self._list_cache[("issue_dependencies", n)] = []
+            return {n: [] for n in issue_numbers}
+
+        def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+            return {n for n in issue_numbers if n in {1, 2}}
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            joined = " ".join(args)
+            if "dependencies" in joined:
+                # The per-issue serial path. With the cache warmed by
+                # issue_dependencies, this must never be reached.
+                self.dependency_run_calls += 1
+                return [] if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubBatched()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+    result = app.dispatch()
+
+    assert result.ok
+    # The batched dependency fetch ran -- _prefetch_blocker_data was
+    # invoked before reachability's per-issue blocker check.
+    assert len(fake_gh.issue_dependencies_calls) >= 1
+    # Every ready issue number was handed to the batch call in one shot
+    # (the warm-up covers the full ready set, not just candidates).
+    fetched = set(fake_gh.issue_dependencies_calls[0])
+    assert {11, 12, 13}.issubset(fetched)
+    # Zero per-issue serial dependency `gh run` calls escaped: every
+    # dependency lookup (reachability's per-issue check plus the dispatch
+    # candidate filter's per-candidate check) resolved from the warm cache.
+    # Against the unfixed code this is 3 (one serial call per ready issue
+    # from reachability's uncached per-issue check).
+    assert fake_gh.dependency_run_calls == 0
+
+
 def test_status_includes_blocked_section(tmp_path: Path) -> None:
     """Issue #108: status (roll-call) should include blocked section."""
     config = OrchestratorConfig(
@@ -44190,6 +44314,251 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
     assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
 
 
+def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path) -> None:
+    """Issue #1109: a dead worker on an approved PR whose PR state carries
+    ``status="rework_requested"`` (evidence the post-approval rework lane
+    dispatched this worker) and whose head is unchanged since review must be
+    auto-reset to ``rework_requested`` -- not wedged in ``dispatched`` via
+    ``dead_worker_unsafe_to_auto_reset``.
+
+    This is the post-approval CI-failure rework lane (#674 -> PR #685): the
+    PR's decision stays ``approved`` while a rework worker is dispatched to
+    fix failing checks. If that worker dies at launch (crash wave, reboot,
+    OOM) without pushing, the sweep must reset so the normal redispatch lane
+    can retry, subject to the same death counter and redispatch caps as the
+    request_changes branch.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1109"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # Approved PR whose post-approval rework lane set status=rework_requested
+    # (via _route_to_rework) and preserved the approved decision + reviewed head.
+    state["prs"]["100"] = {
+        "decision": "approved",
+        "status": "rework_requested",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",  # Unchanged since approved review
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1109",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1109"]
+
+    # Status must be reset to rework_requested so the redispatch lane can retry.
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dispatched_at") is None
+
+    # Worker PID preserved for recovery-path verification (issue #282).
+    assert entry["worker_pid"] == 99999
+    assert entry["worker_process_start_time"] == 1234567890.0
+
+    # Worker death recorded (issue #1134 death counter).
+    assert isinstance(entry.get("worker_death_at"), list)
+    assert len(entry["worker_death_at"]) == 1
+
+    events = state.get("events", [])
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered_events) == 1
+    payload = recovered_events[0]["payload"]
+    assert payload["issue_number"] == 1109
+    assert payload["pr_number"] == 100
+    assert payload["reason"] == "dead_worker_with_approved_rework"
+    assert payload["decision"] == "approved"
+    assert payload["pr_state_status"] == "rework_requested"
+    assert payload["pid"] == 99999
+    assert payload["exit_code"] is None
+    assert payload["duration_seconds"] is None
+
+    # No drift event -- this is a recovery, not an unclassifiable finding.
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert drift_events == []
+
+
+def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) -> None:
+    """Issue #1109: a dead worker on an approved+rework_requested PR that
+    exited cleanly (exit code 0) without pushing must surface as
+    ``dead_worker_clean_exit_no_op`` drift, not auto-reset -- mirroring the
+    #773 clean-exit-no-op sub-case of the request_changes branch so a benign
+    no-op worker does not burn redispatch attempts.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1109"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "approved",
+        "status": "rework_requested",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1109",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = sessions_dir / "issue-1109.claude.terminal.json"
+    terminal_path.write_text(
+        json.dumps(
+            {
+                "pid": 99999,
+                "exit_code": 0,
+                "started_at": "2024-01-01T00:00:00Z",
+                "ended_at": "2024-01-01T00:05:00Z",
+                "duration_seconds": 300.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1109"]
+
+    # Must NOT be reset -- clean exit with no push is a no-op, not a crash.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("dispatched_at") == "2024-01-01T00:00:00Z"
+
+    events = state.get("events", [])
+    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    payload = drift_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_clean_exit_no_op"
+    assert payload["decision"] == "approved"
+    assert payload["pr_state_status"] == "rework_requested"
+    assert payload["exit_code"] == 0
+    assert payload["duration_seconds"] == 300.0
+
+
+def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: Path) -> None:
+    """Issue #1109 guard: an approved PR whose PR state does NOT carry
+    ``status="rework_requested"`` has no evidence a post-approval rework lane
+    dispatched this worker, so the sweep must still surface
+    ``dead_worker_unsafe_to_auto_reset`` drift rather than guess.
+
+    This is the existing test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once
+    scenario (approved, head unchanged, no PR-state status) -- re-asserted
+    here to pin the guard's meaning: the ``pr_state_status == "rework_requested"``
+    check is what separates a safe auto-reset from an unclassifiable drift.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1109"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # Approved but NO status="rework_requested" -- no evidence a rework lane
+    # dispatched this worker.
+    state["prs"]["100"] = {
+        "decision": "approved",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1109",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1109"]
+
+    # No evidence of a rework lane dispatch -- must stay dispatched and drift.
+    assert entry.get("status") == "dispatched"
+
+    events = state.get("events", [])
+    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
+
+
 def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -44511,6 +44880,121 @@ def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
         and e["payload"].get("reason") == "dead_worker_unsafe_to_auto_reset"
     ]
     assert len(drift_events) == 1, "conservative drift must be emitted on failure"
+
+
+def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
+    tmp_path: Path,
+) -> None:
+    """Issue #1128 rework after merge with #1109: an issue that could plausibly
+    match both lanes -- ``last_decision`` is None (the #1128 condition) while
+    ``pr_state.status`` is ``"rework_requested"`` (part of the #1109 condition) --
+    must go through the #1128 advance-to-pr-open lane, NOT the #1109
+    auto-reset-to-rework_requested lane.
+
+    The ``if``/``else`` structure keys the #1109 lane on
+    ``last_decision == "approved"``; a PR with no decision but a
+    ``rework_requested`` status is an inconsistent state that the #1109 guard
+    correctly rejects (no evidence an approved review dispatched this worker).
+    The #1128 lane then advances it to ``pr-open`` so review can assess it,
+    rather than guessing a re-dispatch.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    in_progress = config.labels.in_progress
+    pr_open = config.labels.pr_open
+
+    state = load_state(paths.state_file)
+    state["issues"]["1578"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # No ``decision`` key (last_decision will be None), but PR-state status
+    # is ``rework_requested`` -- this is the "plausibly matches both" edge.
+    state["prs"]["1585"] = {
+        "status": "rework_requested",
+        "reviewed_head_sha": None,
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1578,
+                    "title": "Both-lanes edge",
+                    "url": "https://example.test/issues/1578",
+                    "body": "Unreviewed PR with rework_requested status",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = [
+                {
+                    "number": 1585,
+                    "title": "Salvaged work for #1578",
+                    "url": "https://example.test/pull/1585",
+                    "headRefName": "agent/issue-1578-both-lanes-edge",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-deadbeef",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #1578\n\nTests: regression coverage added.",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1578"]
+
+    # Must advance to pr-open (#1128 lane), NOT reset to rework_requested
+    # (#1109 lane).
+    assert entry["status"] == PASSIVE_OPEN_STATUS, (
+        f"expected open_passive (#1128 lane), got {entry['status']!r}"
+    )
+
+    events = state.get("events", [])
+    advance_events = [e for e in events if e.get("kind") == "orphaned_worker_advanced_to_pr_open"]
+    assert len(advance_events) == 1, "#1128 advance must fire"
+    assert (
+        advance_events[0]["payload"]["reason"]
+        == "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr"
+    )
+
+    # #1109 lane must NOT fire -- no recovered event, no clean_exit_no_op drift.
+    recovered_events = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert recovered_events == [], "#1109 auto-reset must not misfire on a None-decision PR"
+
+    clean_exit_drifts = [
+        e
+        for e in events
+        if e.get("kind") == "orphaned_worker_drift"
+        and e["payload"].get("reason") == "dead_worker_clean_exit_no_op"
+    ]
+    assert clean_exit_drifts == [], "#1109 clean-exit-no-op drift must not misfire"
+
+    # The label swap mirrors the #1128 lane.
+    assert (1578, in_progress) in fake_gh.labels_removed
+    assert (1578, pr_open) in fake_gh.labels_added
 
 
 def test_dispatch_rework_does_not_re_run_orphan_detection(tmp_path: Path) -> None:

@@ -50,6 +50,7 @@ from .config import (
     OrchestratorConfig,
     ReviewDispatchConfig,
 )
+from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
 from . import layout
@@ -63,7 +64,9 @@ from .cross_family import (
     MalformedCrossFamilyVerdict,
     extract_head_ref_oid,
     extract_report_body,
+    launch_cross_family_review,
     parse_cross_family_verdict,
+    reap_cross_family_review,
     report_is_reusable,
     run_cross_family_review,
 )
@@ -4107,6 +4110,43 @@ def _append_sweep_events(
     return state
 
 
+def _get_open_blockers_for_issue(
+    gh: GitHubLike, issue: dict[str, Any]
+) -> tuple[list[int], list[int]]:
+    """Standalone blocker check — the shared core of ``_get_open_blockers``.
+
+    Both the dispatch candidate filter (``_filter_blocked_issues`` via the
+    ``_get_open_blockers`` method) and ``classify_backlog_reachability`` must
+    answer the same question: does this issue have any *open* blockers? This
+    function is the single implementation of that check so the two paths cannot
+    diverge — a dependency-gate change made for dispatch automatically applies
+    to reachability, and vice versa.
+
+    Returns ``(declared_blockers, open_blockers)`` — both sorted lists of issue
+    numbers. ``declared_blockers`` is every blocker mentioned in the issue body
+    or GitHub-native dependencies; ``open_blockers`` is the subset that are
+    currently open. Fail-open: a transient API error resolves to ``([], [])``,
+    so the issue is treated as unblocked (matching the dispatch path's
+    behaviour — a failed lookup does not filter a candidate out).
+    """
+    logger = logging.getLogger(__name__)
+    issue_number = int(issue["number"])
+    body = issue.get("body", "")
+    body_blockers = parse_blockers(body)
+    gh_blockers = get_github_issue_dependencies(gh, issue_number)
+    all_blockers = sorted(set(body_blockers + gh_blockers))
+    if not all_blockers:
+        return [], []
+    open_blockers = gh.are_issues_open(all_blockers)
+    if issue_number in open_blockers:
+        logger.warning(
+            f"Issue #{issue_number} has self-referencing blocker declaration - ignoring"
+        )
+        open_blockers.discard(issue_number)
+        all_blockers.remove(issue_number)
+    return sorted(all_blockers), sorted(open_blockers)
+
+
 def classify_backlog_reachability(
     gh: GitHubLike,
     config: OrchestratorConfig,
@@ -4165,6 +4205,17 @@ def classify_backlog_reachability(
         "terminal_label": 0,
         "active_label": 0,
         "operator_claimed": 0,
+        # Issue #1110: an automated-ready issue with no agent: label that is
+        # blocked by an open predecessor passes every label-only check above
+        # but is permanently (and correctly) unselectable by dispatch, which
+        # applies a further dependency gate (_filter_blocked_issues). Without
+        # this bin those issues were counted ``dispatchable`` by reachability
+        # while being unselectable, producing false dispatch_stale alarms for
+        # a deliberately sequenced cohort tail. ``dispatchable`` now counts
+        # only issues that pass BOTH the label gate and the dependency gate;
+        # this bin holds the issues the dependency gate rejects. The bins
+        # still partition -- every fetched issue lands in exactly one.
+        "blocked_by_open_dependency": 0,
         # An issue with no ``number`` cannot be dispatched or named as an
         # example, but it must still be BINNED rather than skipped: the
         # renderer joins the non-zero reasons, so a backlog of these would
@@ -4202,7 +4253,22 @@ def classify_backlog_reachability(
             elif number in claimed:
                 reason = "operator_claimed"
             else:
-                reason = "dispatchable"
+                # Issue #1110: the label-only checks above mirror
+                # _is_dispatchable, but the dispatch path applies a further
+                # dependency gate (_filter_blocked_issues) that this function
+                # never modeled. Run the same blocker check the dispatch
+                # candidate filter runs and bin dependency-blocked issues
+                # distinctly, so dispatch_staleness can key off the
+                # post-dependency-gate candidate count instead of the
+                # label-only count. Fail-open: a transient API error resolves
+                # to no open blockers (matching dispatch -- a failed lookup
+                # does not filter a candidate out), so the issue bins as
+                # ``dispatchable`` rather than ``blocked_by_open_dependency``.
+                _declared, open_blockers = _get_open_blockers_for_issue(gh, issue)
+                if open_blockers:
+                    reason = "blocked_by_open_dependency"
+                else:
+                    reason = "dispatchable"
         reachability[reason] += 1
         if reason != "dispatchable":
             bucket = examples.setdefault(reason, [])
@@ -4290,6 +4356,15 @@ def check_dispatch_staleness(
     ``recent_issue_numbers`` lets callers short-circuit with the current pass:
     if this pass itself dispatched issues, the most recent non-empty dispatch is
     now and the check returns ``stale: False``.
+
+    Issue #1110: ``stale`` does not fire when every ready issue is blocked by an
+    open dependency (``dispatchable == 0`` and ``blocked_by_open_dependency > 0``).
+    A deliberately sequenced cohort tail (e.g. #887/#888 blocked by an open
+    #886) is permanently -- and correctly -- unselectable by dispatch, so a
+    cadence alarm for it is a false positive that pattern-matches the #944
+    four-day stall this detector exists to catch. The #944 detection stays
+    intact: when ``dispatchable == 0`` and ``blocked_by_open_dependency == 0``
+    (no ready issues at all, e.g. all ``missing_ready``), the alarm still fires.
     """
     result: dict[str, Any] = {
         "stale": False,
@@ -4299,6 +4374,14 @@ def check_dispatch_staleness(
         "threshold_seconds": None,
         "backlog_observed": bool(backlog_reachability.get("observed", False)),
         "backlog_open_total": int(backlog_reachability.get("open_total", 0) or 0),
+        # Issue #1110: surface the post-dependency-gate candidate count so a
+        # reader of the staleness diagnostic can distinguish "nothing ready"
+        # (the #944 case) from "ready but blocked" (the #1110 case) without
+        # cross-referencing the reachability dict.
+        "backlog_dispatchable": int(backlog_reachability.get("dispatchable", 0) or 0),
+        "backlog_blocked_by_open_dependency": int(
+            backlog_reachability.get("blocked_by_open_dependency", 0) or 0
+        ),
         "reason": None,
     }
 
@@ -4334,6 +4417,21 @@ def check_dispatch_staleness(
             result["reason"] = "backlog_not_observed"
         else:
             result["reason"] = "empty_backlog"
+        return result
+
+    # Issue #1110: when every ready issue is blocked by an open dependency,
+    # dispatch is permanently (and correctly) idle -- there is nothing to
+    # dispatch and nothing wrong with the dispatcher. Firing a cadence alarm
+    # here is a false positive that pattern-matches the #944 four-day stall
+    # this detector exists to catch. The ``dispatchable`` count from
+    # classify_backlog_reachability already excludes dependency-blocked issues
+    # (they bin as ``blocked_by_open_dependency``), so ``dispatchable == 0``
+    # with ``blocked_by_open_dependency > 0`` means "ready but blocked", not
+    # "nothing ready". The #944 case (``dispatchable == 0`` and
+    # ``blocked_by_open_dependency == 0``) falls through to the age check below
+    # and still alarms.
+    if result["backlog_dispatchable"] == 0 and result["backlog_blocked_by_open_dependency"] > 0:
+        result["reason"] = "all_ready_blocked_by_dependencies"
         return result
 
     latest = _latest_non_empty_dispatch(state_path)
@@ -4381,6 +4479,10 @@ def _detect_and_handle_orphaned_workers(
     - If last decision was "request_changes" and head advanced, route to the
       review-pending path by calling ``review_callback`` and then flipping the
       issue status to "reviewing"
+    - If last decision was "approved" and the PR state carries
+      ``status="rework_requested"`` (evidence the post-approval rework lane
+      dispatched this worker) and head is unchanged since review, reset to
+      "rework_requested" -- same as the request_changes branch (issue #1109)
     - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
@@ -4889,6 +4991,30 @@ def _detect_and_handle_orphaned_workers(
                             )
                 else:
                     # Not a simple request_changes case.
+                    # Issue #1109: a dead worker on an approved PR is not
+                    # unclassifiable when the post-approval rework lane
+                    # (#674 -> PR #685, plus the merge-conflict and no-op
+                    # rework lanes that share ``_route_to_rework``) dispatched
+                    # it. Those lanes set the PR state status to
+                    # ``rework_requested`` while preserving
+                    # ``decision="approved"``, and the worker is dispatched to
+                    # fix CI/a conflict without re-litigating the review. If
+                    # that worker dies before pushing (head unchanged since
+                    # review), the issue previously wedged in ``dispatched``
+                    # forever because this sweep refused to auto-reset on a
+                    # non-``request_changes`` decision -- no redispatch, no
+                    # cap consumption, invisible to every downstream lane.
+                    # Treat ``decision="approved"`` + PR-state
+                    # ``rework_requested`` + head unchanged as safe to
+                    # auto-reset, mirroring the request_changes branch above
+                    # (including the #773 clean-exit-no-op sub-case so a
+                    # benign exit-0 worker does not burn redispatch attempts).
+                    # ``dead_worker_unsafe_to_auto_reset`` is kept only for
+                    # genuinely unclassifiable decisions -- an approved PR
+                    # whose PR state does not carry ``rework_requested`` has
+                    # no evidence a post-approval rework lane dispatched this
+                    # worker, so auto-resetting would be a guess.
+                    #
                     # Issue #1128: when the dead worker has an OPEN PR with no
                     # review verdict yet (``last_decision`` is null/absent),
                     # the "unsafe to auto-reset" judgment stays -- the PR
@@ -4902,75 +5028,160 @@ def _detect_and_handle_orphaned_workers(
                     # failure, fall through to the conservative drift path so
                     # the next pass re-attempts rather than resetting the
                     # worker.
-                    if last_decision is None:
-                        details = pr_orphan_unreviewed_details.get(issue_number)
-                        if details is not None:
-                            active_labels = details["active_labels"]
-                            issue_labels = details["issue_labels"]
-                            label_write_ok = True
-                            for label in sorted(active_labels):
-                                if not gh.remove_issue_label(issue_number, label):
-                                    label_write_ok = False
-                            if config.labels.pr_open not in issue_labels:
-                                if not gh.add_issue_label(issue_number, config.labels.pr_open):
-                                    label_write_ok = False
-                            if label_write_ok:
-                                entry["status"] = PASSIVE_OPEN_STATUS
-                                entry["dispatched_at"] = None
-                                # Clear any prior drift fingerprint so a
-                                # later regression on this issue re-surfaces.
-                                entry["orphan_drift_fingerprint"] = None
-                                entry["orphan_drift_at"] = None
-                                sweep_events.append(
-                                    (
-                                        "orphaned_worker_advanced_to_pr_open",
-                                        {
-                                            "issue_number": issue_number,
-                                            "pr_number": pr_number,
-                                            "previous_status": "dispatched",
-                                            "new_status": PASSIVE_OPEN_STATUS,
-                                            "reason": "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr",
-                                            "removed_labels": sorted(active_labels),
-                                            "pid": terminal_pid,
-                                            "exit_code": terminal_exit_code,
-                                            "duration_seconds": terminal_duration_seconds,
-                                            "label_write_ok": True,
-                                        },
-                                    )
-                                )
+                    pr_state_status = pr_state.get("status")
+                    if (
+                        last_decision == "approved"
+                        and pr_state_status == "rework_requested"
+                        and reviewed_head_sha
+                        and live_head_sha
+                        and reviewed_head_sha == live_head_sha
+                    ):
+                        if terminal_exit_code == 0:
+                            # Clean exit with no push -- same #773 rationale
+                            # as the request_changes branch: do not spend a
+                            # redispatch attempt on a worker that produced no
+                            # change on this exact head.
+                            fingerprint = _drift_fingerprint(
+                                reason="dead_worker_clean_exit_no_op",
+                                reviewed_head_sha=reviewed_head_sha,
+                            )
+                            if entry.get("orphan_drift_fingerprint") == fingerprint:
                                 state["issues"][str(issue_number)] = entry
                                 continue
-                            # Label write failed -- record the attempt and
-                            # fall through to the fingerprinted drift path so
-                            # the next pass re-attempts the transition (the
-                            # drift fingerprint gates only re-emission of the
-                            # diagnostic, not the transition retry above, which
-                            # runs first on every pass).
-                    # Surface as drift once (covers the ``approved``/other-
-                    # decision cases and #1128 label-write failures).
-                    fingerprint = _drift_fingerprint(
-                        reason="dead_worker_unsafe_to_auto_reset",
-                        last_decision=last_decision or "",
-                        pr_number=pr_number,
-                    )
-                    if entry.get("orphan_drift_fingerprint") != fingerprint:
-                        entry["orphan_drift_fingerprint"] = fingerprint
-                        entry["orphan_drift_at"] = utc_now()
-                        sweep_events.append(
-                            (
-                                "orphaned_worker_drift",
-                                {
-                                    "issue_number": issue_number,
-                                    "pr_number": pr_number,
-                                    "previous_status": "dispatched",
-                                    "last_decision": last_decision,
-                                    "reason": "dead_worker_unsafe_to_auto_reset",
-                                    "pid": terminal_pid,
-                                    "exit_code": terminal_exit_code,
-                                    "duration_seconds": terminal_duration_seconds,
-                                },
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "reason": "dead_worker_clean_exit_no_op",
+                                        "decision": "approved",
+                                        "pr_state_status": pr_state_status,
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
                             )
+                        else:
+                            # No terminal record, or a non-zero/None exit
+                            # code: safe to reset to rework_requested (PR head
+                            # unchanged since the approved review, and the
+                            # post-approval rework lane dispatched this
+                            # worker). Records this as a worker death with a
+                            # distinct reason so the death counter (issue
+                            # #1134) and the redispatch cap (issue #165) apply
+                            # exactly as they do for request_changes.
+                            entry["status"] = "rework_requested"
+                            entry["dispatched_at"] = None
+                            death_ts = utc_now()
+                            prior_deaths = entry.get("worker_death_at")
+                            if not isinstance(prior_deaths, list):
+                                prior_deaths = []
+                            entry["worker_death_at"] = prior_deaths + [death_ts]
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_recovered",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "new_status": "rework_requested",
+                                        "reason": "dead_worker_with_approved_rework",
+                                        "decision": "approved",
+                                        "pr_state_status": pr_state_status,
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                        "worker_death_at": death_ts,
+                                    },
+                                )
+                            )
+                    else:
+                        # Not the #1109 approved+rework_requested classified
+                        # case. This branch covers two populations that share
+                        # one fingerprinted drift fallback below:
+                        #   (a) #1128: ``last_decision`` is None (open PR, no
+                        #       review verdict yet) -- try advancing to
+                        #       ``pr-open``; on label-write failure or missing
+                        #       details, fall through to the shared drift.
+                        #   (b) genuinely unclassifiable decisions -- fall
+                        #       through to the shared drift directly.
+                        if last_decision is None:
+                            details = pr_orphan_unreviewed_details.get(issue_number)
+                            if details is not None:
+                                active_labels = details["active_labels"]
+                                issue_labels = details["issue_labels"]
+                                label_write_ok = True
+                                for label in sorted(active_labels):
+                                    if not gh.remove_issue_label(issue_number, label):
+                                        label_write_ok = False
+                                if config.labels.pr_open not in issue_labels:
+                                    if not gh.add_issue_label(issue_number, config.labels.pr_open):
+                                        label_write_ok = False
+                                if label_write_ok:
+                                    entry["status"] = PASSIVE_OPEN_STATUS
+                                    entry["dispatched_at"] = None
+                                    # Clear any prior drift fingerprint so a
+                                    # later regression on this issue re-surfaces.
+                                    entry["orphan_drift_fingerprint"] = None
+                                    entry["orphan_drift_at"] = None
+                                    sweep_events.append(
+                                        (
+                                            "orphaned_worker_advanced_to_pr_open",
+                                            {
+                                                "issue_number": issue_number,
+                                                "pr_number": pr_number,
+                                                "previous_status": "dispatched",
+                                                "new_status": PASSIVE_OPEN_STATUS,
+                                                "reason": "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr",
+                                                "removed_labels": sorted(active_labels),
+                                                "pid": terminal_pid,
+                                                "exit_code": terminal_exit_code,
+                                                "duration_seconds": terminal_duration_seconds,
+                                                "label_write_ok": True,
+                                            },
+                                        )
+                                    )
+                                    state["issues"][str(issue_number)] = entry
+                                    continue
+                                # Label write failed -- fall through to the
+                                # fingerprinted drift path so the next pass
+                                # re-attempts the transition (the drift
+                                # fingerprint gates only re-emission of the
+                                # diagnostic, not the transition retry above,
+                                # which runs first on every pass).
+                        # Genuinely unclassifiable decision, or #1128 label-
+                        # write failure -- surface as drift once. One shared
+                        # fingerprinted fallback for both lanes (#1109 keeps
+                        # its own classified branch above; this covers
+                        # everything else).
+                        fingerprint = _drift_fingerprint(
+                            reason="dead_worker_unsafe_to_auto_reset",
+                            last_decision=last_decision or "",
+                            pr_number=pr_number,
                         )
+                        if entry.get("orphan_drift_fingerprint") != fingerprint:
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "last_decision": last_decision,
+                                        "reason": "dead_worker_unsafe_to_auto_reset",
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
                 # that the worker pushed but could not create a PR for.
@@ -7690,6 +7901,16 @@ class OrchestratorApp:
         self.gh = gh
         self.dry_run = dry_run
         self.fleet_dir_override = fleet_dir_override
+        # Issue #1001: same-instance once-only escalation flag for the
+        # worker-github-token gate. A missing token is a standing condition;
+        # the gate must not emit an event every loop pass. The cross-instance
+        # source of truth is the durable ``worker_token_escalated`` marker in
+        # state.json (fleet_loop rebuilds this app per repo per pass, so an
+        # instance flag alone resets every pass). This in-memory flag is a
+        # same-instance optimization that also suppresses re-entry under
+        # dry-run, where the durable marker is never written. It is cleared
+        # when the condition resolves (all findings ok) alongside the marker.
+        self._worker_token_escalated = False
         # Make the event ring cap config-driven (issue #525).
         _state.EVENT_RING_SIZE = config.runtime.event_ring_size
         prompts_dir = config.runtime.prompts_dir
@@ -8731,6 +8952,115 @@ class OrchestratorApp:
         ready_issues: list[dict[str, Any]] | None = None,
         merged_prs: _MergedPRListOutcome | None = None,
     ) -> CommandResult:
+        # Issue #1001: worker GitHub token gate. Before dispatching to an
+        # adapter family that routes through sanitize_env's merge, consult the
+        # same predicate doctor._check_worker_github_token uses. If no
+        # worker_env token is configured, escalate once (not per pass) and
+        # either refuse (when dispatch.require_worker_github_token is True) or
+        # warn and proceed (the default, so the gate does not take the fleet
+        # down on a config that has not yet been provisioned — see the issue
+        # #1001 sequencing hazard comment in config.py).
+        #
+        # The once-only guarantee must hold across OrchestratorApp
+        # reconstruction: fleet_dispatch.fleet_loop builds a fresh app per
+        # repo per pass, so an instance-level flag alone resets every pass
+        # and re-escalates indefinitely. The durable marker
+        # ``worker_token_escalated`` in state.json is the cross-instance
+        # source of truth; the instance-level ``_worker_token_escalated``
+        # flag (initialized in __init__) is a same-instance optimization
+        # that also covers dry-run, where the durable marker is never
+        # written. The marker is cleared when the condition resolves (all
+        # findings ok), so a future regression re-escalates.
+        token_findings = worker_github_token_findings(self.config)
+        missing_findings = [f for f in token_findings if not f.ok]
+        if missing_findings:
+            if not self._worker_token_escalated:
+                self._worker_token_escalated = True
+                # Record the escalation event once. Payload carries only
+                # config_key names and adapter contexts — never a token
+                # value or prefix (issue #1001 acceptance criterion).
+                #
+                # Dry-run never writes: the escalation event and the
+                # durable marker are state mutations (state_lock +
+                # save_state), so they are gated on ``not self.dry_run``
+                # — the same read-only contract documented at the
+                # merge_ready dry-run gate (~line 15452, "Dry-run never
+                # writes") and modelled on this function's own
+                # top-of-body dry-run short-circuit. The in-memory
+                # once-only flag is still set under dry-run so a dry-run
+                # pass does not re-enter this block on the next pass;
+                # the event and marker are emitted on the first real
+                # (non-dry-run) dispatch. ``self.dry_run`` is fixed at
+                # construction, so a dry-run instance cannot later
+                # "forget" the flag and skip a real write.
+                #
+                # The durable marker is read inside the lock (not before it)
+                # so the cross-instance once-only guarantee holds without an
+                # unlocked load_state — issue #310's
+                # test_no_unlocked_load_state_in_production_code lint forbids
+                # any load_state outside a state_lock block. The in-memory
+                # ``_worker_token_escalated`` flag is the first gate
+                # (same-instance), so the lock is entered at most once per
+                # instance lifetime (the flag's False→True transition); the
+                # inner ``if not state.get(...)`` re-check is the
+                # authoritative cross-instance gate and no-ops when a prior
+                # instance already set the marker.
+                if not self.dry_run:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        if not state.get("worker_token_escalated", False):
+                            state = self._record_event(
+                                state,
+                                "worker_token_missing",
+                                {
+                                    "findings": [
+                                        {
+                                            "config_key": f.config_key,
+                                            "context": f.context,
+                                        }
+                                        for f in missing_findings
+                                    ],
+                                },
+                                level="warning",
+                            )
+                            state["worker_token_escalated"] = True
+                            save_state(self.paths.state_file, state)
+            # The refusal itself is NOT dry-run-gated: a dry-run preview must
+            # report the same deferral a live pass would take (matching the
+            # fleet_lock_held / graphql_rate_limit deferral precedent in this
+            # function). Only the escalation event / durable marker writes
+            # above stay behind ``not self.dry_run``.
+            if self.config.dispatch.require_worker_github_token:
+                return CommandResult(
+                    True,
+                    "dispatch deferred: no sanctioned worker GitHub token "
+                    "(set devin.worker_env / claude_code.worker_env "
+                    "{'GH_TOKEN': '<scoped-PAT>'}; see issue #1001)",
+                    {
+                        "selected_count": 0,
+                        "attempted_count": 0,
+                        "failed_count": 0,
+                        "skipped_issue_numbers": [],
+                        "label_errors": [],
+                        "sessions": [],
+                        "dispatch_results": [],
+                        "deferred_reason": "worker_token_missing",
+                        "missing_config_keys": [f.config_key for f in missing_findings],
+                    },
+                )
+        else:
+            self._worker_token_escalated = False
+            # Condition resolved: clear the durable marker so a future
+            # regression re-escalates. Dry-run never writes — a dry-run pass
+            # that observes a now-healthy config must not mutate the marker
+            # set by a prior real pass (and cannot have set it itself).
+            if not self.dry_run:
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    if state.get("worker_token_escalated", False):
+                        state["worker_token_escalated"] = False
+                        save_state(self.paths.state_file, state)
+
         # Issue #427: include closed ready-labeled issues so externally-merged PRs
         # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
         if ready_issues is None:
@@ -8742,6 +9072,24 @@ class OrchestratorApp:
             issues = ready_issues
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
         operator_claimed_ready: list[int] = []
+
+        # Issue #1110 rework: classify_backlog_reachability now runs the same
+        # per-issue blocker check the dispatch candidate filter runs (issue
+        # #1110 wired _get_open_blockers_for_issue into its else-branch). That
+        # check calls get_github_issue_dependencies + are_issues_open per issue
+        # -- exactly the N+1 serial `gh` pattern issue #870 built
+        # _prefetch_blocker_data to eliminate. Warm the pass-scoped cache for
+        # every ready issue once, *before* reachability's serial per-issue
+        # lookups run, mirroring how status() warms the cache before its own
+        # classify_backlog_reachability call. ``issues`` here is the
+        # ready-labelled state="all" set; reachability fetches its own open
+        # list, but its blocker check only runs on ready-labelled OPEN issues,
+        # which are a subset of this set, so this warm-up covers every
+        # dependency lookup reachability will make. The later
+        # _filter_blocked_issues(candidates) call below benefits too:
+        # candidates are a further subset, so the cache is already warm for
+        # them as well. Harmless to call twice (second call is a cache hit).
+        self._prefetch_blocker_data(issues)
 
         # Issue #944: observe the UNFILTERED backlog alongside the filtered
         # candidate query above. This does not participate in selection and
@@ -11111,6 +11459,24 @@ class OrchestratorApp:
             enabled=cross_family,
             enforce_regen_budget=enforce_regen_budget,
         )
+        # Issue #1078: when the cross-family review is pending (launched async
+        # but not yet reaped), the review packet must NOT go out — the cross-
+        # family section is empty and the reviewer would make a verdict without
+        # the adversarial findings. Defer the packet write to a later pass when
+        # the review is reaped. This returns ok=True (not a failure) with a
+        # ``cross_family_pending`` data flag so ``loop()`` can skip the
+        # not-reached charge and the merge check.
+        if cf_result is not None and cf_result.pending:
+            return CommandResult(
+                True,
+                f"PR #{pr_number}: cross-family review pending, deferring packet",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "cross_family_pending": True,
+                    "ok": True,
+                },
+            )
         prompt_path = pr_dir / "review-prompt.md"
         decision_path = pr_dir / "review-decision.json"
         diff_size_section = _diff_size_section(
@@ -16358,6 +16724,53 @@ class OrchestratorApp:
         if not use or pr.get("isDraft"):
             return "", None
         report_path = pr_dir / "cross-family-review.md"
+        # Issue #1078: the cross-family review is now asynchronous. A previous
+        # pass may have launched a review via ``launch_cross_family_review``
+        # (Popen, non-blocking) and left a ``.pending.json`` marker. Reap it
+        # before deciding whether to launch a new one. This is the single
+        # collection point — the same PR's pending review is reaped here or not
+        # at all.
+        reaped = reap_cross_family_review(report_path=report_path)
+        if reaped is not None:
+            if reaped.pending:
+                # Still running — the review packet must NOT go out yet. Return
+                # a pending result so ``review()`` defers the packet write; the
+                # next pass will reap again. This is what prevents one repo's
+                # reviewer latency from blocking the other repo's lane: the
+                # fleet pass returns from this PR immediately.
+                return "", reaped
+            # Reaped a completed result (ok or fail). The report file has been
+            # written by ``reap_cross_family_review``. If ok, the section is
+            # ready -- UNLESS the PR's live head has moved on since the review
+            # was launched (the review ran against an earlier head while this
+            # pass's ``pr`` reflects the current one). Re-validate against
+            # ``pr.get("headRefOid")`` with the same predicate the adjacent
+            # reuse path below uses (``report_is_reusable``), so the two
+            # cannot disagree about what counts as stale (issue #1081's
+            # single-definition rule applies here too). If failed, check
+            # exhaustion and fall through to relaunch.
+            if reaped.ok:
+                reaped_text = ""
+                if report_path.exists() and report_path.stat().st_size > 0:
+                    reaped_text = report_path.read_text(encoding="utf-8")
+                if report_is_reusable(reaped_text, pr.get("headRefOid")):
+                    return self._cross_family_section(report_path), reaped
+                # Stale: the head moved while the review was in flight. Do
+                # NOT serve it — fall through to the idempotent reuse check
+                # below, which reaches the same "unusable" conclusion via the
+                # same predicate and continues on to budget claim + relaunch,
+                # exactly as a failed/unusable report would.
+            else:
+                # Reaped a failure — the failure stub is already written.
+                # Check exhaustion for the attempt that just completed, then
+                # fall through to the budget claim + relaunch path below.
+                if enforce_regen_budget:
+                    self._escalate_cross_family_regen_exhausted(
+                        pr_number=pr_number,
+                        issue_number=issue_number,
+                        head_sha=pr.get("headRefOid"),
+                        report_path=report_path,
+                    )
         # Idempotent: a non-empty, semantically valid SUCCESS report is reused,
         # so repeated review()/loop() passes don't re-burn the cross-family model
         # on the same PR. Failure stubs (headed "(UNAVAILABLE)") and exit-zero
@@ -16379,9 +16792,8 @@ class OrchestratorApp:
                 )
         # The report is unusable, so the regeneration below is the repair -- and
         # it is the thing the per-head budget exists to bound, because it runs
-        # the cross-family model synchronously for up to timeout_seconds and
-        # unbounded would starve the other repo in the shared sequential loop
-        # (#1078).
+        # the cross-family model for up to timeout_seconds and unbounded would
+        # starve the other repo in the shared sequential loop (#1078).
         #
         # The claim therefore lives HERE, at the model call it bounds, and not
         # at loop()'s staleness check where it used to (issue #1099). review()
@@ -16426,7 +16838,13 @@ class OrchestratorApp:
                 "diff_path": diff_path,
             },
         )
-        result = run_cross_family_review(
+        # Issue #1078: launch asynchronously (Popen, non-blocking) instead of
+        # calling ``run_cross_family_review`` synchronously. The subprocess
+        # runs in the background; a ``.pending.json`` marker is written so the
+        # next pass can reap the result via ``reap_cross_family_review``. This
+        # returns immediately with ``pending=True``, so the fleet pass moves on
+        # to the next repo without waiting for the cross-family model.
+        result = launch_cross_family_review(
             model=cfg.model,
             command=cfg.command,
             repo_root=self.repo_root,
@@ -16437,6 +16855,13 @@ class OrchestratorApp:
             dry_run=self.dry_run,
             head_ref_oid=pr.get("headRefOid"),
         )
+        # If the launch succeeded, the result is pending — the review packet
+        # must not go out yet. If the launch failed immediately (e.g. OSError),
+        # the failure stub is already written; check exhaustion and return the
+        # section so the packet goes out without a cross-family section (same
+        # behaviour as the old synchronous path on launch failure).
+        if result.pending:
+            return "", result
         # Exhaustion is decided HERE, immediately after the model call that
         # spends the budget, because this is the only point at which both facts
         # the escalation asserts are actually observed: the model ran, and the
@@ -20241,6 +20666,13 @@ class OrchestratorApp:
                         review = self.review(pr_number)
                         if self._record_review_or_error(review, errors, reviews):
                             continue
+                        # Issue #1078: if the cross-family review is pending,
+                        # review() returned without writing a packet or resetting
+                        # the decision. The old head's "approved" decision must
+                        # NOT trigger a merge for the new head — skip to the next
+                        # PR and let a later pass reap the review and rebuild.
+                        if review.data.get("cross_family_pending"):
+                            continue
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved" and is_merge_head:
                             merge_result = self.merge_ready(
@@ -20339,11 +20771,17 @@ class OrchestratorApp:
                             )
                         )
                         review = self.review(pr_number)
-                        if not cross_family_current:
+                        if not cross_family_current and not review.data.get(
+                            "cross_family_pending"
+                        ):
                             # review() has now run for the express purpose of
                             # regenerating this report. If it is still unusable
                             # and no attempt was charged, the regenerator was
-                            # never reached (issue #1099).
+                            # never reached (issue #1099). The
+                            # ``cross_family_pending`` guard (#1078) excludes
+                            # the case where the regenerator WAS reached — it
+                            # launched the async review — but the report is not
+                            # yet written because the subprocess is still running.
                             self._charge_cross_family_regen_not_reached(
                                 pr_number=pr_number,
                                 issue_number=issue_number,
@@ -20351,6 +20789,11 @@ class OrchestratorApp:
                                 attempts_before=attempts_before,
                             )
                         if self._record_review_or_error(review, errors, reviews):
+                            continue
+                        # Issue #1078: same guard as the already_approved branch
+                        # above — a pending cross-family review means no packet
+                        # was written, so any existing decision is stale.
+                        if review.data.get("cross_family_pending"):
                             continue
                         decision = self._review_decision(pr_number)
                         if decision.get("decision") == "approved" and is_merge_head:
@@ -21896,6 +22339,10 @@ class OrchestratorApp:
         # rework_requested and the existing closed-unmerged issue-side
         # handling (closed_unmerged_pr_active_labels) finalizes it.
         closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
+        # Issue #1078: a pending cross-family review means no packet was written.
+        # The issue must NOT be flipped to "reviewing" — it stays
+        # "rework_requested" for the next pass, same as the routed/blocked cases.
+        cross_family_pending = bool(review_result.data.get("cross_family_pending"))
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -21905,6 +22352,7 @@ class OrchestratorApp:
                 review_result.ok
                 and not routed_to_rework
                 and not closed_unmerged_converged
+                and not cross_family_pending
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "rework_requested"
@@ -22216,36 +22664,7 @@ class OrchestratorApp:
             declared_blockers includes all blockers mentioned in the issue body or
             GitHub dependencies. open_blockers is the subset that are currently open.
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-        issue_number = int(issue["number"])
-        body = issue.get("body", "")
-
-        # Parse blockers from issue body
-        body_blockers = parse_blockers(body)
-
-        # Get GitHub native dependencies
-        gh_blockers = get_github_issue_dependencies(self.gh, issue_number)
-
-        # Combine and deduplicate
-        all_blockers = sorted(set(body_blockers + gh_blockers))
-
-        if not all_blockers:
-            return [], []
-
-        # Check which blockers are still open
-        open_blockers = self.gh.are_issues_open(all_blockers)
-
-        # Filter out self-references (malformed markers like "Blocked by #123" on issue #123)
-        if issue_number in open_blockers:
-            logger.warning(
-                f"Issue #{issue_number} has self-referencing blocker declaration - ignoring"
-            )
-            open_blockers.discard(issue_number)
-            all_blockers.remove(issue_number)
-
-        return sorted(all_blockers), sorted(open_blockers)
+        return _get_open_blockers_for_issue(self.gh, issue)
 
     @staticmethod
     def _is_dead_blocker(
