@@ -378,3 +378,46 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: uv run charlie closing-keyword-check --pr ${{ github.event.pull_request.number }}
+      - name: Mojibake gate (issue 1057)
+        # PR-only: push-to-main has no diff to scan (the branch IS main).
+        #
+        # Same structural rationale as the closing-keyword gate above: a
+        # step of the existing "Lint" job, not a new job, so it rides the
+        # already-required "Lint" context and becomes a de facto blocking
+        # gate the moment a PR branch includes this workflow change -- no
+        # branch-protection edit, no orchestrator.config.yaml or
+        # .aviator/config.yml change, no separate promotion step.
+        #
+        # Scans added lines in the PR diff for cp1252/UTF-8 mojibake --
+        # non-ASCII characters corrupted by a misconfigured editing path
+        # (e.g. em-dashes turned into the a-circumflex/euro/quote sequence).
+        # The detection is derived from the encoding process (reverse the
+        # corruption and check whether the result differs), not a hardcoded
+        # list of bad byte sequences, so it catches any UTF-8/cp1252 round
+        # trip. See src/charlie_work/mojibake_gate.py for the full rationale.
+        #
+        # The base SHA is the PR's base branch tip at the time of the run,
+        # available in the workflow event context. actions/checkout@v5 with
+        # its default fetch-depth: 1 creates a shallow clone that contains
+        # only the PR head -- the base SHA is absent, so `git diff` against
+        # it exits 128 ("fatal: bad revision"). We fetch the base SHA
+        # explicitly (--depth 1: just that commit, no history) before
+        # running the gate.
+        #
+        # The gate uses a two-dot diff (base..HEAD), not three-dot
+        # (base...HEAD): three-dot needs the merge-base of base and HEAD,
+        # which requires traversing history between them -- impossible in a
+        # shallow clone where both endpoints are present but the ancestry
+        # chain is cut. Two-dot compares the two trees directly (no
+        # merge-base computation) and works in a shallow clone once both
+        # commits are present. For a PR that is up-to-date with its base
+        # (mergeable, the common case) the two are equivalent; for a PR
+        # that is behind, two-dot scans a superset of the PR's own added
+        # lines, which is safe for a corruption gate -- a false positive
+        # would mean the base branch itself has mojibake, which is a real
+        # problem worth surfacing.
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth 1 origin ${{ github.event.pull_request.base.sha }}
+          if ($LASTEXITCODE -ne 0) { throw "git fetch of base SHA failed" }
+          uv run charlie mojibake-check --base ${{ github.event.pull_request.base.sha }}
