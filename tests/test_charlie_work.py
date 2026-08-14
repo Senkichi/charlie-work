@@ -90,6 +90,7 @@ from charlie_work.workflow import (
     _render_required_changes_section,
     _required_changes_from_checks,
     _summary_is_vacuous,
+    sink_census,
     slugify,
 )
 from charlie_work.worktree import create_worktree
@@ -47870,3 +47871,98 @@ def test_dispatch_falls_back_on_provider_cooldown(
     )
     assert choice.kind == "devin-shell"
     assert choice.reason == "fallback:cooldown"
+
+
+def test_sink_census_counts_escalated_and_blocked_only(tmp_path: Path) -> None:
+    """Issue #1083: ``sink_census`` reads the sink population from state.
+
+    The sink is exactly the issues whose ``status`` is ``escalated`` or
+    ``blocked`` -- the in-state mirror of the ``agent:human-needed`` label.
+    Other terminal-ish statuses (``done``, ``merged``) and non-digit keys
+    are excluded so the census matches the de-escalation sweep's own
+    selection query.
+    """
+    state = {
+        "issues": {
+            "101": {"number": 101, "status": "escalated", "reason_class": "judgment"},
+            "102": {"number": 102, "status": "blocked", "reason_class": "mechanical"},
+            "103": {"number": 103, "status": "done"},
+            "104": {"number": 104, "status": PASSIVE_OPEN_STATUS},
+            "105": {"number": 105, "status": "rework_requested"},
+            "not-an-issue": {"number": 0, "status": "escalated"},
+        }
+    }
+    assert sink_census(state) == {101, 102}
+    # An empty / malformed issues map is safe.
+    assert sink_census({}) == set()
+    assert sink_census({"issues": "not-a-dict"}) == set()
+
+
+def test_loop_records_sink_metric_in_completed_event_and_pass_row(
+    tmp_path: Path,
+) -> None:
+    """Issue #1083: a loop pass reports the sink metric alongside autonomy.
+
+    Autonomy (merge_count/review_count) must never be reported without its
+    drop rate. This test asserts the ``loop_completed`` event payload and the
+    ``loop_passes`` row both carry ``sink_population``, ``sink_arrivals``,
+    and ``sink_clears`` for the pass, with arrivals derived from a
+    before/after census diff around ``_loop_body``.
+
+    ``_loop_body`` is replaced with a stub that escalates one fresh issue
+    mid-pass, so the pass observes one pre-existing parked issue (population
+    before) plus one arrival (population after = 2, arrivals = 1). The stub
+    emits no ``deescalation_cleared`` event, so ``sink_clears`` is 0.
+    """
+    from charlie_work.instrumentation import _get_db
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # One issue already parked in the sink before the pass.
+    state = load_state(paths.state_file)
+    state["issues"]["100"] = {
+        "number": 100,
+        "status": "escalated",
+        "reason_class": "judgment",
+    }
+    save_state(paths.state_file, state)
+
+    # Stub _loop_body to escalate a second issue during the pass and return a
+    # clean CommandResult without touching GitHub. This isolates the sink
+    # census diff (the issue #1083 measurement) from the rest of the pass.
+    def stub_body(limit: int | None, *, merge: bool | None, now=None) -> CommandResult:
+        mid = load_state(paths.state_file)
+        mid["issues"]["200"] = {
+            "number": 200,
+            "status": "blocked",
+            "reason_class": "judgment",
+        }
+        save_state(paths.state_file, mid)
+        return CommandResult(
+            ok=True, message="stub", data={"errors": [], "merges": [], "reviews": []}
+        )
+
+    app._loop_body = stub_body  # type: ignore[assignment]
+    app.loop(limit=0)
+
+    completed = query_events(paths.state_file, kind="loop_completed")
+    assert completed, "loop_completed event was not emitted"
+    payload = completed[-1]["payload"]
+    assert payload["sink_population"] == 2
+    assert payload["sink_arrivals"] == 1
+    assert payload["sink_clears"] == 0
+
+    # The loop_passes row carries the same metric in queryable columns.
+    conn = _get_db(paths.state_file)
+    assert conn is not None
+    row = conn.execute(
+        "SELECT sink_population, sink_arrivals, sink_clears FROM loop_passes "
+        "ORDER BY started_at DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    assert row["sink_population"] == 2
+    assert row["sink_arrivals"] == 1
+    assert row["sink_clears"] == 0
