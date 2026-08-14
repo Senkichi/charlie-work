@@ -297,6 +297,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "reconcile_pass_skipped": "info",
         "record_review": "info",
         "rescue_dispatched": "info",
+        # One outcome record per self-deploy sibling-pull attempt (pulled /
+        # unchanged / skipped / failed, discriminated by the payload's ok and
+        # skipped_reason/error fields). Info because the common case is routine
+        # bookkeeping; failures additionally log at WARNING and are deliberately
+        # outside the self_deploy_alarm streak (a sibling wedge bounds staleness
+        # but does not block orchestrator deploys).
+        "self_deploy_ci_fleet_pull": "info",
         "review_dispatch": "info",
         "review_dispatch_claim": "info",
         "review_packet": "info",
