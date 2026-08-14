@@ -42677,6 +42677,169 @@ def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path)
     assert len(events) == 1
 
 
+def test_classify_dead_sessions_skips_salvage_when_issue_closed(tmp_path: Path) -> None:
+    """Issue #1221 (check 1): salvage refuses to open a PR when the linked
+    issue is already CLOSED. The dead session's snapshot is stale -- an
+    operator/sibling merged the work and closed the issue inside the staleness
+    window -- so salvage re-checks live issue state at fire time and downgrades
+    to a ``salvage_skipped_already_landed`` event instead of a vestigial PR.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    # Closed issue still carrying an active label (the secondary defect in
+    # #1221): the active-label gate lets the lane proceed, and salvage's own
+    # closed-issue check must refuse the PR.
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "CLOSED",
+        }
+    ]
+    gh.pr_create_return = 999  # would-be vestigial salvage PR
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    # No vestigial PR opened.
+    assert not gh.prs_created
+    # Active label is NOT stripped by the skip path (label cleanup is the
+    # reconcile lane's job); the issue is not re-dispatched.
+    assert (1221, config.labels.in_progress) not in gh.labels_removed
+    assert (1221, config.labels.ready) not in gh.labels_added
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "issue_closed"
+    # No session_salvaged event was emitted.
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_skips_salvage_when_pr_merged(tmp_path: Path) -> None:
+    """Issue #1221 (check 2): salvage refuses to open a PR when a PR binding to
+    the issue is already MERGED, even if the GitHub issue is still OPEN (the
+    close event lags or the merge closed it after the snapshot)."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    # A merged PR whose head ref binds to issue 1221 via the branch prefix.
+    gh.prs = [
+        {
+            "number": 1217,
+            "title": "Fix #1221",
+            "url": "https://example.test/pull/1217",
+            "headRefName": branch,
+            "baseRefName": "main",
+            "headRefOid": "sha-merged",
+            "body": "Closes #1221",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+    gh.pr_create_return = 999
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    assert not gh.prs_created
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "pr_merged"
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_skips_salvage_when_branch_empty_diff(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3): salvage refuses to open a PR when the branch's
+    tree is identical to current main's tree -- the work already landed, so a
+    salvage PR would be vestigial.
+
+    Reproduces the exact race: ``inspect_worktree_state`` resolves its base
+    against a *stale* ``origin/main`` tracking ref (so it sees COMPLETED, ahead
+    of the old tip), while the live remote main has already advanced to include
+    the branch's work. Salvage fetches the live tip before opening a PR and
+    detects the empty tree diff.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    # Push the worker branch so a second clone can merge it into main.
+    _git(repo_root, "push", "origin", branch)
+
+    # Advance origin/main to include the branch's work via a SECOND clone,
+    # leaving repo_root's origin/main tracking ref stale -- the race window
+    # between the merge landing and the dead session's staleness tripping.
+    clone2 = tmp_path / "clone2"
+    clone2.mkdir(parents=True, exist_ok=True)
+    _git(clone2, "init", "--initial-branch=main")
+    _git(clone2, "config", "user.email", "test@example.test")
+    _git(clone2, "config", "user.name", "Test User")
+    _git(clone2, "config", "commit.gpgSign", "false")
+    _git(clone2, "remote", "add", "origin", str(remote))
+    _git(clone2, "fetch", "origin")
+    _git(clone2, "merge", "--ff-only", f"origin/{branch}")
+    _git(clone2, "push", "origin", "main")
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 999
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    # No vestigial PR: the branch contributes nothing beyond current main.
+    assert not gh.prs_created
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "empty_diff"
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
 def test_session_failed_relabeled_payload_requires_reason() -> None:
     """Issue #978: the shared payload builder makes a relabel event without a
     ``reason`` unrepresentable -- calling it without ``reason`` raises

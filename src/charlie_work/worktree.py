@@ -3712,6 +3712,53 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
     return "main"
 
 
+def salvage_branch_empty_diff(repo_root: Path, branch: str, base_ref: str) -> bool:
+    """Return True if ``branch``'s tree is identical to current main's tree.
+
+    A salvage PR whose net diff is empty is definitionally vestigial -- there is
+    nothing to preserve that is not already on the default branch. This is the
+    cheap tree-level check (issue #1221, check 3): compare the branch tip's
+    tree SHA against the live default branch's tree SHA.
+
+    ``git fetch origin <base>`` is run first so the comparison sees the *live*
+    remote tip, not a stale tracking ref. The race this exists for is exactly a
+    tracking ref that lags behind a merge that just landed: ``inspect_worktree_state``
+    resolved its base against the same stale ref and saw COMPLETED (ahead of the
+    old tip), so without this fetch the salvage would open a duplicate PR for
+    work that is already on main.
+
+    Fails safe (returns False = "do not skip salvage") on any git error -- a
+    transient fetch/rev-parse failure falls back to opening the PR, which a
+    human reviews anyway. ``git fetch`` does not move HEAD and is safe to run
+    against a checkout a supervisor is actively using (see ``main_ci_reclaim``
+    for the same rationale).
+    """
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+    fetch = _run_remote_captured(
+        ["git", "fetch", "origin", base_branch],
+        cwd=repo_root,
+    )
+    if not fetch.ok:
+        return False
+    base_ref_resolved = f"origin/{base_branch}"
+    branch_ref = _resolve_salvage_branch_ref(repo_root, branch)
+    if branch_ref is None:
+        return False
+    base_tree = run_captured(
+        ["git", "rev-parse", "--verify", "--quiet", f"{base_ref_resolved}^{{tree}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    branch_tree = run_captured(
+        ["git", "rev-parse", "--verify", "--quiet", f"{branch_ref}^{{tree}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not base_tree.ok or not branch_tree.ok:
+        return False
+    return base_tree.stdout.strip() == branch_tree.stdout.strip()
+
+
 # Cap on commit subjects rendered into a salvage body. A runaway branch should
 # not paste hundreds of lines into a PR description; the count is reported so
 # the elision is visible rather than silent.
