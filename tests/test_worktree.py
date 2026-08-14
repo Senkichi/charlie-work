@@ -7437,3 +7437,37 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
 
     # Clean up.
     remove_worktree(repo, info.path, branch=branch_name)
+
+
+# --- Issue #807: worktree_unsafe kind split at detection time ---
+
+
+def test_worktree_unsafe_error_classifies_shim_dirt_from_uncommitted_modifications() -> None:
+    """Issue #807: a ``WorktreeUnsafeError`` raised for uncommitted modifications
+    (launch-shim dirt / adapter shim materialization) must carry
+    ``kind="worktree_unsafe_shim_dirt"`` — the mechanical kind that stays in
+    ``DETERMINISTIC_ESCALATION_FAILURE_KINDS`` and is eligible for auto-de-escalation.
+    """
+    exc = WorktreeUnsafeError("worktree has uncommitted modifications")
+    assert exc.kind == "worktree_unsafe_shim_dirt"
+
+
+def test_worktree_unsafe_error_classifies_local_commits_from_unpushed_commits() -> None:
+    """Issue #807: a ``WorktreeUnsafeError`` raised for local commits not on the
+    remote branch (genuine divergence) must carry
+    ``kind="worktree_unsafe_local_commits"`` — the judgment kind that escalates
+    immediately but is NOT eligible for auto-de-escalation.
+    """
+    exc = WorktreeUnsafeError("worktree has 1 local commit(s) not on remote branch")
+    assert exc.kind == "worktree_unsafe_local_commits"
+
+
+def test_worktree_unsafe_error_explicit_kind_overrides_reason_derivation() -> None:
+    """Issue #807: an explicit ``kind`` argument takes precedence over the
+    auto-derived kind from the reason string, so callers that already know the
+    discriminator can pass it directly."""
+    exc = WorktreeUnsafeError(
+        "worktree has uncommitted modifications",
+        kind="worktree_unsafe_local_commits",
+    )
+    assert exc.kind == "worktree_unsafe_local_commits"

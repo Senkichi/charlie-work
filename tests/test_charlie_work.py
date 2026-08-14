@@ -25561,7 +25561,7 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
         started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -25572,7 +25572,7 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     state = load_state(paths.state_file)
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
-    assert entry["escalation_reason"] == "worktree_unsafe"
+    assert entry["escalation_reason"] == "worktree_unsafe_shim_dirt"
     assert (123, config.labels.human_needed) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
@@ -26030,7 +26030,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
         started_at=now.isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error="worktree creation failed: worktree contains local work",
-        failure_kind="worktree_unsafe",
+        failure_kind="worktree_unsafe_shim_dirt",
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
@@ -26050,7 +26050,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
     state = load_state(paths.state_file)
     issue_entry = state["issues"]["42"]
     assert issue_entry["status"] == "escalated"
-    assert issue_entry["escalation_reason"] == "worktree_unsafe"
+    assert issue_entry["escalation_reason"] == "worktree_unsafe_shim_dirt"
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 42]
     assert "session_failed_relabeled" not in event_kinds
@@ -29149,7 +29149,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
                 adapter="command",
                 ok=False,
                 error="worktree is unsafe to reuse",
-                failure_kind="worktree_unsafe",
+                failure_kind="worktree_unsafe_shim_dirt",
             )
             for request in requests
         ]
@@ -29161,7 +29161,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
 
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
-    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_shim_dirt"
     assert (123, config.labels.human_needed) in fake_gh.labels_added
 
     # The attempt counted by the (now-unified) conflict-rework dispatch must

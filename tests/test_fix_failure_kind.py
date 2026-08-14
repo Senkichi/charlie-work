@@ -151,7 +151,12 @@ def test_dispatch_sessions_claude_code_propagates_worktree_unsafe(
     )
 
     assert results[0].ok is False
-    assert results[0].failure_kind == "worktree_unsafe"
+    # Issue #807: ``WorktreeUnsafeError`` now carries a discriminator (shim
+    # dirt vs local commits) derived from the reason string. "worktree
+    # contains local work" does not mention "local commit", so it classifies
+    # as shim dirt — the mechanical kind that stays in
+    # DETERMINISTIC_ESCALATION_FAILURE_KINDS.
+    assert results[0].failure_kind == "worktree_unsafe_shim_dirt"
 
 
 def test_dispatch_sessions_devin_shell_propagates_rework_branch_conflict(

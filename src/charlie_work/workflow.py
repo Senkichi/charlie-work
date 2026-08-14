@@ -47,6 +47,7 @@ from .config import (
     CrossFamilyConfig,
     DispatchConfig,
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
     ReviewDispatchConfig,
 )
@@ -5151,6 +5152,12 @@ def _reap_restore_rework_requested(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+        # Issue #807: a deterministic judgment failure (e.g. genuine local
+        # commits on the worktree branch) escalates immediately like a
+        # terminal_failure but as ``reason_class="judgment"`` so the
+        # de-escalation sweep never auto-clears it.
+        deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+        immediate_escalation = terminal_failure or deterministic_judgment
 
         # Issue #1134: a worker that died before pushing leaves the PR head
         # unchanged, but that is NOT a no-op — the worker may have completed
@@ -5163,28 +5170,29 @@ def _reap_restore_rework_requested(
         worker_death_at = _windowed_worker_death_at(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
-        if not terminal_failure:
+        if not immediate_escalation:
             worker_death_at = worker_death_at + [
                 datetime.now(UTC).isoformat().replace("+00:00", "Z")
             ]
 
         no_op_count = max(0, len(redispatch_at) - len(worker_death_at))
         death_count = len(worker_death_at)
-        death_loop = not terminal_failure and death_count > config.watchdog.max_auto_redispatch
+        death_loop = not immediate_escalation and death_count > config.watchdog.max_auto_redispatch
         no_op_loop = (
-            not terminal_failure
+            not immediate_escalation
             and not death_loop
             and no_op_count > config.watchdog.max_auto_redispatch
         )
-        should_escalate = terminal_failure or death_loop or no_op_loop
+        should_escalate = immediate_escalation or death_loop or no_op_loop
 
         if should_escalate:
-            if terminal_failure:
+            if immediate_escalation:
                 reason = failure_kind
             elif death_loop:
                 reason = "worker_death_loop"
             else:
                 reason = "redispatch_cap_exceeded"
+            reason_class = "judgment" if deterministic_judgment else "mechanical"
             # Preserve worker_pid/worker_process_start_time (issue #282): the
             # recovery probe still needs the fingerprint even after escalation.
             issue_extra: dict[str, Any] = {
@@ -5199,7 +5207,7 @@ def _reap_restore_rework_requested(
                 "reason": "dead_rework_session_escalated",
                 "redispatch_count": len(redispatch_at),
             }
-            if not terminal_failure:
+            if not immediate_escalation:
                 # Persist the death record regardless of which cap fired —
                 # the death still happened, and the consumption side
                 # (_dispatch_rework_impl) reads it from state.
@@ -5220,7 +5228,7 @@ def _reap_restore_rework_requested(
                 state,
                 worker.issue_number,
                 reason=reason,
-                reason_class="mechanical",
+                reason_class=reason_class,
                 issue_extra=issue_extra,
             )
             state = append_event(
@@ -5234,7 +5242,7 @@ def _reap_restore_rework_requested(
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
             entry["redispatch_at"] = redispatch_at
-            if not terminal_failure:
+            if not immediate_escalation:
                 entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
@@ -6183,14 +6191,22 @@ def _route_dead_worker_to_pre_review_rework(
         ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-        if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+        # Issue #807: a deterministic judgment failure escalates immediately
+        # but as ``reason_class="judgment"`` so the de-escalation sweep
+        # never auto-clears it.
+        deterministic_judgment = failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+        immediate_escalation = terminal_failure or deterministic_judgment
+        if immediate_escalation or len(redispatch_at) > config.watchdog.max_auto_redispatch:
             # Issue #783: merge conflict / rework-branch conflict / stale-CI
             # redispatch cap are all process failures, not judgment calls.
+            # Issue #807: a deterministic judgment failure (genuine local
+            # commits) is a judgment call, not a process failure.
+            reason_class = "judgment" if deterministic_judgment else "mechanical"
             state = _escalate_issue(
                 state,
                 issue_number,
-                reason=(failure_kind if terminal_failure else "redispatch_cap_exceeded"),
-                reason_class="mechanical",
+                reason=(failure_kind if immediate_escalation else "redispatch_cap_exceeded"),
+                reason_class=reason_class,
                 issue_extra={
                     "redispatch_at": redispatch_at,
                     "pre_review_rework_reason": reason,
@@ -6410,8 +6426,8 @@ def _classify_dead_sessions_and_update_throttle_state(
 
             if (
                 failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
-                and w.issue_number not in open_prs_by_issue
-            ):
+                or failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+            ) and w.issue_number not in open_prs_by_issue:
                 try:
                     issue = gh.issue_view(w.issue_number)
                 except Exception:
@@ -6427,11 +6443,17 @@ def _classify_dead_sessions_and_update_throttle_state(
                     ) + [now.isoformat().replace("+00:00", "Z")]
                     # Issue #783: a deterministic launch failure kind is a
                     # process failure, not a judgment call -- mechanical.
+                    # Issue #807: a deterministic judgment failure kind (genuine
+                    # local commits) is a judgment call -- judgment.
+                    deterministic_judgment = (
+                        failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    reason_class = "judgment" if deterministic_judgment else "mechanical"
                     state = _escalate_issue(
                         state,
                         w.issue_number,
                         reason=failure_kind,
-                        reason_class="mechanical",
+                        reason_class=reason_class,
                         issue_extra={"redispatch_at": redispatch_at},
                     )
                     state["issues"][str(w.issue_number)].pop("worker_pid", None)
@@ -6682,23 +6704,32 @@ def _classify_dead_sessions_and_update_throttle_state(
                     # same block, so it bypasses the redispatch-count cap entirely
                     # and escalates on the very first occurrence.
                     terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    # Issue #807: a deterministic judgment failure escalates
+                    # immediately but as ``reason_class="judgment"``.
+                    deterministic_judgment = (
+                        failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    immediate_escalation = terminal_failure or deterministic_judgment
                     if (
-                        terminal_failure
+                        immediate_escalation
                         or len(redispatch_at) > config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review instead of relabeling to ready
                         reason = (
                             failure_kind
-                            if terminal_failure and failure_kind is not None
+                            if immediate_escalation and failure_kind is not None
                             else "redispatch_cap_exceeded"
                         )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure (genuine
+                        # local commits) is a judgment call -- judgment.
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             w.issue_number,
                             reason=reason,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={"redispatch_at": redispatch_at},
                         )
                         # Issue #282: preserve the liveness fingerprint for the
@@ -9165,23 +9196,35 @@ class OrchestratorApp:
                         failed_result is not None
                         and failed_result.failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
                     )
+                    # Issue #807: a deterministic judgment failure escalates
+                    # immediately but as ``reason_class="judgment"``.
+                    deterministic_judgment = (
+                        failed_result is not None
+                        and failed_result.failure_kind
+                        in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    immediate_escalation = terminal_failure or deterministic_judgment
                     entry["dispatch_failed_at"] = all_attempts
-                    if terminal_failure or len(recent) > self.config.watchdog.max_auto_redispatch:
+                    if (
+                        immediate_escalation
+                        or len(recent) > self.config.watchdog.max_auto_redispatch
+                    ):
                         status = "escalated"
                         dispatched_at = None
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             request.issue_number,
                             reason=(
                                 failed_result.failure_kind
                                 if (
-                                    terminal_failure
+                                    immediate_escalation
                                     and failed_result is not None
                                     and failed_result.failure_kind is not None
                                 )
                                 else "dispatch_failed_cap_exceeded"
                             ),
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra=entry,
                         )
                         # Re-read the escalation fields _escalate_issue merged in,
@@ -20449,19 +20492,30 @@ class OrchestratorApp:
                         entry, window_minutes=self.config.watchdog.redispatch_window_minutes
                     ) + [now.isoformat().replace("+00:00", "Z")]
                     terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    # Issue #807: a deterministic judgment failure escalates
+                    # immediately but as ``reason_class="judgment"``.
+                    deterministic_judgment = (
+                        failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+                    )
+                    immediate_escalation = terminal_failure or deterministic_judgment
                     if (
-                        terminal_failure
+                        immediate_escalation
                         or len(redispatch_at) > self.config.watchdog.max_auto_redispatch
                     ):
                         # Escalate to human review
-                        reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        reason = (
+                            failure_kind if immediate_escalation else "redispatch_cap_exceeded"
+                        )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
+                        # Issue #807: a deterministic judgment failure (genuine
+                        # local commits) is a judgment call -- judgment.
+                        reason_class = "judgment" if deterministic_judgment else "mechanical"
                         state = _escalate_issue(
                             state,
                             request.issue_number,
                             reason=reason,
-                            reason_class="mechanical",
+                            reason_class=reason_class,
                             issue_extra={
                                 "redispatch_at": redispatch_at,
                                 "dispatched_at": None,

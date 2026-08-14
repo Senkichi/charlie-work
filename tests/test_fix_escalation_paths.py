@@ -989,7 +989,7 @@ def test_dispatch_deterministic_failure_kind_escalates_on_first_failure(
     app, fake_gh = _closed_pr_app(tmp_path)
     monkeypatch.setattr(
         "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory("worktree_unsafe"),
+        _fake_dispatch_sessions_factory("worktree_unsafe_shim_dirt"),
     )
 
     result = app.dispatch(limit=1)
@@ -997,8 +997,39 @@ def test_dispatch_deterministic_failure_kind_escalates_on_first_failure(
     assert result.ok is False
     state = load_state(app.paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
-    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_shim_dirt"
     # Escalated on the FIRST failure -- not after burning max_auto_redispatch.
+    assert len(state["issues"]["123"]["dispatch_failed_at"]) == 1
+    assert (123, app.config.labels.human_needed) in fake_gh.labels_added
+
+
+def test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #807: a ``worktree_unsafe_local_commits`` failure (genuine unpushed
+    local commits on the worktree branch) must escalate immediately on first
+    occurrence — like a deterministic mechanical failure — but with
+    ``reason_class="judgment"`` so the de-escalation sweep never auto-clears it.
+
+    Without the split (the mutation), ``worktree_unsafe_local_commits`` is not
+    in any deterministic set, so it takes the redispatch-cap path instead of
+    escalating immediately — the issue stays ``dispatch_failed``, not
+    ``escalated``, and this test fails.
+    """
+    app, fake_gh = _closed_pr_app(tmp_path)
+    monkeypatch.setattr(
+        "charlie_work.workflow.dispatch_sessions",
+        _fake_dispatch_sessions_factory("worktree_unsafe_local_commits"),
+    )
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is False
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe_local_commits"
+    assert state["issues"]["123"]["reason_class"] == "judgment"
+    # Escalated on the FIRST failure — not after burning max_auto_redispatch.
     assert len(state["issues"]["123"]["dispatch_failed_at"]) == 1
     assert (123, app.config.labels.human_needed) in fake_gh.labels_added
 
@@ -1102,11 +1133,11 @@ def _fake_dispatch_result_factory(
         (
             "deterministic_failure_escalates_first_try",
             False,
-            "worktree_unsafe",
+            "worktree_unsafe_shim_dirt",
             None,
             "escalated",
             2,
-            "worktree_unsafe",
+            "worktree_unsafe_shim_dirt",
         ),
     ],
 )

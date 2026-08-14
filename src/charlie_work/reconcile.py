@@ -28,7 +28,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .config import (
+    DETERMINISTIC_ESCALATION_FAILURE_KINDS,
+    DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
+    OrchestratorConfig,
+)
 from .github import (
     GitHubError,
     GitHubLike,
@@ -1318,9 +1322,9 @@ def detect_drift(
                         if issue and _issue_state(issue) == "OPEN":
                             issue_labels = label_names(issue)
                             active_labels = issue_labels & labels_cfg.active
-                            if (
-                                active_labels
-                                and failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                            if active_labels and (
+                                failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                                or failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
                             ):
                                 drift.append(
                                     DriftItem(

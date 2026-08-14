@@ -438,7 +438,11 @@ def launch_devin_session(
             # takes the ordinary redispatch-cap path (issue #288 follow-up, PR #314).
             failure_kind = "worktree_probe_failed"
         elif isinstance(exc, WorktreeUnsafeError):
-            failure_kind = "worktree_unsafe"
+            # Issue #807: the discriminator (shim dirt vs local commits) is
+            # computed at detection time and carried on the exception, so the
+            # launch shim emits a distinct failure_kind without classifying
+            # after the fact.
+            failure_kind = exc.kind
         elif isinstance(exc, ReworkBranchConflictError):
             failure_kind = "rework_branch_conflict"
         elif isinstance(exc, WorktreeForeignWriterError):

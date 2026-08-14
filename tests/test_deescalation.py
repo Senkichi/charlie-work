@@ -903,3 +903,61 @@ def test_skip_reason_vocabulary_is_derived_from_the_branches() -> None:
     # `if not (... and ... and ...)` is what made "0 cleared" unreadable, and
     # only `janitor_blocked` means "the sweep works but the PR is not ready".
     assert {"janitor_blocked", "pr_not_open", "pr_conflicting", "no_open_pr"} <= set(reasons)
+
+
+# --- Issue #807: worktree_unsafe split — local commits must NOT auto-de-escalate ---
+
+
+def test_worktree_unsafe_local_commits_not_auto_deescalated(tmp_path: Path) -> None:
+    """Issue #807 AC: a ``worktree_unsafe`` escalation caused by genuine local
+    commits (``worktree_unsafe_local_commits``, ``reason_class="judgment"``)
+    must NOT be auto-de-escalated by the mechanical sweep, even when the PR is
+    open, mergeable, and janitor-ok — the exact conditions that WOULD clear a
+    ``mechanical`` escalation.
+
+    Returning the issue to dispatch is not a no-op for this trigger: it
+    actively fights the safety system that raised the escalation and risks a
+    second writer on a branch that already has divergent local work. The
+    one-writer-per-branch invariant is enforced by the dispatch label;
+    de-escalating releases that mutex.
+    """
+    app = _app(tmp_path)
+    _second_mergequeue_pr(app.gh)  # adds issue 124 / PR 789 (untouched control)
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "worktree_unsafe_local_commits",
+            "reason_class": "judgment",
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    issue_123 = state["issues"]["123"]
+    # The judgment escalation is completely untouched — still escalated, still
+    # judgment, no auto_deescalation_count, no label transitions.
+    assert issue_123["status"] == "escalated"
+    assert issue_123["reason_class"] == "judgment"
+    assert issue_123["escalation_reason"] == "worktree_unsafe_local_commits"
+    assert "auto_deescalation_count" not in issue_123
+    assert all(num != 123 for (num, _label) in app.gh.labels_added)
+    assert all(num != 123 for (num, _label) in app.gh.labels_removed)
+
+    # No deescalation_cleared event was emitted for this issue.
+    cleared = _events(state, "deescalation_cleared")
+    assert all(e["payload"].get("issue_number") != 123 for e in cleared)
+
+    passes = _events(state, "deescalation_pass_completed")
+    assert len(passes) == 1
+    # The candidate query requires reason_class == "mechanical", so a
+    # "judgment" entry never enters the candidate list.
+    assert passes[0]["payload"]["candidates"] == 0
