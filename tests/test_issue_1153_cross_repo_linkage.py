@@ -15,9 +15,14 @@ simply never tracked at all.
 
 The fix (reconcile.py): when an OPEN PR has a ``linked_issue_number`` that
 does not exist in the issue snapshot, emit a ``pr_linked_issue_not_in_repo``
-drift item. ``apply_fixes`` tracks the PR in state and the ``reconcile`` event
-makes the cross-repo linkage failure visible to operators and the janitor,
-instead of silently demoting the PR to passive.
+drift item. ``apply_fixes`` tracks the PR in state with status ``escalated``
+(and ``escalation_reason = "cross_repo_linkage_failure"``) so it is
+distinguishable from the ``open_passive`` placeholder and routed to a human
+remedy, symmetric with the issue-side ``agent:human-needed`` label. The
+``reconcile`` event makes the cross-repo linkage failure visible to operators
+and the janitor. A self-healing condition in ``detect_drift`` skips
+re-emitting once the PR is already tracked with the cross-repo issue_number
+and a status, so the drift item does not re-fire on every pass.
 
 Blind spot 2 (issue side, dispatch loop): an issue whose prior dispatch
 attempts all show ``ahead_of_main: 0`` (the worker hopped to a sibling repo,
@@ -48,7 +53,7 @@ from charlie_work.config import (
 )
 from charlie_work.paths import runtime_paths
 from charlie_work.reconcile import apply_fixes, detect_drift
-from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state
+from charlie_work.state import load_state, save_state
 
 from test_reconcile import FakeGitHub, _issue, _pr
 
@@ -124,8 +129,10 @@ def test_open_pr_with_resolvable_closing_ref_does_not_emit_linkage_drift() -> No
 def test_linkage_drift_apply_fixes_tracks_pr_and_emits_event(tmp_path: Path) -> None:
     """``apply_fixes`` must track the PR in state (so it is visible to future
     sweeps) and emit a ``reconcile`` event that surfaces the cross-repo
-    linkage failure. The PR does not silently become ``open_passive`` --
-    there is a visible event explaining why.
+    linkage failure. The PR is escalated to ``agent:human-needed``-equivalent
+    status (``escalated`` with ``escalation_reason``), not silently demoted to
+    ``open_passive`` -- it remains distinguishable and routable to a human
+    remedy, symmetric with the issue-side treatment.
     """
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -160,9 +167,11 @@ def test_linkage_drift_apply_fixes_tracks_pr_and_emits_event(tmp_path: Path) -> 
     assert pr_entry is not None
     assert pr_entry["number"] == 1147
     assert pr_entry["issue_number"] == 1497
-    # Status is set to PASSIVE_OPEN_STATUS only when the PR was not already
-    # tracked with a meaningful status.
-    assert pr_entry["status"] == PASSIVE_OPEN_STATUS
+    # Status is set to ``escalated`` (not ``open_passive``) with an
+    # escalation_reason, so the PR is distinguishable from the passive
+    # placeholder and routed to a human remedy.
+    assert pr_entry["status"] == "escalated"
+    assert pr_entry["escalation_reason"] == "cross_repo_linkage_failure"
 
     # A reconcile event must be emitted -- the visible signal.
     reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
@@ -175,7 +184,7 @@ def test_linkage_drift_apply_fixes_tracks_pr_and_emits_event(tmp_path: Path) -> 
 def test_linkage_drift_does_not_overwrite_existing_active_status() -> None:
     """If the PR is already tracked with a meaningful active status (e.g.
     ``reviewing``), ``apply_fixes`` must NOT overwrite it with
-    ``PASSIVE_OPEN_STATUS`` -- it only fills in the status when the PR was
+    ``escalated`` -- it only fills in the status when the PR was
     untracked or had no status.
     """
     config = OrchestratorConfig()
@@ -204,6 +213,97 @@ def test_linkage_drift_does_not_overwrite_existing_active_status() -> None:
 
     pr_entry = new_state["prs"]["1147"]
     assert pr_entry["status"] == "reviewing"
+
+
+def test_linkage_drift_self_heals_after_apply_fixes(tmp_path: Path) -> None:
+    """After ``apply_fixes`` has tracked the PR in state with the cross-repo
+    ``issue_number`` and a status, a second ``detect_drift`` pass must NOT
+    re-emit the ``pr_linked_issue_not_in_repo`` drift item.
+
+    Without the self-healing condition in ``detect_drift``, this drift kind
+    would re-fire on every reconcile pass for as long as the PR stays open
+    (the issue never appears in this repo's snapshot), causing
+    ``apply_fixes`` to emit a duplicate ``reconcile`` event each pass --
+    unboundedly filling the capped events ring and ``events.db``. This test
+    mirrors the self-healing pattern every sibling drift kind in the same
+    function relies on (e.g. ``pr_status_normalized`` skips once status is no
+    longer None).
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeGitHub(
+        prs=[
+            _pr(
+                1147,
+                "OPEN",
+                head_ref="agent/issue-1497-fix-review-pipeline",
+                body="Closes #1497\n\nFixes the review pipeline.",
+            )
+        ],
+        issues=[_issue(123, [config.labels.ready])],
+    )
+    state = {"issues": {}, "prs": {}, "events": []}
+    save_state(paths.state_file, state)
+
+    # First pass: detect + apply.
+    drift = detect_drift(gh, state, config)
+    linkage_items = [d for d in drift if d.kind == "pr_linked_issue_not_in_repo"]
+    assert len(linkage_items) == 1
+
+    new_state = apply_fixes(
+        gh,
+        state,
+        linkage_items,
+        config,
+        state_path=paths.state_file,
+    )
+
+    # Second pass: detect_drift on the post-apply state must not re-emit.
+    second_drift = detect_drift(gh, new_state, config)
+    second_linkage = [d for d in second_drift if d.kind == "pr_linked_issue_not_in_repo"]
+    assert len(second_linkage) == 0
+
+
+def test_linkage_drift_self_heals_with_existing_active_status() -> None:
+    """When the PR is already tracked with an active status (e.g.
+    ``reviewing``) but no ``issue_number``, the first ``detect_drift`` pass
+    emits the drift item (the issue_number is missing from state). After
+    ``apply_fixes`` adds the ``issue_number`` (without overwriting the
+    existing status), a second ``detect_drift`` pass must NOT re-emit --
+    the PR is now tracked with the cross-repo ``issue_number`` and a
+    non-None status.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[
+            _pr(
+                1147,
+                "OPEN",
+                head_ref="agent/issue-1497-fix-review-pipeline",
+                body="Closes #1497",
+            )
+        ],
+        issues=[_issue(123, [config.labels.ready])],
+    )
+    state = {
+        "issues": {},
+        "prs": {"1147": {"number": 1147, "status": "reviewing"}},
+        "events": [],
+    }
+
+    # First pass: emits because issue_number is not yet in the PR entry.
+    drift = detect_drift(gh, state, config)
+    linkage_items = [d for d in drift if d.kind == "pr_linked_issue_not_in_repo"]
+    assert len(linkage_items) == 1
+
+    new_state = apply_fixes(gh, state, linkage_items, config)
+    assert new_state["prs"]["1147"]["status"] == "reviewing"
+    assert new_state["prs"]["1147"]["issue_number"] == 1497
+
+    # Second pass: must not re-emit.
+    second_drift = detect_drift(gh, new_state, config)
+    second_linkage = [d for d in second_drift if d.kind == "pr_linked_issue_not_in_repo"]
+    assert len(second_linkage) == 0
 
 
 # ---------------------------------------------------------------------------
