@@ -3641,15 +3641,33 @@ def _detect_and_handle_stalled_reviews(
                 "reviewer_pid": None,
                 "reviewer_process_start_time": None,
             }
-            sweep_events.append(
-                (
-                    "review_dispatch_stalled",
-                    {
-                        "pr_number": int(pr_key) if pr_key.isdigit() else None,
-                        "status": "unclaimed",
-                        "prompt_mtime": packet_age,
-                    },
-                )
+            # Issue #748: an unclaimed packet is a transient startup race, not
+            # a terminal failure. ``review()`` generated the packet but
+            # ``dispatch_reviews`` has not claimed it yet; this sweep marks it
+            # ``review_dispatch_failed`` so the next dispatch pass retries.
+            # Measured against events.db (81 unclaimed events, 2026-07-23 to
+            # 2026-08-13): 31/81 (38%) recovered via ``review_dispatch_claim``
+            # with a median of 19s (27/31 under 60s); the remaining 50/81 were
+            # handled by fallback mechanisms (orphaned-worker routing, stale-
+            # claim reaping, escalation) rather than the normal dispatch path.
+            # In neither case is the packet stuck -- the sweep's
+            # ``review_dispatch_failed`` transition guarantees a retry path.
+            # Routing this through ``append_event`` directly with
+            # ``level="warning"`` (instead of ``sweep_events``) mirrors the two
+            # ``provider_throttled*`` paths above and keeps it out of the
+            # ``_append_sweep_events`` batcher, which deliberately does not
+            # classify levels (see its comment).
+            unclaimed_payload = {
+                "pr_number": int(pr_key) if pr_key.isdigit() else None,
+                "status": "unclaimed",
+                "prompt_mtime": packet_age,
+            }
+            state = append_event(
+                state,
+                "review_dispatch_stalled",
+                unclaimed_payload,
+                state_path=state_file,
+                level="warning",
             )
             changed = True
             stalled.append(
