@@ -54,11 +54,24 @@ _CLOSING_LINE_RE = re.compile(
 
 @dataclass(frozen=True)
 class ClosingLineMatch:
-    """One recognized ``Closes #N`` / ``Closes owner/repo#N`` line."""
+    """One recognized ``Closes #N`` / ``Closes owner/repo#N`` line.
+
+    ``start``/``end`` are the match's character offsets in the body it was
+    found in. Corrections below splice by these offsets, never by searching
+    for ``line`` as a literal substring -- the exact line text can (and, in
+    the field, does) also occur as an unstructured substring elsewhere in
+    the body, e.g. inside prose pulled from a commit-message summary
+    (``summarize_branch_work``). A content-based ``str.replace`` would then
+    patch that earlier, unrelated occurrence instead of the actual
+    structured line at ``start``:``end``, leaving the real defect (wrong or
+    duplicate closing line) untouched in the output.
+    """
 
     line: str
     repo: str | None
     issue_number: int
+    start: int
+    end: int
 
 
 @dataclass(frozen=True)
@@ -136,6 +149,8 @@ def validate_closing_reference(
             line=m.group(0),
             repo=m.group(1),
             issue_number=int(m.group(2)),
+            start=m.start(),
+            end=m.end(),
         )
         for m in _CLOSING_LINE_RE.finditer(body)
     ]
@@ -172,14 +187,23 @@ def validate_closing_reference(
             # repo whenever the original qualifier was itself the defect.
             qualifier = f"{repo}#" if match.repo else "#"
             canonical_line = f"Closes {qualifier}{issue_number}"
-            new_body = body.replace(match.line, canonical_line, 1)
+            # Splice by offset, not by content -- see `ClosingLineMatch`.
+            new_body = body[: match.start] + canonical_line + body[match.end :]
             findings.append("closing reference rewritten")
     else:
         canonical = f"Closes #{issue_number}"
-        first = matches[0]
-        new_body = body.replace(first.line, canonical, 1)
-        for extra in matches[1:]:
-            new_body = new_body.replace(extra.line, "", 1)
+        # Splice every match by offset in a single left-to-right pass so
+        # matches never shift each other's remaining offsets and the same
+        # literal text occurring elsewhere in the body (e.g. in prose) is
+        # never touched.
+        pieces: list[str] = []
+        cursor = 0
+        for index, match in enumerate(matches):
+            pieces.append(body[cursor : match.start])
+            pieces.append(canonical if index == 0 else "")
+            cursor = match.end
+        pieces.append(body[cursor:])
+        new_body = "".join(pieces)
         findings.append("multiple closing lines collapsed to one")
 
     target_issue_open: bool | None = None

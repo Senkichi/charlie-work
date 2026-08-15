@@ -128,6 +128,46 @@ def test_multiple_closing_lines_collapsed_to_one() -> None:
     assert result.findings == ("multiple closing lines collapsed to one",)
 
 
+def test_matching_prose_earlier_in_body_does_not_shadow_the_real_line() -> None:
+    """Regression: the same literal closing-line text can also occur as an
+    unstructured substring earlier in the body (e.g. pulled in from a
+    commit-message excerpt via ``summarize_branch_work``). A content-based
+    ``str.replace`` finds and corrupts that first occurrence instead of the
+    actual structured line, leaving the real (wrong) closing line
+    untouched -- the rewrite must be positional, not literal-text-based."""
+    body = (
+        "Note: someone once wrote Closes #99 here by mistake in prose.\n\nCloses #99\n\nmore text"
+    )
+
+    result = validate_closing_reference(body, 6, "owner/repo")
+
+    assert result.changed is True
+    # The prose sentence must survive untouched...
+    assert "someone once wrote Closes #99 here by mistake in prose." in result.body
+    # ...while the real structured line is the one that got corrected.
+    assert "Closes #6" in result.body
+    lines = result.body.splitlines()
+    structured_lines = [ln for ln in lines if ln.strip() in ("Closes #99", "Closes #6")]
+    assert structured_lines == ["Closes #6"]
+
+
+def test_matching_prose_earlier_in_body_does_not_shadow_removed_duplicate() -> None:
+    """Same hazard, collapse-branch (rule 4): an extra structured closing
+    line must actually be removed even when its exact text also appears as
+    prose earlier in the body."""
+    body = "Text that mentions Closes #2 in passing.\n\nCloses #1\nCloses #2\n\nrest"
+
+    result = validate_closing_reference(body, 42, "owner/repo")
+
+    assert result.changed is True
+    assert "Text that mentions Closes #2 in passing." in result.body
+    lines = result.body.splitlines()
+    structured_lines = [
+        ln for ln in lines if ln.strip() in ("Closes #1", "Closes #2", "Closes #42")
+    ]
+    assert structured_lines == ["Closes #42"]
+
+
 def test_fixes_keyword_recognized_same_as_closes() -> None:
     body = "Fixes #42\n\nrest"
 
@@ -671,6 +711,74 @@ def test_apply_fixes_salvage_no_unlinked_event_when_matched(tmp_path: Path) -> N
 
     events = query_events(state_path, kind="pr_closing_ref_unlinked", issue_number=4300)
     assert events == []
+
+
+def test_apply_fixes_salvage_passes_corrected_body_to_pr_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (AC3): the value ``validate_closing_reference`` returns
+    must be the exact body that reaches ``gh.pr_create`` on the reconcile.py
+    path, not merely computed and discarded. Forces the validator to return
+    a body distinct from reconcile.py's own hand-rolled one and asserts the
+    *created PR's* body -- as observed by ``FakeGitHub.prs_created`` -- is
+    the corrected value, not the pre-correction one. Silently dropping the
+    ``salvage_body = closing_ref.body`` reassignment in reconcile.py would
+    pass every other test in this suite (they only check for the presence
+    of the *correct* issue number, which reconcile.py's own body-builder
+    already writes in the untouched case) but fail this one."""
+    from test_reconcile import (
+        FakeGitHub,
+        _init_bare_remote_and_clone,
+        _issue,
+        _setup_completed_worktree,
+    )
+
+    from charlie_work.reconcile import DriftItem, apply_fixes
+    from charlie_work.state import empty_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 4400)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(4400, [config.labels.in_progress])],
+        repo_root=repo_root,
+        pr_create_return=4401,
+    )
+
+    sentinel_body = "Closes #4400\n\nSENTINEL-BODY-FROM-VALIDATOR-4400"
+
+    def _fake_validate(
+        body: str, issue_number: int, repo: str, gh: Any = None
+    ) -> ValidationResult:
+        return ValidationResult(
+            body=sentinel_body,
+            changed=True,
+            findings=("closing reference rewritten",),
+            target_issue_open=None,
+        )
+
+    monkeypatch.setattr("charlie_work.reconcile.validate_closing_reference", _fake_validate)
+
+    drift = [
+        DriftItem(
+            kind="session_unpublished_work_salvaged",
+            issue_number=4400,
+            pr_number=None,
+            detail="salvage",
+            fix_actions=("push", "pr_create"),
+            remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.pr_open,),
+            branch=branch,
+            base_branch="main",
+        )
+    ]
+
+    apply_fixes(gh, empty_state(), drift, config)
+
+    assert len(gh.prs_created) == 1
+    assert gh.prs_created[0]["body"] == sentinel_body
 
 
 def test_real_pr_view_accepts_fields_keyword() -> None:
