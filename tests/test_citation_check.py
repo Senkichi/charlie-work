@@ -163,6 +163,33 @@ def test_verify_resolves_bare_basename_two_levels_deep(tmp_path: Path) -> None:
     assert "TARGET_WORKFLOW_LINE" in (verdicts[1].current_line_text or "")
 
 
+def test_verify_stale_directory_prefix_resolves_via_recursive_index(
+    tmp_path: Path,
+) -> None:
+    # Regression for the reviewer finding on PR #1199: a citation that carries
+    # a directory prefix whose basename matches a real file but whose prefix
+    # does not (the file moved into a new subdirectory between filing and
+    # dispatch) must resolve via the recursive basename index, not report
+    # FILE_MISSING. The resolver's fallback strips the directory off *any*
+    # unresolved citation via ``Path(path).name`` before consulting the index,
+    # so the index must be built for prefixed citations too -- gating on "no
+    # directory prefix" only would skip the walk and leave the citation
+    # unresolved.
+    lines = [f"line{i}" for i in range(11)]  # index 9 == line 10
+    lines[9] = "TARGET_MOVED_LINE"
+    _write(tmp_path, "src/charlie_work/workflow.py", lines)
+
+    # The citation says ``old_dir/workflow.py:10`` but the file lives at
+    # ``src/charlie_work/workflow.py``. The stale prefix does not exist; the
+    # basename does, two levels deep under src/.
+    verdicts = verify_citations("old_dir/workflow.py:10 drifted", tmp_path)
+
+    assert len(verdicts) == 1
+    assert verdicts[0].citation.path == "old_dir/workflow.py"
+    assert verdicts[0].status is CitationStatus.OK
+    assert "TARGET_MOVED_LINE" in (verdicts[0].current_line_text or "")
+
+
 def test_verify_bare_basename_missing_still_file_missing_two_level_tree(
     tmp_path: Path,
 ) -> None:

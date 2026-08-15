@@ -254,12 +254,18 @@ def verify_citations(
     # times is read once.
     current_lines_cache: dict[str, list[str]] = {}
     at_commit_cache: dict[str, list[str] | None] = {}
-    # Build the recursive basename index lazily: only when at least one
-    # citation is a bare filename (no directory prefix) that the one-level
-    # fallback might miss. A full-path citation resolves directly, so the walk
-    # is skipped entirely for issues that cite full paths only.
+    # Build the recursive basename index whenever there is at least one
+    # relative-path citation. The resolver's fallback strips the directory off
+    # *any* unresolved citation (bare or prefixed) via ``Path(path).name``
+    # before consulting this index, so a citation with a stale/wrong directory
+    # prefix (e.g. a file that moved into a new subdirectory) needs the index
+    # just as much as a bare filename does. Gating on "no directory prefix"
+    # only would leave stale-prefixed citations reporting FILE_MISSING instead
+    # of resolving -- the index would never be built for them. The walk is
+    # bounded to the three source roots and runs once per issue body, so the
+    # cost is one walk per ``verify_citations`` call, not per citation.
     basename_index: dict[str, Path] | None = None
-    if any("/" not in c.path and not Path(c.path).is_absolute() for c in citations):
+    if any(not Path(c.path).is_absolute() for c in citations):
         basename_index = _build_basename_index(repo_root)
 
     for cite in citations:
