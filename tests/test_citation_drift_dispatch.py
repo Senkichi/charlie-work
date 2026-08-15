@@ -145,3 +145,58 @@ def test_dispatch_drift_comment_failure_does_not_abort_dispatch(
     assert result.ok is True
     assert result.data["selected_count"] == 1
     assert any("citation drift comment post failed" in r.message for r in caplog.records)
+
+
+def test_dispatch_flags_stale_prefix_citation_with_comment_and_event(
+    tmp_path: Path,
+) -> None:
+    # A citation with a stale directory prefix (the asserted literal path does
+    # not exist, but the basename resolves via the recursive index) must be
+    # flagged at dispatch time: a flag comment is posted on the issue (visible
+    # to the worker via ``$issue_comments``) and a
+    # ``dispatch_citation_drift_flagged`` event is emitted. The comment must
+    # surface the resolved path so the worker can see where the file moved to.
+    # This is the dispatch-level companion to
+    # ``test_verify_stale_directory_prefix_resolves_via_recursive_index``.
+    lines = [f"line{i}" for i in range(11)]  # index 9 == line 10
+    lines[9] = "TARGET_MOVED_LINE"
+    _write(tmp_path, "src/charlie_work/workflow.py", lines)
+    fake_gh = FakeGitHub()
+    # The citation says ``old_dir/workflow.py:10`` but the file lives at
+    # ``src/charlie_work/workflow.py`` -- stale prefix, valid basename.
+    fake_gh.issues[0]["body"] = "The defect is at old_dir/workflow.py:10 in the loop."
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = _make_app(tmp_path, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    # A drift comment was posted on the issue.
+    posted = getattr(fake_gh, "issue_comments_posted", [])
+    assert len(posted) == 1
+    issue_number, body = posted[0]
+    assert issue_number == 123
+    assert "Citation drift detected" in body
+    assert "old_dir/workflow.py:10" in body
+    assert "stale_prefix" in body
+    # The comment surfaces where the file actually moved to.
+    assert "src/charlie_work/workflow.py" in body
+    # The state record carries the fingerprint + flagged_at timestamp.
+    state = json.loads(
+        (tmp_path / ".var" / "charlie-work" / "state.json").read_text(encoding="utf-8")
+    )
+    entry = state["issues"]["123"]
+    assert entry["citation_drift_fingerprint"]
+    assert "citation_drift_flagged_at" in entry
+    # A ``dispatch_citation_drift_flagged`` event was emitted.
+    drift_events = [
+        e for e in state.get("events", []) if e.get("kind") == "dispatch_citation_drift_flagged"
+    ]
+    assert len(drift_events) == 1
+    payload = drift_events[0]["payload"]
+    assert payload["issue"] == 123
+    cited = payload["drifted_citations"]
+    assert len(cited) == 1
+    assert cited[0]["citation"] == "old_dir/workflow.py:10"
+    assert cited[0]["status"] == "stale_prefix"

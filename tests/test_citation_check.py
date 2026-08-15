@@ -175,6 +175,14 @@ def test_verify_stale_directory_prefix_resolves_via_recursive_index(
     # so the index must be built for prefixed citations too -- gating on "no
     # directory prefix" only would skip the walk and leave the citation
     # unresolved.
+    #
+    # The resolved path is surfaced on the verdict (``resolved_path``) so a
+    # reader can see where the file actually moved to. The status is
+    # ``STALE_PREFIX`` -- a distinct non-OK drift status -- because the
+    # asserted literal path does not exist even though the basename resolved:
+    # an asserted-and-now-false prefix should flag, while a bare (no-prefix)
+    # citation that resolves via basename fallback stays OK (see
+    # ``test_verify_resolves_bare_basename_two_levels_deep``).
     lines = [f"line{i}" for i in range(11)]  # index 9 == line 10
     lines[9] = "TARGET_MOVED_LINE"
     _write(tmp_path, "src/charlie_work/workflow.py", lines)
@@ -186,8 +194,10 @@ def test_verify_stale_directory_prefix_resolves_via_recursive_index(
 
     assert len(verdicts) == 1
     assert verdicts[0].citation.path == "old_dir/workflow.py"
-    assert verdicts[0].status is CitationStatus.OK
-    assert "TARGET_MOVED_LINE" in (verdicts[0].current_line_text or "")
+    assert verdicts[0].status is CitationStatus.STALE_PREFIX
+    # The resolved path surfaces where the file actually moved to.
+    assert verdicts[0].resolved_path is not None
+    assert verdicts[0].resolved_path.replace("\\", "/").endswith("src/charlie_work/workflow.py")
 
 
 def test_verify_bare_basename_missing_still_file_missing_two_level_tree(

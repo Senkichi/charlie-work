@@ -24,6 +24,12 @@ It mechanically detects **coordinate drift**:
   (the file shrank, or the citation was always wrong).
 * ``EMPTY_LINE`` — the cited line is blank; a citation meant to point at code
   now points at a gap between blocks, a strong drift signal.
+* ``STALE_PREFIX`` — the citation carries a directory prefix whose asserted
+  literal path does not exist, but the basename resolves via fallback (the
+  file moved into a new subdirectory between filing and dispatch). The
+  verdict's ``resolved_path`` surfaces where the file actually is. Bare
+  (no-prefix) citations that resolve via basename fallback stay ``OK`` --
+  only an asserted-and-now-false prefix flags.
 
 It **cannot** detect *in-range content drift* — the cited line is still a valid
 line number but now contains unrelated, plausible code (the dangerous band in
@@ -75,6 +81,7 @@ class CitationStatus(str, Enum):
     FILE_MISSING = "file_missing"
     OUT_OF_RANGE = "out_of_range"
     EMPTY_LINE = "empty_line"
+    STALE_PREFIX = "stale_prefix"
     CONTENT_DRIFT = "content_drift"
 
 
@@ -96,6 +103,7 @@ class CitationVerdict:
     status: CitationStatus
     current_line_text: str | None = None
     original_line_text: str | None = None
+    resolved_path: str | None = None
 
 
 # A path-like token: an optional directory prefix, then a filename that carries
@@ -119,21 +127,13 @@ _CITATION_RE = re.compile(
 _SHA_RE = re.compile(r"(?<![\w])(?P<sha>[0-9a-f]{7,40})(?![\w])", re.IGNORECASE)
 
 
-def _looks_like_url_context(path: str) -> bool:
-    """Reject tokens that are really URL schemes (``https:``, ``http:``...).
-
-    A citation path never contains ``://``; a URL always does. This is the
-    single discriminator that keeps ``https://example.com:8080`` from matching
-    as a citation of ``example.com:8080``.
-    """
-    return "://" in path
-
-
 def parse_citations(body: str) -> list[Citation]:
     """Return every ``path:line`` / ``path:start-end`` citation in ``body``.
 
-    Deduplicated and order-preserving by ``(path, line, end_line)``. Tokens whose
-    path contains ``://`` (URLs) are dropped. A citation is *parsed* on shape
+    Deduplicated and order-preserving by ``(path, line, end_line)``. URL
+    schemes (``https://example.com:8080``) are rejected by the regex's
+    lookbehind boundary (``(?<![\\w/.:-])`` — the ``:`` in ``://`` precedes
+    the path token, so the boundary fails). A citation is *parsed* on shape
     alone; whether it is *verified* is a separate step (``verify_citations``)
     that needs the working tree.
     """
@@ -141,8 +141,6 @@ def parse_citations(body: str) -> list[Citation]:
     out: list[Citation] = []
     for m in _CITATION_RE.finditer(body):
         path = m.group("path")
-        if _looks_like_url_context(path):
-            continue
         start = int(m.group("start"))
         end_s = m.group("end")
         end = int(end_s) if end_s is not None else start
@@ -221,6 +219,21 @@ def _resolve(
     return None
 
 
+def _literal_path_exists(path: str, repo_root: Path) -> bool:
+    """Return ``True`` if ``path`` exists as a file at its literal location.
+
+    Mirrors the first check in ``_resolve``: absolute paths are used as-is,
+    relative paths are joined to ``repo_root``. Used to distinguish a
+    citation whose asserted prefix is correct (literal path exists) from one
+    whose prefix is stale (literal path missing, basename resolved via
+    fallback) -- the latter is ``STALE_PREFIX``, not ``OK``.
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        p = repo_root / path
+    return p.is_file()
+
+
 def _read_lines(path: Path) -> list[str]:
     try:
         return path.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
@@ -272,6 +285,23 @@ def verify_citations(
         resolved = _resolve(cite.path, repo_root, basename_index=basename_index)
         if resolved is None:
             verdicts.append(CitationVerdict(cite, CitationStatus.FILE_MISSING))
+            continue
+        # Stale directory prefix: the citation asserted a path with a
+        # directory prefix (``"/" in cite.path``), the literal path does not
+        # exist, but the basename resolved via fallback. The prefix was
+        # asserted and is now false -- flag it so a worker is not silently
+        # pointed at the right file via a wrong path. Bare (no-prefix)
+        # citations that resolve via basename fallback stay OK: only an
+        # asserted-and-now-false prefix flags. ``resolved_path`` surfaces
+        # where the file actually moved to so the flag comment can show it.
+        if "/" in cite.path and not _literal_path_exists(cite.path, repo_root):
+            verdicts.append(
+                CitationVerdict(
+                    cite,
+                    CitationStatus.STALE_PREFIX,
+                    resolved_path=str(resolved),
+                )
+            )
             continue
         cache_key = str(resolved)
         if cache_key not in current_lines_cache:

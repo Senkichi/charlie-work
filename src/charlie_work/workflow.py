@@ -24913,7 +24913,13 @@ class OrchestratorApp:
         lines.append("| citation | status |")
         lines.append("|---|---|")
         for v in drifted:
-            lines.append(f"| `{v.citation.raw}` | {v.status.value} |")
+            status_cell = v.status.value
+            if v.resolved_path:
+                # Surface where the file actually moved to for STALE_PREFIX
+                # verdicts so the worker can grep in the right place.
+                resolved_display = v.resolved_path.replace("\\", "/")
+                status_cell = f"{status_cell} (now at `{resolved_display}`)"
+            lines.append(f"| `{v.citation.raw}` | {status_cell} |")
         body = "\n".join(lines)
         issue_dir = self.paths.issues / f"issue-{issue_number}"
         try:
