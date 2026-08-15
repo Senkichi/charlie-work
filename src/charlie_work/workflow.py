@@ -5663,10 +5663,30 @@ def _detect_and_handle_orphaned_workers(
                 # Issue #259: mark the entry so it is not re-flagged every pass.
                 # Suppress ONLY the duplicate no-open-PR event; with-PR recovery
                 # paths must run regardless of the flag.
+                # Issue #1230: also stamp ``orphan_drift_at`` here so the
+                # ``dead_dispatched_reap_minutes`` time-based backstop (which
+                # keys off ``orphan_drift_at``, checked at the top of this loop)
+                # can converge the status.  Without this, an issue that reaches
+                # this drift branch — e.g. one whose #417 label reclaim was a
+                # no-op because a mention-flag escalation already applied
+                # ``agent:human-needed`` (a terminal label, not in
+                # ``config.labels.active``) — wedges in ``dispatched``
+                # indefinitely: not re-dispatchable (the terminal label excludes
+                # it), not sweepable (status is not ``escalated``), and the
+                # backstop never fires because ``orphan_drift_at`` was never
+                # set.  The reclaim-success branch above deliberately does NOT
+                # set ``orphan_drift_at`` — that path leaves the issue
+                # ``ready`` and re-dispatchable, so the backstop should not
+                # fire.  This branch is reached only when there is nothing to
+                # reclaim (no active labels) or reclaim failed, both of which
+                # mean the issue is not on the normal re-dispatch path and the
+                # backstop is the correct convergence mechanism.
                 if entry.get("orphan_flagged_at"):
                     state["issues"][str(issue_number)] = entry
                     continue
-                entry["orphan_flagged_at"] = utc_now()
+                drift_ts = utc_now()
+                entry["orphan_flagged_at"] = drift_ts
+                entry["orphan_drift_at"] = drift_ts
                 sweep_events.append(
                     (
                         "orphaned_worker_drift",

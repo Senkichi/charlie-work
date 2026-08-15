@@ -42120,6 +42120,114 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     assert payload["exit_code"] == 0
 
 
+def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Path) -> None:
+    """Issue #1230: a dead dispatched worker with no open PR whose issue already
+    carries ``agent:human-needed`` (applied by a mention-flag escalation) is
+    invisible to the #417 ground-truth label reclaim (no active labels to
+    remove) and invisible to the redispatch cap (never re-dispatched because the
+    terminal label excludes it).  The no-open-PR drift branch sets
+    ``orphan_flagged_at`` but never set ``orphan_drift_at``, so the
+    ``dead_dispatched_reap_minutes`` time-based backstop — which keys off
+    ``orphan_drift_at`` — never fired.  The issue wedged in ``dispatched``
+    indefinitely: not dispatchable (status says a worker owns it), not
+    sweepable (status is not ``escalated``), and the label promises a human
+    review the state machine cannot act on.
+
+    The fix: the no-open-PR drift branch must also stamp ``orphan_drift_at`` so
+    the existing ``dead_dispatched_reap_minutes`` backstop converges the status
+    to ``escalated`` after the grace period, regardless of concurrent
+    label-side transitions.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the jc #1421 shape: dispatched, dead PID, no open PR, and the issue
+    # already carries agent:human-needed from a mention-flag escalation
+    # (merged_pr_mention_flagged_at set).  No active labels are present, so the
+    # #417 reclaim is a no-op and the issue is excluded from dispatch.
+    state = load_state(paths.state_file)
+    state["issues"]["1421"] = {
+        "status": "dispatched",
+        "worker_pid": 45292,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2026-08-09T07:33:24Z",
+        "merged_pr_mention_flagged_at": "2026-08-10T12:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues = [
+        {
+            "number": 1421,
+            "title": "call_model cascade timeout",
+            "url": "https://example.test/issues/1421",
+            "body": "",
+            # Only the terminal human-needed label — no active labels.
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Pass 1: the no-open-PR drift branch fires (no active labels to reclaim,
+    # no pushed branch).  It must stamp orphan_drift_at so the time-based
+    # backstop can fire on a later pass.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("orphan_flagged_at") is not None
+    assert entry.get("orphan_drift_at") is not None, (
+        "no-open-PR drift branch must set orphan_drift_at so the "
+        "dead_dispatched_reap_minutes backstop can converge the wedge"
+    )
+    # Status is still dispatched — the grace period has not elapsed.
+    assert entry.get("status") == "dispatched"
+
+    # Simulate the grace period elapsing: rewind orphan_drift_at to 120 minutes
+    # ago (past the 60-minute reap window).
+    old_drift_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    st["issues"]["1421"]["orphan_drift_at"] = old_drift_at
+    save_state(paths.state_file, st)
+
+    # Pass 2: the dead_dispatched_reap_minutes backstop must fire and converge
+    # status to escalated, even though the escalation label is already present.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+
+    # The reap event must be recorded.
+    reaped_events = [
+        e for e in st.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 1421
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
+
+
 def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -> None:
     """Issue #654: a dead dispatched worker whose drift was surfaced recently
     (within ``dead_dispatched_reap_minutes``) must NOT be time-escalated.  The
