@@ -27,7 +27,6 @@ from charlie_work.supervise import (
     _BLOCKER_NAMES_IN_MESSAGE,
     _check_venv,
     _command_failure_message,
-    _match_pth_to_root,
     _pending_sync_marker_path,
     _record_self_deploy_failure_streak,
     _repair_lossless_pull_blockers,
@@ -45,6 +44,7 @@ from charlie_work.supervise import (
     take_snapshot,
     try_acquire_supervisor_lock,
 )
+from charlie_work.worktree import _match_pth_to_root
 from charlie_work.workflow import CommandResult
 
 
@@ -2089,6 +2089,26 @@ def test_repair_venv_pth_rewrites_foreign_editable_to_peer_root(
     assert ok
     assert ci_fleet_pth.read_text(encoding="utf-8").strip() == str(peer_src.resolve())
     assert "configured checkouts" in message
+    assert "_editable_impl_ci_fleet.pth" in repaired
+
+
+def test_repair_venv_pth_rewrites_cross_root_poisoned_editable(tmp_path: Path) -> None:
+    """A foreign .pth repointed at a DIFFERENT configured root is detected and repaired (issue #1180).
+
+    The old detection pass accepted "any configured root", so ``ci_fleet`` ->
+    ``charlie-work/src`` passed the poisoned check because ``charlie-work/src``
+    IS a configured root.  The per-package root detection derives the expected
+    root from the ``.pth`` filename and flags the cross-root anchor as
+    poisoned; the rewrite pass then rewrites the line to the correct peer root.
+    """
+    repo_root, peer_src, _charlie_pth, ci_fleet_pth = _setup_repo_with_peer_dep_venv(
+        tmp_path, ci_fleet_target=(tmp_path / "repo" / "src")
+    )
+
+    ok, message, repaired = _repair_venv_pth(repo_root, repo_root / ".venv")
+
+    assert ok
+    assert ci_fleet_pth.read_text(encoding="utf-8").strip() == str(peer_src.resolve())
     assert "_editable_impl_ci_fleet.pth" in repaired
 
 

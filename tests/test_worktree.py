@@ -5563,7 +5563,7 @@ def test_verify_shared_venv_catches_pth_pointing_outside_main_checkout(tmp_path:
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert not ok
-    assert "points outside all configured checkouts" in message
+    assert "points outside its expected checkout" in message
     assert "uv sync --all-extras" in message
 
 
@@ -5629,7 +5629,7 @@ def test_verify_shared_venv_detects_poisoned_foreign_editable(tmp_path: Path) ->
 
     assert not ok
     assert "_editable_impl_ci_fleet.pth" in message
-    assert "points outside all configured checkouts" in message
+    assert "points outside its expected checkout" in message
 
 
 def test_verify_shared_venv_approves_healthy_foreign_editable(tmp_path: Path) -> None:
@@ -5701,6 +5701,68 @@ def test_verify_shared_venv_ignores_non_path_pth_lines(tmp_path: Path) -> None:
 
     assert ok
     assert "configured checkouts" in message
+
+
+def test_verify_shared_venv_catches_foreign_editable_repointed_at_wrong_root(
+    tmp_path: Path,
+) -> None:
+    """A foreign .pth pointing at a DIFFERENT configured root is caught (issue #1180).
+
+    The old "any configured root" check accepted this: ``ci_fleet`` -> ``charlie-work/src``
+    passes because ``charlie-work/src`` IS a configured root, even though ``ci_fleet``
+    should resolve into ``ci_runners/src``.  The per-package root validation derives
+    the expected root from the ``.pth`` filename and rejects the cross-root anchor.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    wrong_root = (repo_root / "src").resolve()  # charlie-work/src, a configured root
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    # Main repo .pth is healthy.
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    # Foreign .pth is repointed at charlie-work/src -- a configured root, but
+    # the WRONG one for ci_fleet.
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(wrong_root) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+    assert "outside its expected checkout" in message
+    assert str(peer_src.resolve()) in message
+
+
+def test_verify_shared_venv_catches_main_editable_repointed_at_peer_root(
+    tmp_path: Path,
+) -> None:
+    """The reverse cross-root: charlie_work .pth repointed at ci_runners/src (issue #1180).
+
+    Symmetric to the foreign-editable case: ``charlie_work`` -> ``ci_runners/src``
+    passes the old "any root" check because ``ci_runners/src`` is a configured root.
+    Per-package root validation rejects it because charlie_work should resolve into
+    ``charlie-work/src``.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    # Main repo .pth repointed at the peer root -- a configured root, but wrong.
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str(peer_src.resolve()) + "\n", encoding="utf-8"
+    )
+    # Foreign .pth is healthy.
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(peer_src.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_charlie_work.pth" in message
+    assert "outside its expected checkout" in message
+    assert str((repo_root / "src").resolve()) in message
 
 
 def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
@@ -6320,7 +6382,7 @@ def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) ->
     assert result.ok is False
     assert len(result.data["removed"]) == 1
     assert result.data["venv_ok"] is False
-    assert "points outside all configured checkouts" in result.data["venv_message"]
+    assert "points outside its expected checkout" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_open_pr(tmp_path: Path) -> None:

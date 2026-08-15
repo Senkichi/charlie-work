@@ -3825,6 +3825,38 @@ def _configured_editable_roots(
     return roots
 
 
+def _match_pth_to_root(pth: Path, package_to_root: dict[str, Path]) -> Path | None:
+    """Return the configured ``src`` root a ``.pth`` should point at.
+
+    Matches the package name embedded in the ``.pth`` filename (e.g.
+    ``_editable_impl_charlie_work.pth`` -> ``charlie_work``) against the keys of
+    ``package_to_root``.  Only real package names (from
+    :func:`_package_directories`, which excludes loose ``.py`` stems) are in
+    the map, so the substring hazard from the old
+    :func:`_top_level_package_names` filter does not apply.
+
+    Returns ``None`` when zero or more-than-one package names match after
+    longest-name disambiguation, so the caller can fall back to the "any
+    configured root" containment check for detection (issue #1180) or refuse to
+    repair rather than write a wrong root (issue #969 gap 1).
+    """
+    matches = sorted(
+        ((name, root) for name, root in package_to_root.items() if name in pth.name),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0][1]
+    # Ambiguous: only accept the longest (most specific) name when it is
+    # strictly longer than the runner-up.  A tie means two packages are
+    # equally plausible and the correct target is genuinely unknown.
+    if len(matches[0][0]) > len(matches[1][0]):
+        return matches[0][1]
+    return None
+
+
 def _venv_python(venv_path: Path) -> Path:
     if os.name == "nt":
         return venv_path / "Scripts" / "python.exe"
@@ -3875,7 +3907,7 @@ def _verify_shared_venv_by_import(repo_root: Path, venv_path: Path) -> tuple[boo
 
 
 def verify_shared_venv(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
-    """Verify every editable ``.pth`` path line resolves into a configured checkout.
+    """Verify every editable ``.pth`` path line resolves into the correct checkout.
 
     Replaces the former filename-substring filter (issue #969 gap 2).  The old
     filter kept only ``.pth`` files whose *filename* contained a top-level
@@ -3887,16 +3919,26 @@ def verify_shared_venv(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
     an ``ImportError``.
 
     The resolved-target test asks the question actually being asked: "does this
-    path line point into a tree I own?"  Every ``.pth`` in site-packages is
-    scanned; each path-bearing line is resolved and checked against
-    :func:`_configured_editable_roots` (this repo's ``src`` plus relative
-    editable deps from ``[tool.uv.sources]``).  A line resolving outside *all*
-    configured roots is the poisoned-editable case.  Comment/import/empty lines
-    are skipped by :func:`_resolve_pth_line` returning an empty path.
+    path line point into the tree this package should come from?"  Every
+    ``.pth`` in site-packages is scanned; each path-bearing line is resolved
+    and checked against :func:`_configured_editable_roots` (this repo's ``src``
+    plus relative editable deps from ``[tool.uv.sources]``).
 
-    When no configured roots are derivable (no ``src`` directory and no
-    editable deps), falls back to the import-based check so a cold or
-    misconfigured checkout is not silently green.
+    Per-package root validation (issue #1180): when
+    :func:`_match_pth_to_root` can derive the specific root a ``.pth``'s
+    package should resolve into, each line must resolve into THAT root -- not
+    just any configured root.  A poisoned ``_editable_impl_ci_fleet.pth``
+    repointed at ``charlie-work/src`` (a configured root, but the wrong one)
+    would pass the old "any root" check and produce a silent ``ImportError`` at
+    import time.  When ``_match_pth_to_root`` returns ``None`` (unknown
+    package), the "any configured root" check is the correct fallback: a line
+    outside all roots is still poisoned, and the specific root is genuinely
+    unknown so "any" is the tightest provable bound.
+
+    Comment/import/empty lines are skipped by :func:`_resolve_pth_line`
+    returning an empty path.  When no configured roots are derivable (no
+    ``src`` directory and no editable deps), falls back to the import-based
+    check so a cold or misconfigured checkout is not silently green.
     """
     site_packages = _site_packages_dir(venv_path)
     if not site_packages:
@@ -3904,12 +3946,28 @@ def verify_shared_venv(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
     roots = _configured_editable_roots(repo_root)
     if not roots:
         return _verify_shared_venv_by_import(repo_root, venv_path)
+    package_to_root: dict[str, Path] = {}
+    for src_root, package_names in roots:
+        for name in package_names:
+            package_to_root[name] = src_root
     for pth in site_packages.glob("*.pth"):
         content = pth.read_text(encoding="utf-8", errors="replace")
+        expected_root = _match_pth_to_root(pth, package_to_root)
         for raw_line in content.splitlines():
             target = _resolve_pth_line(site_packages, raw_line)
             if target == Path():
                 continue
+            if expected_root is not None:
+                if contains(expected_root, target):
+                    continue
+                return False, (
+                    f"editable .pth {pth.name} points outside its expected "
+                    f"checkout {expected_root}: {target} "
+                    "(hint: uv sync --all-extras)"
+                )
+            # Unknown package: fall back to "any configured root" -- a line
+            # outside all roots is still poisoned, and the specific root is
+            # genuinely unknown so "any" is the tightest provable bound.
             if any(contains(root, target) for root, _ in roots):
                 continue
             return False, (

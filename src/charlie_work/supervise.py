@@ -355,11 +355,20 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str, list[
     """Atomically rewrite poisoned editable ``.pth`` lines to their configured roots.
 
     Scans every ``.pth`` in site-packages (no filename filter -- see
-    :func:`worktree.verify_shared_venv`).  For each path-bearing line that
-    resolves outside all configured checkouts, the correct target is derived
-    from :func:`worktree._configured_editable_roots` by matching the package
-    name embedded in the ``.pth`` filename against the packages each root
-    provides.
+    :func:`worktree.verify_shared_venv`).  For each ``.pth``, the correct
+    target root is derived from :func:`worktree._configured_editable_roots` by
+    matching the package name embedded in the ``.pth`` filename against the
+    packages each root provides (:func:`worktree._match_pth_to_root`).
+
+    Per-package root detection (issue #1180): when a specific root is
+    derivable, a line resolving into a DIFFERENT configured root is poisoned
+    -- it would import the wrong package and produce a silent ``ImportError``.
+    The old detection pass accepted "any configured root", so a foreign
+    editable repointed at the wrong root (e.g. ``ci_fleet`` ->
+    ``charlie-work/src`` instead of ``ci_runners/src``) verified clean.  When
+    the specific root is unknown (``_match_pth_to_root`` returns ``None``),
+    the "any configured root" check is the correct fallback: a line outside
+    all roots is still poisoned, and "any" is the tightest provable bound.
 
     The per-package root is the fix for issue #969 gap 1: the former repair
     rewrote *every* poisoned line to a single ``main_src`` constant
@@ -402,12 +411,24 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str, list[
     for pth in site_packages.glob("*.pth"):
         original = pth.read_text(encoding="utf-8")
         lines = original.splitlines()
-        # First pass: are any lines poisoned, and can we target this .pth?
+        correct_root = worktree._match_pth_to_root(pth, package_to_root)
+        # First pass: are any lines poisoned?  When a specific root is
+        # derivable for this .pth's package, a line resolving into a DIFFERENT
+        # configured root is still poisoned -- it would import the wrong
+        # package and produce a silent ImportError (issue #1180).  When the
+        # specific root is unknown (None), fall back to "any configured root":
+        # a line outside all roots is still poisoned, and "any" is the tightest
+        # provable bound.
         poisoned = False
         for raw_line in lines:
             target = worktree._resolve_pth_line(site_packages, raw_line)
             if target == Path():
                 continue
+            if correct_root is not None:
+                if contains(correct_root, target):
+                    continue
+                poisoned = True
+                break
             if any(contains(root, target) for root, _ in roots):
                 continue
             poisoned = True
@@ -415,7 +436,6 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str, list[
         if not poisoned:
             continue
 
-        correct_root = _match_pth_to_root(pth, package_to_root)
         if correct_root is None:
             unrepairable.append(pth.name)
             continue
@@ -424,7 +444,7 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str, list[
         changed = False
         for raw_line in lines:
             target = worktree._resolve_pth_line(site_packages, raw_line)
-            if target != Path() and not any(contains(root, target) for root, _ in roots):
+            if target != Path() and not contains(correct_root, target):
                 new_lines.append(str(correct_root))
                 changed = True
             else:
@@ -455,37 +475,6 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str, list[
     if not repaired_files:
         return False, "editable .pth did not require rewriting", []
     return True, "rewrote editable .pth targets to configured checkouts", repaired_files
-
-
-def _match_pth_to_root(pth: Path, package_to_root: dict[str, Path]) -> Path | None:
-    """Return the configured ``src`` root a poisoned ``.pth`` should point at.
-
-    Matches the package name embedded in the ``.pth`` filename (e.g.
-    ``_editable_impl_charlie_work.pth`` -> ``charlie_work``) against the keys of
-    ``package_to_root``.  Only real package names (from
-    :func:`worktree._package_directories`, which excludes loose ``.py`` stems)
-    are in the map, so the substring hazard from the old
-    :func:`worktree._top_level_package_names` filter does not apply.
-
-    Returns ``None`` when zero or more-than-one package names match after
-    longest-name disambiguation, so the caller can refuse to repair rather
-    than write a wrong root (issue #969 gap 1).
-    """
-    matches = sorted(
-        ((name, root) for name, root in package_to_root.items() if name in pth.name),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    )
-    if not matches:
-        return None
-    if len(matches) == 1:
-        return matches[0][1]
-    # Ambiguous: only accept the longest (most specific) name when it is
-    # strictly longer than the runner-up.  A tie means two packages are
-    # equally plausible and the correct target is genuinely unknown.
-    if len(matches[0][0]) > len(matches[1][0]):
-        return matches[0][1]
-    return None
 
 
 def _check_venv(repo_root: Path) -> SelfDeployResult:
