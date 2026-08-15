@@ -5481,8 +5481,7 @@ def _detect_and_handle_orphaned_workers(
                 # instead, each dead dispatch is counted exactly once, keyed
                 # by this identity.
                 dispatch_identity = (
-                    f"{entry.get('dispatched_at') or 'none'}"
-                    f":{entry.get('worker_pid') or 'none'}"
+                    f"{entry.get('dispatched_at') or 'none'}:{entry.get('worker_pid') or 'none'}"
                 )
                 prior_dispatch = entry.get("orphan_redispatch_counted_dispatch")
                 # Read the windowed timestamp list. On progress or first

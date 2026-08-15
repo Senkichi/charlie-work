@@ -44939,9 +44939,7 @@ def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path
         _run_sweep()
         st = load_state(paths.state_file)
         entry = st["issues"]["1243"]
-        assert entry.get("status") == "dispatched", (
-            f"must not escalate on pass {pass_number}"
-        )
+        assert entry.get("status") == "dispatched", f"must not escalate on pass {pass_number}"
         assert entry.get("escalation_reason") is None
         # Count must stay at 1 -- the same dead dispatch is being
         # re-observed, not a new redispatch attempt.
