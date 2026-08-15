@@ -8814,6 +8814,184 @@ def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Pat
     assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
 
+def test_dispatch_reviews_skips_empty_diff_pr(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+    must not burn a paid reviewer session. The pre-flight gate skips dispatch,
+    emits review_skipped_empty_diff, and does NOT increment
+    review_dispatch_attempt_count (an empty diff is not a review attempt)."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # Write an EMPTY diff.patch — the signal for a zero-file PR.
+    pr_dir = app.paths.prs / "pr-100"
+    (pr_dir / "diff.patch").write_text("", encoding="utf-8")
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # No reviewer must have been launched.
+    assert len(launched) == 0
+    assert result.data["launched_count"] == 0
+    # The PR must appear in the skipped_empty_diff payload.
+    assert 100 in result.data["skipped_empty_diff"]
+    # review_skipped_empty_diff event must have been emitted.
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert len(skip_events) == 1
+    assert skip_events[0]["pr_number"] == 100
+    # review_dispatch_attempt_count must NOT have been incremented.
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"].get("100", {})
+    assert int(pr_state.get("review_dispatch_attempt_count", 0)) == 0
+    # No dispatch claim must have been written.
+    assert pr_state.get("review_dispatch_status") != "review_dispatch_pending"
+
+
+def test_dispatch_reviews_proceeds_with_nonempty_diff(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: a PR with a non-empty diff.patch must proceed through
+    normal dispatch unchanged — the empty-diff gate only stops zero-file PRs."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # Write a NON-EMPTY diff.patch.
+    pr_dir = app.paths.prs / "pr-100"
+    (pr_dir / "diff.patch").write_text(
+        "diff --git a/foo.py b/foo.py\n+print('hello')\n", encoding="utf-8"
+    )
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The reviewer must have been launched.
+    assert len(launched) == 1
+    assert result.data["launched_count"] == 1
+    # No empty-diff skip.
+    assert result.data["skipped_empty_diff"] == []
+    # No review_skipped_empty_diff event.
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert len(skip_events) == 0
+    # Dispatch must have proceeded — claim upgraded to dispatched.
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_empty_diff_mixed_with_nonempty(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: when both an empty-diff PR and a non-empty-diff PR are
+    queued, only the non-empty PR is dispatched; the empty one is skipped
+    without affecting the other's dispatch."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    _write_review_packet(tmp_path, 200, "sha-200")
+    # PR 100: empty diff. PR 200: non-empty diff.
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+    (app.paths.prs / "pr-200" / "diff.patch").write_text(
+        "diff --git a/bar.py b/bar.py\n+pass\n", encoding="utf-8"
+    )
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # Only PR 200 must have been launched.
+    assert launched == [200]
+    assert result.data["launched_count"] == 1
+    # PR 100 must be in the skipped list.
+    assert 100 in result.data["skipped_empty_diff"]
+    assert 200 not in result.data["skipped_empty_diff"]
+    # PR 100's attempt count must not have been incremented.
+    state = load_state(app.paths.state_file)
+    assert int(state["prs"].get("100", {}).get("review_dispatch_attempt_count", 0)) == 0
+    # PR 200's attempt count must have been incremented (claimed).
+    assert int(state["prs"]["200"].get("review_dispatch_attempt_count", 0)) == 1
+
+
 def test_dispatch_reviews_forwards_orchestrator_config_to_launch(
     monkeypatch, tmp_path: Path
 ) -> None:
