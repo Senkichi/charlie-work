@@ -5426,9 +5426,19 @@ def _detect_and_handle_orphaned_workers(
                     adapter_count_baseline = 0
 
                 head_changed = prior_head is not None and current_head != prior_head
-                if head_changed:
-                    # Progress: reset the baseline so only dispatches after
-                    # this point count toward the cap.
+                first_observation = prior_head is None
+                if head_changed or first_observation:
+                    # Progress or first observation: (re)seed the baseline so
+                    # only dispatches after this point count toward the cap.
+                    # Without the first_observation branch, an issue whose
+                    # adapter_history already exceeds max_auto_redispatch from
+                    # an earlier, unrelated PR cycle would be escalated on the
+                    # very first orphan-sweep pass through this code, with zero
+                    # actual redispatch attempts -- defeating the cap's purpose
+                    # of bounding the loop at N attempts since the failure mode
+                    # started. adapter_history is a never-reset, cross-lane
+                    # cumulative counter, so the baseline must be anchored to
+                    # the first observation, not to 0.
                     adapter_count_baseline = len(adapter_history)
 
                 redispatch_count = len(adapter_history) - adapter_count_baseline
@@ -5473,9 +5483,8 @@ def _detect_and_handle_orphaned_workers(
 
                 # Cap not exceeded (or progress detected): persist the head
                 # fingerprint and baseline so the next orphan-sweep pass can
-                # compare against them. On progress, the baseline was just
-                # reset above; on first observation, prior_head is None and
-                # this simply records the baseline.
+                # compare against them. On progress or first observation, the
+                # baseline was just (re)seeded above; this persists it.
                 entry["orphan_redispatch_head_sha"] = current_head
                 entry["orphan_redispatch_adapter_count"] = adapter_count_baseline
 

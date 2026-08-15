@@ -44511,7 +44511,8 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
         save_state(paths.state_file, st)
 
     # Pass 1: 1 adapter_history entry, first observation.
-    # redispatch_count=1 <= 3, proceed with reclaim.
+    # The first-observation branch seeds adapter_count_baseline to
+    # len(adapter_history)=1, so redispatch_count=0 <= 3, proceed with reclaim.
     _run_sweep()
     st = load_state(paths.state_file)
     assert st["issues"]["1243"].get("status") == "dispatched"
@@ -44522,7 +44523,7 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     # Simulate dispatch 2
     _simulate_redispatch()
 
-    # Pass 2: 2 entries, head unchanged. redispatch_count=2 <= 3, proceed.
+    # Pass 2: 2 entries, head unchanged. redispatch_count=1 <= 3, proceed.
     _run_sweep()
     st = load_state(paths.state_file)
     assert st["issues"]["1243"].get("status") == "dispatched"
@@ -44531,7 +44532,7 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     # Simulate dispatch 3
     _simulate_redispatch()
 
-    # Pass 3: 3 entries, head unchanged. redispatch_count=3 <= 3, proceed.
+    # Pass 3: 3 entries, head unchanged. redispatch_count=2 <= 3, proceed.
     _run_sweep()
     st = load_state(paths.state_file)
     assert st["issues"]["1243"].get("status") == "dispatched"
@@ -44540,7 +44541,16 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     # Simulate dispatch 4
     _simulate_redispatch()
 
-    # Pass 4: 4 entries, head unchanged. redispatch_count=4 > 3, ESCALATE!
+    # Pass 4: 4 entries, head unchanged. redispatch_count=3 <= 3, proceed.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    assert st["issues"]["1243"].get("status") == "dispatched"
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.ready}]
+
+    # Simulate dispatch 5
+    _simulate_redispatch()
+
+    # Pass 5: 5 entries, head unchanged. redispatch_count=4 > 3, ESCALATE!
     _run_sweep()
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
@@ -44564,8 +44574,8 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
         if e.get("kind") == "session_failed_relabeled"
         and e["payload"].get("reason") == "dead_worker_no_open_pr_orphan_sweep"
     ]
-    # Passes 1-3 each emitted one relabel event; pass 4 must not add another.
-    assert len(relabel_events) == 3
+    # Passes 1-4 each emitted one relabel event; pass 5 must not add another.
+    assert len(relabel_events) == 4
 
 
 def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> None:
@@ -44648,6 +44658,96 @@ def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> No
     # The adapter_count_baseline must be reset to len(adapter_history),
     # so the redispatch_count starts from 0 again.
     assert entry.get("orphan_redispatch_adapter_count") == 4
+
+    # No escalation event must have been emitted.
+    escalated_events = [
+        e for e in st.get("events", []) if e.get("kind") == "orphan_sweep_redispatch_escalated"
+    ]
+    assert len(escalated_events) == 0
+
+
+def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
+    tmp_path: Path,
+) -> None:
+    """Issue #1243 regression: an issue whose adapter_history already exceeds
+    max_auto_redispatch from an earlier, unrelated PR cycle must NOT be
+    escalated on the very first orphan-sweep pass. The first-observation
+    branch seeds adapter_count_baseline to len(adapter_history), so the cap
+    counts attempts since this failure mode started, not the issue's entire
+    historical adapter_history length.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the issue with 5 adapter_history entries (more than
+    # max_auto_redispatch=3) and NO orphan_redispatch_head_sha set -- this
+    # is the first time the orphan-sweep cap code sees this issue. The
+    # entries represent dispatches from an earlier, unrelated PR cycle.
+    base_time = datetime.now(UTC)
+    state = load_state(paths.state_file)
+    state["issues"]["1243"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": base_time.isoformat().replace("+00:00", "Z"),
+        "adapter_history": [
+            {
+                "ts": (base_time - timedelta(minutes=60 + i * 10))
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "kind": "claude-code",
+                "provider": "",
+                "reason": "policy:default",
+            }
+            for i in range(5)
+        ],
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubNoPR(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPR()
+    fake_gh.issues = [
+        {
+            "number": 1243,
+            "title": "test issue",
+            "url": "https://example.test/issues/1243",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    # First orphan-sweep pass through the cap code for this issue.
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1243"]
+
+    # The cap must NOT fire on the first observation, even though
+    # len(adapter_history)=5 > max_auto_redispatch=3. The baseline was
+    # seeded to 5, so redispatch_count=0.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("escalation_reason") is None
+
+    # The head fingerprint and baseline must be persisted so subsequent
+    # passes can compare against them.
+    assert entry.get("orphan_redispatch_head_sha") == "none:none"
+    assert entry.get("orphan_redispatch_adapter_count") == 5
 
     # No escalation event must have been emitted.
     escalated_events = [
