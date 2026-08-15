@@ -722,6 +722,7 @@ def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
             "isCrossRepository": False,
             "state": "MERGED",
             "headRefOid": "aaaa1111",
+            "mergeCommitOid": None,
         }
     ]
     assert pull_call_count >= 1
@@ -1161,13 +1162,19 @@ def test_compare_diff_returns_none_on_failure(monkeypatch, tmp_path: Path) -> No
 
 
 def test_normalize_rest_pr_satisfies_merged_pr_list_field_contract() -> None:
-    """_normalize_rest_pr() must emit exactly MERGED_PR_LIST_FIELDS.
+    """_normalize_rest_pr() must emit exactly MERGED_PR_LIST_FIELDS plus the
+    declared REST-only extras.
 
-    The constant is the single source of truth for the merged-PR shape; this
-    asserts the REST path honors it rather than restating the field list, so
-    adding a field to the contract forces the normalizer to supply it.
+    MERGED_PR_LIST_FIELDS is the single source of truth for the shared shape;
+    MERGED_PR_REST_ONLY_FIELDS declares the fields gh's `--json` list cannot
+    express (see the comment at its definition). This asserts the REST path
+    honors both rather than restating the field lists, so adding a field to
+    either contract forces the normalizer to supply it — and an undeclared
+    extra still fails, keeping the two producers' drift visible.
     """
-    expected: set[str] = set(github_module.MERGED_PR_LIST_FIELDS.split(","))
+    expected: set[str] = set(github_module.MERGED_PR_LIST_FIELDS.split(",")) | set(
+        github_module.MERGED_PR_REST_ONLY_FIELDS
+    )
 
     gh = github_module.GitHub(Path("."))
     normalized = gh._normalize_rest_pr(
@@ -1207,6 +1214,46 @@ def test_normalize_rest_pr_maps_head_sha_to_head_ref_oid() -> None:
     )
 
     assert normalized["headRefOid"] == "deadbeef"
+
+
+def test_normalize_rest_pr_maps_merge_commit_sha_to_merge_commit_oid() -> None:
+    """Issue #1194: REST spells the landing merge commit `merge_commit_sha`;
+    the #502 tripwire's queue-sync-merge recognition anchors its reachability
+    check at this commit's first parent, and reads it as `mergeCommitOid`
+    (gh's GraphQL-style naming, matching headRefOid's convention). A None
+    here silently defeats condition 3 of `_queue_sync_merge_covered` for
+    every REST-sourced merged PR."""
+    gh = github_module.GitHub(Path("."))
+
+    normalized = gh._normalize_rest_pr(
+        {
+            "number": 1,
+            "head": {"ref": "topic", "sha": "deadbeef", "repo": {"full_name": "o/r"}},
+            "base": {"repo": {"full_name": "o/r"}},
+            "merge_commit_sha": "c0ffee",
+        }
+    )
+
+    assert normalized["mergeCommitOid"] == "c0ffee"
+
+
+def test_normalize_rest_pr_merge_commit_oid_is_none_when_absent() -> None:
+    """A REST payload with no `merge_commit_sha` (should not happen for a
+    genuinely merged PR, but the field is attacker/API-controlled input) must
+    map to None rather than KeyError, so `_queue_sync_merge_covered` sees its
+    documented fail-closed `not merge_commit_sha` branch instead of crashing
+    the tripwire pass (issue #1194)."""
+    gh = github_module.GitHub(Path("."))
+
+    normalized = gh._normalize_rest_pr(
+        {
+            "number": 1,
+            "head": {"ref": "topic", "sha": "deadbeef", "repo": {"full_name": "o/r"}},
+            "base": {"repo": {"full_name": "o/r"}},
+        }
+    )
+
+    assert normalized["mergeCommitOid"] is None
 
 
 def test_merged_pr_list_exposes_head_ref_oid_end_to_end(monkeypatch, tmp_path: Path) -> None:
