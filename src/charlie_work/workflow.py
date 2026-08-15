@@ -7801,7 +7801,10 @@ def _attempt_salvage(
                     "issue_number": issue_number,
                     "failure_kind": failure_kind,
                     "reason": skip_reason,
-                    "removed_labels": sorted(active_labels),
+                    # The skip path does NOT remove labels -- label cleanup is the
+                    # reconcile lane's job. Record the active labels at skip time
+                    # for diagnosis (what state the issue was in), not as removed.
+                    "active_labels": sorted(active_labels),
                 },
                 state_path=state_file,
             )

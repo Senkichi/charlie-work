@@ -43823,6 +43823,10 @@ def test_classify_dead_sessions_skips_salvage_when_issue_closed(tmp_path: Path) 
     assert len(skip_events) == 1
     assert skip_events[0]["payload"]["issue_number"] == 1221
     assert skip_events[0]["payload"]["reason"] == "issue_closed"
+    # The skip path does NOT remove labels -- the payload records active_labels
+    # (what the issue carried at skip time), not removed_labels.
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
     # No session_salvaged event was emitted.
     assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
 
@@ -43875,6 +43879,8 @@ def test_classify_dead_sessions_skips_salvage_when_pr_merged(tmp_path: Path) -> 
     assert len(skip_events) == 1
     assert skip_events[0]["payload"]["issue_number"] == 1221
     assert skip_events[0]["payload"]["reason"] == "pr_merged"
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
     assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
 
 
@@ -43938,7 +43944,137 @@ def test_classify_dead_sessions_skips_salvage_when_branch_empty_diff(
     assert len(skip_events) == 1
     assert skip_events[0]["payload"]["issue_number"] == 1221
     assert skip_events[0]["payload"]["reason"] == "empty_diff"
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
     assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_salvage_proceeds_when_merged_pr_search_fails(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 2 fail-safe): when ``merged_prs_for_issue`` returns
+    ``ok=False``, salvage must NOT treat that as evidence of a merge. It falls
+    through to the empty-diff check (check 3) and, if the branch has real work,
+    opens a PR -- a human reviews salvage PRs anyway.
+
+    The result carries a non-empty list with ``ok=False`` so the test exercises
+    the ``ok`` flag specifically: without it, ``len(merged) > 0`` alone would
+    trigger ``pr_merged`` and suppress the PR.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+
+    class FakeGitHubFailingMergeSearch(FakeGitHub):
+        def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+            # Non-empty list with ok=False: a failed search that happened to
+            # return items must NOT be treated as a merge.
+            return github_module._MergedPRSearchResult(
+                [{"number": 1217, "state": "MERGED"}], ok=False
+            )
+
+    gh = FakeGitHubFailingMergeSearch(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 888
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    # Salvage proceeded: the ok=False search fell through to the empty-diff
+    # check, which also did not fire (branch has real work), so a PR was opened.
+    assert len(gh.prs_created) == 1
+    assert gh.prs_created[0]["head"] == branch
+    # No skip event -- the fail-safe worked.
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert not [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    salvaged = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert len(salvaged) == 1
+    assert salvaged[0]["payload"]["pr_number"] == 888
+
+
+def test_salvage_branch_empty_diff_returns_false_on_fetch_failure(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3 fail-safe): ``salvage_branch_empty_diff`` returns
+    False (do not skip salvage) when ``git fetch origin <base>`` fails -- a
+    transient network error falls back to opening the PR, which a human reviews
+    anyway. This is the fail-safe branch the design relies on but had no test.
+    """
+    from charlie_work.worktree import salvage_branch_empty_diff
+
+    # A git repo with NO origin remote: ``git fetch origin main`` fails.
+    repo_root = tmp_path / "no-remote-clone"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    _git(repo_root, "init", "--initial-branch=main")
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "Test User")
+    _git(repo_root, "config", "commit.gpgSign", "false")
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(repo_root, "add", "README.md")
+    _git(repo_root, "commit", "-m", "initial commit")
+
+    # No origin remote configured -- fetch will fail.
+    result = salvage_branch_empty_diff(repo_root, "agent/issue-1221", "main")
+    assert result is False
+
+
+def test_salvage_already_landed_proceeds_when_empty_diff_fetch_fails(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3 fail-safe, integration): when the git fetch inside
+    ``salvage_branch_empty_diff`` fails, the function returns False and
+    ``_salvage_already_landed`` returns ``(False, None)`` -- salvage proceeds
+    (does not skip) instead of treating the git error as evidence the work
+    already landed. A human reviews salvage PRs anyway.
+    """
+    from charlie_work.workflow import _salvage_already_landed
+
+    # A git repo with NO origin remote: ``git fetch origin main`` fails.
+    repo_root = tmp_path / "no-remote-clone"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    _git(repo_root, "init", "--initial-branch=main")
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "Test User")
+    _git(repo_root, "config", "commit.gpgSign", "false")
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(repo_root, "add", "README.md")
+    _git(repo_root, "commit", "-m", "initial commit")
+
+    config = OrchestratorConfig()
+
+    class FakeGitHubEmptyMergeSearch(FakeGitHub):
+        def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+            return github_module._MergedPRSearchResult([], ok=True)
+
+    gh = FakeGitHubEmptyMergeSearch()
+
+    # Issue is OPEN, no merged PR binds to it, and the fetch inside
+    # salvage_branch_empty_diff fails (no origin remote). The fail-safe
+    # must let salvage proceed: _salvage_already_landed returns (False, None).
+    already_landed, reason = _salvage_already_landed(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch="agent/issue-1221",
+        base_ref="main",
+        issue_number=1221,
+        issue={"state": "OPEN"},
+    )
+    assert already_landed is False
+    assert reason is None
 
 
 def test_session_failed_relabeled_payload_requires_reason() -> None:
