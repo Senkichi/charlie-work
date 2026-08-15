@@ -29196,6 +29196,85 @@ def test_merge_ready_cross_pr_revert_undetermined_blocks_merge_without_routing(
     assert fake_gh.merged == []
 
 
+def test_merge_ready_dry_run_cross_pr_revert_undetermined_blocks_merge_without_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1068: the dry-run path must mirror the real path's fail-closed
+    behavior for an undetermined cross-PR revert verdict.
+
+    ``_merge_ready_dry_run`` has its own copy of the three-state branch (it
+    cannot call the real ``merge_ready`` since dry-run must not perform any
+    writes). Without this test, a divergence between the two copies — e.g.
+    the dry-run branch treating ``undetermined`` as "clean" instead of
+    "blocked" — would not be caught by the real-path test above.
+    """
+    from charlie_work.config import AutoMergeConfig, DevinConfig
+    from charlie_work.janitor import CrossPrRevertVerdict
+    from charlie_work import workflow as workflow_module
+
+    _base_sha, _feature_sha, agent_sha = _init_cross_pr_revert_repo(tmp_path)
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(
+            required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
+            update_open_prs="next",
+        ),
+        devin=DevinConfig(adapter="command", dispatch_command="exit 0"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs = [
+        {
+            "number": 456,
+            "title": "Fix #123: revert cross-pr",
+            "url": "https://example.test/pull/456",
+            "headRefName": "agent/issue-123-revert",
+            "baseRefName": "main",
+            "headRefOid": agent_sha,
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #123\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    app.record_review(456, "approved", summary="lgtm")
+
+    # Force the gate into the undetermined state — simulating a transient git
+    # failure that leaves "is there a cross-PR revert?" unanswered.
+    monkeypatch.setattr(
+        workflow_module,
+        "detect_cross_pr_revert",
+        lambda pr, repo_root: CrossPrRevertVerdict(
+            reason="cross-PR revert gate could not verify: git fetch failed (exit 1)",
+            undetermined=True,
+        ),
+    )
+
+    result = app.merge_ready(456, merge=True)
+
+    assert result.ok is True
+    # Fail closed: the verdict is computed as blocked, and dry-run reports it
+    # without ever attempting the merge.
+    assert result.data["can_merge"] is False
+    assert result.data["dry_run"] is True
+    assert result.data["merged"] is False
+    # No revert was confirmed, so the PR is NOT routed to rework.
+    assert result.data["cross_pr_revert_detected"] is False
+    assert result.data["cross_pr_revert_routed"] is False
+    assert result.data["cross_pr_revert_undetermined"] is True
+    assert result.data["merge_conflict"] is False
+    assert "could not verify" in result.data.get("cross_pr_revert_reason", "")
+
+    # Dry-run never routes to rework (the write is skipped entirely) and
+    # never attempts a merge.
+    state = load_state(paths.state_file)
+    assert not any(e["kind"] == "cross_pr_revert_rework_requested" for e in state["events"])
+    assert state["issues"].get("123", {}).get("status") != "rework_requested"
+    assert fake_gh.merged == []
+
+
 def test_merge_ready_stale_base_not_routed_to_rework(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
