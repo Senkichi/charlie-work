@@ -546,6 +546,12 @@ class ConcurrencyGovernorResult:
     dispatch_limit: int
     fleet_live_count: int = 0
     fleet_max: int = 0
+    # Issue #1129: open-PR backpressure fields. Populated only when the
+    # governor was called with ``apply_open_pr_backpressure=True`` (fresh-issue
+    # dispatch) and ``dispatch.max_open_agent_prs`` is > 0. Left at 0 for
+    # rework/recovery/loop paths, which are exempt from this clamp.
+    open_pr_count: int = 0
+    open_pr_max: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -557,6 +563,11 @@ class ConcurrencyGovernorResult:
         """Return True if the fleet governor is enabled (fleet_max > 0)."""
         return self.fleet_max > 0
 
+    @property
+    def open_pr_enabled(self) -> bool:
+        """Return True if the open-PR backpressure clamp is enabled (open_pr_max > 0)."""
+        return self.open_pr_max > 0
+
     def report_fields(self) -> dict[str, int]:
         """Return the fields to include in CommandResult.data when clamped."""
         fields = {
@@ -567,6 +578,9 @@ class ConcurrencyGovernorResult:
         if self.fleet_enabled:
             fields["fleet_concurrency_limit"] = self.fleet_max
             fields["fleet_live_session_count"] = self.fleet_live_count
+        if self.open_pr_enabled:
+            fields["open_pr_count"] = self.open_pr_count
+            fields["open_pr_max"] = self.open_pr_max
         return fields
 
 
@@ -8331,7 +8345,11 @@ class OrchestratorApp:
         )
 
     def _apply_concurrency_governor(
-        self, dispatch_limit: int, *, live_count: int | None = None
+        self,
+        dispatch_limit: int,
+        *,
+        live_count: int | None = None,
+        apply_open_pr_backpressure: bool = False,
     ) -> ConcurrencyGovernorResult:
         """Apply global concurrency governor cap to a dispatch limit.
 
@@ -8344,12 +8362,20 @@ class OrchestratorApp:
             dispatch_limit: The requested dispatch limit
             live_count: Optional pre-computed live worker count. If None and
                 max_concurrent > 0, this will compute it via _count_live_sessions.
+            apply_open_pr_backpressure: When True (fresh-issue dispatch only),
+                also clamp to ``max(0, max_open_agent_prs - open_pr_count)``
+                where ``open_pr_count`` is the number of open agent PRs whose
+                head ref matches ``dispatch.branch_prefix``. Rework, recovery,
+                and loop-level callers leave this False -- they reduce
+                verification debt rather than adding to it (issue #1129).
         """
         max_concurrent = self.config.dispatch.max_concurrent_sessions
         fleet_max = self.config.fleet.global_max_concurrent_sessions
+        open_pr_max = self.config.dispatch.max_open_agent_prs if apply_open_pr_backpressure else 0
         available_slots = dispatch_limit
         clamped = False
         fleet_live_count = 0
+        open_pr_count = 0
 
         if max_concurrent > 0:
             if live_count is None:
@@ -8367,6 +8393,50 @@ class OrchestratorApp:
                 dispatch_limit = fleet_available
                 clamped = True
 
+        if open_pr_max > 0:
+            # Issue #1129: count open agent PRs from live GitHub state (the
+            # same pr_list() + branch_prefix derivation _merge_train_candidates
+            # and the reconciler use). No new state; the count is recomputed
+            # each pass and self-corrects after merges/closes.
+            branch_prefix = self.config.dispatch.branch_prefix
+            open_pr_count = sum(
+                1
+                for pr in self.gh.pr_list()
+                if str(pr.get("headRefName") or "").startswith(branch_prefix)
+            )
+            open_pr_available = max(0, open_pr_max - open_pr_count)
+            if open_pr_available < dispatch_limit:
+                # Record a dispatch_backpressure event so "0 dispatched with N
+                # dispatchable" is diagnosable from events.db rather than
+                # reading as idleness (same discipline as #1091's de-escalation
+                # skip attribution). The governor runs outside the state lock,
+                # so log_event (the low-level write primitive for events
+                # outside state-lock contexts) is used directly.
+                #
+                # Dry-run never writes the event: log_event is a durable
+                # events.db mutation, and a dry-run preview must not record
+                # instrumentation (the same write-suppression discipline as the
+                # worker_token_escalated marker above -- the escalation event
+                # and durable marker stay behind ``not self.dry_run``). The
+                # clamp itself (dispatch_limit/clamped below) is NOT dry-run
+                # gated: a dry-run preview must report the same clamped
+                # selected_count a live pass would, matching the
+                # worker_token_missing refusal precedent in _dispatch_impl.
+                if not self.dry_run:
+                    log_event(
+                        self.paths.state_file,
+                        "dispatch_backpressure",
+                        {
+                            "open_pr_count": open_pr_count,
+                            "max_open_agent_prs": open_pr_max,
+                            "requested_limit": dispatch_limit,
+                            "clamped_limit": open_pr_available,
+                        },
+                        repo=self.repo_root.name,
+                    )
+                dispatch_limit = open_pr_available
+                clamped = True
+
         return ConcurrencyGovernorResult(
             clamped=clamped,
             max_concurrent=max_concurrent,
@@ -8375,6 +8445,8 @@ class OrchestratorApp:
             dispatch_limit=dispatch_limit,
             fleet_live_count=fleet_live_count,
             fleet_max=fleet_max,
+            open_pr_count=open_pr_count,
+            open_pr_max=open_pr_max,
         )
 
     @_guard_state_lock
@@ -9235,8 +9307,14 @@ class OrchestratorApp:
         # worker_pid whose sidecar was removed -- cannot silently free a slot.
         live_count = _count_live_sessions(sessions_dir, self.paths.state_file)
 
-        # Apply global concurrency governor cap with pre-computed live_count
-        gov = self._apply_concurrency_governor(dispatch_limit, live_count=live_count)
+        # Apply global concurrency governor cap with pre-computed live_count.
+        # Issue #1129: fresh-issue dispatch also applies open-PR backpressure
+        # (max_open_agent_prs), pacing new PR creation to the review/merge lane.
+        gov = self._apply_concurrency_governor(
+            dispatch_limit,
+            live_count=live_count,
+            apply_open_pr_backpressure=True,
+        )
         dispatch_limit = gov.dispatch_limit
 
         # Compute the merged PR list (if already fetched) for the tripwire so
@@ -9265,7 +9343,7 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if gov.enabled or gov.fleet_enabled:
+                if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                     data.update(gov.report_fields())
                 return CommandResult(
                     False,
@@ -9486,7 +9564,7 @@ class OrchestratorApp:
                 ],
                 "stalled": stalled_entries,
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -10505,7 +10583,7 @@ class OrchestratorApp:
             ],
             "operator_claimed_ready": sorted(operator_claimed_ready),
         }
-        if gov.enabled or gov.fleet_enabled:
+        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
             data.update(gov.report_fields())
 
         # Emit notification digest if there are health transitions (stalled sessions)
@@ -21103,7 +21181,7 @@ class OrchestratorApp:
             "reaped": reaped,
         }
         # Propagate concurrency info from dispatch results
-        if gov.enabled or gov.fleet_enabled:
+        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
             data.update(gov.report_fields())
         # Prefer the dispatch-scoped governor values (they reflect sidecars
         # written by this pass and the most accurate fleet-wide live count).
@@ -21114,6 +21192,8 @@ class OrchestratorApp:
                 "available_slots",
                 "fleet_concurrency_limit",
                 "fleet_live_session_count",
+                "open_pr_count",
+                "open_pr_max",
             ):
                 if key in data[lane]:
                     data[key] = data[lane][key]
@@ -21328,7 +21408,7 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if gov.enabled or gov.fleet_enabled:
+                if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                     data.update(gov.report_fields())
                 return CommandResult(
                     False,
@@ -21504,7 +21584,7 @@ class OrchestratorApp:
                 "worker_death_escalated": sorted(dry_worker_death_escalated),
                 "rescue_issue_numbers": sorted(dry_rescue_issue_numbers),
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -21796,7 +21876,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -21861,7 +21941,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -22118,7 +22198,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -22449,7 +22529,7 @@ class OrchestratorApp:
             "operator_claimed_skipped": sorted(operator_claimed_skipped),
             "no_op_rework_escalated": sorted(no_op_rework_escalated),
         }
-        if gov.enabled or gov.fleet_enabled:
+        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
             data.update(gov.report_fields())
 
         # Emit notification digest if there are health transitions (stalled sessions)
