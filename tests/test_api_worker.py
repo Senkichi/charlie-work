@@ -297,6 +297,67 @@ def test_launch_api_worker_injects_provider_env(
     assert small_fast == "kimi-k3"
 
 
+def test_launch_api_worker_pins_provider_model_not_claude_code_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1245: the api worker's ``--model`` flag must equal the provider
+    registry's model, not ``claude_code.model``. The Claude Code CLI gives the
+    ``--model`` flag precedence over the ``ANTHROPIC_MODEL`` env var, so
+    without pinning the provider's model argv-side the provider's model
+    selection is dead code (Moonshot served whatever it maps the
+    claude-sonnet-5 alias to, not kimi-k3).
+
+    Asserts over the recorded sidecar ``command`` (which captures argv) and
+    ``record.command``. Uses a config whose ``claude_code.model`` deliberately
+    differs from the provider's model so a regression that re-pins
+    ``claude_code.model`` is caught."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    # claude_code.model deliberately differs from the provider model (kimi-k3)
+    # so the two are distinguishable in the pinned --model value.
+    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-sonnet-5"))
+
+    record = launch_api_worker(
+        1245,
+        "agent/issue-1245-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=_api_worker_config(),
+        command_template=_fake_claude_script(tmp_path),
+        config=config,
+    )
+
+    assert record.ok
+    # The provider registry's model is kimi-k3 (from _provider_config default).
+    provider_model = "kimi-k3"
+    claude_code_model = "claude-sonnet-5"
+    # The two must differ, otherwise this test cannot discriminate the fix.
+    assert provider_model != claude_code_model
+
+    # record.command carries the pinned argv.
+    assert "--model" in record.command
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == provider_model
+    assert record.command[idx + 1] != claude_code_model
+    # Exactly one --model pin (dedup behavior of _apply_model_pin unchanged).
+    assert record.command.count("--model") == 1
+
+    # The sidecar's recorded command must agree (it captures argv too).
+    sidecar_path = sessions_dir / "issue-1245.api.json"
+    assert sidecar_path.exists()
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_command = tuple(payload["command"])
+    assert "--model" in sidecar_command
+    sidx = sidecar_command.index("--model")
+    assert sidecar_command[sidx + 1] == provider_model
+    assert sidecar_command.count("--model") == 1
+
+
 def test_launch_api_worker_worker_env_merged_under_provider_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

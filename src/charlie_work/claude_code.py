@@ -921,6 +921,7 @@ def launch_claude_worker(
     adapter_kind: str = "claude-code",
     provider: str = "",
     resolved_review_effort: str | None = None,
+    model_override: str | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -973,6 +974,15 @@ def launch_claude_worker(
     production path, rather than two calls to the same pure function that
     merely agree by convention. When omitted (direct callers, unit tests),
     the effort is resolved internally as a fallback.
+
+    ``model_override``, when provided, is pinned as the ``--model`` value
+    instead of ``resolved_config.claude_code.model``. The api adapter
+    (``api_worker.launch_api_worker``) passes the resolved provider's model
+    here so the ``--model`` flag — which the Claude Code CLI gives precedence
+    over ``ANTHROPIC_MODEL`` — selects the provider's model rather than the
+    claude_code section's. When omitted (the default), the claude_code
+    section's model is pinned exactly as before — the single enforcement
+    point stays ``_apply_model_pin``, never an ``adapter_kind`` branch.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
@@ -1004,7 +1014,16 @@ def launch_claude_worker(
     elif command_template is None:
         command_template = _WORKER_COMMAND_TEMPLATE
     resolved_config = config or OrchestratorConfig()
-    command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
+    # Issue #1245: the api adapter passes its provider's model so the
+    # ``--model`` flag (which the Claude Code CLI prefers over
+    # ``ANTHROPIC_MODEL``) selects the provider's model, not the
+    # claude_code section's. Default to claude_code.model for every other
+    # caller — single enforcement point stays _apply_model_pin, never an
+    # adapter_kind branch.
+    pinned_model = (
+        model_override if model_override is not None else resolved_config.claude_code.model
+    )
+    command_template = _apply_model_pin(command_template, pinned_model)
     # Reviewer sessions may pin their own effort independently of worker
     # effort (empty string means fall back to claude_code.effort), optionally
     # split into a per-PR randomized treatment/control experiment — see
