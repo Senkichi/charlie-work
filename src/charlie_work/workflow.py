@@ -22810,9 +22810,7 @@ class OrchestratorApp:
         committer = head_commit.get("committer")
         committer_login = committer.get("login") if isinstance(committer, dict) else None
         commit_meta = head_commit.get("commit")
-        commit_committer = (
-            commit_meta.get("committer") if isinstance(commit_meta, dict) else None
-        )
+        commit_committer = commit_meta.get("committer") if isinstance(commit_meta, dict) else None
         committer_name = (
             commit_committer.get("name") if isinstance(commit_committer, dict) else None
         )
