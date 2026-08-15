@@ -44783,9 +44783,11 @@ def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
     escalated on the very first orphan-sweep pass. The first-observation
     branch resets orphan_redispatch_at to [now] (count=1), so the cap
     counts attempts since this failure mode started, not the issue's entire
-    historical adapter_history length. With the unconditional timestamp-list
-    counter, adapter_history is not read at all -- but the seed keeps a long
-    adapter_history to prove the new counter does not depend on it.
+    historical adapter_history length. With the timestamp-list counter
+    (independent of adapter routing mode, appending only on a not-yet-counted
+    dispatch identity), adapter_history is not read at all -- but the seed
+    keeps a long adapter_history to prove the new counter does not depend
+    on it.
     """
     from unittest.mock import patch
 
