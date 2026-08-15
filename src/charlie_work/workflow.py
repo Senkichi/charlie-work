@@ -5663,24 +5663,38 @@ def _detect_and_handle_orphaned_workers(
                 # Issue #259: mark the entry so it is not re-flagged every pass.
                 # Suppress ONLY the duplicate no-open-PR event; with-PR recovery
                 # paths must run regardless of the flag.
-                # Issue #1230: also stamp ``orphan_drift_at`` here so the
-                # ``dead_dispatched_reap_minutes`` time-based backstop (which
-                # keys off ``orphan_drift_at``, checked at the top of this loop)
-                # can converge the status.  Without this, an issue that reaches
-                # this drift branch — e.g. one whose #417 label reclaim was a
-                # no-op because a mention-flag escalation already applied
-                # ``agent:human-needed`` (a terminal label, not in
-                # ``config.labels.active``) — wedges in ``dispatched``
-                # indefinitely: not re-dispatchable (the terminal label excludes
-                # it), not sweepable (status is not ``escalated``), and the
-                # backstop never fires because ``orphan_drift_at`` was never
-                # set.  The reclaim-success branch above deliberately does NOT
-                # set ``orphan_drift_at`` — that path leaves the issue
-                # ``ready`` and re-dispatchable, so the backstop should not
-                # fire.  This branch is reached only when there is nothing to
-                # reclaim (no active labels) or reclaim failed, both of which
-                # mean the issue is not on the normal re-dispatch path and the
-                # backstop is the correct convergence mechanism.
+                # Issue #1230: ``orphan_drift_at`` arms the
+                # ``dead_dispatched_reap_minutes`` time-based backstop checked
+                # at the top of this loop.  It must be backfilled whenever it
+                # is missing, INDEPENDENTLY of the ``orphan_flagged_at``
+                # duplicate-event guard below.  An entry that was flagged
+                # before this stamp existed (pre-#1230 builds set only
+                # ``orphan_flagged_at``) or via the reclaim-success branch
+                # above (which deliberately omits ``orphan_drift_at``) has
+                # ``orphan_flagged_at`` set but ``orphan_drift_at`` absent, so
+                # the guard's early-return permanently blocks the backstop
+                # from ever arming.  That is the wedge: the issue is not
+                # re-dispatchable (a terminal label like ``agent:human-needed``
+                # excludes it from the dispatchable pool), not sweepable
+                # (status is not ``escalated``), and the backstop never fires
+                # because ``orphan_drift_at`` was never set.  Backfill from
+                # ``orphan_flagged_at`` so the grace period is measured from
+                # when the drift was first observed -- an already-wedged entry
+                # (e.g. jc #1421, flagged 4+ days ago) converges on the very
+                # next sweep pass instead of waiting another full grace window.
+                # The reclaim-success branch above deliberately does NOT set
+                # ``orphan_drift_at`` -- that path leaves the issue ``ready``
+                # and re-dispatchable, so the backstop should not fire on the
+                # pass that reclaimed it.  This backfill only arms the backstop
+                # for entries that reach THIS drift branch (nothing to reclaim
+                # or reclaim failed), which means the issue is not on the
+                # normal re-dispatch path and the backstop is the correct
+                # convergence mechanism.
+                if (
+                    entry.get("orphan_drift_at") is None
+                    and entry.get("orphan_flagged_at") is not None
+                ):
+                    entry["orphan_drift_at"] = entry["orphan_flagged_at"]
                 if entry.get("orphan_flagged_at"):
                     state["issues"][str(issue_number)] = entry
                     continue

@@ -42228,6 +42228,132 @@ def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Pa
     assert payload["reap_minutes"] == 60
 
 
+def test_orphaned_worker_no_open_pr_already_flagged_backstop_backfills(tmp_path: Path) -> None:
+    """Issue #1230 regression: the real wedge precondition is an entry that was
+    flagged on a prior pass (``orphan_flagged_at`` set) but never received an
+    ``orphan_drift_at`` stamp -- either because it was flagged by a pre-#1230
+    build (which set only ``orphan_flagged_at``) or via the reclaim-success
+    branch (which deliberately omits ``orphan_drift_at``).  The original #1230
+    fix placed the ``orphan_drift_at`` stamp behind the
+    ``orphan_flagged_at`` early-return guard, so already-flagged entries hit
+    ``continue`` before the stamp was written and remained permanently
+    unreachable -- the backstop never armed and the issue never escalated.
+
+    The fix decouples the backfill from the guard: ``orphan_drift_at`` is
+    backfilled from ``orphan_flagged_at`` whenever it is missing, BEFORE the
+    duplicate-event guard's early-return.  This test seeds the exact wedge
+    precondition (``orphan_flagged_at`` set, ``orphan_drift_at`` absent, grace
+    period already elapsed) and verifies the backstop arms on the next sweep
+    pass and the issue escalates.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the wedge precondition: orphan_flagged_at is set to 120 minutes ago
+    # (past the 60-minute reap grace) but orphan_drift_at is ABSENT.  This is
+    # the state a pre-#1230-flagged entry (or a reclaim-success entry that
+    # later fell through to the drift branch) would be in.
+    flagged_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    state = load_state(paths.state_file)
+    state["issues"]["1421"] = {
+        "status": "dispatched",
+        "worker_pid": 45292,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": (datetime.now(UTC) - timedelta(days=4))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "merged_pr_mention_flagged_at": (datetime.now(UTC) - timedelta(days=3))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "orphan_flagged_at": flagged_at,
+        # orphan_drift_at deliberately ABSENT -- the wedge precondition.
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues = [
+        {
+            "number": 1421,
+            "title": "call_model cascade timeout",
+            "url": "https://example.test/issues/1421",
+            "body": "",
+            # Only the terminal human-needed label -- no active labels, so the
+            # #417 reclaim is a no-op and the issue is excluded from dispatch.
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Pass 1: the drift branch is reached (no active labels to reclaim).  The
+    # duplicate-event guard sees orphan_flagged_at already set, but the
+    # backfill must run BEFORE the early-return so orphan_drift_at is armed.
+    # The backstop at the top of the loop already ran this pass with
+    # orphan_drift_at absent, so escalation cannot happen yet -- but the stamp
+    # must now be present for the next pass.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("orphan_drift_at") is not None, (
+        "already-flagged entry must have orphan_drift_at backfilled from "
+        "orphan_flagged_at so the backstop can arm on the next sweep pass"
+    )
+    # Backfill must use the original flag timestamp (not utc_now()) so an
+    # already-wedged entry converges immediately instead of waiting another
+    # full grace window.
+    assert entry.get("orphan_drift_at") == flagged_at
+    # The duplicate-event guard still suppresses the drift event -- no new
+    # orphaned_worker_drift for this issue on this pass.
+    drift_events = [
+        e
+        for e in st.get("events", [])
+        if e.get("kind") == "orphaned_worker_drift"
+        and e.get("payload", {}).get("issue_number") == 1421
+    ]
+    assert len(drift_events) == 0
+    # Status is still dispatched -- the backstop runs at the top of the loop,
+    # before the drift branch, so it could not fire this pass.
+    assert entry.get("status") == "dispatched"
+
+    # Pass 2: the backstop at the top of the loop now sees orphan_drift_at
+    # (backfilled to 120 minutes ago, past the 60-minute grace) and must
+    # escalate.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+
+    reaped_events = [
+        e for e in st.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 1421
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
+
+
 def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -> None:
     """Issue #654: a dead dispatched worker whose drift was surfaced recently
     (within ``dead_dispatched_reap_minutes``) must NOT be time-escalated.  The
