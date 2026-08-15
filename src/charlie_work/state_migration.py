@@ -72,9 +72,10 @@ import dataclasses
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
-from . import safe_path
+from . import layout, safe_path
+from .state import StateLockBusy, load_state, save_state, state_lock
 from .worktree import _list_worktrees_porcelain
 
 #: SQLite WAL-mode side-file suffixes. A child ending in one of these is part
@@ -528,6 +529,23 @@ def _default_mover(src: Path, dst: Path) -> None:
 
 
 @dataclass(frozen=True)
+class StateRewriteResult:
+    """Result of :func:`_rewrite_state_json_paths` -- the embedded-path rewrite.
+
+    ``rewritten`` is the count of string leaves under the old state root that
+    were rewritten to the new one. ``error`` is set on every ``ok=False``
+    outcome: a string that looks like a path under the old root but whose
+    rewritten target does not exist (a non-path that coincidentally contains
+    the prefix, or a path that was not moved), a lock-acquisition failure, or
+    an ``OSError`` from the load/save cycle.
+    """
+
+    ok: bool
+    rewritten: int = 0
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class MigrationOutcome:
     """Result of :func:`apply_state_dir_migration` -- what actually moved.
 
@@ -540,18 +558,145 @@ class MigrationOutcome:
     outcome and is the only field distinguishing *why* -- pre-flight
     refusal, a stale plan caught by the TOCTOU re-check, or an ``OSError``
     from ``mover`` -- since ``aborted_at`` alone cannot tell those apart.
+
+    ``rewritten_paths`` is the count of embedded absolute paths inside
+    ``state.json`` that were rewritten from the old root to the new one as
+    part of the migration (issue #735). It is ``0`` when there is no
+    ``state.json`` to rewrite, when no embedded paths named the old root,
+    or when the rewrite failed (``ok=False``).
     """
 
     ok: bool
     moved: tuple[str, ...] = ()
     error: str | None = None
     aborted_at: str | None = None
+    rewritten_paths: int = 0
+
+
+def _try_rewrite_path_string(
+    value: str, src_root: Path, dst_root: Path
+) -> tuple[str, int, str | None]:
+    """Rewrite *value* if it is a path under *src_root*; verify the target exists.
+
+    A "hit" is a string that, interpreted as a :class:`Path`, is lexically
+    contained in *src_root* (exact-prefix, via :func:`_is_lexically_contained` --
+    the same pure containment check the planner uses, so separator and case
+    differences are folded). For each hit the relative parts below *src_root*
+    are re-anchored under *dst_root* and the resulting path is checked for
+    existence: after a successful all-or-nothing migration every file that was
+    under the old root is now under the new one, so a rewritten target that
+    does not exist means either (a) the string was not really a path but
+    coincidentally started with the old-root prefix, or (b) a path that was not
+    moved. Both are refused -- the issue #735 design principle is that the
+    inconsistent state must never be representable, and silently skipping a
+    non-resolving hit would reintroduce it.
+
+    Returns ``(rewritten_or_original_string, count, error)``. ``count`` is 1
+    on a successful rewrite, 0 otherwise. ``error`` is set when a hit's
+    rewritten target does not exist.
+    """
+    candidate = Path(value)
+    if not _is_lexically_contained(src_root, candidate):
+        return value, 0, None
+    relative = _relative_parts(src_root, candidate)
+    rewritten = dst_root.joinpath(*relative) if relative else dst_root
+    if not rewritten.exists():
+        return (
+            value,
+            0,
+            (
+                f"string {value!r} is under the old state root {src_root} but its "
+                f"rewritten path {rewritten} does not exist -- refusing to rewrite "
+                "a non-path or unmoved target"
+            ),
+        )
+    return str(rewritten), 1, None
+
+
+def _walk_and_rewrite(value: Any, src_root: Path, dst_root: Path) -> tuple[Any, int, str | None]:
+    """Recursively rewrite string leaves under *src_root* to *dst_root*.
+
+    Structural walk, not ``str.replace`` on the file text: a text replace
+    cannot distinguish a path value from a branch name or issue title that
+    happens to contain the token, and a ``json.loads`` round-trip guard catches
+    corruption but not a semantically wrong substitution. Only ``str`` leaves
+    are candidates; dict keys, ints, floats, bools, and ``None`` are passed
+    through untouched.
+
+    Returns ``(new_value, count, error)``. On error, *new_value* is the
+    original *value* unchanged and *count* is 0 -- the caller must not save
+    a partially-rewritten tree.
+    """
+    if isinstance(value, str):
+        return _try_rewrite_path_string(value, src_root, dst_root)
+    if isinstance(value, dict):
+        new_dict: dict[str, Any] = {}
+        total = 0
+        for key, item in value.items():
+            new_item, count, error = _walk_and_rewrite(item, src_root, dst_root)
+            if error is not None:
+                return value, 0, error
+            new_dict[key] = new_item
+            total += count
+        return new_dict, total, None
+    if isinstance(value, list):
+        new_list: list[Any] = []
+        total = 0
+        for item in value:
+            new_item, count, error = _walk_and_rewrite(item, src_root, dst_root)
+            if error is not None:
+                return value, 0, error
+            new_list.append(new_item)
+            total += count
+        return new_list, total, None
+    return value, 0, None
+
+
+def _rewrite_state_json_paths(
+    state_path: Path, src_root: Path, dst_root: Path
+) -> StateRewriteResult:
+    """Load ``state.json``, rewrite embedded paths, save -- all under ``state_lock``.
+
+    The single-point-of-enforcement for the invariant *"pointers in state.json
+    name the live state root"* (issue #735). After :func:`apply_state_dir_migration`
+    moves every child, ``state.json`` itself is at ``dst_root/state.json`` but
+    its *contents* still embed absolute paths naming ``src_root/...``. This
+    function walks the parsed JSON structurally (via :func:`_walk_and_rewrite`),
+    rewrites every string leaf under *src_root* to *dst_root*, verifies each
+    rewritten target exists, and saves atomically (via :func:`save_state`, which
+    uses the temp-file + ``replace`` pattern) under :func:`state_lock`.
+
+    A missing ``state_path`` is not an error: a fresh tree with no state yet
+    has nothing to rewrite, and the migration of the tree itself still
+    succeeded. Returns ``ok=True, rewritten=0`` in that case.
+
+    Per CLAUDE.md ("errors from external processes come back as values, never
+    raised"), :class:`StateLockBusy` and :class:`OSError` are caught and
+    returned as ``ok=False`` with ``.error`` set -- never propagated.
+    """
+    if not state_path.exists():
+        return StateRewriteResult(ok=True, rewritten=0)
+
+    try:
+        with state_lock(state_path):
+            data = load_state(state_path)
+            new_data, count, error = _walk_and_rewrite(data, src_root, dst_root)
+            if error is not None:
+                return StateRewriteResult(ok=False, error=error)
+            if count > 0:
+                save_state(state_path, new_data)
+            return StateRewriteResult(ok=True, rewritten=count)
+    except StateLockBusy as exc:
+        return StateRewriteResult(ok=False, error=f"could not acquire state lock: {exc}")
+    except OSError as exc:
+        return StateRewriteResult(ok=False, error=f"state rewrite I/O error: {exc}")
 
 
 def apply_state_dir_migration(
     plan: MigrationPlan,
     *,
     mover: Callable[[Path, Path], None] | None = None,
+    state_rewriter: Callable[[Path, Path, Path], StateRewriteResult] | None = None,
 ) -> MigrationOutcome:
     """Actuate *plan*: move every movable child from ``src_root`` to ``dst_root``.
 
@@ -603,10 +748,29 @@ def apply_state_dir_migration(
     module cannot touch the filesystem. Nothing is created when
     ``plan.movable`` is empty, so a no-op run has no filesystem side effects.
 
+    Embedded-path rewrite (issue #735)
+    -----------------------------------
+    After every child is moved, ``state.json`` (now at
+    ``dst_root/state.json``) still embeds absolute paths naming the old root
+    -- ``prompt_path``, ``decision_path``, ``cross_family_report``,
+    ``verdict_source``, and any other string leaf that was stored as
+    ``str(Path(...))``. The rewrite is part of the migration itself, not a
+    separate manual gate, so the inconsistent state is never representable.
+    *state_rewriter* (default :func:`_rewrite_state_json_paths`) loads the
+    file under ``state_lock``, walks it structurally, rewrites every string
+    leaf under ``src_root`` to ``dst_root``, verifies each rewritten target
+    exists, and saves atomically. The count is reported in
+    ``MigrationOutcome.rewritten_paths``. A rewrite failure (a non-path hit,
+    a missing target, a lock timeout) returns ``ok=False`` -- the children
+    have already moved, so this is an incomplete migration that needs manual
+    attention, not a rollback point.
+
     Deliberately NOT done here: creating the compat junction (``mklink /J``)
     that makes the legacy location keep resolving after the move. Data
     movement and "make it look finished" must stay separately observable
-    outcomes.
+    outcomes. The embedded-path rewrite removes the *need* for the junction
+    (issue #735), but the junction itself remains a separate operator
+    concern.
     """
     if not plan.ok:
         return MigrationOutcome(
@@ -627,6 +791,7 @@ def apply_state_dir_migration(
         )
 
     move = mover if mover is not None else _default_mover
+    rewrite = state_rewriter if state_rewriter is not None else _rewrite_state_json_paths
     movable = plan.movable
     moved: list[str] = []
 
@@ -689,4 +854,18 @@ def apply_state_dir_migration(
             )
         moved.append(child.name)
 
-    return MigrationOutcome(ok=True, moved=tuple(moved))
+    # Issue #735: after every child is moved, rewrite embedded absolute paths
+    # inside state.json so they name the new root. ``state.json`` was itself a
+    # child and is now at ``dst_root/state.json``; its contents still point at
+    # ``src_root/...``. The rewrite is part of the migration, not a separate
+    # manual gate, so the inconsistent state is never representable.
+    state_path = plan.dst_root / layout.STATE_FILENAME
+    rewrite_result = rewrite(state_path, plan.src_root, plan.dst_root)
+    if not rewrite_result.ok:
+        return MigrationOutcome(
+            ok=False,
+            moved=tuple(moved),
+            error=(f"children moved but state.json path rewrite failed: {rewrite_result.error}"),
+        )
+
+    return MigrationOutcome(ok=True, moved=tuple(moved), rewritten_paths=rewrite_result.rewritten)
