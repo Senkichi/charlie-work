@@ -1029,6 +1029,56 @@ def test_apply_fixes_merged_outside_orchestrator_transitions_labels() -> None:
     assert new_state["prs"]["1"]["status"] == "merged"
 
 
+def test_apply_fixes_merged_outside_orchestrator_stamps_and_preserves_merged_at() -> None:
+    """Issue #747: ``apply_fixes`` must stamp ``merged_at`` when a PR transitions
+    non-merged -> merged via the ``merged_outside_orchestrator`` drift fix, and
+    must preserve an existing ``merged_at`` unchanged when the PR is already
+    recorded as merged. The latter is the issue-still-active re-run path, where
+    ``detect_drift`` re-emits the drift item even though state status is already
+    ``'merged'`` (see reconcile.detect_drift: ``state_status != "merged" or
+    issue_still_active``); the ``merged_at`` guard stops that re-run from
+    back-dating the original observation time."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    drift = [
+        DriftItem(
+            kind="merged_outside_orchestrator",
+            issue_number=10,
+            pr_number=1,
+            detail="PR #1 merged outside orchestrator",
+            fix_actions=("mark state prs[1].status = 'merged'",),
+        )
+    ]
+
+    # Genuine transition: prior status is not 'merged' -> merged_at is stamped.
+    state = empty_state()
+    state["prs"]["1"] = {"status": "reviewing"}
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["1"]["status"] == "merged"
+    stamped = new_state["prs"]["1"].get("merged_at")
+    assert stamped is not None
+    assert stamped  # non-empty ISO 8601 timestamp
+    # The stamp is a real 'Z'-suffixed utc_now() value, not a stale literal.
+    assert stamped.endswith("Z")
+
+    # Re-run where the PR is already recorded as merged (the issue-still-active
+    # path, where detect_drift re-emits the drift despite status == 'merged'):
+    # the original merged_at must be preserved unchanged, never back-dated.
+    # Derived from the real clock (one day in the past) so no date-window
+    # filter can ever rot this seed.
+    original_merged_at = (
+        (datetime.now(UTC) - timedelta(days=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    state2 = empty_state()
+    state2["prs"]["1"] = {"status": "merged", "merged_at": original_merged_at}
+    new_state2 = apply_fixes(gh, state2, drift, config)
+    assert new_state2["prs"]["1"]["status"] == "merged"
+    assert new_state2["prs"]["1"]["merged_at"] == original_merged_at
+
+
 def test_apply_fixes_contradiction_removes_active_labels_directly() -> None:
     config = OrchestratorConfig()
     gh = FakeGitHub(prs=[], issues=[])
@@ -2124,6 +2174,81 @@ def test_apply_fixes_session_failed_relabeled_idempotent(tmp_path: Path) -> None
     # Verify event was emitted
     reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
     assert len(reconcile_events) == 1
+
+
+def test_apply_fixes_session_failed_relabeled_carries_structured_reason(
+    tmp_path: Path,
+) -> None:
+    """Issue #978: the ``reconcile`` event for a ``session_failed_relabeled``
+    drift item must carry the machine-readable ``reason``/``failure_kind`` as
+    structured payload fields, not only buried in the free-text ``detail``
+    string. A query on ``json_extract(payload, '$.reason')`` must not return
+    NULL the way it did when the "why" lived only in English prose."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_relabeled",
+            issue_number=42,
+            pr_number=None,
+            reason="dead_session_no_open_pr",
+            failure_kind="rate_limited",
+            detail="issue #42 session died with rate_limited, no open PR",
+            fix_actions=(
+                f"remove label '{config.labels.in_progress}' from issue #42",
+                f"add label '{config.labels.ready}' to issue #42",
+            ),
+            remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.ready,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    payload = reconcile_events[0]["payload"]
+    assert payload["kind"] == "session_failed_relabeled"
+    assert payload["reason"] == "dead_session_no_open_pr"
+    assert payload["failure_kind"] == "rate_limited"
+
+
+def test_apply_fixes_session_failed_relabeled_reason_absent_when_unset(
+    tmp_path: Path,
+) -> None:
+    """Issue #978: a drift item that does not carry ``reason``/``failure_kind``
+    must not produce a reconcile payload with those keys present-as-None. The
+    payload shape for items without structured fields is unchanged."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(42, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_relabeled",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 session died, no open PR",
+            fix_actions=(f"remove label '{config.labels.in_progress}' from issue #42",),
+            remove_labels=(config.labels.in_progress,),
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    payload = reconcile_events[0]["payload"]
+    assert "reason" not in payload
+    assert "failure_kind" not in payload
 
 
 def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel(
@@ -3525,7 +3650,7 @@ def test_reconcile_fix_deferred_when_supervisor_lock_held(tmp_path: Path) -> Non
         supervisor_lock.release()
 
     assert result.ok is True
-    assert result.data.get("skipped") is True
+    assert result.data.get("pass_skipped") is True
     assert result.data.get("reason") == "supervisor_lock_held"
 
 
@@ -4728,3 +4853,28 @@ def test_reconcile_dry_run_without_fix_still_reports_drift(tmp_path: Path) -> No
 
     after_state = json.loads(paths.state_file.read_text(encoding="utf-8"))
     assert after_state["prs"]["1"]["status"] == "reviewing"
+
+
+def test_apply_fixes_has_no_dry_run_parameter() -> None:
+    """Issue #1051: ``apply_fixes`` must NOT accept a ``dry_run`` parameter.
+
+    The dry-run invariant for ``mop-up --fix`` is enforced at a single point --
+    the ``if fix and not dry_run and drift:`` gate in ``_reconcile_locked``
+    (workflow.py), which short-circuits before ``apply_fixes`` is ever called.
+    Adding a ``dry_run`` parameter to ``apply_fixes`` would create unreachable
+    dead code: the caller guarantees ``dry_run`` is False on every code path
+    that reaches ``apply_fixes``, so any ``dry_run``-conditional branch inside
+    it can never fire from a real CLI invocation. This test locks in the
+    single-point-of-enforcement design so the dead-code pattern is not
+    reintroduced (e.g. by a PR that threads ``dry_run`` into ``apply_fixes``
+    without also restructuring the caller gate to let it through).
+    """
+    import inspect
+
+    sig = inspect.signature(apply_fixes)
+    assert "dry_run" not in sig.parameters, (
+        "apply_fixes must not accept a dry_run parameter (issue #1051): "
+        "the caller-level `not dry_run` gate in _reconcile_locked is the "
+        "single enforcement point; a dry_run param here would be unreachable "
+        "dead code."
+    )

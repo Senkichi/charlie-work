@@ -361,10 +361,10 @@ def test_extract_attention_events_nested_loop_skip() -> None:
         {
             "stalled": [],
             "errors": [],
-            "intake": {"skipped": True, "reason": "state_lock_busy"},
+            "intake": {"pass_skipped": True, "reason": "state_lock_busy"},
             "dispatch": {"state_lock_busy": True, "reason": "state_lock_busy"},
             "dispatch_rework": {"deferred_reason": "graphql_rate_limit"},
-            "dispatch_reviews": {"skipped": True, "reason": "state_lock_busy"},
+            "dispatch_reviews": {"pass_skipped": True, "reason": "state_lock_busy"},
         },
     )
 
@@ -872,6 +872,17 @@ def test_fleet_loop_unclassified_exception_isolated(
     assert "fleet pass error" in result.data["repos"]["owner/repo1"].get("message", "")
     # The exception type must be part of the surfaced message (diagnosability).
     assert "RuntimeError" in result.data["repos"]["owner/repo1"]["message"]
+
+    # Issue #738: the genuine lane-crash path (this test's RuntimeError raised
+    # inside app.loop()) must set ``errored: True`` on the per-repo result data
+    # at its point of origin in fleet_loop's ``except Exception`` handler, so
+    # the supervisor headline can split "errored" from "completed with
+    # conditions". The downstream headline-split tests plant this flag via a
+    # synthetic fixture; this assertion verifies the flag is actually set by
+    # the real exception path, not just honored when present.
+    assert result.data["repos"]["owner/repo1"].get("errored") is True
+    # The successful repo must not carry the marker.
+    assert "errored" not in result.data["repos"]["owner/repo2"]
 
     # Verify overall result is False (one repo failed)
     assert result.ok is False
@@ -1490,7 +1501,7 @@ def test_fleet_loop_skips_repo_when_supervisor_lock_held(
     assert "owner/repo1" in result.data["repos"]
     repo1_data = result.data["repos"]["owner/repo1"]
     assert repo1_data["ok"] is True
-    assert repo1_data["skipped"] is True
+    assert repo1_data["pass_skipped"] is True
     assert repo1_data["reason"] == "supervisor_lock_held"
 
     # repo2 still ran
@@ -1630,7 +1641,7 @@ def test_fleet_loop_work_only_skips_locked_repo(
     assert mock_app.dispatch.call_count == 0
     repo_data = result.data["repos"]["owner/repo1"]
     assert repo_data["ok"] is True
-    assert repo_data["skipped"] is True
+    assert repo_data["pass_skipped"] is True
     assert repo_data["reason"] == "supervisor_lock_held"
 
 
@@ -1941,7 +1952,11 @@ def test_run_fleet_supervise_pass_summary_guards_missing_message(
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
     assert summary_lines
-    assert "3 failed" in summary_lines[0]
+    # Issue #738: non-fatal ok=False conditions are "with conditions", not
+    # "failed" -- the three repos here have no ``errored`` flag, so they land
+    # in the conditions bucket and the errored count stays at zero.
+    assert "3 with conditions" in summary_lines[0]
+    assert "0 errored" in summary_lines[0]
     # No dangling empty reason marker when every message is absent -- check
     # only the text after "fleet pass N:" so the leading "[HH:MM:SS]"
     # timestamp bracket (unrelated to the reason suffix) is not confused for it.
@@ -1975,12 +1990,202 @@ def test_run_fleet_supervise_pass_summary_silent_when_all_ok(
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
     assert summary_lines
-    assert "0 failed" in summary_lines[0]
+    # Issue #738: a fully healthy pass reports zero errored and zero
+    # conditions, not a single "0 failed" blob.
+    assert "0 errored" in summary_lines[0]
+    assert "0 with conditions" in summary_lines[0]
     # No reason suffix at all when nothing failed -- check only the text after
     # "fleet pass N:" so the leading "[HH:MM:SS]" timestamp bracket is not
     # confused for a (nonexistent) reason marker.
     after_prefix = summary_lines[0].split("fleet pass 1:", 1)[1]
     assert "[" not in after_prefix
+
+
+def _mixed_fleet_result(
+    conditions: dict[str, str | None] | None = None,
+    errored: dict[str, str | None] | None = None,
+    ok: dict[str, dict[str, Any]] | None = None,
+) -> CommandResult:
+    """A fleet pass with explicit errored / with-conditions / ok buckets.
+
+    Mirrors the shape ``fleet_loop`` returns after issue #738: the exception
+    path sets ``errored: True`` on the result data, while non-fatal
+    ``ok=False`` conditions from ``app.loop()`` do not. This helper lets a
+    test plant each bucket independently so the headline split is exercised
+    in isolation.
+    """
+    repos: dict[str, dict[str, Any]] = {}
+    for key, msg in (conditions or {}).items():
+        repos[key] = {"ok": False, "message": msg}
+    for key, msg in (errored or {}).items():
+        repos[key] = {"ok": False, "message": msg, "errored": True}
+    for key, data in (ok or {}).items():
+        entry = {"ok": True}
+        entry.update(data)
+        repos[key] = entry
+    return CommandResult(
+        False,
+        "fleet pass complete",
+        {"repos": repos, "digest": {"count": 0, "events": []}},
+    )
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_splits_errored_from_conditions(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #738: the headline must separate lane crashes from non-fatal conditions.
+
+    A pass with one crashed repo (``errored: True``) and one repo that
+    completed with a non-fatal condition (``ok=False``, no ``errored``) must
+    produce ``1 errored, 1 with conditions`` -- not the old ``2 failed`` that
+    painted both red and gated nothing.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _mixed_fleet_result(
+        conditions={"owner/repo1": "loop completed with 2 PR error(s)"},
+        errored={"owner/repo2": "fleet pass error: RuntimeError: boom"},
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines
+    line = summary_lines[0]
+    assert "1 errored" in line, f"crashed repo must count as errored: {line!r}"
+    assert "1 with conditions" in line, f"non-fatal repo must count as conditions: {line!r}"
+    # The old undifferentiated "failed" count must not appear.
+    assert "2 failed" not in line, f"old red-everywhere count must be gone: {line!r}"
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_all_errored(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Issue #738: a pass where every repo crashed reports N errored, 0 conditions.
+
+    This is the genuine-outage case the old gauge could not distinguish from
+    a routine pass -- two repos both crashing is now unambiguously ``2 errored``.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _mixed_fleet_result(
+        errored={
+            "owner/repo1": "fleet pass error: RuntimeError: boom",
+            "owner/repo2": "fleet pass error: ConfigError: bad",
+        }
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    captured = capsys.readouterr()
+    summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
+    assert summary_lines
+    line = summary_lines[0]
+    assert "2 errored" in line
+    assert "0 with conditions" in line
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_pass_summary_logs_non_ok_reason_at_warning(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #738: every non-ok repo's reason must be emitted at WARNING.
+
+    The exception path already logs via ``logger.exception`` inside
+    ``fleet_loop``; this covers the non-fatal ``ok=False`` conditions from
+    ``app.loop()`` that were previously silent in the supervisor log. The
+    reason must be recoverable from the log after the fact, not just from the
+    deduped/truncated summary suffix.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _mixed_fleet_result(
+        conditions={"owner/repo1": "loop completed with 2 PR error(s)"},
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
+        run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(
+        "owner/repo1" in r.getMessage() and "loop completed with 2 PR error(s)" in r.getMessage()
+        for r in warnings
+    ), f"non-ok repo reason must be logged at WARNING, got: {[r.getMessage() for r in warnings]!r}"
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_final_summary_splits_errored_from_conditions(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+) -> None:
+    """Issue #738: the final supervisor summary line also splits the counts.
+
+    The aggregate ``fleet supervisor complete`` line used the same
+    ``total_failed_repos`` counter as the per-pass headline and had the same
+    defect. It must now report ``N errored, N with conditions`` instead of
+    ``N failed repo(s)``.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _mixed_fleet_result(
+        conditions={"owner/repo1": "loop completed with 1 PR error(s)"},
+        errored={"owner/repo2": "fleet pass error: RuntimeError: boom"},
+    )
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+
+    assert "1 errored" in result.message
+    assert "1 with conditions" in result.message
+    assert "failed repo(s)" not in result.message
+    # The return data carries the split counters alongside the legacy sum.
+    assert result.data["total_errored_repos"] == 1
+    assert result.data["total_conditions_repos"] == 1
+    assert result.data["total_failed_repos"] == 2
 
 
 def test_run_fleet_supervise_loop_reports_ok_on_a_clean_child_exit() -> None:
@@ -2127,6 +2332,58 @@ def test_run_fleet_supervise_logs_global_config_provenance(
     assert "present" in present, f"a present global layer was not reported: {present!r}"
     assert "absent" not in present, "a present layer must not read as absent"
     assert "bytes=" in present, "the size distinguishes an empty layer from a populated one"
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_records_ci_fleet_provenance(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #954: the supervisor records ci_fleet's import location + sibling git state.
+
+    The live supervisor imports ci_fleet from an editable working tree, not a
+    commit. This event makes that coupling attributable: it stamps
+    ``ci_fleet.__file__``, the sibling repo's HEAD/branch/dirty-state into the
+    fleet-level events.db at every supervisor start. The event is recorded
+    even when ``declared_ci_fleet_root`` abstains (e.g. from a worktree), so
+    the ``ci_fleet_file`` field is the one fact always present.
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(
+        max_passes=1, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(tmp_path)
+    )
+
+    # The event lands in the fleet-level events.db (sibling of the heartbeat).
+    heartbeat = tmp_path / "supervisor-heartbeat.json"
+    rows = query_events(heartbeat, kind="ci_fleet_provenance")
+    assert rows is not None, "no events.db reader -- the event was not recorded"
+    assert len(rows) == 1, f"expected exactly one ci_fleet_provenance event, got {len(rows)}"
+    payload = rows[0]["payload"]
+    # ci_fleet is importable in this venv, so __file__ is always set.
+    assert payload["ci_fleet_file"] is not None
+    # All fields are present (None is a valid value for the sibling fields
+    # when declared_ci_fleet_root abstains from a worktree).
+    for key in (
+        "sibling_root",
+        "sibling_head",
+        "sibling_branch",
+        "sibling_dirty",
+        "error",
+    ):
+        assert key in payload, f"missing field {key!r} in ci_fleet_provenance payload"
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -6769,3 +7026,88 @@ def test_build_fleet_attention_digest_observed_repo_keys_reconciles_stale_error(
     )
     assert digest2.transitions == ()
     assert _load_fleet_health_state(state_file) == {}
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_records_fleet_lane_completed_event(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #1078: ``fleet_loop`` records a ``fleet_lane_completed`` event to
+    the fleet-level events.db for each repo after every pass, so an operator
+    can observe per-repo lane liveness from one query without hand-querying
+    each repo's individual events.db. This closes the diagnostic trap where
+    silence in the shared fleet log was indistinguishable from a broken fleet.
+    """
+    from charlie_work.fleet_paths import fleet_dir
+
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app1 = MagicMock()
+    mock_app2 = MagicMock()
+    mock_app1.loop.return_value = CommandResult(
+        True, "repo1 loop complete", {"pass_skipped": False, "errored": False}
+    )
+    mock_app2.loop.return_value = CommandResult(
+        True, "repo2 loop complete", {"pass_skipped": False, "errored": False}
+    )
+    mock_app_class.side_effect = [mock_app1, mock_app2]
+    mock_gh_class.return_value = MagicMock()
+
+    fleet_dir_override = str(tmp_path / "fleet")
+    result = fleet_loop(
+        fleet_dir_override=fleet_dir_override,
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # Both repos ran successfully.
+    assert result.data["repos"]["owner/repo1"]["ok"] is True
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+
+    # The fleet-level events.db must carry one fleet_lane_completed event per
+    # repo, with the expected payload fields.
+    fleet_state_path = layout.state_file_path(fleet_dir(override=fleet_dir_override))
+    events = query_events(fleet_state_path, kind="fleet_lane_completed")
+    assert len(events) == 2, f"expected 2 fleet_lane_completed events, got {len(events)}"
+
+    by_repo = {e["payload"]["repo_key"]: e for e in events}
+    assert set(by_repo) == {"owner/repo1", "owner/repo2"}
+
+    for repo_key, event in by_repo.items():
+        assert event["payload"]["ok"] is True
+        assert event["payload"]["pass_skipped"] is False
+        assert event["payload"]["errored"] is False
+        assert "loop complete" in event["payload"]["message"]
+        assert event["repo"] == repo_key

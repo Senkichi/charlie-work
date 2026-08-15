@@ -22,6 +22,8 @@ from .global_config import describe_config_file, load_layered_config
 from .instrumentation import log_event
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, runtime_paths
+from .venv_anchor import verify_interpreter_anchored_editables
+from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 from .supervise import (
     LocalSnapshot,
     orchestrator_root,
@@ -1070,7 +1072,7 @@ def _collect_skip_reasons(data: Any) -> set[str]:
 def _add_skip_reasons(data: dict[str, Any], reasons: set[str]) -> None:
     """Add any skip reason present in a flat result dict to the set."""
     skip_reason = data.get("reason") or data.get("deferred_reason")
-    if data.get("skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
+    if data.get("pass_skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
         reasons.add(skip_reason or "state_lock_busy")
 
 
@@ -1724,6 +1726,14 @@ def fleet_loop(
     # the report only reads api_worker fields, which that replace never touches.
     loaded_configs: dict[str, OrchestratorConfig] = {}
 
+    # Issue #1078: fleet-level state path for per-repo lane liveness events.
+    # Each repo's lane completion is recorded here so an operator can query the
+    # fleet-level events.db (not each repo's individual events.db) to see when
+    # each repo's lane last ran — closing the diagnostic trap where the shared
+    # fleet log shows no lines for a repo whose lane is merely late.
+    resolved_fleet_dir = fleet_dir(override=fleet_dir_override)
+    fleet_state_path = layout.state_file_path(resolved_fleet_dir)
+
     # Run runner prologues if enabled (only for full loop, not work-only).
     # Allocation first: moving an idle slot to a starved repo is free, so it
     # runs before autoscale decides the host needs more runners registered.
@@ -1783,7 +1793,7 @@ def fleet_loop(
                 per_repo_results[repo_key] = CommandResult(
                     True,
                     "supervisor lock held, skipped",
-                    {"skipped": True, "reason": "supervisor_lock_held"},
+                    {"pass_skipped": True, "reason": "supervisor_lock_held"},
                 )
                 attention_events.append(
                     {
@@ -1844,8 +1854,15 @@ def fleet_loop(
             # The exception type is part of the message and the full traceback
             # goes to the log — an unclassified failure must stay diagnosable.
             error_message = f"{type(exc).__name__}: {exc}"
+            # Issue #738: this is the only per-repo construction site that
+            # represents a genuine lane crash (app.loop() never ran to
+            # completion). Mark it distinctly from the non-fatal ok=False
+            # conditions app.loop() returns for (PR errors, the unauthorized-
+            # merge tripwire, etc.) so the supervisor headline can split
+            # "errored" from "completed with conditions" instead of painting
+            # both red under one "failed" count.
             per_repo_results[repo_key] = CommandResult(
-                False, f"fleet pass error: {error_message}", {}
+                False, f"fleet pass error: {error_message}", {"errored": True}
             )
             logger.exception("Error processing repo %s", repo_key)
             # #6-G: the two lines above are an in-process dict and a line in a
@@ -1864,6 +1881,29 @@ def fleet_loop(
                 {"repo_key": repo_key, "type": "error", "error": error_message}
             )
             _record_lane_failure_event(repo_root, repo_key, entry, error_message)
+
+    # Issue #1078: record per-repo lane liveness to the fleet-level events.db
+    # so an operator can observe every repo's last lane completion from one
+    # query, without hand-querying each repo's individual events.db. This
+    # closes the diagnostic trap where the shared fleet log shows no lines for
+    # a repo whose lane is merely late — silence in the shared log is no longer
+    # indistinguishable from a broken fleet.
+    for repo_key, result in per_repo_results.items():
+        try:
+            log_event(
+                fleet_state_path,
+                "fleet_lane_completed",
+                {
+                    "repo_key": repo_key,
+                    "ok": result.ok,
+                    "message": result.message,
+                    "pass_skipped": bool(result.data.get("pass_skipped")),
+                    "errored": bool(result.data.get("errored")),
+                },
+                repo=repo_key,
+            )
+        except Exception:
+            logger.debug("Failed to record fleet_lane_completed for %s", repo_key)
 
     # Call the notifier digest sink exactly once per fleet pass, via the real
     # #166 notify.py implementation (AttentionDigest + emit_digest).
@@ -1951,7 +1991,7 @@ def _is_fleet_pass_active(pass_result: CommandResult) -> bool:
     for repo_data in data.get("repos", {}).values():
         if not isinstance(repo_data, dict):
             continue
-        if repo_data.get("skipped") is True:
+        if repo_data.get("pass_skipped") is True:
             return True
         for section_key in ("dispatch", "dispatch_rework", "dispatch_reviews"):
             section = repo_data.get(section_key) or {}
@@ -2246,6 +2286,27 @@ def _alert_watchdog_not_armed(
         )
 
 
+def _record_ci_fleet_provenance(state_path: Path) -> None:
+    """Record the resolved ``ci_fleet`` import location + sibling git state to events.db.
+
+    Issue #954: the live supervisor imports ``ci_fleet`` from an editable
+    working tree, not a commit. This is the "accept the coupling and
+    instrument it" half -- it converts a silent hazard into an attributable
+    one by stamping ``ci_fleet.__file__``, the sibling repo's HEAD, branch,
+    and dirty-state into the fleet-level ``events.db`` at every supervisor
+    start. Best-effort and never raises: a probe failure lands in the event
+    payload's ``error`` field, and a ``log_event`` failure is swallowed by
+    ``log_event`` itself.
+    """
+    snapshot = ci_fleet_provenance_snapshot()
+    log_event(
+        state_path,
+        "ci_fleet_provenance",
+        ci_fleet_provenance_payload(snapshot),
+        repo="fleet",
+    )
+
+
 def run_fleet_supervise(
     *,
     fleet_dir_override: str | None = None,
@@ -2273,6 +2334,20 @@ def run_fleet_supervise(
     A single ``fleet-supervisor.lock`` in the fleet directory prevents two
     ``charlie fleet supervise`` invocations from overlapping.
     """
+    # Before anything else -- even config load: a repointed editable means the
+    # code below this line is not the reviewed code. Positive violations refuse
+    # startup; abstentions proceed with the reason logged (issue #974).
+    anchor = verify_interpreter_anchored_editables()
+    if not anchor.ok:
+        logger.error("VENV EDITABLE ANCHOR VIOLATION: %s", anchor.detail)
+        log_event(
+            runtime_paths(orchestrator_root(), layout.DEFAULT_STATE_DIR).state_file,
+            "venv_editable_anchor_violation",
+            {"detail": anchor.detail},
+        )
+        return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
+    logger.info("Venv editable anchor: %s", anchor.detail)
+
     try:
         global_config = load_layered_config(
             Path.cwd(),
@@ -2346,6 +2421,13 @@ def run_fleet_supervise(
     total_repo_passes = 0
     total_attention_events = 0
     total_failed_repos = 0
+    # Issue #738: split the aggregate "failed" count into genuine lane crashes
+    # (errored) vs non-fatal ok=False conditions (with conditions) so the
+    # final supervisor summary does not paint the majority of passes red the
+    # way the per-pass headline used to. ``total_failed_repos`` is kept as the
+    # sum of the two for backwards-compatible return-data consumers.
+    total_errored_repos = 0
+    total_conditions_repos = 0
     start_time = clock()
     # Set at every route out of the loop below; see RESTART_EXIT_REASONS.
     exit_reason: str | None = None
@@ -2397,6 +2479,16 @@ def run_fleet_supervise(
         full_pass_interval_seconds=full_pass_interval,
         max_pass_runtime_seconds=cfg.max_pass_runtime_seconds,
     )
+
+    # Record where ci_fleet was actually imported from plus the sibling
+    # repo's HEAD and dirty-state (issue #954). The venv anchor check above
+    # refuses a repointed install, but neither it nor declared_ci_fleet_root
+    # records what the running process *actually loaded* -- and the editable
+    # .pth means that is whatever is saved in the sibling working tree,
+    # committed or not. This does not prevent anything; it makes the coupling
+    # attributable when something breaks. Best-effort: a probe failure is
+    # recorded in the event payload, never propagated to the supervisor path.
+    _record_ci_fleet_provenance(supervisor_heartbeat_path(fleet_dir_override))
 
     # Exit tracking: ``_exit_code`` is 0 for every in-control clean exit (drain,
     # max_runtime, max_passes, HEAD-drift restart, self-deploy restart,
@@ -2463,6 +2555,7 @@ def run_fleet_supervise(
                 fleet_dir_override=fleet_dir_override,
                 dry_run=dry_run,
                 failure_alarm_threshold=cfg.self_deploy_failure_alarm,
+                pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
             )
             notify_config = getattr(global_config, "notify", None)
             notify_enabled = notify_config is not None and getattr(notify_config, "enabled", False)
@@ -2604,28 +2697,60 @@ def run_fleet_supervise(
             repos_data = data.get("repos", {}) if isinstance(data, dict) else {}
             digest = data.get("digest", {}) if isinstance(data, dict) else {}
             repo_count = len(repos_data)
-            failed = sum(
-                1 for r in repos_data.values() if isinstance(r, dict) and not r.get("ok", True)
+            # Issue #738: split "failed" into "errored" (a genuine lane crash,
+            # the exception path in fleet_loop that sets ``errored: True`` on
+            # the result data) and "with conditions" (app.loop() returned
+            # ok=False for a non-fatal business condition -- PR errors, the
+            # unauthorized-merge tripwire, repo_root missing, etc.). The old
+            # single "failed" count was red on 57% of passes and gated nothing.
+            errored = sum(
+                1
+                for r in repos_data.values()
+                if isinstance(r, dict) and not r.get("ok", True) and r.get("errored")
             )
+            conditions = sum(
+                1
+                for r in repos_data.values()
+                if isinstance(r, dict) and not r.get("ok", True) and not r.get("errored")
+            )
+            failed = errored + conditions
             attention_count = digest.get("count", 0) if isinstance(digest, dict) else 0
 
             total_repo_passes += repo_count
             total_attention_events += attention_count
             total_failed_repos += failed
+            total_errored_repos += errored
+            total_conditions_repos += conditions
+
+            # Issue #738: emit a per-repo WARNING for every non-ok repo so the
+            # reason is recoverable from the supervisor log (fleet-pass.log)
+            # after the fact, not just from the deduped/truncated summary
+            # suffix below. The exception path already logs via
+            # logger.exception inside fleet_loop; this covers the non-fatal
+            # ok=False conditions from app.loop() that were previously silent
+            # in the log entirely.
+            for repo_key, r in repos_data.items():
+                if isinstance(r, dict) and not r.get("ok", True):
+                    reason = str(r.get("message") or "").strip()
+                    if reason:
+                        logger.warning(
+                            "fleet pass %s: %s not ok: %s", pass_number, repo_key, reason
+                        )
 
             summary = (
                 f"[{now_str}] fleet pass {pass_number}: {repo_count} repo(s), "
-                f"{repo_count - failed} ok, {failed} failed, "
+                f"{repo_count - failed} ok, {errored} errored, "
+                f"{conditions} with conditions, "
                 f"{attention_count} attention event(s)"
             )
-            # #893: "N failed" alone is indistinguishable from a real outage --
-            # the per-repo failure reason (e.g. a known, acked-releasable
+            # #893: the per-repo failure reason (e.g. a known, acked-releasable
             # control like the unauthorized-merge tripwire) is already sitting
             # in repos_data[key]["message"] (set by fleet_loop) but was never
             # read here. Append it, on the existing line (an attribute of the
             # pass, not a separate report -- see the api_worker_report line
             # below for the precedent on when a *second* line is warranted
-            # instead).
+            # instead). The per-repo WARNING above (#738) is the durable,
+            # untruncated record; this suffix is the at-a-glance digest.
             if failed:
                 # Strip before filtering, not after: a whitespace-only message
                 # is falsy-after-strip but truthy-before, so filtering on the
@@ -2730,6 +2855,8 @@ def run_fleet_supervise(
                 "total_repo_passes": total_repo_passes,
                 "total_attention_events": total_attention_events,
                 "total_failed_repos": total_failed_repos,
+                "total_errored_repos": total_errored_repos,
+                "total_conditions_repos": total_conditions_repos,
                 "elapsed_seconds": elapsed_s,
             },
         )
@@ -2777,13 +2904,16 @@ def run_fleet_supervise(
         True,
         f"fleet supervisor complete: {pass_number} pass(es) in {elapsed_str}, "
         f"{total_repo_passes} repo pass(es), {total_attention_events} attention "
-        f"event(s), {total_failed_repos} failed repo(s) "
+        f"event(s), {total_errored_repos} errored, "
+        f"{total_conditions_repos} with conditions "
         f"[exit_reason={exit_reason or 'unknown'}]",
         {
             "passes": pass_number,
             "total_repo_passes": total_repo_passes,
             "total_attention_events": total_attention_events,
             "total_failed_repos": total_failed_repos,
+            "total_errored_repos": total_errored_repos,
+            "total_conditions_repos": total_conditions_repos,
             "elapsed_seconds": elapsed_s,
             "exit_reason": exit_reason or "unknown",
             "restart_requested": exit_reason in RESTART_EXIT_REASONS,

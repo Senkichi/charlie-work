@@ -93,6 +93,32 @@ class WorktreeProbeFailedError(RuntimeError):
     """
 
 
+# Never pushed; charlie-work owns this namespace exclusively (same convention
+# as attempt_refs.ATTEMPT_REF_PREFIX). A rescue ref preserves worker-authored
+# dirty content immediately before a worktree reset that would destroy it, so
+# a correct ``WorktreeUnsafeError`` refusal becomes recoverable instead of
+# terminal (issue #849).
+RESCUE_REF_PREFIX = "refs/charlie/rescue"
+
+
+@dataclass(frozen=True)
+class RescueCapture:
+    """Result of capturing worktree work to a rescue ref before a reset.
+
+    A rescue ref preserves worker-authored dirty content (tracked modifications
+    + untracked files, excluding orchestrator scaffolding) so that a correct
+    refusal to reset a worktree is recoverable instead of terminal (issue #849).
+
+    ``ref_name``/``commit_sha`` are None when capture failed (``error`` set).
+    Callers must treat capture failure as a hard refusal — the reset must NOT
+    proceed if the work could not be preserved.
+    """
+
+    ref_name: str | None
+    commit_sha: str | None
+    error: str | None = None
+
+
 class LiveWorkerRedispatchError(RuntimeError):
     """Raised when a recovery/redispatch path is about to destroy a worktree
     but the recorded worker process is still alive (or sessions.db shows fresh
@@ -276,6 +302,11 @@ class WorktreeInfo:
     # real, recoverable merge conflict against the base ref. None for every
     # non-rework worktree and for a clean rework pre-merge.
     rework_conflict: ReworkMergeConflict | None = None
+    # Set when a worktree reset was permitted only after capturing the dirty
+    # working tree to a rescue ref (issue #849). None when no capture was
+    # needed (the worktree was safe to reset) or when capture failed (the
+    # reset was refused and WorktreeUnsafeError was raised instead).
+    rescue_capture: RescueCapture | None = None
 
 
 class WorktreeState(str, Enum):
@@ -631,6 +662,37 @@ def _remote_branch_head_sha(repo_root: Path, branch: str) -> str | None:
     return stdout.split()[0]
 
 
+def remote_branch_head_sha(repo_root: Path, branch: str) -> str | None:
+    """Public wrapper for ``_remote_branch_head_sha``.
+
+    Returns the commit SHA for ``origin/{branch}`` if it exists, else ``None``.
+    Used by the orphan-sweep redispatch cap (issue #1243) to measure branch
+    progress across no-open-PR redispatches: an unchanged remote head SHA across
+    attempts is evidence the worker pushed nothing new.
+    """
+    return _remote_branch_head_sha(repo_root, branch)
+
+
+def worktree_head_sha(worktree_path: Path) -> str | None:
+    """Return the HEAD commit SHA of the worktree at ``worktree_path``.
+
+    Returns ``None`` when the worktree does not exist or ``git rev-parse HEAD``
+    fails. Used by the orphan-sweep redispatch cap (issue #1243) to detect
+    stranded commits -- work the worker completed but never pushed. A moving
+    local head with a dead worker is the salvage path's job, not an escalation.
+    """
+    if not worktree_path.is_dir():
+        return None
+    result = run_captured(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return None
+    return result.stdout.strip() or None
+
+
 def remote_branch_ahead_count(
     repo_root: Path, branch: str, base_ref: str = ""
 ) -> tuple[int | None, str | None]:
@@ -743,6 +805,174 @@ def worktree_ahead_of_sha(worktree_path: Path, base_sha: str) -> tuple[int | Non
         return int(count_result.stdout.strip()), None
     except ValueError:
         return None, f"rev-list returned non-integer: {count_result.stdout!r}"
+
+
+@dataclass(frozen=True)
+class SalvagePushResult:
+    """Outcome of a salvage-push attempt on a dead worker's worktree (#1248).
+
+    Three shapes, discriminated by ``pushed``/``skip_reason``/``error``:
+    ``pushed=True`` (work published), ``skip_reason`` set (preconditions not
+    met -- nothing was attempted, the worktree is untouched), or ``error``
+    set (the push itself was attempted and failed; ``old_remote_sha`` and
+    ``commit_count`` still carry what was known at attempt time).
+    """
+
+    pushed: bool
+    skip_reason: str | None = None
+    error: str | None = None
+    old_remote_sha: str | None = None
+    new_remote_sha: str | None = None
+    commit_count: int | None = None
+
+
+def salvage_push_stranded_commits(
+    repo_root: Path,
+    branch: str,
+    worktree_path: Path,
+    *,
+    base_ref: str = "",
+) -> SalvagePushResult:
+    """Fast-forward-push committed-but-unpushed work from a dead worker's worktree.
+
+    A worker that completed its work locally but died before ``git push``
+    presents to the orphan sweep exactly like a worker that did nothing: zero
+    remote delta. This helper publishes that stranded work so the sweep can
+    classify against the real head instead of redispatching (issue #1248).
+
+    Safety properties, in order of enforcement:
+
+    - The caller must have already established the worker is dead (state PID
+      records); this helper additionally refuses when the worktree carries a
+      live or operator writer marker.
+    - Push happens only when the remote tip is an ancestor of the local branch
+      tip (a pure fast-forward), or when the branch does not exist on origin
+      yet and the worktree has commits beyond the base branch. **Never** a
+      force push -- and ``push_branch`` is a plain push, so even a race with a
+      concurrent remote write fails closed on the server side.
+    - Ancestry is only consulted after ``_object_exists`` confirms the remote
+      SHA is present locally: ``merge-base --is-ancestor`` cannot distinguish
+      "not an ancestor" from "unknown object", and a remote tip this worktree
+      has never seen means someone else pushed -- diverged, skip.
+
+    Never raises; every failure comes back as a value.
+    """
+    try:
+        branch = require_valid_ref_name(branch, context="salvage_push branch")
+    except ValueError as exc:
+        return SalvagePushResult(pushed=False, skip_reason=f"invalid_branch: {exc}")
+
+    if not worktree_path.is_dir():
+        return SalvagePushResult(pushed=False, skip_reason="no_worktree")
+
+    marker = read_worktree_marker(worktree_path)
+    if marker is not None:
+        if marker.get("kind") == OPERATOR_MARKER_KIND:
+            return SalvagePushResult(pushed=False, skip_reason="operator_claimed")
+        marker_pid = marker.get("pid")
+        if isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid):
+            return SalvagePushResult(pushed=False, skip_reason="live_writer_marker")
+
+    local_result = run_captured(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not local_result.ok:
+        return SalvagePushResult(pushed=False, skip_reason="branch_ref_missing")
+    local_sha = local_result.stdout.strip()
+
+    remote_exists = _remote_branch_exists(worktree_path, branch)
+    if remote_exists is None:
+        return SalvagePushResult(pushed=False, skip_reason="remote_probe_failed")
+
+    old_remote_sha: str | None = None
+    if remote_exists:
+        old_remote_sha = _remote_branch_head_sha(worktree_path, branch)
+        if old_remote_sha is None:
+            return SalvagePushResult(pushed=False, skip_reason="remote_probe_failed")
+        if old_remote_sha == local_sha:
+            return SalvagePushResult(
+                pushed=False, skip_reason="up_to_date", old_remote_sha=old_remote_sha
+            )
+        if not _object_exists(worktree_path, old_remote_sha):
+            return SalvagePushResult(
+                pushed=False,
+                skip_reason="remote_head_not_local",
+                old_remote_sha=old_remote_sha,
+            )
+        if not _is_ancestor(worktree_path, old_remote_sha, local_sha):
+            return SalvagePushResult(
+                pushed=False, skip_reason="diverged", old_remote_sha=old_remote_sha
+            )
+        count_result = run_captured(
+            ["git", "rev-list", "--count", f"{old_remote_sha}..{local_sha}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not count_result.ok:
+            return SalvagePushResult(
+                pushed=False, skip_reason="count_failed", old_remote_sha=old_remote_sha
+            )
+        try:
+            commit_count = int(count_result.stdout.strip())
+        except ValueError:
+            return SalvagePushResult(
+                pushed=False, skip_reason="count_failed", old_remote_sha=old_remote_sha
+            )
+        if commit_count == 0:
+            return SalvagePushResult(
+                pushed=False,
+                skip_reason="no_stranded_commits",
+                old_remote_sha=old_remote_sha,
+            )
+    else:
+        # Branch never made it to origin. Only publish it when the worktree
+        # actually carries commits beyond the base branch -- creating an empty
+        # remote branch would feed the #935 open-PR lane a PR with no diff.
+        base_branch = resolve_base_branch_name(repo_root, base_ref)
+        base_result = run_captured(
+            ["git", "rev-parse", "--verify", f"origin/{base_branch}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not base_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="base_unresolvable")
+        merge_base_result = run_captured(
+            ["git", "merge-base", base_result.stdout.strip(), local_sha],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not merge_base_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="base_unresolvable")
+        count_result = run_captured(
+            ["git", "rev-list", "--count", f"{merge_base_result.stdout.strip()}..{local_sha}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not count_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="count_failed")
+        try:
+            commit_count = int(count_result.stdout.strip())
+        except ValueError:
+            return SalvagePushResult(pushed=False, skip_reason="count_failed")
+        if commit_count == 0:
+            return SalvagePushResult(pushed=False, skip_reason="no_commits_beyond_base")
+
+    ok, push_error = push_branch(repo_root, branch, worktree_path)
+    if not ok:
+        return SalvagePushResult(
+            pushed=False,
+            error=f"push_failed: {push_error}",
+            old_remote_sha=old_remote_sha,
+            commit_count=commit_count,
+        )
+    return SalvagePushResult(
+        pushed=True,
+        old_remote_sha=old_remote_sha,
+        new_remote_sha=local_sha,
+        commit_count=commit_count,
+    )
 
 
 def _object_exists(repo_root: Path, sha: str) -> bool:
@@ -1434,6 +1664,117 @@ def _worker_authored_dirty(
             continue
         return True
     return False
+
+
+def _capture_worktree_work_to_rescue_ref(
+    repo_root: Path,
+    worktree_path: Path,
+    issue_number: int | None,
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
+) -> RescueCapture:
+    """Capture worker-authored dirty content to a rescue ref (issue #849).
+
+    Stages all worktree changes — tracked modifications, deletions, and
+    untracked files — except orchestrator scaffolding (``injected_paths``,
+    ``materialize_dirs``, and ``.venv``), creates a tree from the resulting
+    index, wraps it in a commit with the worktree's current ``HEAD`` as
+    parent, and saves it to ``refs/charlie/rescue/issue-<n>-<timestamp>``.
+
+    The index is restored to ``HEAD`` after the tree is captured, so the
+    worktree's staging state is unchanged regardless of capture outcome.
+
+    Never raises: every git invocation goes through ``run_captured`` (errors
+    as values). A capture failure returns a ``RescueCapture`` with ``error``
+    set — the caller must refuse the reset in that case, exactly as today.
+    """
+    # Build exclusion pathspecs. ``.venv`` is always excluded: it is either a
+    # junction into the shared virtualenv (following it would add every other
+    # worktree's venv contents) or a local venv that is not worker content.
+    exclusions: list[str] = [":(exclude).venv"]
+    for p in (*injected_paths, *materialize_dirs):
+        normalized = str(p).replace("\\", "/").strip("/")
+        if normalized:
+            exclusions.append(f":(exclude){normalized}")
+
+    add_result = run_captured(
+        ["git", "add", "-A", "--", ".", *exclusions],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+
+    tree_sha: str | None = None
+    if add_result.ok:
+        tree_result = run_captured(
+            ["git", "write-tree"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if tree_result.ok and tree_result.stdout.strip():
+            tree_sha = tree_result.stdout.strip()
+
+    # Always restore the index to HEAD so the worktree's staging state is
+    # unchanged.  This runs whether or not the tree was captured: a failed
+    # ``git add`` may have left a partially-staged index, and ``git reset
+    # --mixed HEAD`` unstages everything without touching the working tree.
+    run_captured(
+        ["git", "reset", "--mixed", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+
+    if tree_sha is None:
+        detail = add_result.error or add_result.stderr or "unknown error"
+        return RescueCapture(
+            ref_name=None,
+            commit_sha=None,
+            error=f"capture failed at add/write-tree stage: {detail}",
+        )
+
+    head_result = run_captured(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not head_result.ok or not head_result.stdout.strip():
+        return RescueCapture(
+            ref_name=None,
+            commit_sha=None,
+            error=f"capture failed: cannot resolve HEAD: "
+            f"{head_result.error or head_result.stderr}",
+        )
+    head_sha = head_result.stdout.strip()
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    issue_part = f"issue-{issue_number}" if issue_number is not None else "issue-unknown"
+    ref_name = f"{RESCUE_REF_PREFIX}/{issue_part}-{timestamp}"
+
+    commit_result = run_captured(
+        ["git", "commit-tree", tree_sha, "-p", head_sha, "-m", f"rescue: {issue_part}"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not commit_result.ok or not commit_result.stdout.strip():
+        return RescueCapture(
+            ref_name=None,
+            commit_sha=None,
+            error=f"capture failed at commit-tree: {commit_result.error or commit_result.stderr}",
+        )
+    commit_sha = commit_result.stdout.strip()
+
+    update_result = run_captured(
+        ["git", "update-ref", ref_name, commit_sha],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not update_result.ok:
+        return RescueCapture(
+            ref_name=None,
+            commit_sha=commit_sha,
+            error=f"capture failed at update-ref: {update_result.error or update_result.stderr}",
+        )
+
+    return RescueCapture(ref_name=ref_name, commit_sha=commit_sha)
 
 
 def _is_confirmed_missing_ref(result: RunResult) -> bool:
@@ -2426,6 +2767,7 @@ def create_worktree(
     reclaimed: str | None = None
     attempt_snapshot: AttemptSnapshot | None = None
     rework_conflict: ReworkMergeConflict | None = None
+    rescue_capture: RescueCapture | None = None
 
     def _snapshot_before_delete(target_branch: str) -> None:
         """Best-effort attempt-tip snapshot immediately before a branch reset.
@@ -2440,6 +2782,107 @@ def create_worktree(
         attempt_snapshot = snapshot_attempt_ref(
             repo_root, target_branch, issue_number, base_ref=resolved_base_ref
         )
+
+    def _emit_rescue_event(capture: RescueCapture, unsafe_reason: str, wt_path: Path) -> None:
+        """Best-effort: record a ``worktree_rescue_captured`` event (issue #849).
+
+        Deferred import so worktree.py never hard-depends on instrumentation's
+        own import chain (ci_fleet at module bottom). A missing state_file
+        (no config) or an instrumentation I/O error is silently skipped —
+        the rescue ref itself is the durable artifact, not the event.
+        """
+        if state_file is None:
+            return
+        try:
+            from .instrumentation import log_event
+
+            log_event(
+                state_file,
+                "worktree_rescue_captured",
+                {
+                    "issue_number": issue_number,
+                    "rescue_ref": capture.ref_name,
+                    "commit_sha": capture.commit_sha,
+                    "worktree_path": str(wt_path),
+                    "reason": unsafe_reason,
+                },
+            )
+        except Exception:  # noqa: BLE001 — instrumentation is best-effort
+            pass
+
+    def _capture_or_raise(
+        check_path: Path, unsafe_reason: str, capture_injected: tuple[str, ...]
+    ) -> None:
+        """Attempt rescue capture before refusing a reset (issue #849).
+
+        If capture succeeds, records it on the enclosing ``rescue_capture``,
+        cleans the working tree so the captured dirty content cannot survive
+        into a new work session, and returns — the reset is permitted because
+        the work is now durable on a ref. If capture fails, raises
+        ``WorktreeUnsafeError`` exactly as today — capture failure must never
+        downgrade the safety property.
+
+        The working-tree clean is the single enforcement point for the "never
+        commit tracked modifications the shim did not itself produce"
+        invariant on the capture-succeeds path. Without it, a reuse-in-place
+        ``git merge --ff-only`` that doesn't touch the dirty files would leave
+        them in place, silently surviving into the next worker's session
+        (issue #849 rework finding).
+        """
+        nonlocal rescue_capture
+        capture = _capture_worktree_work_to_rescue_ref(
+            repo_root,
+            check_path,
+            issue_number,
+            capture_injected,
+            materialize_dirs,
+        )
+        if capture.error is None and capture.ref_name is not None:
+            rescue_capture = capture
+            _emit_rescue_event(capture, unsafe_reason, check_path)
+            _clean_captured_worktree(check_path, capture_injected)
+            return
+        raise WorktreeUnsafeError(unsafe_reason)
+
+    def _clean_captured_worktree(wt_path: Path, clean_injected: tuple[str, ...]) -> None:
+        """Reset and clean the working tree after a successful rescue capture.
+
+        The work is already durable on a rescue ref, so discarding the
+        working-tree copy is safe. Tracked modifications are reset to HEAD;
+        untracked files are removed except orchestrator scaffolding
+        (``.venv``, ``clean_injected``, ``materialize_dirs``) — the same
+        exclusions the capture used, so exactly what was captured is
+        discarded and exactly what was excluded is preserved.
+
+        Raises ``RuntimeError`` on failure: a successful capture with a
+        still-dirty tree is a hazardous state that must surface, not be
+        silently left for the next worker to commit.
+        """
+        reset_result = run_captured(
+            ["git", "reset", "--hard", "HEAD"],
+            cwd=wt_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not reset_result.ok:
+            raise RuntimeError(
+                f"Cannot reset worktree after rescue capture: "
+                f"{reset_result.error or reset_result.stderr}"
+            )
+        exclusions: list[str] = [":(exclude).venv"]
+        for p in (*clean_injected, *materialize_dirs):
+            normalized = str(p).replace("\\", "/").strip("/")
+            if normalized:
+                exclusions.append(f":(exclude){normalized}")
+        clean_result = run_captured(
+            ["git", "clean", "-fd", "--", ".", *exclusions],
+            cwd=wt_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not clean_result.ok:
+            raise RuntimeError(
+                f"Cannot clean worktree after rescue capture: "
+                f"{clean_result.error or clean_result.stderr}"
+            )
 
     def _raise_if_unsafe_to_reset(target_path: Path | None = None) -> None:
         """Hard-refuse to reset if the worktree/branch contains local work."""
@@ -2486,7 +2929,12 @@ def create_worktree(
                     probe_result="live_writer_at_unsafe_evaluation",
                     inconclusive_probe_deferred_count=0,
                 )
-        raise WorktreeUnsafeError(reason)
+        # Issue #849: before refusing, attempt to capture the work durably
+        # onto a rescue ref. If capture succeeds, the reset is permitted
+        # (the work is preserved on a ref, so resetting destroys nothing).
+        # If capture fails, the refusal stands — capture failure must never
+        # downgrade the safety property.
+        _capture_or_raise(check_path, reason, injected_paths)
 
     if recovery is not None:
         # Validate that the recovery record matches the requested branch
@@ -2780,7 +3228,7 @@ def create_worktree(
                     worktree_path, dirty_injected, materialize_dirs
                 )
                 if dirty_reason:
-                    raise WorktreeUnsafeError(dirty_reason)
+                    _capture_or_raise(worktree_path, dirty_reason, dirty_injected)
             # Only fetch if origin remote exists (deterministic check)
             if _has_origin_remote(repo_root):
                 # Fetch the remote-tracking ref only (branch:<branch> fails when branch is checked out)
@@ -2805,7 +3253,7 @@ def create_worktree(
                             worktree_path, injected_paths, materialize_dirs
                         )
                         if dirty_reason:
-                            raise WorktreeUnsafeError(dirty_reason)
+                            _capture_or_raise(worktree_path, dirty_reason, injected_paths)
                         _snapshot_before_delete(branch)
                         base_branch = (
                             resolved_base_ref[len("origin/") :]
@@ -2870,6 +3318,7 @@ def create_worktree(
                 reclaimed=reclaimed,
                 attempt_snapshot=attempt_snapshot,
                 rework_conflict=rework_conflict,
+                rescue_capture=rescue_capture,
             )
         else:
             # No existing worktree: attach to existing branch (no -b flag)
@@ -3065,6 +3514,7 @@ def create_worktree(
         attempt_snapshot=attempt_snapshot,
         materialized_paths=tuple(materialized_paths),
         rework_conflict=rework_conflict,
+        rescue_capture=rescue_capture,
     )
 
 

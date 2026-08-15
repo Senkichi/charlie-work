@@ -1,4 +1,4 @@
-"""Repo-hygiene regression for issue #1138.
+"""Repo-hygiene regression for issues #1138 and #1204.
 
 Worker/orchestrator protocol residue (``.worker-outcome.json``,
 ``.charlie-writer.json``) is state written into each worktree root at runtime,
@@ -7,6 +7,12 @@ every fresh worktree and turns a worker's own write into a modification to a
 tracked file -- the exact shape of dirt that trips the ``worktree_unsafe``
 escalation path. These tests pin the structural prevention: the names are
 gitignored and not tracked.
+
+Issue #1204 extended the same mechanism to worker PR-body scratch files
+(``PR_BODY_*.md``): workers ad-hoc draft their PR body into a
+``PR_BODY_<issue>.md`` file in the worktree root, and salvage squash #1197
+committed ``PR_BODY_1010.md`` to main. The glob pattern closes the class for
+any issue number.
 """
 
 from __future__ import annotations
@@ -20,6 +26,14 @@ from charlie_work.config import WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME
 # its root. Sourced from the canonical constants rather than re-declared, so a
 # rename in config.py flows through here instead of silently rotting the guard.
 _RESIDUE_NAMES = (WORKER_OUTCOME_FILENAME, WRITER_MARKER_FILENAME)
+
+# Worker PR-body scratch glob pattern. The worker prompt does not name a file,
+# but workers ad-hoc write ``PR_BODY_<issue>.md`` into the worktree root. This
+# is a glob, not a fixed filename, so it is declared here rather than sourced
+# from a config constant. A sample concrete name is used for ``check-ignore``
+# and ``ls-files`` exercises below.
+_PR_BODY_GLOB = "PR_BODY_*.md"
+_PR_BODY_SAMPLE = "PR_BODY_9999.md"
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -69,3 +83,45 @@ def test_worker_residue_is_ignored_by_git_check_ignore() -> None:
     ignored = set(result.stdout.splitlines())
     not_ignored = sorted(set(_RESIDUE_NAMES) - ignored)
     assert not not_ignored, f"git check-ignore did not match: {not_ignored}"
+
+
+def test_pr_body_scratch_glob_is_gitignored() -> None:
+    """The ``PR_BODY_*.md`` glob must appear in ``.gitignore``.
+
+    Salvage squash #1197 committed ``PR_BODY_1010.md`` to main (issue #1204)
+    because the worker's ad-hoc PR-body scratch file was not gitignored. The
+    glob pattern closes the class for any issue number.
+    """
+    gitignore = (_REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert _PR_BODY_GLOB in gitignore, f"PR-body scratch glob {_PR_BODY_GLOB!r} not in .gitignore"
+
+
+def test_pr_body_scratch_glob_is_ignored_by_git_check_ignore() -> None:
+    """``git check-ignore`` must resolve a concrete ``PR_BODY_<n>.md`` name.
+
+    Exercises git's actual ignore resolution against the glob, so a malformed
+    pattern (e.g. a missing wildcard) is caught.
+    """
+    result = subprocess.run(
+        ["git", "check-ignore", _PR_BODY_SAMPLE],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    ignored = set(result.stdout.splitlines())
+    assert _PR_BODY_SAMPLE in ignored, (
+        f"git check-ignore did not match {_PR_BODY_SAMPLE!r} against {_PR_BODY_GLOB!r}"
+    )
+
+
+def test_no_pr_body_scratch_files_are_tracked() -> None:
+    """No file matching ``PR_BODY_*.md`` may be tracked on this branch.
+
+    This is the positive control for the ``git rm`` half of the #1204 fix: it
+    fails the moment a tracked ``PR_BODY_*.md`` copy reappears.
+    """
+    tracked = _git("ls-files").splitlines()
+    tracked_pr_body = sorted(
+        name for name in tracked if name.startswith("PR_BODY_") and name.endswith(".md")
+    )
+    assert not tracked_pr_body, f"PR-body scratch files tracked as source: {tracked_pr_body}"

@@ -56,7 +56,17 @@ Schema::
         elapsed_seconds REAL,
         error_count     INTEGER DEFAULT 0,
         merge_count     INTEGER DEFAULT 0,
-        review_count    INTEGER DEFAULT 0
+        review_count    INTEGER DEFAULT 0,
+        -- Issue #1083: the ``agent:human-needed`` sink metric. Autonomy
+        -- (merge_count/review_count) is never reported without its drop rate:
+        -- ``sink_arrivals`` counts issues that entered the sink this pass,
+        -- ``sink_clears`` counts issues the de-escalation sweep drained, and
+        -- ``sink_population`` is the point-in-time census of parked issues.
+        -- Appended at the end so existing index-based readers (verify_events)
+        -- keep working without re-deriving column positions.
+        sink_population INTEGER DEFAULT 0,
+        sink_arrivals   INTEGER DEFAULT 0,
+        sink_clears     INTEGER DEFAULT 0
     );
 """
 
@@ -118,7 +128,10 @@ CREATE TABLE IF NOT EXISTS loop_passes (
     elapsed_seconds REAL,
     error_count     INTEGER DEFAULT 0,
     merge_count     INTEGER DEFAULT 0,
-    review_count    INTEGER DEFAULT 0
+    review_count    INTEGER DEFAULT 0,
+    sink_population INTEGER DEFAULT 0,
+    sink_arrivals   INTEGER DEFAULT 0,
+    sink_clears     INTEGER DEFAULT 0
 );
 """
 
@@ -148,6 +161,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # head. Terminal for this lane -> error.
         "cross_family_report_regen_exhausted": "error",
         "dispatch_blocked_chain_dead": "error",
+        # Issue #1010: the pre-flight cross-repo gate escalated an issue whose
+        # referenced file paths were all absent from the target repo, ending
+        # its dispatch lane this pass. Terminal for the lane -> error, like the
+        # other *_escalated kinds.
+        "dispatch_cross_repo_escalated": "error",
         "dispatch_failed": "error",
         "fleet_pass_config_error": "error",
         "github_error": "error",
@@ -161,6 +179,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "merge_failed": "error",
         "merge_failed_attempt_alarm": "error",
         "operator_claim_failed": "error",
+        # Issue #1243: the orphan-sweep no-open-PR redispatch path hit the
+        # same per-issue cap the rework lane enforces (worker_death_loop)
+        # with an unchanged branch head across attempts -- a death loop with
+        # no progress and no bound. Terminal for the issue -> error, parallel
+        # to session_failed_escalated.
+        "orphan_sweep_redispatch_escalated": "error",
         "orphan_processes_killed": "error",
         "orphaned_worker_routed_to_review": "error",
         "pre_review_rework_routed": "error",
@@ -189,6 +213,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervisor_wedged_killed": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
+        # The supervisor's startup guard found an editable .pth in the running
+        # interpreter's venv pointing outside the interpreter-derived checkout
+        # (the 2026-08-05 scratch-clone repoint shape). The pass is refused
+        # before config load, so this is terminal for the pass -> error.
+        "venv_editable_anchor_violation": "error",
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
@@ -249,6 +278,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervise_relaunch_cap_reached": "warning",
         "unauthorized_merge_check_skipped": "warning",
         "worktree_foreign_writer": "warning",
+        # Issue #849: rescue capture preserves work before a reset. Warning
+        # level because it means a worktree had uncommitted work that was
+        # about to be lost — the capture succeeded, but the condition that
+        # triggered it is worth attention.
+        "worktree_rescue_captured": "warning",
         # -----------------------------------------------------------------
         # info-level kinds: routine bookkeeping, success, recovery, and
         # other ordinary lifecycle events
@@ -262,6 +296,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "deescalation_pass_completed": "info",
         "deescalation_reason_class_backfilled": "info",
         "dispatch": "info",
+        # Issue #1129: open-PR backpressure clamped fresh-issue dispatch. Info,
+        # not warning: this is the intended self-pacing behavior (armed issues
+        # wait in the backlog instead of as open stale PRs), not a fault. The
+        # event exists so "0 dispatched with N dispatchable" is diagnosable from
+        # events.db rather than reading as idleness.
+        "dispatch_backpressure": "info",
         "dispatch_closed_unmerged_ready_stripped": "info",
         "dispatch_rework": "info",
         "draft_pr_ready_triggered": "info",
@@ -270,6 +310,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "flake_rerun_triggered": "info",
         "fleet_canary": "info",
         "fleet_job_observations": "info",
+        "fleet_lane_completed": "info",
         "head_moved": "info",
         "infra_rerun_triggered": "info",
         "intake": "info",
@@ -281,13 +322,42 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "main_ci_reclaim_cancelled": "info",
         "merge_conflict_rework_requested": "info",
         "merge_deferred_stale_base": "info",
+        # Issue #934: operator-issued authorization to merge a worker PR whose
+        # recorded review decision is stale, absent, or pending. An info-level
+        # audit event: it records an explicit operator action, not a fault --
+        # the tripwire and merge-check read it as authorization, never as an
+        # error. Sibling to ``unauthorized_merge_acknowledged`` (the post-merge
+        # retrospective ack), but emitted at authorization time, before the
+        # merge.
+        "merge_authorized": "info",
         "merge_ready": "info",
+        # Issue #747: the merge lane emitted events for every outcome except
+        # success, so merge throughput was unobservable from events.db. This
+        # is the terminal success event, fired exactly once on the fleet's own
+        # direct-merge path (``merge_ready``'s ``merge_pr`` branch). The
+        # ``actor`` payload field distinguishes fleet-merged PRs from
+        # externally-merged PRs, which are recorded by the separate
+        # ``finalize_externally_merged`` / ``merged_outside_orchestrator``
+        # events and never carry this kind.
+        "merge_succeeded": "info",
         "no_op_rework_repair_requested": "info",
         "operator_claim": "info",
         "operator_claim_released": "info",
+        # Issue #1128: a dead worker with an OPEN but unreviewed PR is
+        # advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
+        # dispatch can claim the salvage PR. Info-level recovery bookkeeping,
+        # sibling to ``orphaned_worker_opened_pr``.
+        "orphaned_worker_advanced_to_pr_open": "info",
         "orphaned_worker_drift": "info",
         "orphaned_worker_opened_pr": "info",
         "orphaned_worker_recovered": "info",
+        # Issue #1248: a dead worker's committed-but-unpushed work was
+        # published by the orphan sweep (fast-forward only). The sibling
+        # ``salvage_push_failed`` is the attempted-but-failed case -- warning,
+        # because stranded work is sitting in a worktree the sweep could not
+        # publish and will otherwise be redispatched over.
+        "salvage_pushed_stranded_commits": "info",
+        "salvage_push_failed": "warning",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",
@@ -296,6 +366,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "reconcile_pass_skipped": "info",
         "record_review": "info",
         "rescue_dispatched": "info",
+        # One outcome record per self-deploy sibling-pull attempt (pulled /
+        # unchanged / skipped / failed, discriminated by the payload's ok and
+        # skipped_reason/error fields). Info because the common case is routine
+        # bookkeeping; failures additionally log at WARNING and are deliberately
+        # outside the self_deploy_alarm streak (a sibling wedge bounds staleness
+        # but does not block orchestrator deploys).
+        "self_deploy_ci_fleet_pull": "info",
+        "ci_fleet_provenance": "info",
         "review_dispatch": "info",
         "review_dispatch_claim": "info",
         "review_packet": "info",
@@ -314,6 +392,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervisor_started": "info",
         "unauthorized_merge_acknowledged": "info",
         "unauthorized_merge_baseline_armed": "info",
+        # The #502 tripwire recognized a mergequeue sync-merge (#1194) and
+        # suppressed the finding. Routine under an active merge queue -- fires
+        # on every legitimate sync-merge -- but kept in the audit trail so
+        # suppressions are queryable next to the findings they replaced.
+        "unauthorized_merge_queue_sync_covered": "info",
         "unescalate": "info",
         "verdict_carried_forward_clean_rebase": "info",
         "verdict_carried_forward_line_content": "info",
@@ -594,6 +677,27 @@ def _dedupe_events(db_conn: sqlite3.Connection) -> int:
     return deleted
 
 
+def _add_sink_metric_columns(db_conn: sqlite3.Connection) -> None:
+    """Add the issue #1083 sink-metric columns to ``loop_passes``.
+
+    ``ALTER TABLE … ADD COLUMN`` cannot name a column that already exists, so
+    each addition is guarded by a ``PRAGMA table_info`` check. That makes this
+    idempotent: a database file opened by a newer build (which created the
+    columns via ``CREATE TABLE``) and then handed back to an older build that
+    re-runs this migration is a no-op rather than a crash. The columns are
+    appended at the end of the table so existing index-based readers
+    (``scripts/verify_events.py``) keep working without re-deriving positions.
+    """
+    existing = {row[1] for row in db_conn.execute("PRAGMA table_info(loop_passes)")}
+    if "sink_population" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_population INTEGER DEFAULT 0")
+    if "sink_arrivals" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_arrivals INTEGER DEFAULT 0")
+    if "sink_clears" not in existing:
+        db_conn.execute("ALTER TABLE loop_passes ADD COLUMN sink_clears INTEGER DEFAULT 0")
+    db_conn.commit()
+
+
 def _run_db_migrations(db_conn: sqlite3.Connection) -> None:
     """Run one-time database migrations guarded by ``PRAGMA user_version``.
 
@@ -608,6 +712,12 @@ def _run_db_migrations(db_conn: sqlite3.Connection) -> None:
         # importer (issue #557). Runs once per database file.
         _dedupe_events(db_conn)
         db_conn.execute("PRAGMA user_version = 1")
+    if version < 2:
+        # Migration v2 (issue #1083): add the sink-metric columns to
+        # ``loop_passes`` for pre-existing databases. New databases get them
+        # from ``CREATE TABLE``; this step brings old files forward.
+        _add_sink_metric_columns(db_conn)
+        db_conn.execute("PRAGMA user_version = 2")
 
 
 def _get_db(state_path: Path) -> sqlite3.Connection | None:
@@ -741,11 +851,22 @@ def record_loop_pass(
     error_count: int = 0,
     merge_count: int = 0,
     review_count: int = 0,
+    sink_population: int = 0,
+    sink_arrivals: int = 0,
+    sink_clears: int = 0,
 ) -> None:
     """Record or update a loop pass summary in the ``loop_passes`` table.
 
     On first call (with ``completed_at=None``) an INSERT is issued.
     On second call (with ``completed_at`` set) an UPDATE is issued.
+
+    The ``sink_*`` keyword arguments (issue #1083) record the
+    ``agent:human-needed`` sink metric alongside autonomy throughput so one
+    is never reported without the other: ``sink_population`` is the
+    point-in-time census of parked issues, ``sink_arrivals`` the count that
+    entered the sink this pass, and ``sink_clears`` the count the
+    de-escalation sweep drained this pass. They default to 0 and are
+    ignored on the INSERT (start-of-pass) call, which only reserves the row.
     """
     conn = _get_db(state_path)
     if conn is None:
@@ -760,15 +881,17 @@ def record_loop_pass(
                 conn.execute(
                     """INSERT OR IGNORE INTO loop_passes
                        (correlation_id, started_at, completed_at, ok,
-                        elapsed_seconds, error_count, merge_count, review_count)
-                       VALUES (?, ?, NULL, NULL, NULL, 0, 0, 0)""",
+                        elapsed_seconds, error_count, merge_count, review_count,
+                        sink_population, sink_arrivals, sink_clears)
+                       VALUES (?, ?, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0)""",
                     (correlation_id, started_at),
                 )
             else:
                 conn.execute(
                     """UPDATE loop_passes
                        SET completed_at = ?, ok = ?, elapsed_seconds = ?,
-                           error_count = ?, merge_count = ?, review_count = ?
+                           error_count = ?, merge_count = ?, review_count = ?,
+                           sink_population = ?, sink_arrivals = ?, sink_clears = ?
                        WHERE correlation_id = ?""",
                     (
                         completed_at,
@@ -777,6 +900,9 @@ def record_loop_pass(
                         error_count,
                         merge_count,
                         review_count,
+                        sink_population,
+                        sink_arrivals,
+                        sink_clears,
                         correlation_id,
                     ),
                 )
