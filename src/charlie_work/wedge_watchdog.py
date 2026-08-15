@@ -357,7 +357,7 @@ class WedgeWatchdog:
         # kill — so render ``unknown`` instead of formatting the value.
         age_display = f"{age_seconds:.0f}s" if age_seconds is not None else "unknown"
         message = (
-            f"wedge-watchdog: supervisor child pid={pid} heartbeat stale "
+            f"wedge-watchdog: supervisor child pid={self._process.pid} heartbeat stale "
             f"({last_beat}); age={age_display} exceeds threshold="
             f"{threshold_seconds:.0f}s ({self._stale_multiplier}x "
             f"max_pass_runtime_seconds={pass_timeout}s). Terminating so the "
