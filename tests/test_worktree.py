@@ -56,6 +56,7 @@ from charlie_work.worktree import (
     remove_review_checkout,
     remove_worktree,
     verify_shared_venv,
+    worktree_head_sha,
     write_worktree_marker,
     _is_git_tracked,
     _materialize_directory,
@@ -7735,3 +7736,30 @@ def test_rework_reuse_capture_cleans_worktree_before_ff(
 
     # Clean up.
     remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_worktree_head_sha_returns_real_head(tmp_path: Path) -> None:
+    """Issue #1243: worktree_head_sha against a real repo returns the actual
+    HEAD SHA -- the local half of the orphan-sweep progress fingerprint."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    expected = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert worktree_head_sha(repo) == expected
+
+    # A new commit moves the reported SHA (stranded-commit detection).
+    (repo / "work.txt").write_text("stranded\n", encoding="utf-8")
+    _git(repo, "add", "work.txt")
+    _git(repo, "commit", "-m", "stranded work")
+    new_expected = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert new_expected != expected
+    assert worktree_head_sha(repo) == new_expected
+
+
+def test_worktree_head_sha_missing_dir_returns_none(tmp_path: Path) -> None:
+    assert worktree_head_sha(tmp_path / "does-not-exist") is None
+
+
+def test_worktree_head_sha_non_repo_dir_returns_none(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert worktree_head_sha(plain) is None

@@ -44658,6 +44658,123 @@ def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> No
     assert len(escalated_events) == 0
 
 
+def test_orphan_sweep_redispatch_cap_resets_on_stranded_local_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1243: stranded LOCAL commits (worktree head moved, remote head
+    unchanged) reset the redispatch counter. Unlike the moving-remote-head
+    test above, this exercises the real ``worktree_head_sha`` against a real
+    git worktree -- no mock -- so silently breaking the local half of the
+    progress fingerprint fails here.
+    """
+    from unittest.mock import patch
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import worktree_path_for_branch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Build a REAL git repo at the exact path the sweep derives for this
+    # branch, with one commit -- the stranded work.
+    branch = "agent/issue-1243-test"
+    worktrees_dir = resolved_layout(config, tmp_path).worktrees
+    wt_path = worktree_path_for_branch(tmp_path, branch, worktrees_dir)
+    wt_path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["git", "init", "--initial-branch", branch],
+        ["git", "config", "user.email", "test@example.test"],
+        ["git", "config", "user.name", "Test User"],
+    ):
+        subprocess.run(args, cwd=wt_path, check=True, capture_output=True, text=True)
+    (wt_path / "work.txt").write_text("stranded\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "work.txt"], cwd=wt_path, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "stranded work"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    local_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=wt_path, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    # Seed over-cap timestamps and a prior fingerprint whose REMOTE half
+    # matches this pass (unchanged) but whose LOCAL half is an older SHA --
+    # only the stranded local commit distinguishes this pass from the last.
+    remote_sha = "feedfeedfeed"
+    base_time = datetime.now(UTC)
+    state = load_state(paths.state_file)
+    state["issues"]["1243"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": base_time.isoformat().replace("+00:00", "Z"),
+        "branch_name": branch,
+        "orphan_redispatch_head_sha": f"{remote_sha}:0000000000000000",
+        "orphan_redispatch_at": [
+            (base_time - timedelta(minutes=i * 10)).isoformat().replace("+00:00", "Z")
+            for i in range(4)
+        ],
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubNoPR(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPR(repo_root=tmp_path)
+    fake_gh.issues = [
+        {
+            "number": 1243,
+            "title": "test issue",
+            "url": "https://example.test/issues/1243",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    # remote_branch_head_sha is pinned to the SAME value as the prior
+    # fingerprint's remote half; worktree_head_sha is deliberately NOT
+    # patched -- the real implementation must read the real repo above.
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch("charlie_work.workflow.remote_branch_head_sha", return_value=remote_sha),
+    ):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1243"]
+
+    # The cap must NOT fire -- the stranded local commit is progress.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("escalation_reason") is None
+
+    # The fingerprint's local half must be the REAL HEAD of the real repo.
+    assert entry.get("orphan_redispatch_head_sha") == f"{remote_sha}:{local_sha}"
+
+    # Counter reset to this single pass.
+    assert len(entry.get("orphan_redispatch_at", [])) == 1
+
+    escalated_events = [
+        e for e in st.get("events", []) if e.get("kind") == "orphan_sweep_redispatch_escalated"
+    ]
+    assert len(escalated_events) == 0
+
+
 def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
     tmp_path: Path,
 ) -> None:
