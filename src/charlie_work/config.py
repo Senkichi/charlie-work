@@ -191,6 +191,16 @@ class DispatchConfig:
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
+    # Issue #1129: open-PR backpressure for fresh-issue dispatch. When > 0,
+    # fresh dispatch is clamped to max(0, max_open_agent_prs - open_pr_count)
+    # where open_pr_count is the number of open PRs whose head ref matches
+    # ``branch_prefix`` (recomputed each pass from live GitHub state). This
+    # paces fresh dispatch to the review/merge lane rather than worker
+    # throughput, preventing the open-PR queue from deepening without bound.
+    # Rework, conflict-rework, recovery, and review dispatch are NOT gated --
+    # they reduce verification debt rather than adding to it. 0 = off,
+    # preserving current behavior.
+    max_open_agent_prs: int = 0
     # Repo-root-relative paths copied into each worktree after creation
     # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
     # skip-if-tracked (tracked paths are already present). Errors surface as
@@ -623,6 +633,14 @@ class AutoMergeConfig:
     # merged, so no new post-merge bookkeeping is added here. Default None
     # preserves today's self-merge behavior byte-for-byte.
     mergequeue_label: str | None = None
+    # Issue #1194: GitHub account login of the merge-queue bot (e.g.
+    # "aviator-app[bot]") whose branch sync-merges the #502 unauthorized-merge
+    # tripwire may recognize as approval-covered. Deployment config, not
+    # business logic — no bot literal is hardcoded anywhere. Default None
+    # disables the recognition entirely: every approved-head mismatch keeps
+    # firing exactly as before, so the control's failure mode is unchanged
+    # until an operator names the bot.
+    queue_bot_login: str | None = None
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -1434,6 +1452,19 @@ class PostMortemConfig:
         SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
         SignatureRule(pattern=r"A tool was rejected by the user", kind="worker_blocked"),
     )
+    # Issue #1234: refuse the locked-DB temp-copy fallback when sessions.db
+    # exceeds this size. A best-effort diagnostic must never write a multi-GB
+    # copy to temp — with a 12 GB sessions.db each fallback invocation costs
+    # 12 GB, and imperfect cleanup turns that into a permanent disk-filler.
+    # Default 256 MB; the read-only URI path is unaffected (no copy made).
+    temp_copy_max_bytes: int = 256 * 1024 * 1024
+    # Issue #1234: stale ``charlie-work-postmortem-*`` temp dirs older than
+    # this are reclaimed at the start of every fallback invocation, so a leak
+    # from a pass killed mid-copy (supervisor self-deploy restart cycle) is
+    # transient rather than permanent. Default 2 hours — comfortably longer
+    # than any single post-mortem pass (minutes) yet short enough that leaks
+    # cannot accumulate across a day.
+    temp_copy_reclaim_max_age_hours: int = 2
 
 
 @dataclass(frozen=True)
@@ -1692,6 +1723,18 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'dispatch' key 'require_worker_github_token' must be a bool, "
             f"got {type(_rwt).__name__}"
         )
+    # Issue #1129: int validation for max_open_agent_prs.
+    _mop = dispatch_data.get("max_open_agent_prs")
+    if _mop is not None:
+        if isinstance(_mop, bool) or not isinstance(_mop, int):
+            raise ConfigError(
+                "config section 'dispatch' key 'max_open_agent_prs' must be an int, "
+                f"got {type(_mop).__name__}"
+            )
+        if _mop < 0:
+            raise ConfigError(
+                f"config section 'dispatch' key 'max_open_agent_prs' must be >= 0, got {_mop}"
+            )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     review_dispatch_data = _section(data, "review_dispatch")
@@ -1973,6 +2016,21 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         # `gh pr edit --add-label <label>`, so surrounding whitespace must
         # not survive into the actual GitHub label name.
         auto_merge_data["mergequeue_label"] = stripped_mergequeue_label
+    queue_bot_login = auto_merge_data.get("queue_bot_login")
+    if queue_bot_login is not None:
+        if not isinstance(queue_bot_login, str):
+            raise ConfigError(
+                "config section 'auto_merge' key 'queue_bot_login' must be a string, "
+                f"got {type(queue_bot_login).__name__}"
+            )
+        stripped_queue_bot_login = queue_bot_login.strip()
+        if not stripped_queue_bot_login:
+            raise ConfigError(
+                "config section 'auto_merge' key 'queue_bot_login' must not be empty"
+            )
+        # Store the stripped value: it is compared against the GitHub commit
+        # author login, where surrounding whitespace can never match.
+        auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")

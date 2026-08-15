@@ -1065,7 +1065,12 @@ def run_migrate_state_dir_command(
             )
 
     outcome = actuator(plan)
-    data = {**data, "applied": outcome.ok, "moved": list(outcome.moved)}
+    data = {
+        **data,
+        "applied": outcome.ok,
+        "moved": list(outcome.moved),
+        "rewritten_paths": outcome.rewritten_paths,
+    }
     if not outcome.ok:
         data = {**data, "aborted_at": outcome.aborted_at}
         return CommandResult(
@@ -1073,7 +1078,12 @@ def run_migrate_state_dir_command(
             f"{rendered}\nmigration failed after {len(outcome.moved)} moved: {outcome.error}",
             data,
         )
-    return CommandResult(True, f"{rendered}\nmoved {len(outcome.moved)} children", data)
+    return CommandResult(
+        True,
+        f"{rendered}\nmoved {len(outcome.moved)} children, "
+        f"rewrote {outcome.rewritten_paths} embedded paths",
+        data,
+    )
 
 
 def run_fleet_work(args: argparse.Namespace) -> CommandResult:
@@ -2346,6 +2356,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
                 "terminal_label",
                 "active_label",
                 "operator_claimed",
+                "blocked_by_open_dependency",
                 "unidentified",
             )
             if reachability.get(reason)

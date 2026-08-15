@@ -179,6 +179,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "merge_failed": "error",
         "merge_failed_attempt_alarm": "error",
         "operator_claim_failed": "error",
+        # Issue #1243: the orphan-sweep no-open-PR redispatch path hit the
+        # same per-issue cap the rework lane enforces (worker_death_loop)
+        # with an unchanged branch head across attempts -- a death loop with
+        # no progress and no bound. Terminal for the issue -> error, parallel
+        # to session_failed_escalated.
+        "orphan_sweep_redispatch_escalated": "error",
         "orphan_processes_killed": "error",
         "orphaned_worker_routed_to_review": "error",
         "pre_review_rework_routed": "error",
@@ -291,6 +297,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "deescalation_pass_completed": "info",
         "deescalation_reason_class_backfilled": "info",
         "dispatch": "info",
+        # Issue #1129: open-PR backpressure clamped fresh-issue dispatch. Info,
+        # not warning: this is the intended self-pacing behavior (armed issues
+        # wait in the backlog instead of as open stale PRs), not a fault. The
+        # event exists so "0 dispatched with N dispatchable" is diagnosable from
+        # events.db rather than reading as idleness.
+        "dispatch_backpressure": "info",
         "dispatch_closed_unmerged_ready_stripped": "info",
         "dispatch_rework": "info",
         "draft_pr_ready_triggered": "info",
@@ -332,9 +344,21 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "no_op_rework_repair_requested": "info",
         "operator_claim": "info",
         "operator_claim_released": "info",
+        # Issue #1128: a dead worker with an OPEN but unreviewed PR is
+        # advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
+        # dispatch can claim the salvage PR. Info-level recovery bookkeeping,
+        # sibling to ``orphaned_worker_opened_pr``.
+        "orphaned_worker_advanced_to_pr_open": "info",
         "orphaned_worker_drift": "info",
         "orphaned_worker_opened_pr": "info",
         "orphaned_worker_recovered": "info",
+        # Issue #1248: a dead worker's committed-but-unpushed work was
+        # published by the orphan sweep (fast-forward only). The sibling
+        # ``salvage_push_failed`` is the attempted-but-failed case -- warning,
+        # because stranded work is sitting in a worktree the sweep could not
+        # publish and will otherwise be redispatched over.
+        "salvage_pushed_stranded_commits": "info",
+        "salvage_push_failed": "warning",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",
@@ -369,6 +393,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervisor_started": "info",
         "unauthorized_merge_acknowledged": "info",
         "unauthorized_merge_baseline_armed": "info",
+        # The #502 tripwire recognized a mergequeue sync-merge (#1194) and
+        # suppressed the finding. Routine under an active merge queue -- fires
+        # on every legitimate sync-merge -- but kept in the audit trail so
+        # suppressions are queryable next to the findings they replaced.
+        "unauthorized_merge_queue_sync_covered": "info",
         "unescalate": "info",
         "verdict_carried_forward_clean_rebase": "info",
         "verdict_carried_forward_line_content": "info",

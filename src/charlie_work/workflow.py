@@ -135,11 +135,14 @@ from .worktree import (
     push_branch,
     read_worker_outcome,
     remote_branch_ahead_count,
+    remote_branch_head_sha,
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
+    salvage_push_stranded_commits,
     summarize_branch_work,
     worktree_ahead_of_sha,
+    worktree_head_sha,
     worktree_path_for_branch,
     write_worktree_marker,
 )
@@ -198,6 +201,101 @@ from .process_utils import (
 )
 from .worker import WorkerHealth, WorkerView, _alive_review_worker_issue_numbers, iter_workers
 from .routing import AdapterChoice, record_adapter_choice, select_adapter
+
+# Issue #1106: a rework session that dies at CLI startup (before the worker's
+# first tool action) is not a no-op/conflict rework attempt — the cap counters
+# should only count sessions that *ran* and produced no useful change.  A
+# ``launch_failed`` (process never launched) is always a startup death; a
+# ``stalled`` session that died within this threshold is also a startup death
+# (CLI error, nonzero exit within seconds, empty diff AND empty transcript).
+# The threshold is deliberately generous: a genuine stall (worker ran for
+# minutes but got stuck) must NOT be misclassified as a startup death, so the
+# bound is set above the worst-case CLI startup time but well below the
+# shortest genuine-work session.
+#
+# The ``runtime_seconds`` passed to ``_is_startup_death`` must be bounded by
+# the worker's *actual process runtime* (time from start to death), NOT by the
+# elapsed time until the orchestrator's classification pass runs.  Using
+# ``WorkerView.runtime_seconds()`` (which is ``now - started_at``) would let
+# ordinary polling latency — the gap between when the CLI died and when the
+# reaper pass classifies it — silently push a 5-second startup death past the
+# 60-second threshold and defeat the exemption.  ``_worker_death_bounded_runtime_seconds``
+# derives the runtime from the log file's last-modified time (frozen at death
+# for a dead process) instead.
+STARTUP_DEATH_THRESHOLD_SECONDS: int = 60
+
+
+def _is_startup_death(failure_kind: str | None, runtime_seconds: float) -> bool:
+    """Classify whether a dead rework session died at CLI startup.
+
+    Returns True when the session never reached the worker's first tool
+    action — the cap counters in ``_route_janitor_gate_failure_to_rework``
+    must not count these as no-op/conflict rework attempts (issue #1106).
+
+    ``runtime_seconds`` must be the worker's *death-bounded* runtime (time
+    from ``started_at`` to the last real log activity / death), as computed
+    by ``_worker_death_bounded_runtime_seconds`` — NOT
+    ``WorkerView.runtime_seconds()``, which measures elapsed time until
+    classification and is polluted by polling latency.
+    """
+    if failure_kind is None:
+        return False
+    # ``launch_failed``: the process never launched at all.
+    if failure_kind == "launch_failed":
+        return True
+    # ``stalled`` with a very short runtime: the CLI exited before the
+    # worker did any real work (e.g. "Refusing to run in an untrusted
+    # workspace").  A longer runtime means the worker genuinely ran and
+    # got stuck — that IS a no-op rework attempt the cap should count.
+    if failure_kind == "stalled" and runtime_seconds < STARTUP_DEATH_THRESHOLD_SECONDS:
+        return True
+    return False
+
+
+def _worker_death_bounded_runtime_seconds(worker: WorkerView) -> float:
+    """Return the worker's runtime bounded by actual process death.
+
+    This is the signal ``_is_startup_death`` must use instead of
+    ``WorkerView.runtime_seconds()`` (which is ``now - started_at`` and
+    measures elapsed time until the *classification pass*, not until death).
+    A CLI that dies at 5 seconds but is not classified until 300 seconds
+    later must still be recognized as a 5-second startup death, not a
+    300-second stall.
+
+    The death-bounded runtime is derived from the log file's last-modified
+    time: once the CLI process exits, the log stops being written and its
+    mtime freezes at the death moment.  A fresh ``stat()`` of the log file
+    is the most accurate signal; the sidecar's recorded ``last_activity_at``
+    (updated each pass by ``update_worker_log_stat``) is the fallback when
+    the log file is gone.  When neither is available — the CLI never wrote
+    anything, e.g. a ``launch_failed`` that still got a PID — the runtime is
+    0.0, which is a startup death by construction.
+    """
+    from datetime import UTC, datetime
+
+    try:
+        started_at = datetime.fromisoformat(worker.started_at)
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        return 0.0
+
+    # Prefer a fresh stat of the log file — its mtime is frozen at death for
+    # a dead process, so this is the tightest death-bounded signal.
+    death_ts: float | None = None
+    log_stat = worker.log_stat()
+    if log_stat is not None:
+        death_ts = log_stat.st_mtime
+    if death_ts is None and worker.last_activity_at is not None:
+        # Fall back to the sidecar's recorded last-activity timestamp.
+        from .worker import _iso_to_timestamp
+
+        death_ts = _iso_to_timestamp(worker.last_activity_at)
+    if death_ts is None:
+        # No log activity was ever recorded — the CLI never wrote anything,
+        # which is a startup death by construction (runtime 0.0).
+        return 0.0
+    return max(0.0, death_ts - started_at.timestamp())
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -451,6 +549,12 @@ class ConcurrencyGovernorResult:
     dispatch_limit: int
     fleet_live_count: int = 0
     fleet_max: int = 0
+    # Issue #1129: open-PR backpressure fields. Populated only when the
+    # governor was called with ``apply_open_pr_backpressure=True`` (fresh-issue
+    # dispatch) and ``dispatch.max_open_agent_prs`` is > 0. Left at 0 for
+    # rework/recovery/loop paths, which are exempt from this clamp.
+    open_pr_count: int = 0
+    open_pr_max: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -462,6 +566,11 @@ class ConcurrencyGovernorResult:
         """Return True if the fleet governor is enabled (fleet_max > 0)."""
         return self.fleet_max > 0
 
+    @property
+    def open_pr_enabled(self) -> bool:
+        """Return True if the open-PR backpressure clamp is enabled (open_pr_max > 0)."""
+        return self.open_pr_max > 0
+
     def report_fields(self) -> dict[str, int]:
         """Return the fields to include in CommandResult.data when clamped."""
         fields = {
@@ -472,6 +581,9 @@ class ConcurrencyGovernorResult:
         if self.fleet_enabled:
             fields["fleet_concurrency_limit"] = self.fleet_max
             fields["fleet_live_session_count"] = self.fleet_live_count
+        if self.open_pr_enabled:
+            fields["open_pr_count"] = self.open_pr_count
+            fields["open_pr_max"] = self.open_pr_max
         return fields
 
 
@@ -2007,6 +2119,53 @@ def _windowed_worker_death_at(
         except (ValueError, AttributeError):
             continue
     return result
+
+
+def _windowed_orphan_redispatch_at(
+    entry: dict[str, Any],
+    *,
+    window_minutes: int,
+) -> list[str]:
+    """Return orphan-sweep redispatch timestamps within the configured window.
+
+    Parallel to ``_windowed_redispatch_at`` and ``_windowed_worker_death_at``
+    but reads ``entry["orphan_redispatch_at"]`` -- the list of timestamps
+    recorded by the orphan-sweep no-open-PR redispatch cap (issue #1243) each
+    time it processes an issue whose worker died without leaving an open PR.
+    Unlike ``adapter_history`` (which only grows when ``api_worker.enabled``
+    is ``True``, via ``routing.record_adapter_choice``), this list grows in
+    the default (non-API-routed) configuration too. It is appended once per
+    *dead dispatch* (keyed by ``orphan_redispatch_counted_dispatch``), not
+    once per sweep pass -- the #417 reclaim leaves the dead-worker record in
+    place, so the same entry is re-observed every pass until a genuine
+    redispatch replaces it.
+    """
+    raw = entry.get("orphan_redispatch_at")
+    if not isinstance(raw, list):
+        return []
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=window_minutes)
+    result: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        try:
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start:
+                result.append(t)
+        except (ValueError, AttributeError):
+            continue
+    return result
+
+
+def _orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> str:
+    """Combine remote and local branch head SHAs into a single progress fingerprint.
+
+    A change in either SHA indicates progress -- a remote push or a local
+    (possibly stranded) commit. Used by the orphan-sweep redispatch cap
+    (issue #1243) to distinguish a no-progress death loop (unchanged fingerprint
+    across attempts) from a moving head that is the salvage path's job.
+    """
+    return f"{remote_sha or 'none'}:{local_sha or 'none'}"
 
 
 def _is_review_dispatchable(
@@ -4119,6 +4278,43 @@ def _append_sweep_events(
     return state
 
 
+def _get_open_blockers_for_issue(
+    gh: GitHubLike, issue: dict[str, Any]
+) -> tuple[list[int], list[int]]:
+    """Standalone blocker check — the shared core of ``_get_open_blockers``.
+
+    Both the dispatch candidate filter (``_filter_blocked_issues`` via the
+    ``_get_open_blockers`` method) and ``classify_backlog_reachability`` must
+    answer the same question: does this issue have any *open* blockers? This
+    function is the single implementation of that check so the two paths cannot
+    diverge — a dependency-gate change made for dispatch automatically applies
+    to reachability, and vice versa.
+
+    Returns ``(declared_blockers, open_blockers)`` — both sorted lists of issue
+    numbers. ``declared_blockers`` is every blocker mentioned in the issue body
+    or GitHub-native dependencies; ``open_blockers`` is the subset that are
+    currently open. Fail-open: a transient API error resolves to ``([], [])``,
+    so the issue is treated as unblocked (matching the dispatch path's
+    behaviour — a failed lookup does not filter a candidate out).
+    """
+    logger = logging.getLogger(__name__)
+    issue_number = int(issue["number"])
+    body = issue.get("body", "")
+    body_blockers = parse_blockers(body)
+    gh_blockers = get_github_issue_dependencies(gh, issue_number)
+    all_blockers = sorted(set(body_blockers + gh_blockers))
+    if not all_blockers:
+        return [], []
+    open_blockers = gh.are_issues_open(all_blockers)
+    if issue_number in open_blockers:
+        logger.warning(
+            f"Issue #{issue_number} has self-referencing blocker declaration - ignoring"
+        )
+        open_blockers.discard(issue_number)
+        all_blockers.remove(issue_number)
+    return sorted(all_blockers), sorted(open_blockers)
+
+
 def classify_backlog_reachability(
     gh: GitHubLike,
     config: OrchestratorConfig,
@@ -4177,6 +4373,17 @@ def classify_backlog_reachability(
         "terminal_label": 0,
         "active_label": 0,
         "operator_claimed": 0,
+        # Issue #1110: an automated-ready issue with no agent: label that is
+        # blocked by an open predecessor passes every label-only check above
+        # but is permanently (and correctly) unselectable by dispatch, which
+        # applies a further dependency gate (_filter_blocked_issues). Without
+        # this bin those issues were counted ``dispatchable`` by reachability
+        # while being unselectable, producing false dispatch_stale alarms for
+        # a deliberately sequenced cohort tail. ``dispatchable`` now counts
+        # only issues that pass BOTH the label gate and the dependency gate;
+        # this bin holds the issues the dependency gate rejects. The bins
+        # still partition -- every fetched issue lands in exactly one.
+        "blocked_by_open_dependency": 0,
         # An issue with no ``number`` cannot be dispatched or named as an
         # example, but it must still be BINNED rather than skipped: the
         # renderer joins the non-zero reasons, so a backlog of these would
@@ -4214,7 +4421,22 @@ def classify_backlog_reachability(
             elif number in claimed:
                 reason = "operator_claimed"
             else:
-                reason = "dispatchable"
+                # Issue #1110: the label-only checks above mirror
+                # _is_dispatchable, but the dispatch path applies a further
+                # dependency gate (_filter_blocked_issues) that this function
+                # never modeled. Run the same blocker check the dispatch
+                # candidate filter runs and bin dependency-blocked issues
+                # distinctly, so dispatch_staleness can key off the
+                # post-dependency-gate candidate count instead of the
+                # label-only count. Fail-open: a transient API error resolves
+                # to no open blockers (matching dispatch -- a failed lookup
+                # does not filter a candidate out), so the issue bins as
+                # ``dispatchable`` rather than ``blocked_by_open_dependency``.
+                _declared, open_blockers = _get_open_blockers_for_issue(gh, issue)
+                if open_blockers:
+                    reason = "blocked_by_open_dependency"
+                else:
+                    reason = "dispatchable"
         reachability[reason] += 1
         if reason != "dispatchable":
             bucket = examples.setdefault(reason, [])
@@ -4302,6 +4524,15 @@ def check_dispatch_staleness(
     ``recent_issue_numbers`` lets callers short-circuit with the current pass:
     if this pass itself dispatched issues, the most recent non-empty dispatch is
     now and the check returns ``stale: False``.
+
+    Issue #1110: ``stale`` does not fire when every ready issue is blocked by an
+    open dependency (``dispatchable == 0`` and ``blocked_by_open_dependency > 0``).
+    A deliberately sequenced cohort tail (e.g. #887/#888 blocked by an open
+    #886) is permanently -- and correctly -- unselectable by dispatch, so a
+    cadence alarm for it is a false positive that pattern-matches the #944
+    four-day stall this detector exists to catch. The #944 detection stays
+    intact: when ``dispatchable == 0`` and ``blocked_by_open_dependency == 0``
+    (no ready issues at all, e.g. all ``missing_ready``), the alarm still fires.
     """
     result: dict[str, Any] = {
         "stale": False,
@@ -4311,6 +4542,14 @@ def check_dispatch_staleness(
         "threshold_seconds": None,
         "backlog_observed": bool(backlog_reachability.get("observed", False)),
         "backlog_open_total": int(backlog_reachability.get("open_total", 0) or 0),
+        # Issue #1110: surface the post-dependency-gate candidate count so a
+        # reader of the staleness diagnostic can distinguish "nothing ready"
+        # (the #944 case) from "ready but blocked" (the #1110 case) without
+        # cross-referencing the reachability dict.
+        "backlog_dispatchable": int(backlog_reachability.get("dispatchable", 0) or 0),
+        "backlog_blocked_by_open_dependency": int(
+            backlog_reachability.get("blocked_by_open_dependency", 0) or 0
+        ),
         "reason": None,
     }
 
@@ -4346,6 +4585,21 @@ def check_dispatch_staleness(
             result["reason"] = "backlog_not_observed"
         else:
             result["reason"] = "empty_backlog"
+        return result
+
+    # Issue #1110: when every ready issue is blocked by an open dependency,
+    # dispatch is permanently (and correctly) idle -- there is nothing to
+    # dispatch and nothing wrong with the dispatcher. Firing a cadence alarm
+    # here is a false positive that pattern-matches the #944 four-day stall
+    # this detector exists to catch. The ``dispatchable`` count from
+    # classify_backlog_reachability already excludes dependency-blocked issues
+    # (they bin as ``blocked_by_open_dependency``), so ``dispatchable == 0``
+    # with ``blocked_by_open_dependency > 0`` means "ready but blocked", not
+    # "nothing ready". The #944 case (``dispatchable == 0`` and
+    # ``blocked_by_open_dependency == 0``) falls through to the age check below
+    # and still alarms.
+    if result["backlog_dispatchable"] == 0 and result["backlog_blocked_by_open_dependency"] > 0:
+        result["reason"] = "all_ready_blocked_by_dependencies"
         return result
 
     latest = _latest_non_empty_dispatch(state_path)
@@ -4393,6 +4647,10 @@ def _detect_and_handle_orphaned_workers(
     - If last decision was "request_changes" and head advanced, route to the
       review-pending path by calling ``review_callback`` and then flipping the
       issue status to "reviewing"
+    - If last decision was "approved" and the PR state carries
+      ``status="rework_requested"`` (evidence the post-approval rework lane
+      dispatched this worker) and head is unchanged since review, reset to
+      "rework_requested" -- same as the request_changes branch (issue #1109)
     - Otherwise, surface as drift for human triage (once per unchanged finding)
     - Do NOT clear worker_pid from state.json after handling (issue #282: the
       recovery path needs the fingerprint to verify the worktree is safe to reset).
@@ -4513,6 +4771,65 @@ def _detect_and_handle_orphaned_workers(
     if repo_root is not None:
         worktrees_dir = resolved_layout(config, repo_root).worktrees
 
+    # Issue #1248: salvage-push committed-but-unpushed work from dead workers'
+    # worktrees BEFORE anything below classifies them. A worker that finished
+    # its work locally but died at the final push produces zero remote delta,
+    # so every downstream branch -- request_changes auto-reset, the no-op
+    # rework detector, the #935 pushed-branch lane -- reads it as "did
+    # nothing" and redispatches (or caps out) on work that is already done.
+    # ``salvage_push_stranded_commits`` publishes the work only when it is a
+    # pure fast-forward of the remote tip (never force; diverged worktrees
+    # fall through to the existing ``dead_worker_unsafe_to_auto_reset``
+    # handling untouched). After a successful push the PR snapshot's
+    # ``headRefOid`` is refreshed so the in-lock classification sees the head
+    # advance and routes to review instead of counting a death, and the #935
+    # candidate detection below sees the branch on origin and opens a PR for
+    # it. Runs pre-lock: it is network I/O.
+    salvage_pushes: dict[int, dict[str, Any]] = {}
+    if repo_root is not None and worktrees_dir is not None:
+        for issue_number in orphaned_issues:
+            pr_data = pr_by_issue.get(issue_number)
+            if pr_data is not None and pr_data.get("isCrossRepository"):
+                # The head branch lives in a fork; this checkout cannot (and
+                # must not) push there.
+                continue
+            entry = state.get("issues", {}).get(str(issue_number), {})
+            branch = pr_data.get("headRefName") if pr_data is not None else None
+            if not branch and isinstance(entry, dict):
+                branch = entry.get("branch_name")
+            if not branch:
+                # No recorded branch: never guess a ref name to push to.
+                continue
+            worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
+            result = salvage_push_stranded_commits(
+                repo_root, branch, worktree_path, base_ref=config.dispatch.base_ref
+            )
+            if result.pushed:
+                salvage_pushes[issue_number] = {
+                    "issue_number": issue_number,
+                    "pr_number": int(pr_data["number"]) if pr_data is not None else None,
+                    "branch": branch,
+                    "old_remote_sha": result.old_remote_sha,
+                    "new_remote_sha": result.new_remote_sha,
+                    "commit_count": result.commit_count,
+                }
+                if pr_data is not None and result.new_remote_sha:
+                    # Refresh the snapshot so classification below compares
+                    # against the salvaged head, not the pre-push one.
+                    pr_data["headRefOid"] = result.new_remote_sha
+            elif result.error:
+                salvage_pushes[issue_number] = {
+                    "issue_number": issue_number,
+                    "pr_number": int(pr_data["number"]) if pr_data is not None else None,
+                    "branch": branch,
+                    "old_remote_sha": result.old_remote_sha,
+                    "commit_count": result.commit_count,
+                    "error": result.error,
+                }
+            # skip_reason outcomes are silent by design: "up_to_date" /
+            # "no_worktree" / "no_stranded_commits" describe the overwhelming
+            # majority of dead workers and would flood events.db every pass.
+
     no_pr_issue_details: dict[int, dict[str, Any]] = {}
     pushed_branch_candidates: dict[int, dict[str, Any]] = {}
     state_snapshot = state
@@ -4561,6 +4878,25 @@ def _detect_and_handle_orphaned_workers(
             ahead_count, ahead_error = remote_branch_ahead_count(
                 repo_root, branch, config.dispatch.base_ref
             )
+
+        # Issue #1243: compute the branch head SHA (remote + local worktree)
+        # for the no-open-PR redispatch cap. An unchanged head across attempts
+        # is the "no progress" signal that increments toward the cap; a moving
+        # head (remote push or local stranded commits) resets it. Done here,
+        # outside the state lock, because both probes touch git/network.
+        remote_head_sha = None
+        local_head_sha = None
+        if repo_root is not None:
+            remote_head_sha = remote_branch_head_sha(repo_root, branch)
+        if worktree_path is not None:
+            local_head_sha = worktree_head_sha(worktree_path)
+        no_pr_issue_details.setdefault(issue_number, {}).update(
+            {
+                "branch": branch,
+                "remote_head_sha": remote_head_sha,
+                "local_head_sha": local_head_sha,
+            }
+        )
 
         # Treat a branch as a PR-open candidate when:
         # - the worker itself reported a successful push with a failed PR, OR
@@ -4620,6 +4956,48 @@ def _detect_and_handle_orphaned_workers(
             if route_result is not None:
                 pre_review_routed.add(issue_number)
 
+    # Issue #1128: for dead workers that already have an OPEN PR with no
+    # review verdict yet (``last_decision`` is null/absent), pre-compute the
+    # issue's live GitHub labels outside the state lock. The second-lock
+    # sweep uses these to transition the issue from ``agent:in-progress`` to
+    # ``agent:pr-open`` -- the same LabelConfig-driven swap the
+    # ``orphaned_worker_opened_pr`` lane uses -- so review dispatch can claim
+    # the salvage PR. Without this, the ``dead_worker_unsafe_to_auto_reset``
+    # branch advanced no label and the issue sat on ``agent:in-progress``
+    # indefinitely, asserting a live worker the reconciler had just confirmed
+    # dead. ``pr_by_issue`` only contains OPEN PRs (``gh pr list --state
+    # open``), so presence there is the "PR is OPEN" precondition.
+    pr_orphan_unreviewed_details: dict[int, dict[str, Any]] = {}
+    pr_orphans_unreviewed = [
+        n
+        for n in orphaned_issues
+        if n in pr_by_issue
+        and not state_snapshot.get("prs", {})
+        .get(str(int(pr_by_issue[n]["number"])), {})
+        .get("decision")
+    ]
+    if pr_orphans_unreviewed:
+        # ``issues_by_number`` is only populated above when there were
+        # no-open-PR orphans; build it here when this lane is the sole
+        # consumer so the label read stays a single bulk ``issue_list`` call.
+        if not issues_by_number:
+            for issue in gh.issue_list(state="open"):
+                number = issue.get("number")
+                if number is not None:
+                    issues_by_number[int(number)] = issue
+        for issue_number in pr_orphans_unreviewed:
+            issue = issues_by_number.get(issue_number)
+            if issue is None:
+                # Issue not open/visible -- cannot safely mutate labels;
+                # the conservative drift path below handles it.
+                continue
+            issue_labels = label_names(issue)
+            active_labels = issue_labels & config.labels.active
+            pr_orphan_unreviewed_details[issue_number] = {
+                "issue_labels": issue_labels,
+                "active_labels": active_labels,
+            }
+
     # Handle orphaned workers. Head-advanced request_changes findings are
     # collected and routed to the review lane outside the state lock (review()
     # itself acquires the lock and may call transition()).
@@ -4630,6 +5008,15 @@ def _detect_and_handle_orphaned_workers(
     with state_lock(state_file):
         state = load_state(state_file)
         sweep_events: list[tuple[str, dict[str, Any]]] = []
+        # Issue #1248: record the pre-lock salvage pushes (and push failures)
+        # in the same event stream as the classification they feed, so a
+        # ``dead_worker_with_head_change`` routed below is attributable to its
+        # salvage rather than looking like a spontaneous worker push.
+        for salvage_payload in salvage_pushes.values():
+            if salvage_payload.get("error"):
+                sweep_events.append(("salvage_push_failed", salvage_payload))
+            else:
+                sweep_events.append(("salvage_pushed_stranded_commits", salvage_payload))
         for issue_number in orphaned_issues:
             entry = state["issues"].get(str(issue_number), {})
             if not isinstance(entry, dict):
@@ -4858,30 +5245,198 @@ def _detect_and_handle_orphaned_workers(
                                 )
                             )
                 else:
-                    # Not a simple request_changes case - surface as drift once.
-                    fingerprint = _drift_fingerprint(
-                        reason="dead_worker_unsafe_to_auto_reset",
-                        last_decision=last_decision or "",
-                        pr_number=pr_number,
-                    )
-                    if entry.get("orphan_drift_fingerprint") != fingerprint:
-                        entry["orphan_drift_fingerprint"] = fingerprint
-                        entry["orphan_drift_at"] = utc_now()
-                        sweep_events.append(
-                            (
-                                "orphaned_worker_drift",
-                                {
-                                    "issue_number": issue_number,
-                                    "pr_number": pr_number,
-                                    "previous_status": "dispatched",
-                                    "last_decision": last_decision,
-                                    "reason": "dead_worker_unsafe_to_auto_reset",
-                                    "pid": terminal_pid,
-                                    "exit_code": terminal_exit_code,
-                                    "duration_seconds": terminal_duration_seconds,
-                                },
+                    # Not a simple request_changes case.
+                    # Issue #1109: a dead worker on an approved PR is not
+                    # unclassifiable when the post-approval rework lane
+                    # (#674 -> PR #685, plus the merge-conflict and no-op
+                    # rework lanes that share ``_route_to_rework``) dispatched
+                    # it. Those lanes set the PR state status to
+                    # ``rework_requested`` while preserving
+                    # ``decision="approved"``, and the worker is dispatched to
+                    # fix CI/a conflict without re-litigating the review. If
+                    # that worker dies before pushing (head unchanged since
+                    # review), the issue previously wedged in ``dispatched``
+                    # forever because this sweep refused to auto-reset on a
+                    # non-``request_changes`` decision -- no redispatch, no
+                    # cap consumption, invisible to every downstream lane.
+                    # Treat ``decision="approved"`` + PR-state
+                    # ``rework_requested`` + head unchanged as safe to
+                    # auto-reset, mirroring the request_changes branch above
+                    # (including the #773 clean-exit-no-op sub-case so a
+                    # benign exit-0 worker does not burn redispatch attempts).
+                    # ``dead_worker_unsafe_to_auto_reset`` is kept only for
+                    # genuinely unclassifiable decisions -- an approved PR
+                    # whose PR state does not carry ``rework_requested`` has
+                    # no evidence a post-approval rework lane dispatched this
+                    # worker, so auto-resetting would be a guess.
+                    #
+                    # Issue #1128: when the dead worker has an OPEN PR with no
+                    # review verdict yet (``last_decision`` is null/absent),
+                    # the "unsafe to auto-reset" judgment stays -- the PR
+                    # carries the work, so re-dispatching would duplicate it --
+                    # but leaving the issue on ``agent:in-progress`` makes the
+                    # state machine assert a live worker the reconciler just
+                    # confirmed dead, and review dispatch (which keys off
+                    # ``agent:pr-open``) never sees the salvage PR. Transition
+                    # to ``pr-open`` via the same LabelConfig-driven swap the
+                    # ``orphaned_worker_opened_pr`` lane uses. On label write
+                    # failure, fall through to the conservative drift path so
+                    # the next pass re-attempts rather than resetting the
+                    # worker.
+                    pr_state_status = pr_state.get("status")
+                    if (
+                        last_decision == "approved"
+                        and pr_state_status == "rework_requested"
+                        and reviewed_head_sha
+                        and live_head_sha
+                        and reviewed_head_sha == live_head_sha
+                    ):
+                        if terminal_exit_code == 0:
+                            # Clean exit with no push -- same #773 rationale
+                            # as the request_changes branch: do not spend a
+                            # redispatch attempt on a worker that produced no
+                            # change on this exact head.
+                            fingerprint = _drift_fingerprint(
+                                reason="dead_worker_clean_exit_no_op",
+                                reviewed_head_sha=reviewed_head_sha,
                             )
+                            if entry.get("orphan_drift_fingerprint") == fingerprint:
+                                state["issues"][str(issue_number)] = entry
+                                continue
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "reason": "dead_worker_clean_exit_no_op",
+                                        "decision": "approved",
+                                        "pr_state_status": pr_state_status,
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
+                        else:
+                            # No terminal record, or a non-zero/None exit
+                            # code: safe to reset to rework_requested (PR head
+                            # unchanged since the approved review, and the
+                            # post-approval rework lane dispatched this
+                            # worker). Records this as a worker death with a
+                            # distinct reason so the death counter (issue
+                            # #1134) and the redispatch cap (issue #165) apply
+                            # exactly as they do for request_changes.
+                            entry["status"] = "rework_requested"
+                            entry["dispatched_at"] = None
+                            death_ts = utc_now()
+                            prior_deaths = entry.get("worker_death_at")
+                            if not isinstance(prior_deaths, list):
+                                prior_deaths = []
+                            entry["worker_death_at"] = prior_deaths + [death_ts]
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_recovered",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "new_status": "rework_requested",
+                                        "reason": "dead_worker_with_approved_rework",
+                                        "decision": "approved",
+                                        "pr_state_status": pr_state_status,
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                        "worker_death_at": death_ts,
+                                    },
+                                )
+                            )
+                    else:
+                        # Not the #1109 approved+rework_requested classified
+                        # case. This branch covers two populations that share
+                        # one fingerprinted drift fallback below:
+                        #   (a) #1128: ``last_decision`` is None (open PR, no
+                        #       review verdict yet) -- try advancing to
+                        #       ``pr-open``; on label-write failure or missing
+                        #       details, fall through to the shared drift.
+                        #   (b) genuinely unclassifiable decisions -- fall
+                        #       through to the shared drift directly.
+                        if last_decision is None:
+                            details = pr_orphan_unreviewed_details.get(issue_number)
+                            if details is not None:
+                                active_labels = details["active_labels"]
+                                issue_labels = details["issue_labels"]
+                                label_write_ok = True
+                                for label in sorted(active_labels):
+                                    if not gh.remove_issue_label(issue_number, label):
+                                        label_write_ok = False
+                                if config.labels.pr_open not in issue_labels:
+                                    if not gh.add_issue_label(issue_number, config.labels.pr_open):
+                                        label_write_ok = False
+                                if label_write_ok:
+                                    entry["status"] = PASSIVE_OPEN_STATUS
+                                    entry["dispatched_at"] = None
+                                    # Clear any prior drift fingerprint so a
+                                    # later regression on this issue re-surfaces.
+                                    entry["orphan_drift_fingerprint"] = None
+                                    entry["orphan_drift_at"] = None
+                                    sweep_events.append(
+                                        (
+                                            "orphaned_worker_advanced_to_pr_open",
+                                            {
+                                                "issue_number": issue_number,
+                                                "pr_number": pr_number,
+                                                "previous_status": "dispatched",
+                                                "new_status": PASSIVE_OPEN_STATUS,
+                                                "reason": "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr",
+                                                "removed_labels": sorted(active_labels),
+                                                "pid": terminal_pid,
+                                                "exit_code": terminal_exit_code,
+                                                "duration_seconds": terminal_duration_seconds,
+                                                "label_write_ok": True,
+                                            },
+                                        )
+                                    )
+                                    state["issues"][str(issue_number)] = entry
+                                    continue
+                                # Label write failed -- fall through to the
+                                # fingerprinted drift path so the next pass
+                                # re-attempts the transition (the drift
+                                # fingerprint gates only re-emission of the
+                                # diagnostic, not the transition retry above,
+                                # which runs first on every pass).
+                        # Genuinely unclassifiable decision, or #1128 label-
+                        # write failure -- surface as drift once. One shared
+                        # fingerprinted fallback for both lanes (#1109 keeps
+                        # its own classified branch above; this covers
+                        # everything else).
+                        fingerprint = _drift_fingerprint(
+                            reason="dead_worker_unsafe_to_auto_reset",
+                            last_decision=last_decision or "",
+                            pr_number=pr_number,
                         )
+                        if entry.get("orphan_drift_fingerprint") != fingerprint:
+                            entry["orphan_drift_fingerprint"] = fingerprint
+                            entry["orphan_drift_at"] = utc_now()
+                            sweep_events.append(
+                                (
+                                    "orphaned_worker_drift",
+                                    {
+                                        "issue_number": issue_number,
+                                        "pr_number": pr_number,
+                                        "previous_status": "dispatched",
+                                        "last_decision": last_decision,
+                                        "reason": "dead_worker_unsafe_to_auto_reset",
+                                        "pid": terminal_pid,
+                                        "exit_code": terminal_exit_code,
+                                        "duration_seconds": terminal_duration_seconds,
+                                    },
+                                )
+                            )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
                 # that the worker pushed but could not create a PR for.
@@ -4956,6 +5511,122 @@ def _detect_and_handle_orphaned_workers(
                     )
                     state["issues"][str(issue_number)] = entry
                     continue
+
+                # Issue #1243: per-issue redispatch cap with stall detection.
+                # The no-open-PR orphan-sweep redispatch path is the only
+                # redispatch loop without a bound -- without this cap, a
+                # persistent post-exit condition that leaves no open PR
+                # reproduces the #709 infinite loop (worker exits -> sweep
+                # strips agent:in-progress -> issue returns to the dispatchable
+                # pool -> next pass redispatches -> repeat). The cap counts
+                # dead *dispatches* via a timestamp list
+                # (``orphan_redispatch_at``) deduplicated on dispatch identity,
+                # mirroring the ``redispatch_at``/``worker_death_at`` pattern
+                # used by the parallel worker_death_loop cap elsewhere in this
+                # module.
+                # The previous implementation derived the count from
+                # ``len(adapter_history)``, but that list only grows when
+                # ``api_worker.enabled`` is ``True`` (via
+                # ``routing.record_adapter_choice``) -- so in the default
+                # (non-API-routed) configuration the counter never incremented
+                # and the cap never fired, leaving the #709 infinite loop
+                # unbounded in production. The timestamp list is appended on
+                # every sweep pass through this code, regardless of adapter
+                # routing mode.
+                # "No progress" is measured, not assumed: the branch head SHA
+                # (remote ls-remote + local worktree) is compared across
+                # attempts. A moving head is the salvage path's job, not
+                # escalation. Parallel to the rework lane's worker_death_loop
+                # (fires at death_count > max_auto_redispatch).
+                head_details = no_pr_issue_details.get(issue_number, {})
+                current_head = _orphan_head_fingerprint(
+                    head_details.get("remote_head_sha"),
+                    head_details.get("local_head_sha"),
+                )
+                prior_head = entry.get("orphan_redispatch_head_sha")
+                now_ts = utc_now()
+
+                head_changed = prior_head is not None and current_head != prior_head
+                first_observation = prior_head is None
+                # Identity of the dispatch whose dead worker this pass is
+                # observing. The #417 reclaim deliberately leaves the entry's
+                # status/worker_pid untouched (issue #282 fingerprint
+                # preservation), so the same dead entry is re-discovered by
+                # every subsequent sweep pass until a real redispatch replaces
+                # dispatched_at/worker_pid. Counting passes would therefore
+                # escalate after a few sweeps with zero actual redispatch
+                # attempts (e.g. during fleet-capacity dispatch delays);
+                # instead, each dead dispatch is counted exactly once, keyed
+                # by this identity.
+                dispatch_identity = (
+                    f"{entry.get('dispatched_at') or 'none'}:{entry.get('worker_pid') or 'none'}"
+                )
+                prior_dispatch = entry.get("orphan_redispatch_counted_dispatch")
+                # Read the windowed timestamp list. On progress or first
+                # observation, reset it to [now] so only attempts after this
+                # point count toward the cap. Otherwise, append this pass's
+                # timestamp only when it observes a dispatch not yet counted
+                # -- re-observing the same dead dispatch on a later sweep
+                # pass is not a redispatch attempt. (The timestamp list, not
+                # adapter_history, is still what the count derives from:
+                # adapter_history only grows when api_worker.enabled is True.)
+                orphan_redispatch_at = _windowed_orphan_redispatch_at(
+                    entry, window_minutes=config.watchdog.redispatch_window_minutes
+                )
+                if head_changed or first_observation:
+                    orphan_redispatch_at = [now_ts]
+                elif dispatch_identity != prior_dispatch:
+                    orphan_redispatch_at = orphan_redispatch_at + [now_ts]
+
+                redispatch_count = len(orphan_redispatch_at)
+
+                if redispatch_count > config.watchdog.max_auto_redispatch and not head_changed:
+                    # Cap exceeded with no progress -- escalate instead of
+                    # recording the relabel event that would return the issue
+                    # to the dispatchable pool. The labels were already
+                    # stripped in the pre-lock reclaim, but the post-lock
+                    # transition() call (via reap_escalations) will change
+                    # them to agent:human-needed.
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="orphan_sweep_redispatch_cap_exceeded",
+                        reason_class="mechanical",
+                        issue_extra={
+                            "dispatched_at": None,
+                            "orphan_redispatch_head_sha": current_head,
+                            "orphan_redispatch_at": orphan_redispatch_at,
+                            "orphan_redispatch_counted_dispatch": None,
+                            "orphan_flagged_at": None,
+                            "orphan_drift_fingerprint": None,
+                            "orphan_drift_at": None,
+                        },
+                    )
+                    sweep_events.append(
+                        (
+                            "orphan_sweep_redispatch_escalated",
+                            {
+                                "issue_number": issue_number,
+                                "previous_status": "dispatched",
+                                "reason": "orphan_sweep_redispatch_cap_exceeded",
+                                "redispatch_count": redispatch_count,
+                                "branch_head_sha": head_details.get("remote_head_sha"),
+                                "worktree_head_sha": head_details.get("local_head_sha"),
+                                "orphan_redispatch_at_len": len(orphan_redispatch_at),
+                            },
+                        )
+                    )
+                    reap_escalations.append(issue_number)
+                    continue
+
+                # Cap not exceeded (or progress detected): persist the head
+                # fingerprint, timestamp list, and counted dispatch identity
+                # so the next orphan-sweep pass can compare against them. On
+                # progress or first observation, the list was just (re)seeded
+                # above; this persists it.
+                entry["orphan_redispatch_head_sha"] = current_head
+                entry["orphan_redispatch_at"] = orphan_redispatch_at
+                entry["orphan_redispatch_counted_dispatch"] = dispatch_identity
 
                 # Issue #417: report (and, on success, resolve) the ground-truth
                 # label reclaim computed above before falling back to the
@@ -5454,6 +6125,20 @@ def _reap_restore_rework_requested(
                 entry["worker_death_at"] = worker_death_at
             # Preserve worker_pid (issues #165, #282, #295)
             state["issues"][str(worker.issue_number)] = entry
+            # Issue #1106: record the failure_kind and startup-death
+            # classification in the PR state so the janitor gate's
+            # _route_janitor_gate_failure_to_rework can skip the cap
+            # increment when the session died at CLI startup (before
+            # the worker's first tool action) instead of miscounting
+            # it as a no-op/conflict rework attempt.
+            startup_death = _is_startup_death(
+                failure_kind, _worker_death_bounded_runtime_seconds(worker)
+            )
+            state["prs"][str(pr_number)] = {
+                **state.get("prs", {}).get(str(pr_number), {}),
+                "last_rework_failure_kind": failure_kind,
+                "last_rework_was_startup_death": startup_death,
+            }
             state = append_event(
                 state,
                 "rework_requeued",
@@ -5465,6 +6150,7 @@ def _reap_restore_rework_requested(
                     "reason": "dead_rework_session_recovered",
                     "has_request_changes": has_request_changes,
                     "has_rework_prompt": has_rework_prompt,
+                    "startup_death": startup_death,
                 },
                 state_path=state_file,
             )
@@ -7921,7 +8607,11 @@ class OrchestratorApp:
         )
 
     def _apply_concurrency_governor(
-        self, dispatch_limit: int, *, live_count: int | None = None
+        self,
+        dispatch_limit: int,
+        *,
+        live_count: int | None = None,
+        apply_open_pr_backpressure: bool = False,
     ) -> ConcurrencyGovernorResult:
         """Apply global concurrency governor cap to a dispatch limit.
 
@@ -7934,12 +8624,20 @@ class OrchestratorApp:
             dispatch_limit: The requested dispatch limit
             live_count: Optional pre-computed live worker count. If None and
                 max_concurrent > 0, this will compute it via _count_live_sessions.
+            apply_open_pr_backpressure: When True (fresh-issue dispatch only),
+                also clamp to ``max(0, max_open_agent_prs - open_pr_count)``
+                where ``open_pr_count`` is the number of open agent PRs whose
+                head ref matches ``dispatch.branch_prefix``. Rework, recovery,
+                and loop-level callers leave this False -- they reduce
+                verification debt rather than adding to it (issue #1129).
         """
         max_concurrent = self.config.dispatch.max_concurrent_sessions
         fleet_max = self.config.fleet.global_max_concurrent_sessions
+        open_pr_max = self.config.dispatch.max_open_agent_prs if apply_open_pr_backpressure else 0
         available_slots = dispatch_limit
         clamped = False
         fleet_live_count = 0
+        open_pr_count = 0
 
         if max_concurrent > 0:
             if live_count is None:
@@ -7957,6 +8655,50 @@ class OrchestratorApp:
                 dispatch_limit = fleet_available
                 clamped = True
 
+        if open_pr_max > 0:
+            # Issue #1129: count open agent PRs from live GitHub state (the
+            # same pr_list() + branch_prefix derivation _merge_train_candidates
+            # and the reconciler use). No new state; the count is recomputed
+            # each pass and self-corrects after merges/closes.
+            branch_prefix = self.config.dispatch.branch_prefix
+            open_pr_count = sum(
+                1
+                for pr in self.gh.pr_list()
+                if str(pr.get("headRefName") or "").startswith(branch_prefix)
+            )
+            open_pr_available = max(0, open_pr_max - open_pr_count)
+            if open_pr_available < dispatch_limit:
+                # Record a dispatch_backpressure event so "0 dispatched with N
+                # dispatchable" is diagnosable from events.db rather than
+                # reading as idleness (same discipline as #1091's de-escalation
+                # skip attribution). The governor runs outside the state lock,
+                # so log_event (the low-level write primitive for events
+                # outside state-lock contexts) is used directly.
+                #
+                # Dry-run never writes the event: log_event is a durable
+                # events.db mutation, and a dry-run preview must not record
+                # instrumentation (the same write-suppression discipline as the
+                # worker_token_escalated marker above -- the escalation event
+                # and durable marker stay behind ``not self.dry_run``). The
+                # clamp itself (dispatch_limit/clamped below) is NOT dry-run
+                # gated: a dry-run preview must report the same clamped
+                # selected_count a live pass would, matching the
+                # worker_token_missing refusal precedent in _dispatch_impl.
+                if not self.dry_run:
+                    log_event(
+                        self.paths.state_file,
+                        "dispatch_backpressure",
+                        {
+                            "open_pr_count": open_pr_count,
+                            "max_open_agent_prs": open_pr_max,
+                            "requested_limit": dispatch_limit,
+                            "clamped_limit": open_pr_available,
+                        },
+                        repo=self.repo_root.name,
+                    )
+                dispatch_limit = open_pr_available
+                clamped = True
+
         return ConcurrencyGovernorResult(
             clamped=clamped,
             max_concurrent=max_concurrent,
@@ -7965,6 +8707,8 @@ class OrchestratorApp:
             dispatch_limit=dispatch_limit,
             fleet_live_count=fleet_live_count,
             fleet_max=fleet_max,
+            open_pr_count=open_pr_count,
+            open_pr_max=open_pr_max,
         )
 
     @_guard_state_lock
@@ -8773,6 +9517,24 @@ class OrchestratorApp:
         dispatch_limit = limit if limit is not None else self.config.dispatch.default_limit
         operator_claimed_ready: list[int] = []
 
+        # Issue #1110 rework: classify_backlog_reachability now runs the same
+        # per-issue blocker check the dispatch candidate filter runs (issue
+        # #1110 wired _get_open_blockers_for_issue into its else-branch). That
+        # check calls get_github_issue_dependencies + are_issues_open per issue
+        # -- exactly the N+1 serial `gh` pattern issue #870 built
+        # _prefetch_blocker_data to eliminate. Warm the pass-scoped cache for
+        # every ready issue once, *before* reachability's serial per-issue
+        # lookups run, mirroring how status() warms the cache before its own
+        # classify_backlog_reachability call. ``issues`` here is the
+        # ready-labelled state="all" set; reachability fetches its own open
+        # list, but its blocker check only runs on ready-labelled OPEN issues,
+        # which are a subset of this set, so this warm-up covers every
+        # dependency lookup reachability will make. The later
+        # _filter_blocked_issues(candidates) call below benefits too:
+        # candidates are a further subset, so the cache is already warm for
+        # them as well. Harmless to call twice (second call is a cache hit).
+        self._prefetch_blocker_data(issues)
+
         # Issue #944: observe the UNFILTERED backlog alongside the filtered
         # candidate query above. This does not participate in selection and
         # must not change dispatch behaviour -- it exists so that a zero
@@ -8807,8 +9569,14 @@ class OrchestratorApp:
         # worker_pid whose sidecar was removed -- cannot silently free a slot.
         live_count = _count_live_sessions(sessions_dir, self.paths.state_file)
 
-        # Apply global concurrency governor cap with pre-computed live_count
-        gov = self._apply_concurrency_governor(dispatch_limit, live_count=live_count)
+        # Apply global concurrency governor cap with pre-computed live_count.
+        # Issue #1129: fresh-issue dispatch also applies open-PR backpressure
+        # (max_open_agent_prs), pacing new PR creation to the review/merge lane.
+        gov = self._apply_concurrency_governor(
+            dispatch_limit,
+            live_count=live_count,
+            apply_open_pr_backpressure=True,
+        )
         dispatch_limit = gov.dispatch_limit
 
         # Compute the merged PR list (if already fetched) for the tripwire so
@@ -8837,7 +9605,7 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if gov.enabled or gov.fleet_enabled:
+                if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                     data.update(gov.report_fields())
                 return CommandResult(
                     False,
@@ -9058,7 +9826,7 @@ class OrchestratorApp:
                 ],
                 "stalled": stalled_entries,
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -10077,7 +10845,7 @@ class OrchestratorApp:
             ],
             "operator_claimed_ready": sorted(operator_claimed_ready),
         }
-        if gov.enabled or gov.fleet_enabled:
+        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
             data.update(gov.report_fields())
 
         # Emit notification digest if there are health transitions (stalled sessions)
@@ -10258,6 +11026,7 @@ class OrchestratorApp:
                         **existing_pr_state,
                         "janitor_ok": escalated_verdict.ok,
                         "janitor_failures": list(escalated_verdict.failures),
+                        "is_missing_checks_only_block": escalated_verdict.is_missing_checks_only_block,
                     }
                     if failures_changed:
                         fresh_state = self._record_event(
@@ -10583,6 +11352,7 @@ class OrchestratorApp:
                             "status": "janitor_blocked",
                             "janitor_ok": False,
                             "janitor_failures": list(verdict.failures),
+                            "is_missing_checks_only_block": verdict.is_missing_checks_only_block,
                         }
                         if draft_hold_reason_changed:
                             state = self._record_event(
@@ -10652,6 +11422,7 @@ class OrchestratorApp:
                         "janitor_ok": False,
                         "janitor_failures": list(verdict.failures),
                         "draft_ready_error": draft_ready_error,
+                        "is_missing_checks_only_block": verdict.is_missing_checks_only_block,
                     }
                     if error_changed:
                         state = append_event(
@@ -11034,6 +11805,11 @@ class OrchestratorApp:
                     "janitor_ok": False,
                     "janitor_failures": list(verdict.failures),
                     "check_rerun_attempts": verdict.check_rerun_attempts,
+                    # Issue #1133: structured flag so _is_dead_blocker can
+                    # distinguish the transient "checks not reported yet"
+                    # population from durably-stuck janitor_blocked PRs without
+                    # parsing failure-message text.
+                    "is_missing_checks_only_block": verdict.is_missing_checks_only_block,
                 }
                 # At most once per (pr, head_sha): only emit when this head
                 # hasn't already been flagged as never-created.
@@ -11330,6 +12106,7 @@ class OrchestratorApp:
                 **({} if dispatch_disabled else {"status": "reviewing"}),
                 "janitor_ok": True,
                 "janitor_failures": [],
+                "is_missing_checks_only_block": False,
                 "janitor_warnings": list(merged_warnings),
                 "cross_family_report": cf_result.report_path if cf_result else None,
                 "cross_family_ok": cf_result.ok if cf_result else None,
@@ -13836,31 +14613,44 @@ class OrchestratorApp:
             # (a PR could rework forever instead of escalating to a human).
             request_changes_count = int(pr_state.get("request_changes_count", 0))
             if decision == "request_changes":
-                # Rework cap: past max_rework_cycles the evidence says iteration
-                # thrashes (wrong brief or unimplementable criteria) — escalate to
-                # a human instead of dispatching another cycle.
-                escalated = request_changes_count >= self.config.review.max_rework_cycles
-                # Rescue tier (issue #555): a cap exceedance here is one of the
-                # three verdict-driven ("cheap model wasn't good enough")
-                # causes the rescue tier is gated on. If enabled and this PR
-                # has not already spent its one rescue attempt, route to a
-                # bounded Opus rework instead of escalating — never a second
-                # rescue for the same PR (rescue_attempted is durable, cleared
-                # only by `charlie unescalate`).
-                if (
-                    escalated
-                    and self.config.rescue.enabled
-                    and not pr_state.get("rescue_attempted")
-                ):
-                    escalated = False
-                    rescue_dispatched = True
                 # Only count a rework cycle when the PR head has actually advanced.
                 # If the head is unchanged, the prior cycle's attempt was never
-                # delivered (e.g., worker died orphaned), so re-issuing request_changes
-                # should not consume the escalation budget. See issue #208.
+                # delivered (e.g., worker died orphaned), so re-issuing
+                # request_changes should not consume the escalation budget. See
+                # issue #208.
+                #
+                # Issue #1210: the head_advanced guard previously protected only
+                # the counter increment below — the escalation check ran
+                # unconditionally and fired on an at-cap verdict even when the
+                # head was unchanged. Gate the escalation evaluation (and the
+                # rescue tier, which is itself gated on cap exceedance) on
+                # head_advanced as well, so an at-cap verdict on an unchanged
+                # head re-issues request_changes without escalating, mirroring
+                # what already happens below-cap. Keep the existing behavior for
+                # advanced heads.
                 head_advanced = reviewed_head_sha != pr_state.get("reviewed_head_sha")
-                if not escalated and head_advanced:
-                    request_changes_count += 1
+                if head_advanced:
+                    # Rework cap: past max_rework_cycles the evidence says
+                    # iteration thrashes (wrong brief or unimplementable
+                    # criteria) — escalate to a human instead of dispatching
+                    # another cycle.
+                    escalated = request_changes_count >= self.config.review.max_rework_cycles
+                    # Rescue tier (issue #555): a cap exceedance here is one of
+                    # the three verdict-driven ("cheap model wasn't good
+                    # enough") causes the rescue tier is gated on. If enabled
+                    # and this PR has not already spent its one rescue attempt,
+                    # route to a bounded Opus rework instead of escalating —
+                    # never a second rescue for the same PR (rescue_attempted
+                    # is durable, cleared only by `charlie unescalate`).
+                    if (
+                        escalated
+                        and self.config.rescue.enabled
+                        and not pr_state.get("rescue_attempted")
+                    ):
+                        escalated = False
+                        rescue_dispatched = True
+                    if not escalated:
+                        request_changes_count += 1
                 if not escalated:
                     rework_summary = (
                         rescue_helpers.build_rescue_rework_summary(
@@ -14178,6 +14968,12 @@ class OrchestratorApp:
         "dispatch_failed_at",
         "redispatch_at",
         "worker_death_at",
+        # Issue #1243: the orphan-sweep no-open-PR redispatch cap tracking
+        # fields must reset on human un-escalate so the cap starts fresh
+        # after the operator re-arms the issue.
+        "orphan_redispatch_head_sha",
+        "orphan_redispatch_at",
+        "orphan_redispatch_counted_dispatch",
         "escalation_reason",
         # Issue #783: a human-authorized manual unescalate clears the reason
         # class (the escalation itself is gone) and resets the auto
@@ -17700,6 +18496,44 @@ class OrchestratorApp:
                     }
                     save_state(self.paths.state_file, state)
                 return None
+        # Issue #1106: if the previous rework session died at CLI startup
+        # (before the worker's first tool action), this is NOT a no-op/conflict
+        # rework attempt — requeue without touching the caps.  The cap counters
+        # should only count sessions that *ran* and produced no useful change.
+        #
+        # ``head_settled`` is True only when ``rework_pending`` is True at this
+        # point — the only ``rework_pending = True`` path that reaches here is
+        # ``settled_new_conflicted_head = True`` (the head moved off the
+        # recorded baseline), which means the worker DID push real content
+        # before dying.  A startup death with no content change never reaches
+        # here via the ``rework_pending = True`` branch (it returns None at the
+        # stall check above), so the flag only matters on the
+        # ``rework_pending = False`` path — the first detection or a re-detection
+        # after the issue status left the pending set.
+        head_settled = rework_pending
+        if existing_pr_state.get("last_rework_was_startup_death") and not head_settled:
+            decision = self._review_decision(pr_number)
+            route_extra_state: dict[str, Any] = {
+                "last_rework_failure_kind": None,
+                "last_rework_was_startup_death": False,
+            }
+            if head_sha:
+                route_extra_state[last_head_key] = head_sha
+            label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
+            return CommandResult(
+                True,
+                f"PR #{pr_number} requeued after startup death "
+                f"({existing_pr_state.get('last_rework_failure_kind')}); "
+                f"{attempts_key} not incremented",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "routed_to_rework": True,
+                    "rework_reason": reason,
+                    "startup_death_requeue": True,
+                    "label_error": label_error,
+                },
+            )
         attempts = int(existing_pr_state.get(attempts_key, 0)) + 1
 
         if (
@@ -17754,6 +18588,9 @@ class OrchestratorApp:
                     attempts_key: attempts,
                     **rescue_helpers.build_rescue_dataclass_kwargs(reason),
                     "rescue_dispatched_at": utc_now(),
+                    # Issue #1106: clear startup-death flags.
+                    "last_rework_failure_kind": None,
+                    "last_rework_was_startup_death": False,
                 }
                 state = self._record_event(
                     state,
@@ -17770,6 +18607,9 @@ class OrchestratorApp:
             route_extra_state: dict[str, Any] = {attempts_key: attempts}
             if head_sha:
                 route_extra_state[last_head_key] = head_sha
+            # Issue #1106: clear startup-death flags.
+            route_extra_state["last_rework_failure_kind"] = None
+            route_extra_state["last_rework_was_startup_death"] = False
             label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
             return CommandResult(
                 True,
@@ -17804,7 +18644,12 @@ class OrchestratorApp:
                     reason=escalation_reason,
                     reason_class="mechanical",
                     pr_number=pr_number,
-                    pr_extra={attempts_key: attempts},
+                    pr_extra={
+                        attempts_key: attempts,
+                        # Issue #1106: clear startup-death flags on escalate.
+                        "last_rework_failure_kind": None,
+                        "last_rework_was_startup_death": False,
+                    },
                 )
                 state = self._record_event(
                     state,
@@ -17860,6 +18705,11 @@ class OrchestratorApp:
                     # from a timestamp accumulated during unrelated history.
                     stall_since_key: None,
                     stall_head_key: None,
+                    # Issue #1106: clear startup-death flags — the head
+                    # settled, so the previous session's death (if any) is
+                    # now accounted for by this attempt.
+                    "last_rework_failure_kind": None,
+                    "last_rework_was_startup_death": False,
                 }
                 state = self._record_event(
                     state,
@@ -17885,6 +18735,10 @@ class OrchestratorApp:
         route_extra_state: dict[str, Any] = {attempts_key: attempts}
         if head_sha:
             route_extra_state[last_head_key] = head_sha
+        # Issue #1106: clear startup-death flags — this attempt is being
+        # counted, so the previous session's death is now accounted for.
+        route_extra_state["last_rework_failure_kind"] = None
+        route_extra_state["last_rework_was_startup_death"] = False
         label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
         return CommandResult(
             True,
@@ -19861,6 +20715,7 @@ class OrchestratorApp:
                     **fresh_pr_entry,
                     "janitor_ok": janitor_verdict.ok,
                     "janitor_failures": list(janitor_verdict.failures),
+                    "is_missing_checks_only_block": janitor_verdict.is_missing_checks_only_block,
                 }
             fresh_issue_entry = fresh_state["issues"].get(issue_key)
             if not isinstance(fresh_issue_entry, dict) or (
@@ -20762,7 +21617,7 @@ class OrchestratorApp:
             "reaped": reaped,
         }
         # Propagate concurrency info from dispatch results
-        if gov.enabled or gov.fleet_enabled:
+        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
             data.update(gov.report_fields())
         # Prefer the dispatch-scoped governor values (they reflect sidecars
         # written by this pass and the most accurate fleet-wide live count).
@@ -20773,6 +21628,8 @@ class OrchestratorApp:
                 "available_slots",
                 "fleet_concurrency_limit",
                 "fleet_live_session_count",
+                "open_pr_count",
+                "open_pr_max",
             ):
                 if key in data[lane]:
                     data[key] = data[lane][key]
@@ -20987,7 +21844,7 @@ class OrchestratorApp:
                     "deferred_reason": "provider_throttled",
                     "throttled_until": throttled_until,
                 }
-                if gov.enabled or gov.fleet_enabled:
+                if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                     data.update(gov.report_fields())
                 return CommandResult(
                     False,
@@ -21163,7 +22020,7 @@ class OrchestratorApp:
                 "worker_death_escalated": sorted(dry_worker_death_escalated),
                 "rescue_issue_numbers": sorted(dry_rescue_issue_numbers),
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -21455,7 +22312,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -21520,7 +22377,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -21777,7 +22634,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
             }
-            if gov.enabled or gov.fleet_enabled:
+            if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
             return CommandResult(
                 True,
@@ -21897,6 +22754,20 @@ class OrchestratorApp:
                     entry.pop("orphan_flagged_at", None)
                     entry.pop("orphan_drift_fingerprint", None)
                     entry.pop("orphan_drift_at", None)
+                    # Issue #1106: a new rework dispatch supersedes any
+                    # prior startup-death classification — the new session
+                    # is the one whose outcome the next janitor pass will
+                    # attribute, so the stale flag must not survive.
+                    dispatched_pr = pr_by_issue.get(request.issue_number)
+                    if dispatched_pr is not None:
+                        dispatched_pr_number = int(dispatched_pr["number"])
+                        pr_state = state.get("prs", {}).get(str(dispatched_pr_number), {})
+                        if pr_state:
+                            state["prs"][str(dispatched_pr_number)] = {
+                                **pr_state,
+                                "last_rework_failure_kind": None,
+                                "last_rework_was_startup_death": False,
+                            }
                 # Store worker PID and process start time for state-based liveness detection
                 # This allows recovery even when session sidecar files are orphaned (issue #207)
                 if ok:
@@ -22094,7 +22965,7 @@ class OrchestratorApp:
             "operator_claimed_skipped": sorted(operator_claimed_skipped),
             "no_op_rework_escalated": sorted(no_op_rework_escalated),
         }
-        if gov.enabled or gov.fleet_enabled:
+        if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
             data.update(gov.report_fields())
 
         # Emit notification digest if there are health transitions (stalled sessions)
@@ -22514,36 +23385,7 @@ class OrchestratorApp:
             declared_blockers includes all blockers mentioned in the issue body or
             GitHub dependencies. open_blockers is the subset that are currently open.
         """
-        import logging
-
-        logger = logging.getLogger(__name__)
-        issue_number = int(issue["number"])
-        body = issue.get("body", "")
-
-        # Parse blockers from issue body
-        body_blockers = parse_blockers(body)
-
-        # Get GitHub native dependencies
-        gh_blockers = get_github_issue_dependencies(self.gh, issue_number)
-
-        # Combine and deduplicate
-        all_blockers = sorted(set(body_blockers + gh_blockers))
-
-        if not all_blockers:
-            return [], []
-
-        # Check which blockers are still open
-        open_blockers = self.gh.are_issues_open(all_blockers)
-
-        # Filter out self-references (malformed markers like "Blocked by #123" on issue #123)
-        if issue_number in open_blockers:
-            logger.warning(
-                f"Issue #{issue_number} has self-referencing blocker declaration - ignoring"
-            )
-            open_blockers.discard(issue_number)
-            all_blockers.remove(issue_number)
-
-        return sorted(all_blockers), sorted(open_blockers)
+        return _get_open_blockers_for_issue(self.gh, issue)
 
     @staticmethod
     def _is_dead_blocker(
@@ -22557,6 +23399,18 @@ class OrchestratorApp:
         blocker issue itself is escalated, or its tracked open PR's status is
         escalated/janitor_blocked. Pure local-state lookup, no GitHub calls --
         this only names an already-known dead end, it never widens one.
+
+        Issue #1133: ``janitor_blocked`` conflates a durably-stuck population
+        (failed checks, merge conflict, body gate, CI-never-created) with a
+        transient one -- a brand-new PR whose required checks simply haven't
+        reported yet, which self-heals within one CI cycle. The transient
+        case is identified structurally by ``is_missing_checks_only_block``
+        (the SOLE janitor failure is "Required check(s) missing") combined
+        with the absence of a ``ci_run_never_created_head`` marker (which
+        would mean CI was confirmed to have never started for this head -- a
+        durable condition). Such a PR is NOT dead: it is actively progressing
+        and will unblock on the next janitor pass once CI reports. The
+        ``escalated`` status stays dead unconditionally.
         """
         issue_entry = state.get("issues", {}).get(str(blocker_number), {})
         if isinstance(issue_entry, dict) and issue_entry.get("status") == "escalated":
@@ -22565,8 +23419,22 @@ class OrchestratorApp:
         if pr is not None:
             pr_number = pr.get("number")
             if pr_number is not None:
-                pr_status = state.get("prs", {}).get(str(pr_number), {}).get("status")
-                if pr_status in ("escalated", "janitor_blocked"):
+                pr_state = state.get("prs", {}).get(str(pr_number), {})
+                pr_status = pr_state.get("status")
+                if pr_status == "escalated":
+                    return True
+                if pr_status == "janitor_blocked":
+                    # Issue #1133: a brand-new PR whose only janitor failure is
+                    # "Required check(s) missing" (checks not reported yet) is
+                    # transient, not dead -- unless ``ci_run_never_created_head``
+                    # is set, which means CI was confirmed to have never started
+                    # for this head (the durable population the alert exists for).
+                    # Branch on the structured flag, never on failure-message
+                    # text (same rule as is_draft_only_block consumers).
+                    if pr_state.get("is_missing_checks_only_block") and not pr_state.get(
+                        "ci_run_never_created_head"
+                    ):
+                        return False
                     return True
         return False
 
@@ -22802,6 +23670,151 @@ class OrchestratorApp:
             repo_root=self.repo_root,
         )
 
+    def _queue_sync_merge_covered(
+        self,
+        pr: dict[str, Any],
+        reviewed_head_sha: str | None,
+        live_head_sha: str | None,
+    ) -> bool:
+        """Return True iff the merged head is an approval-covered queue sync-merge.
+
+        Issue #1194: Aviator's mergequeue syncs a PR branch with main before
+        merging, so the merged head is a bot-authored merge commit whose
+        parents are the approved head and a main commit — a structural false
+        positive for the #502 tripwire's strict SHA equality. Recognize that
+        shape, and only that shape, as covered by the recorded approval. All
+        four conditions must hold (fail closed on every missing or ambiguous
+        signal — an unanswerable question keeps the finding firing, and the
+        existing ack flow remains the escape hatch):
+
+        1. the live head is a merge commit with exactly two parents;
+        2. exactly one parent IS the approved ``reviewed_head_sha``;
+        3. the other parent is reachable from the base branch as it stood
+           immediately BEFORE this PR's merge — anchored at the merge
+           commit's first parent, NOT at current main. Post-merge, current
+           main reaches everything the PR carried (including a smuggled
+           second parent) through the merge commit itself, so a naive
+           "reachable from main" test is vacuously true and enforces
+           nothing. Reachability from pre-merge main is the discriminating
+           form: nothing this PR introduced can be reachable from there.
+           This condition is the load-bearing one — it bounds the merged
+           content to (approved head + prior main) regardless of who
+           authored the commit;
+        4. the merge commit's author login is the configured
+           ``auto_merge.queue_bot_login`` and its committer is GitHub's
+           web-flow (both identity signals, same rationale as
+           ``_verify_synced_head``: either alone is spoofable via crafted
+           git metadata). Identity is defense-in-depth on top of (3), not a
+           substitute for it. Unset ``queue_bot_login`` disables recognition
+           entirely — the tripwire behaves exactly as before #1194.
+
+        Suppressions are audit-logged (``unauthorized_merge_queue_sync_covered``,
+        events.db via ``log_event`` — this path holds no state lock) so every
+        exercised gate exception leaves a queryable trail; consumer is the
+        operator auditing tripwire behavior, mirroring the skip-event pattern.
+        """
+        queue_bot_login = self.config.auto_merge.queue_bot_login
+        if not queue_bot_login:
+            return False
+        if not reviewed_head_sha or not live_head_sha:
+            return False
+
+        head_result = self.gh.commit(live_head_sha)
+        head_commit = (
+            head_result.value
+            if isinstance(head_result, GitHubRunResult)
+            and head_result.ok
+            and isinstance(head_result.value, dict)
+            else None
+        )
+        if not head_commit:
+            return False
+
+        parents = [
+            str(p.get("sha"))
+            for p in (head_commit.get("parents") or [])
+            if isinstance(p, dict) and p.get("sha")
+        ]
+        if len(parents) != 2:
+            return False
+        matching = [p for p in parents if p == reviewed_head_sha]
+        if len(matching) != 1:
+            # Zero matches: not a sync of the approved head. Two matches: a
+            # degenerate both-parents-approved merge — nothing to sync, so
+            # nothing this path needs to bless; fail closed.
+            return False
+        other_parent = next(p for p in parents if p != reviewed_head_sha)
+
+        # Identity (condition 4). Checked before the extra API calls of
+        # condition 3 purely to keep the miss path cheap; order does not
+        # affect the verdict since all conditions are conjunctive.
+        author = head_commit.get("author")
+        author_login = author.get("login") if isinstance(author, dict) else None
+        committer = head_commit.get("committer")
+        committer_login = committer.get("login") if isinstance(committer, dict) else None
+        commit_meta = head_commit.get("commit")
+        commit_committer = commit_meta.get("committer") if isinstance(commit_meta, dict) else None
+        committer_name = (
+            commit_committer.get("name") if isinstance(commit_committer, dict) else None
+        )
+        if (
+            author_login != queue_bot_login
+            or committer_login != "web-flow"
+            or committer_name != "GitHub"
+        ):
+            return False
+
+        # Condition 3: anchor at pre-merge main via the landing merge
+        # commit's first parent. GitHub commits merges on the base branch,
+        # so parents[0] of merge_commit_sha is the base tip this merge
+        # advanced. If the queue fast-forwarded instead (merge commit == the
+        # sync commit itself), parents[0] is the approved head, the compare
+        # below cannot succeed, and the finding keeps firing — fail closed.
+        merge_commit_sha = pr.get("mergeCommitOid")
+        if not merge_commit_sha:
+            return False
+        landing_result = self.gh.commit(str(merge_commit_sha))
+        landing_commit = (
+            landing_result.value
+            if isinstance(landing_result, GitHubRunResult)
+            and landing_result.ok
+            and isinstance(landing_result.value, dict)
+            else None
+        )
+        if not landing_commit:
+            return False
+        landing_parents = [
+            str(p.get("sha"))
+            for p in (landing_commit.get("parents") or [])
+            if isinstance(p, dict) and p.get("sha")
+        ]
+        if not landing_parents:
+            return False
+        pre_merge_base = landing_parents[0]
+
+        comparison = self.gh.compare(pre_merge_base, other_parent)
+        if not isinstance(comparison, dict):
+            return False
+        # "identical"/"behind" mean other_parent introduces zero commits not
+        # already on pre-merge main; "ahead"/"diverged" (or anything else)
+        # mean it carries content this approval never covered.
+        if comparison.get("status") not in ("identical", "behind"):
+            return False
+
+        log_event(
+            self.paths.state_file,
+            "unauthorized_merge_queue_sync_covered",
+            {
+                "pr": pr.get("number"),
+                "reviewed_head_sha": reviewed_head_sha,
+                "live_head_sha": live_head_sha,
+                "sync_parent": other_parent,
+                "pre_merge_base": pre_merge_base,
+                "queue_bot_login": queue_bot_login,
+            },
+        )
+        return True
+
     def _detect_unauthorized_merges(
         self, merged_prs: list[dict[str, Any]] | None = None
     ) -> list[dict[str, Any]]:
@@ -22894,7 +23907,24 @@ class OrchestratorApp:
             # after authorization invalidates the override exactly as it
             # invalidates an approved decision.
             override_authorized = _authorized_override_matches(decision, live_head_sha)
-            if (not approved or not head_matches) and not override_authorized:
+            # Issue #1194: an approved decision whose head moved may be an
+            # Aviator queue sync-merge of the approved head — structurally a
+            # false positive. Recognized only under the fail-closed
+            # four-condition predicate in _queue_sync_merge_covered, and
+            # evaluated lazily: only for approved decisions with a genuine
+            # head mismatch and no override, so the common paths (matching
+            # head, unapproved, overridden) never pay its API calls.
+            queue_sync_covered = (
+                approved
+                and not head_matches
+                and not override_authorized
+                and self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+            )
+            if (
+                (not approved or not head_matches)
+                and not override_authorized
+                and not queue_sync_covered
+            ):
                 issue_number = linked_issue_number(
                     pr,
                     is_cross_repository=pr.get("isCrossRepository"),
