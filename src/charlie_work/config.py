@@ -633,6 +633,14 @@ class AutoMergeConfig:
     # merged, so no new post-merge bookkeeping is added here. Default None
     # preserves today's self-merge behavior byte-for-byte.
     mergequeue_label: str | None = None
+    # Issue #1194: GitHub account login of the merge-queue bot (e.g.
+    # "aviator-app[bot]") whose branch sync-merges the #502 unauthorized-merge
+    # tripwire may recognize as approval-covered. Deployment config, not
+    # business logic — no bot literal is hardcoded anywhere. Default None
+    # disables the recognition entirely: every approved-head mismatch keeps
+    # firing exactly as before, so the control's failure mode is unchanged
+    # until an operator names the bot.
+    queue_bot_login: str | None = None
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -1995,6 +2003,21 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         # `gh pr edit --add-label <label>`, so surrounding whitespace must
         # not survive into the actual GitHub label name.
         auto_merge_data["mergequeue_label"] = stripped_mergequeue_label
+    queue_bot_login = auto_merge_data.get("queue_bot_login")
+    if queue_bot_login is not None:
+        if not isinstance(queue_bot_login, str):
+            raise ConfigError(
+                "config section 'auto_merge' key 'queue_bot_login' must be a string, "
+                f"got {type(queue_bot_login).__name__}"
+            )
+        stripped_queue_bot_login = queue_bot_login.strip()
+        if not stripped_queue_bot_login:
+            raise ConfigError(
+                "config section 'auto_merge' key 'queue_bot_login' must not be empty"
+            )
+        # Store the stripped value: it is compared against the GitHub commit
+        # author login, where surrounding whitespace can never match.
+        auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")
