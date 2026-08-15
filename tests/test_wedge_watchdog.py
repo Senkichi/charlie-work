@@ -590,7 +590,8 @@ def test_watchdog_kills_wedged_child_and_logs_event(tmp_path: Path) -> None:
     _path, kind, payload, kwargs = event_calls[0]
     assert kind == WEDGE_KILL_EVENT_KIND
     assert kwargs.get("repo") == "fleet"
-    assert payload["pid"] == 12345
+    assert payload["pid"] == 12345  # the killed process's pid
+    assert payload["heartbeat_pid"] == 12345  # matched heartbeat's pid
     assert payload["stale_multiplier"] == WEDGE_KILL_STALE_MULTIPLIER
 
 
@@ -792,11 +793,14 @@ def test_watchdog_kills_when_heartbeat_from_prior_pid_after_grace(tmp_path: Path
 
     assert process.killed is True
     assert wd.killed is True
-    # The kill event records the stale (prior-pid) heartbeat for diagnostics.
+    # The kill event's ``pid`` is the process actually terminated
+    # (``self._process.pid``), not the stale prior-pid heartbeat — the
+    # heartbeat's pid is preserved separately as ``heartbeat_pid``.
     assert len(event_calls) == 1
     _path, kind, payload, _kwargs = event_calls[0]
     assert kind == WEDGE_KILL_EVENT_KIND
-    assert payload["pid"] == 11111
+    assert payload["pid"] == 22222
+    assert payload["heartbeat_pid"] == 11111
 
 
 def test_watchdog_kills_when_no_heartbeat_at_all_after_grace(tmp_path: Path) -> None:
@@ -815,7 +819,8 @@ def test_watchdog_kills_when_no_heartbeat_at_all_after_grace(tmp_path: Path) -> 
     clock advances past ``WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS`` so
     ``_is_wedged`` returns ``(True, None)``, and ``_kill`` must format
     ``age=None`` as ``unknown`` (not crash), reach ``process.kill()``, set
-    ``_killed``, and record the event with ``pid=None``.
+    ``_killed``, and record the event with ``pid`` equal to the killed
+    process's pid (``self._process.pid``) and ``heartbeat_pid=None``.
     """
     start = datetime.now(UTC)
     late = start + timedelta(seconds=WEDGE_KILL_FIRST_BEAT_GRACE_SECONDS + 1)
@@ -853,13 +858,15 @@ def test_watchdog_kills_when_no_heartbeat_at_all_after_grace(tmp_path: Path) -> 
     assert any("wedge-watchdog" in m for m in log_messages)
     assert any("age=unknown" in m for m in log_messages)
     assert any("Terminating" in m for m in log_messages)
-    # An event was recorded with the registered kind and pid=None (no
-    # heartbeat → no pid to report).
+    # An event was recorded with the registered kind. ``pid`` is the
+    # killed process's pid (always known), and ``heartbeat_pid`` is None
+    # (no heartbeat file → no stated pid).
     assert len(event_calls) == 1
     _path, kind, payload, kwargs = event_calls[0]
     assert kind == WEDGE_KILL_EVENT_KIND
     assert kwargs.get("repo") == "fleet"
-    assert payload["pid"] is None
+    assert payload["pid"] == 22222
+    assert payload["heartbeat_pid"] is None
     assert payload["age_seconds"] is None
     assert payload["last_beat_at"] is None
 

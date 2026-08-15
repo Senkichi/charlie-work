@@ -338,10 +338,18 @@ class WedgeWatchdog:
         caller must continue monitoring rather than treating the child as
         killed. ``heartbeat`` may be ``None`` when the wedge verdict came
         from the first-beat grace window expiring with no heartbeat file
-        at all; the log/event payload then reports ``pid=None``.
+        at all.
+
+        The event payload's ``pid`` is always ``self._process.pid`` — the
+        process actually terminated — because that is the only pid known
+        with certainty on every kill path (the heartbeat may be absent, or
+        carry a *prior* supervisor's pid). The heartbeat's stated pid, when
+        present, is preserved separately as ``heartbeat_pid`` so the
+        forensic record still shows which (possibly stale) heartbeat drove
+        the verdict.
         """
         hb = heartbeat if heartbeat is not None else {}
-        pid = hb.get("pid")
+        heartbeat_pid = hb.get("pid")
         last_beat = hb.get("last_beat_at")
         pass_timeout = self._derive_pass_timeout(hb)
         threshold_seconds = self._stale_multiplier * pass_timeout
@@ -369,7 +377,8 @@ class WedgeWatchdog:
                 self._heartbeat_path,
                 WEDGE_KILL_EVENT_KIND,
                 {
-                    "pid": pid,
+                    "pid": self._process.pid,
+                    "heartbeat_pid": heartbeat_pid,
                     "last_beat_at": last_beat,
                     "age_seconds": age_seconds,
                     "threshold_seconds": threshold_seconds,
@@ -383,7 +392,7 @@ class WedgeWatchdog:
         try:
             self._process.kill()
         except Exception:
-            logger.exception("WedgeWatchdog: failed to kill process pid=%s", pid)
+            logger.exception("WedgeWatchdog: failed to kill process pid=%s", self._process.pid)
             return False
         self._killed = True
         return True
