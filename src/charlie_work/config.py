@@ -1452,6 +1452,19 @@ class PostMortemConfig:
         SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
         SignatureRule(pattern=r"A tool was rejected by the user", kind="worker_blocked"),
     )
+    # Issue #1234: refuse the locked-DB temp-copy fallback when sessions.db
+    # exceeds this size. A best-effort diagnostic must never write a multi-GB
+    # copy to temp — with a 12 GB sessions.db each fallback invocation costs
+    # 12 GB, and imperfect cleanup turns that into a permanent disk-filler.
+    # Default 256 MB; the read-only URI path is unaffected (no copy made).
+    temp_copy_max_bytes: int = 256 * 1024 * 1024
+    # Issue #1234: stale ``charlie-work-postmortem-*`` temp dirs older than
+    # this are reclaimed at the start of every fallback invocation, so a leak
+    # from a pass killed mid-copy (supervisor self-deploy restart cycle) is
+    # transient rather than permanent. Default 2 hours — comfortably longer
+    # than any single post-mortem pass (minutes) yet short enough that leaks
+    # cannot accumulate across a day.
+    temp_copy_reclaim_max_age_hours: int = 2
 
 
 @dataclass(frozen=True)
