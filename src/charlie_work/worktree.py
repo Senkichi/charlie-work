@@ -780,10 +780,11 @@ def worktree_ahead_of_sha(worktree_path: Path, base_sha: str) -> tuple[int | Non
 class SalvagePushResult:
     """Outcome of a salvage-push attempt on a dead worker's worktree (#1248).
 
-    Exactly one of three shapes: ``pushed=True`` (work published),
-    ``skip_reason`` set (preconditions not met -- nothing was attempted, the
-    worktree is untouched), or ``error`` set (the push itself was attempted
-    and failed).
+    Three shapes, discriminated by ``pushed``/``skip_reason``/``error``:
+    ``pushed=True`` (work published), ``skip_reason`` set (preconditions not
+    met -- nothing was attempted, the worktree is untouched), or ``error``
+    set (the push itself was attempted and failed; ``old_remote_sha`` and
+    ``commit_count`` still carry what was known at attempt time).
     """
 
     pushed: bool
