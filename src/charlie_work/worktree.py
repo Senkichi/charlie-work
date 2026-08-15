@@ -776,6 +776,173 @@ def worktree_ahead_of_sha(worktree_path: Path, base_sha: str) -> tuple[int | Non
         return None, f"rev-list returned non-integer: {count_result.stdout!r}"
 
 
+@dataclass(frozen=True)
+class SalvagePushResult:
+    """Outcome of a salvage-push attempt on a dead worker's worktree (#1248).
+
+    Exactly one of three shapes: ``pushed=True`` (work published),
+    ``skip_reason`` set (preconditions not met -- nothing was attempted, the
+    worktree is untouched), or ``error`` set (the push itself was attempted
+    and failed).
+    """
+
+    pushed: bool
+    skip_reason: str | None = None
+    error: str | None = None
+    old_remote_sha: str | None = None
+    new_remote_sha: str | None = None
+    commit_count: int | None = None
+
+
+def salvage_push_stranded_commits(
+    repo_root: Path,
+    branch: str,
+    worktree_path: Path,
+    *,
+    base_ref: str = "",
+) -> SalvagePushResult:
+    """Fast-forward-push committed-but-unpushed work from a dead worker's worktree.
+
+    A worker that completed its work locally but died before ``git push``
+    presents to the orphan sweep exactly like a worker that did nothing: zero
+    remote delta. This helper publishes that stranded work so the sweep can
+    classify against the real head instead of redispatching (issue #1248).
+
+    Safety properties, in order of enforcement:
+
+    - The caller must have already established the worker is dead (state PID
+      records); this helper additionally refuses when the worktree carries a
+      live or operator writer marker.
+    - Push happens only when the remote tip is an ancestor of the local branch
+      tip (a pure fast-forward), or when the branch does not exist on origin
+      yet and the worktree has commits beyond the base branch. **Never** a
+      force push -- and ``push_branch`` is a plain push, so even a race with a
+      concurrent remote write fails closed on the server side.
+    - Ancestry is only consulted after ``_object_exists`` confirms the remote
+      SHA is present locally: ``merge-base --is-ancestor`` cannot distinguish
+      "not an ancestor" from "unknown object", and a remote tip this worktree
+      has never seen means someone else pushed -- diverged, skip.
+
+    Never raises; every failure comes back as a value.
+    """
+    try:
+        branch = require_valid_ref_name(branch, context="salvage_push branch")
+    except ValueError as exc:
+        return SalvagePushResult(pushed=False, skip_reason=f"invalid_branch: {exc}")
+
+    if not worktree_path.is_dir():
+        return SalvagePushResult(pushed=False, skip_reason="no_worktree")
+
+    marker = read_worktree_marker(worktree_path)
+    if marker is not None:
+        if marker.get("kind") == OPERATOR_MARKER_KIND:
+            return SalvagePushResult(pushed=False, skip_reason="operator_claimed")
+        marker_pid = marker.get("pid")
+        if isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid):
+            return SalvagePushResult(pushed=False, skip_reason="live_writer_marker")
+
+    local_result = run_captured(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not local_result.ok:
+        return SalvagePushResult(pushed=False, skip_reason="branch_ref_missing")
+    local_sha = local_result.stdout.strip()
+
+    remote_exists = _remote_branch_exists(worktree_path, branch)
+    if remote_exists is None:
+        return SalvagePushResult(pushed=False, skip_reason="remote_probe_failed")
+
+    old_remote_sha: str | None = None
+    if remote_exists:
+        old_remote_sha = _remote_branch_head_sha(worktree_path, branch)
+        if old_remote_sha is None:
+            return SalvagePushResult(pushed=False, skip_reason="remote_probe_failed")
+        if old_remote_sha == local_sha:
+            return SalvagePushResult(
+                pushed=False, skip_reason="up_to_date", old_remote_sha=old_remote_sha
+            )
+        if not _object_exists(worktree_path, old_remote_sha):
+            return SalvagePushResult(
+                pushed=False,
+                skip_reason="remote_head_not_local",
+                old_remote_sha=old_remote_sha,
+            )
+        if not _is_ancestor(worktree_path, old_remote_sha, local_sha):
+            return SalvagePushResult(
+                pushed=False, skip_reason="diverged", old_remote_sha=old_remote_sha
+            )
+        count_result = run_captured(
+            ["git", "rev-list", "--count", f"{old_remote_sha}..{local_sha}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not count_result.ok:
+            return SalvagePushResult(
+                pushed=False, skip_reason="count_failed", old_remote_sha=old_remote_sha
+            )
+        try:
+            commit_count = int(count_result.stdout.strip())
+        except ValueError:
+            return SalvagePushResult(
+                pushed=False, skip_reason="count_failed", old_remote_sha=old_remote_sha
+            )
+        if commit_count == 0:
+            return SalvagePushResult(
+                pushed=False,
+                skip_reason="no_stranded_commits",
+                old_remote_sha=old_remote_sha,
+            )
+    else:
+        # Branch never made it to origin. Only publish it when the worktree
+        # actually carries commits beyond the base branch -- creating an empty
+        # remote branch would feed the #935 open-PR lane a PR with no diff.
+        base_branch = resolve_base_branch_name(repo_root, base_ref)
+        base_result = run_captured(
+            ["git", "rev-parse", "--verify", f"origin/{base_branch}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not base_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="base_unresolvable")
+        merge_base_result = run_captured(
+            ["git", "merge-base", base_result.stdout.strip(), local_sha],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not merge_base_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="base_unresolvable")
+        count_result = run_captured(
+            ["git", "rev-list", "--count", f"{merge_base_result.stdout.strip()}..{local_sha}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not count_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="count_failed")
+        try:
+            commit_count = int(count_result.stdout.strip())
+        except ValueError:
+            return SalvagePushResult(pushed=False, skip_reason="count_failed")
+        if commit_count == 0:
+            return SalvagePushResult(pushed=False, skip_reason="no_commits_beyond_base")
+
+    ok, push_error = push_branch(repo_root, branch, worktree_path)
+    if not ok:
+        return SalvagePushResult(
+            pushed=False,
+            error=f"push_failed: {push_error}",
+            old_remote_sha=old_remote_sha,
+            commit_count=commit_count,
+        )
+    return SalvagePushResult(
+        pushed=True,
+        old_remote_sha=old_remote_sha,
+        new_remote_sha=local_sha,
+        commit_count=commit_count,
+    )
+
+
 def _object_exists(repo_root: Path, sha: str) -> bool:
     """Return True if ``sha`` names an object present in the local object store.
 
