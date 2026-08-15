@@ -119,7 +119,7 @@ def test_orphan_salvage_repo_root_guard(
         *,
         repo_root: Any,
         **kwargs: Any,
-    ) -> tuple[int | None, str | None]:
+    ) -> tuple[int | None, str | None, Any]:
         # Record every invocation first, before any guard logic, so the test can
         # assert the actual value that reached the helper.
         calls.append(repo_root)
@@ -130,12 +130,12 @@ def test_orphan_salvage_repo_root_guard(
         if repo_root is None:
             # Mirror the real helper's None handling: it returns an error so the
             # caller follows the existing salvage-failure drift path.
-            return (None, "repo_root is required to open a salvage PR")
+            return (None, "repo_root is required to open a salvage PR", None)
         if not repo_root.exists():
             raise AssertionError(
                 f"_open_pr_for_orphaned_branch called with non-existent repo_root: {repo_root}"
             )
-        return (101, None)
+        return (101, None, None)
 
     with (
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
