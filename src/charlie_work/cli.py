@@ -13,6 +13,7 @@ import yaml
 
 from . import CLI_NAME
 from .closing_keyword_gate import find_unexpected_closing_references
+from .mojibake_gate import find_mojibake_in_diff
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
@@ -41,6 +42,7 @@ from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root, resolved_layout, runtime_paths
 from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
+from .subprocess_runner import run_captured
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
 from .supervise import orchestrator_root, self_deploy
 from ci_fleet.charlie_work_adapter import (
@@ -446,6 +448,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     closing_keyword_check.add_argument("--pr", type=int, required=True)
 
+    mojibake_check = subparsers.add_parser(
+        "mojibake-check",
+        help=(
+            "CI gate (issue #1057): fail if the diff introduces mojibake -- "
+            "non-ASCII characters corrupted by a UTF-8/cp1252 round trip "
+            "(e.g. em-dashes turned into the a-circumflex/euro/quote sequence). "
+            "Scans added lines in the diff against --base (default: origin/main) "
+            "using a round-trip detection derived from the encoding process, "
+            "not a hardcoded list of bad sequences."
+        ),
+    )
+    mojibake_check.add_argument(
+        "--base",
+        default="origin/main",
+        help="Git ref to diff against (default: origin/main). Uses the "
+        "two-dot diff (base..HEAD) which compares trees directly and works "
+        "in shallow clones (CI uses fetch-depth: 1) where three-dot "
+        "(base...HEAD) cannot resolve the merge-base.",
+    )
+
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
         help="Plan (and optionally apply) a move of a legacy state dir to its new root",
@@ -779,6 +801,87 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
     )
 
 
+def run_mojibake_check_command(args: argparse.Namespace) -> CommandResult:
+    """CI gate (issue #1057): fail if the diff introduces mojibake.
+
+    Runs ``git diff <base>..HEAD`` in the repo root and scans every added
+    line for cp1252/UTF-8 mojibake via :func:`find_mojibake_in_diff`.  The
+    detection is derived from the encoding process (reverse the corruption
+    and check whether the result differs) rather than a hardcoded list of
+    bad byte sequences, so it catches any UTF-8/cp1252 round trip -- not
+    just the specific em-dash sequence documented in the issue.
+
+    Uses a two-dot diff (``base..HEAD``) rather than three-dot
+    (``base...HEAD``) because CI runs against a shallow clone
+    (``actions/checkout@v5`` with ``fetch-depth: 1``).  Three-dot needs the
+    merge-base of *base* and HEAD, which requires traversing the ancestry
+    chain between them -- impossible when the shallow boundary cuts it.
+    Two-dot compares the two trees directly (no merge-base computation) and
+    works once both commits are present.  The CI workflow fetches the base
+    SHA with ``git fetch --depth 1`` before invoking this command; see the
+    "Mojibake gate" step in ``ci.yml``.
+
+    Like the closing-keyword gate, this is deliberately a step of the
+    existing "Lint" job (added in ci.yml), not a new job: GitHub reports
+    check-run status per job, so riding the already-required "Lint" context
+    makes this a de facto blocking gate the moment a PR branch includes the
+    workflow change -- no branch-protection edit, no orchestrator.config.yaml
+    change, no separate promotion step.
+
+    Errors as values (per CLAUDE.md): a git failure comes back as
+    ``CommandResult(ok=False)`` -- never raised -- so the CI step exits
+    non-zero without a Python traceback.
+    """
+    ctx = bootstrap_command(args)
+
+    base = getattr(args, "base", "origin/main")
+    result = run_captured(
+        ["git", "diff", f"{base}..HEAD"],
+        cwd=ctx.repo_root,
+        timeout_seconds=60,
+    )
+    if not result.ok:
+        return CommandResult(
+            False,
+            f"mojibake-check: could not run git diff against {base}: "
+            f"{result.error or result.stderr or 'git diff failed'}",
+            {"base": base},
+        )
+
+    findings = find_mojibake_in_diff(result.stdout)
+
+    data = {
+        "base": base,
+        "findings": [
+            {
+                "path": f.path,
+                "line": f.line_number,
+                "content": f.content,
+                "recovered": f.recovered,
+            }
+            for f in findings
+        ],
+    }
+
+    if findings:
+        lines = [f"  {f.path}:{f.line_number}: {f.content!r} -> {f.recovered!r}" for f in findings]
+        message = (
+            f"mojibake-check: {len(findings)} corrupted line(s) in diff "
+            f"against {base}\n"
+            + "\n".join(lines)
+            + "\nNon-ASCII characters were corrupted by a UTF-8/cp1252 round "
+            "trip. Restore the original characters -- do NOT replace them with "
+            "ASCII equivalents."
+        )
+        return CommandResult(False, message, data)
+
+    return CommandResult(
+        True,
+        f"mojibake-check: clean (diff against {base})",
+        data,
+    )
+
+
 def _resolve_migration_root(raw: str, repo_root: Path) -> Path:
     """Resolve a ``--src``/``--dst`` argument against *repo_root* when relative."""
     candidate = Path(raw)
@@ -962,7 +1065,12 @@ def run_migrate_state_dir_command(
             )
 
     outcome = actuator(plan)
-    data = {**data, "applied": outcome.ok, "moved": list(outcome.moved)}
+    data = {
+        **data,
+        "applied": outcome.ok,
+        "moved": list(outcome.moved),
+        "rewritten_paths": outcome.rewritten_paths,
+    }
     if not outcome.ok:
         data = {**data, "aborted_at": outcome.aborted_at}
         return CommandResult(
@@ -970,7 +1078,12 @@ def run_migrate_state_dir_command(
             f"{rendered}\nmigration failed after {len(outcome.moved)} moved: {outcome.error}",
             data,
         )
-    return CommandResult(True, f"{rendered}\nmoved {len(outcome.moved)} children", data)
+    return CommandResult(
+        True,
+        f"{rendered}\nmoved {len(outcome.moved)} children, "
+        f"rewrote {outcome.rewritten_paths} embedded paths",
+        data,
+    )
 
 
 def run_fleet_work(args: argparse.Namespace) -> CommandResult:
@@ -2148,6 +2261,12 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
                 summary_file=args.summary_file,
                 comment=args.comment,
                 reviewed_head=args.reviewed_head,
+                # Issue #1072: the operator CLI is the one caller that may
+                # legitimately pin a verdict to a superseded head (issue #467's
+                # explicit-choice design). Automated callers use the default
+                # False and are refused by record_review()'s compare-and-swap
+                # guard when the live head has moved past the packet head.
+                allow_stale_head=True,
             )
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})
@@ -2237,6 +2356,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
                 "terminal_label",
                 "active_label",
                 "operator_claimed",
+                "blocked_by_open_dependency",
                 "unidentified",
             )
             if reachability.get(reason)
@@ -2326,6 +2446,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_migrate_state_dir_command(args)
         elif args.command == "closing-keyword-check":
             result = run_closing_keyword_check_command(args)
+        elif args.command == "mojibake-check":
+            result = run_mojibake_check_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
@@ -2381,7 +2503,7 @@ def main(argv: list[str] | None = None) -> int:
                 # repo_data now includes the ok field from fleet_dispatch
                 ok = repo_data.get("ok", True)
                 status = "OK" if ok else "FAILED"
-                if repo_data.get("skipped"):
+                if repo_data.get("pass_skipped"):
                     status = "SKIPPED"
                 print(f"  {repo_key}: {status}")
                 if status != "OK" and repo_data.get("message"):

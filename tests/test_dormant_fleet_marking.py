@@ -70,11 +70,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "charlie_work"
 TESTS = REPO_ROOT / "tests"
 
-# Both ways into the package: `[project.scripts]` in pyproject.toml declares
+# Ways into the package: `[project.scripts]` in pyproject.toml declares
 # charlie = "charlie_work.cli:main", and `python -m charlie_work` enters through
 # __main__. Omitting the second classified __main__ itself as dormant, which is
-# how this list got checked rather than assumed.
-ENTRY_MODULES: tuple[str, ...] = ("cli", "__main__")
+# how this list got checked rather than assumed. merge_preflight_hook is a
+# third entry point: `.claude/settings.json` registers it as a PreToolUse
+# hook via `python -m charlie_work.merge_preflight_hook` (#894), so nothing
+# in src/ imports it by design.
+ENTRY_MODULES: tuple[str, ...] = ("cli", "__main__", "merge_preflight_hook")
 
 MARKER = "rollback_path"
 

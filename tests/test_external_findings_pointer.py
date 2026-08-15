@@ -29,6 +29,9 @@ from charlie_work.workflow import _render_required_changes_section
 _POINTER_HEADER = "Also required: findings posted on the PR itself"
 # A second, prose-level distinctive phrase from inside the pointer body.
 _POINTER_PHRASE = "Read the PR's review comments and review threads on GitHub before you start"
+# Issue #999: the external-findings section's own heading (distinct from the
+# pointer's header so the two cannot be confused).
+_EXTERNAL_SECTION_HEADER = "## Findings posted on the PR itself"
 
 
 # --------------------------------------------------------------------------
@@ -229,3 +232,144 @@ def test_blocked_with_summary_only_returns_empty_string() -> None:
     section = _render_required_changes_section(decision)
 
     assert section == ""
+
+
+# --------------------------------------------------------------------------
+# Issue #999: external findings render as their own section, separate from
+# the reviewer's required_changes. findings_channel keeps describing ONLY
+# the reviewer's list, so "derived" is never overwritten. Old-shape records
+# (no external_findings field) render exactly as before this fix.
+# --------------------------------------------------------------------------
+
+
+def test_derived_with_external_findings_renders_summary_verbatim_and_external_section() -> None:
+    """The core #999 acceptance criterion: a verdict that is BOTH ``derived``
+    AND carries external findings renders the derived summary verbatim (not
+    as a single bullet) under its own heading AND the external items as
+    bullets under theirs.
+
+    Before #999, ``record_review`` overwrote ``findings_channel`` to
+    ``"external"`` and merged the external items into ``required_changes``,
+    so the renderer took the itemized path and the multi-paragraph derived
+    summary was emitted as one ``- {...}`` bullet -- destroying the only
+    representation of what the reviewer wanted changed.
+    """
+    prose = (
+        "The retry wrapper swallows the exception type. Callers cannot "
+        "distinguish a transient failure from a permanent one, so every "
+        "retry loop masks real bugs. This affects the parse() and fetch() "
+        "paths alike.\n\nA targeted regression test should cover both."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": prose,
+        "required_changes": [prose],
+        "findings_channel": "derived",
+        "external_findings": [
+            "The migration needs a rollback path before this can land.",
+            "Add a changelog entry (Fixes #649).",
+        ],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    # The derived summary renders verbatim, NOT as a bullet.
+    assert prose in section
+    assert f"- {prose}" not in section
+    assert "did not record a structured findings list" in section
+    # The external findings render under their own heading as bullets.
+    assert _EXTERNAL_SECTION_HEADER in section
+    assert "- The migration needs a rollback path before this can land." in section
+    assert "- Add a changelog entry (Fixes issue 649)." in section
+    # The external closing keyword is defanged.
+    assert _CLOSING_KEYWORD_REF.search(section) is None, "live closing keyword survived"
+    # The pointer is NOT appended -- the external section replaces it.
+    assert _POINTER_HEADER not in section
+    assert _POINTER_PHRASE not in section
+    assert section.count(_EXTERNAL_SECTION_HEADER) == 1
+
+
+def test_itemized_with_external_findings_renders_both_sections() -> None:
+    """A reviewer-provided itemized list plus external findings: the
+    reviewer's list renders as the itemized tier (normal intro, not the
+    external-aware one) and the external items render under their own
+    heading. ``findings_channel`` is unset (the reviewer provided a list,
+    so the derivation block never ran)."""
+    decision = {
+        "decision": "request_changes",
+        "summary": "fix A",
+        "required_changes": ["fix the off-by-one", "add a regression test"],
+        "external_findings": ["The migration needs a rollback path."],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    # Reviewer's itemized list with the normal (non-external) intro.
+    assert "## Required changes" in section
+    assert "authoritative list of what must change" in section
+    assert "- fix the off-by-one" in section
+    assert "- add a regression test" in section
+    # External findings under their own heading.
+    assert _EXTERNAL_SECTION_HEADER in section
+    assert "- The migration needs a rollback path." in section
+    # No pointer (the external section replaces it).
+    assert _POINTER_HEADER not in section
+
+
+def test_old_shape_external_channel_renders_unchanged_with_pointer() -> None:
+    """Migration guarantee (issue #999): a verdict written before this fix
+    has external findings already merged into ``required_changes`` with
+    ``findings_channel == "external"`` and NO ``external_findings`` field.
+    It must render exactly as before -- the itemized tier with the
+    external-aware intro and the pointer -- so no content is lost from any
+    verdict already on disk."""
+    decision = {
+        "decision": "request_changes",
+        "summary": "The retry wrapper swallows the exception type.",
+        "required_changes": [
+            "add a regression test",
+            "The migration needs a rollback path.",
+        ],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    # Old-shape itemized tier with the external-aware intro.
+    assert "## Required changes" in section
+    assert "verified findings posted on the PR itself" in section
+    assert "- add a regression test" in section
+    assert "- The migration needs a rollback path." in section
+    # The pointer is still appended (old shape).
+    assert _POINTER_HEADER in section
+    assert section.count(_POINTER_HEADER) == 1
+    # No new-shape external section (no external_findings field).
+    assert _EXTERNAL_SECTION_HEADER not in section
+
+
+def test_vacuous_with_external_findings_still_replaces_not_separate_section() -> None:
+    """The ``vacuous`` case is the one that must NOT become a separate
+    section: a content-free reviewer summary has nothing worth rendering
+    above the external items, so ``record_review`` still *replaces*
+    ``required_changes`` with the external findings (channel ``"external"``,
+    no ``external_findings`` field). The renderer's old-shape ``"external"``
+    path handles it -- the vacuous tier-3 warning does NOT fire and the
+    external items render as the itemized list."""
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": ["The migration needs a rollback path."],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    # The vacuous tier-3 warning does NOT fire (the external items replaced
+    # the vacuous content).
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section
+    assert LEGACY_VACUOUS_SUMMARY not in section
+    # The external items render as the itemized list (old-shape external).
+    assert "- The migration needs a rollback path." in section
+    assert "verified findings posted on the PR itself" in section
+    # No new-shape external section.
+    assert _EXTERNAL_SECTION_HEADER not in section

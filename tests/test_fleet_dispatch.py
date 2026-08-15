@@ -361,10 +361,10 @@ def test_extract_attention_events_nested_loop_skip() -> None:
         {
             "stalled": [],
             "errors": [],
-            "intake": {"skipped": True, "reason": "state_lock_busy"},
+            "intake": {"pass_skipped": True, "reason": "state_lock_busy"},
             "dispatch": {"state_lock_busy": True, "reason": "state_lock_busy"},
             "dispatch_rework": {"deferred_reason": "graphql_rate_limit"},
-            "dispatch_reviews": {"skipped": True, "reason": "state_lock_busy"},
+            "dispatch_reviews": {"pass_skipped": True, "reason": "state_lock_busy"},
         },
     )
 
@@ -1501,7 +1501,7 @@ def test_fleet_loop_skips_repo_when_supervisor_lock_held(
     assert "owner/repo1" in result.data["repos"]
     repo1_data = result.data["repos"]["owner/repo1"]
     assert repo1_data["ok"] is True
-    assert repo1_data["skipped"] is True
+    assert repo1_data["pass_skipped"] is True
     assert repo1_data["reason"] == "supervisor_lock_held"
 
     # repo2 still ran
@@ -1641,7 +1641,7 @@ def test_fleet_loop_work_only_skips_locked_repo(
     assert mock_app.dispatch.call_count == 0
     repo_data = result.data["repos"]["owner/repo1"]
     assert repo_data["ok"] is True
-    assert repo_data["skipped"] is True
+    assert repo_data["pass_skipped"] is True
     assert repo_data["reason"] == "supervisor_lock_held"
 
 
@@ -7026,3 +7026,88 @@ def test_build_fleet_attention_digest_observed_repo_keys_reconciles_stale_error(
     )
     assert digest2.transitions == ()
     assert _load_fleet_health_state(state_file) == {}
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_records_fleet_lane_completed_event(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #1078: ``fleet_loop`` records a ``fleet_lane_completed`` event to
+    the fleet-level events.db for each repo after every pass, so an operator
+    can observe per-repo lane liveness from one query without hand-querying
+    each repo's individual events.db. This closes the diagnostic trap where
+    silence in the shared fleet log was indistinguishable from a broken fleet.
+    """
+    from charlie_work.fleet_paths import fleet_dir
+
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app1 = MagicMock()
+    mock_app2 = MagicMock()
+    mock_app1.loop.return_value = CommandResult(
+        True, "repo1 loop complete", {"pass_skipped": False, "errored": False}
+    )
+    mock_app2.loop.return_value = CommandResult(
+        True, "repo2 loop complete", {"pass_skipped": False, "errored": False}
+    )
+    mock_app_class.side_effect = [mock_app1, mock_app2]
+    mock_gh_class.return_value = MagicMock()
+
+    fleet_dir_override = str(tmp_path / "fleet")
+    result = fleet_loop(
+        fleet_dir_override=fleet_dir_override,
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+    )
+
+    # Both repos ran successfully.
+    assert result.data["repos"]["owner/repo1"]["ok"] is True
+    assert result.data["repos"]["owner/repo2"]["ok"] is True
+
+    # The fleet-level events.db must carry one fleet_lane_completed event per
+    # repo, with the expected payload fields.
+    fleet_state_path = layout.state_file_path(fleet_dir(override=fleet_dir_override))
+    events = query_events(fleet_state_path, kind="fleet_lane_completed")
+    assert len(events) == 2, f"expected 2 fleet_lane_completed events, got {len(events)}"
+
+    by_repo = {e["payload"]["repo_key"]: e for e in events}
+    assert set(by_repo) == {"owner/repo1", "owner/repo2"}
+
+    for repo_key, event in by_repo.items():
+        assert event["payload"]["ok"] is True
+        assert event["payload"]["pass_skipped"] is False
+        assert event["payload"]["errored"] is False
+        assert "loop complete" in event["payload"]["message"]
+        assert event["repo"] == repo_key

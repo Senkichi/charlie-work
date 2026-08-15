@@ -1071,7 +1071,7 @@ def _collect_skip_reasons(data: Any) -> set[str]:
 def _add_skip_reasons(data: dict[str, Any], reasons: set[str]) -> None:
     """Add any skip reason present in a flat result dict to the set."""
     skip_reason = data.get("reason") or data.get("deferred_reason")
-    if data.get("skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
+    if data.get("pass_skipped") or data.get("state_lock_busy") or skip_reason in _SKIP_REASONS:
         reasons.add(skip_reason or "state_lock_busy")
 
 
@@ -1725,6 +1725,14 @@ def fleet_loop(
     # the report only reads api_worker fields, which that replace never touches.
     loaded_configs: dict[str, OrchestratorConfig] = {}
 
+    # Issue #1078: fleet-level state path for per-repo lane liveness events.
+    # Each repo's lane completion is recorded here so an operator can query the
+    # fleet-level events.db (not each repo's individual events.db) to see when
+    # each repo's lane last ran — closing the diagnostic trap where the shared
+    # fleet log shows no lines for a repo whose lane is merely late.
+    resolved_fleet_dir = fleet_dir(override=fleet_dir_override)
+    fleet_state_path = layout.state_file_path(resolved_fleet_dir)
+
     # Run runner prologues if enabled (only for full loop, not work-only).
     # Allocation first: moving an idle slot to a starved repo is free, so it
     # runs before autoscale decides the host needs more runners registered.
@@ -1784,7 +1792,7 @@ def fleet_loop(
                 per_repo_results[repo_key] = CommandResult(
                     True,
                     "supervisor lock held, skipped",
-                    {"skipped": True, "reason": "supervisor_lock_held"},
+                    {"pass_skipped": True, "reason": "supervisor_lock_held"},
                 )
                 attention_events.append(
                     {
@@ -1873,6 +1881,29 @@ def fleet_loop(
             )
             _record_lane_failure_event(repo_root, repo_key, entry, error_message)
 
+    # Issue #1078: record per-repo lane liveness to the fleet-level events.db
+    # so an operator can observe every repo's last lane completion from one
+    # query, without hand-querying each repo's individual events.db. This
+    # closes the diagnostic trap where the shared fleet log shows no lines for
+    # a repo whose lane is merely late — silence in the shared log is no longer
+    # indistinguishable from a broken fleet.
+    for repo_key, result in per_repo_results.items():
+        try:
+            log_event(
+                fleet_state_path,
+                "fleet_lane_completed",
+                {
+                    "repo_key": repo_key,
+                    "ok": result.ok,
+                    "message": result.message,
+                    "pass_skipped": bool(result.data.get("pass_skipped")),
+                    "errored": bool(result.data.get("errored")),
+                },
+                repo=repo_key,
+            )
+        except Exception:
+            logger.debug("Failed to record fleet_lane_completed for %s", repo_key)
+
     # Call the notifier digest sink exactly once per fleet pass, via the real
     # #166 notify.py implementation (AttentionDigest + emit_digest).
     notify_config = getattr(global_config, "notify", None) if global_config else None
@@ -1959,7 +1990,7 @@ def _is_fleet_pass_active(pass_result: CommandResult) -> bool:
     for repo_data in data.get("repos", {}).values():
         if not isinstance(repo_data, dict):
             continue
-        if repo_data.get("skipped") is True:
+        if repo_data.get("pass_skipped") is True:
             return True
         for section_key in ("dispatch", "dispatch_rework", "dispatch_reviews"):
             section = repo_data.get(section_key) or {}
