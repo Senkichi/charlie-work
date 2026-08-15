@@ -3167,6 +3167,35 @@ def test_launch_claude_worker_honors_configured_model_override(
     assert record.command[idx + 1] == "claude-opus-4-8"
 
 
+def test_launch_claude_worker_model_override_wins_over_claude_code_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1245: an explicit ``model_override`` is pinned as the ``--model``
+    value instead of ``claude_code.model``. This is the seam the api adapter
+    uses to pin the provider's model. The two values deliberately differ so a
+    regression that ignores the override is caught."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-sonnet-5"))
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+        model_override="kimi-k3",
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == "kimi-k3"
+    assert record.command[idx + 1] != "claude-sonnet-5"
+
+
 def test_launch_claude_worker_review_pins_configured_model_by_default(
     tmp_path: Path,
 ) -> None:
