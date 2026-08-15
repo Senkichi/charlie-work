@@ -4936,12 +4936,10 @@ def _detect_and_handle_orphaned_workers(
         # ``dead_worker_with_head_change`` routed below is attributable to its
         # salvage rather than looking like a spontaneous worker push.
         for salvage_payload in salvage_pushes.values():
-            kind = (
-                "salvage_push_failed"
-                if salvage_payload.get("error")
-                else "salvage_pushed_stranded_commits"
-            )
-            sweep_events.append((kind, salvage_payload))
+            if salvage_payload.get("error"):
+                sweep_events.append(("salvage_push_failed", salvage_payload))
+            else:
+                sweep_events.append(("salvage_pushed_stranded_commits", salvage_payload))
         for issue_number in orphaned_issues:
             entry = state["issues"].get(str(issue_number), {})
             if not isinstance(entry, dict):
