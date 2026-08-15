@@ -40,3 +40,9 @@ test_marker*.txt
 # `git add -A`s a worktree with residue can commit them again.
 .worker-outcome.json
 .charlie-writer.json
+# Worker PR-body scratch files. The worker prompt does not name a file, but
+# workers ad-hoc draft their PR body into a PR_BODY_<issue>.md file in the
+# worktree root before passing it to `gh pr create --body`. Salvage squash
+# #1197 committed PR_BODY_1010.md to main this way (issue #1204). The glob
+# closes the class: any issue number, present or future, is covered.
+PR_BODY_*.md

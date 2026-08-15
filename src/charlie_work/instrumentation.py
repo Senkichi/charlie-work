@@ -282,6 +282,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "deescalation_pass_completed": "info",
         "deescalation_reason_class_backfilled": "info",
         "dispatch": "info",
+        # Issue #1129: open-PR backpressure clamped fresh-issue dispatch. Info,
+        # not warning: this is the intended self-pacing behavior (armed issues
+        # wait in the backlog instead of as open stale PRs), not a fault. The
+        # event exists so "0 dispatched with N dispatchable" is diagnosable from
+        # events.db rather than reading as idleness.
+        "dispatch_backpressure": "info",
         "dispatch_closed_unmerged_ready_stripped": "info",
         "dispatch_rework": "info",
         "draft_pr_ready_triggered": "info",
@@ -323,6 +329,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "no_op_rework_repair_requested": "info",
         "operator_claim": "info",
         "operator_claim_released": "info",
+        # Issue #1128: a dead worker with an OPEN but unreviewed PR is
+        # advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
+        # dispatch can claim the salvage PR. Info-level recovery bookkeeping,
+        # sibling to ``orphaned_worker_opened_pr``.
+        "orphaned_worker_advanced_to_pr_open": "info",
         "orphaned_worker_drift": "info",
         "orphaned_worker_opened_pr": "info",
         "orphaned_worker_recovered": "info",

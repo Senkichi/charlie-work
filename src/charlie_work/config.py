@@ -191,6 +191,16 @@ class DispatchConfig:
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
+    # Issue #1129: open-PR backpressure for fresh-issue dispatch. When > 0,
+    # fresh dispatch is clamped to max(0, max_open_agent_prs - open_pr_count)
+    # where open_pr_count is the number of open PRs whose head ref matches
+    # ``branch_prefix`` (recomputed each pass from live GitHub state). This
+    # paces fresh dispatch to the review/merge lane rather than worker
+    # throughput, preventing the open-PR queue from deepening without bound.
+    # Rework, conflict-rework, recovery, and review dispatch are NOT gated --
+    # they reduce verification debt rather than adding to it. 0 = off,
+    # preserving current behavior.
+    max_open_agent_prs: int = 0
     # Repo-root-relative paths copied into each worktree after creation
     # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
     # skip-if-tracked (tracked paths are already present). Errors surface as
@@ -1700,6 +1710,18 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'dispatch' key 'require_worker_github_token' must be a bool, "
             f"got {type(_rwt).__name__}"
         )
+    # Issue #1129: int validation for max_open_agent_prs.
+    _mop = dispatch_data.get("max_open_agent_prs")
+    if _mop is not None:
+        if isinstance(_mop, bool) or not isinstance(_mop, int):
+            raise ConfigError(
+                "config section 'dispatch' key 'max_open_agent_prs' must be an int, "
+                f"got {type(_mop).__name__}"
+            )
+        if _mop < 0:
+            raise ConfigError(
+                f"config section 'dispatch' key 'max_open_agent_prs' must be >= 0, got {_mop}"
+            )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     review_dispatch_data = _section(data, "review_dispatch")
