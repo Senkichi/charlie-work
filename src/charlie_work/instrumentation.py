@@ -343,6 +343,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "orphaned_worker_drift": "info",
         "orphaned_worker_opened_pr": "info",
         "orphaned_worker_recovered": "info",
+        # Issue #1248: a dead worker's committed-but-unpushed work was
+        # published by the orphan sweep (fast-forward only). The sibling
+        # ``salvage_push_failed`` is the attempted-but-failed case -- warning,
+        # because stranded work is sitting in a worktree the sweep could not
+        # publish and will otherwise be redispatched over.
+        "salvage_pushed_stranded_commits": "info",
+        "salvage_push_failed": "warning",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",

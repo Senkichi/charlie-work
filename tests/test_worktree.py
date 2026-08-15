@@ -33,6 +33,7 @@ from charlie_work.worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
     ReworkMergeConflict,
+    SalvagePushResult,
     _clear_declared_scaffolding_collisions,
     _default_worktrees_dir,
     _eligible_for_scaffolding_repair,
@@ -55,6 +56,7 @@ from charlie_work.worktree import (
     read_worktree_marker,
     remove_review_checkout,
     remove_worktree,
+    salvage_push_stranded_commits,
     verify_shared_venv,
     worktree_head_sha,
     write_worktree_marker,
@@ -7763,3 +7765,227 @@ def test_worktree_head_sha_non_repo_dir_returns_none(tmp_path: Path) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
     assert worktree_head_sha(plain) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #1248: salvage_push_stranded_commits
+# ---------------------------------------------------------------------------
+#
+# All tests here use real local git repos (a bare "origin" remote + a clone
+# that owns the linked worktrees under test) -- the established pattern for
+# worktree.py functions in this file. No network, no gh.
+
+
+def test_salvage_push_stranded_fast_forward(tmp_path: Path) -> None:
+    """Remote at X, worktree has 2 unpushed commits on top -> pure FF push."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a1"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    old_remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    for name in ("first.txt", "second.txt"):
+        (info.path / name).write_text(f"{name}\n", encoding="utf-8")
+        _git(info.path, "add", name)
+        _git(info.path, "commit", "-m", f"add {name}")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert isinstance(result, SalvagePushResult)
+    assert result.pushed is True
+    assert result.skip_reason is None
+    assert result.error is None
+    assert result.old_remote_sha == old_remote_sha
+    assert result.new_remote_sha == local_tip
+    assert result.commit_count == 2
+
+    assert _git(remote, "rev-parse", branch).stdout.strip() == local_tip
+
+
+def test_salvage_push_diverged_leaves_remote_untouched(tmp_path: Path) -> None:
+    """Remote advanced with a commit the worktree has fetched but is not an
+    ancestor of the local tip -> skip_reason="diverged", remote unchanged.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a2"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    old_remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    # Local, unpushed commit.
+    (info.path / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(info.path, "add", "local.txt")
+    _git(info.path, "commit", "-m", "local unpushed commit")
+
+    # A second clone pushes a sibling commit on the same branch, advancing
+    # origin without the first worktree's knowledge.
+    other_clone = tmp_path / "other-clone"
+    _clone_repo(remote, other_clone)
+    _git(other_clone, "checkout", branch)
+    (other_clone / "remote.txt").write_text("remote\n", encoding="utf-8")
+    _git(other_clone, "add", "remote.txt")
+    _git(other_clone, "commit", "-m", "remote sibling commit")
+    _git(other_clone, "push", "origin", branch)
+
+    # Fetch the new remote tip into the worktree's object store so
+    # `_object_exists` succeeds and the divergence (not "unknown object") is
+    # what `_is_ancestor` actually detects.
+    _git(info.path, "fetch", "origin", branch)
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "diverged"
+    assert result.error is None
+    assert result.old_remote_sha != old_remote_sha  # remote moved via other_clone
+    assert _git(remote, "rev-parse", branch).stdout.strip() == result.old_remote_sha
+
+
+def test_salvage_push_remote_head_not_local(tmp_path: Path) -> None:
+    """Remote tip is unknown to the worktree's object store (never fetched)
+    -> skip_reason="remote_head_not_local", distinct from "diverged".
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a3"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+
+    (info.path / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(info.path, "add", "local.txt")
+    _git(info.path, "commit", "-m", "local unpushed commit")
+
+    other_clone = tmp_path / "other-clone"
+    _clone_repo(remote, other_clone)
+    _git(other_clone, "checkout", branch)
+    (other_clone / "remote.txt").write_text("remote\n", encoding="utf-8")
+    _git(other_clone, "add", "remote.txt")
+    _git(other_clone, "commit", "-m", "remote sibling commit")
+    _git(other_clone, "push", "origin", branch)
+
+    # Deliberately do NOT fetch -- the worktree has never heard of the new
+    # remote tip.
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "remote_head_not_local"
+    assert result.error is None
+
+
+def test_salvage_push_up_to_date_skips(tmp_path: Path) -> None:
+    """Local branch tip already equals the remote tip -> no push attempted."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a4"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "up_to_date"
+    assert result.old_remote_sha == remote_sha
+    assert _git(remote, "rev-parse", branch).stdout.strip() == remote_sha
+
+
+def test_salvage_push_never_pushed_creates_branch(tmp_path: Path) -> None:
+    """Branch never reached origin, worktree has commits beyond the base ->
+    pushed=True, old_remote_sha=None, branch created on the bare repo.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a5"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # Confirm the branch is genuinely absent on origin before salvage.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is True
+    assert result.skip_reason is None
+    assert result.old_remote_sha is None
+    assert result.new_remote_sha == local_tip
+    assert result.commit_count == 1
+    assert _git(remote, "rev-parse", branch).stdout.strip() == local_tip
+
+
+def test_salvage_push_never_pushed_no_commits_beyond_base_skips(tmp_path: Path) -> None:
+    """Branch never reached origin AND has no commits beyond the base ->
+    skip_reason="no_commits_beyond_base", no branch created.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a6"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    # No commits made -- worktree HEAD is exactly origin/main's tip.
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "no_commits_beyond_base"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+def test_salvage_push_no_worktree_skips(tmp_path: Path) -> None:
+    """Worktree directory does not exist -> skip_reason="no_worktree"."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    missing_path = tmp_path / "does-not-exist"
+
+    result = salvage_push_stranded_commits(repo, "agent/issue-1248-a7", missing_path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "no_worktree"
+
+
+def test_salvage_push_live_writer_marker_skips(tmp_path: Path) -> None:
+    """A live (this-process) worker writer marker refuses the push."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a8-worker"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+
+    # The current test process's own pid is alive by construction.
+    write_worktree_marker(info.path, os.getpid(), "worker-session-1", kind="worker")
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "live_writer_marker"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+def test_salvage_push_operator_claimed_marker_skips(tmp_path: Path) -> None:
+    """An operator-claim marker refuses the push regardless of pid liveness."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a8-operator"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+
+    write_worktree_marker(
+        info.path, os.getpid(), OPERATOR_MARKER_SESSION_ID, kind=OPERATOR_MARKER_KIND
+    )
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "operator_claimed"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
