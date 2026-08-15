@@ -233,6 +233,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "draft_pr_ready_failed": "warning",
         "draft_pr_ready_held": "warning",
         "flake_rerun_failed": "warning",
+        # Issue #1132: fires when the slow-cadence self-heal re-probe finds a
+        # parked PR's linked issue now resolves. The PR recovers and resumes
+        # normal processing, but the marker was only set because a
+        # ``foreign_issue_ref`` park -- meant to be permanent -- slipped past
+        # the pre-park REST re-probe on a transient failure. Warning, not
+        # info, for the same reason as ``self_deploy_blockers_cleared``: a
+        # repeating burst on one PR is the signature of an underlying
+        # classification bug, not routine bookkeeping.
+        "foreign_issue_ref_cleared": "warning",
         "graphql_rate_limit_deferred": "warning",
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
