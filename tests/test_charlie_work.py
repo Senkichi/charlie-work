@@ -9261,6 +9261,14 @@ def test_dispatch_reviews_reaps_stalled_claim_when_disabled(monkeypatch, tmp_pat
         "process_start_time": 1.0,
     }
     (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    # Give the reviewer a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path this test
+    # exercises). Without this the log read would fail (the sidecar's
+    # log_path names a file that was never created) and classify as
+    # UNDETERMINED (issue #1069), whose first-few-deaths handling rolls the
+    # claim back to re-dispatchable instead of reaping it to
+    # review_dispatch_failed.
+    Path(sidecar["log_path"]).write_text("ordinary crash output\n", encoding="utf-8")
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         state["prs"]["100"] = {
