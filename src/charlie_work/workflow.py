@@ -139,6 +139,7 @@ from .worktree import (
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
+    salvage_push_stranded_commits,
     summarize_branch_work,
     worktree_ahead_of_sha,
     worktree_path_for_branch,
@@ -4901,6 +4902,65 @@ def _detect_and_handle_orphaned_workers(
     if repo_root is not None:
         worktrees_dir = resolved_layout(config, repo_root).worktrees
 
+    # Issue #1248: salvage-push committed-but-unpushed work from dead workers'
+    # worktrees BEFORE anything below classifies them. A worker that finished
+    # its work locally but died at the final push produces zero remote delta,
+    # so every downstream branch -- request_changes auto-reset, the no-op
+    # rework detector, the #935 pushed-branch lane -- reads it as "did
+    # nothing" and redispatches (or caps out) on work that is already done.
+    # ``salvage_push_stranded_commits`` publishes the work only when it is a
+    # pure fast-forward of the remote tip (never force; diverged worktrees
+    # fall through to the existing ``dead_worker_unsafe_to_auto_reset``
+    # handling untouched). After a successful push the PR snapshot's
+    # ``headRefOid`` is refreshed so the in-lock classification sees the head
+    # advance and routes to review instead of counting a death, and the #935
+    # candidate detection below sees the branch on origin and opens a PR for
+    # it. Runs pre-lock: it is network I/O.
+    salvage_pushes: dict[int, dict[str, Any]] = {}
+    if repo_root is not None and worktrees_dir is not None:
+        for issue_number in orphaned_issues:
+            pr_data = pr_by_issue.get(issue_number)
+            if pr_data is not None and pr_data.get("isCrossRepository"):
+                # The head branch lives in a fork; this checkout cannot (and
+                # must not) push there.
+                continue
+            entry = state.get("issues", {}).get(str(issue_number), {})
+            branch = pr_data.get("headRefName") if pr_data is not None else None
+            if not branch and isinstance(entry, dict):
+                branch = entry.get("branch_name")
+            if not branch:
+                # No recorded branch: never guess a ref name to push to.
+                continue
+            worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
+            result = salvage_push_stranded_commits(
+                repo_root, branch, worktree_path, base_ref=config.dispatch.base_ref
+            )
+            if result.pushed:
+                salvage_pushes[issue_number] = {
+                    "issue_number": issue_number,
+                    "pr_number": int(pr_data["number"]) if pr_data is not None else None,
+                    "branch": branch,
+                    "old_remote_sha": result.old_remote_sha,
+                    "new_remote_sha": result.new_remote_sha,
+                    "commit_count": result.commit_count,
+                }
+                if pr_data is not None and result.new_remote_sha:
+                    # Refresh the snapshot so classification below compares
+                    # against the salvaged head, not the pre-push one.
+                    pr_data["headRefOid"] = result.new_remote_sha
+            elif result.error:
+                salvage_pushes[issue_number] = {
+                    "issue_number": issue_number,
+                    "pr_number": int(pr_data["number"]) if pr_data is not None else None,
+                    "branch": branch,
+                    "old_remote_sha": result.old_remote_sha,
+                    "commit_count": result.commit_count,
+                    "error": result.error,
+                }
+            # skip_reason outcomes are silent by design: "up_to_date" /
+            # "no_worktree" / "no_stranded_commits" describe the overwhelming
+            # majority of dead workers and would flood events.db every pass.
+
     no_pr_issue_details: dict[int, dict[str, Any]] = {}
     pushed_branch_candidates: dict[int, dict[str, Any]] = {}
     state_snapshot = state
@@ -5060,6 +5120,15 @@ def _detect_and_handle_orphaned_workers(
     with state_lock(state_file):
         state = load_state(state_file)
         sweep_events: list[tuple[str, dict[str, Any]]] = []
+        # Issue #1248: record the pre-lock salvage pushes (and push failures)
+        # in the same event stream as the classification they feed, so a
+        # ``dead_worker_with_head_change`` routed below is attributable to its
+        # salvage rather than looking like a spontaneous worker push.
+        for salvage_payload in salvage_pushes.values():
+            if salvage_payload.get("error"):
+                sweep_events.append(("salvage_push_failed", salvage_payload))
+            else:
+                sweep_events.append(("salvage_pushed_stranded_commits", salvage_payload))
         for issue_number in orphaned_issues:
             entry = state["issues"].get(str(issue_number), {})
             if not isinstance(entry, dict):
