@@ -127,6 +127,15 @@ PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # object, and on the REST path it is already present in the payload as
 # head.sha, so adding it costs neither an extra request nor a graph walk.
 MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+# Fields the REST normalizer emits BEYOND MERGED_PR_LIST_FIELDS. These cannot
+# join the constant: it doubles as the literal `gh pr list --json` field list,
+# and gh has no `mergeCommitOid` spelling (only the `mergeCommit` object), so
+# adding it there would break the gh query in merged_prs_for_issue(). That is
+# safe only because every consumer of these extras reads merged_pr_list(),
+# which is REST-only by construction, and treats an absent key as "cannot
+# verify" (the #1194 queue-sync predicate fails closed without it). Adding an
+# entry here means accepting that the gh-backed path will never carry it.
+MERGED_PR_REST_ONLY_FIELDS = ("mergeCommitOid",)
 # Fields needed by `charlie closing-keyword-check` (issue #790): the gate only
 # scans PR body/title text for closing keywords and resolves the PR's own
 # declared-target binding via linked_issue_number(), which reads headRefName
@@ -353,6 +362,13 @@ class GitHub:
             # GraphQL name. Without this mapping every consumer reading
             # headRefOid off a merged PR silently sees None.
             "headRefOid": head.get("sha"),
+            # Issue #1194: the merge commit that landed this PR on the base
+            # branch. Its FIRST parent is the base tip immediately before
+            # this merge — the only post-merge anchor from which "was this
+            # content already on main?" can still be answered, since after
+            # the merge everything the PR carried is main-reachable through
+            # the merge commit itself.
+            "mergeCommitOid": pr.get("merge_commit_sha"),
         }
 
     def run(
