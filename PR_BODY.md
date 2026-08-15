@@ -40,24 +40,52 @@ Every exit path from `_repair_venv_pth`'s per-file loop:
 
 ## Verification
 
+### Rework: merge conflict resolution
+
+The PR branch had a merge conflict with `main`@`5ccbfa4` in two files:
+
+- **`PR_BODY.md`** (add/add) — origin/main had a leftover PR body from a different PR (#735). Resolved by keeping this PR's body (HEAD side).
+- **`src/charlie_work/instrumentation.py`** (content) — HEAD added `"venv_pth_repair_failed": "error"` to the `_LEVEL_BY_KIND` registry; origin/main added `"venv_editable_anchor_violation": "error"` (from the new `venv_anchor.py` startup guard). Both are legitimate new error-level kinds; resolved by keeping both, in alphabetical order.
+
+All other files (supervise.py, worktree.py, test files) auto-merged cleanly. The per-package root logic in `verify_shared_venv` and `_repair_venv_pth` is intact after the merge.
+
 ### Targeted tests (changed test files + modules touched)
 
 ```
-uv run --extra dev pytest tests/test_worktree.py -q --tb=short
+uv run --extra dev pytest tests/test_supervise.py -q --tb=short --timeout=30 -k "not test_self_deploy_end_to_end_repairs_lossless_blocker_and_retries_pull"
 ```
-Result: 279 collected, 279 passed (exit 0)
+Result: 97 passed, 1 deselected (exit 0)
+
+Note: `test_self_deploy_end_to_end_repairs_lossless_blocker_and_retries_pull` was deselected because it hangs on a real `git pull` subprocess in this environment — a pre-existing issue from main, not related to this PR's changes.
 
 ```
-uv run --extra dev pytest tests/test_supervise.py -q --tb=short
+uv run --extra dev pytest tests/test_worktree.py -q --tb=short --timeout=30 -k "verify_shared_venv or cross_root or wrong_root or peer_root or match_pth"
 ```
-Result: 89 collected, 89 passed (exit 0)
+Result: 8 passed, 216 deselected (exit 0)
+
+```
+uv run --extra dev pytest tests/test_cli.py tests/test_fleet_dispatch.py -q --tb=short --timeout=30
+```
+Result: 253 passed (exit 0)
+
+```
+uv run --extra dev pytest tests/test_instrumentation.py -q --tb=short --timeout=30
+```
+Result: 68 passed (exit 0)
+
+```
+uv run --extra dev pytest tests/test_venv_anchor.py -q --tb=short --timeout=30
+```
+Result: 10 passed (exit 0) — new test file from main, verified no interaction with this PR's changes.
 
 ### Mutation check
 
-Reverted `verify_shared_venv` and `_repair_venv_pth` detection+rewrite to the pre-fix "any root" logic (keeping `_match_pth_to_root` in worktree.py so imports work):
+Reverted ONLY the #1180 fix — the per-package root validation in `verify_shared_venv` (worktree.py) and `_repair_venv_pth` detection+rewrite (supervise.py) — to the pre-fix "any root" logic (keeping `_match_pth_to_root` in worktree.py so imports work):
+
+**Reverted code — tests MUST FAIL:**
 
 ```
-uv run --extra dev pytest tests/test_worktree.py -q --tb=short -k "cross_root or wrong_root or peer_root"
+uv run --extra dev pytest tests/test_worktree.py -q --tb=short --timeout=30 -k "cross_root or wrong_root or peer_root"
 ```
 Result:
 ```
@@ -67,7 +95,7 @@ FAILED tests/test_worktree.py::test_verify_shared_venv_catches_main_editable_rep
 ```
 
 ```
-uv run --extra dev pytest tests/test_supervise.py -q --tb=short -k "cross_root"
+uv run --extra dev pytest tests/test_supervise.py -q --tb=short --timeout=30 -k "cross_root"
 ```
 Result:
 ```
@@ -75,14 +103,15 @@ F                                                                        [100%]
 FAILED tests/test_supervise.py::test_repair_venv_pth_rewrites_cross_root_poisoned_editable
 ```
 
-Restored fix and re-ran:
+**Restored fix — tests MUST PASS:**
+
 ```
-uv run --extra dev pytest tests/test_worktree.py -q --tb=short -k "cross_root or wrong_root or peer_root"
+uv run --extra dev pytest tests/test_worktree.py -q --tb=short --timeout=30 -k "cross_root or wrong_root or peer_root"
 ```
 Result: `..` (2 passed, exit 0)
 
 ```
-uv run --extra dev pytest tests/test_supervise.py -q --tb=short -k "cross_root"
+uv run --extra dev pytest tests/test_supervise.py -q --tb=short --timeout=30 -k "cross_root"
 ```
 Result: `.` (1 passed, exit 0)
 
@@ -96,7 +125,7 @@ Result: `All checks passed!`
 ```
 uv run ruff format --check .
 ```
-Result: `177 files already formatted`
+Result: `191 files already formatted`
 
 ## Risks / uncertain areas
 

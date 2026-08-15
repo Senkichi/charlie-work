@@ -15,6 +15,7 @@ from charlie_work.config import (
     DispatchConfig,
     OrchestratorConfig,
     RuntimeConfig,
+    build_config_from_data,
     load_config,
 )
 from charlie_work.global_config import load_layered_config
@@ -284,6 +285,33 @@ def test_load_config_quota_probe_enabled_rejects_non_bool(tmp_path: Path) -> Non
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "quota_probe:\n  enabled: not-a-bool\n")
     with pytest.raises(ConfigError, match="quota_probe.*enabled.*must be a bool"):
+        load_config(config_file)
+
+
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_default() -> None:
+    """SupervisorConfig.self_deploy_pull_ci_fleet defaults to False (issue #552)."""
+    config = load_config(Path("nonexistent.yaml"))
+    assert config.supervisor.self_deploy_pull_ci_fleet is False
+
+
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_accepts_true(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """supervisor:
+  self_deploy_pull_ci_fleet: true
+""",
+    )
+    config = load_config(config_file)
+    assert config.supervisor.self_deploy_pull_ci_fleet is True
+
+
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_rejects_non_bool(
+    tmp_path: Path,
+) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "supervisor:\n  self_deploy_pull_ci_fleet: not-a-bool\n")
+    with pytest.raises(ConfigError, match="supervisor.*self_deploy_pull_ci_fleet.*must be a bool"):
         load_config(config_file)
 
 
@@ -1587,3 +1615,9 @@ main_ci_reclaim:
     config = load_config(config_file)
     assert config.main_ci_reclaim.enabled is False
     assert config.main_ci_reclaim.workflow_filename == "tests.yml"
+
+
+def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -> None:
+    """Issue #1001: dispatch.require_worker_github_token must be a bool."""
+    with pytest.raises(ConfigError, match="require_worker_github_token.*must be a bool"):
+        build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})

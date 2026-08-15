@@ -43,10 +43,15 @@ project environment is already ``.venv`` in the project root.
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import layout
 from .worktree import _unlink_reparse_point, is_junction
+
+if TYPE_CHECKING:
+    from .config import OrchestratorConfig
 
 # Issue #646: box-wide dispatch parallelism cap. A consuming repo's own
 # pyproject.toml commonly ships `addopts = "... -n auto --dist loadscope"`
@@ -81,6 +86,20 @@ DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 # manage its own.
 UV_NO_SYNC_VAR = "UV_NO_SYNC"
 _UV_NO_SYNC_DEFAULT = "1"
+
+# Issue #502/#1001: the GitHub token variable names sanitize_env() strips from
+# every worker subprocess's environment. The single source of truth for both
+# sanitize_env's strip loop and the worker-github-token predicate shared by
+# doctor.py's preflight check and workflow.py's dispatch gate (issue #1001).
+# Mirrored nowhere — doctor.py imports this constant instead of maintaining a
+# private copy (the pre-#1001 _STRIPPED_GH_TOKEN_VARS was deleted when this
+# became the shared predicate).
+STRIPPED_GH_TOKEN_VARS = (
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+)
 
 
 def _is_owned_venv(path: Path) -> bool:
@@ -156,12 +175,7 @@ def sanitize_env(target_path: Path) -> dict[str, str]:
     # must use an operator-supplied scoped token via worker_env.GH_TOKEN. Strip
     # both the dotcom tokens and the GHES enterprise tokens so a worker cannot
     # fall back on an enterprise-scoped credential to run ``gh pr merge``.
-    for token_var in (
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_ENTERPRISE_TOKEN",
-        "GITHUB_ENTERPRISE_TOKEN",
-    ):
+    for token_var in STRIPPED_GH_TOKEN_VARS:
         env.pop(token_var, None)
 
     # Issue #502: isolate gh's config directory so the worker cannot fall back
@@ -251,6 +265,123 @@ def resolve_uv_no_sync(
     return sanitized_env.get(UV_NO_SYNC_VAR, _UV_NO_SYNC_DEFAULT), "default"
 
 
+# ---------------------------------------------------------------------------
+# Issue #1001: shared worker-github-token predicate
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorkerTokenFinding:
+    """One adapter path's worker-github-token status (issue #1001).
+
+    Produced by :func:`worker_github_token_findings`, the single predicate
+    shared by ``doctor.py:_check_worker_github_token`` (preflight) and the
+    dispatch gate in ``workflow.py:_dispatch_impl``. Both consumers call this
+    function so they cannot drift into disagreeing about whether the fleet is
+    healthy — a test asserts they share one predicate.
+
+    ``ok`` is True when the adapter's ``worker_env`` mapping contains one of
+    :data:`STRIPPED_GH_TOKEN_VARS`. ``configured_var`` is the variable name
+    that satisfied the check (or ``None`` when ``ok`` is False). Neither field
+    ever carries a token *value* — only the variable *name* and a boolean.
+    """
+
+    name: str
+    context: str
+    config_key: str
+    ok: bool
+    configured_var: str | None = None
+
+    @property
+    def detail(self) -> str:
+        """Human-readable remediation message (no token value or prefix)."""
+        if self.ok:
+            return (
+                f"{self.config_key} configures {self.configured_var} — restores "
+                "a scoped token for worker `gh` calls after sanitize_env strips "
+                "the orchestrator's own token (issue #502/#873)"
+            )
+        return (
+            f"{self.config_key} has no GH_TOKEN/GITHUB_TOKEN (or GHES equivalent) "
+            "— sanitize_env (issue #502) strips the orchestrator's token from "
+            f"every worker and points GH_CONFIG_DIR at an empty directory, so "
+            f"workers dispatched via the `{self.context}` adapter right now have "
+            "no sanctioned credential for `gh` and will stall or silently fall "
+            "back to an ambient Git Credential Manager entry (issue #873). Set "
+            f"{self.config_key}={{'GH_TOKEN': '<scoped-PAT>'}} to fix — never "
+            "widen sanitize_env itself to pass the orchestrator's token through."
+        )
+
+
+def worker_github_token_findings(config: OrchestratorConfig) -> list[WorkerTokenFinding]:
+    """Return per-adapter-path findings on whether ``worker_env`` supplies a
+    sanctioned GitHub token (issue #1001).
+
+    This is the single predicate shared by ``doctor.py``'s preflight check
+    (``_check_worker_github_token``) and ``workflow.py``'s dispatch gate. Both
+    call this function so they cannot disagree.
+
+    Only fires for adapter families that route through ``sanitize_env``'s
+    merge: ``devin-shell`` (sources ``devin.worker_env``) and
+    ``claude-code``/``api`` (both source ``claude_code.worker_env`` — the
+    ``api`` adapter reuses the claude-code launch path). ``manual`` and
+    ``command`` do not route through ``sanitize_env`` and are excluded.
+
+    A second, separately-named finding fires whenever the claude-code launch
+    path is reachable via routing (``api_worker.enabled`` or
+    ``rescue.enabled``) and the primary adapter is not already claude-code/api
+    — so a ``devin-shell`` default with rescue enabled cannot hide a missing
+    ``claude_code.worker_env`` token.
+
+    Reads only config — never reads the process environment, never calls
+    ``sanitize_env``, never logs a token value. Returns presence as a boolean
+    and the variable *name* only.
+    """
+    adapter = config.devin.adapter
+    findings: list[WorkerTokenFinding] = []
+
+    if adapter == "devin-shell":
+        worker_env = config.devin.worker_env
+        configured_var = next((var for var in STRIPPED_GH_TOKEN_VARS if worker_env.get(var)), None)
+        findings.append(
+            WorkerTokenFinding(
+                name="worker GitHub token",
+                context=adapter,
+                config_key="devin.worker_env",
+                ok=configured_var is not None,
+                configured_var=configured_var,
+            )
+        )
+    elif adapter in ("claude-code", "api"):
+        worker_env = config.claude_code.worker_env
+        configured_var = next((var for var in STRIPPED_GH_TOKEN_VARS if worker_env.get(var)), None)
+        findings.append(
+            WorkerTokenFinding(
+                name="worker GitHub token",
+                context=adapter,
+                config_key="claude_code.worker_env",
+                ok=configured_var is not None,
+                configured_var=configured_var,
+            )
+        )
+
+    claude_code_reachable_via_routing = config.api_worker.enabled or config.rescue.enabled
+    if claude_code_reachable_via_routing and adapter not in ("claude-code", "api"):
+        worker_env = config.claude_code.worker_env
+        configured_var = next((var for var in STRIPPED_GH_TOKEN_VARS if worker_env.get(var)), None)
+        findings.append(
+            WorkerTokenFinding(
+                name="worker GitHub token (claude-code-routed)",
+                context="api/rescue",
+                config_key="claude_code.worker_env",
+                ok=configured_var is not None,
+                configured_var=configured_var,
+            )
+        )
+
+    return findings
+
+
 __all__ = [
     "sanitize_env",
     "resolve_pytest_cap",
@@ -258,4 +389,7 @@ __all__ = [
     "PYTEST_XDIST_AUTO_NUM_WORKERS_VAR",
     "DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS",
     "UV_NO_SYNC_VAR",
+    "STRIPPED_GH_TOKEN_VARS",
+    "WorkerTokenFinding",
+    "worker_github_token_findings",
 ]

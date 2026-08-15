@@ -39,7 +39,7 @@ from charlie_work.claude_code import (
 )
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.subprocess_runner import RunResult
-from charlie_work.worktree import WorktreeInfo
+from charlie_work.worktree import WorktreeForeignWriterError, WorktreeInfo
 
 
 def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
@@ -584,6 +584,74 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
 
     sidecar_path = sessions_dir / "issue-13.claude.json"
     assert sidecar_path.exists()
+
+
+def test_launch_claude_worker_foreign_writer_error_serializes_path_and_writes_clean_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression test for issue #1184.
+
+    ``WorktreeForeignWriterError.worktree_path`` is a ``pathlib.Path``. If
+    ``launch_claude_worker`` inserts it into the failure ``ClaudeWorkerRecord``
+    without ``str()`` coercion, ``_write_json_atomic`` raises ``TypeError``
+    mid-write, stranding a ``.tmp`` file and never producing a readable
+    sidecar or a returned record.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    foreign_path = tmp_path / "foreign-wt"
+
+    def foreign_writer_create_worktree(
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        materialize_dirs=(),
+        rework=False,
+        recovery=None,
+        issue_number=None,
+        config=None,
+        sessions_dir=None,
+    ):
+        raise WorktreeForeignWriterError(
+            worktree_path=foreign_path,
+            pid=1234,
+            session_id="abc",
+        )
+
+    monkeypatch.setattr(claude_code, "create_worktree", foreign_writer_create_worktree)
+
+    # Must not raise: the shim converts this exception into a durable
+    # error record.
+    record = launch_claude_worker(
+        14,
+        "agent/issue-14-foreign",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert not record.ok
+    assert record.failure_kind == "worktree_foreign_writer"
+    assert isinstance(record.worktree_path, str)
+    assert record.worktree_path == str(foreign_path)
+
+    sidecar_path = sessions_dir / "issue-14.claude.json"
+    tmp_sidecar_path = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
+
+    assert sidecar_path.exists()
+    assert not tmp_sidecar_path.exists()
+
+    # json.loads must succeed cleanly — this is the assertion that would
+    # fail (TypeError during json.dump, no file or a stranded .tmp instead)
+    # if the str() coercion were reverted.
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["failure_kind"] == "worktree_foreign_writer"
+    assert payload["worktree_path"] == str(foreign_path)
 
 
 def test_launch_claude_worker_fetch_failure_yields_error_record_not_exception(
@@ -3097,6 +3165,35 @@ def test_launch_claude_worker_honors_configured_model_override(
     assert record.command.count("--model") == 1
     idx = record.command.index("--model")
     assert record.command[idx + 1] == "claude-opus-4-8"
+
+
+def test_launch_claude_worker_model_override_wins_over_claude_code_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1245: an explicit ``model_override`` is pinned as the ``--model``
+    value instead of ``claude_code.model``. This is the seam the api adapter
+    uses to pin the provider's model. The two values deliberately differ so a
+    regression that ignores the override is caught."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-sonnet-5"))
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+        model_override="kimi-k3",
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == "kimi-k3"
+    assert record.command[idx + 1] != "claude-sonnet-5"
 
 
 def test_launch_claude_worker_review_pins_configured_model_by_default(

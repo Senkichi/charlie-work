@@ -109,6 +109,10 @@ for r in rows:
     print(
         f"  cid={r[0]} started={r[1]} completed={r[2]} ok={r[3]} elapsed={r[4]}s errors={r[5]} merges={r[6]} reviews={r[7]}"
     )
+    # Issue #1083: the agent:human-needed sink metric. Appended columns
+    # (indices 8-10) are absent on pre-#1083 databases, so guard by length.
+    if len(r) > 10:
+        print(f"    sink: population={r[8]} arrivals={r[9]} clears={r[10]}")
 print()
 
 # Reuse the path confirmed to exist above rather than re-deriving it again:

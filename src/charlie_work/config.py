@@ -191,6 +191,16 @@ class DispatchConfig:
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
+    # Issue #1129: open-PR backpressure for fresh-issue dispatch. When > 0,
+    # fresh dispatch is clamped to max(0, max_open_agent_prs - open_pr_count)
+    # where open_pr_count is the number of open PRs whose head ref matches
+    # ``branch_prefix`` (recomputed each pass from live GitHub state). This
+    # paces fresh dispatch to the review/merge lane rather than worker
+    # throughput, preventing the open-PR queue from deepening without bound.
+    # Rework, conflict-rework, recovery, and review dispatch are NOT gated --
+    # they reduce verification debt rather than adding to it. 0 = off,
+    # preserving current behavior.
+    max_open_agent_prs: int = 0
     # Repo-root-relative paths copied into each worktree after creation
     # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
     # skip-if-tracked (tracked paths are already present). Errors surface as
@@ -249,6 +259,17 @@ class DispatchConfig:
     # fires while the unfiltered backlog is observed to be non-empty. 0
     # disables the check.
     dispatch_staleness_minutes: int = 240
+    # Issue #1001: when True, dispatch refuses to launch workers if no
+    # sanctioned GitHub token is configured in the active adapter's
+    # ``worker_env`` (the same predicate ``doctor._check_worker_github_token``
+    # uses). Defaults False (warn-only: escalate once, dispatch anyway) so the
+    # gate does not take the fleet down on a config that has not yet been
+    # provisioned with a token — see the issue #1001 sequencing hazard
+    # comment. Flip to True only after an operator has provisioned a scoped
+    # token in ``devin.worker_env`` / ``claude_code.worker_env`` and confirmed
+    # workers reach ``gh pr create`` successfully. Issue #1224 tracks that
+    # staged rollout, including the eventual flip of this default to True.
+    require_worker_github_token: bool = False
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -612,6 +633,14 @@ class AutoMergeConfig:
     # merged, so no new post-merge bookkeeping is added here. Default None
     # preserves today's self-merge behavior byte-for-byte.
     mergequeue_label: str | None = None
+    # Issue #1194: GitHub account login of the merge-queue bot (e.g.
+    # "aviator-app[bot]") whose branch sync-merges the #502 unauthorized-merge
+    # tripwire may recognize as approval-covered. Deployment config, not
+    # business logic — no bot literal is hardcoded anywhere. Default None
+    # disables the recognition entirely: every approved-head mismatch keeps
+    # firing exactly as before, so the control's failure mode is unchanged
+    # until an operator names the bot.
+    queue_bot_login: str | None = None
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -1328,6 +1357,15 @@ class SupervisorConfig:
     mirrors ``self_deploy_failure_alarm``). 0 disables the alarm. A cycle
     with zero repos configured never counts toward this streak in either
     direction -- that is a configuration state, not an incident (issue #855).
+    ``self_deploy_pull_ci_fleet``: when true, ``self_deploy`` also FF-pulls
+    ``origin/main`` in the declared ``ci-fleet`` sibling checkout after a
+    successful orchestrator pull, but only when that sibling is clean and on
+    ``main``. Default false: in a development layout the sibling is a working
+    repo whose HEAD must never be moved out from under a session. Enable it
+    only for a dedicated deploy clone (issue #552), where the sibling exists
+    solely to be deployed to -- without it the daemon's editable ``ci_fleet``
+    is a silent version freeze, since ``self_deploy`` otherwise only ever
+    pulls the orchestrator checkout.
     """
 
     poll_interval_seconds: int = 20
@@ -1336,6 +1374,7 @@ class SupervisorConfig:
     max_runtime_minutes: int = 0
     max_pass_runtime_seconds: int = 1800
     self_deploy_failure_alarm: int = 3
+    self_deploy_pull_ci_fleet: bool = False
     zero_pass_alarm: int = 3
 
 
@@ -1664,6 +1703,25 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 raise ConfigError(
                     f"config section 'dispatch' key '{_int_key}' must be >= 0, got {_int_value}"
                 )
+    # Issue #1001: bool validation for require_worker_github_token.
+    _rwt = dispatch_data.get("require_worker_github_token")
+    if _rwt is not None and not isinstance(_rwt, bool):
+        raise ConfigError(
+            "config section 'dispatch' key 'require_worker_github_token' must be a bool, "
+            f"got {type(_rwt).__name__}"
+        )
+    # Issue #1129: int validation for max_open_agent_prs.
+    _mop = dispatch_data.get("max_open_agent_prs")
+    if _mop is not None:
+        if isinstance(_mop, bool) or not isinstance(_mop, int):
+            raise ConfigError(
+                "config section 'dispatch' key 'max_open_agent_prs' must be an int, "
+                f"got {type(_mop).__name__}"
+            )
+        if _mop < 0:
+            raise ConfigError(
+                f"config section 'dispatch' key 'max_open_agent_prs' must be >= 0, got {_mop}"
+            )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
     review = _build_section(ReviewConfig, "review", _section(data, "review"))
     review_dispatch_data = _section(data, "review_dispatch")
@@ -1945,6 +2003,21 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         # `gh pr edit --add-label <label>`, so surrounding whitespace must
         # not survive into the actual GitHub label name.
         auto_merge_data["mergequeue_label"] = stripped_mergequeue_label
+    queue_bot_login = auto_merge_data.get("queue_bot_login")
+    if queue_bot_login is not None:
+        if not isinstance(queue_bot_login, str):
+            raise ConfigError(
+                "config section 'auto_merge' key 'queue_bot_login' must be a string, "
+                f"got {type(queue_bot_login).__name__}"
+            )
+        stripped_queue_bot_login = queue_bot_login.strip()
+        if not stripped_queue_bot_login:
+            raise ConfigError(
+                "config section 'auto_merge' key 'queue_bot_login' must not be empty"
+            )
+        # Store the stripped value: it is compared against the GitHub commit
+        # author login, where surrounding whitespace can never match.
+        auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")
@@ -2648,6 +2721,12 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 f"config section 'supervisor' key '{int_key}' must be an int, "
                 f"got {type(value).__name__}"
             )
+    pull_ci_fleet = supervisor_data.get("self_deploy_pull_ci_fleet")
+    if pull_ci_fleet is not None and not isinstance(pull_ci_fleet, bool):
+        raise ConfigError(
+            "config section 'supervisor' key 'self_deploy_pull_ci_fleet' must be "
+            f"a bool, got {type(pull_ci_fleet).__name__}"
+        )
     supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
     post_mortem_data = _section(data, "post_mortem")
     pm_enabled = post_mortem_data.get("enabled")

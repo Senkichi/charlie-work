@@ -13,6 +13,7 @@ import yaml
 
 from . import CLI_NAME
 from .closing_keyword_gate import find_unexpected_closing_references
+from .mojibake_gate import find_mojibake_in_diff
 from .config import ConfigError, OrchestratorConfig, find_config_path
 from .doctor import DoctorCheck, run_doctor
 from .fleet_dispatch import (
@@ -41,6 +42,7 @@ from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root, resolved_layout, runtime_paths
 from .quiesce import check_quiescence
 from .state import StateLockBusy, load_state_locked, utc_now
+from .subprocess_runner import run_captured
 from .state_migration import apply_state_dir_migration, gather_migration_inputs
 from .supervise import orchestrator_root, self_deploy
 from ci_fleet.charlie_work_adapter import (
@@ -212,6 +214,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     merge_check.add_argument("pr", type=int, help="PR number to check")
 
+    merge_authorize = subparsers.add_parser(
+        "merge-authorize",
+        help=(
+            "Record an operator's explicit authorization to merge a worker PR "
+            "(issue #934). Writes an authorized_override into the PR's "
+            "review-decision.json, bound to the current head SHA, so the "
+            "tripwire and merge-check read a recorded authorization rather "
+            "than inferring one. Requires --reason; never weakens the control."
+        ),
+    )
+    merge_authorize.add_argument("pr", type=int, help="PR number to authorize")
+    merge_authorize.add_argument(
+        "--reason",
+        default=None,
+        help=(
+            "Why this merge is authorized (e.g. 'CI green, stale decision "
+            "overridden after content review'). Mandatory — a tripwire that "
+            "can be silenced silently is no control, before the merge as "
+            "much as after it."
+        ),
+    )
+    merge_authorize.add_argument(
+        "--by",
+        default=None,
+        help="Operator who authorized the merge (recorded for audit).",
+    )
+    merge_authorize.add_argument(
+        "--sha",
+        default=None,
+        help=(
+            "SHA to bind the authorization to. Defaults to the PR's live "
+            "headRefOid. An authorization that does not name the SHA it "
+            "authorizes reintroduces the rebase-moved-head hole (#802/#804)."
+        ),
+    )
+
     merge_ready = subparsers.add_parser("ship-it")
     merge_ready.add_argument("--pr", type=int, required=True)
     merge_group = merge_ready.add_mutually_exclusive_group()
@@ -373,6 +411,18 @@ def build_parser() -> argparse.ArgumentParser:
     autoscale_parser.add_argument(
         "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
     )
+    provision_parser = runners_sub.add_parser(
+        "provision",
+        help=(
+            "Manually provision one new runner when the pool is starved, reusing "
+            "decide_autoscale()'s guardrails (max_runners, RAM headroom, cooldown). "
+            "Scale-up only: never scales down. Issue #826."
+        ),
+    )
+    _add_dry_run(provision_parser)
+    provision_parser.add_argument(
+        "--fleet-wide", action="store_true", help="Use fleet-wide runner counts for guardrails"
+    )
     allocate_parser = runners_sub.add_parser(
         "allocate",
         help=(
@@ -397,6 +447,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     closing_keyword_check.add_argument("--pr", type=int, required=True)
+
+    mojibake_check = subparsers.add_parser(
+        "mojibake-check",
+        help=(
+            "CI gate (issue #1057): fail if the diff introduces mojibake -- "
+            "non-ASCII characters corrupted by a UTF-8/cp1252 round trip "
+            "(e.g. em-dashes turned into the a-circumflex/euro/quote sequence). "
+            "Scans added lines in the diff against --base (default: origin/main) "
+            "using a round-trip detection derived from the encoding process, "
+            "not a hardcoded list of bad sequences."
+        ),
+    )
+    mojibake_check.add_argument(
+        "--base",
+        default="origin/main",
+        help="Git ref to diff against (default: origin/main). Uses the "
+        "two-dot diff (base..HEAD) which compares trees directly and works "
+        "in shallow clones (CI uses fetch-depth: 1) where three-dot "
+        "(base...HEAD) cannot resolve the merge-base.",
+    )
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -731,6 +801,87 @@ def run_closing_keyword_check_command(args: argparse.Namespace) -> CommandResult
     )
 
 
+def run_mojibake_check_command(args: argparse.Namespace) -> CommandResult:
+    """CI gate (issue #1057): fail if the diff introduces mojibake.
+
+    Runs ``git diff <base>..HEAD`` in the repo root and scans every added
+    line for cp1252/UTF-8 mojibake via :func:`find_mojibake_in_diff`.  The
+    detection is derived from the encoding process (reverse the corruption
+    and check whether the result differs) rather than a hardcoded list of
+    bad byte sequences, so it catches any UTF-8/cp1252 round trip -- not
+    just the specific em-dash sequence documented in the issue.
+
+    Uses a two-dot diff (``base..HEAD``) rather than three-dot
+    (``base...HEAD``) because CI runs against a shallow clone
+    (``actions/checkout@v5`` with ``fetch-depth: 1``).  Three-dot needs the
+    merge-base of *base* and HEAD, which requires traversing the ancestry
+    chain between them -- impossible when the shallow boundary cuts it.
+    Two-dot compares the two trees directly (no merge-base computation) and
+    works once both commits are present.  The CI workflow fetches the base
+    SHA with ``git fetch --depth 1`` before invoking this command; see the
+    "Mojibake gate" step in ``ci.yml``.
+
+    Like the closing-keyword gate, this is deliberately a step of the
+    existing "Lint" job (added in ci.yml), not a new job: GitHub reports
+    check-run status per job, so riding the already-required "Lint" context
+    makes this a de facto blocking gate the moment a PR branch includes the
+    workflow change -- no branch-protection edit, no orchestrator.config.yaml
+    change, no separate promotion step.
+
+    Errors as values (per CLAUDE.md): a git failure comes back as
+    ``CommandResult(ok=False)`` -- never raised -- so the CI step exits
+    non-zero without a Python traceback.
+    """
+    ctx = bootstrap_command(args)
+
+    base = getattr(args, "base", "origin/main")
+    result = run_captured(
+        ["git", "diff", f"{base}..HEAD"],
+        cwd=ctx.repo_root,
+        timeout_seconds=60,
+    )
+    if not result.ok:
+        return CommandResult(
+            False,
+            f"mojibake-check: could not run git diff against {base}: "
+            f"{result.error or result.stderr or 'git diff failed'}",
+            {"base": base},
+        )
+
+    findings = find_mojibake_in_diff(result.stdout)
+
+    data = {
+        "base": base,
+        "findings": [
+            {
+                "path": f.path,
+                "line": f.line_number,
+                "content": f.content,
+                "recovered": f.recovered,
+            }
+            for f in findings
+        ],
+    }
+
+    if findings:
+        lines = [f"  {f.path}:{f.line_number}: {f.content!r} -> {f.recovered!r}" for f in findings]
+        message = (
+            f"mojibake-check: {len(findings)} corrupted line(s) in diff "
+            f"against {base}\n"
+            + "\n".join(lines)
+            + "\nNon-ASCII characters were corrupted by a UTF-8/cp1252 round "
+            "trip. Restore the original characters -- do NOT replace them with "
+            "ASCII equivalents."
+        )
+        return CommandResult(False, message, data)
+
+    return CommandResult(
+        True,
+        f"mojibake-check: clean (diff against {base})",
+        data,
+    )
+
+
 def _resolve_migration_root(raw: str, repo_root: Path) -> Path:
     """Resolve a ``--src``/``--dst`` argument against *repo_root* when relative."""
     candidate = Path(raw)
@@ -914,7 +1065,12 @@ def run_migrate_state_dir_command(
             )
 
     outcome = actuator(plan)
-    data = {**data, "applied": outcome.ok, "moved": list(outcome.moved)}
+    data = {
+        **data,
+        "applied": outcome.ok,
+        "moved": list(outcome.moved),
+        "rewritten_paths": outcome.rewritten_paths,
+    }
     if not outcome.ok:
         data = {**data, "aborted_at": outcome.aborted_at}
         return CommandResult(
@@ -922,7 +1078,12 @@ def run_migrate_state_dir_command(
             f"{rendered}\nmigration failed after {len(outcome.moved)} moved: {outcome.error}",
             data,
         )
-    return CommandResult(True, f"{rendered}\nmoved {len(outcome.moved)} children", data)
+    return CommandResult(
+        True,
+        f"{rendered}\nmoved {len(outcome.moved)} children, "
+        f"rewrote {outcome.rewritten_paths} embedded paths",
+        data,
+    )
 
 
 def run_fleet_work(args: argparse.Namespace) -> CommandResult:
@@ -1020,6 +1181,11 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         state_root=state_root,
         fleet_dir_override=args.fleet_dir,
         dry_run=args.dry_run,
+        pull_ci_fleet=(
+            global_config.supervisor.self_deploy_pull_ci_fleet
+            if global_config is not None
+            else False
+        ),
     )
     if not deploy.ok:
         print(f"self-deploy skipped: {deploy.error}", flush=True)
@@ -1791,6 +1957,163 @@ def run_runners_autoscale(args: argparse.Namespace) -> CommandResult:
         )
 
 
+def run_runners_provision(args: argparse.Namespace) -> CommandResult:
+    """Manually provision one new runner when the pool is starved (issue #826).
+
+    Scale-up only. Reuses ``decide_autoscale()``'s guardrails — max_runners,
+    RAM headroom, cooldown, CPU threshold — so the manual trigger cannot
+    bypass a ceiling that the unattended path would respect. Deliberately
+    never scales down: ``provision`` is an "add capacity" button, not a
+    second autoscale. If ``decide_autoscale`` returns ``ScaleAction.DOWN``,
+    the command reports the decision and exits without action.
+
+    Operator ruling (2026-08-13): approved as manual-trigger only, NOT
+    unattended autoscale. ``runner_scaling.enabled`` remaining false (the
+    code default) is a hard refusal — the operator must opt in by setting
+    the ``runner_scaling`` section (``enabled``, ``managed_root``,
+    ``package_zip``) in config before this command can act.
+
+    Provisioning stays on its own cadence and must not start or stop
+    listeners — ``charlie runners allocate`` remains the only controller of
+    which listeners run. This command only adds registrations via
+    ``provision_runner``; it never calls ``scale_down_idle_runners``.
+    """
+    ctx = bootstrap_command(args)
+
+    if not ctx.config.runner_scaling.enabled:
+        return CommandResult(
+            ok=False,
+            message="runner_scaling feature is not enabled in config",
+            data={},
+        )
+
+    dry_run = getattr(args, "dry_run", False)
+    fleet_wide = getattr(args, "fleet_wide", False)
+
+    # Observe current pool state
+    state = observe_runner_pool(
+        ctx.gh, ctx.config.runner_scaling, state_dir=ctx.paths.root, dry_run=dry_run
+    )
+
+    # Load fleet-wide totals if requested — same guardrail source as autoscale
+    fleet_totals: FleetTotals | None = None
+    skipped_repos: list[str] = []
+    if fleet_wide:
+        total_runners, total_busy_runners, skipped_repos = count_fleet_runners(
+            args.fleet_dir, runtime=ctx.config.runtime
+        )
+        fleet_totals = FleetTotals(
+            total_runners=total_runners,
+            total_busy_runners=total_busy_runners,
+        )
+
+    # Check cooldown — a guardrail decide_autoscale also enforces internally,
+    # but surfacing it here lets the operator see the reason without digging
+    # through the decision's ``reason`` string.
+    in_cooldown = is_in_cooldown(ctx.paths.root, ctx.config.runner_scaling.cooldown_minutes)
+
+    # is_idle_for_duration is a scale-down input only. Provision is scale-up
+    # only, so it is always False here — passing True would let decide_autoscale
+    # return DOWN, which this command would then refuse to act on anyway.
+    # Hardcoding False is not a hardcoded element (rule #9): it is the correct
+    # value for an input this command does not use, not a list of things to
+    # manage.
+    decision = decide_autoscale(
+        state,
+        ctx.config.runner_scaling,
+        fleet_totals=fleet_totals,
+        in_cooldown=in_cooldown,
+        is_idle_for_duration=False,
+    )
+
+    # Provision is scale-up only. A DOWN decision is reported but not acted
+    # on — this command must not become a second scale-down path that fights
+    # allocation's hysteresis or autoscale's idle detection.
+    if decision.action == ScaleAction.DOWN:
+        return CommandResult(
+            ok=True,
+            message=(
+                f"provision: scale-down declined (provision is scale-up only) - {decision.reason}"
+            ),
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "declined": True,
+            },
+        )
+
+    # In dry-run mode, return the decision without executing
+    if dry_run or decision.action != ScaleAction.UP:
+        return CommandResult(
+            ok=True,
+            message=f"provision: no action - {decision.reason}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "state": format_runner_pool_state(state),
+                "fleet_totals": {
+                    "total_runners": fleet_totals.total_runners if fleet_totals else 0,
+                    "total_busy_runners": fleet_totals.total_busy_runners if fleet_totals else 0,
+                    "skipped_repos": skipped_repos,
+                }
+                if fleet_totals
+                else None,
+            },
+        )
+
+    # Execute the scale-up
+    from ci_fleet.charlie_work_adapter import provision_runner
+
+    # Affinity knobs sourced from runner_allocation, same as autoscale.
+    # 0/0 (the section's defaults) is a no-op downstream.
+    result = provision_runner(
+        ctx.gh,
+        ctx.config.runner_scaling,
+        state.busy_runners,
+        dry_run=False,
+        reserved_threads=ctx.config.runner_allocation.reserved_threads,
+        threads_per_slot=ctx.config.runner_allocation.threads_per_slot,
+    )
+    if result.ok:
+        from ci_fleet.charlie_work_adapter import record_scale_event
+
+        record_scale_event(ctx.paths.root, "up")
+        return CommandResult(
+            ok=True,
+            message=f"provision: scaled up - {decision.reason}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "provisioning": {
+                    "runner_name": result.runner_name,
+                    "runner_dir": str(result.runner_dir) if result.runner_dir else None,
+                },
+            },
+        )
+    else:
+        return CommandResult(
+            ok=False,
+            message=f"provision: scale up failed - {result.error}",
+            data={
+                "decision": {
+                    "action": decision.action.value,
+                    "count": decision.count,
+                    "reason": decision.reason,
+                },
+                "error": result.error,
+            },
+        )
+
+
 def run_runners_allocate(args: argparse.Namespace) -> CommandResult:
     """Rebalance running runner listeners across repos by live queue demand.
 
@@ -1938,6 +2261,12 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
                 summary_file=args.summary_file,
                 comment=args.comment,
                 reviewed_head=args.reviewed_head,
+                # Issue #1072: the operator CLI is the one caller that may
+                # legitimately pin a verdict to a superseded head (issue #467's
+                # explicit-choice design). Automated callers use the default
+                # False and are refused by record_review()'s compare-and-swap
+                # guard when the live head has moved past the packet head.
+                allow_stale_head=True,
             )
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})
@@ -1948,6 +2277,8 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "merge-check":
         return app.merge_check(args.pr)
+    if args.command == "merge-authorize":
+        return app.merge_authorize(args.pr, args.reason or "", by=args.by, sha=args.sha)
     if args.command == "ship-it":
         return app.merge_ready(args.pr, merge=args.merge)
     if args.command == "tripwire":
@@ -2025,6 +2356,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
                 "terminal_label",
                 "active_label",
                 "operator_claimed",
+                "blocked_by_open_dependency",
                 "unidentified",
             )
             if reachability.get(reason)
@@ -2100,6 +2432,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_runners_scale_down(args)
             elif args.runners_command == "autoscale":
                 result = run_runners_autoscale(args)
+            elif args.runners_command == "provision":
+                result = run_runners_provision(args)
             elif args.runners_command == "allocate":
                 result = run_runners_allocate(args)
             else:
@@ -2112,6 +2446,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_migrate_state_dir_command(args)
         elif args.command == "closing-keyword-check":
             result = run_closing_keyword_check_command(args)
+        elif args.command == "mojibake-check":
+            result = run_mojibake_check_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
@@ -2167,7 +2503,7 @@ def main(argv: list[str] | None = None) -> int:
                 # repo_data now includes the ok field from fleet_dispatch
                 ok = repo_data.get("ok", True)
                 status = "OK" if ok else "FAILED"
-                if repo_data.get("skipped"):
+                if repo_data.get("pass_skipped"):
                     status = "SKIPPED"
                 print(f"  {repo_key}: {status}")
                 if status != "OK" and repo_data.get("message"):

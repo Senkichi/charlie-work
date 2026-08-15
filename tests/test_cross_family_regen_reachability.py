@@ -190,10 +190,18 @@ def _stub_model(monkeypatch: pytest.MonkeyPatch, *, writes: str | None) -> list[
     down). Invocation of THIS is the end-to-end signal that regeneration was
     actually reached -- ``review()`` being called is necessary but not
     sufficient.
+
+    Issue #1078: the code now calls ``launch_cross_family_review`` (async,
+    Popen-based) instead of ``run_cross_family_review`` (synchronous). The
+    fake simulates immediate completion — it writes the report and returns a
+    non-pending result — so these regen-reachability tests can still exercise
+    the full ``loop() → review() → _cross_family_for_pr`` path in a single
+    pass. The async-specific behaviour (pending, reap on next pass) is covered
+    by ``test_issue_1078_async_cross_family.py``.
     """
     calls: list[dict[str, Any]] = []
 
-    def fake_run(**kwargs: Any) -> CrossFamilyResult:
+    def fake_launch(**kwargs: Any) -> CrossFamilyResult:
         calls.append(kwargs)
         report_path = Path(kwargs["report_path"])
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +213,7 @@ def _stub_model(monkeypatch: pytest.MonkeyPatch, *, writes: str | None) -> list[
             ok=writes is not None, report_path=str(report_path), model="glm-5.2"
         )
 
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", fake_run)
+    monkeypatch.setattr("charlie_work.workflow.launch_cross_family_review", fake_launch)
     return calls
 
 

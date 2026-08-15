@@ -204,6 +204,38 @@ def test_unescalate_merged_pr_normalizes_status_without_label_edge(tmp_path: Pat
     assert app.gh.labels_removed == []
 
 
+def test_unescalate_merged_pr_stamps_merged_at_on_transition(tmp_path: Path) -> None:
+    """Issue #747: ``unescalate`` normalizing an escalated PR whose live GitHub
+    state is MERGED is a non-merged -> merged transition, so it must stamp
+    ``merged_at`` (the same pattern as the other five merged_at sites) so merge
+    throughput/latency stay computable from state.json regardless of which path
+    finalized the PR. The guard is on the pre-reset entry's status, so a
+    concurrent writer that already flipped the entry to 'merged' between the
+    snapshot and the in-lock apply is not back-dated."""
+    app = _app(tmp_path)
+    app.gh.prs[0]["state"] = "MERGED"
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "review_dispatch_attempt_count": 3,
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(pr_number=456)
+
+    assert result.ok is True
+    state = load_state(app.paths.state_file)
+    pr_entry = state["prs"]["456"]
+    assert pr_entry["status"] == "merged"
+    # merged_at is stamped on the genuine escalated -> merged transition.
+    assert "merged_at" in pr_entry
+    assert pr_entry["merged_at"]
+    assert pr_entry["merged_at"].endswith("Z")
+
+
 def test_unescalate_escalated_issue_with_no_pr_drops_status_and_requeues(tmp_path: Path) -> None:
     app = _app(tmp_path)
     with state_lock(app.paths.state_file):
@@ -486,3 +518,76 @@ def test_unescalate_concurrent_writer_fields_survive_the_write(tmp_path: Path) -
     assert state["prs"]["456"]["concurrent_field"] == "must-survive"
     assert state["issues"]["123"]["concurrent_issue_field"] == "must-survive"
     assert state["prs"]["456"]["status"] == PASSIVE_OPEN_STATUS
+
+
+# --- Issue #849: unescalate worktree safety re-check ---
+
+
+def test_unescalate_refuses_worktree_unsafe_when_worktree_still_dirty(
+    tmp_path: Path,
+) -> None:
+    """Issue #849: ``unescalate`` must refuse to clear a ``worktree_unsafe``
+    escalation while the worktree still has uncommitted worker-authored
+    content. Clearing the label without inspecting the worktree reports
+    success for an operation that changed nothing causal — the next rework
+    dispatch reproduces the escalation deterministically.
+    """
+    import subprocess
+
+    from charlie_work.worktree import worktree_path_for_branch
+
+    branch = "agent/issue-849-unescalate-refuse"
+    # Init a real git repo at tmp_path.
+    subprocess.run(["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.test"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test User"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "README.md").write_text("initial\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "README.md"], check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "initial"], check=True, capture_output=True
+    )
+
+    app = _app(tmp_path)
+    wt_path = worktree_path_for_branch(app.repo_root, branch, app._layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "worktree", "add", str(wt_path), "-b", branch],
+        check=True,
+        capture_output=True,
+    )
+    # Make the worktree dirty.
+    (wt_path / "worker_wip.txt").write_text("uncommitted work\n", encoding="utf-8")
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "worktree_unsafe",
+            "reason_class": "mechanical",
+            "branch_name": branch,
+        }
+        save_state(app.paths.state_file, state)
+
+    result = app.unescalate(None, 123, dry_run=False)
+
+    # unescalate refuses to clear — the worktree is still unsafe.
+    assert result.ok is True
+    assert result.data["changed"] is False
+    assert result.data["worktree_still_unsafe"] is True
+
+    state = load_state(app.paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
+    # The dirty worktree content survives.
+    assert (wt_path / "worker_wip.txt").read_text(encoding="utf-8") == "uncommitted work\n"
