@@ -177,6 +177,14 @@ def launch_api_worker(
             config=config,
             adapter_kind="api",
             provider=provider_name,
+            # Issue #1245: pin the provider's model as the ``--model`` flag.
+            # The Claude Code CLI gives ``--model`` precedence over the
+            # ``ANTHROPIC_MODEL`` env var _provider_env also injects, so
+            # without this the claude_code section's model would win and the
+            # provider's model selection would be dead argv-side. The env
+            # injection stays as belt-and-suspenders (it also covers
+            # auxiliary small-fast-model calls).
+            model_override=provider.model,
         )
     except Exception as exc:
         # launch_claude_worker itself never raises, but a future regression or a
