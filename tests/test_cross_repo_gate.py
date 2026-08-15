@@ -89,6 +89,20 @@ def test_absolute_path_outside_repo_blocks(tmp_path: Path) -> None:
     assert not result.passed
 
 
+def test_posix_style_absolute_path_outside_repo_blocks(tmp_path: Path) -> None:
+    """A POSIX-style absolute path (no drive letter) also keeps escalating.
+
+    ``Path(candidate).is_absolute()`` is platform-dependent: on Windows a
+    POSIX-style absolute path like ``/home/user/other-repo/foo.py`` reports
+    ``is_absolute() is False`` (no drive letter), which would otherwise let
+    it fall through to the single-ambiguous-candidate abstain path instead
+    of escalating. This is a regression test for that specific misfire.
+    """
+    body = "The bug is in /home/senki/other-repo/foo.py."
+    result = cross_repo_gate(body, tmp_path)
+    assert not result.passed
+
+
 def test_urls_are_not_treated_as_file_paths(tmp_path: Path) -> None:
     """URLs should not be extracted as file paths."""
     body = "See https://example.com/docs/api.py for reference."
@@ -142,6 +156,75 @@ def test_gate_result_is_frozen() -> None:
         raise AssertionError("CrossRepoGateResult should be frozen")
 
 
+def test_jc_1688_domain_shaped_table_cell_extracts_nothing_and_passes(
+    tmp_path: Path,
+) -> None:
+    """jc#1688 misfire: a scheme-less domain+path fragment in a markdown table
+    cell (``pultegroupinc.com/.../default.aspx``) is not a file path — it
+    must extract as zero candidates so the gate passes."""
+    body = (
+        "| Pulte Group | type textbox 'Search Jobs' @ pultegroupinc.com/.../default.aspx | **0** |"
+    )
+    result = cross_repo_gate(body, tmp_path)
+    assert result.referenced_paths == ()
+    assert result.passed
+
+
+def test_cw_1062_single_non_repo_shaped_candidate_abstains(tmp_path: Path) -> None:
+    """cw#1062 misfire: the sole extracted candidate is ``Scripts/charlie.exe``
+    — a venv-relative path, not a reference to this repo's code (``Scripts``
+    is not a real top-level directory here). Isolates fix 2: the fragment is
+    not domain-shaped, so this exercises only the decision-layer rule."""
+    body = (
+        "Both hits are `self_deploy_failed` on `uv sync` failing to remove "
+        "Scripts/charlie.exe (the known #854 condition)."
+    )
+    paths = extract_referenced_paths(body)
+    assert paths == ["Scripts/charlie.exe"]
+
+    result = cross_repo_gate(body, tmp_path)
+    assert result.passed
+    assert result.referenced_paths == ("Scripts/charlie.exe",)
+    assert result.missing_paths == ("Scripts/charlie.exe",)
+
+
+def test_domain_token_excluded_leaves_real_missing_path_to_escalate(
+    tmp_path: Path,
+) -> None:
+    """Isolates fix 1: two candidates in the body, one domain-shaped (must be
+    excluded by the regex fix) and one real repo-shaped missing path. The
+    domain token is dropped during extraction; the surviving candidate is a
+    single repo-shaped missing path, which still escalates — proving the
+    regex fix does not depend on the decision-layer fix's abstain behavior.
+    """
+    (tmp_path / "src" / "charlie_work").mkdir(parents=True)
+
+    body = (
+        "See pultegroupinc.com/careers/default.aspx for context; the actual "
+        "bug is in `src/charlie_work/nonexistent.py`."
+    )
+    paths = extract_referenced_paths(body)
+    assert paths == ["src/charlie_work/nonexistent.py"]
+
+    result = cross_repo_gate(body, tmp_path)
+    assert not result.passed
+    assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
+    assert "cross_repo_target" in result.reason
+
+
+def test_single_repo_shaped_relative_candidate_still_escalates(tmp_path: Path) -> None:
+    """A single missing relative candidate whose first segment IS a real
+    repo_root directory (``src``) still escalates — the decision-layer
+    exception only abstains for non-repo-shaped candidates."""
+    (tmp_path / "src" / "charlie_work").mkdir(parents=True)
+
+    body = "The bug is in `src/charlie_work/nonexistent.py`."
+    result = cross_repo_gate(body, tmp_path)
+    assert not result.passed
+    assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
+    assert "cross_repo_target" in result.reason
+
+
 def test_issue_953_scenario_blocks(tmp_path: Path) -> None:
     """The exact scenario from issue #1010/#953: issue body references
     ``suite_coverage.py`` at a path in a sibling repo, with no matching file
@@ -154,5 +237,21 @@ def test_issue_953_scenario_blocks(tmp_path: Path) -> None:
         "`C:\\Users\\senki\\repos\\ci_runners` — the **shared main checkout** — and worked there."
     )
     result = cross_repo_gate(body, tmp_path)
+    assert not result.passed
+    assert "cross_repo_target" in result.reason
+
+
+def test_domain_token_adjacent_to_real_path_does_not_swallow_it(
+    tmp_path: Path,
+) -> None:
+    """A domain-shaped token packed tightly against a repo-shaped path in a
+    compact markdown table cell must not swallow its neighbor: the domain
+    token is stripped, the real (missing) repo-shaped candidate survives,
+    and the gate still escalates on it."""
+    (tmp_path / "src" / "charlie_work").mkdir(parents=True)
+
+    body = "| Pulte | pultegroupinc.com/careers/default.aspx|src/charlie_work/real.py |"
+    result = cross_repo_gate(body, tmp_path)
+    assert result.referenced_paths == ("src/charlie_work/real.py",)
     assert not result.passed
     assert "cross_repo_target" in result.reason
