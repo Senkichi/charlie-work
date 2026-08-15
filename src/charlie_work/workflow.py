@@ -2132,9 +2132,12 @@ def _windowed_orphan_redispatch_at(
     recorded by the orphan-sweep no-open-PR redispatch cap (issue #1243) each
     time it processes an issue whose worker died without leaving an open PR.
     Unlike ``adapter_history`` (which only grows when ``api_worker.enabled``
-    is ``True``, via ``routing.record_adapter_choice``), this list is appended
-    unconditionally on every orphan-sweep pass through the cap code, so the
-    cap actually fires in the default (non-API-routed) configuration.
+    is ``True``, via ``routing.record_adapter_choice``), this list grows in
+    the default (non-API-routed) configuration too. It is appended once per
+    *dead dispatch* (keyed by ``orphan_redispatch_counted_dispatch``), not
+    once per sweep pass -- the #417 reclaim leaves the dead-worker record in
+    place, so the same entry is re-observed every pass until a genuine
+    redispatch replaces it.
     """
     raw = entry.get("orphan_redispatch_at")
     if not isinstance(raw, list):
@@ -5438,10 +5441,11 @@ def _detect_and_handle_orphaned_workers(
                 # reproduces the #709 infinite loop (worker exits -> sweep
                 # strips agent:in-progress -> issue returns to the dispatchable
                 # pool -> next pass redispatches -> repeat). The cap counts
-                # orphan-sweep passes via an unconditional timestamp list
-                # (``orphan_redispatch_at``), mirroring the
-                # ``redispatch_at``/``worker_death_at`` pattern used by the
-                # parallel worker_death_loop cap elsewhere in this module.
+                # dead *dispatches* via a timestamp list
+                # (``orphan_redispatch_at``) deduplicated on dispatch identity,
+                # mirroring the ``redispatch_at``/``worker_death_at`` pattern
+                # used by the parallel worker_death_loop cap elsewhere in this
+                # module.
                 # The previous implementation derived the count from
                 # ``len(adapter_history)``, but that list only grows when
                 # ``api_worker.enabled`` is ``True`` (via
@@ -5466,18 +5470,35 @@ def _detect_and_handle_orphaned_workers(
 
                 head_changed = prior_head is not None and current_head != prior_head
                 first_observation = prior_head is None
+                # Identity of the dispatch whose dead worker this pass is
+                # observing. The #417 reclaim deliberately leaves the entry's
+                # status/worker_pid untouched (issue #282 fingerprint
+                # preservation), so the same dead entry is re-discovered by
+                # every subsequent sweep pass until a real redispatch replaces
+                # dispatched_at/worker_pid. Counting passes would therefore
+                # escalate after a few sweeps with zero actual redispatch
+                # attempts (e.g. during fleet-capacity dispatch delays);
+                # instead, each dead dispatch is counted exactly once, keyed
+                # by this identity.
+                dispatch_identity = (
+                    f"{entry.get('dispatched_at') or 'none'}"
+                    f":{entry.get('worker_pid') or 'none'}"
+                )
+                prior_dispatch = entry.get("orphan_redispatch_counted_dispatch")
                 # Read the windowed timestamp list. On progress or first
-                # observation, reset it to [now] so only passes after this
+                # observation, reset it to [now] so only attempts after this
                 # point count toward the cap. Otherwise, append this pass's
-                # timestamp unconditionally -- this is the fix for the
-                # api_worker.enabled=False gap: the counter grows on every
-                # sweep pass, not only when adapter routing records a choice.
+                # timestamp only when it observes a dispatch not yet counted
+                # -- re-observing the same dead dispatch on a later sweep
+                # pass is not a redispatch attempt. (The timestamp list, not
+                # adapter_history, is still what the count derives from:
+                # adapter_history only grows when api_worker.enabled is True.)
                 orphan_redispatch_at = _windowed_orphan_redispatch_at(
                     entry, window_minutes=config.watchdog.redispatch_window_minutes
                 )
                 if head_changed or first_observation:
                     orphan_redispatch_at = [now_ts]
-                else:
+                elif dispatch_identity != prior_dispatch:
                     orphan_redispatch_at = orphan_redispatch_at + [now_ts]
 
                 redispatch_count = len(orphan_redispatch_at)
@@ -5498,6 +5519,7 @@ def _detect_and_handle_orphaned_workers(
                             "dispatched_at": None,
                             "orphan_redispatch_head_sha": current_head,
                             "orphan_redispatch_at": orphan_redispatch_at,
+                            "orphan_redispatch_counted_dispatch": None,
                             "orphan_flagged_at": None,
                             "orphan_drift_fingerprint": None,
                             "orphan_drift_at": None,
@@ -5521,11 +5543,13 @@ def _detect_and_handle_orphaned_workers(
                     continue
 
                 # Cap not exceeded (or progress detected): persist the head
-                # fingerprint and timestamp list so the next orphan-sweep pass
-                # can compare against them. On progress or first observation,
-                # the list was just (re)seeded above; this persists it.
+                # fingerprint, timestamp list, and counted dispatch identity
+                # so the next orphan-sweep pass can compare against them. On
+                # progress or first observation, the list was just (re)seeded
+                # above; this persists it.
                 entry["orphan_redispatch_head_sha"] = current_head
                 entry["orphan_redispatch_at"] = orphan_redispatch_at
+                entry["orphan_redispatch_counted_dispatch"] = dispatch_identity
 
                 # Issue #417: report (and, on success, resolve) the ground-truth
                 # label reclaim computed above before falling back to the
@@ -14872,6 +14896,7 @@ class OrchestratorApp:
         # after the operator re-arms the issue.
         "orphan_redispatch_head_sha",
         "orphan_redispatch_at",
+        "orphan_redispatch_counted_dispatch",
         "escalation_reason",
         # Issue #783: a human-authorized manual unescalate clears the reason
         # class (the escalation itself is gone) and resets the auto
