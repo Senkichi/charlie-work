@@ -56,6 +56,7 @@ from charlie_work.worktree import (
     read_worktree_marker,
     remove_review_checkout,
     remove_worktree,
+    resolve_base_branch_name,
     salvage_push_stranded_commits,
     verify_shared_venv,
     worktree_head_sha,
@@ -3343,6 +3344,68 @@ def test_resolve_default_branch_ref_raises_when_unhealable(tmp_path: Path) -> No
 
     with pytest.raises(RuntimeError, match="issue #239"):
         _resolve_default_branch_ref(repo_root)
+
+
+def _init_repo_with_branch(repo_root: Path, initial_branch: str) -> None:
+    """Init a non-bare repo with a custom initial branch name and one commit."""
+    repo_root.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", f"--initial-branch={initial_branch}"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+
+
+def test_resolve_base_branch_name_derives_trunk_default(tmp_path: Path) -> None:
+    """Issue #1250: an unset base_ref must resolve to the repo's real default
+    branch (here ``trunk``), not a hardcoded ``main``. Uses a local git fixture
+    with no network: ``git clone`` sets ``refs/remotes/origin/HEAD`` to point at
+    the remote's default branch, which ``resolve_base_branch_name`` reads via
+    ``git symbolic-ref``.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo_with_branch(remote_repo, "trunk")
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # A fresh clone sets origin/HEAD -> origin/trunk automatically; verify the
+    # precondition so the test fails loudly if the fixture regresses.
+    symref = _git(repo_root, "symbolic-ref", "refs/remotes/origin/HEAD")
+    assert symref.stdout.strip() == "refs/remotes/origin/trunk"
+
+    assert resolve_base_branch_name(repo_root, "") == "trunk"
+
+
+def test_resolve_base_branch_name_falls_back_to_main_when_repo_silent(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #1250: the ``"main"`` literal is reachable only when the repo
+    itself provides no answer (no remote HEAD symref, no HEAD match), and its
+    use is logged so the guess is visible. A bare ``git init`` with no remote
+    has no ``refs/remotes/origin/HEAD`` to read.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+
+    with caplog.at_level("WARNING", logger="charlie_work.worktree"):
+        assert resolve_base_branch_name(repo_root, "") == "main"
+    assert any("falling back to hardcoded 'main'" in record.message for record in caplog.records)
+
+
+def test_resolve_base_branch_name_strips_origin_prefix(tmp_path: Path) -> None:
+    """Prefix-stripping behavior is unchanged by the #1250 fix: an explicit
+    ``origin/<branch>`` ref is returned as the bare branch name without
+    consulting the remote HEAD.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    assert resolve_base_branch_name(repo_root, "origin/develop") == "develop"
+    assert resolve_base_branch_name(repo_root, "refs/remotes/origin/release") == "release"
+    assert resolve_base_branch_name(repo_root, "refs/heads/feature") == "feature"
 
 
 def test_fresh_dispatch_autoresolve_ignores_stale_local_head(tmp_path: Path) -> None:
