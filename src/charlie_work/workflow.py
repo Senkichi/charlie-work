@@ -23352,6 +23352,151 @@ class OrchestratorApp:
             repo_root=self.repo_root,
         )
 
+    def _queue_sync_merge_covered(
+        self,
+        pr: dict[str, Any],
+        reviewed_head_sha: str | None,
+        live_head_sha: str | None,
+    ) -> bool:
+        """Return True iff the merged head is an approval-covered queue sync-merge.
+
+        Issue #1194: Aviator's mergequeue syncs a PR branch with main before
+        merging, so the merged head is a bot-authored merge commit whose
+        parents are the approved head and a main commit — a structural false
+        positive for the #502 tripwire's strict SHA equality. Recognize that
+        shape, and only that shape, as covered by the recorded approval. All
+        four conditions must hold (fail closed on every missing or ambiguous
+        signal — an unanswerable question keeps the finding firing, and the
+        existing ack flow remains the escape hatch):
+
+        1. the live head is a merge commit with exactly two parents;
+        2. exactly one parent IS the approved ``reviewed_head_sha``;
+        3. the other parent is reachable from the base branch as it stood
+           immediately BEFORE this PR's merge — anchored at the merge
+           commit's first parent, NOT at current main. Post-merge, current
+           main reaches everything the PR carried (including a smuggled
+           second parent) through the merge commit itself, so a naive
+           "reachable from main" test is vacuously true and enforces
+           nothing. Reachability from pre-merge main is the discriminating
+           form: nothing this PR introduced can be reachable from there.
+           This condition is the load-bearing one — it bounds the merged
+           content to (approved head + prior main) regardless of who
+           authored the commit;
+        4. the merge commit's author login is the configured
+           ``auto_merge.queue_bot_login`` and its committer is GitHub's
+           web-flow (both identity signals, same rationale as
+           ``_verify_synced_head``: either alone is spoofable via crafted
+           git metadata). Identity is defense-in-depth on top of (3), not a
+           substitute for it. Unset ``queue_bot_login`` disables recognition
+           entirely — the tripwire behaves exactly as before #1194.
+
+        Suppressions are audit-logged (``unauthorized_merge_queue_sync_covered``,
+        events.db via ``log_event`` — this path holds no state lock) so every
+        exercised gate exception leaves a queryable trail; consumer is the
+        operator auditing tripwire behavior, mirroring the skip-event pattern.
+        """
+        queue_bot_login = self.config.auto_merge.queue_bot_login
+        if not queue_bot_login:
+            return False
+        if not reviewed_head_sha or not live_head_sha:
+            return False
+
+        head_result = self.gh.commit(live_head_sha)
+        head_commit = (
+            head_result.value
+            if isinstance(head_result, GitHubRunResult)
+            and head_result.ok
+            and isinstance(head_result.value, dict)
+            else None
+        )
+        if not head_commit:
+            return False
+
+        parents = [
+            str(p.get("sha"))
+            for p in (head_commit.get("parents") or [])
+            if isinstance(p, dict) and p.get("sha")
+        ]
+        if len(parents) != 2:
+            return False
+        matching = [p for p in parents if p == reviewed_head_sha]
+        if len(matching) != 1:
+            # Zero matches: not a sync of the approved head. Two matches: a
+            # degenerate both-parents-approved merge — nothing to sync, so
+            # nothing this path needs to bless; fail closed.
+            return False
+        other_parent = next(p for p in parents if p != reviewed_head_sha)
+
+        # Identity (condition 4). Checked before the extra API calls of
+        # condition 3 purely to keep the miss path cheap; order does not
+        # affect the verdict since all conditions are conjunctive.
+        author = head_commit.get("author")
+        author_login = author.get("login") if isinstance(author, dict) else None
+        committer = head_commit.get("committer")
+        committer_login = committer.get("login") if isinstance(committer, dict) else None
+        commit_meta = head_commit.get("commit")
+        commit_committer = commit_meta.get("committer") if isinstance(commit_meta, dict) else None
+        committer_name = (
+            commit_committer.get("name") if isinstance(commit_committer, dict) else None
+        )
+        if (
+            author_login != queue_bot_login
+            or committer_login != "web-flow"
+            or committer_name != "GitHub"
+        ):
+            return False
+
+        # Condition 3: anchor at pre-merge main via the landing merge
+        # commit's first parent. GitHub commits merges on the base branch,
+        # so parents[0] of merge_commit_sha is the base tip this merge
+        # advanced. If the queue fast-forwarded instead (merge commit == the
+        # sync commit itself), parents[0] is the approved head, the compare
+        # below cannot succeed, and the finding keeps firing — fail closed.
+        merge_commit_sha = pr.get("mergeCommitOid")
+        if not merge_commit_sha:
+            return False
+        landing_result = self.gh.commit(str(merge_commit_sha))
+        landing_commit = (
+            landing_result.value
+            if isinstance(landing_result, GitHubRunResult)
+            and landing_result.ok
+            and isinstance(landing_result.value, dict)
+            else None
+        )
+        if not landing_commit:
+            return False
+        landing_parents = [
+            str(p.get("sha"))
+            for p in (landing_commit.get("parents") or [])
+            if isinstance(p, dict) and p.get("sha")
+        ]
+        if not landing_parents:
+            return False
+        pre_merge_base = landing_parents[0]
+
+        comparison = self.gh.compare(pre_merge_base, other_parent)
+        if not isinstance(comparison, dict):
+            return False
+        # "identical"/"behind" mean other_parent introduces zero commits not
+        # already on pre-merge main; "ahead"/"diverged" (or anything else)
+        # mean it carries content this approval never covered.
+        if comparison.get("status") not in ("identical", "behind"):
+            return False
+
+        log_event(
+            self.paths.state_file,
+            "unauthorized_merge_queue_sync_covered",
+            {
+                "pr": pr.get("number"),
+                "reviewed_head_sha": reviewed_head_sha,
+                "live_head_sha": live_head_sha,
+                "sync_parent": other_parent,
+                "pre_merge_base": pre_merge_base,
+                "queue_bot_login": queue_bot_login,
+            },
+        )
+        return True
+
     def _detect_unauthorized_merges(
         self, merged_prs: list[dict[str, Any]] | None = None
     ) -> list[dict[str, Any]]:
@@ -23444,7 +23589,24 @@ class OrchestratorApp:
             # after authorization invalidates the override exactly as it
             # invalidates an approved decision.
             override_authorized = _authorized_override_matches(decision, live_head_sha)
-            if (not approved or not head_matches) and not override_authorized:
+            # Issue #1194: an approved decision whose head moved may be an
+            # Aviator queue sync-merge of the approved head — structurally a
+            # false positive. Recognized only under the fail-closed
+            # four-condition predicate in _queue_sync_merge_covered, and
+            # evaluated lazily: only for approved decisions with a genuine
+            # head mismatch and no override, so the common paths (matching
+            # head, unapproved, overridden) never pay its API calls.
+            queue_sync_covered = (
+                approved
+                and not head_matches
+                and not override_authorized
+                and self._queue_sync_merge_covered(pr, reviewed_head_sha, live_head_sha)
+            )
+            if (
+                (not approved or not head_matches)
+                and not override_authorized
+                and not queue_sync_covered
+            ):
                 issue_number = linked_issue_number(
                     pr,
                     is_cross_repository=pr.get("isCrossRepository"),

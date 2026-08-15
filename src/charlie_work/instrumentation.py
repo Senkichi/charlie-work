@@ -377,6 +377,11 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "supervisor_started": "info",
         "unauthorized_merge_acknowledged": "info",
         "unauthorized_merge_baseline_armed": "info",
+        # The #502 tripwire recognized a mergequeue sync-merge (#1194) and
+        # suppressed the finding. Routine under an active merge queue -- fires
+        # on every legitimate sync-merge -- but kept in the audit trail so
+        # suppressions are queryable next to the findings they replaced.
+        "unauthorized_merge_queue_sync_covered": "info",
         "unescalate": "info",
         "verdict_carried_forward_clean_rebase": "info",
         "verdict_carried_forward_line_content": "info",
