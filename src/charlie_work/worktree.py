@@ -109,10 +109,22 @@ class WorktreeUnsafeError(RuntimeError):
     ``kind`` carries the discriminator (issue #807) so the launch shim can
     emit a distinct ``failure_kind`` at detection time rather than
     classifying after the fact. It is derived from the ``dirty_reason``
-    string by ``_worktree_unsafe_kind_from_reason``.
+    string by ``_worktree_unsafe_kind_from_reason`` unless the caller
+    supplies it explicitly, in which case it must be one of
+    ``WORKTREE_UNSAFE_KINDS`` — an unrecognized explicit ``kind`` would
+    silently fail to match either
+    ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` or
+    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``, degrading to
+    the ordinary redispatch-cap path instead of escalating, so this fails
+    closed with a ``ValueError`` rather than allowing that silently.
     """
 
     def __init__(self, reason: str, *, kind: str | None = None) -> None:
+        if kind is not None and kind not in WORKTREE_UNSAFE_KINDS:
+            raise ValueError(
+                f"invalid WorktreeUnsafeError kind {kind!r}; expected one of "
+                f"{sorted(WORKTREE_UNSAFE_KINDS)}"
+            )
         self.reason = reason
         self.kind = kind or _worktree_unsafe_kind_from_reason(reason)
         super().__init__(reason)

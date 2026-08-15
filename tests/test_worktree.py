@@ -21,6 +21,7 @@ from charlie_work import worktree as worktree_module
 from charlie_work.worktree import (
     OPERATOR_MARKER_KIND,
     OPERATOR_MARKER_SESSION_ID,
+    WORKTREE_UNSAFE_KINDS,
     WorktreeCleanResult,
     WorktreeCleanGH,
     WorktreeInfo,
@@ -7471,3 +7472,26 @@ def test_worktree_unsafe_error_explicit_kind_overrides_reason_derivation() -> No
         kind="worktree_unsafe_local_commits",
     )
     assert exc.kind == "worktree_unsafe_local_commits"
+
+
+def test_worktree_unsafe_error_rejects_unrecognized_explicit_kind() -> None:
+    """Issue #807: an explicit ``kind`` that isn't one of ``WORKTREE_UNSAFE_KINDS``
+    must fail closed with ``ValueError`` rather than being accepted silently. A
+    stray/unrecognized kind would match neither
+    ``DETERMINISTIC_ESCALATION_FAILURE_KINDS`` nor
+    ``DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``, so it would silently
+    degrade to the ordinary redispatch-cap path instead of escalating.
+    """
+    with pytest.raises(ValueError):
+        WorktreeUnsafeError(
+            "worktree has uncommitted modifications",
+            kind="worktree_unsafe_bogus",
+        )
+
+
+def test_worktree_unsafe_error_derived_kind_is_always_a_known_kind() -> None:
+    """Issue #807: a reason string that matches neither known discriminator
+    pattern must still derive a kind from ``WORKTREE_UNSAFE_KINDS`` (the
+    fail-closed fallback), never an unrecognized or empty kind."""
+    exc = WorktreeUnsafeError("worktree is in an unexpected state")
+    assert exc.kind in WORKTREE_UNSAFE_KINDS
