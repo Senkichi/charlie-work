@@ -179,6 +179,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "merge_failed": "error",
         "merge_failed_attempt_alarm": "error",
         "operator_claim_failed": "error",
+        # Issue #1243: the orphan-sweep no-open-PR redispatch path hit the
+        # same per-issue cap the rework lane enforces (worker_death_loop)
+        # with an unchanged branch head across attempts -- a death loop with
+        # no progress and no bound. Terminal for the issue -> error, parallel
+        # to session_failed_escalated.
+        "orphan_sweep_redispatch_escalated": "error",
         "orphan_processes_killed": "error",
         "orphaned_worker_routed_to_review": "error",
         "pre_review_rework_routed": "error",
