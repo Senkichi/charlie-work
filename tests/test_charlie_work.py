@@ -14678,6 +14678,132 @@ def test_loop_foreign_issue_ref_self_heal_clears_stale_marker(
     assert any(e.get("payload", {}).get("pr_number") == 456 for e in cleared)
 
 
+def test_loop_foreign_issue_ref_self_heal_refreshes_on_confirmed_404(
+    tmp_path: Path,
+) -> None:
+    """Issue #1132: a >24h-stale ``foreign_issue_ref`` marker re-probed via
+    REST that re-confirms the issue is still absent (GitHubNotFoundError) must
+    refresh ``detected_at`` so the next re-probe is another full interval away,
+    and the PR must remain parked — it must NOT fall through to normal per-PR
+    work this pass."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.github import GitHubNotFoundError
+
+    class ConfirmedForeignGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            # Issue 123 does not exist in this repo.
+            self.issues = []
+
+        def issue_view(self, number: int):
+            if number == 123:
+                raise GitHubNotFoundError("could not resolve to a Issue with the number 123.")
+            return super().issue_view(number)
+
+    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ConfirmedForeignGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Seed a stale marker: >24h old, linked to issue 123.
+    frozen_now = datetime.now(UTC)
+    stale_detected_at = (frozen_now - timedelta(hours=25)).isoformat().replace("+00:00", "Z")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **(state["prs"].get("456") or {}),
+            "number": 456,
+            "foreign_issue_ref": {
+                "issue": 123,
+                "detected_at": stale_detected_at,
+                "reason": "stale wrong park from a transient outage",
+            },
+        }
+        save_state(paths.state_file, state)
+
+    result = app.loop(limit=0, now=frozen_now)
+
+    # detected_at was refreshed — advanced past the stale seed.
+    state = load_state(app.paths.state_file)
+    marker = state["prs"]["456"]["foreign_issue_ref"]
+    assert marker["issue"] == 123
+    refreshed_at = datetime.fromisoformat(str(marker["detected_at"]).replace("Z", "+00:00"))
+    stale_at = datetime.fromisoformat(stale_detected_at.replace("Z", "+00:00"))
+    assert refreshed_at > stale_at
+
+    # The PR remains parked — not counted as an open tracked PR, and it
+    # surfaces in the parked-foreign-PR visibility fields.
+    assert result.data["open_tracked_prs"] == 0
+    assert result.data["parked_foreign_pr_count"] == 1
+    assert result.data["parked_foreign_prs"] == [456]
+
+
+def test_loop_foreign_issue_ref_self_heal_fail_open_on_transient_github_error(
+    tmp_path: Path,
+) -> None:
+    """Issue #1132: a >24h-stale ``foreign_issue_ref`` marker re-probed via
+    REST that fails with a non-404 ``GitHubError`` (transient — e.g. a
+    connection reset or rate limit) must clear the marker (fail-open) rather
+    than holding the PR on a signal that could itself be the outage. Under
+    repeated transient failures the PR must not flap between parked and
+    un-parked: once cleared, subsequent passes route the transient failure to
+    the retryable errors path, never re-parking."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.github import GitHubError
+
+    class TransientGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = []
+
+        def issue_view(self, number: int):
+            if number == 123:
+                raise GitHubError("transient: connection reset by peer")
+            return super().issue_view(number)
+
+    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = TransientGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    frozen_now = datetime.now(UTC)
+    stale_detected_at = (frozen_now - timedelta(hours=25)).isoformat().replace("+00:00", "Z")
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["prs"]["456"] = {
+            **(state["prs"].get("456") or {}),
+            "number": 456,
+            "foreign_issue_ref": {
+                "issue": 123,
+                "detected_at": stale_detected_at,
+                "reason": "stale wrong park from a transient outage",
+            },
+        }
+        save_state(paths.state_file, state)
+
+    # Pass 1: self-heal re-probe raises a non-404 GitHubError → fail-open,
+    # marker cleared. The PR falls through to normal per-PR work, where
+    # review() also hits the transient GitHubError → routed to errors.
+    result1 = app.loop(limit=0, now=frozen_now)
+
+    state = load_state(app.paths.state_file)
+    assert "foreign_issue_ref" not in (state["prs"].get("456") or {})
+    # The transient failure was routed to errors, not parked.
+    assert any(e["pr"] == 456 for e in result1.data["errors"])
+    assert result1.data["parked_foreign_pr_count"] == 0
+
+    # Pass 2: same transient failure persists. The PR must NOT be re-parked
+    # (no flap). The marker stays cleared and the failure is routed to errors.
+    result2 = app.loop(limit=0, now=frozen_now)
+
+    state = load_state(app.paths.state_file)
+    assert "foreign_issue_ref" not in (state["prs"].get("456") or {})
+    assert any(e["pr"] == 456 for e in result2.data["errors"])
+    assert result2.data["parked_foreign_pr_count"] == 0
+
+
 def test_loop_parked_foreign_prs_visible_in_loop_completed(
     tmp_path: Path,
 ) -> None:
