@@ -139,6 +139,7 @@ from .worktree import (
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
+    salvage_head_on_base,
     salvage_push_stranded_commits,
     summarize_branch_work,
     worktree_ahead_of_sha,
@@ -7952,6 +7953,63 @@ def _open_salvage_pr(
     return pr_number, None
 
 
+def _salvage_is_superseded(
+    *,
+    gh: GitHubLike,
+    repo_root: Path,
+    worktree_path: Path,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+) -> tuple[bool, str | None]:
+    """Return whether salvage would open a duplicate PR for already-landed work.
+
+    Single enforcement point for issue #1241. The salvage lane used to decide
+    purely from worktree shape (dead worker + local commits => open a PR) and
+    never checked whether the linked issue was already CLOSED or whether the
+    commits were already reachable from the base branch. Both produce a
+    duplicate PR that consumes a review session and leaves a stale branch.
+
+    Two positive-evidence checks, either of which triggers a skip:
+
+    1. The linked issue is CLOSED (``gh.issue_view`` ``state`` == ``"closed"``).
+    2. Every commit on the salvage head is already an ancestor of
+       ``origin/<base>`` (``salvage_head_on_base`` after a fetch) --
+       reachability, not branch-existence, since the agent branch may already
+       be deleted while its commits live on in the merge commit's history.
+
+    Returns ``(superseded, reason)``. ``reason`` is a short token
+    (``"issue_closed"`` / ``"commits_reachable_from_base"``) for the skip
+    event, or ``None`` when not superseded.
+
+    Fail-open: a failed ``issue_view`` or reachability probe returns
+    ``(False, None)`` so salvage proceeds as today. A duplicate PR is
+    recoverable; silently dropped work is not. ``branch`` is accepted for
+    logging context but the reachability probe uses the worktree's HEAD SHA
+    directly (the commits the salvage would push), not the branch name.
+    """
+    # 1. Issue-closed check. A closed issue means the work already landed
+    #    through some merge path; opening a salvage PR duplicates it.
+    try:
+        issue = gh.issue_view(issue_number)
+    except Exception:
+        issue = None
+    if issue and str(issue.get("state") or "").upper() == "CLOSED":
+        return True, "issue_closed"
+
+    # 2. Reachability check: every local commit already on the base branch.
+    #    The salvage head is the worktree's HEAD -- the commits the salvage
+    #    would push. If those are already ancestors of origin/<base>, the
+    #    work merged via another path and a PR would duplicate it.
+    head_sha = worktree_head_sha(worktree_path)
+    if head_sha is None:
+        return False, None
+    on_base = salvage_head_on_base(repo_root, head_sha, base_ref)
+    if on_base is True:
+        return True, "commits_reachable_from_base"
+    return False, None
+
+
 def _attempt_salvage(
     *,
     gh: GitHubLike,
@@ -7973,7 +8031,54 @@ def _attempt_salvage(
     ``ok`` is ``True`` once the PR is created, even if the label swap failed;
     in that case ``error`` describes the label failure and the
     ``session_salvaged`` event records ``label_write_ok=False``.
+
+    Issue #1241: before pushing, the salvage lane checks whether the work is
+    already landed -- the linked issue is CLOSED, or every commit on the
+    salvage head is already reachable from ``origin/<base>``. Either is
+    positive evidence that opening a PR would duplicate already-merged work.
+    On a superseded verdict the lane emits a ``salvage_skipped_superseded``
+    event and returns ``(True, None)`` so the caller skips the relabel-to-ready
+    path (the issue is closed / the work landed; re-dispatching would be
+    wrong). The check fails open: a probe failure proceeds with salvage as
+    today, because a duplicate PR is recoverable while silently dropped work
+    is not.
     """
+    # Issue #1241: single enforcement point for the superseded-work check.
+    # The dead worker's worktree may still hold commits that have already
+    # merged to the base branch via another path (an operator salvage, or the
+    # rework lane's own auto-salvage), or the linked issue may already be
+    # closed. Both make a salvage PR a duplicate.
+    superseded, skip_reason = _salvage_is_superseded(
+        gh=gh,
+        repo_root=repo_root,
+        worktree_path=worktree_path,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+    )
+    if superseded:
+        with state_lock(state_file):
+            state = load_state(state_file)
+            state = append_event(
+                state,
+                "salvage_skipped_superseded",
+                {
+                    "issue_number": issue_number,
+                    "failure_kind": failure_kind,
+                    "reason": skip_reason,
+                    "branch": branch,
+                    "pr_number": None,
+                },
+                state_path=state_file,
+            )
+            save_state(state_file, state)
+        # The work is already on the base branch / the issue is closed: there
+        # is nothing to push or PR. Return ok=True so the caller skips the
+        # relabel-to-ready path -- re-dispatching a closed issue or re-PR-ing
+        # landed work would both be wrong. The worktree directory itself is
+        # reclaimed by the normal ``clean_worktrees`` sweep.
+        return True, None
+
     push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
     if not push_ok:
         return False, push_error

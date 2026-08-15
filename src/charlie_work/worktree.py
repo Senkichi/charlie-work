@@ -807,6 +807,81 @@ def worktree_ahead_of_sha(worktree_path: Path, base_sha: str) -> tuple[int | Non
         return None, f"rev-list returned non-integer: {count_result.stdout!r}"
 
 
+def salvage_head_on_base(repo_root: Path, head_sha: str, base_ref: str) -> bool | None:
+    """Return whether ``head_sha`` is already reachable from ``origin/<base>``.
+
+    Used by the salvage lane's superseded-work check (issue #1241): a dead
+    worker's worktree may still hold commits that have *already* merged to the
+    base branch via another path (an operator salvage, or the rework lane's
+    own auto-salvage). Opening a "Salvaged work for #N" PR for those commits
+    produces a duplicate that consumes a review session and leaves a stale
+    branch for the operator to clean up.
+
+    ``git merge-base --is-ancestor <head> origin/<base>`` after a fetch is the
+    reachability test the issue specifies -- reachability, not branch-existence,
+    because the agent branch may already be deleted while its commits live on
+    in the merge commit's history.
+
+    Returns ``True`` when ``head_sha`` is an ancestor of the fetched base tip
+    (the work is already on the base branch -- salvage would duplicate it),
+    ``False`` when it is provably not, and ``None`` when the probe could not
+    decide (fetch failed, ref unresolvable, object missing, merge-base
+    errored). ``None`` is fail-open: the caller proceeds with salvage as
+    today, because a duplicate PR is recoverable while silently dropped work
+    is not.
+    """
+    try:
+        safe_head = require_valid_sha(head_sha, context="salvage_head_on_base head_sha")
+    except ValueError:
+        return None
+
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+    # Always refresh the tracking ref before the ancestry check. The merge
+    # that landed the work happened on the remote, so the local
+    # ``origin/<base>`` is stale until fetched -- checking ancestry against a
+    # stale ref would read "not an ancestor" and open a duplicate PR, the
+    # exact defect this probe exists to prevent. The issue specifies the
+    # fetch explicitly: "``git merge-base --is-ancestor <head> origin/main``
+    # after a fetch".
+    fetch_result = run_captured(
+        ["git", "fetch", "origin", base_branch],
+        cwd=repo_root,
+        timeout_seconds=_REMOTE_TIMEOUT_SECONDS,
+    )
+    if not fetch_result.ok:
+        # Fail-open: a fetch failure proceeds with salvage as today. A
+        # duplicate PR is recoverable; silently dropped work is not.
+        return None
+    base_ref_local = f"origin/{base_branch}"
+    base_result = run_captured(
+        ["git", "rev-parse", "--verify", base_ref_local],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not base_result.ok:
+        return None
+    base_sha = base_result.stdout.strip()
+
+    # Gate on object existence: ``--is-ancestor`` exits non-zero both for "not
+    # an ancestor" and for "unknown object" (see ``_object_exists``). The head
+    # lives in the shared object store (worktrees share it), but be defensive
+    # against a pruned/missing object and fail open rather than misclassify.
+    if not _object_exists(repo_root, safe_head) or not _object_exists(repo_root, base_sha):
+        return None
+
+    ancestor_result = run_captured(
+        ["git", "merge-base", "--is-ancestor", safe_head, base_sha],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    # exit 0 => ancestor (superseded); exit 1 => not ancestor; 128/other => error.
+    if ancestor_result.returncode == 0:
+        return True
+    if ancestor_result.returncode == 1:
+        return False
+    return None
+
+
 @dataclass(frozen=True)
 class SalvagePushResult:
     """Outcome of a salvage-push attempt on a dead worker's worktree (#1248).
