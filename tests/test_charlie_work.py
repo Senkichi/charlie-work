@@ -43888,6 +43888,237 @@ def test_orphaned_worker_reclaim_carries_required_reason(tmp_path: Path) -> None
     assert events[0]["payload"]["reason"] == "dead_worker_no_open_pr_orphan_sweep"
 
 
+def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
+    tmp_path: Path,
+) -> None:
+    """Issue #1243: 3+ no-progress orphan-sweep redispatches must escalate
+    instead of a 4th dispatch. The branch head is unchanged across attempts
+    (no remote push, no local commits), so the cap fires parallel to the
+    rework lane's worker_death_loop (death_count > max_auto_redispatch).
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1243"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2026-08-14T00:00:00Z",
+        "adapter_history": [
+            {
+                "ts": "2026-08-14T00:13:00Z",
+                "kind": "claude-code",
+                "provider": "",
+                "reason": "policy:default",
+            },
+        ],
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubNoPR(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPR()
+    fake_gh.issues = [
+        {
+            "number": 1243,
+            "title": "test issue",
+            "url": "https://example.test/issues/1243",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    def _simulate_redispatch() -> None:
+        """Simulate a dispatch between sweeps: add an adapter_history entry,
+        reset the issue's GitHub labels to in_progress (the dispatch
+        transition would do this), and clear orphan flags (the dispatch
+        clears them on success).
+        """
+        st = load_state(paths.state_file)
+        entry = st["issues"]["1243"]
+        entry["adapter_history"].append(
+            {
+                "ts": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "kind": "claude-code",
+                "provider": "",
+                "reason": "policy:default",
+            }
+        )
+        entry.pop("orphan_flagged_at", None)
+        entry.pop("orphan_drift_fingerprint", None)
+        entry.pop("orphan_drift_at", None)
+        # FakeGitHub's label ops only record calls; simulate the dispatch
+        # transition landing in_progress on GitHub.
+        fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+        fake_gh.labels_added = []
+        fake_gh.labels_removed = []
+        save_state(paths.state_file, st)
+
+    # Pass 1: 1 adapter_history entry, first observation.
+    # redispatch_count=1 <= 3, proceed with reclaim.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    assert st["issues"]["1243"].get("status") == "dispatched"
+    assert st["issues"]["1243"].get("orphan_redispatch_head_sha") == "none:none"
+    # Simulate the reclaim's label change landing on GitHub.
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.ready}]
+
+    # Simulate dispatch 2
+    _simulate_redispatch()
+
+    # Pass 2: 2 entries, head unchanged. redispatch_count=2 <= 3, proceed.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    assert st["issues"]["1243"].get("status") == "dispatched"
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.ready}]
+
+    # Simulate dispatch 3
+    _simulate_redispatch()
+
+    # Pass 3: 3 entries, head unchanged. redispatch_count=3 <= 3, proceed.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    assert st["issues"]["1243"].get("status") == "dispatched"
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.ready}]
+
+    # Simulate dispatch 4
+    _simulate_redispatch()
+
+    # Pass 4: 4 entries, head unchanged. redispatch_count=4 > 3, ESCALATE!
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1243"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "orphan_sweep_redispatch_cap_exceeded"
+    assert entry.get("reason_class") == "mechanical"
+
+    # Verify the dedicated event was emitted (not session_failed_escalated).
+    escalated_events = [
+        e for e in st.get("events", []) if e.get("kind") == "orphan_sweep_redispatch_escalated"
+    ]
+    assert len(escalated_events) == 1
+    assert escalated_events[0]["payload"]["issue_number"] == 1243
+    assert escalated_events[0]["payload"]["redispatch_count"] == 4
+    assert escalated_events[0]["payload"]["reason"] == "orphan_sweep_redispatch_cap_exceeded"
+
+    # The relabel event must NOT be emitted for the cap-exceeded pass.
+    relabel_events = [
+        e
+        for e in st.get("events", [])
+        if e.get("kind") == "session_failed_relabeled"
+        and e["payload"].get("reason") == "dead_worker_no_open_pr_orphan_sweep"
+    ]
+    # Passes 1-3 each emitted one relabel event; pass 4 must not add another.
+    assert len(relabel_events) == 3
+
+
+def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> None:
+    """Issue #1243: a moving branch head (remote push or local stranded
+    commits) resets the redispatch counter, so the cap does not fire even
+    after max_auto_redispatch+1 attempts. A moving head with a dead worker
+    is the salvage path's job, not escalation.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Start with 4 adapter_history entries and a prior head fingerprint,
+    # which would normally trigger the cap (redispatch_count=4 > 3).
+    state = load_state(paths.state_file)
+    state["issues"]["1243"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2026-08-14T00:00:00Z",
+        "branch_name": "agent/issue-1243-test",
+        "adapter_history": [
+            {"ts": "2026-08-14T00:13:00Z", "kind": "claude-code", "provider": "", "reason": "p"},
+            {"ts": "2026-08-14T00:19:00Z", "kind": "claude-code", "provider": "", "reason": "p"},
+            {"ts": "2026-08-14T00:42:00Z", "kind": "claude-code", "provider": "", "reason": "p"},
+            {"ts": "2026-08-14T01:05:00Z", "kind": "claude-code", "provider": "", "reason": "p"},
+        ],
+        "orphan_redispatch_head_sha": "none:none",
+        "orphan_redispatch_adapter_count": 0,
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubNoPR(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPR(repo_root=tmp_path)
+    fake_gh.issues = [
+        {
+            "number": 1243,
+            "title": "test issue",
+            "url": "https://example.test/issues/1243",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    # Mock remote_branch_head_sha to return a NEW SHA (the worker pushed
+    # something since the last orphan-sweep). The head fingerprint changes,
+    # so the counter resets and the cap does not fire.
+    new_sha = "abc123def456"
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch("charlie_work.workflow.remote_branch_head_sha", return_value=new_sha),
+        patch("charlie_work.workflow.worktree_head_sha", return_value=None),
+    ):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1243"]
+
+    # The cap must NOT fire -- the head moved, which is progress.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("escalation_reason") is None
+
+    # The head fingerprint must be updated to the new SHA.
+    assert entry.get("orphan_redispatch_head_sha") == f"{new_sha}:none"
+
+    # The adapter_count_baseline must be reset to len(adapter_history),
+    # so the redispatch_count starts from 0 again.
+    assert entry.get("orphan_redispatch_adapter_count") == 4
+
+    # No escalation event must have been emitted.
+    escalated_events = [
+        e for e in st.get("events", []) if e.get("kind") == "orphan_sweep_redispatch_escalated"
+    ]
+    assert len(escalated_events) == 0
+
+
 def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> None:
     """Issue #252: a clean worktree with no commits relabels to ready."""
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
