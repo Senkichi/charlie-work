@@ -662,6 +662,37 @@ def _remote_branch_head_sha(repo_root: Path, branch: str) -> str | None:
     return stdout.split()[0]
 
 
+def remote_branch_head_sha(repo_root: Path, branch: str) -> str | None:
+    """Public wrapper for ``_remote_branch_head_sha``.
+
+    Returns the commit SHA for ``origin/{branch}`` if it exists, else ``None``.
+    Used by the orphan-sweep redispatch cap (issue #1243) to measure branch
+    progress across no-open-PR redispatches: an unchanged remote head SHA across
+    attempts is evidence the worker pushed nothing new.
+    """
+    return _remote_branch_head_sha(repo_root, branch)
+
+
+def worktree_head_sha(worktree_path: Path) -> str | None:
+    """Return the HEAD commit SHA of the worktree at ``worktree_path``.
+
+    Returns ``None`` when the worktree does not exist or ``git rev-parse HEAD``
+    fails. Used by the orphan-sweep redispatch cap (issue #1243) to detect
+    stranded commits -- work the worker completed but never pushed. A moving
+    local head with a dead worker is the salvage path's job, not an escalation.
+    """
+    if not worktree_path.is_dir():
+        return None
+    result = run_captured(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return None
+    return result.stdout.strip() or None
+
+
 def remote_branch_ahead_count(
     repo_root: Path, branch: str, base_ref: str = ""
 ) -> tuple[int | None, str | None]:

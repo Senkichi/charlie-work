@@ -136,12 +136,14 @@ from .worktree import (
     push_branch,
     read_worker_outcome,
     remote_branch_ahead_count,
+    remote_branch_head_sha,
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
     salvage_push_stranded_commits,
     summarize_branch_work,
     worktree_ahead_of_sha,
+    worktree_head_sha,
     worktree_path_for_branch,
     write_worktree_marker,
 )
@@ -2118,6 +2120,53 @@ def _windowed_worker_death_at(
         except (ValueError, AttributeError):
             continue
     return result
+
+
+def _windowed_orphan_redispatch_at(
+    entry: dict[str, Any],
+    *,
+    window_minutes: int,
+) -> list[str]:
+    """Return orphan-sweep redispatch timestamps within the configured window.
+
+    Parallel to ``_windowed_redispatch_at`` and ``_windowed_worker_death_at``
+    but reads ``entry["orphan_redispatch_at"]`` -- the list of timestamps
+    recorded by the orphan-sweep no-open-PR redispatch cap (issue #1243) each
+    time it processes an issue whose worker died without leaving an open PR.
+    Unlike ``adapter_history`` (which only grows when ``api_worker.enabled``
+    is ``True``, via ``routing.record_adapter_choice``), this list grows in
+    the default (non-API-routed) configuration too. It is appended once per
+    *dead dispatch* (keyed by ``orphan_redispatch_counted_dispatch``), not
+    once per sweep pass -- the #417 reclaim leaves the dead-worker record in
+    place, so the same entry is re-observed every pass until a genuine
+    redispatch replaces it.
+    """
+    raw = entry.get("orphan_redispatch_at")
+    if not isinstance(raw, list):
+        return []
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=window_minutes)
+    result: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        try:
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start:
+                result.append(t)
+        except (ValueError, AttributeError):
+            continue
+    return result
+
+
+def _orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> str:
+    """Combine remote and local branch head SHAs into a single progress fingerprint.
+
+    A change in either SHA indicates progress -- a remote push or a local
+    (possibly stranded) commit. Used by the orphan-sweep redispatch cap
+    (issue #1243) to distinguish a no-progress death loop (unchanged fingerprint
+    across attempts) from a moving head that is the salvage path's job.
+    """
+    return f"{remote_sha or 'none'}:{local_sha or 'none'}"
 
 
 def _is_review_dispatchable(
@@ -5010,6 +5059,25 @@ def _detect_and_handle_orphaned_workers(
                 repo_root, branch, config.dispatch.base_ref
             )
 
+        # Issue #1243: compute the branch head SHA (remote + local worktree)
+        # for the no-open-PR redispatch cap. An unchanged head across attempts
+        # is the "no progress" signal that increments toward the cap; a moving
+        # head (remote push or local stranded commits) resets it. Done here,
+        # outside the state lock, because both probes touch git/network.
+        remote_head_sha = None
+        local_head_sha = None
+        if repo_root is not None:
+            remote_head_sha = remote_branch_head_sha(repo_root, branch)
+        if worktree_path is not None:
+            local_head_sha = worktree_head_sha(worktree_path)
+        no_pr_issue_details.setdefault(issue_number, {}).update(
+            {
+                "branch": branch,
+                "remote_head_sha": remote_head_sha,
+                "local_head_sha": local_head_sha,
+            }
+        )
+
         # Treat a branch as a PR-open candidate when:
         # - the worker itself reported a successful push with a failed PR, OR
         # - the branch exists on origin and is ahead of the base (has commits).
@@ -5623,6 +5691,122 @@ def _detect_and_handle_orphaned_workers(
                     )
                     state["issues"][str(issue_number)] = entry
                     continue
+
+                # Issue #1243: per-issue redispatch cap with stall detection.
+                # The no-open-PR orphan-sweep redispatch path is the only
+                # redispatch loop without a bound -- without this cap, a
+                # persistent post-exit condition that leaves no open PR
+                # reproduces the #709 infinite loop (worker exits -> sweep
+                # strips agent:in-progress -> issue returns to the dispatchable
+                # pool -> next pass redispatches -> repeat). The cap counts
+                # dead *dispatches* via a timestamp list
+                # (``orphan_redispatch_at``) deduplicated on dispatch identity,
+                # mirroring the ``redispatch_at``/``worker_death_at`` pattern
+                # used by the parallel worker_death_loop cap elsewhere in this
+                # module.
+                # The previous implementation derived the count from
+                # ``len(adapter_history)``, but that list only grows when
+                # ``api_worker.enabled`` is ``True`` (via
+                # ``routing.record_adapter_choice``) -- so in the default
+                # (non-API-routed) configuration the counter never incremented
+                # and the cap never fired, leaving the #709 infinite loop
+                # unbounded in production. The timestamp list is appended on
+                # every sweep pass through this code, regardless of adapter
+                # routing mode.
+                # "No progress" is measured, not assumed: the branch head SHA
+                # (remote ls-remote + local worktree) is compared across
+                # attempts. A moving head is the salvage path's job, not
+                # escalation. Parallel to the rework lane's worker_death_loop
+                # (fires at death_count > max_auto_redispatch).
+                head_details = no_pr_issue_details.get(issue_number, {})
+                current_head = _orphan_head_fingerprint(
+                    head_details.get("remote_head_sha"),
+                    head_details.get("local_head_sha"),
+                )
+                prior_head = entry.get("orphan_redispatch_head_sha")
+                now_ts = utc_now()
+
+                head_changed = prior_head is not None and current_head != prior_head
+                first_observation = prior_head is None
+                # Identity of the dispatch whose dead worker this pass is
+                # observing. The #417 reclaim deliberately leaves the entry's
+                # status/worker_pid untouched (issue #282 fingerprint
+                # preservation), so the same dead entry is re-discovered by
+                # every subsequent sweep pass until a real redispatch replaces
+                # dispatched_at/worker_pid. Counting passes would therefore
+                # escalate after a few sweeps with zero actual redispatch
+                # attempts (e.g. during fleet-capacity dispatch delays);
+                # instead, each dead dispatch is counted exactly once, keyed
+                # by this identity.
+                dispatch_identity = (
+                    f"{entry.get('dispatched_at') or 'none'}:{entry.get('worker_pid') or 'none'}"
+                )
+                prior_dispatch = entry.get("orphan_redispatch_counted_dispatch")
+                # Read the windowed timestamp list. On progress or first
+                # observation, reset it to [now] so only attempts after this
+                # point count toward the cap. Otherwise, append this pass's
+                # timestamp only when it observes a dispatch not yet counted
+                # -- re-observing the same dead dispatch on a later sweep
+                # pass is not a redispatch attempt. (The timestamp list, not
+                # adapter_history, is still what the count derives from:
+                # adapter_history only grows when api_worker.enabled is True.)
+                orphan_redispatch_at = _windowed_orphan_redispatch_at(
+                    entry, window_minutes=config.watchdog.redispatch_window_minutes
+                )
+                if head_changed or first_observation:
+                    orphan_redispatch_at = [now_ts]
+                elif dispatch_identity != prior_dispatch:
+                    orphan_redispatch_at = orphan_redispatch_at + [now_ts]
+
+                redispatch_count = len(orphan_redispatch_at)
+
+                if redispatch_count > config.watchdog.max_auto_redispatch and not head_changed:
+                    # Cap exceeded with no progress -- escalate instead of
+                    # recording the relabel event that would return the issue
+                    # to the dispatchable pool. The labels were already
+                    # stripped in the pre-lock reclaim, but the post-lock
+                    # transition() call (via reap_escalations) will change
+                    # them to agent:human-needed.
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="orphan_sweep_redispatch_cap_exceeded",
+                        reason_class="mechanical",
+                        issue_extra={
+                            "dispatched_at": None,
+                            "orphan_redispatch_head_sha": current_head,
+                            "orphan_redispatch_at": orphan_redispatch_at,
+                            "orphan_redispatch_counted_dispatch": None,
+                            "orphan_flagged_at": None,
+                            "orphan_drift_fingerprint": None,
+                            "orphan_drift_at": None,
+                        },
+                    )
+                    sweep_events.append(
+                        (
+                            "orphan_sweep_redispatch_escalated",
+                            {
+                                "issue_number": issue_number,
+                                "previous_status": "dispatched",
+                                "reason": "orphan_sweep_redispatch_cap_exceeded",
+                                "redispatch_count": redispatch_count,
+                                "branch_head_sha": head_details.get("remote_head_sha"),
+                                "worktree_head_sha": head_details.get("local_head_sha"),
+                                "orphan_redispatch_at_len": len(orphan_redispatch_at),
+                            },
+                        )
+                    )
+                    reap_escalations.append(issue_number)
+                    continue
+
+                # Cap not exceeded (or progress detected): persist the head
+                # fingerprint, timestamp list, and counted dispatch identity
+                # so the next orphan-sweep pass can compare against them. On
+                # progress or first observation, the list was just (re)seeded
+                # above; this persists it.
+                entry["orphan_redispatch_head_sha"] = current_head
+                entry["orphan_redispatch_at"] = orphan_redispatch_at
+                entry["orphan_redispatch_counted_dispatch"] = dispatch_identity
 
                 # Issue #417: report (and, on success, resolve) the ground-truth
                 # label reclaim computed above before falling back to the
@@ -14974,6 +15158,12 @@ class OrchestratorApp:
         "dispatch_failed_at",
         "redispatch_at",
         "worker_death_at",
+        # Issue #1243: the orphan-sweep no-open-PR redispatch cap tracking
+        # fields must reset on human un-escalate so the cap starts fresh
+        # after the operator re-arms the issue.
+        "orphan_redispatch_head_sha",
+        "orphan_redispatch_at",
+        "orphan_redispatch_counted_dispatch",
         "escalation_reason",
         # Issue #783: a human-authorized manual unescalate clears the reason
         # class (the escalation itself is gone) and resets the auto
