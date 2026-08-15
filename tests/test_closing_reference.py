@@ -292,24 +292,30 @@ def test_closing_issues_referenced_numbers_empty_on_malformed_field() -> None:
 
 
 def _local_names_aliased_from_pr_create_getattr(tree: ast.AST) -> set[str]:
-    """Names assigned from ``getattr(x, "pr_create", ...)`` anywhere in ``tree``.
+    """Names assigned from a reference to ``pr_create`` anywhere in ``tree``.
 
-    Covers the indirect-call shape (``pr_create = getattr(gh, "pr_create",
-    None); pr_create(...)``) without hardcoding which module uses it.
+    Covers both indirect-call shapes:
+    - ``pr_create = getattr(gh, "pr_create", None); pr_create(...)``
+    - ``fn = gh.pr_create; fn(...)`` (an ``ast.Attribute`` bound to a name,
+      no ``getattr`` involved)
+
+    without hardcoding which module uses it.
     """
     aliases: set[str] = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
             continue
         value = node.value
-        if not (
+        is_getattr_alias = (
             isinstance(value, ast.Call)
             and isinstance(value.func, ast.Name)
             and value.func.id == "getattr"
             and len(value.args) >= 2
             and isinstance(value.args[1], ast.Constant)
             and value.args[1].value == "pr_create"
-        ):
+        )
+        is_attribute_alias = isinstance(value, ast.Attribute) and value.attr == "pr_create"
+        if not (is_getattr_alias or is_attribute_alias):
             continue
         for target in node.targets:
             if isinstance(target, ast.Name):
