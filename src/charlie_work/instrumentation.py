@@ -374,6 +374,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # publish and will otherwise be redispatched over.
         "salvage_pushed_stranded_commits": "info",
         "salvage_push_failed": "warning",
+        # Issue #1221: the pre-open re-check found the work already landed
+        # (issue closed, a PR already merged, or the branch's diff against
+        # main is empty) and skipped opening a vestigial duplicate PR. Info,
+        # not warning: this is the intended outcome of the fix -- the caller
+        # treats the skip as "handled" (no redispatch), sibling to
+        # ``salvage_pushed_stranded_commits`` rather than to
+        # ``salvage_push_failed`` (which is a genuine failure to publish).
+        "salvage_skipped_already_landed": "info",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",
