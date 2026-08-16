@@ -294,7 +294,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # vestigial duplicate PRs), not a routine dispatch outcome. A
         # repeating burst on one PR is the signal that a salvage/duplicate
         # path keeps producing zero-delta PRs.
-        "review_skipped_empty_diff": "warning",
+        "review_dispatch_skipped_empty_diff": "warning",
         # The stale-claim recovery sweep (issue #487's "never claimed/dispatched"
         # path) skipped a PR without acting on it -- prompt_path was missing from
         # state or the file it names no longer exists on disk. Warning, not info:

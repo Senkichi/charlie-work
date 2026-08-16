@@ -14323,8 +14323,8 @@ class OrchestratorApp:
         # empty (zero-file diff vs base) must not burn a paid reviewer
         # session reviewing nothing. The packet build (review()) already
         # fetches and writes diff.patch; an empty patch is the signal. Skip
-        # dispatch for these PRs and emit review_skipped_empty_diff instead
-        # of claiming. review_dispatch_attempt_count is NOT incremented --
+        # dispatch for these PRs and emit review_dispatch_skipped_empty_diff
+        # instead of claiming. review_dispatch_attempt_count is NOT incremented --
         # an empty diff is not a review attempt and must not walk toward
         # escalation. Do not auto-close the PR from this path; closing is a
         # separate judgment (the #1221 fix owns the duplicate-PR lifecycle).
@@ -14347,7 +14347,7 @@ class OrchestratorApp:
                 for pr_number in skipped_empty_diff:
                     state = self._record_event(
                         state,
-                        "review_skipped_empty_diff",
+                        "review_dispatch_skipped_empty_diff",
                         {
                             "pr_number": pr_number,
                             "issue_number": skipped_empty_diff_issues.get(pr_number),
