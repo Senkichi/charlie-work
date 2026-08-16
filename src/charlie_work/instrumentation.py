@@ -249,6 +249,20 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
         "main_ci_reclaim_failed": "warning",
+        # cw#1263: the orchestrator's own salvage-PR-body builders had to
+        # rewrite the ``Closes #N`` line before handing the body to
+        # ``gh pr create``. Warning, not error: the rewrite happens before
+        # creation, so the body is still usable -- but a recurring burst
+        # indicates the salvage builders are drifting from the canonical
+        # form again.
+        "pr_closing_ref_rewritten": "warning",
+        # cw#1263: after ``gh pr create`` succeeded, GitHub's own
+        # ``closingIssuesReferences`` resolution did not include the
+        # intended issue -- the PR was created but will not auto-close it on
+        # merge. Warning, not error: the PR still exists and is still
+        # actionable, but the issue's lifecycle labels will not flip
+        # automatically without a human or a later reconcile pass noticing.
+        "pr_closing_ref_unlinked": "warning",
         "quota_probe_failed": "warning",
         "required_changes_vacuous": "warning",
         "review_dispatch_lifecycle_reaped": "warning",

@@ -154,6 +154,13 @@ MERGED_PR_REST_ONLY_FIELDS = ("mergeCommitOid",)
 # whole class of integration-context permission gaps instead of chasing them
 # field by field.
 CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,isCrossRepository"
+# Fields for the post-create closing-reference verification (cw#1263): the
+# only field needed is GitHub's own GraphQL resolution of which issues this
+# PR will close on merge -- as opposed to `linked_issue_number`'s regex-based
+# guess, `closingIssuesReferences` is GitHub's authoritative answer. Kept as
+# narrow as `CLOSING_KEYWORD_PR_FIELDS` for the same reason: no CI/review
+# state is needed, so no `statusCheckRollup` token-scope risk.
+PR_CLOSING_ISSUES_FIELDS = "closingIssuesReferences"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
