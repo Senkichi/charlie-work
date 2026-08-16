@@ -272,6 +272,17 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # actionable, but the issue's lifecycle labels will not flip
         # automatically without a human or a later reconcile pass noticing.
         "pr_closing_ref_unlinked": "warning",
+        # cw#1273: the outer `gh pr create` retry ladder (pr_create_retry.py)
+        # exhausted every attempt for a branch a worker had already pushed --
+        # the branch is stranded (pushed, no PR, no further retry). Warning,
+        # not error: the branch still exists and can be recovered by hand or
+        # by a later pass, but this is the specific, actionable signal the
+        # generic `orphaned_worker_drift` finding used to bury (#1273's "4 of
+        # 36 escalations were pushed-branch-no-PR"). Emitted from the
+        # orphan-reap sweep's existing `_drift_fingerprint` dedup path
+        # (workflow.py), never from pr_create_retry.py itself -- that module
+        # has no state_file/fingerprint state to dedup against.
+        "pr_create_failed_branch_stranded": "warning",
         "quota_probe_failed": "warning",
         "required_changes_vacuous": "warning",
         "review_dispatch_lifecycle_reaped": "warning",

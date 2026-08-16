@@ -784,6 +784,18 @@ class RuntimeConfig:
     # help a call that never returns — only a timeout converts the hang into a
     # failure the existing retry/next-pass machinery can absorb.
     gh_timeout_seconds: float = 120.0
+    # cw#1273: outer retry for `gh pr create` specifically, layered on top of
+    # GitHub.run()'s inner pre-connection-only retry above. The inner retry's
+    # ~7s default span is far shorter than the ~45s TLS blips observed on
+    # this host, and mutations are deliberately excluded from the inner
+    # retry's post-send-failure case (at-most-once semantics) -- see
+    # pr_create_retry.py's module docstring for the composition rationale.
+    # `pr_create_retry_max_attempts` additional attempts follow the first on
+    # failure (mirrors `gh_max_retries`'s "N retries, N+1 total tries"
+    # naming); backoff before retry n is `pr_create_retry_base_seconds *
+    # (3 ** (n - 1))` -- 10s/30s/90s with the defaults.
+    pr_create_retry_max_attempts: int = 3
+    pr_create_retry_base_seconds: float = 10.0
     # Pre-emptive GraphQL rate-limit guard. Before starting quota-heavy phases
     # (mop-up sweeps, merged-PR listings), GitHub.check_graphql_rate_limit()
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
@@ -2118,6 +2130,22 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
                 f"got {gh_timeout_seconds}"
             )
+    pr_create_retry_max_attempts = runtime_data.get("pr_create_retry_max_attempts")
+    if pr_create_retry_max_attempts is not None and not isinstance(
+        pr_create_retry_max_attempts, int
+    ):
+        raise ConfigError(
+            "config section 'runtime' key 'pr_create_retry_max_attempts' must be an int, "
+            f"got {type(pr_create_retry_max_attempts).__name__}"
+        )
+    pr_create_retry_base_seconds = runtime_data.get("pr_create_retry_base_seconds")
+    if pr_create_retry_base_seconds is not None and not isinstance(
+        pr_create_retry_base_seconds, (int, float)
+    ):
+        raise ConfigError(
+            "config section 'runtime' key 'pr_create_retry_base_seconds' must be a number, "
+            f"got {type(pr_create_retry_base_seconds).__name__}"
+        )
     graphql_rate_limit_threshold = runtime_data.get("graphql_rate_limit_threshold")
     if graphql_rate_limit_threshold is not None:
         if not isinstance(graphql_rate_limit_threshold, int):

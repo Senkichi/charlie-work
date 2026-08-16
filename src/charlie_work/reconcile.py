@@ -42,6 +42,7 @@ from .github import (
 from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, transition
 from .paths import resolved_layout, runtime_paths
+from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
@@ -2415,8 +2416,8 @@ def apply_fixes(
                 if repo_root is not None:
                     push_ok, push_error = push_branch(repo_root, item.branch)
                     if push_ok:
-                        pr_create = getattr(gh, "pr_create", None)
-                        if pr_create is not None:
+                        has_pr_create = getattr(gh, "pr_create", None) is not None
+                        if has_pr_create:
                             # Same janitor body gate as a worker-authored PR --
                             # boilerplate alone can never satisfy it. Derive the
                             # rationale from the worker's own commit log rather
@@ -2457,12 +2458,20 @@ def apply_fixes(
                                         "source": "session_unpublished_work_salvaged",
                                     },
                                 )
-                            pr_number = pr_create(
+                            # cw#1273: route through the bounded outer retry
+                            # + duplicate-PR guard instead of calling
+                            # gh.pr_create directly, matching workflow.py's
+                            # _open_salvage_pr (the other pr_create call site).
+                            retry_result = create_pr_with_retry(
+                                gh,
                                 head=item.branch,
                                 base=item.base_branch,
                                 title=f"Salvaged work for issue #{item.issue_number}",
                                 body=salvage_body,
+                                max_retries=config.runtime.pr_create_retry_max_attempts,
+                                base_seconds=config.runtime.pr_create_retry_base_seconds,
                             )
+                            pr_number = retry_result.pr_number
                         if pr_number is not None:
                             salvage_ok = True
                             # `pr_number` is falsy (0) under `dry_run`, where no

@@ -43970,11 +43970,16 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     assert "pr_number" not in entry
 
     events = state.get("events", [])
-    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    # cw#1273: this specific reason now emits its own kind
+    # (pr_create_failed_branch_stranded) instead of the generic
+    # orphaned_worker_drift, after the bounded outer retry (3 attempts)
+    # exhausted -- see workflow.py's orphan-reap sweep.
+    drift_events = [e for e in events if e.get("kind") == "pr_create_failed_branch_stranded"]
     assert len(drift_events) == 1
     assert drift_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_pr_create_failed"
     assert drift_events[0]["payload"]["pr_create_error"] is not None
     assert drift_events[0]["payload"]["worker_reported"] is True
+    assert drift_events[0]["payload"]["branch_name"] == branch
 
     # Must NOT emit the generic no-open-PR drift, which would cause re-dispatch.
     no_pr_events = [
@@ -43984,6 +43989,132 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
         and e["payload"].get("reason") == "dead_worker_no_open_pr"
     ]
     assert not no_pr_events
+
+
+def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
+    tmp_path: Path,
+) -> None:
+    """cw#1273 AC4: a repeated ``pr_create_failed_branch_stranded`` terminal
+    for the same branch/error within one ``orphan_drift_fingerprint`` window
+    must emit only once -- proven by running the orphan-reap sweep twice
+    against state that still has no PR number and the same failing
+    ``gh pr create``, and asserting the event count stays at 1. This rides
+    the pre-existing ``_drift_fingerprint``/``orphan_drift_fingerprint``
+    dedup mechanism unchanged (see workflow.py's orphan-reap sweep) rather
+    than inventing a second dedup layer for the new event kind.
+    """
+    from unittest.mock import patch
+
+    from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.process_utils import (
+        worker_terminal_status_path,
+        write_worker_terminal_status,
+    )
+    from charlie_work.state import load_state, save_state
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    branch = "agent/issue-935-workers-push-a-finished-branch-but-cannot-open-t"
+    state = load_state(paths.state_file)
+    state["issues"]["935"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+        "branch_name": branch,
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    terminal_path = worker_terminal_status_path(sessions_dir, 935, "claude")
+    write_worker_terminal_status(
+        terminal_path,
+        pid=1234,
+        exit_code=0,
+        started_at="2026-07-30T00:00:00Z",
+        ended_at="2026-07-30T00:05:00Z",
+        duration_seconds=300.0,
+        worker_outcome={
+            "push_succeeded": True,
+            "pr_created": False,
+            "error": "gh unauthenticated",
+        },
+    )
+
+    in_progress = config.labels.in_progress
+
+    class FakeGitHubForFailedPr(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__(repo_root=tmp_path / "not-a-repo")
+            self.issues = [
+                {
+                    "number": 935,
+                    "title": "Workers push a finished branch but cannot open the PR",
+                    "url": "https://example.test/issues/935",
+                    "body": "Workers cannot open PRs because gh is unauthenticated.",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = []
+            self.pr_create_return = None  # PR create fails, every attempt, forever.
+
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForFailedPr()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["935"]
+    assert entry.get("status") == "dispatched"
+    assert "orphan_drift_fingerprint" in entry
+
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "pr_create_failed_branch_stranded"]
+    assert len(drift_events) == 1, (
+        f"expected exactly one pr_create_failed_branch_stranded event across two "
+        f"sweep passes within the same fingerprint window, got {len(drift_events)}"
+    )
+    assert drift_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_pr_create_failed"
+    assert drift_events[0]["payload"]["branch_name"] == branch
+
+    # Positive control: the assertion above is only meaningful if pass 2
+    # actually reached the emit site and was suppressed BY THE FINGERPRINT --
+    # not because some earlier state mutation from pass 1 (status, sidecar
+    # consumption, an unrelated early `continue`) made pass 2 exit before
+    # ever getting there. Clear `orphan_drift_fingerprint` -- the same
+    # "force re-observation" pattern this file already uses elsewhere (e.g.
+    # `test_orphaned_worker_drift_fingerprint_cleared_on_redispatch`) -- and
+    # sweep again: if the mechanism under test is real, this MUST produce a
+    # second event, since nothing else changed.
+    state = load_state(paths.state_file)
+    state["issues"]["935"].pop("orphan_drift_fingerprint", None)
+    save_state(paths.state_file, state)
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    events = state.get("events", [])
+    drift_events = [e for e in events if e.get("kind") == "pr_create_failed_branch_stranded"]
+    assert len(drift_events) == 2, (
+        f"expected a second pr_create_failed_branch_stranded event once the "
+        f"fingerprint was cleared (proving the sweep re-reaches the emit site "
+        f"and the first assertion's count==1 was real dedup, not an unrelated "
+        f"early exit), got {len(drift_events)}"
+    )
+    assert drift_events[1]["payload"]["branch_name"] == branch
 
 
 def test_classify_dead_sessions_no_open_pr_happy_path_reclaims_in_one_pass(
