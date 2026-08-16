@@ -347,6 +347,14 @@ class WedgeWatchdog:
         present, is preserved separately as ``heartbeat_pid`` so the
         forensic record still shows which (possibly stale) heartbeat drove
         the verdict.
+
+        The ``supervisor_wedged_killed`` event is recorded **only after**
+        ``process.kill()`` succeeds. Recording it before the kill would log
+        a failed kill attempt as a completed kill — undermining the
+        forensic-accuracy invariant this event exists to serve. A kill
+        failure is still diagnosed via ``logger.exception`` so the attempt
+        is not silent, but no ``supervisor_wedged_killed`` event is emitted
+        for a kill that did not happen.
         """
         hb = heartbeat if heartbeat is not None else {}
         heartbeat_pid = hb.get("pid")
@@ -372,6 +380,18 @@ class WedgeWatchdog:
             f"scheduled task's next tick relaunches a fresh daemon."
         )
         self._log(message)
+        # Kill first, record the event only on success. A failed kill must
+        # not be logged as a completed kill — the ``supervisor_wedged_killed``
+        # event is the explicit record that the kill was deliberate and
+        # happened, so emitting it before ``kill()`` succeeds would defeat its
+        # forensic purpose. The kill-failure exception is logged via
+        # ``logger.exception`` so the attempt is not silent.
+        try:
+            self._process.kill()
+        except Exception:
+            logger.exception("WedgeWatchdog: failed to kill process pid=%s", self._process.pid)
+            return False
+        self._killed = True
         try:
             self._log_event_fn(
                 self._heartbeat_path,
@@ -389,10 +409,4 @@ class WedgeWatchdog:
             )
         except Exception:
             logger.exception("WedgeWatchdog: failed to record kill event")
-        try:
-            self._process.kill()
-        except Exception:
-            logger.exception("WedgeWatchdog: failed to kill process pid=%s", self._process.pid)
-            return False
-        self._killed = True
         return True

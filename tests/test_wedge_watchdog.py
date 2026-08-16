@@ -877,6 +877,13 @@ def test_watchdog_kill_failure_does_not_set_killed_and_continues(tmp_path: Path)
     The watchdog attempts to kill, ``kill()`` raises ``OSError``, the loop
     continues monitoring. On the next poll the child has exited on its own,
     so the watchdog returns without setting ``_killed``.
+
+    The ``supervisor_wedged_killed`` event must NOT be recorded for a kill
+    that did not happen — recording it before ``process.kill()`` succeeds
+    would log a failed kill attempt as a completed kill, undermining the
+    forensic-accuracy invariant the event exists to serve. The kill-failure
+    is still diagnosed via ``logger.exception`` (not asserted here); the
+    assertion is that no event was emitted.
     """
     now = datetime.now(UTC)
     hb_path = tmp_path / "supervisor-heartbeat.json"
@@ -887,6 +894,10 @@ def test_watchdog_kill_failure_does_not_set_killed_and_continues(tmp_path: Path)
     )
     # Alive on first poll (triggers kill attempt), then exits on its own.
     process = FakeProcess(poll_results=[None, 0], kill_raises=True)
+    event_calls: list[tuple[Any, ...]] = []
+
+    def fake_log_event(state_path: Any, kind: str, payload: Any, **kwargs: Any) -> None:
+        event_calls.append((state_path, kind, payload, kwargs))
 
     wd = WedgeWatchdog(
         process,  # type: ignore[arg-type]
@@ -895,7 +906,7 @@ def test_watchdog_kill_failure_does_not_set_killed_and_continues(tmp_path: Path)
         clock=lambda: now,
         log=lambda _: None,
         sleep_func=lambda _: None,
-        log_event_fn=lambda *a, **k: None,
+        log_event_fn=fake_log_event,
     )
     thread = wd.start()
     thread.join(timeout=5.0)
@@ -903,10 +914,19 @@ def test_watchdog_kill_failure_does_not_set_killed_and_continues(tmp_path: Path)
 
     assert process.kill_count == 0  # kill() raised, never succeeded
     assert wd.killed is False  # kill did not succeed
+    # No kill event recorded — the kill did not happen, so it must not be
+    # logged as a completed kill.
+    assert event_calls == []
 
 
 def test_watchdog_retries_kill_after_failure(tmp_path: Path) -> None:
-    """After a failed kill, the watchdog retries and succeeds on the second attempt."""
+    """After a failed kill, the watchdog retries and succeeds on the second attempt.
+
+    The ``supervisor_wedged_killed`` event is recorded exactly once — on the
+    successful retry. The failed first attempt must not emit an event (it did
+    not kill anything), confirming the event is gated on ``process.kill()``
+    succeeding rather than on the kill being attempted.
+    """
     now = datetime.now(UTC)
     hb_path = tmp_path / "supervisor-heartbeat.json"
     _write_heartbeat(
@@ -927,6 +947,10 @@ def test_watchdog_retries_kill_after_failure(tmp_path: Path) -> None:
         original_kill()
 
     process.kill = kill_then_succeed  # type: ignore[method-assign]
+    event_calls: list[tuple[Any, ...]] = []
+
+    def fake_log_event(state_path: Any, kind: str, payload: Any, **kwargs: Any) -> None:
+        event_calls.append((state_path, kind, payload, kwargs))
 
     wd = WedgeWatchdog(
         process,  # type: ignore[arg-type]
@@ -935,7 +959,7 @@ def test_watchdog_retries_kill_after_failure(tmp_path: Path) -> None:
         clock=lambda: now,
         log=lambda _: None,
         sleep_func=lambda _: None,
-        log_event_fn=lambda *a, **k: None,
+        log_event_fn=fake_log_event,
     )
     thread = wd.start()
     thread.join(timeout=5.0)
@@ -943,6 +967,11 @@ def test_watchdog_retries_kill_after_failure(tmp_path: Path) -> None:
 
     assert process.kill_count == 1  # second kill succeeded
     assert wd.killed is True
+    # Exactly one event — on the successful retry, not the failed first attempt.
+    assert len(event_calls) == 1
+    _path, kind, payload, _kwargs = event_calls[0]
+    assert kind == WEDGE_KILL_EVENT_KIND
+    assert payload["pid"] == 12345  # the killed process's pid
 
 
 # ---------------------------------------------------------------------------
