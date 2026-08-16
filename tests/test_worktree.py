@@ -3408,6 +3408,47 @@ def test_resolve_base_branch_name_strips_origin_prefix(tmp_path: Path) -> None:
     assert resolve_base_branch_name(repo_root, "refs/heads/feature") == "feature"
 
 
+def test_resolve_base_branch_name_heals_missing_origin_head(tmp_path: Path) -> None:
+    """Issue #1250 regression: a clone whose origin/HEAD symref is deleted must
+    still resolve to the repo's real default branch, not a hardcoded ``main``.
+
+    Mirrors ``test_resolve_default_branch_ref_heals_missing_origin_head`` but
+    exercises the public ``resolve_base_branch_name`` fallback path. The remote
+    uses a non-``main`` default branch (``trunk``) so the assertion discriminates
+    a real heal from a hardcoded ``main`` fallback: against the unfixed code the
+    deleted symref is not healed and the function returns ``"main"``, which is
+    wrong for this repo.
+    """
+    remote_repo = tmp_path / "remote"
+    _init_repo_with_branch(remote_repo, "trunk")
+    repo_root = tmp_path / "repo"
+    _clone_repo(remote_repo, repo_root)
+
+    # Simulate the incident state from #239/#1250: origin remote present, but
+    # the origin/HEAD symref is absent (deleted after clone).
+    subprocess.run(
+        ["git", "symbolic-ref", "--delete", "refs/remotes/origin/HEAD"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert resolve_base_branch_name(repo_root, "") == "trunk"
+
+    # The heal must persist in-repo (set-head --auto), not just resolve
+    # transiently — mirroring the assertion in the _resolve_default_branch_ref
+    # healing test.
+    symref = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert symref.stdout.strip() == "refs/remotes/origin/trunk"
+
+
 def test_fresh_dispatch_autoresolve_ignores_stale_local_head(tmp_path: Path) -> None:
     """base_ref='' must base on the fetched origin tip even when origin/HEAD is
     unset and local HEAD is stale AND carries operator-only work (issue #239)."""

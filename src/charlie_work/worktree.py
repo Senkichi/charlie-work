@@ -3895,12 +3895,15 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
     are stripped to their local branch name; ``HEAD`` falls back to the current
     branch. When ``base_ref`` is empty or unrecognized and the ``HEAD`` probe
     fails, the default branch is derived from the repository's remote HEAD
-    (``git symbolic-ref refs/remotes/origin/HEAD``) instead of a hardcoded
-    literal, so a repo whose default branch is ``master``/``trunk`` is not
-    silently compared against a nonexistent ``origin/main``. The literal
-    ``"main"`` survives only as a last resort when the repo itself provides no
-    answer, and its use is logged so the guess is visible. This function never
-    raises.
+    (reusing ``_resolve_default_branch_ref``, which reads
+    ``git symbolic-ref refs/remotes/origin/HEAD`` and heals an unset symref via
+    ``git remote set-head origin --auto``) instead of a hardcoded literal, so a
+    repo whose default branch is ``master``/``trunk`` is not silently compared
+    against a nonexistent ``origin/main`` — including the incident state from
+    #239/#1250 where the symref was deleted after clone. The literal ``"main"``
+    survives only as a last resort when the repo itself provides no answer (no
+    origin remote, or an origin whose default branch cannot be healed), and its
+    use is logged so the guess is visible. This function never raises.
     """
     if base_ref.startswith("refs/remotes/origin/"):
         return base_ref[len("refs/remotes/origin/") :]
@@ -3917,26 +3920,36 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
         if current_branch.ok and current_branch.stdout.strip():
             return current_branch.stdout.strip()
     # Derive the default branch from the repository's remote HEAD instead of a
-    # hardcoded literal. ``git symbolic-ref refs/remotes/origin/HEAD`` is set
-    # automatically by ``git clone`` (and repairable via
-    # ``git remote set-head origin --auto`` when unset); it yields a ref like
-    # ``refs/remotes/origin/trunk`` for a repo whose default branch is ``trunk``.
-    remote_head = run_captured(
-        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
-        cwd=repo_root,
-        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
-    )
-    if remote_head.ok:
-        ref = remote_head.stdout.strip()
-        prefix = "refs/remotes/origin/"
-        if ref.startswith(prefix):
-            derived = ref[len(prefix) :]
-            if derived:
-                return derived
+    # hardcoded literal. Reuse ``_resolve_default_branch_ref`` rather than
+    # re-reading the symref here so the unset-symref case is healed via
+    # ``git remote set-head origin --auto`` (issue #239 / #1250): a clone whose
+    # ``refs/remotes/origin/HEAD`` was deleted still resolves to the real
+    # default branch instead of silently falling back to ``main``. That helper
+    # returns ``"origin/<branch>"`` when origin is present, ``"HEAD"`` for a
+    # pure-local repo with no origin, and raises ``RuntimeError`` when an origin
+    # exists but its default branch cannot be healed. This function never
+    # raises, so the RuntimeError is caught and logged here.
+    try:
+        default_ref = _resolve_default_branch_ref(repo_root)
+    except RuntimeError as exc:
+        logging.getLogger(__name__).warning(
+            "resolve_base_branch_name: could not derive default branch from repo "
+            "at %s (base_ref=%r): %s; falling back to hardcoded 'main'.",
+            repo_root,
+            base_ref,
+            exc,
+        )
+        return "main"
+    if default_ref.startswith("origin/"):
+        derived = default_ref[len("origin/") :]
+        if derived:
+            return derived
+    # ``default_ref == "HEAD"``: pure-local repo with no origin remote, so there
+    # is no remote default branch to derive. The literal ``"main"`` is the last
+    # resort and its use is logged so the guess is visible.
     logging.getLogger(__name__).warning(
         "resolve_base_branch_name: could not derive default branch from repo "
-        "at %s (base_ref=%r); falling back to hardcoded 'main'. Run "
-        "'git remote set-head origin --auto' to repair.",
+        "at %s (base_ref=%r); falling back to hardcoded 'main'.",
         repo_root,
         base_ref,
     )
