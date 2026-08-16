@@ -152,6 +152,7 @@ from .worktree import (
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
+    salvage_branch_empty_diff,
     salvage_push_stranded_commits,
     summarize_branch_work,
     worktree_ahead_of_sha,
@@ -7961,6 +7962,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                         state_file=state_file,
                         failure_kind=failure_kind,
                         issue_title=issue.get("title") if issue else None,
+                        issue=issue,
                     )
                     if salvaged:
                         continue
@@ -8258,6 +8260,55 @@ def _open_salvage_pr(
     return pr_number, None, closing_ref
 
 
+def _salvage_already_landed(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    issue: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """Return ``(already_landed, reason)`` if salvage should be skipped.
+
+    Issue #1221: a dead session's snapshot (issue, pr_number, branch) can be
+    stale by the time staleness trips and salvage fires -- the linked issue may
+    have been closed and/or its PR merged by an operator or sibling worker
+    inside the staleness threshold window. Re-check LIVE terminal state at fire
+    time instead of trusting the snapshot. Any one of these means a salvage PR
+    would be vestigial (a duplicate of already-landed work):
+
+    1. the linked issue is CLOSED (``issue`` carries ``state`` from the
+       caller's ``gh.issue_view`` -- one call, already made).
+    2. a PR binding to this issue is MERGED (``gh.merged_prs_for_issue`` -- one
+       call). A failed search (``ok=False``) is treated as "unknown", which
+       falls through to opening the PR; a human reviews salvage PRs anyway.
+    3. the salvage branch's tree contributes an empty diff against current main
+       (``salvage_branch_empty_diff`` -- a fetch + two rev-parse calls). This
+       is the belt-and-suspenders for the case where (1)/(2) miss (e.g. a
+       squash-merge that closed the issue but whose PR search lags, or work
+       landed via a sibling branch). Fails safe (returns False) on git error.
+
+    ``reason`` is a short string identifying which check fired, recorded in the
+    ``salvage_skipped_already_landed`` event for diagnosis.
+    """
+    # (1) Issue closed.
+    if issue is not None and str(issue.get("state") or "").upper() == "CLOSED":
+        return True, "issue_closed"
+
+    # (2) A merged PR binds to this issue.
+    merged = gh.merged_prs_for_issue(issue_number, config.dispatch.branch_prefix)
+    if getattr(merged, "ok", True) and len(merged) > 0:
+        return True, "pr_merged"
+
+    # (3) The branch's tree is identical to current main's tree.
+    if salvage_branch_empty_diff(repo_root, branch, base_ref):
+        return True, "empty_diff"
+
+    return False, None
+
+
 def _attempt_salvage(
     *,
     gh: GitHubLike,
@@ -8272,6 +8323,7 @@ def _attempt_salvage(
     state_file: Path,
     failure_kind: str | None,
     issue_title: str | None = None,
+    issue: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None]:
     """Push a completed branch and open a PR, then move labels to ``pr_open``.
 
@@ -8279,7 +8331,45 @@ def _attempt_salvage(
     ``ok`` is ``True`` once the PR is created, even if the label swap failed;
     in that case ``error`` describes the label failure and the
     ``session_salvaged`` event records ``label_write_ok=False``.
+
+    ``ok`` is also ``True`` (with ``error=None``) when salvage is *skipped*
+    because the work already landed (issue #1221): the dead session's snapshot
+    can be stale, so before opening a PR we re-check live terminal state. A
+    skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
+    duplicate PR, and the caller treats it as "handled" (no redispatch).
     """
+    already_landed, skip_reason = _salvage_already_landed(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+        issue=issue,
+    )
+    if already_landed:
+        with state_lock(state_file):
+            state = load_state(state_file)
+            # Issue #282: preserve the liveness fingerprint so the recovery
+            # path can verify the worker is dead before the worktree is
+            # reclaimed.
+            state = append_event(
+                state,
+                "salvage_skipped_already_landed",
+                {
+                    "issue_number": issue_number,
+                    "failure_kind": failure_kind,
+                    "reason": skip_reason,
+                    # The skip path does NOT remove labels -- label cleanup is the
+                    # reconcile lane's job. Record the active labels at skip time
+                    # for diagnosis (what state the issue was in), not as removed.
+                    "active_labels": sorted(active_labels),
+                },
+                state_path=state_file,
+            )
+            save_state(state_file, state)
+        return True, None
+
     push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
     if not push_ok:
         return False, push_error
