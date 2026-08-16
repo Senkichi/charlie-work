@@ -8712,13 +8712,21 @@ def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
 
 
 def _dispatch_reviews_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, enabled: bool = True
+    tmp_path: Path,
+    *,
+    prs: list[dict[str, Any]] | None = None,
+    enabled: bool = True,
+    dry_run: bool = False,
 ) -> OrchestratorApp:
     """Build an OrchestratorApp with review_dispatch enabled (by default) and an empty state file.
 
     Issue #868: ``enabled`` is overridable so tests can exercise
     ``dispatch_reviews()``'s disabled-gate path with the same PR/state seeding
     helpers used by the enabled-path tests.
+
+    Issue #1251: ``dry_run`` is overridable so tests can exercise the dry-run
+    preview branch of ``dispatch_reviews()`` (read-only selection + empty-diff
+    pre-flight mirror) with the same PR/state seeding helpers.
     """
     config = OrchestratorConfig(
         review_dispatch=ReviewDispatchConfig(enabled=enabled),
@@ -8733,7 +8741,7 @@ def _dispatch_reviews_app(
     fake_gh.issues = []
     if prs is not None:
         fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
 
 
 def _fake_claude_worker_record(pr_number: int, branch: str) -> ClaudeWorkerRecord:
@@ -8812,6 +8820,268 @@ def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Pat
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
     assert state["prs"]["100"]["reviewer_pid"] == 12345
     assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_skips_empty_diff_pr(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+    must not burn a paid reviewer session. The pre-flight gate skips dispatch,
+    emits review_skipped_empty_diff, and does NOT increment
+    review_dispatch_attempt_count (an empty diff is not a review attempt)."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # Write an EMPTY diff.patch — the signal for a zero-file PR.
+    pr_dir = app.paths.prs / "pr-100"
+    (pr_dir / "diff.patch").write_text("", encoding="utf-8")
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # No reviewer must have been launched.
+    assert len(launched) == 0
+    assert result.data["launched_count"] == 0
+    # The PR must appear in the skipped_empty_diff payload.
+    assert 100 in result.data["skipped_empty_diff"]
+    # review_skipped_empty_diff event must have been emitted.
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert len(skip_events) == 1
+    assert skip_events[0]["pr_number"] == 100
+    # review_dispatch_attempt_count must NOT have been incremented.
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"].get("100", {})
+    assert int(pr_state.get("review_dispatch_attempt_count", 0)) == 0
+    # No dispatch claim must have been written.
+    assert pr_state.get("review_dispatch_status") != "review_dispatch_pending"
+
+
+def test_dispatch_reviews_proceeds_with_nonempty_diff(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: a PR with a non-empty diff.patch must proceed through
+    normal dispatch unchanged — the empty-diff gate only stops zero-file PRs."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # Write a NON-EMPTY diff.patch.
+    pr_dir = app.paths.prs / "pr-100"
+    (pr_dir / "diff.patch").write_text(
+        "diff --git a/foo.py b/foo.py\n+print('hello')\n", encoding="utf-8"
+    )
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The reviewer must have been launched.
+    assert len(launched) == 1
+    assert result.data["launched_count"] == 1
+    # No empty-diff skip.
+    assert result.data["skipped_empty_diff"] == []
+    # No review_skipped_empty_diff event.
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert len(skip_events) == 0
+    # Dispatch must have proceeded — claim upgraded to dispatched.
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_empty_diff_mixed_with_nonempty(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: when both an empty-diff PR and a non-empty-diff PR are
+    queued, only the non-empty PR is dispatched; the empty one is skipped
+    without affecting the other's dispatch."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    _write_review_packet(tmp_path, 200, "sha-200")
+    # PR 100: empty diff. PR 200: non-empty diff.
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+    (app.paths.prs / "pr-200" / "diff.patch").write_text(
+        "diff --git a/bar.py b/bar.py\n+pass\n", encoding="utf-8"
+    )
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # Only PR 200 must have been launched.
+    assert launched == [200]
+    assert result.data["launched_count"] == 1
+    # PR 100 must be in the skipped list.
+    assert 100 in result.data["skipped_empty_diff"]
+    assert 200 not in result.data["skipped_empty_diff"]
+    # PR 100's attempt count must not have been incremented.
+    state = load_state(app.paths.state_file)
+    assert int(state["prs"].get("100", {}).get("review_dispatch_attempt_count", 0)) == 0
+    # PR 200's attempt count must have been incremented (claimed).
+    assert int(state["prs"]["200"].get("review_dispatch_attempt_count", 0)) == 1
+
+
+def test_dispatch_reviews_dry_run_empty_diff_preview_is_read_only(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #1251: the dry-run preview branch of dispatch_reviews mirrors the
+    real path's empty-diff pre-flight gate (added at the dry-run branch's
+    dry_selected/dry_skipped_empty_diff loop) but must stay strictly read-only:
+    no review_skipped_empty_diff event emitted, no state.json mutation, no
+    attempt_count change. This is the only test covering that loop -- no other
+    dispatch_reviews dry-run test exists in the file."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, dry_run=True)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    _write_review_packet(tmp_path, 200, "sha-200")
+    # PR 100: empty diff. PR 200: non-empty diff.
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+    (app.paths.prs / "pr-200" / "diff.patch").write_text(
+        "diff --git a/bar.py b/bar.py\n+pass\n", encoding="utf-8"
+    )
+
+    # A dry-run pass must never launch a worker. Guard against the launch
+    # helper being invoked at all -- if it is, the dry-run gate failed.
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        raise AssertionError("dry-run dispatch_reviews must not launch a worker")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    # Snapshot state.json's raw bytes so a no-op dry-run can be proven by
+    # byte-equality, not just by re-reading parsed fields.
+    state_path = app.paths.state_file
+    state_before = state_path.read_bytes()
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The empty-diff PR is excluded from the would-dispatch count; the
+    # non-empty PR is the only one that would be dispatched.
+    assert result.data["selected_count"] == 1
+    assert result.data["attempted_count"] == 1
+    assert result.data["launched_count"] == 0
+    # deferred_count = all_candidates - dry_selected = 2 - 1 = 1 (the empty
+    # PR is counted as deferred in the dry-run preview, mirroring how the
+    # real path's deferred_count = candidates - dispatchable treats a
+    # pre-flight-skipped PR as not-selected).
+    assert result.data["deferred_count"] == 1
+    # The empty-diff PR is reported in skipped_empty_diff; the non-empty is not.
+    assert result.data["skipped_empty_diff"] == [100]
+    # Read-only contract: no review_skipped_empty_diff event emitted.
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert skip_events == []
+    # Read-only contract: state.json bytes unchanged.
+    assert state_path.read_bytes() == state_before
+    # Read-only contract: no attempt_count mutation for either PR.
+    state = load_state(state_path)
+    assert "100" not in state["prs"]
+    assert "200" not in state["prs"]
 
 
 def test_dispatch_reviews_forwards_orchestrator_config_to_launch(
@@ -9261,6 +9531,14 @@ def test_dispatch_reviews_reaps_stalled_claim_when_disabled(monkeypatch, tmp_pat
         "process_start_time": 1.0,
     }
     (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    # Give the reviewer a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path this test
+    # exercises). Without this the log read would fail (the sidecar's
+    # log_path names a file that was never created) and classify as
+    # UNDETERMINED (issue #1069), whose first-few-deaths handling rolls the
+    # claim back to re-dispatchable instead of reaping it to
+    # review_dispatch_failed.
+    Path(sidecar["log_path"]).write_text("ordinary crash output\n", encoding="utf-8")
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         state["prs"]["100"] = {
@@ -15130,6 +15408,12 @@ def test_detect_and_handle_stalled_reviews_skips_terminal_pr_reaps_sidecar(
     sidecar_100.write_text(json.dumps(_sidecar(100, old_started)), encoding="utf-8")
     sidecar_200 = reviews_dir / "issue-200.claude.json"
     sidecar_200.write_text(json.dumps(_sidecar(200, old_started)), encoding="utf-8")
+    # PR 200 is the non-terminal PR that should get the normal reap-to-failed
+    # treatment. Give it a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path). Without this the
+    # log read would fail and classify as UNDETERMINED (issue #1069), which
+    # rolls back instead of failing — not the path this test exercises.
+    (reviews_dir / "issue-200.claude.log").write_text("ordinary crash output\n", encoding="utf-8")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
     monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
@@ -15275,6 +15559,12 @@ def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
         "adapter_kind": "claude-code",
     }
     (reviews_dir / "issue-100.claude.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    # Give the reviewer a readable log with no throttle marker so it
+    # classifies as NOT_THROTTLED (the counted-failure path that calls
+    # _remove_review_checkout_with_warning). Without this the log read would
+    # fail and classify as UNDETERMINED (issue #1069), which uses a different
+    # checkout-removal path — not the warning path this test exercises.
+    (reviews_dir / "issue-100.claude.log").write_text("ordinary crash output\n", encoding="utf-8")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
     monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: False)
@@ -42118,6 +42408,240 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     assert payload["reason"] == "dead_dispatched_worker_reap"
     assert payload["reap_minutes"] == 60
     assert payload["exit_code"] == 0
+
+
+def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Path) -> None:
+    """Issue #1230: a dead dispatched worker with no open PR whose issue already
+    carries ``agent:human-needed`` (applied by a mention-flag escalation) is
+    invisible to the #417 ground-truth label reclaim (no active labels to
+    remove) and invisible to the redispatch cap (never re-dispatched because the
+    terminal label excludes it).  The no-open-PR drift branch sets
+    ``orphan_flagged_at`` but never set ``orphan_drift_at``, so the
+    ``dead_dispatched_reap_minutes`` time-based backstop — which keys off
+    ``orphan_drift_at`` — never fired.  The issue wedged in ``dispatched``
+    indefinitely: not dispatchable (status says a worker owns it), not
+    sweepable (status is not ``escalated``), and the label promises a human
+    review the state machine cannot act on.
+
+    The fix: the no-open-PR drift branch must also stamp ``orphan_drift_at`` so
+    the existing ``dead_dispatched_reap_minutes`` backstop converges the status
+    to ``escalated`` after the grace period, regardless of concurrent
+    label-side transitions.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the jc #1421 shape: dispatched, dead PID, no open PR, and the issue
+    # already carries agent:human-needed from a mention-flag escalation
+    # (merged_pr_mention_flagged_at set).  No active labels are present, so the
+    # #417 reclaim is a no-op and the issue is excluded from dispatch.
+    state = load_state(paths.state_file)
+    state["issues"]["1421"] = {
+        "status": "dispatched",
+        "worker_pid": 45292,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2026-08-09T07:33:24Z",
+        "merged_pr_mention_flagged_at": "2026-08-10T12:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues = [
+        {
+            "number": 1421,
+            "title": "call_model cascade timeout",
+            "url": "https://example.test/issues/1421",
+            "body": "",
+            # Only the terminal human-needed label — no active labels.
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Pass 1: the no-open-PR drift branch fires (no active labels to reclaim,
+    # no pushed branch).  It must stamp orphan_drift_at so the time-based
+    # backstop can fire on a later pass.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("orphan_flagged_at") is not None
+    assert entry.get("orphan_drift_at") is not None, (
+        "no-open-PR drift branch must set orphan_drift_at so the "
+        "dead_dispatched_reap_minutes backstop can converge the wedge"
+    )
+    # Status is still dispatched — the grace period has not elapsed.
+    assert entry.get("status") == "dispatched"
+
+    # Simulate the grace period elapsing: rewind orphan_drift_at to 120 minutes
+    # ago (past the 60-minute reap window).
+    old_drift_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    st["issues"]["1421"]["orphan_drift_at"] = old_drift_at
+    save_state(paths.state_file, st)
+
+    # Pass 2: the dead_dispatched_reap_minutes backstop must fire and converge
+    # status to escalated, even though the escalation label is already present.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+
+    # The reap event must be recorded.
+    reaped_events = [
+        e for e in st.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 1421
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
+
+
+def test_orphaned_worker_no_open_pr_already_flagged_backstop_backfills(tmp_path: Path) -> None:
+    """Issue #1230 regression: the real wedge precondition is an entry that was
+    flagged on a prior pass (``orphan_flagged_at`` set) but never received an
+    ``orphan_drift_at`` stamp -- either because it was flagged by a pre-#1230
+    build (which set only ``orphan_flagged_at``) or via the reclaim-success
+    branch (which deliberately omits ``orphan_drift_at``).  The original #1230
+    fix placed the ``orphan_drift_at`` stamp behind the
+    ``orphan_flagged_at`` early-return guard, so already-flagged entries hit
+    ``continue`` before the stamp was written and remained permanently
+    unreachable -- the backstop never armed and the issue never escalated.
+
+    The fix decouples the backfill from the guard: ``orphan_drift_at`` is
+    backfilled from ``orphan_flagged_at`` whenever it is missing, BEFORE the
+    duplicate-event guard's early-return.  This test seeds the exact wedge
+    precondition (``orphan_flagged_at`` set, ``orphan_drift_at`` absent, grace
+    period already elapsed) and verifies the backstop arms on the next sweep
+    pass and the issue escalates.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the wedge precondition: orphan_flagged_at is set to 120 minutes ago
+    # (past the 60-minute reap grace) but orphan_drift_at is ABSENT.  This is
+    # the state a pre-#1230-flagged entry (or a reclaim-success entry that
+    # later fell through to the drift branch) would be in.
+    flagged_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    state = load_state(paths.state_file)
+    state["issues"]["1421"] = {
+        "status": "dispatched",
+        "worker_pid": 45292,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": (datetime.now(UTC) - timedelta(days=4))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "merged_pr_mention_flagged_at": (datetime.now(UTC) - timedelta(days=3))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "orphan_flagged_at": flagged_at,
+        # orphan_drift_at deliberately ABSENT -- the wedge precondition.
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues = [
+        {
+            "number": 1421,
+            "title": "call_model cascade timeout",
+            "url": "https://example.test/issues/1421",
+            "body": "",
+            # Only the terminal human-needed label -- no active labels, so the
+            # #417 reclaim is a no-op and the issue is excluded from dispatch.
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Pass 1: the drift branch is reached (no active labels to reclaim).  The
+    # duplicate-event guard sees orphan_flagged_at already set, but the
+    # backfill must run BEFORE the early-return so orphan_drift_at is armed.
+    # The backstop at the top of the loop already ran this pass with
+    # orphan_drift_at absent, so escalation cannot happen yet -- but the stamp
+    # must now be present for the next pass.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("orphan_drift_at") is not None, (
+        "already-flagged entry must have orphan_drift_at backfilled from "
+        "orphan_flagged_at so the backstop can arm on the next sweep pass"
+    )
+    # Backfill must use the original flag timestamp (not utc_now()) so an
+    # already-wedged entry converges immediately instead of waiting another
+    # full grace window.
+    assert entry.get("orphan_drift_at") == flagged_at
+    # The duplicate-event guard still suppresses the drift event -- no new
+    # orphaned_worker_drift for this issue on this pass.
+    drift_events = [
+        e
+        for e in st.get("events", [])
+        if e.get("kind") == "orphaned_worker_drift"
+        and e.get("payload", {}).get("issue_number") == 1421
+    ]
+    assert len(drift_events) == 0
+    # Status is still dispatched -- the backstop runs at the top of the loop,
+    # before the drift branch, so it could not fire this pass.
+    assert entry.get("status") == "dispatched"
+
+    # Pass 2: the backstop at the top of the loop now sees orphan_drift_at
+    # (backfilled to 120 minutes ago, past the 60-minute grace) and must
+    # escalate.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+
+    reaped_events = [
+        e for e in st.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 1421
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
 
 
 def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -> None:

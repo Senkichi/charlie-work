@@ -251,11 +251,32 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "infra_rerun_failed": "warning",
         "janitor_rework_stalled": "warning",
         "main_ci_reclaim_failed": "warning",
+        # cw#1263: the orchestrator's own salvage-PR-body builders had to
+        # rewrite the ``Closes #N`` line before handing the body to
+        # ``gh pr create``. Warning, not error: the rewrite happens before
+        # creation, so the body is still usable -- but a recurring burst
+        # indicates the salvage builders are drifting from the canonical
+        # form again.
+        "pr_closing_ref_rewritten": "warning",
+        # cw#1263: after ``gh pr create`` succeeded, GitHub's own
+        # ``closingIssuesReferences`` resolution did not include the
+        # intended issue -- the PR was created but will not auto-close it on
+        # merge. Warning, not error: the PR still exists and is still
+        # actionable, but the issue's lifecycle labels will not flip
+        # automatically without a human or a later reconcile pass noticing.
+        "pr_closing_ref_unlinked": "warning",
         "quota_probe_failed": "warning",
         "required_changes_vacuous": "warning",
         "review_dispatch_lifecycle_reaped": "warning",
         "review_packet_template_stale": "warning",
         "review_quota_exhausted": "warning",
+        # Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+        # was skipped before claiming a paid reviewer session. Warning, not
+        # info: an empty diff is a symptom of an upstream bug (e.g. #1221's
+        # vestigial duplicate PRs), not a routine dispatch outcome. A
+        # repeating burst on one PR is the signal that a salvage/duplicate
+        # path keeps producing zero-delta PRs.
+        "review_skipped_empty_diff": "warning",
         # The stale-claim recovery sweep (issue #487's "never claimed/dispatched"
         # path) skipped a PR without acting on it -- prompt_path was missing from
         # state or the file it names no longer exists on disk. Warning, not info:
@@ -409,6 +430,20 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
 # that refer to ``_ERROR_KINDS`` / ``_WARNING_KINDS`` continue to work.
 _ERROR_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "error"})
 _WARNING_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "warning"})
+
+# Issue #1271: re-exported, not declared here. ``heartbeat_check.py`` is
+# stdlib-only by design (see ``scripts/README.md``) and this module imports
+# ``ci_fleet.observability``/``ci_fleet.provenance`` below at module load, so
+# declaring the frozenset in this module and having the script import it
+# from here would make a broken ``ci_fleet`` install crash the script with
+# an unhandled ImportError on exactly the failure class it exists to report.
+# ``charlie_work.event_kinds`` is the genuine leaf (stdlib-only, no further
+# charlie_work/ci_fleet imports) that both this module and
+# ``heartbeat_check.py`` import from -- see its module docstring. Every
+# member must be registered in ``_LEVEL_BY_KIND`` at ``"warning"`` --
+# bucketing only makes sense for warnings -- which
+# ``test_expected_operational_kinds_are_all_registered_warnings`` enforces.
+from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS  # noqa: E402,F401
 
 
 def _now_iso() -> str:

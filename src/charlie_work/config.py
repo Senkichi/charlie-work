@@ -515,6 +515,21 @@ class ReviewDispatchConfig:
     # verdict (e.g. every reviewer hits the session limit) is re-dispatched
     # indefinitely, burning quota every stale-claim interval.
     max_review_dispatch_attempts: int = 3
+    # Maximum consecutive UNDETERMINED (unreadable/empty reviewer log)
+    # classifications for the same PR before the rollback stops preserving
+    # the attempt budget (issue #1069). The first N consecutive undetermined
+    # deaths are treated as transient I/O hiccups — the claim is rolled back
+    # and the attempt counter decremented, exactly like the throttle path but
+    # without arming fleet-wide backoff. Once the streak exceeds this value
+    # the condition is persistent, not transient: subsequent undetermined
+    # deaths become counted failures (attempt counter NOT decremented) so the
+    # existing ``max_review_dispatch_attempts`` cap can converge and escalate
+    # rather than redispatching forever with no cap and no backoff — the same
+    # outage shape as #1342-1346 via a new path. The streak resets on any
+    # definitive outcome (throttled, not-throttled, verdict recorded, new
+    # packet, operator unescalate). 0 disables the bound (preserves the
+    # pre-fix unbounded rollback — not recommended).
+    max_consecutive_review_log_unreadable: int = 3
     # Maximum agentic turns for a reviewer session. Caps token spend per
     # review by limiting how many tool-call round-trips the reviewer can make.
     # 0 means unlimited (preserves pre-existing behavior). 40 is generous for
@@ -1452,6 +1467,19 @@ class PostMortemConfig:
         SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
         SignatureRule(pattern=r"A tool was rejected by the user", kind="worker_blocked"),
     )
+    # Issue #1234: refuse the locked-DB temp-copy fallback when sessions.db
+    # exceeds this size. A best-effort diagnostic must never write a multi-GB
+    # copy to temp — with a 12 GB sessions.db each fallback invocation costs
+    # 12 GB, and imperfect cleanup turns that into a permanent disk-filler.
+    # Default 256 MB; the read-only URI path is unaffected (no copy made).
+    temp_copy_max_bytes: int = 256 * 1024 * 1024
+    # Issue #1234: stale ``charlie-work-postmortem-*`` temp dirs older than
+    # this are reclaimed at the start of every fallback invocation, so a leak
+    # from a pass killed mid-copy (supervisor self-deploy restart cycle) is
+    # transient rather than permanent. Default 2 hours — comfortably longer
+    # than any single post-mortem pass (minutes) yet short enough that leaks
+    # cannot accumulate across a day.
+    temp_copy_reclaim_max_age_hours: int = 2
 
 
 @dataclass(frozen=True)
@@ -1761,6 +1789,19 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be >= 1, "
             f"got {rd_max_attempts}"
+        )
+    rd_max_unreadable = review_dispatch_data.get("max_consecutive_review_log_unreadable")
+    if rd_max_unreadable is not None and (
+        isinstance(rd_max_unreadable, bool) or not isinstance(rd_max_unreadable, int)
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_consecutive_review_log_unreadable' must be an int, "
+            f"got {type(rd_max_unreadable).__name__}"
+        )
+    if rd_max_unreadable is not None and rd_max_unreadable < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_consecutive_review_log_unreadable' must be >= 0, "
+            f"got {rd_max_unreadable}"
         )
     rd_probe_max_interval = review_dispatch_data.get("quota_probe_max_interval_minutes")
     if rd_probe_max_interval is not None and (

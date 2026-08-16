@@ -226,7 +226,7 @@ def test_open_salvage_pr_with_empty_base_ref_still_derives_summary(tmp_path: Pat
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=repo_root)
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=repo_root,
