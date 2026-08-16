@@ -101,6 +101,7 @@ from .closing_reference import (
     closing_issues_referenced_numbers,
     validate_closing_reference,
 )
+from .pr_create_retry import create_pr_with_retry
 from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
 from .janitor import (
@@ -5677,8 +5678,14 @@ def _detect_and_handle_orphaned_workers(
                         state["issues"][str(issue_number)] = entry
                         continue
 
-                    # PR creation failed -- surface as a distinct drift so the
-                    # orchestrator does not silently re-dispatch completed work.
+                    # PR creation failed after the bounded outer retry
+                    # (pr_create_retry.py) and the duplicate-PR guard both
+                    # exhausted -- the branch is pushed and stranded (cw#1273).
+                    # Reuses this sweep's existing _drift_fingerprint dedup
+                    # path rather than inventing a parallel one; the "reason"
+                    # value is preserved unchanged from before cw#1273 so the
+                    # fingerprint (and any existing dedup state already on
+                    # disk from before this change) stays stable.
                     fingerprint = _drift_fingerprint(
                         reason="dead_worker_branch_pushed_pr_create_failed",
                         branch_name=candidate["branch"],
@@ -5691,7 +5698,7 @@ def _detect_and_handle_orphaned_workers(
                     entry["orphan_drift_at"] = utc_now()
                     sweep_events.append(
                         (
-                            "orphaned_worker_drift",
+                            "pr_create_failed_branch_stranded",
                             {
                                 "issue_number": issue_number,
                                 "branch_name": candidate["branch"],
@@ -8216,9 +8223,24 @@ def _open_salvage_pr(
             },
         )
 
-    pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
+    # cw#1273: every gh.pr_create call site routes through the bounded outer
+    # retry + duplicate-PR guard instead of calling gh.pr_create directly.
+    retry_result = create_pr_with_retry(
+        gh,
+        head=branch,
+        base=base_branch,
+        title=title,
+        body=body,
+        max_retries=config.runtime.pr_create_retry_max_attempts,
+        base_seconds=config.runtime.pr_create_retry_base_seconds,
+    )
+    pr_number = retry_result.pr_number
     if pr_number is None:
-        return None, "gh pr create failed or returned no PR number", closing_ref
+        return (
+            None,
+            retry_result.error or "gh pr create failed or returned no PR number",
+            closing_ref,
+        )
 
     # `pr_number` is falsy (0) under `dry_run`, where no real PR was opened and
     # a `gh pr view 0` call would be both wasted and nonsensical -- only probe

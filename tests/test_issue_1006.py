@@ -146,10 +146,13 @@ def test_orphan_salvage_repo_root_guard(
     state = load_state(state_file)
     issue_state = state["issues"][str(issue_number)]
 
+    # cw#1273: this specific reason now emits its own kind
+    # (pr_create_failed_branch_stranded) instead of the generic
+    # orphaned_worker_drift, after the bounded outer retry exhausted.
     drift_events = [
         e
         for e in state.get("events", [])
-        if e.get("kind") == "orphaned_worker_drift"
+        if e.get("kind") == "pr_create_failed_branch_stranded"
         and e.get("payload", {}).get("reason") == "dead_worker_branch_pushed_pr_create_failed"
     ]
     opened_events = [
