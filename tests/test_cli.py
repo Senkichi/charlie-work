@@ -29,7 +29,7 @@ from charlie_work.quiesce import QuiesceReport
 from charlie_work.dirty_tree import DirtyTreeReport
 from charlie_work.state_migration import MigrationChild, MigrationOutcome, MigrationPlan
 from charlie_work.supervise import SelfDeployResult
-from charlie_work.workflow import CommandResult
+from charlie_work.workflow import ORCHESTRATOR_COMMENT_MARKER, CommandResult
 from ci_fleet.runner_allocation import AllocationPlan
 from ci_fleet.runner_allocation_pass import AllocationPassResult
 
@@ -38,7 +38,7 @@ class _FakeGitHub:
     """Stub GitHub client sufficient to drive cli.main through the verdict path."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
+        self.pr_comment_calls: list[tuple[int, str]] = []
 
     def name_with_owner(self) -> str:
         return "owner/repo"
@@ -60,6 +60,12 @@ class _FakeGitHub:
 
     def pr_diff(self, number: int) -> str:
         return "diff content"
+
+    def pr_comment(self, number: int, body_file: Path) -> None:
+        # Issue #1268 (W11): record_review's post_verdict_comment default
+        # (True) means every CLI verdict now posts a PR comment via this
+        # method -- mirrors _CapturingGitHub in test_review_pr_comment.py.
+        self.pr_comment_calls.append((number, body_file.read_text(encoding="utf-8")))
 
     def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
         return [] if json_output else ""
@@ -133,7 +139,8 @@ def test_cli_verdict_success_records_decision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Happy path: a readable summary file records the verdict and exits 0."""
-    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    fake_gh = _FakeGitHub()
+    monkeypatch.setattr(cli, "GitHub", lambda *a, **k: fake_gh)
     repo = _make_repo(tmp_path)
     summary = repo / "summary.md"
     summary.write_text("lgtm", encoding="utf-8")
@@ -160,6 +167,16 @@ def test_cli_verdict_success_records_decision(
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["decision"] == "approved"
     assert decision["summary"] == "lgtm"
+
+    # Issue #1268 (W11) AC4/AC5: post_verdict_comment defaults to True, so
+    # this terminal decision must also post exactly one PR comment carrying
+    # the round header -- see workflow.py's record_review comment gate and
+    # tests/test_review_pr_comment.py for the dedicated coverage.
+    assert len(fake_gh.pr_comment_calls) == 1
+    posted_number, posted_body = fake_gh.pr_comment_calls[0]
+    assert posted_number == 1
+    assert posted_body.startswith(ORCHESTRATOR_COMMENT_MARKER + "\n")
+    assert "## Fleet review - round 1 - approved" in posted_body
 
 
 def test_cli_verdict_reviewed_head_flag_records_source(
