@@ -31,6 +31,17 @@ from typing import Any
 import psutil
 import yaml
 
+# Issue #1271: the single declared source of truth for which warning-level
+# kinds are normal-operation signals (see the frozenset's own docstring in
+# instrumentation.py). Imported, never re-declared or hardcoded here, so
+# check_warning_events' bucketing stays correct as that set changes without
+# this file needing an edit. Unlike the rest of this module (see the
+# stale-open-issue-mention section docstring below for why it otherwise
+# avoids importing charlie_work), this one string-literal set is worth
+# importing directly: duplicating it here would be exactly the kind of
+# hardcoded list that drifts from the registry it is supposed to mirror.
+from charlie_work.instrumentation import EXPECTED_OPERATIONAL_KINDS
+
 # --------------------------------------------------------------------------
 # CONSTANTS
 # --------------------------------------------------------------------------
@@ -142,11 +153,11 @@ class Report:
         """Surface a non-fatal finding.
 
         Unlike `anom`, this does not set `self.anomaly`, so it never flips
-        `main()`'s exit code. Issue #946: warning-level events (e.g.
-        `dispatch_stale`) are worth surfacing but several existing
-        `_WARNING_KINDS` members are normal-operation events, not faults --
-        alarming on them would make this check permanently red and get
-        ignored within a day.
+        `main()`'s exit code. Issue #946: warning-level events are worth
+        surfacing but several existing `_WARNING_KINDS` members are
+        normal-operation events, not faults (see `EXPECTED_OPERATIONAL_KINDS`,
+        issue #1271, for exactly which ones) -- alarming on them would make
+        this check permanently red and get ignored within a day.
         """
         self.lines.append(f"WARN {check}: {detail}")
 
@@ -1177,40 +1188,49 @@ def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> 
     """Surface warning-level events that fire but have no consumer (issue #946).
 
     Mirrors `check_error_events` above one level down the `level` column:
-    every member of `instrumentation._WARNING_KINDS` -- including issue
-    #946's own `dispatch_stale`, plus roughly six pre-existing kinds such as
-    `dispatch_skip_blocked`, `session_exited`, `runner_capacity_starved`, and
-    `draft_pr_ready_held` -- is emitted, classified, documented, and unit
-    tested, but before this check nothing in the codebase ever read a
-    warning-level row. This gives all of them their first reader at once,
-    the same detection-to-delivery gap `check_error_events` closed for
-    `level = 'error'`.
+    every member of `instrumentation._WARNING_KINDS` -- issue #946's
+    motivating kind plus roughly a dozen other pre-existing ones -- is
+    emitted, classified, documented, and unit tested, but before this check
+    nothing in the codebase ever read a warning-level row. This gives all of
+    them their first reader at once, the same detection-to-delivery gap
+    `check_error_events` closed for `level = 'error'`.
 
     Coverage is DERIVED, never a hardcoded `kind` list, for the identical
     reason as `check_error_events`: `level` is computed once and persisted
     per-row at write time by `instrumentation._classify_level` (checked
     against `_WARNING_KINDS` there), so filtering on the persisted
     `level = 'warning'` column here picks up every current and future
-    warning kind without this script importing `charlie_work` or restating
-    its kind list.
+    warning kind without restating the kind list. This one check does import
+    `charlie_work.instrumentation` (see the module-level import's own
+    comment) -- but only for `EXPECTED_OPERATIONAL_KINDS`, the presentation
+    bucketing below, which is a distinct question from coverage.
 
     Deliberately different from `check_error_events` in exactly one place:
     a new warning-level event is reported via `report.warn`, not
-    `report.anom`. Several `_WARNING_KINDS` members
-    (`runner_capacity_starved`, `session_exited`, `draft_pr_ready_held`) are
-    normal-operation events, not faults -- and a deliberately paused fleet
-    with a non-empty backlog (the `dispatch_stale` case this check exists
-    to surface) is not a crash either. Flipping the heartbeat to failure on
-    every one of those would make this check permanently red and get
-    ignored within a day; visibility is the goal, not a new alarm. The
-    db-availability guards below stay `report.anom`, matching
-    `check_error_events`: an unreadable events.db means this check cannot
-    vouch for the repo at all, which is a genuine anomaly independent of
-    whether any warning fired.
+    `report.anom`. Several `_WARNING_KINDS` members are normal-operation
+    events, not faults -- and a deliberately paused fleet with a non-empty
+    backlog is not a crash either (see `EXPECTED_OPERATIONAL_KINDS` for
+    exactly which kinds). Flipping the heartbeat to failure on every one of
+    those would make this check permanently red and get ignored within a
+    day; visibility is the goal, not a new alarm. The db-availability guards
+    below stay `report.anom`, matching `check_error_events`: an unreadable
+    events.db means this check cannot vouch for the repo at all, which is a
+    genuine anomaly independent of whether any warning fired.
 
     See `check_error_events`'s docstring for the missing-db-is-an-anomaly
     rationale and the ISO-vs-SQLite string-comparison trap this avoids by
     comparing `ts` in Python against `baseline`, never in SQL.
+
+    Issue #1271: the kinds in `EXPECTED_OPERATIONAL_KINDS` routinely
+    dominate warning volume (a live 7-day window measured them as the
+    majority of 676 total warnings) and drowned the rare genuine warning
+    kinds in a flat listing. New rows whose `kind` is a member are bucketed
+    into a one-line summarized count instead of the detailed listing; every
+    other kind keeps the original flat `kind@ts` format unchanged. Both are
+    still reported via `report.warn`, never `report.anom` -- bucketing
+    changes presentation, not severity. Kind counts within the summary are
+    ordered by sorted kind name (never dict/insertion order) so two runs
+    over the same fixture produce byte-identical report lines.
     """
     check = f"warning-events {repo.slug}"
     db_path = repo.state_dir / "events.db"
@@ -1239,17 +1259,37 @@ def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> 
     finally:
         conn.close()
 
-    new_warnings: list[str] = []
+    new_warnings_detail: list[str] = []
+    expected_operational_counts: dict[str, int] = {}
     for ts, kind in rows:
         ts_dt = parse_iso(ts)
         # An unparseable ts fails toward visibility (reported), not silence.
         if ts_dt is None or ts_dt > baseline:
-            new_warnings.append(f"{kind}@{ts}")
+            if kind in EXPECTED_OPERATIONAL_KINDS:
+                expected_operational_counts[kind] = expected_operational_counts.get(kind, 0) + 1
+            else:
+                new_warnings_detail.append(f"{kind}@{ts}")
 
-    facts = f"warning_rows={len(rows)} new_since_last_beat={len(new_warnings)}"
-    if new_warnings:
-        report.warn(check, f"new warning-level event(s) since last beat: {new_warnings} ({facts})")
-    else:
+    total_new = len(new_warnings_detail) + sum(expected_operational_counts.values())
+    facts = f"warning_rows={len(rows)} new_since_last_beat={total_new}"
+
+    if new_warnings_detail:
+        report.warn(
+            check, f"new warning-level event(s) since last beat: {new_warnings_detail} ({facts})"
+        )
+    if expected_operational_counts:
+        # Sorted by kind name -- never dict/insertion order -- for
+        # deterministic, byte-identical output across repeated runs.
+        counts_str = ", ".join(
+            f"{kind}={expected_operational_counts[kind]}"
+            for kind in sorted(expected_operational_counts)
+        )
+        report.warn(
+            check,
+            f"{sum(expected_operational_counts.values())} routine operational warnings "
+            f"({counts_str}) ({facts})",
+        )
+    if not new_warnings_detail and not expected_operational_counts:
         report.ok(check, facts)
 
 
