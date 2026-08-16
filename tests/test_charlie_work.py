@@ -8312,6 +8312,7 @@ def test_review_no_op_rework_suppressed_when_stale_ci_verdict(tmp_path: Path) ->
         "request_changes",
         summary="Tests passed: .github:18 — Process completed with exit code 1.",
         required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        verdict_provenance="ci_gate_auto_reject",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8352,6 +8353,7 @@ def test_review_stale_ci_skip_emits_gate_pass_event(tmp_path: Path) -> None:
         "request_changes",
         summary="Tests passed: .github:18 — Process completed with exit code 1.",
         required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        verdict_provenance="ci_gate_auto_reject",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8388,6 +8390,7 @@ def test_review_stale_ci_skip_no_gate_pass_event_in_dry_run(tmp_path: Path) -> N
         "request_changes",
         summary="Tests passed: .github:18 — Process completed with exit code 1.",
         required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        verdict_provenance="ci_gate_auto_reject",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8420,6 +8423,7 @@ def test_review_stale_ci_gate_pass_event_deduped_per_head(tmp_path: Path) -> Non
         "request_changes",
         summary="Tests passed: .github:18 — Process completed with exit code 1.",
         required_changes=_STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+        verdict_provenance="ci_gate_auto_reject",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8457,6 +8461,7 @@ def test_review_no_op_rework_routes_when_prose_finding(tmp_path: Path) -> None:
         "request_changes",
         summary="fix A",
         required_changes=["src/foo.py:42 — off-by-one error in the loop bound."],
+        verdict_provenance="fresh_llm_review",
     )
     state = load_state(app.paths.state_file)
     record = {**state["issues"].get("123", {}), "number": 123, "status": "reviewing"}
@@ -8511,7 +8516,7 @@ def test_merge_ready_post_update_branch_records_verified_sync_event(
         }
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(pr_number, "approved", summary="lgtm")
+    app.record_review(pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Advance the base tip so the PR is stale and triggers pr_update_branch.
     post_merge_base = "main-merged-sha"
@@ -8606,7 +8611,7 @@ def test_merge_ready_head_sync_verification_none_sets_sync_failed(
     fake_gh.diffs[pr_number] = original_diff
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(pr_number, "approved", summary="lgtm")
+    app.record_review(pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Simulate the branch moving (e.g. a rebase) with unchanged cumulative
     # content, so the patch-id carry-forward tier fires naturally and the
@@ -8688,8 +8693,8 @@ def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -14557,7 +14562,7 @@ def test_record_review_resets_cross_family_parse_failure_count(tmp_path: Path) -
         state["prs"]["456"] = {"number": 456, "cross_family_parse_failure_count": 5}
         save_state(paths.state_file, state)
 
-    app.record_review(456, "approved", summary="all clear")
+    app.record_review(456, "approved", summary="all clear", verdict_provenance="fresh_llm_review")
 
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["cross_family_parse_failure_count"] == 0
@@ -14625,15 +14630,21 @@ def test_rework_cap_escalates_to_human(tmp_path: Path) -> None:
 
     # First request_changes (count = 1, head = "sha-1")
     fake_gh.pr_head_shas[456] = "sha-1"
-    first = app.record_review(456, "request_changes", summary="fix A")
+    first = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Second request_changes (count = 2, head = "sha-2")
     fake_gh.pr_head_shas[456] = "sha-2"
-    second = app.record_review(456, "request_changes", summary="fix B")
+    second = app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
 
     # Third request_changes (count stays at 2, escalated, head = "sha-3")
     fake_gh.pr_head_shas[456] = "sha-3"
-    third = app.record_review(456, "request_changes", summary="fix C")
+    third = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
 
     assert first.data["escalated"] is False and first.data["rework_path"]
     assert second.data["escalated"] is False and second.data["rework_path"]
@@ -19844,7 +19855,7 @@ def test_merge_ready_mergequeue_mode_labels_instead_of_merging(tmp_path: Path) -
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -19866,7 +19877,7 @@ def test_merge_ready_mergequeue_hold_label_on_pr_prevents_re_add(tmp_path: Path)
     fake_gh = FakeGitHub()
     fake_gh.prs[0]["labels"] = [{"name": config.labels.merge_hold}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -19890,7 +19901,7 @@ def test_merge_ready_mergequeue_hold_label_on_issue_prevents_re_add(tmp_path: Pa
         {"name": config.labels.merge_hold},
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -19909,7 +19920,7 @@ def test_merge_ready_mergequeue_hold_label_removed_resumes_re_add(tmp_path: Path
     hold_label = config.labels.merge_hold
     fake_gh.prs[0]["labels"] = [{"name": hold_label}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     held = app.merge_ready(456, merge=True)
     assert held.data["merge_hold"] is True
@@ -19943,7 +19954,7 @@ def test_merge_ready_mergequeue_hold_issue_check_unavailable_fails_closed(tmp_pa
 
     fake_gh = IssueViewFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -19981,7 +19992,7 @@ def test_merge_ready_mergequeue_hold_issue_degraded_payload_fails_closed(
 
     fake_gh = IssueViewDegradedGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -20058,8 +20069,8 @@ def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
     fake_gh = FakeGitHub()
     _second_mergequeue_pr(fake_gh)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
-    app.record_review(789, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # First poll: 456 was reviewed first (and sorts first on a tie), so it
     # wins merge-train head and gets parked into the mergequeue.
@@ -20091,7 +20102,7 @@ def test_merge_train_candidates_no_state_read_when_mergequeue_label_unset(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     def _fail_if_called(*_args, **_kwargs):
         raise AssertionError("load_state_locked called with mergequeue_label unset")
@@ -20117,7 +20128,7 @@ def test_merge_ready_mergequeue_parked_pr_skips_charlie_branch_sync(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # First poll parks the PR.
     first = app.merge_ready(456, merge=True)
@@ -20153,7 +20164,7 @@ def test_merge_ready_mergequeue_label_add_failure_does_not_advance_status(
     fake_gh = FakeGitHub()
     fake_gh.add_pr_label_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -20192,7 +20203,7 @@ def test_merge_ready_mergequeue_label_add_failure_alarm_fires_at_threshold(
     fake_gh = FakeGitHub()
     fake_gh.add_pr_label_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     first = app.merge_ready(456, merge=True)
     assert first.data["merge_attempt_alarm"] is False
@@ -20226,7 +20237,7 @@ def test_merge_ready_mergequeue_silent_revert_increments_counter_across_passes(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # Pass 1: fresh handoff, succeeds. Counter starts/stays at 0.
     first = app.merge_ready(456, merge=True)
@@ -20273,7 +20284,7 @@ def test_merge_ready_mergequeue_silent_revert_escalation_reachable(tmp_path: Pat
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     first = app.merge_ready(456, merge=True)
     assert first.data["merge_attempt_alarm"] is False
@@ -20299,7 +20310,7 @@ def test_merge_ready_mergequeue_label_present_next_pass_not_treated_as_reverted(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     first = app.merge_ready(456, merge=True)
     assert first.data["consecutive_failed_merge_attempts"] == 0
@@ -20331,7 +20342,7 @@ def test_merge_ready_mergequeue_revert_detector_ignores_non_mergequeue_prior_sta
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     seed = load_state(paths.state_file)
     seed["prs"]["456"] = {
@@ -20386,7 +20397,7 @@ def test_merge_ready_mergequeue_check_failure_still_routes_to_rework(tmp_path: P
         checks=[{"name": name, "state": "SUCCESS"} for name in required]
     )
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # Pass 1: checks green, handoff succeeds, status becomes "mergequeue".
     first = app.merge_ready(456, merge=True)
@@ -20700,11 +20711,11 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
 
     # First request_changes (count = 1, head = "sha-1")
     fake_gh.pr_head_shas[456] = "sha-1"
-    app.record_review(456, "request_changes", summary="a")
+    app.record_review(456, "request_changes", summary="a", verdict_provenance="fresh_llm_review")
 
     # Second request_changes (count = 2, head = "sha-2")
     fake_gh.pr_head_shas[456] = "sha-2"
-    app.record_review(456, "request_changes", summary="b")
+    app.record_review(456, "request_changes", summary="b", verdict_provenance="fresh_llm_review")
 
     # Flood the event log so any record_review events for 456 are evicted.
     state = load_state(paths.state_file)
@@ -20717,7 +20728,9 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
 
     # Third request_changes (count stays at 2, escalated, head = "sha-3")
     fake_gh.pr_head_shas[456] = "sha-3"
-    third = app.record_review(456, "request_changes", summary="c")
+    third = app.record_review(
+        456, "request_changes", summary="c", verdict_provenance="fresh_llm_review"
+    )
 
     assert third.data["escalated"] is True
     assert third.data["rework_path"] is None
@@ -20730,7 +20743,7 @@ def test_record_review_approved_transitions_labels(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # review_approved clears reviewing/needs-rework so the issue isn't stuck.
     assert (123, "agent:reviewing") in fake_gh.labels_removed
@@ -20752,7 +20765,9 @@ def test_record_review_transition_failure_recorded(tmp_path: Path) -> None:
     fake_gh = LabelFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     label_error = result.data["label_error"]
@@ -20777,7 +20792,9 @@ def test_record_review_request_changes_transition_failure_recorded(tmp_path: Pat
     fake_gh = LabelFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "request_changes", summary="fix it")
+    result = app.record_review(
+        456, "request_changes", summary="fix it", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     label_error = result.data["label_error"]
@@ -20802,7 +20819,9 @@ def test_record_review_blocked_transition_failure_recorded(tmp_path: Path) -> No
     fake_gh = LabelFailGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "blocked", summary="security issue")
+    result = app.record_review(
+        456, "blocked", summary="security issue", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     label_error = result.data["label_error"]
@@ -20828,7 +20847,7 @@ def test_merge_ready_head_moved_transition_failure_recorded(tmp_path: Path) -> N
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # First approve the PR to set reviewed_head_sha
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Then simulate head moved by updating the PR head SHA
     fake_gh.pr_head_shas[456] = "sha-different"
@@ -21926,7 +21945,7 @@ def test_merge_ready_sets_status_merged(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -21945,7 +21964,7 @@ def test_merge_ready_emits_merge_succeeded_on_fleet_merge(tmp_path: Path) -> Non
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -22006,7 +22025,7 @@ def test_merge_ready_mergequeue_handoff_does_not_emit_merge_succeeded(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -22025,7 +22044,7 @@ def test_merge_ready_dry_run_does_not_merge_or_persist(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -22057,7 +22076,7 @@ def test_merge_ready_dry_run_mergequeue_does_not_label_or_persist(tmp_path: Path
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -22085,7 +22104,7 @@ def test_merge_ready_dry_run_preserves_existing_state(tmp_path: Path) -> None:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     # Plant a pre-existing PR state entry with a non-zero counter.
     with state_lock(paths.state_file):
@@ -22199,7 +22218,7 @@ def test_merge_ready_evaluation_only_preserves_recorded_merged_fact(tmp_path: Pa
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
 
     merge_result = app.merge_ready(456, merge=True)
     assert merge_result.data["merged"] is True
@@ -22236,7 +22255,7 @@ def test_merge_ready_failed_attempt_alarm_fires_once_at_threshold(tmp_path: Path
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # First two failed attempts do not alarm.
     result1 = app.merge_ready(456, merge=False)
@@ -22322,7 +22341,7 @@ def test_merge_ready_failed_attempt_alarm_reports_merge_state_not_unknown(
     }
     fake_gh.update_branch_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
     assert result.data["can_merge"] is False
@@ -22370,7 +22389,7 @@ def test_merge_ready_failed_attempt_alarm_falls_back_when_merge_state_unknown(
     }
     fake_gh.update_branch_ok = False
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
     assert result.data["can_merge"] is False
@@ -22416,7 +22435,7 @@ def test_merge_ready_failed_attempt_alarm_reports_unavailable_not_passed(
 
     fake_gh = FakeGitHubWithChecksUnavailable()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
     assert result.data["checks_unavailable"] is True
@@ -22451,7 +22470,7 @@ def test_merge_ready_failed_attempt_alarm_resets_on_merge(tmp_path: Path) -> Non
     missing_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, missing_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for _ in range(3):
         app.merge_ready(456, merge=False)
 
@@ -22491,7 +22510,7 @@ def test_merge_ready_failed_attempt_alarm_resets_on_head_move(tmp_path: Path) ->
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     app.merge_ready(456, merge=False)
     app.merge_ready(456, merge=False)
 
@@ -22535,7 +22554,7 @@ def test_merge_ready_readiness_gate_escalates_no_ci_stall(tmp_path: Path) -> Non
     fake_gh.prs[0]["mergeable"] = "MERGEABLE"
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
 
@@ -22585,7 +22604,7 @@ def test_merge_ready_readiness_gate_escalates_dirty_pr(tmp_path: Path) -> None:
     ]
     fake_gh._record_pr_heads(fake_gh.prs)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
 
@@ -22617,7 +22636,7 @@ def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Pa
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     app.merge_ready(456, merge=False)
     app.merge_ready(456, merge=False)
 
@@ -22625,7 +22644,9 @@ def test_merge_ready_failed_attempt_alarm_resets_on_decision_change(tmp_path: Pa
     assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 2
 
     # Operator changes decision to request_changes.
-    app.record_review(456, "request_changes", summary="needs work")
+    app.record_review(
+        456, "request_changes", summary="needs work", verdict_provenance="fresh_llm_review"
+    )
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["consecutive_failed_merge_attempts"] == 0
     assert state["issues"]["123"]["merge_alert"] == "OK"
@@ -22652,7 +22673,7 @@ def test_merge_ready_failed_attempt_alarm_skips_pending_only_checks(tmp_path: Pa
     fake_gh = FakeGitHubWithChecks(checks=pending_checks)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     for _ in range(3):
         result = app.merge_ready(456, merge=False)
@@ -22693,7 +22714,7 @@ def test_merge_ready_failed_attempt_alarm_preserves_count_across_pending_only_pa
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     app.merge_ready(456, merge=False)
     app.merge_ready(456, merge=False)
 
@@ -22752,7 +22773,7 @@ def test_merge_ready_failed_attempt_alarm_pending_passes_do_not_delay_threshold(
     ]
     fail_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fail_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     expected_sequence = [1, 1, 2, 2, 3]
     is_pending_step = [False, True, False, True, False]
@@ -22797,7 +22818,7 @@ def test_merge_ready_failed_attempt_alarm_clamps_at_threshold_plus_one(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     results = [app.merge_ready(456, merge=False) for _ in range(6)]
 
@@ -22839,7 +22860,7 @@ def test_merge_ready_failed_attempt_alarm_resets_when_can_merge_without_merging(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fail_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fail_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     app.merge_ready(456, merge=False)
     app.merge_ready(456, merge=False)
 
@@ -22892,7 +22913,7 @@ def test_merge_ready_stale_base_alarm_fires_after_threshold(
     # Simulate a base-sync that reports success but does not advance the head.
     monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     for attempt in range(1, 4):
         result = app.merge_ready(456, merge=False)
@@ -22954,7 +22975,7 @@ def test_merge_ready_merge_alert_refires_after_can_merge_recovery(tmp_path: Path
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     failing_gh = FakeGitHubWithChecks(checks=failing_checks)
     app = OrchestratorApp(tmp_path, paths, config, failing_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # First degradation to threshold.
     for _ in range(3):
@@ -24385,7 +24406,9 @@ def test_record_review_captures_reviewed_head_sha(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -24428,7 +24451,9 @@ def test_record_review_requires_explicit_head_when_packet_and_live_differ(
 
     # Without an explicit choice, the verdict must fail loudly and must not
     # overwrite the pending decision file written by review().
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
     assert result.ok is False
     assert "sha-abc123" in result.message
     assert "sha-new789" in result.message
@@ -24441,7 +24466,12 @@ def test_record_review_requires_explicit_head_when_packet_and_live_differ(
     # Automated callers (review() exits, dispatch_reviews) use the default False
     # and are refused by record_review()'s compare-and-swap guard.
     result = app.record_review(
-        456, "approved", summary="lgtm", reviewed_head="sha-abc123", allow_stale_head=True
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-abc123",
+        allow_stale_head=True,
+        verdict_provenance="operator_manual",
     )
     assert result.ok is True
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -24457,7 +24487,13 @@ def test_record_review_requires_explicit_head_when_packet_and_live_differ(
     state["prs"].pop("456", None)
     save_state(paths.state_file, state)
 
-    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-new789")
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-new789",
+        verdict_provenance="fresh_llm_review",
+    )
     assert result.ok is True
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["reviewed_head_sha"] == "sha-new789"
@@ -24490,7 +24526,9 @@ def test_record_review_blocked_persists_reviewed_patch_id(tmp_path: Path) -> Non
     assert review_result.ok is True
     packet_patch_id = _calculate_patch_id(fake_gh.diffs[456])
 
-    result = app.record_review(456, "blocked", summary="security concern")
+    result = app.record_review(
+        456, "blocked", summary="security concern", verdict_provenance="fresh_llm_review"
+    )
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -24510,7 +24548,9 @@ def test_record_review_request_changes_rejects_empty_summary(tmp_path: Path) -> 
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "request_changes", summary="")
+    result = app.record_review(
+        456, "request_changes", summary="", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is False
     assert "--summary or --summary-file is required" in result.message
@@ -24529,7 +24569,7 @@ def test_record_review_blocked_rejects_empty_summary(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "blocked", summary="")
+    result = app.record_review(456, "blocked", summary="", verdict_provenance="fresh_llm_review")
 
     assert result.ok is False
     assert "--summary or --summary-file is required" in result.message
@@ -24545,7 +24585,9 @@ def test_record_review_request_changes_rejects_whitespace_only_summary(tmp_path:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "request_changes", summary="   \n\t  ")
+    result = app.record_review(
+        456, "request_changes", summary="   \n\t  ", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is False
     assert "--summary or --summary-file is required" in result.message
@@ -24558,7 +24600,7 @@ def test_record_review_approved_allows_empty_summary(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "approved", summary="")
+    result = app.record_review(456, "approved", summary="", verdict_provenance="fresh_llm_review")
 
     assert result.ok is True
     assert result.message == "review recorded (head from live)"
@@ -24582,7 +24624,7 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -24591,7 +24633,9 @@ def test_record_review_decision_payload_includes_required_changes(tmp_path: Path
     # approved is never subject to derivation: no marker at all (issue #792 AC-4).
     assert "findings_channel" not in decision
 
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "required_changes" in decision
@@ -24619,7 +24663,13 @@ def test_record_review_derives_required_changes_from_summary(tmp_path: Path) -> 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     prose = "The null check in parse() is missing, causing a crash on empty input."
-    result = app.record_review(456, "request_changes", summary=prose, required_changes=None)
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary=prose,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
+    )
 
     assert result.ok is True
     decision = json.loads(
@@ -24652,7 +24702,11 @@ def test_record_review_persists_vacuous_marker_when_nothing_derivable(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.record_review(
-        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+        456,
+        "request_changes",
+        summary=LEGACY_VACUOUS_SUMMARY,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24686,6 +24740,7 @@ def test_record_review_positive_control_legacy_vacuous_summary(tmp_path: Path) -
         "request_changes",
         summary=LEGACY_VACUOUS_SUMMARY,
         required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24707,7 +24762,10 @@ def test_record_review_blocked_also_derives_required_changes(tmp_path: Path) -> 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.record_review(
-        456, "blocked", summary="Security review flagged an unauthenticated endpoint."
+        456,
+        "blocked",
+        summary="Security review flagged an unauthenticated endpoint.",
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24740,6 +24798,7 @@ def test_record_review_folds_external_findings_into_required_changes(
         "request_changes",
         summary="The retry wrapper swallows the exception type (Fixes #649).",
         required_changes=["add a regression test"],
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24775,7 +24834,11 @@ def test_record_review_external_findings_override_vacuous_summary(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     result = app.record_review(
-        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+        456,
+        "request_changes",
+        summary=LEGACY_VACUOUS_SUMMARY,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24820,6 +24883,7 @@ def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path
         "request_changes",
         summary="internal summary round 1",
         required_changes=["fix the internal thing"],
+        verdict_provenance="fresh_llm_review",
     )
     assert result1.ok is True
     decision1 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
@@ -24851,6 +24915,7 @@ def test_record_review_external_findings_scoped_to_previous_round(tmp_path: Path
         "request_changes",
         summary="internal summary round 2",
         required_changes=["fix the internal thing, round 2"],
+        verdict_provenance="fresh_llm_review",
     )
     assert result2.ok is True
     decision2 = json.loads((pr_dir / "review-decision.json").read_text(encoding="utf-8"))
@@ -24903,7 +24968,11 @@ def test_orchestrator_own_comment_is_not_reingested_as_external_finding(
     ]
 
     result = app.record_review(
-        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -24961,7 +25030,11 @@ def test_human_quote_reply_to_orchestrator_comment_is_still_ingested(
     ]
 
     result = app.record_review(
-        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -25014,7 +25087,13 @@ def test_record_review_derived_with_external_findings_preserves_both(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     # No itemized required_changes -> record_review derives from summary.
-    result = app.record_review(456, "request_changes", summary=prose, required_changes=None)
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary=prose,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
+    )
 
     assert result.ok is True
     decision = json.loads(
@@ -25111,7 +25190,11 @@ def test_worker_rework_reply_is_not_ingested_as_external_finding(
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.record_review(
-        456, "request_changes", summary="internal summary", required_changes=["keep me"]
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
     )
 
     assert result.ok is True
@@ -25204,7 +25287,11 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     # Round 1: request_changes. The gap comment is after the round-1 head
     # commit, so ``before`` excludes it this round -- it must NOT appear yet.
     r1 = app.record_review(
-        456, "request_changes", summary="round 1", required_changes=["internal-1"]
+        456,
+        "request_changes",
+        summary="round 1",
+        required_changes=["internal-1"],
+        verdict_provenance="fresh_llm_review",
     )
     assert r1.ok is True
     d1 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
@@ -25242,7 +25329,11 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     }
 
     r2 = app.record_review(
-        456, "request_changes", summary="round 2", required_changes=["internal-2"]
+        456,
+        "request_changes",
+        summary="round 2",
+        required_changes=["internal-2"],
+        verdict_provenance="fresh_llm_review",
     )
     assert r2.ok is True
     d2 = json.loads((paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8"))
@@ -25275,13 +25366,21 @@ def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     vacuous_result = app.record_review(
-        456, "request_changes", summary=LEGACY_VACUOUS_SUMMARY, required_changes=None
+        456,
+        "request_changes",
+        summary=LEGACY_VACUOUS_SUMMARY,
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
     assert vacuous_result.ok is True
 
     fake_gh.pr_head_shas[456] = "sha-2"
     derivable_result = app.record_review(
-        456, "request_changes", summary="Real finding here.", required_changes=None
+        456,
+        "request_changes",
+        summary="Real finding here.",
+        required_changes=None,
+        verdict_provenance="fresh_llm_review",
     )
     assert derivable_result.ok is True
 
@@ -25302,19 +25401,25 @@ def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> No
     decision_path = paths.prs / "pr-456" / "review-decision.json"
 
     fake_gh.pr_head_shas[456] = "sha-1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert "escalated" in decision
     assert decision["escalated"] is False
     assert app._review_decision(456)["escalated"] is False
 
     fake_gh.pr_head_shas[456] = "sha-2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["escalated"] is False
 
     fake_gh.pr_head_shas[456] = "sha-3"
-    app.record_review(456, "request_changes", summary="fix C")
+    app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["escalated"] is True
     # _review_decision is the reader used by merge_ready and merge-train
@@ -25333,10 +25438,14 @@ def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> 
 
     # First request_changes is not escalated (count 0 -> 1).
     fake_gh.pr_head_shas[456] = "sha-1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     # Second request_changes hits the max_rework_cycles cap and escalates.
     fake_gh.pr_head_shas[456] = "sha-2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
 
     result = app.merge_ready(456)
     assert result.ok is True
@@ -25366,7 +25475,9 @@ def test_record_review_request_changes_updates_issue_status_to_rework_requested(
     assert issue_number == 123
 
     # Record a non-escalated request_changes decision
-    result = app.record_review(456, "request_changes", summary="fix A")
+    result = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     assert result.data["escalated"] is False
@@ -25409,7 +25520,9 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
     assert state["issues"]["123"]["status"] == "dispatched"
 
     # Step 2: record_review(request_changes) updates issue status to rework_requested
-    review_result = app.record_review(456, "request_changes", summary="fix A")
+    review_result = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     assert review_result.ok is True
     assert review_result.data["escalated"] is False
 
@@ -25469,7 +25582,9 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
 
     # Step 2: Record first request_changes (count = 1, not escalated, head = "sha-1")
     fake_gh.pr_head_shas[456] = "sha-1"
-    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    review_result_1 = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_1.ok is True
     assert review_result_1.data["escalated"] is False
 
@@ -25484,7 +25599,9 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
     fake_gh.pr_head_shas[456] = "sha-2"
 
-    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    review_result_2 = app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_2.ok is True
     assert review_result_2.data["escalated"] is False
 
@@ -25495,7 +25612,9 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     # Step 4: Record third request_changes (count stays at 2, escalated because max_rework_cycles = 2, head = "sha-3")
     # When escalated, the count is NOT incremented (see workflow.py line 731-734)
     fake_gh.pr_head_shas[456] = "sha-3"
-    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    review_result_3 = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_3.ok is True
     assert review_result_3.data["escalated"] is True  # Should be escalated
 
@@ -25559,7 +25678,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
 
     # Step 2: Record first request_changes (count = 1, head = "sha-1")
     fake_gh.pr_head_shas[456] = "sha-1"
-    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    review_result_1 = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_1.ok is True
     assert review_result_1.data["escalated"] is False
 
@@ -25574,7 +25695,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
-    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    review_result_2 = app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_2.ok is True
     assert review_result_2.data["escalated"] is False
 
@@ -25585,7 +25708,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
 
     # Step 4: Record third request_changes with NEW head (count should increment to 2)
     fake_gh.pr_head_shas[456] = "sha-2"
-    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    review_result_3 = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_3.ok is True
     assert review_result_3.data["escalated"] is False
 
@@ -25630,7 +25755,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
 
     # Step 2: Drive request_changes_count up to the cap (2) over two advancing heads.
     fake_gh.pr_head_shas[456] = "sha-1"
-    review_result_1 = app.record_review(456, "request_changes", summary="fix A")
+    review_result_1 = app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_1.ok is True
     assert review_result_1.data["escalated"] is False
 
@@ -25639,7 +25766,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     (pr_dir / "rework-prompt.md").write_text("Fix the issues", encoding="utf-8")
 
     fake_gh.pr_head_shas[456] = "sha-2"
-    review_result_2 = app.record_review(456, "request_changes", summary="fix B")
+    review_result_2 = app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_2.ok is True
     assert review_result_2.data["escalated"] is False
 
@@ -25650,7 +25779,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     # Step 3: A request_changes verdict on the SAME head (sha-2) — the worker
     # died without pushing anything. request_changes_count is already at the
     # cap. This must NOT escalate and must NOT mutate the counter.
-    review_result_3 = app.record_review(456, "request_changes", summary="fix C")
+    review_result_3 = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_3.ok is True
     assert review_result_3.data["escalated"] is False
 
@@ -25667,7 +25798,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     # Step 4: Sanity — once the head DOES advance, the at-cap verdict escalates
     # as before (existing behavior preserved for advanced heads).
     fake_gh.pr_head_shas[456] = "sha-3"
-    review_result_4 = app.record_review(456, "request_changes", summary="fix D")
+    review_result_4 = app.record_review(
+        456, "request_changes", summary="fix D", verdict_provenance="fresh_llm_review"
+    )
     assert review_result_4.ok is True
     assert review_result_4.data["escalated"] is True
 
@@ -25685,7 +25818,7 @@ def test_merge_ready_refuses_when_head_moved_after_approval(tmp_path: Path) -> N
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
     fake_gh.pr_head_shas[456] = "sha-new-head"
 
@@ -25719,7 +25852,7 @@ def test_merge_ready_head_moved_does_not_stamp_reviewing_when_dispatch_disabled(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
     fake_gh.pr_head_shas[456] = "sha-new-head"
 
@@ -25768,7 +25901,7 @@ def test_merge_ready_escalated_head_moved_makes_no_label_or_status_mutations(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     fake_gh.prs[0] = {**fake_gh.prs[0], "headRefOid": "sha-new-head"}
     fake_gh.pr_head_shas[456] = "sha-new-head"
     # Simulate the fleet state a livelocked issue #602/PR #679 was actually
@@ -25815,7 +25948,7 @@ def test_merge_ready_merges_when_head_unchanged_after_approval(tmp_path: Path) -
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -25848,7 +25981,7 @@ def test_merge_ready_escalated_issue_blocks_merge_of_otherwise_green_pr(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     # Escalate the linked issue for an unrelated reason.
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -25887,7 +26020,7 @@ def test_merge_ready_escalated_pr_blocks_merge_of_otherwise_green_pr(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["prs"]["456"] = {
@@ -25929,7 +26062,7 @@ def test_merge_ready_escalated_issue_counter_does_not_climb(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"] = {
@@ -25967,7 +26100,7 @@ def test_merge_ready_escalated_issue_blocks_mergequeue_handoff(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="ok")
+    app.record_review(456, "approved", summary="ok", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"] = {
@@ -26006,7 +26139,7 @@ def test_merge_ready_dry_run_escalated_issue_reports_hold(tmp_path: Path) -> Non
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dry_run = True
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"] = {
@@ -26036,7 +26169,7 @@ def test_merge_ready_passes_admin_flag_when_configured(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -26059,7 +26192,7 @@ def test_merge_ready_passes_merge_flags_when_configured(tmp_path: Path) -> None:
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -26085,7 +26218,7 @@ def test_merge_ready_merge_flags_takes_precedence_over_admin(tmp_path: Path) -> 
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -26109,7 +26242,7 @@ def test_merge_ready_default_merge_flags_preserves_current_behavior(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=True)
 
@@ -29984,7 +30117,7 @@ def test_merge_ready_next_mode_syncs_head_before_merge(tmp_path: Path) -> None:
     fake_gh.prs[0]["mergeStateStatus"] = "BEHIND"
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -30035,8 +30168,8 @@ def test_merge_ready_next_mode_skips_non_head(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     # Ensure 456 is the head of the queue regardless of when approvals occurred.
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
@@ -30072,7 +30205,7 @@ def test_merge_ready_clean_stale_base_syncs_and_merges(tmp_path: Path) -> None:
     }
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -30100,7 +30233,7 @@ def test_merge_ready_current_base_no_sync(tmp_path: Path) -> None:
     # mergeStateStatus CLEAN and the compare API agrees the base is current.
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -30145,7 +30278,7 @@ def test_merge_ready_conflict_rework_debounces_and_preserves_approval(tmp_path: 
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     original_decision = json.loads(decision_path.read_text())
 
@@ -30234,7 +30367,7 @@ def test_merge_ready_merge_conflict_routes_to_rework(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     original_decision = json.loads(decision_path.read_text())
 
@@ -30328,7 +30461,7 @@ def test_merge_ready_check_failure_routes_to_rework(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     decision_path = paths.prs / "pr-456" / "review-decision.json"
     original_decision = json.loads(decision_path.read_text())
 
@@ -30537,7 +30670,7 @@ def test_merge_ready_silent_cross_pr_revert_blocks_and_routes_to_rework(
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -30591,7 +30724,7 @@ def test_merge_ready_silent_cross_pr_revert_allows_explicit_marker(
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -30638,7 +30771,7 @@ def test_merge_ready_silent_cross_pr_revert_prompt_echo_does_not_bypass(
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -30689,7 +30822,7 @@ def test_merge_ready_stale_base_not_routed_to_rework(
     monkeypatch.setattr(fake_gh, "pr_update_branch", lambda pr_number: True)
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -30734,7 +30867,7 @@ def test_merge_ready_conflict_alarm_message_is_honest(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result1 = app.merge_ready(456, merge=False)
     assert result1.data["merge_conflict"] is True
@@ -30800,7 +30933,7 @@ def test_merge_ready_conflict_rework_routes_past_threshold(tmp_path: Path) -> No
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Pre-seed the state with attempt count *past* the threshold (simulates
     # a prior rework dispatch that failed to transition the issue).
@@ -30854,7 +30987,7 @@ def test_merge_ready_conflict_no_linked_issue_alarm_is_honest(tmp_path: Path) ->
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -30914,7 +31047,7 @@ def test_merge_ready_conflict_label_failure_is_recorded(tmp_path: Path) -> None:
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=False)
 
     assert result.ok is True
@@ -30971,7 +31104,7 @@ def test_merge_ready_conflict_inflight_worker_returns_early(tmp_path: Path) -> N
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"]["status"] = "dispatched"
@@ -31035,7 +31168,7 @@ def test_merge_ready_conflict_blocked_issue_not_rerouted(tmp_path: Path) -> None
     fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
         state["issues"]["123"]["status"] = "blocked"
@@ -31108,7 +31241,7 @@ def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
     fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     unrelated_redispatch_at = ["2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"]
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -31193,7 +31326,7 @@ def test_merge_ready_conflict_rework_dispatch_bounded_by_cap_across_repeated_eva
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     def _reset_issue_to_fresh() -> None:
         with state_lock(paths.state_file):
@@ -31312,7 +31445,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     dispatch_result = app.merge_ready(456, merge=False)
     assert dispatch_result.ok is True
@@ -31402,7 +31535,7 @@ def test_startup_death_does_not_consume_conflict_rework_cap(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Seed the PR state with the startup-death flag, simulating a dead
     # rework session that was reaped by _reap_restore_rework_requested.
@@ -31456,7 +31589,9 @@ def test_startup_death_does_not_consume_no_op_rework_cap(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Force issue status to "reviewing" (the orphaned/stuck shape the
     # no-op route exists for — same as test_janitor_no_op_rework_routes_
@@ -31533,7 +31668,7 @@ def test_non_startup_death_still_consumes_conflict_rework_cap(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Seed the PR state with a NON-startup death (stalled, but the flag
     # is False — the session ran long enough to be a genuine no-op).
@@ -32096,7 +32231,7 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Directly construct the "this lane's own cap already exhausted,
     # escalated" state that _route_janitor_gate_failure_to_rework's
@@ -32217,7 +32352,7 @@ def test_merge_ready_conflict_carry_forward_resets_counter_before_dispatch(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(pr_number, "approved", summary="lgtm")
+    app.record_review(pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Two CONFLICTING passes with the original head bring the counter to 2.
     for _ in range(2):
@@ -32306,7 +32441,7 @@ def test_merge_ready_conflict_dispatch_rechecks_issue_status_under_lock(
         },
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     result = app.merge_ready(456, merge=False)
 
@@ -32363,8 +32498,8 @@ def test_update_open_agent_prs_next_mode_syncs_stale_clean_base(tmp_path: Path) 
     # advances the fake base tip, even though mergeStateStatus reports CLEAN.
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32486,7 +32621,9 @@ def test_update_open_agent_prs_next_mode_syncs_head_of_queue(tmp_path: Path) -> 
 
     # Approve in order: 456 first (head), then 789, then 101.
     for pr_number in (456, 789, 101):
-        app.record_review(pr_number, "approved", summary="lgtm")
+        app.record_review(
+            pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+        )
     # Override timestamps so fast tests don't all land in the same second.
     for idx, pr_number in enumerate((456, 789, 101)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
@@ -32555,8 +32692,8 @@ def test_update_open_agent_prs_next_mode_skips_up_to_date_head(tmp_path: Path) -
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     # Ensure 456 is the head of the queue.
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
@@ -32636,8 +32773,8 @@ def test_update_open_agent_prs_next_mode_reports_compare_unavailable(tmp_path: P
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32772,7 +32909,9 @@ def test_front_of_train_only_updates_next_candidate(tmp_path: Path) -> None:
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     for pr_number in (456, 789, 101):
-        app.record_review(pr_number, "approved", summary="lgtm")
+        app.record_review(
+            pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+        )
     for idx, pr_number in enumerate((456, 789, 101)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32849,7 +32988,9 @@ def test_front_of_train_carries_forward_approved_verdict_end_to_end(tmp_path: Pa
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     for pr_number in (456, 789, 101):
-        app.record_review(pr_number, "approved", summary="lgtm")
+        app.record_review(
+            pr_number, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+        )
     for idx, pr_number in enumerate((456, 789, 101)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32929,9 +33070,11 @@ def test_front_of_train_skips_request_changes_and_blocked(tmp_path: Path) -> Non
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "request_changes", summary="needs work")
-    app.record_review(101, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(
+        789, "request_changes", summary="needs work", verdict_provenance="fresh_llm_review"
+    )
+    app.record_review(101, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789, 101)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -32969,7 +33112,7 @@ def test_merge_ready_compare_unavailable_fail_closed(tmp_path: Path) -> None:
     fake_gh = FakeGitHubCompareUnavailable()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -33032,7 +33175,7 @@ def test_merge_ready_merge_train_post_sync_head_race_rejected(tmp_path: Path) ->
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.ok is True
@@ -33106,7 +33249,7 @@ def test_merge_ready_race_with_spoofed_committer_name_rejected(tmp_path: Path) -
         },
     )
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.data["merged"] is False
@@ -33133,7 +33276,7 @@ def test_merge_ready_race_with_spoofed_webflow_login_rejected(tmp_path: Path) ->
         },
     )
 
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     result = app.merge_ready(456, merge=True)
 
     assert result.data["merged"] is False
@@ -33189,8 +33332,8 @@ def test_update_open_agent_prs_merge_train_post_sync_head_race_rejected(
     ]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    app.record_review(456, "approved", summary="lgtm")
-    app.record_review(789, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
+    app.record_review(789, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
     for idx, pr_number in enumerate((456, 789)):
         decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
         decision = json.loads(decision_path.read_text(encoding="utf-8"))
@@ -35777,6 +35920,7 @@ def test_dispatch_rework_approved_verdict_clears_rework_requested(tmp_path: Path
         decision="approved",
         summary="LGTM",
         comment=None,
+        verdict_provenance="fresh_llm_review",
     )
 
     # Verify the issue status is now "approved", not "rework_requested"
@@ -35833,7 +35977,9 @@ def test_dispatch_rework_routes_to_review_instead_of_relaunch_when_head_moved(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -35888,7 +36034,9 @@ def test_dispatch_rework_launches_when_head_matches_reviewed_sha(tmp_path: Path)
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Head is unchanged (still the default "sha-abc123") — genuinely outstanding.
     rework_prompt = pr_dir / "rework-prompt.md"
@@ -35922,7 +36070,9 @@ def test_dispatch_rework_skips_without_stranding_when_head_indeterminate(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Head moves, but the diff fetch now fails — GitHub.pr_diff's real
     # allow_failure=True contract returns "" on failure, so an empty diff is
@@ -35973,7 +36123,9 @@ def test_dispatch_rework_launches_when_head_moved_by_sync_merge_only(tmp_path: P
     pr_dir.mkdir(parents=True, exist_ok=True)
     diff_text = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     fake_gh.diffs[456] = diff_text
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     with state_lock(paths.state_file):
         state = load_state(paths.state_file)
@@ -36029,7 +36181,9 @@ def test_dispatch_rework_head_moved_but_review_blocked_by_janitor_retries_next_p
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Head advances with a real content change (routes to review) AND the PR
     # is now conflicting (janitor blocks review() before any packet/label write).
@@ -36085,7 +36239,9 @@ def test_dispatch_rework_skips_when_live_head_ref_oid_missing(tmp_path: Path) ->
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Live head is unavailable from the PR list response.
     fake_gh.prs[0]["headRefOid"] = None
@@ -36184,7 +36340,9 @@ def test_review_started_skip_when_head_unchanged_after_request_changes(tmp_path:
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
 
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Verify the decision was recorded
     with state_lock(paths.state_file):
@@ -36240,7 +36398,9 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
 
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Advance the PR head and change the diff (simulating actual content changes)
     fake_gh.prs[0]["headRefOid"] = "sha-new-head"
@@ -36274,17 +36434,23 @@ def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path)
     # First request_changes (count = 1)
     fake_gh.pr_head_shas[456] = "1111111111111111111111111111111111111111"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Second request_changes (count = 2)
     fake_gh.pr_head_shas[456] = "2222222222222222222222222222222222222222"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
 
     # Third request_changes (escalated)
     fake_gh.pr_head_shas[456] = "3333333333333333333333333333333333333333"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 3"
-    app.record_review(456, "request_changes", summary="fix C")
+    app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
 
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
@@ -36334,17 +36500,23 @@ def test_review_short_circuits_escalated_issue_less_pr(tmp_path: Path) -> None:
     # First request_changes (count = 1)
     fake_gh.pr_head_shas[456] = "1111111111111111111111111111111111111111"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Second request_changes (count = 2)
     fake_gh.pr_head_shas[456] = "2222222222222222222222222222222222222222"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
 
     # Third request_changes (escalated)
     fake_gh.pr_head_shas[456] = "3333333333333333333333333333333333333333"
     fake_gh.diffs[456] = "diff --git a/file b/file\n+change 3"
-    result = app.record_review(456, "request_changes", summary="fix C")
+    result = app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
     assert result.data["escalated"] is True
 
     state = load_state(paths.state_file)
@@ -49609,7 +49781,13 @@ def test_record_review_session_metrics_none_preserves_prior_metrics(tmp_path: Pa
         }
         save_state(paths.state_file, state)
 
-    result = app.record_review(456, "approved", summary="lgtm", session_metrics=None)
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        session_metrics=None,
+        verdict_provenance="fresh_llm_review",
+    )
 
     assert result.ok is True
     state = load_state(paths.state_file)
@@ -49646,7 +49824,13 @@ def test_record_review_session_metrics_replaces_prior_metrics(tmp_path: Path) ->
         "tool_call_count": 2,
         "verdict_source": "events",
     }
-    result = app.record_review(456, "approved", summary="lgtm", session_metrics=new_metrics)
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        session_metrics=new_metrics,
+        verdict_provenance="fresh_llm_review",
+    )
 
     assert result.ok is True
     state = load_state(paths.state_file)
@@ -49724,6 +49908,7 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         "request_changes",
         summary="fix A",
         required_changes=["add null check", "update tests"],
+        verdict_provenance="fresh_llm_review",
     )
 
     decision = json.loads(
@@ -49767,6 +49952,7 @@ def test_cross_family_request_changes_verdict_persists_required_changes(
         parsed.decision,
         summary=parsed.summary,
         required_changes=parsed.required_changes,
+        verdict_provenance="cross_family_review",
     )
     assert result.ok
 
@@ -49814,6 +50000,7 @@ def test_cross_family_legacy_path_verdict_with_empty_required_changes_gets_deriv
         parsed.decision,
         summary=parsed.summary,
         required_changes=parsed.required_changes,
+        verdict_provenance="cross_family_review",
     )
     assert result.ok is True
 
@@ -49840,6 +50027,7 @@ def test_rework_brief_contains_required_changes_from_verdict(tmp_path: Path) -> 
         "request_changes",
         summary="fix A",
         required_changes=findings,
+        verdict_provenance="fresh_llm_review",
     )
 
     brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")
@@ -50312,6 +50500,7 @@ def test_rework_brief_falls_back_to_summary_when_required_changes_empty(
         "request_changes",
         summary=reviewer_summary,
         required_changes=[],
+        verdict_provenance="fresh_llm_review",
     )
 
     brief = (paths.prs / "pr-456" / "rework-prompt.md").read_text(encoding="utf-8")

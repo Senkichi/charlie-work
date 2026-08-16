@@ -218,11 +218,17 @@ def test_record_review_request_changes_cap_writes_paired_fields(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     fake_gh.pr_head_shas[456] = "sha-1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     fake_gh.pr_head_shas[456] = "sha-2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     fake_gh.pr_head_shas[456] = "sha-3"
-    app.record_review(456, "request_changes", summary="fix C")
+    app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
 
     state = load_state(paths.state_file)
     issue = state["issues"]["123"]
@@ -241,7 +247,9 @@ def test_record_review_blocked_writes_paired_judgment_fields(
     fake_gh = FakeGitHub()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
-    result = app.record_review(456, "blocked", summary="security concern")
+    result = app.record_review(
+        456, "blocked", summary="security concern", verdict_provenance="fresh_llm_review"
+    )
     assert result.ok is True
 
     state = load_state(paths.state_file)

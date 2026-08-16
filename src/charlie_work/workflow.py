@@ -6475,6 +6475,56 @@ REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# Issue #1265: every writer of a review-decision verdict must say WHERE the
+# decision came from. This is a distinct field from the pre-existing
+# ``session_metrics.verdict_source`` (set in ``_reap_review_verdicts``,
+# meaning "which parser found the reviewer's fenced verdict block" --
+# log/events/file:{source}). ``verdict_provenance`` instead means "which
+# mechanism produced this verdict at all" and is required (no default,
+# anywhere) on every ``record_review`` call and on the two writers that
+# bypass ``record_review`` entirely (``_update_approval_head``'s carry-
+# forward patch, and the pending-reset template). Follows the same
+# plain-string-checked-against-a-set convention ``record_review`` already
+# uses for ``decision`` -- deliberately not an Enum type.
+#
+# Mapping (one call site can share a value; a value need not have exactly
+# one call site -- ``carried_forward`` has none in ``record_review`` at all,
+# it is stamped directly by ``_update_approval_head``):
+#   ci_gate_auto_reject       -- review()'s CI-gate reject (sole failing
+#                                check, and the co-occurring-janitor-failure
+#                                variant added by #1258/#1286)
+#   test_adequacy_auto_reject -- review()'s test-adequacy hard-gate reject
+#                                (issue #179; a distinct mechanism from the
+#                                CI gate, not folded into it)
+#   fresh_llm_review          -- _reap_review_verdicts (a live reviewer's
+#                                parsed verdict)
+#   stranded_reconciliation   -- _reconcile_stranded_verdicts (issue #736: a
+#                                completed on-disk verdict whose state write
+#                                was lost, re-ingested from review-
+#                                decision.json -- not a fresh decision)
+#   cross_family_review       -- _record_cross_family_verdicts
+#   unparseable_exhausted     -- _handle_malformed_cross_family_verdict's
+#                                bound-exhaustion synthetic approve
+#   rescue_review             -- rescue-tier review's approve
+#   operator_manual           -- cli.py's ``charlie verdict`` command
+#   carried_forward           -- _update_approval_head (never via
+#                                record_review; stamped directly on the
+#                                decision-file patch and all three
+#                                verdict_carried_forward_* event payloads)
+VERDICT_PROVENANCE_VALUES: frozenset[str] = frozenset(
+    {
+        "ci_gate_auto_reject",
+        "test_adequacy_auto_reject",
+        "fresh_llm_review",
+        "stranded_reconciliation",
+        "cross_family_review",
+        "unparseable_exhausted",
+        "rescue_review",
+        "operator_manual",
+        "carried_forward",
+    }
+)
+
 
 class PromptOverrideDriftError(RuntimeError):
     """One or more configured prompt templates reference placeholders their
@@ -12182,6 +12232,7 @@ class OrchestratorApp:
                     summary=summary,
                     reviewed_head=pr.get("headRefOid"),
                     required_changes=required_changes,
+                    verdict_provenance="ci_gate_auto_reject",
                 )
 
             # Merge-conflict and no-op-rework janitor failures used to have no
@@ -12362,6 +12413,7 @@ class OrchestratorApp:
                     summary=summary,
                     reviewed_head=pr.get("headRefOid"),
                     required_changes=required_changes,
+                    verdict_provenance="ci_gate_auto_reject",
                 )
 
             # See _detect_ci_run_never_created for why this check exists
@@ -12483,6 +12535,7 @@ class OrchestratorApp:
                     "request_changes",
                     summary=summary,
                     reviewed_head=pr.get("headRefOid"),
+                    verdict_provenance="test_adequacy_auto_reject",
                 )
             # Gate passed while enabled: add Tier-2 packet section (issue #180)
             test_adequacy_section = render_test_adequacy_section(
@@ -12657,6 +12710,12 @@ class OrchestratorApp:
             "summary": "",
             "required_changes": [],
             "reviewed_at": None,
+            # Issue #1265: an explicit None sentinel, not an omitted key --
+            # "pending" is not a verdict yet, so it has no provenance to
+            # report, but the key's presence keeps the no-default contract
+            # structurally checkable (a bypass writer that forgets the key
+            # entirely looks identical to one that never considered it).
+            "verdict_provenance": None,
         }
         if not decision_path.exists():
             self._write_json(decision_path, decision_template)
@@ -13332,6 +13391,7 @@ class OrchestratorApp:
                 reviewed_head=packet_head_sha,
                 required_changes=verdict["required_changes"],
                 session_metrics=session_metrics,
+                verdict_provenance="fresh_llm_review",
             )
             if result.ok:
                 recorded.append(
@@ -13478,6 +13538,7 @@ class OrchestratorApp:
                 summary=decision_data.get("summary", ""),
                 reviewed_head=decision_data.get("reviewed_head_sha"),
                 required_changes=decision_data.get("required_changes"),
+                verdict_provenance="stranded_reconciliation",
             )
             entry: dict[str, Any] = {
                 "pr_number": pr_number,
@@ -13588,6 +13649,7 @@ class OrchestratorApp:
                 summary=parsed.summary,
                 reviewed_head=packet_head,
                 required_changes=parsed.required_changes,
+                verdict_provenance="cross_family_review",
             )
             results.append(
                 {
@@ -13723,6 +13785,7 @@ class OrchestratorApp:
             ),
             reviewed_head=packet_head,
             required_changes=(),
+            verdict_provenance="unparseable_exhausted",
         )
         return {
             "pr_number": pr_number,
@@ -14972,6 +15035,7 @@ class OrchestratorApp:
                 summary=verdict["summary"],
                 reviewed_head=head_sha,
                 required_changes=verdict["required_changes"],
+                verdict_provenance="rescue_review",
             )
             return CommandResult(
                 True,
@@ -15068,11 +15132,23 @@ class OrchestratorApp:
         required_changes: Sequence[str] | None = None,
         session_metrics: dict[str, Any] | None = None,
         *,
+        verdict_provenance: str,
         allow_stale_head: bool = False,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
                 False, "decision must be approved, request_changes, or blocked", {}
+            )
+        # Issue #1265: no default above -- every caller must say where the
+        # verdict came from. This membership check catches a garbage/typo'd
+        # literal (a missing argument is already caught earlier, at the call
+        # boundary, by the keyword-only parameter having no default).
+        if verdict_provenance not in VERDICT_PROVENANCE_VALUES:
+            return CommandResult(
+                False,
+                "verdict_provenance must be one of: "
+                + ", ".join(sorted(VERDICT_PROVENANCE_VALUES)),
+                {},
             )
         summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
         # Issue #11: reject empty summary for request_changes/blocked decisions
@@ -15365,6 +15441,12 @@ class OrchestratorApp:
             "decision": decision,
             "summary": summary_text,
             "required_changes": effective_required_changes,
+            # Issue #1265: unconditional -- every record_review call already
+            # requires this argument (no default, see the keyword-only
+            # parameter above), so it is always present, never a
+            # conditionally-added key the way findings_channel/
+            # external_findings are.
+            "verdict_provenance": verdict_provenance,
             "reviewed_head_sha": reviewed_head_sha,
             "reviewed_head_source": reviewed_head_source,
             "reviewed_patch_id": reviewed_patch_id,
@@ -15618,6 +15700,13 @@ class OrchestratorApp:
                 "issue_number": issue_number,
                 "decision": decision,
                 "escalated": escalated,
+                # Issue #1265: top-level and unconditional, distinct from
+                # (and a sibling of, not nested inside) the pre-existing
+                # session_metrics.verdict_source added conditionally below --
+                # that field means "which parser found the fenced verdict
+                # block"; this one means "which mechanism produced the
+                # verdict at all".
+                "verdict_provenance": verdict_provenance,
             }
             if session_metrics is not None:
                 event_payload["session_metrics"] = session_metrics
@@ -20268,6 +20357,12 @@ class OrchestratorApp:
             updated_decision = dict(current_decision)
             updated_decision["reviewed_head_sha"] = new_head
             updated_decision["carry_forward_tier"] = tier
+            # Issue #1265: carry-forward always stamps "carried_forward",
+            # unconditionally overwriting whatever provenance the verdict
+            # being carried had -- this write's own mechanism IS the
+            # provenance of the resulting (still-valid) verdict, regardless
+            # of how the original decision was produced.
+            updated_decision["verdict_provenance"] = "carried_forward"
             if new_patch_id is not None:
                 updated_decision["reviewed_patch_id"] = new_patch_id
             if new_signature is not None:
@@ -20318,6 +20413,7 @@ class OrchestratorApp:
                     "patch_id": new_patch_id,
                     "carry_forward_tier": tier,
                     "carried_forward_from": carried_forward,
+                    "verdict_provenance": "carried_forward",
                 },
             )
             save_state(self.paths.state_file, state)

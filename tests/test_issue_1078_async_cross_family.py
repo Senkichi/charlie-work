@@ -403,7 +403,7 @@ def test_cross_family_pending_skips_merge_ready_in_loop_body(tmp_path: Path) -> 
     # state["prs"]["456"]["decision"]="approved", ["status"]="approved", and
     # ["reviewed_head_sha"]="sha-abc123" — the already_approved fast path's
     # preconditions.
-    app.record_review(456, "approved", summary="lgtm")
+    app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
 
     # Advance the PR head so already_approved's head_matches is False, forcing
     # the branch that calls review() → _cross_family_for_pr → launch.
@@ -463,7 +463,9 @@ def test_cross_family_pending_skips_rework_status_flip(tmp_path: Path) -> None:
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
     fake_gh.diffs[456] = reviewed_diff
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Head advances AND the diff content genuinely changes (different patch-id,
     # not just a sync-merge) — the condition that makes dispatch_rework route
