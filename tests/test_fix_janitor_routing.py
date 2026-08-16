@@ -19,34 +19,17 @@ and CLEAN checks) rather than duplicating that fixture.
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from _janitor_routing_fixtures import _conflicting_app, _set_decision
 from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewConfig, WatchdogConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp
 
 from test_charlie_work import FakeGitHub
-
-
-def _set_decision(app: OrchestratorApp, pr_number: int, decision: str) -> None:
-    pr_dir = app.paths.prs / f"pr-{pr_number}"
-    pr_dir.mkdir(parents=True, exist_ok=True)
-    (pr_dir / "review-decision.json").write_text(
-        json.dumps({"decision": decision}), encoding="utf-8"
-    )
-
-
-def _conflicting_app(tmp_path: Path, **config_kwargs) -> OrchestratorApp:
-    config = OrchestratorConfig(**config_kwargs)
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    fake_gh.prs[0]["mergeable"] = "CONFLICTING"
-    fake_gh.prs[0]["mergeStateStatus"] = "DIRTY"
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
 
 
 def test_janitor_conflict_routes_to_rework_when_request_changes(tmp_path: Path) -> None:

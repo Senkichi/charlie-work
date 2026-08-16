@@ -30,10 +30,10 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
+from _fakes_github import FakeGitHubWithMissingRequiredAndRuns
 from test_charlie_work import (
     FakeGitHub,
     FakeGitHubWithChecks,
-    FakeGitHubWithMissingRequired,
     _required_checks_config,
 )
 
@@ -187,21 +187,6 @@ def test_janitor_gate_emits_once_then_silent_until_failures_change(tmp_path: Pat
     state = load_state(app.paths.state_file)
     assert len(_events(state, "janitor_gate")) == 2
     assert state["prs"]["456"]["janitor_failures"] != first_failures
-
-
-class FakeGitHubWithMissingRequiredAndRuns(FakeGitHubWithMissingRequired):
-    """No required checks reported at all (so every required check is
-    "missing" per the janitor gate), plus a configurable
-    ``workflow_runs_for_head`` response so tests can control whether GitHub
-    Actions ever created a run for the head SHA.
-    """
-
-    def __init__(self, runs: list[dict[str, Any]] | None) -> None:
-        super().__init__()
-        self._runs = runs
-
-    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
-        return self._runs
 
 
 def test_ci_run_never_created_emitted_once_per_head_with_control(tmp_path: Path) -> None:

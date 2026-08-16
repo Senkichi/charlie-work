@@ -6,7 +6,6 @@ import errno
 import json
 import logging
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -20,11 +19,45 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from _fakes_github import (
+    FakeGitHub,
+    FakeGitHubWithChecks,
+    FakeGitHubWithChecksAndAnnotations,
+    FakeGitHubWithMissingRequired,
+)
+from _helpers import (
+    EXAMPLES_DIR,
+    VALID_CROSS_FAMILY_REPORT,
+    _STALE_CI_CONTAMINATED_REQUIRED_CHANGES,
+    _STALE_CI_GREEN_CHECKS,
+    _STALE_CI_RED_CHECKS,
+    _STALE_CI_REQUIRED,
+    _cross_family_app,
+    _init_git_repo,
+    _second_mergequeue_pr,
+)
+from _merge_tripwire_fixtures import (
+    _ack_unauthorized_merge,
+    _arm_unauthorized_merge_tripwire,
+    _merge_check_app,
+    _merged_worker_pr,
+    _write_decision,
+)
+from _review_fixtures import (
+    _dispatch_reviews_app,
+    _fake_claude_worker_record,
+    _make_dead_review_sidecar,
+    _make_loop_app,
+    _required_checks_config,
+    _set_review_dispatched_state,
+    _write_review_events,
+    _write_review_packet,
+)
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work import cli
 from charlie_work import github as github_module
-from charlie_work.checks import _run_id_from_link, summarize_checks
-from charlie_work.github import _job_id_from_link, is_infrastructure_failure
+from charlie_work.checks import summarize_checks
+from charlie_work.github import is_infrastructure_failure
 from charlie_work.config import (
     AutoMergeConfig,
     ClaudeCodeConfig,
@@ -96,8 +129,6 @@ from charlie_work.workflow import (
 from charlie_work.worktree import create_worktree
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.devin_shell import SessionRecord
-
-EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
 
 def _load_external_fixture(name: str) -> list[dict[str, Any]]:
@@ -3060,665 +3091,6 @@ def test_pr_list_raises_limit_to_500_and_warns_on_truncation(
     assert any("truncated" in record.message for record in caplog.records)
 
 
-def _required_checks_config(**kwargs) -> OrchestratorConfig:
-    from charlie_work.config import AutoMergeConfig
-
-    auto_merge = AutoMergeConfig(
-        required_checks=("Tests passed", "Lint & Format", "Pre-commit"),
-        enabled=True,  # Ensure auto_merge is enabled for merge tests
-        **kwargs,
-    )
-    return OrchestratorConfig(auto_merge=auto_merge)
-
-
-class FakeGitHub:
-    def __init__(self, repo_root: Any = None, dry_run: bool = False) -> None:
-        self.repo_root = repo_root
-        self.dry_run = dry_run
-        self.issues = [
-            {
-                "number": 123,
-                "title": "Fix search",
-                "url": "https://example.test/issues/123",
-                "body": "Search is broken",
-                "labels": [{"name": "automated-ready"}],
-                "state": "OPEN",
-            }
-        ]
-        # A janitor-green PR: open, non-draft, linked issue, tests mentioned.
-        self.prs = [
-            {
-                "number": 456,
-                "title": "Fix #123: search",
-                "url": "https://example.test/pull/456",
-                "headRefName": "agent/issue-123-fix-search",
-                "baseRefName": "main",
-                "headRefOid": "sha-abc123",
-                "mergeStateStatus": "CLEAN",
-                "body": "Closes #123\n\nTests: regression coverage added.",
-                "labels": [],
-                "isCrossRepository": False,
-                "state": "OPEN",
-            }
-        ]
-        self.labels_added: list[tuple[int, str]] = []
-        self.labels_removed: list[tuple[int, str]] = []
-        self.labels_created: list[tuple[str, str, str]] = []
-        self.pr_labels_added: list[tuple[int, str]] = []
-        self.add_pr_label_ok = True
-        self.prs_created: list[dict[str, Any]] = []
-        self.pr_create_return: int | None = None
-        self.merged: list[tuple[int, str]] = []
-        self.merged_admin_flags: list[bool] = []
-        self.merged_merge_flags: list[tuple[str, ...]] = []
-        self.deleted_branches: list[str] = []
-        self.delete_branch_ok = True
-        self.update_branch_ok = True
-        self.pr_update_branch_calls: list[int] = []
-        self.pr_ready_calls: list[int] = []
-        self.pr_ready_ok = True
-        self.pr_ready_error: str | None = None
-        self.pr_close_calls: list[int] = []
-        self.pr_close_ok = True
-        self.pr_close_error: str | None = None
-        self.pr_reopen_calls: list[int] = []
-        self.pr_reopen_ok = True
-        self.pr_reopen_error: str | None = None
-        self.push_empty_commit_calls: list[str] = []
-        self.push_empty_commit_ok = True
-        self.push_empty_commit_error: str | None = None
-        self.pr_head_shas: dict[int, str] = {}
-        self.diffs: dict[int, str] = {}
-        self.pr_external_issue_comments: dict[int, list[dict[str, Any]]] = {}
-        self.pr_external_reviews: dict[int, list[dict[str, Any]]] = {}
-        self.pr_external_review_comments: dict[int, list[dict[str, Any]]] = {}
-        self.closed_issues: list[int] = []
-        self.commits: dict[str, dict[str, Any]] = {}
-        # Default base head and per-(base,head) compare overrides for testing
-        # the merge-base freshness gate.
-        self.base_head_sha = "base-sha"
-        self.compare_overrides: dict[tuple[str, str], dict[str, Any] | None] = {}
-        self.compare_diff_overrides: dict[tuple[str, str], str | None] = {}
-        # Per-base branch protection overrides for testing issue #812's
-        # freshness-policy derivation. Default (no override) is None, matching
-        # the real GitHub.branch_protection()'s fail-closed return on any read
-        # failure -- so every pre-existing test keeps exercising the
-        # require_current_base fallback unchanged unless it opts in.
-        self.branch_protection_overrides: dict[str, dict[str, Any] | None] = {}
-        self.branch_protection_calls: list[str] = []
-        self._record_pr_heads(self.prs)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        object.__setattr__(self, name, value)
-        if name == "base_head_sha" and hasattr(self, "commits"):
-            if value not in self.commits:
-                self.commits[value] = {"parents": []}
-        elif name == "prs" and hasattr(self, "commits") and hasattr(self, "base_head_sha"):
-            self._record_pr_heads(value)
-
-    def _record_pr_heads(self, prs: list[dict[str, Any]]) -> None:
-        """Index PR head SHAs as commits rooted at the current base tip."""
-        base = self.base_head_sha
-        for pr in prs:
-            head = pr.get("headRefOid")
-            if head and head not in self.commits:
-                self.commits[head] = {"parents": [{"sha": base}]}
-
-    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
-        return (True, 10000, 0)
-
-    def invalidate_list_cache(self) -> None:
-        # The real GitHub clears its per-pass list cache here (called at the
-        # start of every loop pass); the fake has no cache, so this is a no-op.
-        self.list_cache_invalidations = getattr(self, "list_cache_invalidations", 0) + 1
-
-    def issue_list(self, labels=None, state=None):
-        # Honor the label filter: return only issues with the ready label
-        # Support both old signature (ready_label: str) and new (labels=None, state=None)
-        if isinstance(labels, str):
-            ready_label = labels
-            return [
-                issue
-                for issue in self.issues
-                if ready_label in [label["name"] for label in issue.get("labels", [])]
-            ]
-        elif labels:
-            return [
-                issue
-                for issue in self.issues
-                if any(
-                    label in [label_obj["name"] for label_obj in issue.get("labels", [])]
-                    for label in labels
-                )
-            ]
-        return self.issues
-
-    def issue_view(self, number: int):
-        # Return the issue matching the requested number
-        for issue in self.issues:
-            if issue["number"] == number:
-                return issue
-        raise ValueError(f"Issue {number} not found")
-
-    def pr_list(self):
-        return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "OPEN"]
-
-    def merged_pr_list(self):
-        return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
-
-    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
-        # Issue #882: match the production shape. GitHubCLI.merged_prs_for_issue
-        # always returns a MergedPRSearchResult carrying ``.ok``; the base fake
-        # used to return a plain list, which only worked because the sole
-        # consumer reads defensively via ``getattr(merged_prs, "ok", True)``.
-        # Returning the typed wrapper here keeps the fake and the real thing
-        # agreeing, so a future caller that reads ``.ok`` directly does not pass
-        # tests here and AttributeError in production.
-        matched = []
-        for pr in self.prs:
-            if pr.get("state", "OPEN").upper() != "MERGED":
-                continue
-            bound = linked_issue_number(
-                pr,
-                is_cross_repository=pr.get("isCrossRepository"),
-                branch_prefix=branch_prefix,
-            )
-            if bound == issue_number:
-                matched.append(pr)
-        return github_module._MergedPRSearchResult(matched, ok=True)
-
-    def pr_view(self, number: int):
-        # Return the PR matching the requested number
-        for pr in self.prs:
-            if pr["number"] == number:
-                # Return a copy with the current head SHA (if overridden)
-                pr_copy = dict(pr)
-                if number in self.pr_head_shas:
-                    pr_copy["headRefOid"] = self.pr_head_shas[number]
-                return pr_copy
-        raise ValueError(f"PR {number} not found")
-
-    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
-        self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
-        return self.pr_create_return
-
-    def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
-        # No fixture data configured means an empty list, matching the real
-        # GitHub.pr_commits's "no failure, nothing found" shape rather than
-        # raising. Not exercised by any GitHubLike-typed call site as of the
-        # PR that added this method (only the concrete GitHub-typed
-        # closing-keyword-check CLI path calls it), but kept here so
-        # FakeGitHub stays a complete stand-in for the GitHubLike protocol.
-        return []
-
-    def pr_checks(self, number: int):
-        return [
-            {"name": "Tests passed", "state": "SUCCESS"},
-            {"name": "Lint & Format", "bucket": "pass"},
-            {"name": "Pre-commit", "state": "SUCCESS"},
-        ]
-
-    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
-        # Mirrors the real GitHub.check_run_annotations default: no
-        # annotations configured means an empty list, never a raise.
-        return []
-
-    def pr_diff(self, number: int):
-        # Return custom diff if set, otherwise default
-        if number in self.diffs:
-            return self.diffs[number]
-        return "diff --git a/file b/file"
-
-    def add_issue_label(self, number: int, label: str) -> bool:
-        self.labels_added.append((number, label))
-        return True
-
-    def remove_issue_label(self, number: int, label: str) -> bool:
-        self.labels_removed.append((number, label))
-        return True
-
-    def add_pr_label(self, number: int, label: str) -> bool:
-        self.pr_labels_added.append((number, label))
-        return self.add_pr_label_ok
-
-    def close_issue(self, number: int) -> bool:
-        """Track issue closure for testing. Idempotent — returns True even if already closed."""
-        # Track the closure
-        self.closed_issues.append(number)
-        # Update the issue state in the issues list
-        for issue in self.issues:
-            if issue["number"] == number:
-                issue["state"] = "CLOSED"
-                break
-        return True
-
-    def issue_comment(self, number: int, body_file: Path) -> None:
-        """Record issue comments posted by the orchestrator (issue #1000)."""
-        posted = getattr(self, "issue_comments_posted", [])
-        posted.append((number, Path(body_file).read_text(encoding="utf-8")))
-        self.issue_comments_posted = posted
-
-    def name_with_owner(self) -> str:
-        return "test-owner/test-repo"
-
-    def merge_pr(
-        self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
-    ) -> str:
-        self.merged.append((number, strategy))
-        # merge_flags takes precedence over admin
-        if merge_flags:
-            self.merged_admin_flags.append("--admin" in merge_flags)
-        else:
-            self.merged_admin_flags.append(admin)
-        self.merged_merge_flags.append(merge_flags)
-
-        # Model the real effect of a merge: the base branch tip advances to a
-        # merge commit whose parents are the previous base tip and the merged PR
-        # head. This lets stale-base tests derive base movement organically from
-        # recorded merges instead of hand-feeding compare_overrides.
-        pr: dict[str, Any] | None = None
-        for candidate in self.prs:
-            if candidate.get("number") == number:
-                pr = candidate
-                break
-        if pr is not None:
-            base_ref = pr.get("baseRefName") or "main"
-            head_sha = pr.get("headRefOid")
-            old_base = self.base_head_sha
-            merge_sha = f"{base_ref}-merged-{head_sha}"
-            self.commits[merge_sha] = {
-                "parents": [{"sha": old_base}, {"sha": head_sha}],
-                "committer": {"login": "web-flow"},
-                "commit": {"committer": {"name": "GitHub"}},
-            }
-            self.base_head_sha = merge_sha
-
-        return "merged"
-
-    def delete_branch(self, branch: str) -> bool:
-        self.deleted_branches.append(branch)
-        return self.delete_branch_ok
-
-    def pr_ready(self, number: int) -> github_module.GitHubRunResult:
-        self.pr_ready_calls.append(number)
-        if self.pr_ready_ok:
-            for pr in self.prs:
-                if pr["number"] == number:
-                    # Simulate GitHub's real effect: the PR is no longer a
-                    # draft, so the next janitor pass sees isDraft=False.
-                    pr["isDraft"] = False
-                    break
-            return github_module.GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        error = self.pr_ready_error or "gh: pull request #%d is not ready for review" % number
-        return github_module.GitHubRunResult(
-            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
-        )
-
-    def pr_close(self, number: int) -> github_module.GitHubRunResult:
-        self.pr_close_calls.append(number)
-        if self.pr_close_ok:
-            for pr in self.prs:
-                if pr["number"] == number:
-                    pr["state"] = "CLOSED"
-                    break
-            return github_module.GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        error = self.pr_close_error or "gh: could not close pull request #%d" % number
-        return github_module.GitHubRunResult(
-            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
-        )
-
-    def pr_reopen(self, number: int) -> github_module.GitHubRunResult:
-        self.pr_reopen_calls.append(number)
-        if self.pr_reopen_ok:
-            for pr in self.prs:
-                if pr["number"] == number:
-                    pr["state"] = "OPEN"
-                    break
-            return github_module.GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        error = self.pr_reopen_error or "gh: could not reopen pull request #%d" % number
-        return github_module.GitHubRunResult(
-            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
-        )
-
-    def push_empty_commit(self, branch: str) -> github_module.GitHubRunResult:
-        self.push_empty_commit_calls.append(branch)
-        if self.push_empty_commit_ok:
-            for pr in self.prs:
-                if pr.get("headRefName") == branch:
-                    # Simulate GitHub's real effect: the branch tip moves to a
-                    # new (synthetic) SHA, same as a real empty-commit push.
-                    old_head = pr.get("headRefOid", "")
-                    pr["headRefOid"] = f"{old_head}-empty-commit"
-                    break
-            return github_module.GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        error = self.push_empty_commit_error or f"gh: could not push empty commit to {branch!r}"
-        return github_module.GitHubRunResult(
-            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
-        )
-
-    def pr_update_branch(self, pr_number: int) -> bool:
-        self.pr_update_branch_calls.append(pr_number)
-        # Simulate a base update by moving the PR's head to a new SHA
-        # This reproduces the churn that the fix prevents
-        for pr in self.prs:
-            if pr["number"] == pr_number:
-                # Append a merge-SHA marker to simulate the head moving
-                old_head = pr.get("headRefOid", "")
-                new_head = f"{old_head}-updated"
-                pr["headRefOid"] = new_head
-                # A real update-branch makes the PR current with its base. Future
-                # compare calls for the new head should see the current base tip.
-                pr["mergeStateStatus"] = "CLEAN"
-                base_ref = pr.get("baseRefName") or "main"
-                base_head = self.base_head_sha
-                self.compare_overrides[(base_ref, new_head)] = {
-                    "base_commit": {"sha": base_head},
-                    "merge_base_commit": {"sha": base_head},
-                }
-                # Record the fake commit metadata so the post-sync verification
-                # helper sees a valid GitHub web-flow merge commit.
-                self.commits[new_head] = {
-                    "parents": [
-                        {"sha": old_head},
-                        {"sha": base_head},
-                    ],
-                    "committer": {"login": "web-flow"},
-                    "commit": {"committer": {"name": "GitHub"}},
-                }
-                return self.update_branch_ok
-        return False
-
-    def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
-        """Default implementation: check the actual state field in issues."""
-        open_issues: set[int] = set()
-        for number in issue_numbers:
-            for issue in self.issues:
-                if issue["number"] == number and str(issue.get("state") or "").upper() == "OPEN":
-                    open_issues.add(number)
-                    break
-        return open_issues
-
-    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
-        """Fake run method for GitHub API calls. Returns empty list for dependencies by default."""
-        # Handle dependency API calls
-        if "dependencies" in " ".join(args):
-            # Default: return empty list (feature not available)
-            # Tests can override this by setting dependencies_response
-            if hasattr(self, "dependencies_response"):
-                return self.dependencies_response
-            return [] if json_output else ""
-        # Handle run list API calls
-        if "run" in args and "list" in args:
-            # Default: return empty list
-            # Tests can override this by setting runs_response
-            if hasattr(self, "runs_response"):
-                return self.runs_response
-            return [] if json_output else ""
-        # Handle run cancel API calls
-        if "run" in args and "cancel" in args:
-            # Default: return success string
-            return "Cancelled"
-        # Handle external findings API calls (issue #950).
-        joined = " ".join(args)
-        m = re.search(r"/issues/(\d+)/comments", joined)
-        if m and "/pulls/" not in joined:
-            return self.pr_external_issue_comments.get(int(m.group(1)), [])
-        m = re.search(r"/pulls/(\d+)/reviews", joined)
-        if m and "/comments" not in joined:
-            return self.pr_external_reviews.get(int(m.group(1)), [])
-        m = re.search(r"/pulls/(\d+)/comments", joined)
-        if m and "/reviews/" not in joined:
-            return self.pr_external_review_comments.get(int(m.group(1)), [])
-        # Handle paginated PR list REST API calls from reconcile.py.
-        if args[0] == "api" and "pulls?state=all" in args[1]:
-            url = args[1]
-            page_match = re.search(r"[?&]page=(\d+)", url)
-            page = int(page_match.group(1)) if page_match else 1
-            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
-            per_page = int(per_page_match.group(1)) if per_page_match else 100
-            start = (page - 1) * per_page
-            return self.prs[start : start + per_page]
-        # Handle paginated issue list REST API calls from reconcile.py.
-        if args[0] == "api" and "issues?state=all" in args[1]:
-            url = args[1]
-            page_match = re.search(r"[?&]page=(\d+)", url)
-            page = int(page_match.group(1)) if page_match else 1
-            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
-            per_page = int(per_page_match.group(1)) if per_page_match else 100
-            start = (page - 1) * per_page
-            return self.issues[start : start + per_page]
-        # Handle other API calls (for reconcile tests)
-        if json_output:
-            return []
-        return ""
-
-    def commit(self, sha: str) -> github_module.GitHubRunResult:
-        commit = self.commits.get(sha)
-        if not isinstance(commit, dict):
-            return github_module.GitHubRunResult(
-                ok=False,
-                returncode=1,
-                stdout="",
-                stderr="",
-                value=None,
-                error=f"commit {sha} not found",
-            )
-        return github_module.GitHubRunResult(
-            ok=True, returncode=0, stdout="", stderr="", value=commit
-        )
-
-    def _ancestors(self, sha: str) -> set[str]:
-        """Return all ancestors of ``sha`` (including ``sha`` itself)."""
-        seen: set[str] = set()
-        stack = [sha]
-        while stack:
-            current = stack.pop()
-            if current in seen or not current:
-                continue
-            seen.add(current)
-            commit = self.commits.get(current)
-            if not isinstance(commit, dict):
-                continue
-            for parent in commit.get("parents", []):
-                if isinstance(parent, dict):
-                    parent_sha = parent.get("sha")
-                else:
-                    parent_sha = parent
-                if parent_sha:
-                    stack.append(parent_sha)
-        return seen
-
-    def _merge_base(self, base_sha: str, head_sha: str) -> str | None:
-        """Return the best common ancestor of ``base_sha`` and ``head_sha``.
-
-        The best common ancestor is a common ancestor that is not itself an
-        ancestor of another common ancestor. For linear DAGs this is the usual
-        merge-base; the simple filter works for the small graphs in these tests.
-        """
-        base_ancestors = self._ancestors(base_sha)
-        head_ancestors = self._ancestors(head_sha)
-        common = base_ancestors & head_ancestors
-        if not common:
-            return None
-        best = [
-            sha
-            for sha in common
-            if not any(sha in self._ancestors(other) and sha != other for other in common)
-        ]
-        if not best:
-            best = list(common)
-
-        # Deterministic tie-break: prefer the ancestor closest to the base tip.
-        def _distance(source: str, target: str) -> int:
-            if source == target:
-                return 0
-            visited: set[str] = {source}
-            queue: list[tuple[str, int]] = [(source, 0)]
-            while queue:
-                current, dist = queue.pop(0)
-                commit = self.commits.get(current)
-                if not isinstance(commit, dict):
-                    continue
-                for parent in commit.get("parents", []):
-                    if isinstance(parent, dict):
-                        parent_sha = parent.get("sha")
-                    else:
-                        parent_sha = parent
-                    if parent_sha == target:
-                        return dist + 1
-                    if parent_sha and parent_sha not in visited:
-                        visited.add(parent_sha)
-                        queue.append((parent_sha, dist + 1))
-            return len(self.commits)
-
-        best.sort(key=lambda sha: (_distance(base_sha, sha), _distance(head_sha, sha), sha))
-        return best[0]
-
-    def compare(self, base: str, head: str) -> dict[str, Any] | None:
-        override = self.compare_overrides.get((base, head))
-        if override is not None:
-            return override
-        base_head = self.base_head_sha
-
-        # Find the matching PR so we can honor mergeStateStatus hints when the
-        # graph is not enough or contradicts a BEHIND signal.
-        matching_pr = None
-        for pr in self.prs:
-            if pr.get("headRefOid") == head:
-                matching_pr = pr
-                break
-        if matching_pr is None:
-            for pr_number, pr_head in self.pr_head_shas.items():
-                if pr_head == head:
-                    for pr in self.prs:
-                        if pr.get("number") == pr_number:
-                            matching_pr = pr
-                            break
-                    break
-
-        # If we have a commit graph for both the current base tip and the head,
-        # derive the merge base from recorded merges. This is the path that lets
-        # merge tests prove ``merge advances main`` organically.
-        if base_head in self.commits and head in self.commits:
-            merge_base = self._merge_base(base_head, head)
-            base_current = merge_base == base_head
-            if base_current and str(matching_pr.get("mergeStateStatus") or "").upper() == "BEHIND":
-                # A BEHIND mergeStateStatus is a stronger stale signal than the
-                # current graph, so tests can still simulate a stale branch by
-                # setting mergeStateStatus to BEHIND.
-                return {
-                    "base_commit": {"sha": base_head},
-                    "merge_base_commit": {"sha": f"{base_head}-stale"},
-                }
-            return {
-                "base_commit": {"sha": base_head},
-                "merge_base_commit": {"sha": merge_base if merge_base else ""},
-            }
-
-        # If no graph is available, fall back to the PR's mergeStateStatus when
-        # it is known. Tests can still use compare_overrides to model exceptional
-        # cases (e.g. CLEAN-but-stale where mergeStateStatus lags).
-        if (
-            matching_pr is not None
-            and str(matching_pr.get("mergeStateStatus") or "").upper() == "BEHIND"
-        ):
-            return {
-                "base_commit": {"sha": base_head},
-                "merge_base_commit": {"sha": f"{base_head}-stale"},
-            }
-        # Default: the PR's merge-base is the current base tip.
-        return {
-            "base_commit": {"sha": base_head},
-            "merge_base_commit": {"sha": base_head},
-        }
-
-    def compare_diff(self, base: str, head: str) -> str | None:
-        override = self.compare_diff_overrides.get((base, head), "_unset")
-        if override != "_unset":
-            return override
-        return f"diff --git a/interdiff b/interdiff\n--- a/interdiff\n+++ b/interdiff\n@@ -1 +1 @@\n-{base}\n+{head}\n"
-
-    def branch_protection(self, base: str) -> dict[str, Any] | None:
-        self.branch_protection_calls.append(base)
-        return self.branch_protection_overrides.get(base)
-
-    def label_create(self, label: str, color: str, description: str) -> None:
-        self.labels_created.append((label, color, description))
-
-    def label_list(self) -> list[dict[str, object]]:
-        # Return all labels that have been created — simulates creation success.
-        return [{"name": name} for name, _color, _desc in self.labels_created]
-
-    def pr_comment(self, number: int, body_file: Path) -> None:
-        pass
-
-    def remove_pr_label(self, number: int, label: str) -> bool:
-        return True
-
-    def actions_job(self, job_id: int) -> dict[str, Any] | None:
-        return None
-
-    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
-        return None
-
-    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
-        return None
-
-    def validate_field_lists(self) -> None:
-        pass
-
-
-class FakeGitHubWithChecks(FakeGitHub):
-    """FakeGitHub whose pr_checks returns a configurable list."""
-
-    def __init__(self, checks: list[dict[str, Any]] | None = None) -> None:
-        super().__init__()
-        self.checks = checks if checks is not None else []
-
-    def pr_checks(self, number: int) -> list[dict[str, Any]]:
-        # Mirror production GitHub.pr_checks: inject databaseId/runId from the
-        # check link, but only when not already provided by the test.
-        return [
-            {
-                **check,
-                "databaseId": check.get("databaseId", _job_id_from_link(check.get("link"))),
-                "runId": check.get("runId", _run_id_from_link(check.get("link"))),
-            }
-            for check in self.checks
-        ]
-
-
-class FakeGitHubWithChecksAndAnnotations(FakeGitHubWithChecks):
-    """FakeGitHubWithChecks whose check_run_annotations returns a configurable
-    per-check-run-id mapping (issue #771 tests)."""
-
-    def __init__(
-        self,
-        checks: list[dict[str, Any]] | None = None,
-        annotations_by_check_run_id: dict[int, list[dict[str, Any]]] | None = None,
-    ) -> None:
-        super().__init__(checks=checks)
-        self.annotations_by_check_run_id = annotations_by_check_run_id or {}
-
-    def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
-        return self.annotations_by_check_run_id.get(check_run_id, [])
-
-
-class FakeGitHubWithMissingRequired(FakeGitHubWithChecks):
-    """No required checks present at all, so every required check is missing."""
-
-    def __init__(self) -> None:
-        super().__init__(checks=[])
-
-
 def test_fake_github_default_pr_head_is_indexed() -> None:
     """Issue #347: the default FakeGitHub fixture must index the PR head in commits.
 
@@ -5941,19 +5313,6 @@ def test_merge_ready_requires_approved_decision_then_merges(tmp_path: Path) -> N
     assert ready.data["branch_deleted"] is True
 
 
-def _merge_check_app(tmp_path: Path):
-    config = _required_checks_config()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    return OrchestratorApp(tmp_path, paths, config, fake_gh), paths, fake_gh
-
-
-def _write_decision(tmp_path: Path, pr: int, payload: dict) -> None:
-    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / f"pr-{pr}"
-    decision_dir.mkdir(parents=True, exist_ok=True)
-    (decision_dir / "review-decision.json").write_text(json.dumps(payload), encoding="utf-8")
-
-
 def test_merge_check_fails_closed_with_no_decision(tmp_path: Path) -> None:
     """Issue #894. No recorded decision must never read as authorization."""
     app, _, fake_gh = _merge_check_app(tmp_path)
@@ -6249,31 +5608,6 @@ def _review_queue_app(
     if prs is not None:
         fake_gh.prs = prs
     return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
-
-
-def _write_review_packet(
-    tmp_path: Path,
-    pr_number: int,
-    packet_head_sha: str,
-    decision: dict[str, Any] | None = None,
-) -> Path:
-    """Create a review packet fixture for a PR."""
-    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / f"pr-{pr_number}"
-    pr_dir.mkdir(parents=True, exist_ok=True)
-    (pr_dir / "pr.json").write_text(
-        json.dumps({"number": pr_number, "headRefOid": packet_head_sha}),
-        encoding="utf-8",
-    )
-    (pr_dir / "review-prompt.md").write_text(
-        f"review prompt for PR #{pr_number}",
-        encoding="utf-8",
-    )
-    if decision is not None:
-        (pr_dir / "review-decision.json").write_text(
-            json.dumps(decision),
-            encoding="utf-8",
-        )
-    return pr_dir
 
 
 def test_review_queue_includes_missing_pending_and_stale_decisions(
@@ -7951,22 +7285,6 @@ def test_review_queue_carry_forward_records_event(tmp_path: Path) -> None:
 # Issue #1111: stale-CI request_changes verdict suppression in review_queue()
 # --------------------------------------------------------------------------
 
-_STALE_CI_REQUIRED = ("Tests passed", "Pre-commit")
-
-_STALE_CI_GREEN_CHECKS = [
-    {"name": "Tests passed", "state": "SUCCESS"},
-    {"name": "Pre-commit", "state": "SUCCESS"},
-]
-
-_STALE_CI_RED_CHECKS = [
-    {"name": "Tests passed", "state": "FAILURE"},
-    {"name": "Pre-commit", "state": "SUCCESS"},
-]
-
-_STALE_CI_CONTAMINATED_REQUIRED_CHANGES = [
-    "Tests passed: .github:18 — Process completed with exit code 1."
-]
-
 
 def _stale_ci_review_queue_app(
     tmp_path: Path,
@@ -8777,55 +8095,6 @@ def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
     assert payload["pr_number"] == 789
     assert payload["issue_number"] == 124
     assert payload["carry_forward_tier"] == "verified-sync"
-
-
-def _dispatch_reviews_app(
-    tmp_path: Path,
-    *,
-    prs: list[dict[str, Any]] | None = None,
-    enabled: bool = True,
-    dry_run: bool = False,
-) -> OrchestratorApp:
-    """Build an OrchestratorApp with review_dispatch enabled (by default) and an empty state file.
-
-    Issue #868: ``enabled`` is overridable so tests can exercise
-    ``dispatch_reviews()``'s disabled-gate path with the same PR/state seeding
-    helpers used by the enabled-path tests.
-
-    Issue #1251: ``dry_run`` is overridable so tests can exercise the dry-run
-    preview branch of ``dispatch_reviews()`` (read-only selection + empty-diff
-    pre-flight mirror) with the same PR/state seeding helpers.
-    """
-    config = OrchestratorConfig(
-        review_dispatch=ReviewDispatchConfig(enabled=enabled),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    (paths.root).mkdir(parents=True, exist_ok=True)
-    (paths.root / "state.json").write_text(
-        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
-        encoding="utf-8",
-    )
-    fake_gh = FakeGitHub()
-    fake_gh.issues = []
-    if prs is not None:
-        fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
-
-
-def _fake_claude_worker_record(pr_number: int, branch: str) -> ClaudeWorkerRecord:
-    """Return a successful Claude worker record for monkeypatched launches."""
-    return ClaudeWorkerRecord(
-        issue_number=pr_number,
-        branch=branch,
-        worktree_path="/fake/worktree",
-        prompt_path="/fake/prompt.md",
-        command=("claude", "-p"),
-        pid=12345,
-        started_at="2026-07-06T12:00:00Z",
-        log_path="/fake/log.log",
-        error=None,
-        process_start_time=1.0,
-    )
 
 
 def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Path) -> None:
@@ -10270,21 +9539,6 @@ def test_dispatch_reviews_respects_max_concurrent_reviews(monkeypatch, tmp_path:
     assert result.data["launched_count"] == 2
 
 
-def _init_git_repo(repo_root: Path) -> None:
-    import subprocess
-
-    repo_root.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=repo_root, check=True, capture_output=True, text=True
-    )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
-
-
 def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Path) -> None:
     """Issue #397: a reaped stale-claim review must tear down that PR's
     isolated review checkout, not just free the state.json claim."""
@@ -11340,28 +10594,6 @@ def test_loop_zero_checks_pr_does_not_land_in_errors_bucket(tmp_path: Path) -> N
     assert result.data["reviews"][0]["pr"] == 456
 
 
-def _arm_unauthorized_merge_tripwire(paths, pre_existing: tuple[int, ...] = ()) -> None:
-    """Declare the #502 tripwire already armed, so a test sees its steady state.
-
-    The tripwire's first pass over a fresh state records a baseline of the merges
-    that predate it and reports nothing (see
-    ``OrchestratorApp._apply_unauthorized_merge_baseline``). Any test asserting on
-    findings must therefore say whether it is exercising the arming pass or the
-    steady state. Calling this with no arguments means "armed, and there was no
-    pre-existing backlog", which is the condition every pre-baseline tripwire test
-    was implicitly written against.
-    """
-    from charlie_work.state import load_state, save_state
-    from charlie_work.workflow import UNAUTHORIZED_MERGE_BASELINE_KEY
-
-    state = load_state(paths.state_file)
-    state[UNAUTHORIZED_MERGE_BASELINE_KEY] = {
-        "armed_at": "2026-07-26T00:00:00Z",
-        "pre_existing_prs": list(pre_existing),
-    }
-    save_state(paths.state_file, state)
-
-
 def test_detect_unauthorized_merges_flags_worker_self_merge(tmp_path: Path) -> None:
     """A merged worker branch without an approved review decision is flagged as a possible self-merge (issue #502)."""
     from charlie_work.config import OrchestratorConfig
@@ -12261,22 +11493,6 @@ def test_loop_tripwire_silent_for_approved_matching_head(tmp_path: Path) -> None
     )
 
 
-def _merged_worker_pr(number: int, issue: int, sha: str) -> dict[str, Any]:
-    """A merged worker-branch PR shaped like merged_pr_list() output."""
-    return {
-        "number": number,
-        "title": f"fix: work for #{issue}",
-        "url": f"https://example.test/pull/{number}",
-        "headRefName": f"agent/issue-{issue}-fix",
-        "baseRefName": "main",
-        "headRefOid": sha,
-        "state": "MERGED",
-        "isCrossRepository": False,
-        "body": f"Closes #{issue}",
-        "labels": [],
-    }
-
-
 def test_unauthorized_merge_tripwire_arms_instead_of_flagging_history(tmp_path: Path) -> None:
     """The first pass records pre-existing uncovered merges as a baseline and reports nothing.
 
@@ -12425,29 +11641,6 @@ def test_unauthorized_merge_baseline_arming_writes_nothing_in_dry_run(tmp_path: 
     assert UNAUTHORIZED_MERGE_BASELINE_KEY not in load_state(paths.state_file), (
         "dry-run must leave no baseline behind"
     )
-
-
-def _ack_unauthorized_merge(paths, pr_number: int, reason: str = "triaged") -> None:
-    """Mark a post-arming unauthorized-merge finding as acknowledged in state.json.
-
-    Mirrors ``_arm_unauthorized_merge_tripwire`` for the ack half of the
-    tripwire: tests asserting on post-arming findings use this to declare the
-    steady state where a finding has already been triaged and must no longer
-    pin ``ok=False`` (issue #673).
-    """
-    from charlie_work.state import load_state, save_state
-    from charlie_work.workflow import UNAUTHORIZED_MERGE_ACK_KEY
-
-    state = load_state(paths.state_file)
-    acks = state.get(UNAUTHORIZED_MERGE_ACK_KEY)
-    if not isinstance(acks, dict):
-        acks = {}
-    acks[str(pr_number)] = {
-        "acknowledged_at": "2026-07-27T00:00:00Z",
-        "reason": reason,
-    }
-    state[UNAUTHORIZED_MERGE_ACK_KEY] = acks
-    save_state(paths.state_file, state)
 
 
 def test_unauthorized_merge_ack_suppresses_acknowledged_finding(tmp_path: Path) -> None:
@@ -12736,12 +11929,6 @@ def _fake_completed(
         return subprocess.CompletedProcess(command, returncode, stdout=stdout, stderr=stderr)
 
     return _runner
-
-
-def _cross_family_app(tmp_path: Path, *, enabled: bool) -> OrchestratorApp:
-    config = OrchestratorConfig(cross_family=CrossFamilyConfig(enabled=enabled))
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 
 
 def test_render_command_templates_list_and_string() -> None:
@@ -13200,9 +12387,6 @@ def test_spec_review_missing_file_propagates_os_error(tmp_path: Path) -> None:
 
 
 # --- Issue #38 regression: transient retry + empty/blocked report guard --------
-
-
-VALID_CROSS_FAMILY_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
 
 
 def test_run_cross_family_retries_once_on_transient_rate_limit_then_success(
@@ -19652,20 +18836,6 @@ def test_find_repo_root_explicit_raises_when_not_git_repo(tmp_path: Path) -> Non
         raise AssertionError("expected RepoNotFoundError")
 
 
-def _init_git_repo(repo_root: Path) -> None:
-    """Create a real non-bare git repo with one commit on ``main``."""
-    repo_root.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=repo_root, check=True, capture_output=True, text=True
-    )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
-
-
 def test_find_repo_root_resolves_shared_root_from_linked_worktree(tmp_path: Path) -> None:
     """Issue #648: with no --repo, find_repo_root() invoked from inside a
     linked git worktree must resolve the *shared* (main) worktree root, not
@@ -20085,36 +19255,6 @@ def test_merge_ready_mergequeue_mode_unapproved_pr_not_labeled(tmp_path: Path) -
     assert fake_gh.pr_labels_added == []
     assert fake_gh.merged == []
     assert result.data.get("mergequeue_label_applied") is None
-
-
-def _second_mergequeue_pr(fake_gh) -> None:
-    """Add a second approved-candidate issue/PR pair (124/789) to a FakeGitHub
-    fixture, reviewed after the default 123/456 pair."""
-    fake_gh.issues.append(
-        {
-            "number": 124,
-            "title": "Fix parsing",
-            "url": "https://example.test/issues/124",
-            "body": "Parsing is broken",
-            "labels": [{"name": "automated-ready"}],
-            "state": "OPEN",
-        }
-    )
-    fake_gh.prs.append(
-        {
-            "number": 789,
-            "title": "Fix #124: parsing",
-            "url": "https://example.test/pull/789",
-            "headRefName": "agent/issue-124-fix-parsing",
-            "baseRefName": "main",
-            "headRefOid": "sha-def789",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #124\n\nTests: regression coverage added.",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        }
-    )
 
 
 def test_merge_ready_mergequeue_parked_pr_excluded_from_merge_train_head(
@@ -45487,22 +44627,6 @@ def test_signature_rule_is_frozen() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_loop_app(tmp_path: Path, *, prs: list[dict]) -> tuple[OrchestratorApp, FakeGitHub]:
-    """Build a minimal OrchestratorApp with the given open PRs for loop() tests."""
-    config = OrchestratorConfig(
-        cross_family=CrossFamilyConfig(enabled=False),
-        auto_merge=_approved_automerge(),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    # Ensure PRs passed into loop tests are treated as open even if callers omit state.
-    for pr in prs:
-        pr.setdefault("state", "OPEN")
-    fake_gh.prs = prs
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    return app, fake_gh
-
-
 def test_loop_open_tracked_prs_counted(tmp_path: Path) -> None:
     """loop() data includes open_tracked_prs = number of PRs with linked issues."""
     prs = [
@@ -49473,79 +48597,6 @@ def test_dispatch_only_issues_preserves_mixed_fresh_recovery_order(
 
 
 # --- Issue #507: record review verdicts from dead reviewer logs -------------
-
-
-def _make_dead_review_sidecar(
-    reviews_dir: Path,
-    pr_number: int,
-    log_text: str,
-    *,
-    started_at: str | None = None,
-) -> Path:
-    """Create a claude-code review sidecar + log file for a dead reviewer."""
-    reviews_dir.mkdir(parents=True, exist_ok=True)
-    log_path = reviews_dir / f"issue-{pr_number}-review.claude.log"
-    log_path.write_text(log_text, encoding="utf-8")
-    sidecar = {
-        "issue_number": pr_number,
-        "branch": f"agent/issue-{pr_number}-fix",
-        "worktree_path": str(reviews_dir / f"issue-{pr_number}"),
-        "prompt_path": str(reviews_dir / f"issue-{pr_number}-review-prompt.md"),
-        "command": ["claude", "-p", "--permission-mode", "plan"],
-        "pid": 99999,
-        "started_at": started_at or "2026-07-06T12:00:00Z",
-        "log_path": str(log_path),
-        "error": None,
-        "process_start_time": 1.0,
-    }
-    sidecar_path = reviews_dir / f"issue-{pr_number}.claude.json"
-    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
-    return sidecar_path
-
-
-def _write_review_events(
-    reviews_dir: Path, pr_number: int, *, turns: int, tool_calls: int = 0
-) -> Path:
-    """Write a stream-json events sidecar for a reviewer that ran ``turns`` turns.
-
-    ``parse_claude_events`` counts one turn per ``assistant`` event and one tool
-    call per ``tool_use`` content block. Without this sidecar a dead reviewer
-    has zero turns and zero tool calls, which classifies as a launch failure
-    rather than a turn-limit death (issue #588) -- so any test asserting
-    turn-limit behaviour must seed real session telemetry.
-    """
-    reviews_dir.mkdir(parents=True, exist_ok=True)
-    events_path = reviews_dir / f"issue-{pr_number}-review.events.jsonl"
-    lines: list[str] = []
-    for index in range(turns):
-        content: list[dict[str, Any]] = [{"type": "text", "text": f"Analysis step {index + 1}."}]
-        if index < tool_calls:
-            content.append({"type": "tool_use", "id": f"t{index}", "name": "Read", "input": {}})
-        lines.append(json.dumps({"type": "assistant", "message": {"content": content}}))
-    events_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return events_path
-
-
-def _set_review_dispatched_state(
-    app: OrchestratorApp,
-    pr_number: int,
-    issue_number: int,
-    dispatched_at: str,
-) -> None:
-    """Seed state.json with a review_dispatch_dispatched claim."""
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state["prs"][str(pr_number)] = {
-            "number": pr_number,
-            "issue_number": issue_number,
-            "review_dispatch_status": "review_dispatch_dispatched",
-            "review_dispatched_at": dispatched_at,
-            "review_dispatch_pending_at": None,
-            "review_dispatch_failed_at": None,
-            "reviewer_pid": 99999,
-            "reviewer_process_start_time": 1.0,
-        }
-        save_state(app.paths.state_file, state)
 
 
 def test_parse_review_verdict_from_log_extracts_last_fenced_json(tmp_path: Path) -> None:

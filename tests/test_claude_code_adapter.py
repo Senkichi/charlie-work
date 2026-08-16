@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _claude_adapter_fixtures import _install_fake_create_worktree
 from _worker_marker_wait import read_worker_marker
 
 from charlie_work import claude_code
@@ -59,50 +60,6 @@ def _fake_worktree_with_venv(tmp_path: Path, branch: str) -> WorktreeInfo:
     worktree_path.mkdir(parents=True, exist_ok=True)
     (worktree_path / ".venv").mkdir()
     return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
-
-
-def _install_fake_create_worktree(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    calls: list[dict] | None = None,
-    with_venv: bool = False,
-) -> None:
-    def fake_create_worktree(
-        repo_root,
-        branch,
-        *,
-        base_ref="HEAD",
-        worktrees_dir=None,
-        venv_source=None,
-        materialize_dirs=(),
-        rework=False,
-        recovery=None,
-        issue_number=None,
-        config=None,
-        sessions_dir=None,
-    ):
-        if calls is not None:
-            calls.append(
-                {
-                    "repo_root": repo_root,
-                    "branch": branch,
-                    "base_ref": base_ref,
-                    "worktrees_dir": worktrees_dir,
-                    "venv_source": venv_source,
-                    "materialize_dirs": materialize_dirs,
-                    "rework": rework,
-                    "recovery": recovery,
-                    "issue_number": issue_number,
-                    "config": config,
-                    "sessions_dir": sessions_dir,
-                }
-            )
-        if with_venv:
-            return _fake_worktree_with_venv(tmp_path, branch)
-        return _fake_worktree(tmp_path, branch)
-
-    monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
 
 
 def _fake_claude_script(tmp_path: Path) -> tuple[str, ...]:
