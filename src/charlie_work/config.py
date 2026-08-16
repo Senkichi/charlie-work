@@ -345,6 +345,20 @@ class ReviewConfig:
     # mode to hours instead of the unbounded, indefinite spin this issue was
     # filed over.
     rework_stall_minutes: int = 240
+    # Issue #1268 (W11), item 3: record_review's PR-comment gate used to
+    # fire only for request_changes and only when a caller passed
+    # comment=True (the CLI's `charlie verdict --comment`). Every other
+    # terminal decision (approved, blocked) and every automated caller
+    # (dispatch_reviews' reap path, rescue's approved exit, etc.) recorded a
+    # verdict with no corresponding PR-visible trace -- a human or peer
+    # agent reading the PR thread saw nothing. True posts a
+    # "## Fleet review - round K - <decision>" comment for every terminal
+    # decision (still excluding an in-call escalation, which the rescue
+    # tier and the rework-cap path already comment on themselves -- see
+    # record_review's gate). False restores the old silent default; the
+    # CLI's `--comment` flag remains a force-on override on top of this,
+    # not replaced by it.
+    post_verdict_comment: bool = True
 
 
 @dataclass(frozen=True)

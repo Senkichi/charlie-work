@@ -622,10 +622,18 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     # fails open: any future function elsewhere in src/ named record_review
     # or merge_authorize would silently inherit the exemption and this scan
     # would stay green while it wrote review-decision.json with no
-    # provenance. Asserting the exemption resolves to exactly the two known,
-    # deliberate sites (both in workflow.py) turns that into a hard failure
-    # instead of a silent widening.
-    assert len(exempted_write_sites) == 2, exempted_write_sites
+    # provenance. Asserting the exemption resolves to exactly the three
+    # known, deliberate sites (all in workflow.py) turns that into a hard
+    # failure instead of a silent widening. Three, not two, since issue
+    # #1268 (W11) added a second review-decision.json write inside
+    # record_review itself: the per-round archive copy under
+    # rounds/round-K/, written from the exact same already-validated
+    # decision_payload dict as the live write immediately above it (not a
+    # second, independently-constructed payload) -- so it is exempt for the
+    # identical reason the live write is, and the function-name-based
+    # exemption already covers it correctly. merge_authorize still
+    # contributes exactly one.
+    assert len(exempted_write_sites) == 3, exempted_write_sites
     assert all(site.startswith("workflow.py:") for site in exempted_write_sites), (
         exempted_write_sites
     )

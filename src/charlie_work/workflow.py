@@ -7278,6 +7278,120 @@ def _is_verdict_newer_than_brief(decision_path: Path, brief_path: Path) -> bool:
     return decision_path.stat().st_mtime_ns > brief_path.stat().st_mtime_ns
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` via a temp file + atomic rename.
+
+    Module-level (not an ``OrchestratorApp`` method) because callers that
+    need it -- the module-level ``_write_rework_prompt`` below, which has no
+    ``self``, and ``record_review``'s per-round archive copies -- must not
+    write a torn file to a path another process may poll mid-write (the
+    same failure class as the exists-is-not-content-ready incident).
+    Mirrors ``OrchestratorApp._write_json``'s tmp+replace shape.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+    tmp_path.replace(path)
+
+
+# Issue #1268 (W11): the field set that identifies a review round. Two
+# ``record_review`` calls that agree on all four are the same round (a
+# retry); any difference -- including on an unchanged head -- is a distinct
+# verdict and must never overwrite a prior round's archived text.
+# ``reviewed_at``/``reviewed_patch_id`` are deliberately excluded: both
+# legitimately differ on a byte-identical retry (a fresh timestamp, a
+# recomputed patch id for the same diff) and would otherwise defeat the
+# retry check entirely.
+_ROUND_COMPARE_KEYS = ("decision", "summary", "required_changes", "reviewed_head_sha")
+
+
+def _existing_round_numbers(rounds_dir: Path) -> list[int]:
+    """Return the round numbers already archived under ``rounds_dir``.
+
+    Directory names are ``round-<K>``, K unpadded (no zero-padding). Any
+    reader comparing round numbers -- including the W13/#1270 consumer that
+    will build on this layout -- must parse the trailing digits as ``int``
+    before ordering; a lexicographic string sort is wrong here (``"round-10"``
+    sorts before ``"round-2"``).
+    """
+    if not rounds_dir.is_dir():
+        return []
+    numbers: list[int] = []
+    for entry in rounds_dir.iterdir():
+        if entry.is_dir() and entry.name.startswith("round-"):
+            suffix = entry.name[len("round-") :]
+            if suffix.isdigit():
+                numbers.append(int(suffix))
+    return numbers
+
+
+def _next_round_number(rounds_dir: Path, decision_payload: Mapping[str, Any]) -> int:
+    """Return the round-K under which ``decision_payload`` should be archived.
+
+    Two independent requirements, not one:
+
+    * RETRY -- the exact same write re-submitted (e.g. a crash between
+      archiving round-K and the ``save_state`` call that would have recorded
+      the head move, followed by a re-submission of the identical payload for
+      the same head) must land back in the same round-K, never mint
+      round-(K+1).
+    * DISTINCT -- a different decision, summary, required_changes, or
+      reviewed_head_sha must never overwrite a prior round's archived text,
+      even when the head SHA has not advanced.
+
+    Head advancement alone is deliberately NOT used as the sole
+    discriminator: it satisfies the retry requirement (an advanced head is
+    always a new round) but fails the distinct-verdict requirement -- a
+    second, genuinely different verdict recorded on an *unchanged* head would
+    be misread as "same round, overwrite in place", reproducing -- one layer
+    down -- the exact data-loss bug this archive exists to fix. Comparing the
+    archived content itself sidesteps that, and also reads only the archive
+    already on disk (never ``pr_state``/``state.json``), so a crash between a
+    prior archive write and the ``save_state`` call that would have persisted
+    the head move cannot desync this decision from what is actually on disk.
+    """
+    highest = max(_existing_round_numbers(rounds_dir), default=0)
+    if highest == 0:
+        return 1
+    prior_decision = _read_review_decision(
+        rounds_dir / f"round-{highest}" / "review-decision.json"
+    )
+    is_retry = prior_decision is not None and all(
+        prior_decision.get(key) == decision_payload.get(key) for key in _ROUND_COMPARE_KEYS
+    )
+    return highest if is_retry else highest + 1
+
+
+# Issue #1268 (W11), item 2: bound how much verdict prose a single
+# ``record_review`` events.db row can carry. events.db is append-only and
+# unbounded (unlike the capped in-memory events ring), so unbounded reviewer
+# prose would grow the DB file without limit; the round-K archive (above) is
+# the full-text source of truth, this is an observability-only copy. A
+# distinct helper from ``_truncate_reason`` deliberately: that one has
+# existing callers depending on its 200-char/``"..."`` contract, and
+# retuning it for a 16KB/``"...truncated"`` use would risk their behavior.
+_EVENT_TEXT_MAX_BYTES = 16 * 1024
+_EVENT_TRUNCATE_MARKER = "...truncated"
+
+
+def _truncate_for_event(text: str, max_bytes: int = _EVENT_TEXT_MAX_BYTES) -> str:
+    """Truncate ``text`` to at most ``max_bytes`` UTF-8 bytes for an event payload.
+
+    Byte-based, not character-based -- the budget is a DB-row-size concern,
+    and reviewer prose is not guaranteed ASCII. ``errors="ignore"`` on the
+    final decode can drop a partial multi-byte character sitting exactly at
+    the cut boundary, so the truncated result's encoded length is only
+    guaranteed to be ``<= max_bytes``, not exactly equal to it.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    marker_bytes = _EVENT_TRUNCATE_MARKER.encode("utf-8")
+    keep = max(0, max_bytes - len(marker_bytes))
+    return encoded[:keep].decode("utf-8", errors="ignore") + _EVENT_TRUNCATE_MARKER
+
+
 def _render_rework_prompt(
     state_file: Path,
     pr: dict[str, Any],
@@ -7383,12 +7497,18 @@ def _write_rework_prompt(
     # $section_scope_contract or reverts to the old repo-scoped wording is
     # caught at the dispatch boundary.
     assert_containment(prompt, context=f"rework prompt for PR #{pr_number}")
-    prompt_path.write_text(prompt, encoding="utf-8")
+    # Issue #1268 (W11), item 1 binding-comment #4: both the live brief and
+    # its sidecar are polled by dispatch-time readers (regeneration checks,
+    # worker launch), so a plain write_text here is the same
+    # exists-is-not-content-ready failure class as the atomic-write
+    # invariant already covers for JSON state -- tmp+replace via
+    # ``_write_text_atomic`` closes that gap for text artifacts too.
+    _write_text_atomic(prompt_path, prompt)
     # Sidecar: the raw (non-defanged) dispatch note, so a dispatch-time
     # regeneration (when review-decision.json is newer than the brief) can
     # reproduce the note and re-defang it fresh rather than parsing already-
     # rewritten markdown back out.
-    (pr_dir / "rework-dispatch-note.txt").write_text(dispatch_note, encoding="utf-8")
+    _write_text_atomic(pr_dir / "rework-dispatch-note.txt", dispatch_note)
     return prompt_path
 
 
@@ -15477,6 +15597,14 @@ class OrchestratorApp:
         if ingestion_before is not None:
             decision_payload["before"] = ingestion_before
         decision_path = pr_dir / "review-decision.json"
+        # Issue #1268 (W11): per-round archive directory. ``round_number`` is
+        # declared here (rather than inside the lock below) so it survives
+        # past the lock for later use -- e.g. a comment header rendered after
+        # the lock releases needs to reference the same round this call
+        # recorded. It is always reassigned inside the lock before use; the
+        # 0 default is never observed downstream.
+        rounds_dir = pr_dir / "rounds"
+        round_number: int = 0
         # Merge-update (never in-place assignment) and persist BEFORE any GitHub
         # label mutation: a label-write failure or crash must not desync the
         # durable decision/counter from what actually happened.
@@ -15584,8 +15712,32 @@ class OrchestratorApp:
                 except (OSError, json.JSONDecodeError):
                     pass
             self._write_json(decision_path, decision_payload)
+            # Issue #1268 (W11): archive this round's artifacts before a
+            # later round's call can overwrite the live files above in
+            # place. round_number is derived from the archive already on
+            # disk -- never from pr_state or request_changes_count (see
+            # _next_round_number's docstring) -- so a crash between this
+            # write and save_state() below cannot desync the round this call
+            # recorded from what is actually on disk.
+            round_number = _next_round_number(rounds_dir, decision_payload)
+            round_dir = rounds_dir / f"round-{round_number}"
+            self._write_json(round_dir / "review-decision.json", decision_payload)
             if decision == "request_changes" and not escalated:
                 rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
+                # Archived alongside the decision above, same round_dir: this
+                # branch is the only one that produces these two live files
+                # (an approved/blocked round has no rework brief), so only
+                # archive them here. Read back the just-written live files
+                # rather than re-deriving the rendered text, so the archive
+                # copy is guaranteed byte-identical to what actually shipped.
+                _write_text_atomic(
+                    round_dir / "rework-prompt.md",
+                    Path(rework_path).read_text(encoding="utf-8"),
+                )
+                _write_text_atomic(
+                    round_dir / "rework-dispatch-note.txt",
+                    (pr_dir / "rework-dispatch-note.txt").read_text(encoding="utf-8"),
+                )
             rescue_fields = (
                 rescue_helpers.build_rescue_dataclass_kwargs("rework_cycle_cap")
                 if rescue_dispatched
@@ -15707,6 +15859,28 @@ class OrchestratorApp:
                 # block"; this one means "which mechanism produced the
                 # verdict at all".
                 "verdict_provenance": verdict_provenance,
+                # Issue #1268 (W11), item 2: previously never assigned at all
+                # (confirmed live: 0 non-null across every existing
+                # record_review row) -- events.db carried no verdict text.
+                # These are an observability-only, size-bounded copy; the
+                # round-K archive (`rounds/round-K/review-decision.json`,
+                # above) is the untruncated source of truth W13 reads from.
+                # ``required_changes`` is a list on ``decision_payload``, so
+                # it is newline-joined into a single string before the same
+                # byte-budget truncation applies to it. ``str(item)`` guards
+                # every assignment site of ``effective_required_changes`` --
+                # most are already ``list[str]``, but the #999 external-
+                # findings path (``effective_required_changes =
+                # list(external_findings)``) is never itself read as
+                # strings elsewhere, so this join must not assume str
+                # elements there. Coercing costs nothing for the str case
+                # (round-trips identically) and makes this key correct for
+                # every present and future assignment site rather than
+                # only the ones exercised by today's tests.
+                "summary": _truncate_for_event(summary_text),
+                "required_changes": _truncate_for_event(
+                    "\n".join(str(item) for item in effective_required_changes)
+                ),
             }
             if session_metrics is not None:
                 event_payload["session_metrics"] = session_metrics
@@ -15778,9 +15952,53 @@ class OrchestratorApp:
                         "add_failures": result.add_failures,
                         "remove_failures": result.remove_failures,
                     }
-        if decision == "request_changes" and comment and summary_text:
+        # Issue #1268 (W11), item 3: was `decision == "request_changes" and
+        # comment and summary_text` -- request_changes-only, and silent
+        # unless a caller explicitly passed comment=True. Widened to fire
+        # for every terminal decision this call actually recorded
+        # (approved/request_changes/blocked), gated on the config default
+        # (`review.post_verdict_comment`, True) OR the existing `comment`
+        # force-on override -- the CLI's `--comment` flag stays a strict
+        # superset of the config default, never replaced by it. Still
+        # excludes `escalated`: that is the SAME in-call local flipped by
+        # the rework-cap logic above (not the early state-guard escalated
+        # return at the top of this function, which never reaches this far)
+        # -- the rescue tier and the rework-cap escalation path already post
+        # their own comment for that case (_process_rescue_review,
+        # rescue_helpers), so leaving this gate open on escalated=True would
+        # double-post. `summary_text` is no longer required to be truthy:
+        # it is guaranteed non-empty for request_changes/blocked (the reject
+        # gate near the top of this function), but NOT for approved (no
+        # validation requires it) -- dropping the clause means an
+        # empty-summary approval still gets its header + required-changes
+        # section posted rather than silently skipping the comment for a
+        # decision type this gate previously never even reached.
+        if not escalated and (comment or self.config.review.post_verdict_comment):
+            header = f"## Fleet review - round {round_number} - {decision}"
+            body_parts = [header]
+            if summary_text:
+                body_parts.append(summary_text)
+            # Issue #792's `findings_channel == "derived"` marker (set above,
+            # ~15326) means `effective_required_changes` is not a real
+            # structured list -- it is `[summary_text.strip()]`, the exact
+            # same text just appended above as the summary paragraph.
+            # `_render_required_changes_section` (the rework-brief renderer)
+            # already treats this case specially for that reason -- tier-2
+            # prose, never a one-item bullet wrapping a whole paragraph
+            # (see its docstring) -- and this gate must honor the same
+            # invariant for the same reason: rendering both here would post
+            # the reviewer's entire summary twice in one comment. Every
+            # other channel (a real structured list, or `"external"``'s
+            # replacement list) is unaffected -- only `"derived"` is ever a
+            # verbatim copy of `summary_text`.
+            if effective_required_changes and findings_channel != "derived":
+                body_parts.append(
+                    "### Required changes\n"
+                    + "\n".join(f"- {rc}" for rc in effective_required_changes)
+                )
+            comment_body = "\n\n".join(body_parts)
             try:
-                self._comment_pr(pr_number, summary_text)
+                self._comment_pr(pr_number, comment_body)
             except GitHubError as exc:
                 # Comment failure is separate from label transition failure
                 if label_error is None:
