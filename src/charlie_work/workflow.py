@@ -8,6 +8,7 @@ import re
 import signal
 import subprocess
 import time
+from enum import Enum
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
 from datetime import UTC, datetime, timedelta
@@ -3415,6 +3416,32 @@ def _merge_on_write_save(
         save_state(state_file, merged)
 
 
+class _ThrottleClassification(Enum):
+    """Three-way classification of a dead reviewer's log for throttle
+    detection (issue #1069).
+
+    A plain bool cannot distinguish "the log was readable and contained no
+    throttle marker" (``NOT_THROTTLED``) from "the log could not be read or
+    was empty" (``UNDETERMINED``). Both used to collapse to
+    ``throttled = False``, which burned the PR's dispatch attempt budget for
+    a death that may not have been its fault AND failed to arm the fleet-wide
+    reviewer-quota backoff — re-arming the #1342-1346 redispatch-into-the-wall
+    outage mechanism through the read-error path rather than the logic path
+    it was originally closed against.
+
+    Folding the unknown into either existing branch is wrong: defaulting to
+    ``THROTTLED`` over-applies fleet-wide backoff with no evidence (this file
+    was separately burned by over-applying backoff), while defaulting to
+    ``NOT_THROTTLED`` burns the per-PR attempt budget and leaves the fleet
+    unprotected. The distinct third state carries its own handling — roll
+    back the claim (preserving the attempt budget) without arming backoff.
+    """
+
+    THROTTLED = "throttled"
+    NOT_THROTTLED = "not_throttled"
+    UNDETERMINED = "undetermined"
+
+
 def _detect_and_handle_stalled_reviews(
     reviews_dir: Path,
     state_file: Path,
@@ -3531,21 +3558,52 @@ def _detect_and_handle_stalled_reviews(
         # is closed, instead of backing off via the same reviewer-quota gate
         # the launch-time path uses (job-cannon PRs #1342/#1343/#1344/#1346,
         # 2026-07-21: 20+ hours of hot redispatch into a session-limit wall).
-        throttled = False
+        #
+        # Issue #1069: the log read itself can fail (OSError) or yield an
+        # empty (0-byte) log -- a reviewer that died before its first flush.
+        # Both used to collapse to ``throttled = False`` alongside a clean
+        # read with no marker, indistinguishable from a genuine non-throttle
+        # death. That burned the PR's attempt budget for a death that may not
+        # have been its fault AND failed to arm the fleet-wide backoff,
+        # re-arming the #1342-1346 outage mechanism through the read-error
+        # path. The classification is now a three-way enum so the
+        # undetermined case gets its own handling rather than being folded
+        # into either existing branch (both defaults are wrong: defaulting to
+        # throttled over-applies backoff with no evidence, defaulting to
+        # not-throttled burns the budget and leaves the fleet unprotected).
+        classification = _ThrottleClassification.NOT_THROTTLED
         log_mtime_dt: datetime | None = None
         reset_at: datetime | None = None
+        log_read_ok = False
         try:
             log_file = Path(w.log_path)
             log_text = log_file.read_text(encoding="utf-8", errors="replace")
+            log_read_ok = True
             try:
                 log_mtime_dt = datetime.fromtimestamp(log_file.stat().st_mtime, tz=UTC)
             except OSError:
                 log_mtime_dt = None
         except OSError:
             log_text = ""
-        if log_text:
+            log_read_ok = False
+        if not log_read_ok or not log_text:
+            # Unreadable (OSError) or empty (0-byte) log: the reviewer died
+            # before its first flush or the read raced an I/O hiccup. We
+            # cannot determine whether the provider was throttled, so this is
+            # the distinct third state -- not NOT_THROTTLED (which would burn
+            # the PR's attempt budget for a death that may not be its fault)
+            # and not THROTTLED (which would over-apply fleet-wide backoff
+            # with no evidence). See _ThrottleClassification for the full
+            # rationale.
+            classification = _ThrottleClassification.UNDETERMINED
+        else:
             tail = log_text[-2048:] if len(log_text) > 2048 else log_text
-            throttled = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
+            matched = match_throttle_tail(tail, config.runtime.throttle_error_markers)[0]
+            classification = (
+                _ThrottleClassification.THROTTLED
+                if matched
+                else _ThrottleClassification.NOT_THROTTLED
+            )
             # Issue #612: the session-limit notice names a specific reset
             # clock time in an IANA zone (e.g. "resets 1:20am
             # (America/Los_Angeles)"). Parse it once per dead session so the
@@ -3555,10 +3613,13 @@ def _detect_and_handle_stalled_reviews(
             # subsequent throttled sessions in the same wave reuse the
             # already-applied backoff, matching the one-increment-per-wave
             # guard below.
-            if throttled and not throttle_backoff_applied:
+            if (
+                classification is _ThrottleClassification.THROTTLED
+                and not throttle_backoff_applied
+            ):
                 reset_at = parse_reset_clock_time(tail, resolved_now)
 
-        if throttled:
+        if classification is _ThrottleClassification.THROTTLED:
             # A green flat-interval probe may have already cleared
             # reviewer_quota AFTER this reviewer died (issue #662): the
             # throttle signature in a dead session's log tail is frozen at
@@ -3641,6 +3702,7 @@ def _detect_and_handle_stalled_reviews(
                     "review_dispatched_at": None,
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
+                    "review_log_unreadable_streak": 0,
                 }
                 event_payload = {
                     "pr_number": w.issue_number,
@@ -3680,6 +3742,7 @@ def _detect_and_handle_stalled_reviews(
             attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
             if attempt_count > 0:
                 rolled_back["review_dispatch_attempt_count"] = attempt_count - 1
+            rolled_back["review_log_unreadable_streak"] = 0
             state["prs"][pr_key] = rolled_back
             event_payload = {
                 "pr_number": w.issue_number,
@@ -3719,6 +3782,131 @@ def _detect_and_handle_stalled_reviews(
             w.reap_sidecar(reviews_dir)
             continue
 
+        if classification is _ThrottleClassification.UNDETERMINED:
+            # The reviewer's log could not be read (OSError) or was empty
+            # (0-byte, died before first flush). We cannot tell whether the
+            # provider was throttled, so this is neither a counted PR-level
+            # failure (which would burn the attempt budget for a death that
+            # may not be the PR's fault) nor a confirmed throttle (which
+            # would arm fleet-wide backoff with no evidence -- this file was
+            # burned by over-applying backoff before).
+            #
+            # Review finding on PR #1161: the original fix rolled back the
+            # claim and decremented the attempt counter on every UNDETERMINED
+            # death, exactly like the throttle path. But unlike the throttle
+            # path it did NOT arm fleet-wide backoff, so nothing stopped the
+            # redispatch loop: dispatch increments the counter, UNDETERMINED
+            # decrements it, net zero per cycle, and the
+            # ``max_review_dispatch_attempts`` cap never fired -- an
+            # unbounded, unthrottled redispatch loop for any PR whose
+            # reviewer log stays persistently unreadable/empty, the same
+            # outage shape as #1342-1346 via a new path.
+            #
+            # The bound: track a per-PR ``review_log_unreadable_streak``
+            # across sweeps. The first N consecutive UNDETERMINED deaths
+            # (``max_consecutive_review_log_unreadable``, default 3) are
+            # treated as transient I/O hiccups -- roll back the claim and
+            # decrement the attempt counter, exactly like the throttle path
+            # but without arming backoff. Once the streak exceeds N the
+            # condition is persistent, not transient: subsequent UNDETERMINED
+            # deaths become counted failures (attempt counter NOT
+            # decremented, status set to ``review_dispatch_failed``) so the
+            # existing ``max_review_dispatch_attempts`` cap converges and
+            # escalates instead of looping forever. The streak resets on any
+            # definitive outcome (throttled, not-throttled, verdict recorded,
+            # new packet, operator unescalate).
+            max_unreadable_streak = config.review_dispatch.max_consecutive_review_log_unreadable
+            prev_streak = int(pr_state.get("review_log_unreadable_streak", 0))
+            streak = prev_streak + 1
+            if max_unreadable_streak > 0 and streak > max_unreadable_streak:
+                # Persistent unreadable-log condition: stop preserving the
+                # attempt budget. This is a counted failure (like the
+                # NOT_THROTTLED path below) -- the attempt counter is NOT
+                # decremented so the existing ``max_review_dispatch_attempts``
+                # cap can fire and escalate. A distinct event reason keeps
+                # the persistent condition diagnosable separately from a
+                # one-off unreadable death (issue #1069).
+                state["prs"][pr_key] = {
+                    **pr_state,
+                    "number": w.issue_number,
+                    "review_dispatch_status": "review_dispatch_failed",
+                    "review_dispatch_failed_at": w.started_at,
+                    "review_dispatch_pending_at": None,
+                    "review_dispatched_at": None,
+                    "reviewer_pid": None,
+                    "reviewer_process_start_time": None,
+                    "review_log_unreadable_streak": streak,
+                }
+                event_payload = {
+                    "pr_number": w.issue_number,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                    "reason": "review_log_persistently_unreadable",
+                    "streak": streak,
+                }
+                state = append_event(
+                    state,
+                    "review_dispatch_stalled",
+                    event_payload,
+                    state_path=state_file,
+                    level=_classify_review_dispatch_stalled_level(event_payload),
+                )
+                changed = True
+                stalled.append(
+                    {
+                        "pr": w.issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "reason": event_payload["reason"],
+                    }
+                )
+                remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+                w.reap_sidecar(reviews_dir)
+                continue
+            # Transient unreadable-log death (streak <= N): roll back the
+            # claim and decrement the attempt counter exactly like the
+            # throttle path, but do NOT arm the reviewer-quota backoff. If
+            # the provider IS throttled, the next dispatch launches a new
+            # reviewer whose readable log will classify correctly and arm
+            # backoff on the next sweep; if it is not, the PR re-dispatches
+            # without burning its budget (issue #1069).
+            rolled_back = without_review_dispatch_claim(pr_state)
+            attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
+            if attempt_count > 0:
+                rolled_back["review_dispatch_attempt_count"] = attempt_count - 1
+            rolled_back["review_log_unreadable_streak"] = streak
+            state["prs"][pr_key] = rolled_back
+            event_payload = {
+                "pr_number": w.issue_number,
+                "pid": w.pid,
+                "started_at": w.started_at,
+                "reason": "review_log_unreadable",
+                "streak": streak,
+            }
+            state = append_event(
+                state,
+                "review_dispatch_stalled",
+                event_payload,
+                state_path=state_file,
+                level=_classify_review_dispatch_stalled_level(event_payload),
+            )
+            changed = True
+            stalled.append(
+                {
+                    "pr": w.issue_number,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                    "reason": event_payload["reason"],
+                }
+            )
+            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
+            # Reap the sidecar: the rolled-back claim is non-terminal, so
+            # neither terminal guard above will ever reap it -- without this
+            # the same dead reviewer resurfaces every sweep (same rationale
+            # as the throttle path's reap above).
+            w.reap_sidecar(reviews_dir)
+            continue
+
         state["prs"][pr_key] = {
             **pr_state,
             "number": w.issue_number,
@@ -3728,6 +3916,7 @@ def _detect_and_handle_stalled_reviews(
             "review_dispatched_at": None,
             "reviewer_pid": None,
             "reviewer_process_start_time": None,
+            "review_log_unreadable_streak": 0,
         }
         sweep_events.append(
             (
@@ -12140,6 +12329,11 @@ class OrchestratorApp:
                 # New packet for a (possibly) new head: reset the dispatch
                 # attempt counter so the fresh review cycle starts clean.
                 "review_dispatch_attempt_count": 0,
+                # Reset the unreadable-log streak: a new packet is a new
+                # review cycle, so a prior persistent-unreadable condition
+                # must not carry forward and immediately count against the
+                # fresh attempt budget (issue #1069).
+                "review_log_unreadable_streak": 0,
                 # A clean janitor pass ends the no-op-rework epoch (the
                 # janitor's no-op check passing means content actually
                 # moved): without this reset, attempts consumed by a long-
@@ -14749,6 +14943,10 @@ class OrchestratorApp:
                 # the PR is not stuck. If the head later advances and triggers a
                 # new review cycle, the counter starts fresh.
                 "review_dispatch_attempt_count": 0,
+                # Reset the unreadable-log streak: a verdict proves the
+                # reviewer pipeline is healthy, so any prior
+                # persistent-unreadable condition is resolved (issue #1069).
+                "review_log_unreadable_streak": 0,
                 # Reset the cross-family parse-failure bound (issue #784
                 # AC-8): a real verdict was just recorded -- whether a
                 # genuine parse or this method's own "abandon" call from
@@ -14951,6 +15149,7 @@ class OrchestratorApp:
     # checks passed).
     _UNESCALATE_PR_RESET_FIELDS = (
         "review_dispatch_attempt_count",
+        "review_log_unreadable_streak",
         "request_changes_count",
         "conflict_rework_attempts",
         "conflict_rework_attempts_last_head",
