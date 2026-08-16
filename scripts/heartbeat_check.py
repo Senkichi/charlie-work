@@ -47,7 +47,21 @@ import yaml
 # isn't (that's the entire reason it is stdlib-only; see scripts/README.md).
 # `event_kinds` is a genuine leaf: no charlie_work or ci_fleet imports of
 # its own, so importing it can never reach ci_fleet transitively.
-from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS
+#
+# Guarded with try/except, not a bare import: this script is routinely run
+# via `uv run --active`, which resolves against whatever venv happens to be
+# active rather than this project's own -- a documented failure mode in this
+# fleet (see the `uv-worktree-virtualenv-shadowing` project memory) where
+# `charlie_work` itself is not importable at all, not merely `ci_fleet`.
+# `scripts/README.md`'s invariant is "a broken package install can never
+# break the check that would detect it" -- unconditional, not scoped to
+# ci_fleet -- so a missing `charlie_work` degrades this script to the exact
+# pre-#1271 behavior (no bucketing; every warning kind goes to the flat
+# detailed list) instead of crashing on import.
+try:
+    from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS
+except ImportError:
+    EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset()
 
 # --------------------------------------------------------------------------
 # CONSTANTS

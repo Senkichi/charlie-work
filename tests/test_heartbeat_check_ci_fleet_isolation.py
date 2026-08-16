@@ -1,4 +1,5 @@
-"""``scripts/heartbeat_check.py`` must import even when ``ci_fleet`` is absent.
+"""``scripts/heartbeat_check.py`` must import even when ``ci_fleet`` -- or
+``charlie_work`` itself -- is absent.
 
 Review finding on issue #1271: the initial fix declared
 ``EXPECTED_OPERATIONAL_KINDS`` in ``charlie_work.instrumentation``, which
@@ -12,11 +13,24 @@ frozenset to ``charlie_work.event_kinds``, a genuine leaf module with no
 ``charlie_work``/``ci_fleet`` imports of its own, and re-exports it from
 ``instrumentation`` for in-package consumers.
 
+That leaf-module fix closes the ``ci_fleet``-broken case, but the finding
+also named "no test covering a charlie_work-less run" -- a distinct,
+narrower failure mode where ``charlie_work`` itself (not just its
+``ci_fleet`` dependency) is not importable. This is not theoretical here:
+this script is routinely invoked via ``uv run --active``, which resolves
+against whatever venv happens to be active rather than this project's own,
+and the ``uv-worktree-virtualenv-shadowing`` project memory documents that
+resolving to a wrong venv -- one without ``charlie_work`` installed at all
+-- has actually happened in this fleet. ``heartbeat_check.py`` guards the
+``charlie_work.event_kinds`` import with ``try/except ImportError``,
+degrading to an empty ``EXPECTED_OPERATIONAL_KINDS`` (the exact pre-#1271
+behavior: no bucketing, every warning kind in the flat detailed list)
+instead of crashing.
+
 Modeled on ``tests/test_cli_import_isolation.py``'s ci_fleet-confinement
-pattern: a static AST check that always runs regardless of environment,
-plus a subprocess runtime check (meta-path blocker making ``ci_fleet``
-genuinely absent, not merely unimported) that proves the real failure mode
-is gone.
+pattern: static AST checks that always run regardless of environment, plus
+subprocess runtime checks (meta-path blockers making a package genuinely
+absent, not merely unimported) that prove both real failure modes are gone.
 """
 
 from __future__ import annotations
@@ -173,5 +187,82 @@ def test_heartbeat_check_imports_with_ci_fleet_absent() -> None:
     assert result.returncode == 0, (
         "heartbeat_check.py failed to import with ci_fleet absent -- exactly the "
         f"failure class it exists to report:\n{result.stderr}"
+    )
+    assert "IMPORT_OK" in result.stdout
+
+
+_CHARLIE_WORK_BLOCKER = '''
+import sys
+
+
+class _CharlieWorkBlocker:
+    """Make charlie_work look genuinely absent, not merely unimported."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == "charlie_work" or name.startswith("charlie_work."):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return None
+
+
+sys.meta_path.insert(0, _CharlieWorkBlocker())
+'''
+
+
+def _run_charlie_work_blocked(body: str) -> "subprocess.CompletedProcess[str]":
+    return subprocess.run(
+        [sys.executable, "-c", _CHARLIE_WORK_BLOCKER + textwrap.dedent(body)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_the_charlie_work_blocker_actually_blocks() -> None:
+    """Positive control -- same shape as ``test_the_ci_fleet_blocker_actually_blocks``."""
+    control = subprocess.run(
+        [sys.executable, "-c", "import charlie_work; print('PRESENT')"],
+        capture_output=True,
+        text=True,
+    )
+    assert control.returncode == 0 and "PRESENT" in control.stdout, (
+        "fixture premise gone: charlie_work is not importable even without the "
+        f"blocker, so this file can no longer prove anything.\n{control.stderr}"
+    )
+
+    blocked = _run_charlie_work_blocked("import charlie_work")
+    assert blocked.returncode != 0, "blocker did not block; the runtime test below is vacuous"
+    assert "charlie_work" in blocked.stderr
+
+
+def test_heartbeat_check_imports_with_charlie_work_absent() -> None:
+    """The narrower regression test the finding also named: heartbeat_check.py
+    must load with ``charlie_work`` itself gone, not just ``ci_fleet``.
+
+    This is the scenario ``uv run --active`` can produce in this fleet (see
+    the module docstring): a venv with no ``charlie_work`` install at all.
+    Unlike the ci_fleet-absent case, the frozenset must degrade to *empty*
+    here (the pre-#1271 flat-listing behavior), not stay populated -- there
+    is no source left to populate it from.
+    """
+    result = _run_charlie_work_blocked(
+        f"""
+        import importlib.util
+        import sys
+
+        spec = importlib.util.spec_from_file_location(
+            "heartbeat_check", r"{_HEARTBEAT_CHECK}"
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["heartbeat_check"] = module
+        spec.loader.exec_module(module)
+        assert module.EXPECTED_OPERATIONAL_KINDS == frozenset(), (
+            "must degrade to empty, not raise, not stay populated: "
+            f"{{module.EXPECTED_OPERATIONAL_KINDS!r}}"
+        )
+        print("IMPORT_OK")
+        """
+    )
+    assert result.returncode == 0, (
+        "heartbeat_check.py failed to import with charlie_work absent -- exactly "
+        f"the failure class the finding named:\n{result.stderr}"
     )
     assert "IMPORT_OK" in result.stdout
