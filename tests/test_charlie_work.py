@@ -18576,24 +18576,23 @@ def test_scope_fence_no_stale_checks_config_or_verdict_source_added() -> None:
     """
     from charlie_work.janitor import JanitorVerdict
 
+    # Deliberately two targeted membership checks, not an exact-set equality
+    # against today's full field list: W17 (later in this same lane) adds
+    # exactly these two fields to ReviewConfig on purpose, and an exact-set
+    # assertion would fail on that legitimate, already-planned change (and on
+    # any other unrelated future field) as if it were a scope-fence
+    # violation. The two ``not in`` checks are the actual AC7 requirement --
+    # they stay red only for the one regression this item guards against.
     review_config_fields = {f.name for f in dataclasses.fields(ReviewConfig)}
     assert "stale_checks_grace_minutes" not in review_config_fields
     assert "stale_checks_max_retriggers" not in review_config_fields
-    assert review_config_fields == {
-        "max_rework_cycles",
-        "require_tests_or_rationale",
-        "require_issue_link",
-        "max_conflict_rework_attempts",
-        "max_no_op_rework_attempts",
-        "rework_stall_minutes",
-    }
 
     janitor_verdict_fields = {f.name for f in dataclasses.fields(JanitorVerdict)}
     assert "verdict_source" not in janitor_verdict_fields
 
 
 def test_missing_checks_only_pr_falls_through_to_janitor_blocked_unchanged(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Issue #1258 (AC7, behavioral half): a PR whose required checks are
     entirely MISSING (never reported), as opposed to FAILED, is the
@@ -18610,11 +18609,24 @@ def test_missing_checks_only_pr_falls_through_to_janitor_blocked_unchanged(
     ``janitor_blocked`` bookkeeping exactly as it did before this item's
     diff: no ``record_review`` decision, no ``review_dispatch_skipped_ci_red``
     event, no reviewer launch.
+
+    ``review_dispatch`` is explicitly enabled here (``_required_checks_config()``
+    alone leaves it at its ``enabled=False`` default) and the launch seam is
+    driven for real via ``_fail_if_launched`` -- with dispatch left disabled,
+    ``dispatch_reviews()`` returns ``launched_count == 0`` on its very first
+    line for every fixture, sole-failure and co-occurring alike, which would
+    make that assertion pass for any mutation of the gate. The positive
+    control proving this zero is real, not vacuous, is the AC1 sibling
+    ``test_janitor_all_checks_green_dispatches_reviewer_ci_red_kind_absent``,
+    which drives the identical enabled seam and gets ``launched_count == 1``.
     """
-    config = _required_checks_config()
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHubWithMissingRequired()
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    launched = _fail_if_launched(monkeypatch)
 
     result = app.review(456)
 
@@ -18629,10 +18641,14 @@ def test_missing_checks_only_pr_falls_through_to_janitor_blocked_unchanged(
     assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
 
     # No packet was written (the janitor gate blocked before packet-build),
-    # so dispatch_reviews has structurally nothing to launch for this PR.
+    # so dispatch_reviews has structurally nothing to launch for this PR --
+    # driven for real, with dispatch enabled and the launch seam wired to
+    # fail loudly, not inferred from a disabled-dispatch early return.
     dispatch_result = app.dispatch_reviews()
     assert dispatch_result.ok is True
     assert dispatch_result.data["launched_count"] == 0
+    assert dispatch_result.data["selected_count"] == 0
+    assert launched == []
 
 
 def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
@@ -18652,6 +18668,13 @@ def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
     share the ``review_dispatch_*`` shape AC4 pins for the new CI-red kind
     -- renaming an already-shipped, already-tested kind is out of this
     item's scope and would itself be an unreviewed behavior change.
+
+    ``_dispatch_reviews_app`` defaults ``review_dispatch.enabled=True``, so
+    ``launched == []`` here is a real launch-avoidance assertion, not a
+    disabled-dispatch early return. The positive control proving this fixture
+    would otherwise launch is the pre-existing sibling
+    ``test_dispatch_reviews_proceeds_with_nonempty_diff`` (same app/packet
+    helpers, non-empty ``diff.patch``), which gets exactly one launch.
     """
     from charlie_work.instrumentation import _LEVEL_BY_KIND
 
