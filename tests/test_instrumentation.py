@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work.instrumentation import (
+    EXPECTED_OPERATIONAL_KINDS,
     _LEVEL_BY_KIND,
     close_db,
     correlation_context,
@@ -1563,6 +1564,24 @@ def test_event_kind_registry_exhaustive() -> None:
         "site -- remove it or update it to match the current source: "
         + "; ".join(f"{site.path} in {site.scope}(): `{site.source}`" for site in stale)
     )
+
+
+def test_expected_operational_kinds_are_all_registered_warnings() -> None:
+    """#1271: bucketing only makes sense for warnings.
+
+    Every member of ``EXPECTED_OPERATIONAL_KINDS`` must be registered in
+    ``_LEVEL_BY_KIND`` at ``"warning"`` -- an info or error kind (or an
+    unregistered one) accidentally added to the set would silently vanish
+    from ``check_error_events``'s coverage or from the info stream, since
+    ``check_warning_events`` only ever queries ``level = 'warning'`` rows.
+    """
+    assert EXPECTED_OPERATIONAL_KINDS, "the set must not be empty"
+    for kind in EXPECTED_OPERATIONAL_KINDS:
+        assert kind in _LEVEL_BY_KIND, f"{kind} is not registered in _LEVEL_BY_KIND"
+        assert _LEVEL_BY_KIND[kind] == "warning", (
+            f"{kind} is registered at level {_LEVEL_BY_KIND[kind]!r}, not 'warning' -- "
+            "bucketing only makes sense for warning-level kinds"
+        )
 
 
 def test_self_deploy_event_kind_only_returns_registered_kinds() -> None:

@@ -431,6 +431,20 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
 _ERROR_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "error"})
 _WARNING_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "warning"})
 
+# Issue #1271: re-exported, not declared here. ``heartbeat_check.py`` is
+# stdlib-only by design (see ``scripts/README.md``) and this module imports
+# ``ci_fleet.observability``/``ci_fleet.provenance`` below at module load, so
+# declaring the frozenset in this module and having the script import it
+# from here would make a broken ``ci_fleet`` install crash the script with
+# an unhandled ImportError on exactly the failure class it exists to report.
+# ``charlie_work.event_kinds`` is the genuine leaf (stdlib-only, no further
+# charlie_work/ci_fleet imports) that both this module and
+# ``heartbeat_check.py`` import from -- see its module docstring. Every
+# member must be registered in ``_LEVEL_BY_KIND`` at ``"warning"`` --
+# bucketing only makes sense for warnings -- which
+# ``test_expected_operational_kinds_are_all_registered_warnings`` enforces.
+from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS  # noqa: E402,F401
+
 
 def _now_iso() -> str:
     """Return the current UTC time as an ISO 8601 string with 'Z' suffix."""
