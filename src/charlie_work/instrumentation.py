@@ -210,6 +210,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # (the 2026-08-05 scratch-clone repoint shape). The pass is refused
         # before config load, so this is terminal for the pass -> error.
         "venv_editable_anchor_violation": "error",
+        "venv_pth_repair_failed": "error",
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
@@ -296,6 +297,8 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_rate_limit_deferred": "warning",
         "supervise_relaunch_cap_reached": "warning",
         "unauthorized_merge_check_skipped": "warning",
+        "venv_pth_mismatch": "warning",
+        "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",
         # Issue #849: rescue capture preserves work before a reset. Warning
         # level because it means a worktree had uncommitted work that was

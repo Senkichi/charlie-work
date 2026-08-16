@@ -783,7 +783,7 @@ def test_run_fleet_bash_rats_emits_attention_digest_on_venv_repaired(
             changed=False,
             synced=False,
             venv_repaired=True,
-            message="venv editable target repaired: shared venv editable .pth points to main checkout src",
+            message="venv editable target repaired: shared venv editable .pth targets all resolve to configured checkouts",
         )
     )
     monkeypatch.setattr(cli, "self_deploy", deploy_mock)
