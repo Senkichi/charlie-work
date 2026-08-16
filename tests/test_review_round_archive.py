@@ -55,8 +55,7 @@ import pytest
 import charlie_work.workflow as workflow
 from charlie_work.workflow import OrchestratorApp, _existing_round_numbers
 
-from _review_fixtures import (  # noqa: F401  (_PR_NUMBER: deliberate re-export)
-    _PR_NUMBER,
+from _review_fixtures import (
     _pr_dir,
     _record,
     _round_archive_app,

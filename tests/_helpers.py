@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Any
 
 from _fakes_github import FakeGitHub
 from charlie_work.config import CrossFamilyConfig, OrchestratorConfig
@@ -65,7 +64,7 @@ def _cross_family_app(tmp_path: Path, *, enabled: bool) -> OrchestratorApp:
 VALID_CROSS_FAMILY_REPORT = "**MAJOR**\nissue\n\nVerdict: safe"
 
 
-def _second_mergequeue_pr(fake_gh: Any) -> None:
+def _second_mergequeue_pr(fake_gh) -> None:
     """Add a second approved-candidate issue/PR pair (124/789) to a FakeGitHub
     fixture, reviewed after the default 123/456 pair."""
     fake_gh.issues.append(
