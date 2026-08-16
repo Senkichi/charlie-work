@@ -870,6 +870,141 @@ def test_load_config_readiness_no_ci_minutes_accepts_valid_int(tmp_path: Path) -
     assert config.auto_merge.readiness_no_ci_minutes == 30
 
 
+def test_load_config_stale_checks_grace_minutes_rejects_bool_true(tmp_path: Path) -> None:
+    """Issue #1274 (W17): YAML boolean true is not a valid integer minutes value."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: true
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_grace_minutes_rejects_bool_false(tmp_path: Path) -> None:
+    """Issue #1274 (W17): YAML boolean false silently means 0 if treated as int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: false
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_grace_minutes_rejects_negative(tmp_path: Path) -> None:
+    """Issue #1274 (W17): negative minutes is semantically meaningless."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_grace_minutes_accepts_valid_int(tmp_path: Path) -> None:
+    """Issue #1274 (W17): zero and positive integers are both accepted."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: 0
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.stale_checks_grace_minutes == 0
+
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_grace_minutes: 20
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.stale_checks_grace_minutes == 20
+
+
+def test_load_config_stale_checks_max_retriggers_rejects_bool_true(tmp_path: Path) -> None:
+    """Issue #1274 (W17): YAML boolean true is not a valid integer count."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: true
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_max_retriggers_rejects_bool_false(tmp_path: Path) -> None:
+    """Issue #1274 (W17): YAML boolean false silently means 0 if treated as int."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: false
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must be an int"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_max_retriggers_rejects_negative(tmp_path: Path) -> None:
+    """Issue #1274 (W17): a negative retrigger cap is semantically meaningless."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: -1
+""",
+    )
+    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must not be negative"):
+        load_config(config_file)
+
+
+def test_load_config_stale_checks_max_retriggers_accepts_valid_int(tmp_path: Path) -> None:
+    """Issue #1274 (W17): zero (no retries) and positive counts are both accepted."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: 0
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.stale_checks_max_retriggers == 0
+
+    _write_config(
+        config_file,
+        """review:
+  stale_checks_max_retriggers: 5
+""",
+    )
+    config = load_config(config_file)
+    assert config.review.stale_checks_max_retriggers == 5
+
+
+def test_load_config_stale_checks_defaults_when_absent(tmp_path: Path) -> None:
+    """Issue #1274 (W17): an absent `review` section (or absent keys within an
+    otherwise-present one) falls back to ReviewConfig's documented defaults --
+    no silent zero/None, matching the sibling
+    auto_merge.ci_run_never_created_grace_minutes default-fallback shape.
+    """
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(config_file, "review:\n  max_rework_cycles: 2\n")
+    config = load_config(config_file)
+    assert config.review.stale_checks_grace_minutes == 15
+    assert config.review.stale_checks_max_retriggers == 3
+
+
 def test_api_worker_config_defaults() -> None:
     """An absent api_worker section yields safe defaults and no behavior change."""
     config = load_config()

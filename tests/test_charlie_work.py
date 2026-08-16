@@ -3118,6 +3118,15 @@ class FakeGitHub:
         self.pr_ready_calls: list[int] = []
         self.pr_ready_ok = True
         self.pr_ready_error: str | None = None
+        self.pr_close_calls: list[int] = []
+        self.pr_close_ok = True
+        self.pr_close_error: str | None = None
+        self.pr_reopen_calls: list[int] = []
+        self.pr_reopen_ok = True
+        self.pr_reopen_error: str | None = None
+        self.push_empty_commit_calls: list[str] = []
+        self.push_empty_commit_ok = True
+        self.push_empty_commit_error: str | None = None
         self.pr_head_shas: dict[int, str] = {}
         self.diffs: dict[int, str] = {}
         self.pr_external_issue_comments: dict[int, list[dict[str, Any]]] = {}
@@ -3343,6 +3352,54 @@ class FakeGitHub:
                 ok=True, returncode=0, stdout="", stderr="", value=None, error=None
             )
         error = self.pr_ready_error or "gh: pull request #%d is not ready for review" % number
+        return github_module.GitHubRunResult(
+            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
+        )
+
+    def pr_close(self, number: int) -> github_module.GitHubRunResult:
+        self.pr_close_calls.append(number)
+        if self.pr_close_ok:
+            for pr in self.prs:
+                if pr["number"] == number:
+                    pr["state"] = "CLOSED"
+                    break
+            return github_module.GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        error = self.pr_close_error or "gh: could not close pull request #%d" % number
+        return github_module.GitHubRunResult(
+            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
+        )
+
+    def pr_reopen(self, number: int) -> github_module.GitHubRunResult:
+        self.pr_reopen_calls.append(number)
+        if self.pr_reopen_ok:
+            for pr in self.prs:
+                if pr["number"] == number:
+                    pr["state"] = "OPEN"
+                    break
+            return github_module.GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        error = self.pr_reopen_error or "gh: could not reopen pull request #%d" % number
+        return github_module.GitHubRunResult(
+            ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
+        )
+
+    def push_empty_commit(self, branch: str) -> github_module.GitHubRunResult:
+        self.push_empty_commit_calls.append(branch)
+        if self.push_empty_commit_ok:
+            for pr in self.prs:
+                if pr.get("headRefName") == branch:
+                    # Simulate GitHub's real effect: the branch tip moves to a
+                    # new (synthetic) SHA, same as a real empty-commit push.
+                    old_head = pr.get("headRefOid", "")
+                    pr["headRefOid"] = f"{old_head}-empty-commit"
+                    break
+            return github_module.GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        error = self.push_empty_commit_error or f"gh: could not push empty commit to {branch!r}"
         return github_module.GitHubRunResult(
             ok=False, returncode=1, stdout="", stderr=error, value=None, error=error
         )
@@ -18760,35 +18817,28 @@ def test_dispatch_claim_site_has_no_redundant_ci_status_check() -> None:
     )
 
 
-def test_scope_fence_no_stale_checks_config_or_verdict_source_added() -> None:
-    """Issue #1258 (AC7, structural half): this item's diff must add NEITHER
-    ``ReviewConfig.stale_checks_grace_minutes`` / ``max_retriggers`` (W17's
-    fields -- W17 lands AFTER W1 in this lane; the issue's binding comment
-    is explicit that W1 must not re-add them regardless of landing order)
-    NOR a ``verdict_source`` field/enum anywhere in the new CI-red gate
-    (W8's "ci_gate_auto_reject provenance enum" -- W8 also lands after W1).
+def test_scope_fence_no_verdict_source_added() -> None:
+    """Issue #1258 (AC7, structural half): this item's diff must add NO
+    ``verdict_source`` field/enum anywhere in the new CI-red gate (W8's
+    "ci_gate_auto_reject provenance enum" -- W8 lands after W1).
 
-    Pins both boundaries down as executable checks rather than prose so a
-    later edit to this same gate trips CI instead of silently reintroducing
-    either deferred field. ``verdict_source`` already exists elsewhere in
-    this codebase (``_reap_review_verdicts`` provenance, an unrelated
-    pre-existing mechanism -- see workflow.py's own field of that name) --
-    this test does not (and must not) assert the string is absent from the
-    whole repo, only that the two structures this item actually touches
-    (``ReviewConfig`` and ``JanitorVerdict``) never gained the field.
+    Originally this test also pinned ``ReviewConfig.stale_checks_grace_minutes``
+    / ``max_retriggers`` absent, guarding against W1 (or #1258 itself)
+    re-adding W17's fields prematurely. W17 (issue #1274, this same lane) has
+    now landed those two fields on ``ReviewConfig`` on purpose -- see
+    ``ReviewConfig.stale_checks_grace_minutes``/``stale_checks_max_retriggers``
+    and their loader validation block in config.py. That half of this test is
+    therefore retired; the ``verdict_source`` guard below is unrelated
+    (W8/#1258 concern) and still applies.
+
+    ``verdict_source`` already exists elsewhere in this codebase
+    (``_reap_review_verdicts`` provenance, an unrelated pre-existing
+    mechanism -- see workflow.py's own field of that name) -- this test does
+    not (and must not) assert the string is absent from the whole repo, only
+    that ``JanitorVerdict`` (the structure this item actually touches) never
+    gained the field.
     """
     from charlie_work.janitor import JanitorVerdict
-
-    # Deliberately two targeted membership checks, not an exact-set equality
-    # against today's full field list: W17 (later in this same lane) adds
-    # exactly these two fields to ReviewConfig on purpose, and an exact-set
-    # assertion would fail on that legitimate, already-planned change (and on
-    # any other unrelated future field) as if it were a scope-fence
-    # violation. The two ``not in`` checks are the actual AC7 requirement --
-    # they stay red only for the one regression this item guards against.
-    review_config_fields = {f.name for f in dataclasses.fields(ReviewConfig)}
-    assert "stale_checks_grace_minutes" not in review_config_fields
-    assert "stale_checks_max_retriggers" not in review_config_fields
 
     janitor_verdict_fields = {f.name for f in dataclasses.fields(JanitorVerdict)}
     assert "verdict_source" not in janitor_verdict_fields
