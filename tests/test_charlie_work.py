@@ -18557,6 +18557,137 @@ def test_dispatch_claim_site_has_no_redundant_ci_status_check() -> None:
     )
 
 
+def test_scope_fence_no_stale_checks_config_or_verdict_source_added() -> None:
+    """Issue #1258 (AC7, structural half): this item's diff must add NEITHER
+    ``ReviewConfig.stale_checks_grace_minutes`` / ``max_retriggers`` (W17's
+    fields -- W17 lands AFTER W1 in this lane; the issue's binding comment
+    is explicit that W1 must not re-add them regardless of landing order)
+    NOR a ``verdict_source`` field/enum anywhere in the new CI-red gate
+    (W8's "ci_gate_auto_reject provenance enum" -- W8 also lands after W1).
+
+    Pins both boundaries down as executable checks rather than prose so a
+    later edit to this same gate trips CI instead of silently reintroducing
+    either deferred field. ``verdict_source`` already exists elsewhere in
+    this codebase (``_reap_review_verdicts`` provenance, an unrelated
+    pre-existing mechanism -- see workflow.py's own field of that name) --
+    this test does not (and must not) assert the string is absent from the
+    whole repo, only that the two structures this item actually touches
+    (``ReviewConfig`` and ``JanitorVerdict``) never gained the field.
+    """
+    from charlie_work.janitor import JanitorVerdict
+
+    review_config_fields = {f.name for f in dataclasses.fields(ReviewConfig)}
+    assert "stale_checks_grace_minutes" not in review_config_fields
+    assert "stale_checks_max_retriggers" not in review_config_fields
+    assert review_config_fields == {
+        "max_rework_cycles",
+        "require_tests_or_rationale",
+        "require_issue_link",
+        "max_conflict_rework_attempts",
+        "max_no_op_rework_attempts",
+        "rework_stall_minutes",
+    }
+
+    janitor_verdict_fields = {f.name for f in dataclasses.fields(JanitorVerdict)}
+    assert "verdict_source" not in janitor_verdict_fields
+
+
+def test_missing_checks_only_pr_falls_through_to_janitor_blocked_unchanged(
+    tmp_path: Path,
+) -> None:
+    """Issue #1258 (AC7, behavioral half): a PR whose required checks are
+    entirely MISSING (never reported), as opposed to FAILED, is the
+    pre-existing "absent checks" code path this item must leave untouched
+    -- it is classification-only (``is_missing_checks_only_block``, issue
+    #1133) with no retrigger, and W17's not-yet-built
+    stale-checks-grace/retrigger policy is what would eventually act on it.
+
+    Both of this item's new/extended gates require
+    ``verdict.failed_required_checks`` to be truthy
+    (``is_check_failure_block`` and the new co-occurring branch alike) --
+    a purely-missing check leaves that tuple empty, so neither can fire by
+    construction. This PR must fall straight through to the passive
+    ``janitor_blocked`` bookkeeping exactly as it did before this item's
+    diff: no ``record_review`` decision, no ``review_dispatch_skipped_ci_red``
+    event, no reviewer launch.
+    """
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithMissingRequired()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    pr_state = state["prs"]["456"]
+    assert pr_state["status"] == "janitor_blocked"
+    assert pr_state["is_missing_checks_only_block"] is True
+    # Neither the pre-existing sole-failure short-circuit nor the new
+    # co-occurring branch fired -- no request_changes decision was recorded.
+    assert "decision" not in pr_state
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
+
+    # No packet was written (the janitor gate blocked before packet-build),
+    # so dispatch_reviews has structurally nothing to launch for this PR.
+    dispatch_result = app.dispatch_reviews()
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["launched_count"] == 0
+
+
+def test_dispatch_reviews_empty_diff_skip_is_registered_and_never_launches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC5): the #1251 empty-diff pre-flight guard already
+    landed on this clone's main (commit 7de2fa9, PR #1278) before this item
+    started -- per the task's "integrate with it instead of duplicating"
+    instruction, this item does not reimplement it. This test pins the two
+    concrete AC5 guarantees against the ALREADY-MERGED gate as an explicit
+    W1 regression (not just #1251's own suite): zero reviewer-launch calls
+    for a zero-file PR, and its dedicated event kind is genuinely registered
+    in instrumentation.py's exhaustive registry (not just a bare string).
+
+    Naming note (flagged, not fixed here): ``review_skipped_empty_diff``
+    predates issue #1258's ``review_dispatch_skipped_ci_red`` and does not
+    share the ``review_dispatch_*`` shape AC4 pins for the new CI-red kind
+    -- renaming an already-shipped, already-tested kind is out of this
+    item's scope and would itself be an unreviewed behavior change.
+    """
+    from charlie_work.instrumentation import _LEVEL_BY_KIND
+
+    assert "review_skipped_empty_diff" in _LEVEL_BY_KIND
+
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+
+    launched = _fail_if_launched(monkeypatch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    assert launched == []
+    assert result.data["launched_count"] == 0
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert len(skip_events) == 1
+    assert skip_events[0]["pr_number"] == 100
+
+
 def test_janitor_required_check_rerun_api_error_falls_through_to_rework(tmp_path: Path) -> None:
     """Issue #391: a rerun API error surfaces as an event and falls through to rework."""
     config = _required_checks_config()
