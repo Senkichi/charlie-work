@@ -203,6 +203,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_stalled": "error",
         "spec_review_failed": "error",
         "supervisor_restart_watchdog_disabled": "error",
+        # The supervise-loop wrapper's WedgeWatchdog detected that the
+        # supervisor child was alive but had not updated its heartbeat in
+        # well beyond the configured pass-timeout bound, and terminated it
+        # so the scheduled task's next tick relaunches a fresh daemon
+        # (issue #728). Error, not warning: a wedged supervisor was doing
+        # no fleet work and every surface reported green -- the kill is the
+        # recovery, and the event is the only record that it happened.
+        "supervisor_wedged_killed": "error",
         "supervisor_zero_pass_alarm": "error",
         "unauthorized_merge_detected": "error",
         # The supervisor's startup guard found an editable .pth in the running
