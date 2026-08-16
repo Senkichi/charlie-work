@@ -1,23 +1,21 @@
-"""Shared fixture for ``test_claude_code_adapter.py``'s externally-imported
+"""Shared fixtures for ``test_claude_code_adapter.py``'s externally-imported
 surface.
 
 Hoisted out of ``test_claude_code_adapter.py`` (issue #1284): a
 ``monkeypatch``-based ``create_worktree`` stand-in, imported by other test
-modules. ``test_claude_code_adapter.py`` is one of the three monoliths
-issue #1284 marks out of scope for a full split -- only this one exported
-symbol moves; the rest of the file is untouched.
+modules, plus the two small ``WorktreeInfo`` builders it closes over.
+``test_claude_code_adapter.py`` is one of the three monoliths issue #1284
+marks out of scope for a full split -- only these exported symbols move;
+the rest of the file is untouched.
 
-The ``_fake_worktree``/``_fake_worktree_with_venv`` builders this closes
-over are NOT hoisted: every other test module that needs one defines its
-own local copy rather than importing test_claude_code_adapter.py's (see
-test_api_worker.py, test_devin_shell.py, test_fix_conflict_worktree.py,
-test_fix_reviewer_argv.py) -- they are genuinely internal-only, not shared
-fixtures. The import below is deferred to call time (inside the nested
-``fake_create_worktree``) specifically to avoid a load-time circular
-import: test_claude_code_adapter.py itself imports this module's
-``_install_fake_create_worktree`` back (general back-reference rule), so a
-module-level import here would try to load test_claude_code_adapter.py
-while it is still mid-import.
+``_fake_worktree`` still has real internal callers in
+``test_claude_code_adapter.py``, so that file imports it back (general
+back-reference rule). ``_fake_worktree_with_venv`` had none -- its only
+caller was always this fixture's ``with_venv=True`` branch -- so it moves
+here outright with no back-reference needed. Both are plain module-level
+imports now: unlike an earlier version of this module, there is no
+circular-import hazard to defer around, since this module no longer needs
+anything from ``test_claude_code_adapter.py``.
 """
 
 from __future__ import annotations
@@ -25,6 +23,27 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
+from charlie_work.worktree import WorktreeInfo
+
+
+def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
+    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
+
+
+def _fake_worktree_with_venv(tmp_path: Path, branch: str) -> WorktreeInfo:
+    """Create a fake worktree with a .venv directory.
+
+    This makes sanitize_env actively SET VIRTUAL_ENV (instead of POP-ing it),
+    which makes the merge order testable: if worker_env is merged first,
+    sanitize_env will clobber the override.
+    """
+    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    (worktree_path / ".venv").mkdir()
+    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
 
 
 def _install_fake_create_worktree(
@@ -50,9 +69,6 @@ def _install_fake_create_worktree(
         config=None,
         sessions_dir=None,
     ):
-        # Deferred to call time -- see module docstring for why.
-        from test_claude_code_adapter import _fake_worktree, _fake_worktree_with_venv
-
         if calls is not None:
             calls.append(
                 {

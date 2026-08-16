@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _claude_adapter_fixtures import _install_fake_create_worktree
+from _claude_adapter_fixtures import _fake_worktree, _install_fake_create_worktree
 from _worker_marker_wait import read_worker_marker
 
 from charlie_work import claude_code
@@ -41,25 +41,6 @@ from charlie_work.claude_code import (
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.worktree import WorktreeForeignWriterError, WorktreeInfo
-
-
-def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
-    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
-
-
-def _fake_worktree_with_venv(tmp_path: Path, branch: str) -> WorktreeInfo:
-    """Create a fake worktree with a .venv directory.
-
-    This makes sanitize_env actively SET VIRTUAL_ENV (instead of POP-ing it),
-    which makes the merge order testable: if worker_env is merged first,
-    sanitize_env will clobber the override.
-    """
-    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    (worktree_path / ".venv").mkdir()
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
 
 
 def _fake_claude_script(tmp_path: Path) -> tuple[str, ...]:

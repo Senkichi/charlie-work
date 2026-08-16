@@ -169,10 +169,16 @@ def _fake_claude_worker_record(pr_number: int, branch: str) -> ClaudeWorkerRecor
     )
 
 
+def _approved_automerge():
+    from charlie_work.config import AutoMergeConfig
+
+    # No required checks -> the check gate is vacuously satisfied, isolating the
+    # approved-decision path for merge tests.
+    return AutoMergeConfig(required_checks=(), require_approved_review=True)
+
+
 def _make_loop_app(tmp_path: Path, *, prs: list[dict]) -> tuple[OrchestratorApp, FakeGitHub]:
     """Build a minimal OrchestratorApp with the given open PRs for loop() tests."""
-    from test_charlie_work import _approved_automerge
-
     config = OrchestratorConfig(
         cross_family=CrossFamilyConfig(enabled=False),
         auto_merge=_approved_automerge(),

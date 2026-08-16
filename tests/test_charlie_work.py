@@ -44,6 +44,7 @@ from _merge_tripwire_fixtures import (
     _write_decision,
 )
 from _review_fixtures import (
+    _approved_automerge,
     _dispatch_reviews_app,
     _fake_claude_worker_record,
     _make_dead_review_sidecar,
@@ -19058,14 +19059,6 @@ def test_runtime_paths_silent_when_state_json_exists(tmp_path: Path, caplog: Any
 
 
 # --- adversarial-review fixes: regressions + coverage gaps ---------------------
-
-
-def _approved_automerge():
-    from charlie_work.config import AutoMergeConfig
-
-    # No required checks -> the check gate is vacuously satisfied, isolating the
-    # approved-decision path for merge tests.
-    return AutoMergeConfig(required_checks=(), require_approved_review=True)
 
 
 def _mergequeue_automerge(label: str = "mergequeue"):
