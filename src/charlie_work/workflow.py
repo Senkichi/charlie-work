@@ -79,6 +79,7 @@ from .github import (
     GitHubNotFoundError,
     GitHubRunResult,
     GraphQLBudgetError,
+    PR_CLOSING_ISSUES_FIELDS,
     cancel_superseded_runs,
     defang_closing_keywords,
     detect_prose_only_dependencies,
@@ -88,6 +89,11 @@ from .github import (
     label_names,
     linked_issue_number,
     parse_blockers,
+)
+from .closing_reference import (
+    ValidationResult,
+    closing_issues_referenced_numbers,
+    validate_closing_reference,
 )
 from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
@@ -5630,7 +5636,7 @@ def _detect_and_handle_orphaned_workers(
                     # returning an error, which preserves the existing drift/hold
                     # behavior for no-repo-root orphans.
                     salvage_repo_root = repo_root if isinstance(repo_root, Path) else None
-                    pr_number, pr_error = _open_pr_for_orphaned_branch(
+                    pr_number, pr_error, _closing_ref = _open_pr_for_orphaned_branch(
                         gh=gh,
                         config=config,
                         repo_root=salvage_repo_root,
@@ -5640,6 +5646,7 @@ def _detect_and_handle_orphaned_workers(
                         active_labels=details.get("active_labels", set()),
                         issue_labels=details.get("issue_labels", set()),
                         issue_title=(details.get("issue") or {}).get("title"),
+                        state_file=state_file,
                     )
                     if pr_number is not None:
                         entry["status"] = PASSIVE_OPEN_STATUS
@@ -8069,6 +8076,20 @@ def _classify_dead_sessions_and_update_throttle_state(
     return reaped
 
 
+def _safe_repo_slug(gh: GitHubLike) -> str:
+    """Return the ``owner/repo`` slug, or ``"?"`` if the lookup fails.
+
+    ``name_with_owner()`` raises ``GitHubError`` on failure (offline, gh
+    missing, etc.); this is used only to qualify a closing-reference line, so
+    a lookup failure must not stop salvage-PR creation. Mirrors
+    ``reconcile._repo_slug``.
+    """
+    try:
+        return gh.name_with_owner()
+    except Exception:
+        return "?"
+
+
 def _open_salvage_pr(
     *,
     gh: GitHubLike,
@@ -8081,17 +8102,34 @@ def _open_salvage_pr(
     issue_labels: set[str],
     issue_title: str | None = None,
     source_description: str = "worker branch",
-) -> tuple[int | None, str | None]:
+    state_file: Path | None = None,
+) -> tuple[int | None, str | None, ValidationResult | None]:
     """Open a PR for a salvaged worker branch and move issue labels toward ``pr_open``.
 
-    Returns ``(pr_number, error)``. ``pr_number`` is the created PR number,
-    or ``None`` when the PR could not be created. ``error`` is ``None`` when
-    both the PR and the label swap succeeded; otherwise it describes the first
-    failure encountered (a missing ``repo_root``, a failed PR create, or a
-    label write failure after the PR was created).
+    Returns ``(pr_number, error, closing_ref)``. ``pr_number`` is the created
+    PR number, or ``None`` when the PR could not be created. ``error`` is
+    ``None`` when both the PR and the label swap succeeded; otherwise it
+    describes the first failure encountered (a missing ``repo_root``, a
+    failed PR create, or a label write failure after the PR was created).
+    ``closing_ref`` is the `~charlie_work.closing_reference.ValidationResult`
+    from canonicalizing the closing-reference line before the PR was
+    created, or ``None`` when PR creation never reached that far (missing
+    ``repo_root``).
+
+    cw#1263: the body's ``Closes #N`` line is validated/canonicalized via
+    `closing_reference.validate_closing_reference` before ``gh.pr_create``
+    ever sees it -- this is the sole point where both salvage/orphan-recovery
+    callers (`_attempt_salvage`, `_open_pr_for_orphaned_branch`) create a PR,
+    so routing the fixed-up body through here covers both without a second
+    call site to keep in sync. After a successful create, GitHub's own
+    ``closingIssuesReferences`` resolution is queried and compared against
+    ``issue_number``; a mismatch is logged (``pr_closing_ref_unlinked``) but
+    never blocks the return -- this is the only verification surface that
+    would catch it, since GitHub's own auto-close resolution can diverge from
+    the text charlie-work wrote even when that text looks correct.
     """
     if repo_root is None:
-        return None, "repo_root is required to open a salvage PR"
+        return None, "repo_root is required to open a salvage PR", None
 
     base_branch = resolve_base_branch_name(repo_root, base_ref)
 
@@ -8123,9 +8161,48 @@ def _open_salvage_pr(
     if summary:
         body = f"{body}\n\n{summary}"
 
+    closing_ref = validate_closing_reference(body, issue_number, repo=_safe_repo_slug(gh), gh=gh)
+    body = closing_ref.body
+    if closing_ref.changed and state_file is not None:
+        log_event(
+            state_file,
+            "pr_closing_ref_rewritten",
+            {
+                "issue_number": issue_number,
+                "findings": list(closing_ref.findings),
+                "source": source_description,
+            },
+        )
+
     pr_number = gh.pr_create(head=branch, base=base_branch, title=title, body=body)
     if pr_number is None:
-        return None, "gh pr create failed or returned no PR number"
+        return None, "gh pr create failed or returned no PR number", closing_ref
+
+    # `pr_number` is falsy (0) under `dry_run`, where no real PR was opened and
+    # a `gh pr view 0` call would be both wasted and nonsensical -- only probe
+    # a real, truthy PR number.
+    if pr_number and state_file is not None:
+        query_ok = True
+        try:
+            pr_view = gh.pr_view(pr_number, fields=PR_CLOSING_ISSUES_FIELDS)
+        except Exception:
+            pr_view = {}
+            query_ok = False
+        linked_numbers = closing_issues_referenced_numbers(pr_view)
+        # Only log when the query itself succeeded: a transient `gh` failure
+        # collapses to the same empty result as "GitHub really didn't link
+        # the issue", and this event exists to be acted on -- conflating a
+        # failed probe with a genuine miss would make it noisy and untrustworthy.
+        if query_ok and issue_number not in linked_numbers:
+            log_event(
+                state_file,
+                "pr_closing_ref_unlinked",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "linked_issue_numbers": sorted(linked_numbers),
+                },
+            )
 
     label_write_ok = True
     for label in sorted(active_labels):
@@ -8136,9 +8213,9 @@ def _open_salvage_pr(
             label_write_ok = False
 
     if not label_write_ok:
-        return pr_number, "PR created but label write failed"
+        return pr_number, "PR created but label write failed", closing_ref
 
-    return pr_number, None
+    return pr_number, None, closing_ref
 
 
 def _attempt_salvage(
@@ -8167,7 +8244,7 @@ def _attempt_salvage(
     if not push_ok:
         return False, push_error
 
-    pr_number, pr_error = _open_salvage_pr(
+    pr_number, pr_error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=repo_root,
@@ -8178,6 +8255,7 @@ def _attempt_salvage(
         issue_labels=issue_labels,
         issue_title=issue_title,
         source_description="completed-but-unpublished worker worktree",
+        state_file=state_file,
     )
     if pr_number is None:
         return False, pr_error or "gh pr create failed or returned no PR number"
@@ -8214,14 +8292,17 @@ def _open_pr_for_orphaned_branch(
     active_labels: set[str],
     issue_labels: set[str],
     issue_title: str | None = None,
-) -> tuple[int | None, str | None]:
+    state_file: Path | None = None,
+) -> tuple[int | None, str | None, ValidationResult | None]:
     """Open a PR for a branch that the worker pushed but could not create a PR for.
 
-    Returns ``(pr_number, error)``. Errors are recorded as values and never
-    raised. This is the orchestrator-side recovery for issue #935: workers are
-    unauthenticated in their environment, so after pushing a completed branch
-    they cannot run ``gh pr create``. The orchestrator, which is authenticated,
-    creates the PR and moves the issue labels toward ``pr_open``.
+    Returns ``(pr_number, error, closing_ref)``. Errors are recorded as
+    values and never raised. This is the orchestrator-side recovery for
+    issue #935: workers are unauthenticated in their environment, so after
+    pushing a completed branch they cannot run ``gh pr create``. The
+    orchestrator, which is authenticated, creates the PR and moves the issue
+    labels toward ``pr_open``. See `_open_salvage_pr` for the closing-
+    reference validation and post-create verification this delegates to.
     """
     return _open_salvage_pr(
         gh=gh,
@@ -8234,6 +8315,7 @@ def _open_pr_for_orphaned_branch(
         issue_labels=issue_labels,
         issue_title=issue_title,
         source_description="worker branch that could not open a PR",
+        state_file=state_file,
     )
 
 
