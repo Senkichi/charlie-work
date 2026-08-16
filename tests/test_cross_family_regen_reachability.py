@@ -48,7 +48,7 @@ from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state
 from charlie_work.workflow import OrchestratorApp
 
 # Reuse the shared FakeGitHub whose default PR #456 is janitor-green.
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 HEAD = "sha-static"
 

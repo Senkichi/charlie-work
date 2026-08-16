@@ -35,7 +35,7 @@ from charlie_work.state import (
 )
 from charlie_work.workflow import OrchestratorApp, _escalate_issue
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 
 def _closed_pr_app(tmp_path: Path) -> tuple[OrchestratorApp, FakeGitHub]:

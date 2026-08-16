@@ -22,7 +22,7 @@ from charlie_work.config import (
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state
 from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 
 def test_none_not_in_deterministic_escalation_failure_kinds() -> None:

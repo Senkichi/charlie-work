@@ -35,8 +35,8 @@ from charlie_work.config import OrchestratorConfig
 from charlie_work.labels import TransitionOutcome, transition
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, state_lock
 
-from test_charlie_work import FakeGitHub
-from test_cli import _FakeGitHub, _make_repo
+from _cli_fixtures import _FakeGitHub, _make_repo
+from _fakes_github import FakeGitHub
 
 
 # --- labels.py: the two new label edges, tested directly via transition() ---

@@ -47,7 +47,7 @@ from charlie_work.workflow import OrchestratorApp
 
 # Reuse the shared FakeGitHub whose default PR #456 is janitor-green and
 # linked to issue #123.
-from test_charlie_work import FakeGitHub, FakeGitHubWithChecksAndAnnotations
+from _fakes_github import FakeGitHub, FakeGitHubWithChecksAndAnnotations
 
 
 class FakeGitHubHeadMovesOnSecondView(FakeGitHub):

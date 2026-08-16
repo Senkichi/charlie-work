@@ -495,7 +495,7 @@ def _salvage_labels(config: OrchestratorConfig) -> tuple[set[str], set[str]]:
 
 
 def test_open_salvage_pr_logs_unlinked_event_on_mismatch(tmp_path: Path) -> None:
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -533,7 +533,7 @@ def test_open_salvage_pr_logs_unlinked_event_on_mismatch(tmp_path: Path) -> None
 
 def test_open_salvage_pr_no_unlinked_event_when_matched(tmp_path: Path) -> None:
     """The discriminating case: GitHub's resolution DOES match. No event."""
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -567,7 +567,7 @@ def test_open_salvage_pr_no_unlinked_event_when_probe_fails(tmp_path: Path) -> N
     reference -- it is indistinguishable from a real miss only in its return
     shape, not in what it means. Logging it anyway would make the warning
     untrustworthy (see advisor review, cw#1263)."""
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -599,7 +599,7 @@ def test_open_salvage_pr_no_unlinked_event_when_probe_fails(tmp_path: Path) -> N
 def test_open_salvage_pr_skips_probe_under_dry_run(tmp_path: Path) -> None:
     """``pr_create`` returning ``0`` (dry-run sentinel) must not trigger a
     live ``gh pr view 0`` call."""
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -633,7 +633,7 @@ def test_open_salvage_pr_logs_rewritten_event_when_validator_changes_body(
     itself, so the rewrite branch is defensive in production -- exercise it
     by forcing ``validate_closing_reference`` to report a change, the same
     way a future defect in the body-builder would surface it."""
-    from test_issue_956 import _SalvageTestGitHub
+    from _salvage_fixtures import _SalvageTestGitHub
 
     from charlie_work.workflow import _open_salvage_pr
 
@@ -682,7 +682,7 @@ def test_apply_fixes_salvage_logs_unlinked_event_on_mismatch(tmp_path: Path) -> 
     through the same post-create probe as ``workflow.py``'s -- this exercises
     that side, which the earlier version of this test file never reached at
     all (every existing reconcile salvage test omits ``state_path``)."""
-    from test_reconcile import (
+    from _reconcile_fixtures import (
         FakeGitHub,
         _init_bare_remote_and_clone,
         _issue,
@@ -739,7 +739,7 @@ def test_apply_fixes_salvage_logs_unlinked_event_on_mismatch(tmp_path: Path) -> 
 
 def test_apply_fixes_salvage_no_unlinked_event_when_matched(tmp_path: Path) -> None:
     """Discriminating negative case for the reconcile-side probe."""
-    from test_reconcile import (
+    from _reconcile_fixtures import (
         FakeGitHub,
         _init_bare_remote_and_clone,
         _issue,
@@ -804,7 +804,7 @@ def test_apply_fixes_salvage_passes_corrected_body_to_pr_create(
     pass every other test in this suite (they only check for the presence
     of the *correct* issue number, which reconcile.py's own body-builder
     already writes in the untouched case) but fail this one."""
-    from test_reconcile import (
+    from _reconcile_fixtures import (
         FakeGitHub,
         _init_bare_remote_and_clone,
         _issue,

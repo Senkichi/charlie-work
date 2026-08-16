@@ -34,8 +34,8 @@ from charlie_work.workflow import (
     summarize_loop_errors,
 )
 
-from test_charlie_work import (
-    FakeGitHub,
+from _fakes_github import FakeGitHub
+from _merge_tripwire_fixtures import (
     _ack_unauthorized_merge,
     _arm_unauthorized_merge_tripwire,
     _merged_worker_pr,

@@ -30,12 +30,8 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
-from _fakes_github import FakeGitHubWithMissingRequiredAndRuns
-from test_charlie_work import (
-    FakeGitHub,
-    FakeGitHubWithChecks,
-    _required_checks_config,
-)
+from _fakes_github import FakeGitHub, FakeGitHubWithChecks, FakeGitHubWithMissingRequiredAndRuns
+from _review_fixtures import _required_checks_config
 
 
 def _events(state, kind: str) -> list[dict]:

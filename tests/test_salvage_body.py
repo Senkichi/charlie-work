@@ -18,8 +18,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from test_charlie_work import _init_git_repo
-from test_worktree import _clone_repo, _git
+from _helpers import _init_git_repo
+from _worktree_fixtures import _clone_repo, _git
 
 from charlie_work.janitor import _TESTS_OR_RATIONALE_RE
 from charlie_work.worktree import _SALVAGE_LOG_LIMIT, summarize_branch_work
@@ -210,7 +210,7 @@ def test_open_salvage_pr_with_empty_base_ref_still_derives_summary(tmp_path: Pat
     Every other test in this file (and in test_issue_956.py) hardcodes
     ``base_ref="main"``, which is exactly why the defect shipped.
     """
-    from test_issue_956 import _SalvageTestGitHub, _salvage_labels
+    from _salvage_fixtures import _SalvageTestGitHub, _salvage_labels
 
     from charlie_work.config import OrchestratorConfig
     from charlie_work.workflow import _open_salvage_pr
