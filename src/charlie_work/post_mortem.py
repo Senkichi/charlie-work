@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import re
 import shutil
@@ -60,6 +61,20 @@ if TYPE_CHECKING:
 # call (issue #261 spec: "block payload is JSON embedded in a role=tool
 # node's content string prefixed with 'Tool blocked:'").
 _BLOCK_CONTENT_PREFIX = "Tool blocked:"
+
+logger = logging.getLogger(__name__)
+
+# Default thresholds for the locked-DB temp-copy fallback (issue #1234).
+# These mirror the PostMortemConfig field defaults so that _open_readonly can
+# be called directly (e.g. from tests) without a config instance and still
+# apply the same safeguards. The config values are the source of truth in
+# production — callers pass them through explicitly.
+_TEMP_COPY_MAX_BYTES_DEFAULT = 256 * 1024 * 1024  # 256 MB
+_TEMP_COPY_RECLAIM_MAX_AGE_HOURS_DEFAULT = 2
+
+# Prefix used for mkdtemp in the locked-DB fallback and matched by the
+# reclamation sweep (issue #1234).
+_POSTMORTEM_TEMP_PREFIX = "charlie-work-postmortem-"
 
 
 def _default_db_path() -> Path:
@@ -299,13 +314,76 @@ def read_post_mortem(sessions_dir: Path, issue_number: int) -> PostMortemRecord 
         return None
 
 
-def _open_readonly(db_path: Path) -> tuple[sqlite3.Connection | None, Path | None, str | None]:
+def _reclaim_stale_temp_copies(max_age_hours: int) -> int:
+    """Delete ``charlie-work-postmortem-*`` temp dirs older than ``max_age_hours``.
+
+    Structural fix for issue #1234 root cause #4: per-run cleanup without a
+    reclamation sweep guarantees monotonic accumulation, because any pass
+    killed mid-copy or mid-analysis (e.g. the supervisor self-deploy restart
+    cycle) skips ``_cleanup_temp_copy`` and leaves a full sessions.db copy
+    behind forever. Sweeping at the boundary where new copies are minted
+    (the start of ``_open_readonly``'s fallback) makes every leak transient
+    regardless of which exit path was skipped.
+
+    Best-effort: each dir is removed with ``shutil.rmtree(ignore_errors=True)``
+    so a locked/unreadable entry cannot abort the sweep. Returns the number of
+    dirs removed. Never raises — a reclamation failure is logged, not raised.
+    """
+    if max_age_hours <= 0:
+        return 0
+    temp_root = Path(tempfile.gettempdir())
+    cutoff = datetime.now(UTC).timestamp() - max_age_hours * 3600
+    reclaimed = 0
+    try:
+        candidates = list(temp_root.glob(f"{_POSTMORTEM_TEMP_PREFIX}*"))
+    except OSError:
+        return 0
+    for entry in candidates:
+        if not entry.is_dir():
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > cutoff:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            reclaimed += 1
+        else:
+            logger.warning(
+                "post_mortem: failed to reclaim stale temp dir %s (older than %dh); "
+                "manual cleanup may be needed (issue #1234).",
+                entry,
+                max_age_hours,
+            )
+    if reclaimed:
+        logger.info(
+            "post_mortem: reclaimed %d stale charlie-work-postmortem temp dir(s) older than %dh.",
+            reclaimed,
+            max_age_hours,
+        )
+    return reclaimed
+
+
+def _open_readonly(
+    db_path: Path,
+    *,
+    temp_copy_max_bytes: int = _TEMP_COPY_MAX_BYTES_DEFAULT,
+    reclaim_max_age_hours: int = _TEMP_COPY_RECLAIM_MAX_AGE_HOURS_DEFAULT,
+) -> tuple[sqlite3.Connection | None, Path | None, str | None]:
     """Open ``db_path`` read-only without taking a lock that could contend
     with the live Devin CLI process.
 
     Returns ``(connection, temp_copy_path_or_None, error)``. On success,
     ``temp_copy_path`` is set only when the copy-to-temp fallback was used
     (caller must clean it up). Never raises.
+
+    Locked-DB fallback safeguards (issue #1234): before minting a new temp
+    copy, stale ``charlie-work-postmortem-*`` dirs from prior crashed passes
+    are reclaimed (root cause #4), and the copy is refused outright when
+    ``sessions.db`` exceeds ``temp_copy_max_bytes`` (root cause #1) — a
+    best-effort diagnostic must never write a multi-GB copy to temp.
     """
     if not db_path.exists():
         return None, None, f"sessions.db not found at {db_path}"
@@ -324,8 +402,23 @@ def _open_readonly(db_path: Path) -> tuple[sqlite3.Connection | None, Path | Non
     # our read-only URI connection. Copy to a private temp file instead —
     # a stale-by-milliseconds snapshot is an acceptable tradeoff for a
     # best-effort diagnostic that must never block or fail the reaper.
+    #
+    # Reclaim stale temp dirs from prior passes first (issue #1234 #4), then
+    # refuse the copy when the DB is too large to copy safely (issue #1234 #1).
+    _reclaim_stale_temp_copies(reclaim_max_age_hours)
     try:
-        tmp_dir = Path(tempfile.mkdtemp(prefix="charlie-work-postmortem-"))
+        db_size = db_path.stat().st_size
+    except OSError as exc:
+        return None, None, f"failed to stat sessions.db: {exc}"
+    if db_size > temp_copy_max_bytes:
+        return (
+            None,
+            None,
+            f"sessions.db is {db_size} bytes (> {temp_copy_max_bytes} limit); "
+            "skipping temp-copy fallback to avoid a multi-GB temp write",
+        )
+    try:
+        tmp_dir = Path(tempfile.mkdtemp(prefix=_POSTMORTEM_TEMP_PREFIX))
         tmp_copy = tmp_dir / "sessions.db"
         shutil.copy2(db_path, tmp_copy)
         conn = sqlite3.connect(f"file:{tmp_copy.as_posix()}?mode=ro", uri=True, timeout=5)
@@ -338,12 +431,21 @@ def _open_readonly(db_path: Path) -> tuple[sqlite3.Connection | None, Path | Non
 def _cleanup_temp_copy(temp_copy_path: Path | None) -> None:
     if temp_copy_path is None:
         return
-    try:
-        temp_copy_path.unlink(missing_ok=True)
-        temp_copy_path.parent.rmdir()
-    except OSError:
-        # Best-effort — a leaked temp dir is not worth failing the pass over.
-        pass
+    # Remove the whole mkdtemp dir, not just sessions.db — opening the copy
+    # creates sessions.db-shm/-wal siblings that the old unlink+rmdir missed,
+    # so rmdir failed on a non-empty dir and the except-OSError-pass swallowed
+    # it, leaking the dir forever (issue #1234 root cause #2).
+    temp_dir = temp_copy_path.parent
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    if temp_dir.exists():
+        # Log rather than silently swallow — the next accumulation must be
+        # visible in the orchestrator log, not discovered at 0.8 GB free
+        # (issue #1234: log-on-cleanup-failure).
+        logger.warning(
+            "post_mortem: failed to clean up temp copy dir %s; it may need "
+            "manual removal (issue #1234).",
+            temp_dir,
+        )
 
 
 def _parse_session_created_at(value: Any) -> datetime | None:
@@ -953,7 +1055,11 @@ def real_activity_for_worker(
         db_error: str | None = None
         db_timestamp: datetime | None = None
         try:
-            conn, temp_copy_path, db_error = _open_readonly(db_path)
+            conn, temp_copy_path, db_error = _open_readonly(
+                db_path,
+                temp_copy_max_bytes=pm_config.temp_copy_max_bytes,
+                reclaim_max_age_hours=pm_config.temp_copy_reclaim_max_age_hours,
+            )
             if conn is None:
                 sources.append(
                     ActivitySource(
@@ -1170,7 +1276,11 @@ def _classify_via_sessions_db(
     """
     db_path = _resolve_db_path(pm_config.db_path)
 
-    conn, temp_copy_path, open_error = _open_readonly(db_path)
+    conn, temp_copy_path, open_error = _open_readonly(
+        db_path,
+        temp_copy_max_bytes=pm_config.temp_copy_max_bytes,
+        reclaim_max_age_hours=pm_config.temp_copy_reclaim_max_age_hours,
+    )
     if conn is None:
         _try_write_record(
             sessions_dir,
