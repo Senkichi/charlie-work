@@ -35,6 +35,8 @@ $required_changes_section
 - Re-run verification and update the PR body or comment with results.
 - If you disagree with a finding, explain with evidence in the PR instead of ignoring it.
 
+$section_scope_contract
+
 $section_invariant_enumeration
 
 $section_caller_sweep

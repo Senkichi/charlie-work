@@ -208,3 +208,90 @@ def test_dispatch_stale_event_classified_as_warning(tmp_path: Path) -> None:
 
     assert len(events) == 1
     assert events[0]["level"] == "warning"
+
+
+# ---------------------------------------------------------------------------
+# Issue #1110: staleness must not fire when every ready issue is blocked by an
+# open dependency. A deliberately sequenced cohort tail is permanently -- and
+# correctly -- unselectable by dispatch, so a cadence alarm for it is a false
+# positive that pattern-matches the #944 four-day stall this detector exists
+# to catch.
+# ---------------------------------------------------------------------------
+
+
+def _backlog_blocked(*, open_total: int = 2, blocked: int = 2) -> dict[str, object]:
+    """A backlog where every ready issue is dependency-blocked."""
+    return {
+        "observed": True,
+        "open_total": open_total,
+        "dispatchable": 0,
+        "blocked_by_open_dependency": blocked,
+    }
+
+
+def test_not_stale_when_all_ready_issues_blocked_by_dependencies(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    now = datetime.now(UTC).replace(microsecond=0)
+    config = DispatchConfig(dispatch_staleness_minutes=60)
+    old = _iso_now(now - timedelta(minutes=90))
+    _write_dispatch_event(state_path, old, [1])
+
+    result = check_dispatch_staleness(
+        state_path,
+        config,
+        _backlog_blocked(open_total=2, blocked=2),
+        now=now,
+    )
+
+    assert result["stale"] is False
+    assert result["reason"] == "all_ready_blocked_by_dependencies"
+    assert result["backlog_dispatchable"] == 0
+    assert result["backlog_blocked_by_open_dependency"] == 2
+
+
+def test_still_stale_when_no_ready_issues_at_all(tmp_path: Path) -> None:
+    # The #944 case: open issues exist but none are ready (all missing_ready,
+    # terminal, etc.). dispatchable == 0 and blocked_by_open_dependency == 0.
+    # The alarm MUST still fire -- this is the four-day stall this detector
+    # exists to catch. The #1110 fix must not suppress it.
+    state_path = tmp_path / "state.json"
+    now = datetime.now(UTC).replace(microsecond=0)
+    config = DispatchConfig(dispatch_staleness_minutes=60)
+    old = _iso_now(now - timedelta(minutes=90))
+    _write_dispatch_event(state_path, old, [1])
+
+    backlog = {
+        "observed": True,
+        "open_total": 87,
+        "dispatchable": 0,
+        "blocked_by_open_dependency": 0,
+        "missing_ready": 87,
+    }
+    result = check_dispatch_staleness(state_path, config, backlog, now=now)
+
+    assert result["stale"] is True
+    assert result["reason"] == "dispatch_stale"
+    assert result["backlog_dispatchable"] == 0
+    assert result["backlog_blocked_by_open_dependency"] == 0
+
+
+def test_stale_when_dispatchable_issues_exist_despite_some_blocked(tmp_path: Path) -> None:
+    # A backlog with both genuinely dispatchable issues and dependency-blocked
+    # ones: the post-gate count is > 0, so the alarm fires normally. The #1110
+    # fix only suppresses the alarm when ALL ready issues are blocked.
+    state_path = tmp_path / "state.json"
+    now = datetime.now(UTC).replace(microsecond=0)
+    config = DispatchConfig(dispatch_staleness_minutes=60)
+    old = _iso_now(now - timedelta(minutes=90))
+    _write_dispatch_event(state_path, old, [1])
+
+    backlog = {
+        "observed": True,
+        "open_total": 3,
+        "dispatchable": 1,
+        "blocked_by_open_dependency": 2,
+    }
+    result = check_dispatch_staleness(state_path, config, backlog, now=now)
+
+    assert result["stale"] is True
+    assert result["reason"] == "dispatch_stale"

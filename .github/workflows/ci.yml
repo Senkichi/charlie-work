@@ -16,6 +16,29 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Force UTF-8 on every Python process CI spawns. The self-hosted runner is a
+# Windows box where Python resolves its text layer from the ANSI codepage
+# (cp1252 on the GitHub runner image), not UTF-8 -- so any test that touches a
+# non-ASCII path, fixture, event payload, or subprocess pipe is decoded with
+# the wrong codec without this. That asymmetry with the dev box (which sets
+# both machine-wide) is the failure mode: a test passes locally and fails only
+# in CI, or -- worse -- passes in CI while silently mangling, because a
+# mojibaked string is still a string and most assertions never look.
+#
+# Set BOTH, and keep the ':surrogateescape' suffix. This mirrors
+# scripts/fleet-pass.ps1 (lines 62-63), which sets exactly these two variables
+# for the live supervisor for the same reason.
+#   - PYTHONUTF8=1 also fixes the open() default, which PYTHONIOENCODING does
+#     not touch -- the two are not redundant.
+#   - A BARE 'utf-8' is actively harmful: it overrides the surrogateescape
+#     handlers that UTF-8 mode installs and resets stdin/stdout to 'strict',
+#     turning graceful degradation into a hard crash on any not-quite-clean
+#     byte off a pipe. Do not shorten. See fleet-pass.ps1:53-60 for the full
+#     warning and ~/.claude/docs/utf8-hardening.md for the rationale.
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8:surrogateescape"
+
 # SELF-HOSTED (2026-07): hosted-runner minutes exhausted mid-month; all jobs
 # run on the repo-registered self-hosted runner (cw-9800x3d-1, local Windows
 # box). The hosted ubuntu+windows matrix is suspended — restore it from git
@@ -378,3 +401,46 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: uv run charlie closing-keyword-check --pr ${{ github.event.pull_request.number }}
+      - name: Mojibake gate (issue 1057)
+        # PR-only: push-to-main has no diff to scan (the branch IS main).
+        #
+        # Same structural rationale as the closing-keyword gate above: a
+        # step of the existing "Lint" job, not a new job, so it rides the
+        # already-required "Lint" context and becomes a de facto blocking
+        # gate the moment a PR branch includes this workflow change -- no
+        # branch-protection edit, no orchestrator.config.yaml or
+        # .aviator/config.yml change, no separate promotion step.
+        #
+        # Scans added lines in the PR diff for cp1252/UTF-8 mojibake --
+        # non-ASCII characters corrupted by a misconfigured editing path
+        # (e.g. em-dashes turned into the a-circumflex/euro/quote sequence).
+        # The detection is derived from the encoding process (reverse the
+        # corruption and check whether the result differs), not a hardcoded
+        # list of bad byte sequences, so it catches any UTF-8/cp1252 round
+        # trip. See src/charlie_work/mojibake_gate.py for the full rationale.
+        #
+        # The base SHA is the PR's base branch tip at the time of the run,
+        # available in the workflow event context. actions/checkout@v5 with
+        # its default fetch-depth: 1 creates a shallow clone that contains
+        # only the PR head -- the base SHA is absent, so `git diff` against
+        # it exits 128 ("fatal: bad revision"). We fetch the base SHA
+        # explicitly (--depth 1: just that commit, no history) before
+        # running the gate.
+        #
+        # The gate uses a two-dot diff (base..HEAD), not three-dot
+        # (base...HEAD): three-dot needs the merge-base of base and HEAD,
+        # which requires traversing history between them -- impossible in a
+        # shallow clone where both endpoints are present but the ancestry
+        # chain is cut. Two-dot compares the two trees directly (no
+        # merge-base computation) and works in a shallow clone once both
+        # commits are present. For a PR that is up-to-date with its base
+        # (mergeable, the common case) the two are equivalent; for a PR
+        # that is behind, two-dot scans a superset of the PR's own added
+        # lines, which is safe for a corruption gate -- a false positive
+        # would mean the base branch itself has mojibake, which is a real
+        # problem worth surfacing.
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth 1 origin ${{ github.event.pull_request.base.sha }}
+          if ($LASTEXITCODE -ne 0) { throw "git fetch of base SHA failed" }
+          uv run charlie mojibake-check --base ${{ github.event.pull_request.base.sha }}

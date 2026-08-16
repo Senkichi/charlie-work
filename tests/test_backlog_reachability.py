@@ -22,20 +22,49 @@ from charlie_work.workflow import classify_backlog_reachability
 
 
 class FakeGh:
-    """Minimal stub for the one GitHubLike method classify_backlog_reachability
-    calls: issue_list(state=...). Never touches the network."""
+    """Minimal stub for the GitHubLike methods classify_backlog_reachability
+    calls: issue_list(state=...) and, since issue #1110, the blocker-check
+    surface (are_issues_open + the dependency cache that
+    get_github_issue_dependencies reads). Never touches the network."""
 
-    def __init__(self, issues: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        issues: list[dict[str, Any]],
+        *,
+        open_blockers: set[int] | None = None,
+        dependencies: dict[int, list[int]] | None = None,
+    ) -> None:
         self._issues = issues
         self.calls: list[dict[str, Any]] = []
+        # _list_cache is the pass-scoped cache the real GitHubClient uses;
+        # get_github_issue_dependencies checks it before calling gh.run, so
+        # pre-seeding it simulates GitHub-native dependencies without a network
+        # call. Issues not in ``dependencies`` fall through to gh.run -> None
+        # -> [] (fail-open, matching production).
+        self._list_cache: dict[tuple[str, Any], Any] = {}
+        for number, deps in (dependencies or {}).items():
+            self._list_cache[("issue_dependencies", number)] = deps
+        self._open_blockers = open_blockers or set()
 
     def issue_list(self, labels: Any = None, state: Any = None) -> list[dict[str, Any]]:
         self.calls.append({"labels": labels, "state": state})
         return list(self._issues)
 
+    def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
+        return {n for n in issue_numbers if n in self._open_blockers}
 
-def _issue(number: int, names: set[str]) -> dict[str, Any]:
-    return {"number": number, "labels": [{"name": n} for n in names]}
+    def run(
+        self, args: list[str], *, json_output: bool = False, allow_failure: bool = False
+    ) -> Any:
+        # Simulate "GitHub-native dependencies feature not available" —
+        # get_github_issue_dependencies treats None as a transient failure and
+        # returns [] (fail-open). Per-issue deps are injected via the cache
+        # instead, so this is only hit for issues without explicit deps.
+        return None
+
+
+def _issue(number: int, names: set[str], body: str = "") -> dict[str, Any]:
+    return {"number": number, "labels": [{"name": n} for n in names], "body": body}
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +155,7 @@ def test_exclusion_arms_bin_independently_in_precedence_order() -> None:
         + result["terminal_label"]
         + result["active_label"]
         + result["operator_claimed"]
+        + result["blocked_by_open_dependency"]
         + result["dispatchable"]
         == result["open_total"]
     )
@@ -400,6 +430,7 @@ def test_issue_without_number_is_binned_as_unidentified_not_dropped() -> None:
             "terminal_label",
             "active_label",
             "operator_claimed",
+            "blocked_by_open_dependency",
             "unidentified",
             "dispatchable",
         )
@@ -423,4 +454,121 @@ def test_renderer_names_unidentified_and_never_fires_with_empty_reasons() -> Non
     # The specific regression: an alarm that fires naming no cause at all.
     assert "()" not in rendered
     assert "no reason recorded" not in rendered
+    assert rendered.isascii()
+
+
+# ---------------------------------------------------------------------------
+# 10. Issue #1110: dependency-blocked issues must bin as
+#     ``blocked_by_open_dependency``, not ``dispatchable``. The dispatch path
+#     applies a dependency gate (_filter_blocked_issues) that the label-only
+#     _is_dispatchable check does not model. Without this bin, a deliberately
+#     sequenced cohort tail (e.g. #887/#888 blocked by an open #886) was counted
+#     ``dispatchable`` by reachability while being permanently unselectable by
+#     dispatch, producing false dispatch_stale alarms.
+# ---------------------------------------------------------------------------
+
+
+def test_dependency_blocked_issue_bins_as_blocked_not_dispatchable() -> None:
+    # The exact observed scenario from issue #1110: #887 and #888 are
+    # automated-ready, no agent: label, but both bodies declare "Blocked by
+    # #886" and #886 is open. Dispatch correctly skips them; reachability
+    # must not count them as dispatchable.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [
+        _issue(887, {labels.ready}, body="Blocked by #886"),
+        _issue(888, {labels.ready}, body="Blocked by #886"),
+    ]
+    gh = FakeGh(issues, open_blockers={886})
+
+    result = classify_backlog_reachability(gh, config)
+
+    assert result["observed"] is True
+    assert result["open_total"] == 2
+    assert result["dispatchable"] == 0
+    assert result["blocked_by_open_dependency"] == 2
+    assert result["unreachable_examples"]["blocked_by_open_dependency"] == [887, 888]
+    # The bins still partition the backlog.
+    assert (
+        result["missing_ready"]
+        + result["terminal_label"]
+        + result["active_label"]
+        + result["operator_claimed"]
+        + result["blocked_by_open_dependency"]
+        + result["dispatchable"]
+        == result["open_total"]
+    )
+
+
+def test_closed_blocker_issue_still_dispatchable() -> None:
+    # An issue whose declared blocker is CLOSED is not blocked -- the
+    # dependency gate passes it. It must bin as ``dispatchable``, not
+    # ``blocked_by_open_dependency``. This is the counterpart to the test
+    # above: the blocker check must consult open state, not just presence of
+    # a blocker declaration.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [_issue(900, {labels.ready}, body="Blocked by #886")]
+    # 886 is NOT in open_blockers -> are_issues_open returns empty set.
+    gh = FakeGh(issues, open_blockers=set())
+
+    result = classify_backlog_reachability(gh, config)
+
+    assert result["dispatchable"] == 1
+    assert result["blocked_by_open_dependency"] == 0
+
+
+def test_mixed_blocked_and_unblocked_ready_issues() -> None:
+    # A backlog with one blocked and one unblocked ready issue: the unblocked
+    # one bins as ``dispatchable``, the blocked one as
+    # ``blocked_by_open_dependency``. This confirms the blocker check runs
+    # per-issue, not as a blanket flag.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [
+        _issue(887, {labels.ready}, body="Blocked by #886"),
+        _issue(950, {labels.ready}),  # no blockers
+    ]
+    gh = FakeGh(issues, open_blockers={886})
+
+    result = classify_backlog_reachability(gh, config)
+
+    assert result["dispatchable"] == 1
+    assert result["blocked_by_open_dependency"] == 1
+    assert result["unreachable_examples"]["blocked_by_open_dependency"] == [887]
+
+
+def test_github_native_dependency_also_blocks() -> None:
+    # The blocker check unions body-declared blockers with GitHub-native
+    # dependencies (get_github_issue_dependencies). An issue with no body
+    # blocker but a GitHub-native dependency on an open issue must also bin
+    # as ``blocked_by_open_dependency``.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [_issue(960, {labels.ready})]  # no body blocker
+    gh = FakeGh(issues, open_blockers={886}, dependencies={960: [886]})
+
+    result = classify_backlog_reachability(gh, config)
+
+    assert result["dispatchable"] == 0
+    assert result["blocked_by_open_dependency"] == 1
+
+
+def test_renderer_names_blocked_by_open_dependency() -> None:
+    # When all ready issues are dependency-blocked, dispatchable == 0 and the
+    # renderer fires -- naming ``blocked_by_open_dependency`` as the cause
+    # so an operator sees the real reason rather than a label-only mystery.
+    config = OrchestratorConfig()
+    labels = config.labels
+    issues = [
+        _issue(887, {labels.ready}, body="Blocked by #886"),
+        _issue(888, {labels.ready}, body="Blocked by #886"),
+    ]
+    gh = FakeGh(issues, open_blockers={886})
+
+    result = classify_backlog_reachability(gh, config)
+    rendered = cli._render_backlog_reachability(result)
+
+    assert "0 dispatchable" in rendered
+    assert "blocked_by_open_dependency=2" in rendered
     assert rendered.isascii()

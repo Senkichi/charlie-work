@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from collections.abc import Callable
@@ -99,3 +100,28 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     that single knob for suite-wide isolation.
     """
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strip ambient credential env vars so no test's premise depends on what
+    happens to be set on the host.
+
+    The 2026-08-15 host reboot made a User-scope ``MOONSHOT_API_KEY`` visible
+    to the self-hosted CI runner and every fresh shell. Any test that builds
+    an api_worker config without explicitly setting the key (relying on
+    "the key is absent, so preflight falls back to devin-shell") silently
+    changed routing: dispatch went to the api adapter instead of the
+    monkeypatched devin-shell path and hit real ``git worktree add`` calls
+    (``test_dispatch_partitioned_homogeneous_batch_labels_with_single_kind``
+    turned main red).
+
+    The deny-set is derived from the naming convention rather than
+    enumerated: ``api_worker``'s ``api_key_env`` contract names credential
+    variables ``*_API_KEY`` (api_worker.py), so every ambient variable with
+    that suffix is removed. A test that needs a credential sets it explicitly
+    with ``monkeypatch.setenv`` in its own body — autouse fixtures run first,
+    so the per-test value wins.
+    """
+    for name in [key for key in os.environ if key.endswith("_API_KEY")]:
+        monkeypatch.delenv(name, raising=False)

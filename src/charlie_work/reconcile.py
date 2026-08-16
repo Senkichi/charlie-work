@@ -28,16 +28,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .github import (
     GitHubError,
     GitHubLike,
     GraphQLBudgetError,
+    PR_CLOSING_ISSUES_FIELDS,
     _LIST_LIMIT,
     label_names,
     linked_issue_number,
 )
-from .instrumentation import query_events
+from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, transition
 from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
@@ -49,6 +51,7 @@ from .state import (
     append_event,
     is_claim_stale,
     set_throttled_until,
+    utc_now,
     without_review_dispatch_claim,
 )
 from .worktree import (
@@ -86,6 +89,15 @@ class DriftItem:
     # Unused by every other kind.
     throttle_reason: str | None = None
     throttle_adapter_kind: str | None = None
+    # Issue #978: structured "why" for session_failed_relabeled drift items,
+    # so the machine-readable reason is not buried only in the free-text
+    # ``detail`` string. ``reason`` is the canonical path identifier (e.g.
+    # "dead_session_no_open_pr"); ``failure_kind`` is the classifier's
+    # optional refinement (may be None when classification was inconclusive).
+    # Both are threaded into the ``reconcile`` event payload by apply_fixes.
+    # Unused by every other kind.
+    reason: str | None = None
+    failure_kind: str | None = None
 
 
 # State-machine statuses that mean "this issue is in the orchestrator's pipeline".
@@ -1148,6 +1160,8 @@ def detect_drift(
                                             kind="session_failed_relabeled",
                                             issue_number=w.issue_number,
                                             pr_number=None,
+                                            reason="launch_stalled_no_open_pr",
+                                            failure_kind="launch_stalled",
                                             detail=(
                                                 f"issue #{w.issue_number} session launch_stalled "
                                                 f"(hung at shim marker), activity_sources={json.dumps(activity_payload)}, "
@@ -1388,6 +1402,8 @@ def detect_drift(
                                         kind="session_failed_relabeled",
                                         issue_number=w.issue_number,
                                         pr_number=None,
+                                        reason="dead_session_no_open_pr",
+                                        failure_kind=failure_kind,
                                         detail=(
                                             f"issue #{w.issue_number} session died with "
                                             f"{failure_kind or 'unknown failure'}, no open PR, "
@@ -2046,6 +2062,14 @@ def apply_fixes(
                 }
                 if item.issue_number is not None:
                     new_pr_state["issue_number"] = item.issue_number
+                # Issue #747: ``merged_outside_orchestrator`` drift only fires
+                # when ``state_status != "merged"`` (detect_drift, above), so
+                # this is always a genuine non-merged -> merged transition.
+                # Stamp ``merged_at`` so externally-merged entries get the
+                # same timestamp field as fleet-merged ones; existing merged
+                # entries are never back-dated because they never reach here.
+                if existing_pr.get("status") != "merged":
+                    new_pr_state["merged_at"] = utc_now()
                 new_prs[pr_key] = new_pr_state
 
                 if repo_root is not None:
@@ -2410,6 +2434,29 @@ def apply_fixes(
                             )
                             if branch_summary:
                                 salvage_body = f"{salvage_body}\n\n{branch_summary}"
+                            # cw#1263: canonicalize/validate the closing-reference
+                            # line the same way workflow.py's `_open_salvage_pr`
+                            # does, via the shared `closing_reference` module.
+                            # `workflow.py` imports `reconcile.py` (for
+                            # `apply_fixes`/`detect_drift`), so importing
+                            # `workflow._open_salvage_pr` back into this module
+                            # would cycle -- the standalone third module is what
+                            # lets both salvage-body builders share one
+                            # implementation without either importing the other.
+                            closing_ref = validate_closing_reference(
+                                salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
+                            )
+                            salvage_body = closing_ref.body
+                            if closing_ref.changed and state_path is not None:
+                                log_event(
+                                    state_path,
+                                    "pr_closing_ref_rewritten",
+                                    {
+                                        "issue_number": item.issue_number,
+                                        "findings": list(closing_ref.findings),
+                                        "source": "session_unpublished_work_salvaged",
+                                    },
+                                )
                             pr_number = pr_create(
                                 head=item.branch,
                                 base=item.base_branch,
@@ -2418,6 +2465,33 @@ def apply_fixes(
                             )
                         if pr_number is not None:
                             salvage_ok = True
+                            # `pr_number` is falsy (0) under `dry_run`, where no
+                            # real PR was opened -- only probe a real, truthy PR
+                            # number (mirrors workflow.py::_open_salvage_pr).
+                            if pr_number and state_path is not None:
+                                query_ok = True
+                                try:
+                                    pr_view = gh.pr_view(
+                                        pr_number, fields=PR_CLOSING_ISSUES_FIELDS
+                                    )
+                                except Exception:
+                                    pr_view = {}
+                                    query_ok = False
+                                linked_numbers = closing_issues_referenced_numbers(pr_view)
+                                # Only log when the query itself succeeded --
+                                # a transient `gh` failure must not be conflated
+                                # with a genuine unlinked-PR miss (see
+                                # workflow.py::_open_salvage_pr for rationale).
+                                if query_ok and item.issue_number not in linked_numbers:
+                                    log_event(
+                                        state_path,
+                                        "pr_closing_ref_unlinked",
+                                        {
+                                            "issue_number": item.issue_number,
+                                            "pr_number": pr_number,
+                                            "linked_issue_numbers": sorted(linked_numbers),
+                                        },
+                                    )
                         else:
                             salvage_error = "gh pr create failed or returned no PR number"
                     else:
@@ -2462,6 +2536,7 @@ def apply_fixes(
                         kind="session_failed_relabeled",
                         issue_number=item.issue_number,
                         pr_number=None,
+                        reason="salvage_failed_fallback",
                         detail=item.detail,
                         fix_actions=tuple(fix_actions),
                         remove_labels=item.remove_labels,
@@ -2491,22 +2566,34 @@ def apply_fixes(
                         kind=item.kind,
                         issue_number=item.issue_number,
                         pr_number=item.pr_number,
+                        reason=item.reason,
+                        failure_kind=item.failure_kind,
                         detail=item.detail,
                         fix_actions=tuple(fix_actions),
                         remove_labels=item.remove_labels,
                         add_labels=item.add_labels,
                     )
 
+        # Issue #978: thread the structured ``reason``/``failure_kind`` onto
+        # the reconcile event payload so the machine-readable "why" is not
+        # buried only in the free-text ``detail`` string. Only included when
+        # the drift item carries them (session_failed_relabeled kinds); other
+        # kinds leave the payload shape unchanged.
+        reconcile_payload: dict[str, Any] = {
+            "kind": item.kind,
+            "issue_number": item.issue_number,
+            "pr_number": item.pr_number,
+            "fix_actions": list(item.fix_actions),
+            "detail": item.detail,
+        }
+        if item.reason is not None:
+            reconcile_payload["reason"] = item.reason
+        if item.failure_kind is not None:
+            reconcile_payload["failure_kind"] = item.failure_kind
         new_state = append_event(
             new_state,
             "reconcile",
-            {
-                "kind": item.kind,
-                "issue_number": item.issue_number,
-                "pr_number": item.pr_number,
-                "fix_actions": list(item.fix_actions),
-                "detail": item.detail,
-            },
+            reconcile_payload,
             state_path=state_path,
         )
 

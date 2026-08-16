@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 
 from .config import ApiWorkerConfig, OrchestratorConfig
+from .env_sanitize import worker_github_token_findings
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
 from . import layout
@@ -144,21 +145,21 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
         )
 
 
-#  Issue #873 Part 2: the token variable names sanitize_env() strips from
-#  every worker subprocess's environment (issue #502). Mirrored here, not
-#  imported from env_sanitize, so this preflight check touches only its own
-#  module — see _check_worker_github_token's docstring for why.
-_STRIPPED_GH_TOKEN_VARS = (
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_ENTERPRISE_TOKEN",
-    "GITHUB_ENTERPRISE_TOKEN",
-)
+#  Issue #873 Part 2 / #1001: the token variable names and the adapter-path
+#  predicate live in env_sanitize.py now — shared by this preflight check and
+#  the dispatch gate in workflow.py so they cannot drift (issue #1001). The
+#  pre-#1001 private _STRIPPED_GH_TOKEN_VARS copy was deleted when
+#  worker_github_token_findings became the single predicate.
 
 
 def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
     """Flag a dispatch-enabled adapter with no scoped GitHub token configured
     for its workers (issue #873 Part 2).
+
+    Delegates to :func:`env_sanitize.worker_github_token_findings` — the single
+    predicate shared with the dispatch gate in ``workflow.py:_dispatch_impl``
+    (issue #1001) — so the doctor preflight and the dispatch gate cannot
+    disagree about whether the fleet is healthy.
 
     Background: ``env_sanitize.sanitize_env`` (issue #502) is a deliberate
     security control — it strips ``GH_TOKEN``/``GITHUB_TOKEN`` (and the GHES
@@ -228,59 +229,11 @@ def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
     severity-independent ``failed`` list — the finding is exactly as visible
     at ``warning``, it just doesn't block).
     """
-    adapter = config.devin.adapter
-    checks: list[tuple[str, str, str, dict[str, str]]] = []
-    if adapter == "devin-shell":
-        checks.append(
-            ("worker GitHub token", adapter, "devin.worker_env", config.devin.worker_env)
-        )
-    elif adapter in ("claude-code", "api"):
-        checks.append(
-            (
-                "worker GitHub token",
-                adapter,
-                "claude_code.worker_env",
-                config.claude_code.worker_env,
-            )
-        )
-
-    claude_code_reachable_via_routing = config.api_worker.enabled or config.rescue.enabled
-    if claude_code_reachable_via_routing and adapter not in ("claude-code", "api"):
-        checks.append(
-            (
-                "worker GitHub token (claude-code-routed)",
-                "api/rescue",
-                "claude_code.worker_env",
-                config.claude_code.worker_env,
-            )
-        )
-
-    for name, context, config_key, worker_env in checks:
-        configured_var = next(
-            (var for var in _STRIPPED_GH_TOKEN_VARS if worker_env.get(var)), None
-        )
-        if configured_var is not None:
-            add(
-                name,
-                True,
-                f"{config_key} configures {configured_var} — restores a scoped "
-                "token for worker `gh` calls after sanitize_env strips the "
-                "orchestrator's own token (issue #502/#873)",
-                severity="warning",
-            )
-            continue
-
+    for finding in worker_github_token_findings(config):
         add(
-            name,
-            False,
-            f"{config_key} has no GH_TOKEN/GITHUB_TOKEN (or GHES equivalent) — "
-            "sanitize_env (issue #502) strips the orchestrator's token from "
-            "every worker and points GH_CONFIG_DIR at an empty directory, so "
-            f"workers dispatched via the `{context}` adapter right now have no "
-            "sanctioned credential for `gh` and will stall or silently fall "
-            "back to an ambient Git Credential Manager entry (issue #873). Set "
-            f"{config_key}={{'GH_TOKEN': '<scoped-PAT>'}} to fix — never widen "
-            "sanitize_env itself to pass the orchestrator's token through.",
+            finding.name,
+            finding.ok,
+            finding.detail,
             severity="warning",
         )
 

@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work.instrumentation import (
+    EXPECTED_OPERATIONAL_KINDS,
     _LEVEL_BY_KIND,
     close_db,
     correlation_context,
@@ -541,6 +542,9 @@ def test_record_loop_pass(tmp_path: Path) -> None:
         error_count=0,
         merge_count=2,
         review_count=3,
+        sink_population=23,
+        sink_arrivals=5,
+        sink_clears=2,
     )
 
     from charlie_work.instrumentation import _get_db
@@ -558,6 +562,84 @@ def test_record_loop_pass(tmp_path: Path) -> None:
     assert row[5] == 0  # error_count
     assert row[6] == 2  # merge_count
     assert row[7] == 3  # review_count
+    # Issue #1083: sink-metric columns appended at the end.
+    assert row[8] == 23  # sink_population
+    assert row[9] == 5  # sink_arrivals
+    assert row[10] == 2  # sink_clears
+
+
+def test_loop_passes_sink_columns_migrated_on_old_db(tmp_path: Path) -> None:
+    """Issue #1083: a pre-existing events.db gains the sink-metric columns.
+
+    A database created before #1083 has the 8-column ``loop_passes`` schema
+    and ``user_version = 1``. Opening it through ``_get_db`` must ALTER it
+    forward to the 11-column schema and bump ``user_version`` to 2, without
+    losing the pre-existing row. Re-opening must not re-run the migration.
+    """
+    import sqlite3
+
+    from charlie_work.instrumentation import _get_db, close_db
+
+    state_path = tmp_path / "state.json"
+    db_path = state_path.parent / "events.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build a pre-#1083 database: old loop_passes schema, user_version=1,
+    # with one already-recorded pass.
+    pre = sqlite3.connect(str(db_path))
+    pre.executescript(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+            repo TEXT, correlation_id TEXT, pr_number INTEGER,
+            issue_number INTEGER, level TEXT DEFAULT 'info'
+        );
+        CREATE TABLE loop_passes (
+            correlation_id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL, completed_at TEXT,
+            ok INTEGER, elapsed_seconds REAL,
+            error_count INTEGER DEFAULT 0,
+            merge_count INTEGER DEFAULT 0,
+            review_count INTEGER DEFAULT 0
+        );
+        """
+    )
+    pre.execute(
+        """INSERT INTO loop_passes
+           (correlation_id, started_at, completed_at, ok, elapsed_seconds,
+            error_count, merge_count, review_count)
+           VALUES (?, ?, ?, 1, 12.0, 0, 1, 0)""",
+        ("cid-old", "2025-01-01T00:00:00Z", "2025-01-01T00:00:12Z"),
+    )
+    pre.execute("PRAGMA user_version = 1")
+    pre.commit()
+    pre.close()
+
+    # First access triggers the v2 migration.
+    conn = _get_db(state_path)
+    assert conn is not None
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(loop_passes)")}
+    assert "sink_population" in cols
+    assert "sink_arrivals" in cols
+    assert "sink_clears" in cols
+    # The pre-existing row is preserved and the new columns default to 0.
+    row = conn.execute(
+        "SELECT * FROM loop_passes WHERE correlation_id = ?", ("cid-old",)
+    ).fetchone()
+    assert row is not None
+    assert row["merge_count"] == 1
+    assert row["sink_population"] == 0
+    assert row["sink_arrivals"] == 0
+    assert row["sink_clears"] == 0
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    assert version == 2
+
+    # Re-opening must not re-run the migration (user_version guard).
+    close_db(state_path)
+    conn2 = _get_db(state_path)
+    assert conn2 is not None
+    assert conn2.execute("PRAGMA user_version").fetchone()[0] == 2
 
 
 def test_jsonl_migration(tmp_path: Path) -> None:
@@ -1482,6 +1564,24 @@ def test_event_kind_registry_exhaustive() -> None:
         "site -- remove it or update it to match the current source: "
         + "; ".join(f"{site.path} in {site.scope}(): `{site.source}`" for site in stale)
     )
+
+
+def test_expected_operational_kinds_are_all_registered_warnings() -> None:
+    """#1271: bucketing only makes sense for warnings.
+
+    Every member of ``EXPECTED_OPERATIONAL_KINDS`` must be registered in
+    ``_LEVEL_BY_KIND`` at ``"warning"`` -- an info or error kind (or an
+    unregistered one) accidentally added to the set would silently vanish
+    from ``check_error_events``'s coverage or from the info stream, since
+    ``check_warning_events`` only ever queries ``level = 'warning'`` rows.
+    """
+    assert EXPECTED_OPERATIONAL_KINDS, "the set must not be empty"
+    for kind in EXPECTED_OPERATIONAL_KINDS:
+        assert kind in _LEVEL_BY_KIND, f"{kind} is not registered in _LEVEL_BY_KIND"
+        assert _LEVEL_BY_KIND[kind] == "warning", (
+            f"{kind} is registered at level {_LEVEL_BY_KIND[kind]!r}, not 'warning' -- "
+            "bucketing only makes sense for warning-level kinds"
+        )
 
 
 def test_self_deploy_event_kind_only_returns_registered_kinds() -> None:
