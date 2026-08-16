@@ -18772,12 +18772,22 @@ def test_dispatch_claim_site_has_no_redundant_ci_status_check() -> None:
     ``statusCheckRollup``. Zero hits confirmed by recon before this item's
     branch was added; this pins that finding down so a future PR that adds a
     second check here fails CI instead of silently duplicating the gate.
+
+    issue #1283 Phase A: ``_is_review_dispatchable`` and
+    ``_select_review_dispatch_candidates`` moved to
+    ``charlie_work/dispatch_selection.py``; only ``dispatch_reviews`` (an
+    ``OrchestratorApp`` method) stays in workflow.py. Both files are
+    AST-parsed and their ``FunctionDef``/``AsyncFunctionDef`` tables unioned
+    before the target check below, so the probe keeps covering the same
+    three call sites across the split instead of silently losing two of
+    them the moment they became import lines in workflow.py.
     """
     import ast
 
-    src_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
-    source = src_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(src_path))
+    workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
+    dispatch_selection_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
+    )
 
     targets = {
         "dispatch_reviews",
@@ -18795,11 +18805,14 @@ def test_dispatch_claim_site_has_no_redundant_ci_status_check() -> None:
     )
 
     found: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in targets:
-            segment = ast.get_source_segment(source, node)
-            assert segment is not None, f"could not extract source for {node.name}"
-            found[node.name] = segment
+    for src_path in (workflow_path, dispatch_selection_path):
+        source = src_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(src_path))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in targets:
+                segment = ast.get_source_segment(source, node)
+                assert segment is not None, f"could not extract source for {node.name}"
+                found[node.name] = segment
 
     assert found.keys() == targets, (
         f"expected to find {sorted(targets)}, found {sorted(found)} -- "
@@ -42877,19 +42890,54 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     # Escalated paths now consolidate on _escalate_issue and pass redispatch_at
     # through issue_extra, so direct entry["redispatch_at"] assignments only
     # remain in the non-escalated branches below.
+    #
+    # issue #1283 Phase A hazard (not in the recon's original list -- found by
+    # the full-suite run for this split): AST-based real-assignment count, not
+    # a raw substring count. `_windowed_redispatch_at`'s own docstring quotes
+    # ``entry["redispatch_at"]`` in prose ("Normalizes ``entry["redispatch_at"]``
+    # to a list of strings..."), and `.count()` over raw source text counted
+    # that quote as a 5th "call site" for as long as the docstring lived in
+    # workflow.py (confirmed: pre-split workflow.py already had exactly 4 real
+    # assignments + this 1 docstring quote = 5 -- the miscounting predates
+    # this extraction). Moving the function (and its docstring) to
+    # dispatch_selection.py dropped the naive count to 4 with zero change to
+    # any real write site -- a false regression signal, the opposite failure
+    # mode from AC7's hazard test but the same root cause (name/text search
+    # over source that doesn't distinguish code from prose). Both files are
+    # scanned and summed via real ast.Assign nodes so neither a docstring
+    # quote nor a future extraction of one of the three named call sites can
+    # produce a false pass or a false failure here.
+    import ast
 
-    import charlie_work.workflow as workflow_module
-    import inspect
+    workflow_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
+    dispatch_selection_path = (
+        Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
+    )
 
-    workflow_source = inspect.getsource(workflow_module)
+    def _count_redispatch_at_assignments(path: Path) -> int:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        count = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "entry"
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == "redispatch_at"
+                ):
+                    count += 1
+        return count
 
-    # Count direct redispatch_at assignments to entry. After issue #750, the
-    # escalated call sites all route through _escalate_issue, so this count
-    # only covers non-escalated branches. Any unexpected increase means a new
-    # call site is writing redispatch_at.
-    redispatch_assignments = workflow_source.count('entry["redispatch_at"]')
-    assert redispatch_assignments == 5, (
-        f"Expected 5 redispatch_at assignments, found {redispatch_assignments}"
+    # Any unexpected increase means a new call site is writing redispatch_at.
+    redispatch_assignments = _count_redispatch_at_assignments(
+        workflow_path
+    ) + _count_redispatch_at_assignments(dispatch_selection_path)
+    assert redispatch_assignments == 4, (
+        'Expected 4 real entry["redispatch_at"] assignment statements across '
+        f"workflow.py and dispatch_selection.py, found {redispatch_assignments}"
     )
 
 
