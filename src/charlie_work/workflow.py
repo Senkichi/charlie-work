@@ -12158,6 +12158,24 @@ class OrchestratorApp:
                 required_changes = _required_changes_from_checks(
                     checks, verdict.failed_required_checks, self.gh.check_run_annotations
                 )
+                # Issue #1258: dedicated provenance for the CI-red
+                # short-circuit -- record_review() itself only logs a
+                # decision-agnostic "record_review" event, with nothing
+                # naming this as the deterministic janitor gate rather than
+                # a human/LLM verdict. Additive: the short-circuit's own
+                # return/routing above is unchanged.
+                log_event(
+                    self.paths.state_file,
+                    "review_dispatch_skipped_ci_red",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "failed_required_checks": list(verdict.failed_required_checks),
+                        "co_occurring_failures": [],
+                        "co_occurring": False,
+                    },
+                    repo=self.repo_root.name,
+                )
                 return self.record_review(
                     pr_number,
                     "request_changes",
@@ -12241,6 +12259,110 @@ class OrchestratorApp:
                 # None: a rework for this issue is already pending, so there is
                 # nothing to route -- fall through to the janitor_blocked
                 # bookkeeping below and wait for the pending cycle.
+
+            # Issue #1258: a required check can fail alongside a janitor
+            # failure that is neither the sole failure (is_check_failure_block
+            # above already routes that) nor a bare merge conflict (already
+            # routed above via _route_janitor_gate_failure_to_rework). That
+            # combination used to fall straight through to the passive
+            # janitor_blocked bookkeeping below -- neither reviewed nor
+            # routed to rework, silently re-logging the same failure set
+            # forever (the same "zero readers" dead end issue #765/#776 fixed
+            # for the merge-conflict/no-op-rework cases). Route it through
+            # the same record_review(request_changes) machinery the
+            # sole-failure short-circuit above uses, decision-agnostic, with
+            # required_changes/summary naming BOTH the failing check(s) and
+            # the co-occurring janitor failure(s) so a rework worker sees the
+            # whole picture in one pass.
+            #
+            # is_merge_conflict_block is excluded: without it, a
+            # conflict+red-check PR whose merge-conflict rework is already
+            # pending (routed returned None just above) would ALSO get
+            # routed through here -- a double-dispatch regression, not a
+            # fix.
+            #
+            # verdict.is_no_op_rework (the raw flag, NOT is_no_op_rework_block)
+            # is also excluded, and this exclusion is load-bearing, not
+            # redundant with is_no_op_rework_block above: is_no_op_rework_block
+            # itself structurally requires `not verdict.failed_required_checks`
+            # and so can never be True here -- but the underlying
+            # `verdict.is_no_op_rework` flag CAN still be True with a
+            # co-occurring required-check failure (same diff pushed again
+            # while CI is still red), and that exact combination is
+            # test_janitor_required_check_failure_noop_does_not_reroute's
+            # issue #376 invariant: re-requesting a rework whose only signal
+            # is "same diff as last time" is not productive while CI is
+            # still red, and changing that is out of this fix's scope. A
+            # PR in that state still stalls in janitor_blocked below after
+            # this diff -- an accepted carve-out, not an oversight.
+            #
+            # verdict.infra_definitive_failed is also excluded: an
+            # infra-failed required check (CANCELLED/TIMED_OUT job-level
+            # kill, issue #841) co-occurring with a genuine required-check
+            # failure has its OWN dedicated remediation path (infra-rerun +
+            # escalation, above) that this branch must not shadow or
+            # double-dispatch against -- there is no code-fix rework for an
+            # infra kill, so routing it through record_review(request_
+            # changes) as if a code push could fix it would be a
+            # mis-classification, not a fix.
+            # test_janitor_mixed_genuine_failure_and_infra_failure_routes_to_rework_not_infra_rerun
+            # (issue #847, pre-existing) pins this exact combination falling
+            # through to janitor_blocked untouched, unchanged by this diff.
+            # infra_definitive_failed is populated here whenever an
+            # infra_failed required check co-occurs with a genuine
+            # failed_required_checks entry, regardless of whether the infra
+            # check's run id is parseable: is_infra_failure_block requires
+            # `not failed_required_checks`, so it is always False in that
+            # combination, which forces classify_infra_failures'
+            # record_attempts=False path -- every infra_failed name lands in
+            # definitive_failed (never rerun_run_ids) on this pass. Checking
+            # infra_definitive_failed alone is therefore sufficient; it is
+            # never empty here while infra_rerun_run_ids is non-empty.
+            is_co_occurring_check_failure_block = (
+                bool(verdict.failed_required_checks)
+                and not verdict.is_check_failure_block
+                and not is_merge_conflict_block
+                and not verdict.is_no_op_rework
+                and not verdict.infra_definitive_failed
+            )
+            if issue_number is not None and is_co_occurring_check_failure_block:
+                transition(self.gh, self.config.labels, issue_number, "review_started")
+                # verdict.failures always ends with the "Required check(s)
+                # failed: ..." message when failed_required_checks is
+                # truthy (janitor.run_janitor appends it last, nothing after
+                # it) -- so failures[:-1] is exactly the co-occurring
+                # janitor failure text(s), independent of which check(s)
+                # _check_body/_check_title_conventional/etc. produced.
+                co_occurring_failures = list(verdict.failures[:-1])
+                summary = (
+                    f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix. "
+                    f"Also blocked by: {'; '.join(co_occurring_failures)}"
+                )
+                required_changes = (
+                    _required_changes_from_checks(
+                        checks, verdict.failed_required_checks, self.gh.check_run_annotations
+                    )
+                    + co_occurring_failures
+                )
+                log_event(
+                    self.paths.state_file,
+                    "review_dispatch_skipped_ci_red",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "failed_required_checks": list(verdict.failed_required_checks),
+                        "co_occurring_failures": co_occurring_failures,
+                        "co_occurring": True,
+                    },
+                    repo=self.repo_root.name,
+                )
+                return self.record_review(
+                    pr_number,
+                    "request_changes",
+                    summary=summary,
+                    reviewed_head=pr.get("headRefOid"),
+                    required_changes=required_changes,
+                )
 
             # See _detect_ci_run_never_created for why this check exists
             # (job-cannon measured 11 PRs stuck 4+ days behind an ambiguous
@@ -14201,8 +14323,8 @@ class OrchestratorApp:
         # empty (zero-file diff vs base) must not burn a paid reviewer
         # session reviewing nothing. The packet build (review()) already
         # fetches and writes diff.patch; an empty patch is the signal. Skip
-        # dispatch for these PRs and emit review_skipped_empty_diff instead
-        # of claiming. review_dispatch_attempt_count is NOT incremented --
+        # dispatch for these PRs and emit review_dispatch_skipped_empty_diff
+        # instead of claiming. review_dispatch_attempt_count is NOT incremented --
         # an empty diff is not a review attempt and must not walk toward
         # escalation. Do not auto-close the PR from this path; closing is a
         # separate judgment (the #1221 fix owns the duplicate-PR lifecycle).
@@ -14225,7 +14347,7 @@ class OrchestratorApp:
                 for pr_number in skipped_empty_diff:
                     state = self._record_event(
                         state,
-                        "review_skipped_empty_diff",
+                        "review_dispatch_skipped_empty_diff",
                         {
                             "pr_number": pr_number,
                             "issue_number": skipped_empty_diff_issues.get(pr_number),
