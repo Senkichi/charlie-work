@@ -262,6 +262,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "review_dispatch_lifecycle_reaped": "warning",
         "review_packet_template_stale": "warning",
         "review_quota_exhausted": "warning",
+        # Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+        # was skipped before claiming a paid reviewer session. Warning, not
+        # info: an empty diff is a symptom of an upstream bug (e.g. #1221's
+        # vestigial duplicate PRs), not a routine dispatch outcome. A
+        # repeating burst on one PR is the signal that a salvage/duplicate
+        # path keeps producing zero-delta PRs.
+        "review_skipped_empty_diff": "warning",
         # The stale-claim recovery sweep (issue #487's "never claimed/dispatched"
         # path) skipped a PR without acting on it -- prompt_path was missing from
         # state or the file it names no longer exists on disk. Warning, not info:

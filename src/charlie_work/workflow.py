@@ -13597,16 +13597,28 @@ class OrchestratorApp:
                 limit,
                 probe_mode_dry,
             )
+            # Issue #1251: mirror the real path's empty-diff pre-flight gate
+            # in the dry-run preview so the two cannot diverge. Read-only:
+            # no events emitted, no state mutation.
+            dry_selected: list[dict[str, Any]] = []
+            dry_skipped_empty_diff: list[int] = []
+            for c in selection.selected:
+                diff_text = self._read_packet_diff(c["pr"])
+                if diff_text is not None and not diff_text.strip():
+                    dry_skipped_empty_diff.append(c["pr"])
+                else:
+                    dry_selected.append(c)
             return CommandResult(
                 True,
-                f"dry-run: would dispatch {len(selection.selected)} reviewer(s)",
+                f"dry-run: would dispatch {len(dry_selected)} reviewer(s)",
                 {
-                    "selected_count": len(selection.selected),
-                    "attempted_count": len(selection.selected),
+                    "selected_count": len(dry_selected),
+                    "attempted_count": len(dry_selected),
                     "failed_count": 0,
                     "launched_count": 0,
-                    "deferred_count": len(all_candidates) - len(selection.selected),
+                    "deferred_count": len(all_candidates) - len(dry_selected),
                     "escalated_skipped": selection.escalated_skipped,
+                    "skipped_empty_diff": dry_skipped_empty_diff,
                     "merge_conflict_routed": [c["pr"] for c in selection.merge_conflict_routed],
                     "rescue_marked_excluded": [c["pr"] for c in rescue_marked_dry],
                     "recorded_verdicts": recorded_verdicts,
@@ -13814,6 +13826,43 @@ class OrchestratorApp:
         dispatchable = selection.dispatchable
         local_cap = selection.local_cap
         selected = selection.selected
+
+        # Issue #1251: pre-flight empty-diff gate. A PR whose diff.patch is
+        # empty (zero-file diff vs base) must not burn a paid reviewer
+        # session reviewing nothing. The packet build (review()) already
+        # fetches and writes diff.patch; an empty patch is the signal. Skip
+        # dispatch for these PRs and emit review_skipped_empty_diff instead
+        # of claiming. review_dispatch_attempt_count is NOT incremented --
+        # an empty diff is not a review attempt and must not walk toward
+        # escalation. Do not auto-close the PR from this path; closing is a
+        # separate judgment (the #1221 fix owns the duplicate-PR lifecycle).
+        # A missing diff.patch is NOT treated as empty -- that is a missing
+        # packet (a different problem), not a zero-delta PR.
+        skipped_empty_diff: list[int] = []
+        skipped_empty_diff_issues: dict[int, int | None] = {}
+        selected_with_diff: list[dict[str, Any]] = []
+        for c in selected:
+            diff_text = self._read_packet_diff(c["pr"])
+            if diff_text is not None and not diff_text.strip():
+                skipped_empty_diff.append(c["pr"])
+                skipped_empty_diff_issues[c["pr"]] = c.get("issue")
+            else:
+                selected_with_diff.append(c)
+        selected = selected_with_diff
+        if skipped_empty_diff:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for pr_number in skipped_empty_diff:
+                    state = self._record_event(
+                        state,
+                        "review_skipped_empty_diff",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": skipped_empty_diff_issues.get(pr_number),
+                        },
+                        level="warning",
+                    )
+                save_state(self.paths.state_file, state)
 
         # Escalate PRs whose dispatch attempt count has reached the cap.
         # These PRs are stuck (every reviewer died without a verdict) and
@@ -14293,6 +14342,7 @@ class OrchestratorApp:
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
             "escalated_skipped": escalated_skipped,
+            "skipped_empty_diff": skipped_empty_diff,
             "merge_conflict_results": merge_conflict_results,
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
