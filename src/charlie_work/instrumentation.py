@@ -238,6 +238,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "cross_family_regen_not_reached": "warning",
         "dead_dispatched_worker_reaped": "warning",
         "deescalation_cap_exhausted": "warning",
+        # Issue #1000: a path:line citation in a dispatch-ready issue no longer
+        # matches the working tree (file renamed/deleted, line out of range, or
+        # blank). Warning, not error: dispatch is not gated on drift -- the flag
+        # comment is the signal, not a hold -- but a repeating burst on one issue
+        # means its citations keep rotting faster than anyone corrects them.
+        "dispatch_citation_drift_flagged": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",
         "dispatch_skip_blocked": "warning",

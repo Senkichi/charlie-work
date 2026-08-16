@@ -43,6 +43,12 @@ from .checks import (
     _is_failing_run,
     summarize_checks,
 )
+from .citation_check import (
+    CitationVerdict,
+    drift_fingerprint as citation_drift_fingerprint,
+    drifted_verdicts as drifted_citation_verdicts,
+    verify_citations,
+)
 from .config import (
     AutoMergeConfig,
     CrossFamilyConfig,
@@ -58,7 +64,7 @@ from . import layout
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
-from .subprocess_runner import no_console_window_kwargs
+from .subprocess_runner import no_console_window_kwargs, run_captured
 from .cross_family import (
     CrossFamilyResult,
     LEGACY_VACUOUS_SUMMARY,
@@ -10653,6 +10659,11 @@ class OrchestratorApp:
         adapter_choices: dict[int, AdapterChoice] = {}
         api_enabled = self.config.api_worker.enabled
         routing_inputs = self._routing_inputs() if api_enabled else None
+        # Issue #1000: per-issue citation-drift verdicts and the fingerprint that
+        # dedups the flag-comment across passes. Populated in the loop below;
+        # consumed in the second state-lock section to stamp the issue record and
+        # emit one ``dispatch_citation_drift_flagged`` event per drift change.
+        citation_drift_stamps: dict[int, tuple[str, list[CitationVerdict]]] = {}
         # Issue #1010: pre-flight cross-repo gate. Issues whose referenced
         # file paths are all absent from the target repo are escalated to
         # human-needed instead of dispatching a worker that will wander to a
@@ -10686,6 +10697,18 @@ class OrchestratorApp:
                     template = self.config.api_worker.worker_template
 
             prompt_path = self._write_worker_prompt(full_issue, template=template)
+
+            # Issue #1000: verify path:line citations in the issue body against
+            # the working tree before a worker is sent to them. Drift is flagged
+            # (a comment on the issue, which the worker sees via $issue_comments)
+            # rather than auto-edited -- the correction needs judgment. The flag
+            # is deduped by fingerprint so a still-stale issue is not re-commented
+            # every pass, and a newly-stale citation re-alerts. Non-blocking: a
+            # verification failure never aborts dispatch, and dispatch itself is
+            # not gated on drift -- the comment is the signal, not a hold.
+            citation_drift_stamps.update(
+                self._check_issue_citations(issue_number, full_issue, previous_entries)
+            )
 
             # Check if this is a dead-worker recovery: the issue has a previous
             # dispatch record with the same branch name (i.e., our own crashed attempt)
@@ -10904,6 +10927,42 @@ class OrchestratorApp:
                     if result and result.pid is not None:
                         entry["worker_pid"] = result.pid
                         entry["worker_process_start_time"] = result.process_start_time
+                # Issue #1000: stamp the citation-drift fingerprint computed in
+                # the outside-lock loop. The comment was already posted there
+                # (best-effort); this persists the dedup marker so a still-stale
+                # issue is not re-commented next pass, and emits one event per
+                # drift change. ``citation_drift_flagged_at`` records the last
+                # time drift was observed, not the first -- it moves with every
+                # newly-detected drift state, matching the fingerprint's
+                # re-alert semantics.
+                drift_stamp = citation_drift_stamps.get(request.issue_number)
+                if drift_stamp is not None:
+                    fp, drift_verdicts = drift_stamp
+                    entry["citation_drift_fingerprint"] = fp
+                    if fp:
+                        entry["citation_drift_flagged_at"] = utc_now()
+                        state = self._record_event(
+                            state,
+                            "dispatch_citation_drift_flagged",
+                            {
+                                "issue": request.issue_number,
+                                "drifted_citations": [
+                                    {
+                                        "citation": v.citation.raw,
+                                        "path": v.citation.path,
+                                        "line": v.citation.line,
+                                        "end_line": v.citation.end_line,
+                                        "status": v.status.value,
+                                    }
+                                    for v in drift_verdicts
+                                ],
+                            },
+                        )
+                    else:
+                        # Drift resolved since the last pass: clear the marker
+                        # so a future regression re-alerts. No event -- the
+                        # interesting transition is into drift, not out of it.
+                        entry.pop("citation_drift_flagged_at", None)
                 state["issues"][str(request.issue_number)] = entry
                 # Issue #482: record the adapter choice (including fallback
                 # choices) into adapter_history so every routing decision is
@@ -25229,6 +25288,117 @@ class OrchestratorApp:
         try:
             return diff_path.read_text(encoding="utf-8")
         except OSError:
+            return None
+
+    def _check_issue_citations(
+        self,
+        issue_number: int,
+        full_issue: dict[str, Any],
+        previous_entries: dict[int, dict[str, Any]],
+    ) -> dict[int, tuple[str, list[CitationVerdict]]]:
+        """Verify ``path:line`` citations in ``full_issue``'s body (issue #1000).
+
+        Returns ``{issue_number: (fingerprint, drifted_verdicts)}`` when the
+        drift fingerprint changed since the last pass (including a change to
+        empty when drift resolved), and ``{}`` otherwise -- the caller only
+        stamps/emit-vents on a change, so an unchanged-stale issue is not
+        re-commented every pass. When drift is newly detected a flag comment is
+        posted on the issue (best-effort; a failure is logged and swallowed so
+        it can never abort dispatch). The comment is visible to the dispatched
+        worker through ``$issue_comments`` (issue #872), which is the point: a
+        worker that sees "these line numbers have drifted, grep for the symbol"
+        is not silently misled onto unrelated code.
+
+        This is the "cheap check" backstop. It catches coordinate drift
+        (file missing / out of range / blank line); it does not catch in-range
+        content drift, which the filing convention (``CONTRIBUTING.md``) is the
+        durable fix for. See ``citation_check`` for the full rationale.
+        """
+        body = str(full_issue.get("body") or "")
+        if not body.strip():
+            return {}
+        try:
+            verdicts = verify_citations(body, self.repo_root)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "citation_check failed issue=%d", issue_number, exc_info=True
+            )
+            return {}
+        drifted = drifted_citation_verdicts(verdicts)
+        new_fp = citation_drift_fingerprint(verdicts)
+        prev_entry = previous_entries.get(issue_number, {})
+        prev_fp = prev_entry.get("citation_drift_fingerprint")
+        # ``None`` (never stamped) and "" (no drift) both mean "no current drift
+        # marker" for the comparison; treat them as equal so the first pass on a
+        # clean issue does not stamp an empty fingerprint as a "change".
+        if (prev_fp or "") == new_fp:
+            return {}
+        if new_fp:
+            self._post_citation_drift_comment(issue_number, drifted)
+        return {issue_number: (new_fp, drifted)}
+
+    def _post_citation_drift_comment(
+        self, issue_number: int, drifted: list[CitationVerdict]
+    ) -> None:
+        """Post a best-effort flag comment listing drifted citations (issue #1000).
+
+        Never raises: a comment-posting failure is logged and swallowed so it
+        cannot abort the dispatch pass. The comment is stamped with the current
+        ``HEAD`` sha (the commit the check ran against) per the issue's
+        recommendation 2, so a reader can tell a drifted citation from one that
+        was always wrong.
+        """
+        head_sha = self._read_head_sha_best_effort()
+        lines = [
+            f"{ORCHESTRATOR_COMMENT_MARKER}",
+            "",
+            "## Citation drift detected (issue #1000)",
+            "",
+            "One or more ``path:line`` citations in this issue no longer match the"
+            " working tree. A worker reading the bare line number would land on"
+            " unrelated code and may infer the defect was already fixed. **Grep for"
+            " the cited symbol or surrounding context instead of trusting the line"
+            " number**, and consider re-filing with a symbol citation (see"
+            ' ``CONTRIBUTING.md`` -- "Citing code in issues").',
+            "",
+        ]
+        if head_sha:
+            lines.append(f"Verified against `HEAD` = `{head_sha}`.")
+            lines.append("")
+        lines.append("| citation | status |")
+        lines.append("|---|---|")
+        for v in drifted:
+            status_cell = v.status.value
+            if v.resolved_path:
+                # Surface where the file actually moved to for STALE_PREFIX
+                # verdicts so the worker can grep in the right place.
+                resolved_display = v.resolved_path.replace("\\", "/")
+                status_cell = f"{status_cell} (now at `{resolved_display}`)"
+            lines.append(f"| `{v.citation.raw}` | {status_cell} |")
+        body = "\n".join(lines)
+        issue_dir = self.paths.issues / f"issue-{issue_number}"
+        try:
+            issue_dir.mkdir(parents=True, exist_ok=True)
+            body_path = issue_dir / "citation-drift-comment.md"
+            body_path.write_text(body, encoding="utf-8")
+            self.gh.issue_comment(issue_number, body_path)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "citation drift comment post failed issue=%d", issue_number, exc_info=True
+            )
+
+    def _read_head_sha_best_effort(self) -> str | None:
+        """Return the current ``HEAD`` sha of ``repo_root``, or ``None``."""
+        try:
+            res = run_captured(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.repo_root,
+                timeout_seconds=15,
+            )
+            if not res.ok:
+                return None
+            return res.stdout.strip() or None
+        except Exception:
             return None
 
     def _comment_pr(self, pr_number: int, summary: str) -> None:
