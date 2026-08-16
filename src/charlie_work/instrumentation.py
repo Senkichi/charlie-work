@@ -291,6 +291,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # skip was silent, so a repeating burst is the only signal that recovery
         # kept giving up rather than the PR not needing recovery.
         "review_stale_claim_recovery_skipped": "warning",
+        # Issue #736: the stranded-verdict reconciliation sweep found an
+        # on-disk decision but ``record_review`` refused to ingest it (e.g.
+        # the #467/#1072 stale-head guard fired). Warning, not error: the
+        # sweep itself is not broken, it correctly declined a verdict it
+        # could not safely apply, and the PR is left for a fresh review
+        # dispatch. Sibling to the success case ``review_verdict_reconciled``,
+        # emitted from the same call site with an explicit ``level="warning"``.
+        "review_verdict_reconcile_failed": "warning",
         "rework_issue_fetch_skipped": "warning",
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
@@ -415,6 +423,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "review_dispatch": "info",
         "review_dispatch_claim": "info",
         "review_packet": "info",
+        # Issue #736: the stranded-verdict reconciliation sweep found an
+        # on-disk decision that state never ingested (state write lost, but
+        # the packet head still matches live) and successfully replayed it
+        # through ``record_review``. Info, not warning: this is the sweep
+        # doing its job -- recovering a verdict that was always valid, just
+        # never applied. The failure case is the sibling
+        # ``review_verdict_reconcile_failed``, emitted from the same call
+        # site at warning level.
+        "review_verdict_reconciled": "info",
         "rework_already_pushed": "info",
         "rework_brief_regenerated": "info",
         "runner_allocation": "info",
