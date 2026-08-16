@@ -284,6 +284,14 @@ NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 # enforcing agreement between them, which is the exact drift this module
 # exists to prevent. If a future consumer inside the package needs that path,
 # add the constant then and update the script to match in the same change.
+#
+# ``charlie_work.event_kinds`` (#1271) is the one narrow, deliberate
+# exception to "the script cannot import this package": it is a genuine
+# leaf module (stdlib-only, no further imports) built specifically so
+# ``heartbeat_check.py`` can share a constant with the rest of the package
+# without reaching ``layout`` or anything ``ci_fleet``-reachable like
+# ``instrumentation``. It is not a precedent for adding more constants here
+# for the script to import — see ``scripts/README.md``.
 
 #: ``*_FILENAME`` constants deliberately *excluded* from Rule 1 enforcement.
 #:
