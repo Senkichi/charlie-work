@@ -13264,13 +13264,6 @@ class OrchestratorApp:
             # verdict ingestion.
             if pr_status in ("merged", "closed"):
                 continue
-            # Skip if state already carries a completed decision -- the
-            # verdict was already ingested. This covers both the normal case
-            # (decision matches the file) and the case where a later verdict
-            # superseded the file.
-            recorded_decision = pr_state.get("decision")
-            if recorded_decision in ("approved", "request_changes", "blocked"):
-                continue
             decision_path_str = pr_state.get("decision_path")
             if not decision_path_str:
                 continue
@@ -13287,9 +13280,37 @@ class OrchestratorApp:
             on_disk_decision = decision_data.get("decision")
             if on_disk_decision not in ("approved", "request_changes", "blocked"):
                 continue
+            on_disk_reviewed_head_sha = decision_data.get("reviewed_head_sha")
+            # Skip only if state already ingested THIS on-disk verdict -- the
+            # same decision recorded against the same reviewed head. A
+            # prior-round terminal decision with a DIFFERENT
+            # reviewed_head_sha than the on-disk file means a later round's
+            # verdict was written to disk but never ingested into state (the
+            # #736 stranded shape re-opened for round-2+); it must still be
+            # reconciled. Skipping solely because ``state.decision`` holds
+            # any terminal value from a prior round would strand every
+            # round-2+ verdict whose state write was lost.
+            #
+            # ``record_review``'s own #467/#1072 head-drift guard is the
+            # safety net for stale heads: it refuses to pin a verdict to a
+            # head that no longer matches the packet/live head for automated
+            # callers (``allow_stale_head`` defaults to ``False``). So this
+            # skip's job is only to avoid re-processing a verdict already
+            # ingested for the SAME on-disk decision, not to skip every PR
+            # that has ever had a decision recorded.
+            recorded_decision = pr_state.get("decision")
+            recorded_reviewed_head_sha = pr_state.get("reviewed_head_sha")
+            if (
+                recorded_decision in ("approved", "request_changes", "blocked")
+                and recorded_decision == on_disk_decision
+                and recorded_reviewed_head_sha == on_disk_reviewed_head_sha
+            ):
+                continue
             # Stranded verdict found: the on-disk file carries a completed
-            # decision but state has no ``decision`` key. Ingest it via
-            # ``record_review`` so the full state-machine transition (PR
+            # decision not reflected in state -- either state has no
+            # ``decision`` key at all, or it carries a prior-round decision
+            # recorded against a different ``reviewed_head_sha``. Ingest it
+            # via ``record_review`` so the full state-machine transition (PR
             # status, issue status, rework prompt, label transition) runs
             # exactly as if the verdict were freshly rendered.
             #

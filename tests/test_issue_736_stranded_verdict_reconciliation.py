@@ -42,9 +42,15 @@ def _seed_stranded_pr(
     decision: dict[str, Any] | None = None,
     pr_status: str = "reviewing",
     state_decision: str | None = None,
+    state_reviewed_head_sha: str | None = None,
 ) -> Path:
     """Seed a PR with a review packet and a completed on-disk verdict that is
     NOT reflected in ``state.decision`` (the #736 stranded-verdict shape).
+
+    ``state_decision`` / ``state_reviewed_head_sha`` seed a prior-round
+    terminal decision already recorded in state (the round-2+ stranded
+    shape): ``record_review`` always persists both together, so a real
+    already-ingested prior round carries both keys.
 
     Returns the PR directory path.
     """
@@ -64,6 +70,8 @@ def _seed_stranded_pr(
         }
         if state_decision is not None:
             pr_entry["decision"] = state_decision
+        if state_reviewed_head_sha is not None:
+            pr_entry["reviewed_head_sha"] = state_reviewed_head_sha
         state["prs"][str(pr_number)] = pr_entry
         save_state(app.paths.state_file, state)
     return pr_dir
@@ -164,8 +172,18 @@ def test_stranded_verdict_not_reingested_when_state_already_has_decision(
         "summary": "fix A",
         "required_changes": ["fix A"],
     }
-    # state.decision is already set — the verdict was already ingested.
-    _seed_stranded_pr(app, tmp_path, 100, 10, decision=verdict, state_decision="request_changes")
+    # state already carries the prior-round decision AND the
+    # reviewed_head_sha it was recorded against — the real shape of an
+    # already-ingested verdict (record_review persists both together).
+    _seed_stranded_pr(
+        app,
+        tmp_path,
+        100,
+        10,
+        decision=verdict,
+        state_decision="request_changes",
+        state_reviewed_head_sha="sha-100",
+    )
 
     result = app.dispatch_reviews()
 
@@ -383,3 +401,89 @@ def test_stranded_verdict_not_ingested_when_live_head_advanced(tmp_path: Path) -
     assert len(failed_events) == 1
     assert failed_events[0]["payload"]["pr_number"] == 100
     assert failed_events[0]["payload"]["decision"] == "request_changes"
+
+
+def test_stranded_later_round_verdict_ingested_despite_prior_terminal_decision(
+    tmp_path: Path,
+) -> None:
+    """Issue #736 round-2+ regression: a PR may carry a prior-round terminal
+    decision in state (e.g. ``request_changes`` recorded against ``sha-100``)
+    AND a NEW on-disk ``review-decision.json`` for a later round whose
+    ``reviewed_head_sha`` matches the current live head (e.g. ``approved``
+    against ``sha-200``) that was never ingested.
+
+    The eligibility skip must compare the on-disk verdict's identity against
+    state's recorded verdict, not skip solely because ``state.decision`` holds
+    any terminal value from a prior round. Skipping on any terminal decision
+    strands every round-2+ verdict whose state write was lost — the exact
+    #736 gap re-opened for later rounds. ``record_review``'s own
+    #467/#1072 head-drift guard is the safety net for stale heads, so this
+    skip's job is only to avoid re-processing a verdict already ingested for
+    the SAME on-disk decision (same ``reviewed_head_sha`` + same decision).
+    """
+    # The live PR head is sha-200 (the round-2 head). The review packet and
+    # on-disk verdict were written against sha-200.
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, enabled=False)
+
+    # The new (round-2) on-disk verdict: approved against sha-200, never
+    # ingested into state.
+    verdict = {
+        "decision": "approved",
+        "issue_number": 10,
+        "pr_number": 100,
+        "reviewed_at": (datetime.now(UTC) - timedelta(hours=2)).isoformat(),
+        "reviewed_head_sha": "sha-200",
+        "summary": "round 2 looks good",
+    }
+    # State still carries the PRIOR-round terminal decision (request_changes
+    # against sha-100) — the round-1 verdict that was successfully ingested
+    # before the head advanced. The round-2 verdict on disk was never
+    # ingested (state write lost).
+    _seed_stranded_pr(
+        app,
+        tmp_path,
+        100,
+        10,
+        head_sha="sha-200",
+        decision=verdict,
+        state_decision="request_changes",
+        state_reviewed_head_sha="sha-100",
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The round-2 stranded verdict was reconciled despite the prior-round
+    # terminal decision in state.
+    assert len(result.data["reconciled_verdicts"]) == 1
+    assert result.data["reconciled_verdicts"][0]["pr_number"] == 100
+    assert result.data["reconciled_verdicts"][0]["decision"] == "approved"
+    assert result.data["reconciled_verdicts"][0]["ok"] is True
+
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"]["100"]
+    # The new round-2 verdict supplanted the prior-round decision.
+    assert pr_state["decision"] == "approved"
+    assert pr_state["reviewed_head_sha"] == "sha-200"
+    assert pr_state["status"] == "approved"
+
+    close_db(app.paths.state_file)
+    events = query_events(app.paths.state_file, kind="review_verdict_reconciled")
+    assert len(events) == 1
+    assert events[0]["payload"]["pr_number"] == 100
+    assert events[0]["payload"]["decision"] == "approved"
