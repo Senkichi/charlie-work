@@ -18268,7 +18268,18 @@ def test_janitor_required_check_first_failure_triggers_rerun(tmp_path: Path) -> 
 
 
 def test_janitor_required_check_second_failure_routes_to_rework(tmp_path: Path) -> None:
-    """Issue #391: the same check failing again on the same head is definitive and routes to rework."""
+    """Issue #391: the same check failing again on the same head is definitive and routes to rework.
+
+    Issue #1258 extends this test (rather than adding a parallel one) to also
+    cover: (a) AC2 -- the pre-existing sole-failure short-circuit and its
+    one-time flake-debounce rerun are unchanged by the new co-occurring-
+    failure branch (the rerun fires exactly once, on pass 1, never again on
+    pass 2's definitive failure); (b) AC4 -- the new
+    ``review_dispatch_skipped_ci_red`` provenance kind is emitted exactly
+    once, alongside (additive to) this short-circuit's pre-existing
+    ``record_review``-driven routing, tagged ``co_occurring: False`` because
+    the required-check failure is this PR's sole janitor failure.
+    """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
@@ -18288,6 +18299,9 @@ def test_janitor_required_check_second_failure_routes_to_rework(tmp_path: Path) 
     assert result1.ok is False
     assert result1.data.get("rerun_run_ids") == [12345]
     assert len(fake_gh.rerun_calls) == 1
+    # Pass 1 is the one-time flake-debounce rerun itself, not the definitive
+    # short-circuit -- no provenance event yet.
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
 
     result2 = app.review(456)
     assert result2.ok is True
@@ -18296,8 +18310,251 @@ def test_janitor_required_check_second_failure_routes_to_rework(tmp_path: Path) 
     assert state["prs"]["456"]["decision"] == "request_changes"
     assert state["prs"]["456"]["request_changes_count"] == 1
     assert (123, config.labels.needs_rework) in fake_gh.labels_added
-    # No additional rerun was triggered on the second pass.
+    # No additional rerun was triggered on the second pass: AC2's "exactly
+    # one rerun, not zero, not twice" across both passes.
     assert len(fake_gh.rerun_calls) == 1
+
+    ci_red_events = query_events(paths.state_file, kind="review_dispatch_skipped_ci_red")
+    assert len(ci_red_events) == 1
+    payload = ci_red_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["failed_required_checks"] == ["Tests passed"]
+    assert payload["co_occurring"] is False
+    assert payload["co_occurring_failures"] == []
+
+
+def _fail_if_launched(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Fail the test loudly if a reviewer is launched -- reused for every
+    fixture below that must never reach a paid reviewer session (issue
+    #1258's co-occurring-failure gate). Mirrors the identical pattern in
+    ``test_fix_escalated_dispatch_gate.py`` for the analogous escalated-PR
+    gate."""
+    launched: list[Any] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> Any:
+        launched.append((args, kwargs))
+        raise AssertionError("launch_claude_worker must not be called on red CI")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+    return launched
+
+
+def test_janitor_required_check_failure_with_co_occurring_body_failure_routes_to_rework(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC3): a required-check failure that is NOT the PR's sole
+    janitor failure -- here, co-occurring with an empty PR body
+    (``_check_body``) -- used to fall straight through
+    ``is_check_failure_block`` (which requires the check failure be the SOLE
+    blocker) into the passive ``janitor_blocked`` dead end: neither reviewed
+    nor routed to rework, silently re-logging the same failure set forever.
+    This must now route to rework via the same ``record_review(request_
+    changes)`` machinery the sole-failure short-circuit uses, naming BOTH the
+    failing check and the co-occurring janitor failure, and it must never
+    launch a reviewer.
+
+    The launch-avoidance assertion drives the real, end-to-end pipeline
+    (``review()`` then ``dispatch_reviews()``), not just ``review()`` in
+    isolation: launch happens in ``dispatch_reviews`` (workflow.py), which a
+    ``review()``-only test never reaches, so a bare ``assert launched == []``
+    against a monkeypatch that method can't trigger would pass for ANY
+    mutation -- an inert control (see the AC1 sibling test immediately below,
+    which drives the identical seam and gets ``launched_count == 1``; that is
+    the positive-control proof this guard is live and this zero is real).
+    """
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    # Trip _check_body's "PR body is empty" failure alongside the red check.
+    # This co-occurring failure is independent of issue_number binding
+    # (unlike a missing-linked-issue fixture, which review() itself requires
+    # non-None before reaching ANY routing branch -- see the janitor.py
+    # cross-reference in _check_linked_issue) and is not a merge conflict or
+    # a no-op-rework, so it exercises exactly the new branch, not the
+    # existing sole-failure short-circuit or the merge-conflict/no-op-rework
+    # routing block.
+    fake_gh.prs[0]["body"] = ""
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    launched = _fail_if_launched(monkeypatch)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    assert launched == []
+
+    # Drive the real launch seam: no packet was written (the PR never left
+    # the janitor-blocked/rework path), so dispatch_reviews must select and
+    # launch nothing. This is what makes ``launched == []`` above meaningful
+    # rather than vacuous.
+    dispatch_result = app.dispatch_reviews()
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["launched_count"] == 0
+    assert dispatch_result.data["selected_count"] == 0
+    assert launched == []
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["prs"]["456"]["decision"] == "request_changes"
+    assert state["prs"]["456"]["request_changes_count"] == 1
+    assert (123, config.labels.needs_rework) in fake_gh.labels_added
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert rework_prompt.exists()
+    prompt_text = rework_prompt.read_text(encoding="utf-8")
+    assert "CI failed on Tests passed" in prompt_text
+    assert "PR body is empty" in prompt_text
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert "Tests passed" in decision["summary"]
+    assert "PR body is empty" in decision["summary"]
+    assert decision["required_changes"] == ["PR body is empty"]
+
+    ci_red_events = query_events(paths.state_file, kind="review_dispatch_skipped_ci_red")
+    assert len(ci_red_events) == 1
+    payload = ci_red_events[0]["payload"]
+    assert payload["pr_number"] == 456
+    assert payload["issue_number"] == 123
+    assert payload["failed_required_checks"] == ["Tests passed"]
+    assert payload["co_occurring"] is True
+    assert payload["co_occurring_failures"] == ["PR body is empty"]
+
+
+def test_janitor_all_checks_green_dispatches_reviewer_ci_red_kind_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC1): the green-checks path is unaffected by the new
+    co-occurring-failure branch and the new provenance kind -- both guards
+    require ``verdict.failed_required_checks`` to be truthy, which an
+    all-green PR never has, so neither new branch's body executes at all.
+    Exercises the real, end-to-end pipeline (``review()`` packet-build then
+    ``dispatch_reviews()`` launch), not just ``review()`` in isolation, so
+    "the reviewer is launched with the same command as pre-diff" is an
+    actual launch-call assertion, not merely an absence-of-packet inference.
+    """
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "SUCCESS"},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = paths.prs / "pr-456" / "review-prompt.md"
+    assert packet.exists()
+    # The janitor gate never blocked this PR, so none of its routing kinds
+    # (old or new) fired.
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
+    assert not any(
+        e["kind"] == "janitor_gate" for e in load_state(paths.state_file).get("events", [])
+    )
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    dispatch_result = app.dispatch_reviews()
+
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["launched_count"] == 1
+    assert len(launched) == 1
+    _launch_args, launch_kwargs = launched[0]
+    assert launch_kwargs.get("review") is True
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["review_dispatch_status"] == "review_dispatch_dispatched"
+    # Pre-existing dispatch-lane kinds still fire (additive, not replaced).
+    assert query_events(paths.state_file, kind="review_dispatch_claim") != []
+    # The new CI-red kind is scoped to the janitor gate and never fires on
+    # the dispatch-claim/launch path itself (also AC6's redundant-gate claim,
+    # from the launch side).
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
+
+
+def test_dispatch_claim_site_has_no_redundant_ci_status_check() -> None:
+    """Issue #1258 (AC6): the janitor gate in ``review()`` must stay the SOLE
+    source of truth for "is CI red" -- a second, independent CI-status check
+    anywhere near the dispatch-claim/launch site would be the exact
+    redundant-gate hazard the issue's binding comment warns against (two
+    disagreeing sources of truth for the same question).
+
+    AST-scans the three dispatch-claim-site functions/methods (not a plain
+    text grep over the whole file, which would also match unrelated code
+    elsewhere) for any of the tokens a CI-status read would need to use:
+    ``pr_checks``/``summarize_checks``/``failed_required_checks``/
+    ``required_checks``/``is_check_failure``/``checkSuite``/
+    ``statusCheckRollup``. Zero hits confirmed by recon before this item's
+    branch was added; this pins that finding down so a future PR that adds a
+    second check here fails CI instead of silently duplicating the gate.
+    """
+    import ast
+
+    src_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
+    source = src_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(src_path))
+
+    targets = {
+        "dispatch_reviews",
+        "_is_review_dispatchable",
+        "_select_review_dispatch_candidates",
+    }
+    forbidden = (
+        "pr_checks",
+        "summarize_checks",
+        "failed_required_checks",
+        "required_checks",
+        "is_check_failure",
+        "checkSuite",
+        "statusCheckRollup",
+    )
+
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in targets:
+            segment = ast.get_source_segment(source, node)
+            assert segment is not None, f"could not extract source for {node.name}"
+            found[node.name] = segment
+
+    assert found.keys() == targets, (
+        f"expected to find {sorted(targets)}, found {sorted(found)} -- "
+        "a rename/move at the dispatch-claim site invalidated this probe's anchors"
+    )
+
+    violations = {
+        name: [token for token in forbidden if token in segment] for name, segment in found.items()
+    }
+    violations = {name: tokens for name, tokens in violations.items() if tokens}
+    assert not violations, (
+        "a CI-status token was found at the dispatch-claim site -- this is the "
+        "redundant-gate hazard: the janitor gate in review() must remain the "
+        f"sole source of truth for 'is CI red': {violations}"
+    )
 
 
 def test_janitor_required_check_rerun_api_error_falls_through_to_rework(tmp_path: Path) -> None:

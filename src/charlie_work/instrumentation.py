@@ -433,6 +433,17 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "ci_fleet_provenance": "info",
         "review_dispatch": "info",
         "review_dispatch_claim": "info",
+        # Issue #1258: the janitor's CI-red short-circuit in review() never
+        # emitted a dedicated event -- only whatever record_review() itself
+        # logs (decision-agnostic, no CI-specific marker). Covers BOTH the
+        # pre-existing sole-failure short-circuit (a required check is the
+        # only janitor failure) and the co-occurring case added alongside
+        # this kind (a required check fails together with another
+        # non-merge-conflict janitor failure). Info, not error/warning: this
+        # is the deterministic gate doing its job -- routing to rework
+        # without ever starting a paid reviewer session -- not a condition
+        # that ended a lane or lost work.
+        "review_dispatch_skipped_ci_red": "info",
         "review_packet": "info",
         # Issue #736: the stranded-verdict reconciliation sweep found an
         # on-disk decision that state never ingested (state write lost, but
