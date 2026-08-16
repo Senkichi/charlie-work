@@ -177,6 +177,7 @@ def test_orphan_salvage_repo_root_guard(
         assert len(relabel_events) == 0
         assert len(drift_events) == 1
         assert drift_events[0]["payload"]["issue_number"] == issue_number
+        assert drift_events[0]["payload"]["branch_name"] == branch
         # The issue is held as drift, not silently relabeled/reopened.
         assert issue_state["status"] == "dispatched"
         assert issue_state.get("orphan_drift_fingerprint") is not None

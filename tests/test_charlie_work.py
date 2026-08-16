@@ -43979,6 +43979,7 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     assert drift_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_pr_create_failed"
     assert drift_events[0]["payload"]["pr_create_error"] is not None
     assert drift_events[0]["payload"]["worker_reported"] is True
+    assert drift_events[0]["payload"]["branch_name"] == branch
 
     # Must NOT emit the generic no-open-PR drift, which would cause re-dispatch.
     no_pr_events = [
@@ -44086,6 +44087,7 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
         f"sweep passes within the same fingerprint window, got {len(drift_events)}"
     )
     assert drift_events[0]["payload"]["reason"] == "dead_worker_branch_pushed_pr_create_failed"
+    assert drift_events[0]["payload"]["branch_name"] == branch
 
     # Positive control: the assertion above is only meaningful if pass 2
     # actually reached the emit site and was suppressed BY THE FINGERPRINT --
@@ -44112,6 +44114,7 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
         f"and the first assertion's count==1 was real dedup, not an unrelated "
         f"early exit), got {len(drift_events)}"
     )
+    assert drift_events[1]["payload"]["branch_name"] == branch
 
 
 def test_classify_dead_sessions_no_open_pr_happy_path_reclaims_in_one_pass(
