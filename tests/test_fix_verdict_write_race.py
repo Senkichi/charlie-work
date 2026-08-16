@@ -299,7 +299,13 @@ def test_record_review_rejects_stale_packet_head_without_allow_stale_head(
     decision_path = paths.prs / "pr-456" / "review-decision.json"
 
     # An automated caller passing the stale packet head must be rejected.
-    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-abc123")
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-abc123",
+        verdict_provenance="fresh_llm_review",
+    )
     assert result.ok is False
     assert result.data["reason"] == "head_moved_during_build"
     assert result.data["packet_head_sha"] == "sha-abc123"
@@ -330,7 +336,12 @@ def test_record_review_allows_stale_packet_head_with_allow_stale_head(
 
     # The operator CLI passes allow_stale_head=True and is allowed to proceed.
     result = app.record_review(
-        456, "approved", summary="lgtm", reviewed_head="sha-abc123", allow_stale_head=True
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-abc123",
+        allow_stale_head=True,
+        verdict_provenance="fresh_llm_review",
     )
     assert result.ok is True
     decision = json.loads(
@@ -358,7 +369,13 @@ def test_record_review_allows_live_head_when_packet_stale(tmp_path: Path) -> Non
     fake_gh.diffs[456] = "diff --git a/file b/file\n+unreviewed change"
 
     # Choosing the live head is fine — no allow_stale_head needed.
-    result = app.record_review(456, "approved", summary="lgtm", reviewed_head="sha-new789")
+    result = app.record_review(
+        456,
+        "approved",
+        summary="lgtm",
+        reviewed_head="sha-new789",
+        verdict_provenance="fresh_llm_review",
+    )
     assert result.ok is True
     decision = json.loads(
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")

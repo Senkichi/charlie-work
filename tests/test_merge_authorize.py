@@ -140,7 +140,9 @@ def test_authorized_override_survives_subsequent_record_review(tmp_path: Path) -
     # 2. A reviewer subsequently records a verdict for the same PR. This is the
     #    sequential (not racy) scenario: the operator authorized, then a review
     #    round completes and record_review overwrites the decision file.
-    review_result = app.record_review(456, "approved", summary="lgtm after rebase")
+    review_result = app.record_review(
+        456, "approved", summary="lgtm after rebase", verdict_provenance="fresh_llm_review"
+    )
     assert review_result.ok is True
 
     # 3. The override must survive the full-file overwrite.

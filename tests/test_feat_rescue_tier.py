@@ -73,7 +73,9 @@ def test_rework_cycle_cap_dispatches_rescue_instead_of_escalating(tmp_path: Path
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     _seed_pr_state(paths, 456, 123, request_changes_count=config.review.max_rework_cycles)
 
-    result = app.record_review(456, "request_changes", summary="needs another pass")
+    result = app.record_review(
+        456, "request_changes", summary="needs another pass", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is True
     assert result.data["escalated"] is False
@@ -118,7 +120,9 @@ def test_rework_cycle_cap_with_rescue_already_attempted_escalates_normally(
         rescue_cause="rework_cycle_cap",
     )
 
-    result = app.record_review(456, "request_changes", summary="still broken")
+    result = app.record_review(
+        456, "request_changes", summary="still broken", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.data["escalated"] is True
     assert result.data["rescue_dispatched"] is False
@@ -139,7 +143,9 @@ def test_rework_cycle_cap_disabled_config_matches_legacy_escalation(tmp_path: Pa
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     _seed_pr_state(paths, 456, 123, request_changes_count=config.review.max_rework_cycles)
 
-    result = app.record_review(456, "request_changes", summary="needs another pass")
+    result = app.record_review(
+        456, "request_changes", summary="needs another pass", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.data["escalated"] is True
     assert result.data["rescue_dispatched"] is False
@@ -518,7 +524,9 @@ def test_unescalate_clears_rescue_marker(tmp_path: Path) -> None:
     assert pr_state["request_changes_count"] == 0
 
     # A fresh cap exceedance after unescalate gets a fresh rescue attempt.
-    result2 = app.record_review(456, "request_changes", summary="needs work again")
+    result2 = app.record_review(
+        456, "request_changes", summary="needs work again", verdict_provenance="fresh_llm_review"
+    )
     assert result2.data.get("rescue_dispatched") is not True  # only 1 request_changes so far
 
 

@@ -908,7 +908,9 @@ def test_record_review_escalated_pr_blocks_and_writes_no_decision(tmp_path: Path
         save_state(app.paths.state_file, state)
     before = load_state(app.paths.state_file)
 
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is False
     assert "unescalate" in result.message
@@ -936,7 +938,9 @@ def test_record_review_escalated_linked_issue_blocks_even_if_pr_state_is_clean(
         state["issues"]["123"] = {"number": 123, "status": "escalated"}
         save_state(app.paths.state_file, state)
 
-    result = app.record_review(456, "approved", summary="lgtm")
+    result = app.record_review(
+        456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
 
     assert result.ok is False
     assert "unescalate" in result.message

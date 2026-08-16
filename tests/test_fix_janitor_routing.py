@@ -294,7 +294,9 @@ def test_janitor_no_op_rework_routes_to_rework(tmp_path: Path) -> None:
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     _force_issue_status(app, 123, "reviewing")
 
     # Same head, same diff as the recorded verdict: no actual content change.
@@ -324,7 +326,9 @@ def test_janitor_no_op_rework_waits_while_rework_pending(tmp_path: Path) -> None
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     for _ in range(4):
         result = app.review(456)
@@ -352,7 +356,9 @@ def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(tmp_path: Path) 
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     _force_issue_status(app, 123, "reviewing")
     result1 = app.review(456)
@@ -679,7 +685,9 @@ def test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Head advances AND the diff content genuinely changes (so dispatch_rework
     # routes to _route_rework_candidate_to_review). pr_list still reports OPEN.
@@ -739,7 +747,9 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     state = load_state(paths.state_file)
     state["issues"]["123"] = {
@@ -962,7 +972,9 @@ def test_janitor_no_op_rework_stalled_escalates(tmp_path: Path) -> None:
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     # record_review leaves the issue in rework_requested directly -- the
     # common real-world shape: no_op_rework's own "fresh route" baseline
     # write is never reached because the issue is already pending by the
@@ -1342,7 +1354,9 @@ def test_janitor_no_op_rework_reconcile_status_oscillation_does_not_reset_stall_
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new"
     )
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
 
     # Clock starts on the first passive wait (issue already rework_requested).
     result_wait = app.review(456)

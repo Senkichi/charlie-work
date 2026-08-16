@@ -190,11 +190,17 @@ def test_record_review_event_payload_includes_issue_number(tmp_path: Path) -> No
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     fake_gh.pr_head_shas[456] = "sha-1"
-    app.record_review(456, "request_changes", summary="fix A")
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
     fake_gh.pr_head_shas[456] = "sha-2"
-    app.record_review(456, "request_changes", summary="fix B")
+    app.record_review(
+        456, "request_changes", summary="fix B", verdict_provenance="fresh_llm_review"
+    )
     fake_gh.pr_head_shas[456] = "sha-3"
-    app.record_review(456, "request_changes", summary="fix C")
+    app.record_review(
+        456, "request_changes", summary="fix C", verdict_provenance="fresh_llm_review"
+    )
 
     state = load_state(paths.state_file)
     record_review_events = [e for e in state.get("events", []) if e.get("kind") == "record_review"]
