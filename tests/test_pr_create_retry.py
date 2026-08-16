@@ -24,6 +24,9 @@ from charlie_work.pr_create_retry import (
     DEFAULT_BASE_SECONDS,
     DEFAULT_MAX_RETRIES,
     PrCreateRetryResult,
+    PrecheckStatus,
+    _find_pr_for_head,
+    _should_block_create_after_precheck_failure,
     create_pr_with_retry,
 )
 
@@ -35,7 +38,17 @@ class _FakePrCreator:
     ``StopIteration``/index error would be a test bug, not a case to guard
     against -- these tests always supply exactly as many responses as the
     expected number of live attempts). ``existing_prs`` backs ``pr_list()``
-    for the duplicate-PR guard.
+    for the duplicate-PR guard when ``pr_list_queue`` is not given -- a
+    static return value on every call, matching the original fake's
+    behavior exactly for every test that doesn't need ``pr_list()`` to ever
+    raise.
+
+    ``pr_list_queue`` (cw#1273 fail-open fix), when given, takes over
+    ``pr_list()`` entirely: one entry is popped per live call, where an
+    exception *instance* is raised and anything else is returned as-is. This
+    is what lets a test simulate ``pr_list()`` raising ``GitHubError`` on
+    some calls and recovering (or not) on later ones -- something a single
+    static ``existing_prs`` list cannot express.
     """
 
     def __init__(
@@ -43,9 +56,11 @@ class _FakePrCreator:
         pr_create_responses: list[int | None],
         *,
         existing_prs: list[dict[str, Any]] | None = None,
+        pr_list_queue: list[list[dict[str, Any]] | BaseException] | None = None,
     ) -> None:
         self._responses = list(pr_create_responses)
         self._existing_prs = existing_prs if existing_prs is not None else []
+        self._pr_list_queue = list(pr_list_queue) if pr_list_queue is not None else None
         self.create_calls: list[dict[str, Any]] = []
         self.pr_list_calls = 0
         self.invalidate_calls = 0
@@ -56,6 +71,11 @@ class _FakePrCreator:
 
     def pr_list(self) -> list[dict[str, Any]]:
         self.pr_list_calls += 1
+        if self._pr_list_queue is not None:
+            item = self._pr_list_queue.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
         return self._existing_prs
 
     def invalidate_list_cache(self) -> None:
@@ -244,6 +264,136 @@ def test_duplicate_pr_guard_survives_a_gh_without_the_optional_methods() -> None
     assert result.ok is True
     assert result.pr_number == 7001
     assert gh.create_calls == 2
+
+
+# ---------------------------------------------------------------------------
+# cw#1273 fail-open fix: the duplicate-PR precheck (`gh pr list`) is itself a
+# live `gh` call that can fail. Collapsing that failure into "no PR found" is
+# the bug a live adversarial verifier reproduced: two live `pr_create` calls
+# (a duplicate PR) when `pr_list` raised while a matching PR already existed.
+# The precheck is now three-state (`PrecheckStatus`); these tests cover each
+# of the three required scenarios.
+# ---------------------------------------------------------------------------
+
+
+def test_find_pr_for_head_classifies_github_error_as_precheck_failed() -> None:
+    """Direct unit coverage of the fail-open fix itself: a `GitHubError` from
+    `pr_list()` must be classified as `PRECHECK_FAILED`, never silently
+    collapsed into `NOT_FOUND` -- a `NOT_FOUND` return here is
+    indistinguishable from a genuine empty list to the caller, which is
+    exactly what let a second `pr_create` fire in the verifier's repro."""
+    gh = _FakePrCreator([], pr_list_queue=[github_module.GitHubError("boom")])
+
+    status, pr_number = _find_pr_for_head(gh, "agent/issue-1273")
+
+    assert status is PrecheckStatus.PRECHECK_FAILED
+    assert pr_number is None
+    assert gh.pr_list_calls == 1
+
+
+def test_a_precheck_failure_then_recovery_adopts_existing_pr_without_a_second_create() -> None:
+    """Verifier repro, scenario (a): an ambiguous post-send create failure,
+    then `pr_list` raises `GitHubError` (not a clean empty list) while a
+    matching PR already exists, then `pr_list` recovers on a later retry.
+    The precheck-failure must not be treated as "not found" -- the loop must
+    keep re-checking (never issuing a second `pr_create`) until it can
+    actually see the existing PR and adopt it."""
+    gh = _FakePrCreator(
+        [None],
+        pr_list_queue=[
+            github_module.GitHubError("rate limited"),
+            [{"headRefName": "agent/issue-1273", "number": 4242}],
+        ],
+    )
+    sleeps, sleep_fn = _sleep_recorder()
+
+    result = create_pr_with_retry(
+        gh, head="agent/issue-1273", base="main", title="t", body="b", sleep_fn=sleep_fn
+    )
+
+    assert result == PrCreateRetryResult(
+        ok=True, pr_number=4242, adopted_existing=True, attempts=1, error=None
+    )
+    # The whole point: only the one (ambiguous) live create call ever reached
+    # the mock, even though the precheck itself failed once first.
+    assert len(gh.create_calls) == 1
+    assert gh.pr_list_calls == 2
+    assert gh.invalidate_calls == 2
+    # One backoff sleep for the blocked (precheck-failed) attempt; adoption
+    # on the next attempt short-circuits before any further sleep.
+    assert sleeps == [DEFAULT_BASE_SECONDS]
+
+
+def test_b_precheck_failure_persists_exhausts_without_ever_issuing_a_second_create() -> None:
+    """Verifier repro, scenario (b): `pr_list` raises `GitHubError` on every
+    subsequent check and never recovers. Every remaining retry slot must be
+    consumed by backoff-then-reprecheck, never by a second `pr_create` --
+    exhaustion returns the same failure result as any other exhaustion path,
+    which is what lets the existing stranded-branch terminal path fire."""
+    gh = _FakePrCreator(
+        [None],
+        pr_list_queue=[
+            github_module.GitHubError("rate limited"),
+            github_module.GitHubError("rate limited"),
+            github_module.GitHubError("rate limited"),
+        ],
+    )
+    sleeps, sleep_fn = _sleep_recorder()
+
+    result = create_pr_with_retry(
+        gh, head="agent/issue-1273", base="main", title="t", body="b", sleep_fn=sleep_fn
+    )
+
+    assert result.ok is False
+    assert result.pr_number is None
+    assert result.adopted_existing is False
+    # Only the one ambiguous create ever fired -- every retry after it was
+    # consumed by a blocked (precheck-failed) attempt, not a live create.
+    assert result.attempts == 1
+    assert result.error is not None
+    assert len(gh.create_calls) == 1
+    assert gh.pr_list_calls == 3
+    assert sleeps == [DEFAULT_BASE_SECONDS, DEFAULT_BASE_SECONDS * 3, DEFAULT_BASE_SECONDS * 9]
+
+
+def test_c_first_attempt_never_prechecks_so_a_raising_pr_list_cannot_block_it() -> None:
+    """Verifier repro, scenario (c) -- the first-attempt asymmetry: unlike
+    every retry, the very first `pr_create` call is never gated by a
+    precheck at all -- nothing could exist yet, so a `pr_list` that would
+    raise never even gets the chance to matter. `pr_list_queue` is left
+    empty deliberately: if a future change adds a precheck ahead of the
+    first attempt, popping from an empty queue raises `IndexError` and this
+    test fails loudly rather than silently passing on the wrong path."""
+    gh = _FakePrCreator([5001], pr_list_queue=[])
+    sleeps, sleep_fn = _sleep_recorder()
+
+    result = create_pr_with_retry(
+        gh, head="agent/issue-1273", base="main", title="t", body="b", sleep_fn=sleep_fn
+    )
+
+    assert result == PrCreateRetryResult(
+        ok=True, pr_number=5001, adopted_existing=False, attempts=1, error=None
+    )
+    assert len(gh.create_calls) == 1
+    assert gh.pr_list_calls == 0
+    assert sleeps == []
+
+
+def test_precheck_failure_blocks_creation_only_once_one_is_already_in_flight() -> None:
+    """Direct unit coverage of the asymmetry itself (`PrCreateRetryResult`
+    requirement 2's third bullet): a `PRECHECK_FAILED` precheck blocks the
+    next create only once a create has already been attempted this
+    invocation (`attempts > 0`) -- on a hypothetical `attempts == 0`
+    precheck failure, nothing is ambiguous yet, so it must not block. That
+    `attempts == 0` case is unreachable through `create_pr_with_retry`'s
+    public API today (see
+    `test_c_first_attempt_never_prechecks_so_a_raising_pr_list_cannot_block_it`
+    above) -- tested directly here so the asymmetry is pinned independent of
+    that gating."""
+    assert _should_block_create_after_precheck_failure(PrecheckStatus.PRECHECK_FAILED, 0) is False
+    assert _should_block_create_after_precheck_failure(PrecheckStatus.PRECHECK_FAILED, 1) is True
+    assert _should_block_create_after_precheck_failure(PrecheckStatus.NOT_FOUND, 1) is False
+    assert _should_block_create_after_precheck_failure(PrecheckStatus.FOUND, 1) is False
 
 
 # ---------------------------------------------------------------------------
