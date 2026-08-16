@@ -12295,11 +12295,35 @@ class OrchestratorApp:
             # still red, and changing that is out of this fix's scope. A
             # PR in that state still stalls in janitor_blocked below after
             # this diff -- an accepted carve-out, not an oversight.
+            #
+            # verdict.infra_definitive_failed is also excluded: an
+            # infra-failed required check (CANCELLED/TIMED_OUT job-level
+            # kill, issue #841) co-occurring with a genuine required-check
+            # failure has its OWN dedicated remediation path (infra-rerun +
+            # escalation, above) that this branch must not shadow or
+            # double-dispatch against -- there is no code-fix rework for an
+            # infra kill, so routing it through record_review(request_
+            # changes) as if a code push could fix it would be a
+            # mis-classification, not a fix.
+            # test_janitor_mixed_genuine_failure_and_infra_failure_routes_to_rework_not_infra_rerun
+            # (issue #847, pre-existing) pins this exact combination falling
+            # through to janitor_blocked untouched, unchanged by this diff.
+            # infra_definitive_failed is populated here whenever an
+            # infra_failed required check co-occurs with a genuine
+            # failed_required_checks entry, regardless of whether the infra
+            # check's run id is parseable: is_infra_failure_block requires
+            # `not failed_required_checks`, so it is always False in that
+            # combination, which forces classify_infra_failures'
+            # record_attempts=False path -- every infra_failed name lands in
+            # definitive_failed (never rerun_run_ids) on this pass. Checking
+            # infra_definitive_failed alone is therefore sufficient; it is
+            # never empty here while infra_rerun_run_ids is non-empty.
             is_co_occurring_check_failure_block = (
                 bool(verdict.failed_required_checks)
                 and not verdict.is_check_failure_block
                 and not is_merge_conflict_block
                 and not verdict.is_no_op_rework
+                and not verdict.infra_definitive_failed
             )
             if issue_number is not None and is_co_occurring_check_failure_block:
                 transition(self.gh, self.config.labels, issue_number, "review_started")

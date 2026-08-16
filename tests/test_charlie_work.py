@@ -18432,6 +18432,66 @@ def test_janitor_required_check_failure_with_co_occurring_body_failure_routes_to
     assert payload["co_occurring_failures"] == ["PR body is empty"]
 
 
+def test_janitor_required_check_failure_with_co_occurring_infra_failure_stays_blocked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1258 (AC3 carve-out): unlike AC3's ``_check_body`` co-occurring
+    failure immediately above, a genuine required-check FAILURE co-occurring
+    with an INFRA-failed required check (CANCELLED/TIMED_OUT, issue #841/#847)
+    must NOT route through the new ``is_co_occurring_check_failure_block``
+    branch -- it has its own dedicated infra-rerun/escalation remediation
+    that this fix must not shadow or double-dispatch against. This is the
+    same combination the pre-existing
+    ``test_janitor_mixed_genuine_failure_and_infra_failure_routes_to_rework_not_infra_rerun``
+    (issue #847) pins from the infra side; this sibling pins it from #1258's
+    side -- through the real ``review()`` + ``dispatch_reviews()`` pipeline,
+    with the new provenance kind explicitly asserted ABSENT -- so the
+    boundary is owned by this issue's own tests, not inferred from an
+    unrelated suite.
+    """
+    config = dataclasses.replace(
+        _required_checks_config(), review_dispatch=ReviewDispatchConfig(enabled=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHubWithChecks(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE"},
+            {"name": "Lint & Format", "state": "CANCELLED"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ]
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    launched = _fail_if_launched(monkeypatch)
+
+    result = app.review(456)
+
+    # Falls through to the passive janitor_blocked path, unchanged by this
+    # diff -- this combination is an accepted carve-out (infra remediation
+    # owns it), not a new rework route.
+    assert result.ok is False
+    assert launched == []
+
+    dispatch_result = app.dispatch_reviews()
+    assert dispatch_result.ok is True
+    assert dispatch_result.data["launched_count"] == 0
+    assert dispatch_result.data["selected_count"] == 0
+    assert launched == []
+
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["status"] == "janitor_blocked"
+    assert state["prs"]["456"].get("decision") is None
+    failures = state["prs"]["456"]["janitor_failures"]
+    assert any("Tests passed" in f for f in failures)
+    assert any("infrastructure" in f.lower() and "Lint & Format" in f for f in failures)
+
+    rework_prompt = paths.prs / "pr-456" / "rework-prompt.md"
+    assert not rework_prompt.exists()
+
+    # The new co-occurring-failure provenance kind must NOT fire for this
+    # carve-out -- it is reserved for the code-fixable branch above.
+    assert query_events(paths.state_file, kind="review_dispatch_skipped_ci_red") == []
+
+
 def test_janitor_all_checks_green_dispatches_reviewer_ci_red_kind_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
