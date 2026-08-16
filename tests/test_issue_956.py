@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from charlie_work.config import OrchestratorConfig
+from charlie_work.github import MergedPRSearchResult
 
 
 class _SalvageTestGitHub:
@@ -47,6 +48,15 @@ class _SalvageTestGitHub:
     def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
         self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
         return self.pr_create_return
+
+    def merged_prs_for_issue(self, issue_number: int, branch_prefix: str) -> MergedPRSearchResult:
+        # Issue #1221: ``_attempt_salvage`` now re-checks live terminal state
+        # before opening a PR, calling ``merged_prs_for_issue`` on every path.
+        # Match the production shape (``MergedPRSearchResult`` carrying ``.ok``)
+        # so the fake and the real GitHubCLI agree. These tests exercise the
+        # salvage-proceeds path, so return an empty (ok) result -- no merged PR
+        # binds to the issue, and salvage falls through to opening the PR.
+        return MergedPRSearchResult([], ok=True)
 
     def remove_issue_label(self, number: int, label: str) -> bool:
         self.labels_removed.append((number, label))

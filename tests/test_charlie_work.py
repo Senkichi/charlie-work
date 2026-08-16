@@ -3283,6 +3283,12 @@ class FakeGitHub:
                 break
         return True
 
+    def issue_comment(self, number: int, body_file: Path) -> None:
+        """Record issue comments posted by the orchestrator (issue #1000)."""
+        posted = getattr(self, "issue_comments_posted", [])
+        posted.append((number, Path(body_file).read_text(encoding="utf-8")))
+        self.issue_comments_posted = posted
+
     def name_with_owner(self) -> str:
         return "test-owner/test-repo"
 
@@ -8712,13 +8718,21 @@ def test_update_open_agent_prs_front_of_train_records_verified_sync_event(
 
 
 def _dispatch_reviews_app(
-    tmp_path: Path, *, prs: list[dict[str, Any]] | None = None, enabled: bool = True
+    tmp_path: Path,
+    *,
+    prs: list[dict[str, Any]] | None = None,
+    enabled: bool = True,
+    dry_run: bool = False,
 ) -> OrchestratorApp:
     """Build an OrchestratorApp with review_dispatch enabled (by default) and an empty state file.
 
     Issue #868: ``enabled`` is overridable so tests can exercise
     ``dispatch_reviews()``'s disabled-gate path with the same PR/state seeding
     helpers used by the enabled-path tests.
+
+    Issue #1251: ``dry_run`` is overridable so tests can exercise the dry-run
+    preview branch of ``dispatch_reviews()`` (read-only selection + empty-diff
+    pre-flight mirror) with the same PR/state seeding helpers.
     """
     config = OrchestratorConfig(
         review_dispatch=ReviewDispatchConfig(enabled=enabled),
@@ -8733,7 +8747,7 @@ def _dispatch_reviews_app(
     fake_gh.issues = []
     if prs is not None:
         fake_gh.prs = prs
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
 
 
 def _fake_claude_worker_record(pr_number: int, branch: str) -> ClaudeWorkerRecord:
@@ -8812,6 +8826,268 @@ def test_dispatch_reviews_launches_for_all_queued_prs(monkeypatch, tmp_path: Pat
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
     assert state["prs"]["100"]["reviewer_pid"] == 12345
     assert state["prs"]["200"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_skips_empty_diff_pr(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+    must not burn a paid reviewer session. The pre-flight gate skips dispatch,
+    emits review_skipped_empty_diff, and does NOT increment
+    review_dispatch_attempt_count (an empty diff is not a review attempt)."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # Write an EMPTY diff.patch — the signal for a zero-file PR.
+    pr_dir = app.paths.prs / "pr-100"
+    (pr_dir / "diff.patch").write_text("", encoding="utf-8")
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # No reviewer must have been launched.
+    assert len(launched) == 0
+    assert result.data["launched_count"] == 0
+    # The PR must appear in the skipped_empty_diff payload.
+    assert 100 in result.data["skipped_empty_diff"]
+    # review_skipped_empty_diff event must have been emitted.
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert len(skip_events) == 1
+    assert skip_events[0]["pr_number"] == 100
+    # review_dispatch_attempt_count must NOT have been incremented.
+    state = load_state(app.paths.state_file)
+    pr_state = state["prs"].get("100", {})
+    assert int(pr_state.get("review_dispatch_attempt_count", 0)) == 0
+    # No dispatch claim must have been written.
+    assert pr_state.get("review_dispatch_status") != "review_dispatch_pending"
+
+
+def test_dispatch_reviews_proceeds_with_nonempty_diff(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: a PR with a non-empty diff.patch must proceed through
+    normal dispatch unchanged — the empty-diff gate only stops zero-file PRs."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # Write a NON-EMPTY diff.patch.
+    pr_dir = app.paths.prs / "pr-100"
+    (pr_dir / "diff.patch").write_text(
+        "diff --git a/foo.py b/foo.py\n+print('hello')\n", encoding="utf-8"
+    )
+
+    launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append((args, kwargs))
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The reviewer must have been launched.
+    assert len(launched) == 1
+    assert result.data["launched_count"] == 1
+    # No empty-diff skip.
+    assert result.data["skipped_empty_diff"] == []
+    # No review_skipped_empty_diff event.
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert len(skip_events) == 0
+    # Dispatch must have proceeded — claim upgraded to dispatched.
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+def test_dispatch_reviews_empty_diff_mixed_with_nonempty(monkeypatch, tmp_path: Path) -> None:
+    """Issue #1251: when both an empty-diff PR and a non-empty-diff PR are
+    queued, only the non-empty PR is dispatched; the empty one is skipped
+    without affecting the other's dispatch."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    _write_review_packet(tmp_path, 200, "sha-200")
+    # PR 100: empty diff. PR 200: non-empty diff.
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+    (app.paths.prs / "pr-200" / "diff.patch").write_text(
+        "diff --git a/bar.py b/bar.py\n+pass\n", encoding="utf-8"
+    )
+
+    launched: list[int] = []
+
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        launched.append(kwargs.get("issue_number") or args[0])
+        return _fake_claude_worker_record(
+            kwargs.get("issue_number") or args[0],
+            kwargs.get("branch") or args[1],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # Only PR 200 must have been launched.
+    assert launched == [200]
+    assert result.data["launched_count"] == 1
+    # PR 100 must be in the skipped list.
+    assert 100 in result.data["skipped_empty_diff"]
+    assert 200 not in result.data["skipped_empty_diff"]
+    # PR 100's attempt count must not have been incremented.
+    state = load_state(app.paths.state_file)
+    assert int(state["prs"].get("100", {}).get("review_dispatch_attempt_count", 0)) == 0
+    # PR 200's attempt count must have been incremented (claimed).
+    assert int(state["prs"]["200"].get("review_dispatch_attempt_count", 0)) == 1
+
+
+def test_dispatch_reviews_dry_run_empty_diff_preview_is_read_only(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Issue #1251: the dry-run preview branch of dispatch_reviews mirrors the
+    real path's empty-diff pre-flight gate (added at the dry-run branch's
+    dry_selected/dry_skipped_empty_diff loop) but must stay strictly read-only:
+    no review_skipped_empty_diff event emitted, no state.json mutation, no
+    attempt_count change. This is the only test covering that loop -- no other
+    dispatch_reviews dry-run test exists in the file."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+        {
+            "number": 200,
+            "title": "Fix #20",
+            "url": "https://example.test/pull/200",
+            "headRefName": "agent/issue-20-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-200",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #20",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs, dry_run=True)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    _write_review_packet(tmp_path, 200, "sha-200")
+    # PR 100: empty diff. PR 200: non-empty diff.
+    (app.paths.prs / "pr-100" / "diff.patch").write_text("", encoding="utf-8")
+    (app.paths.prs / "pr-200" / "diff.patch").write_text(
+        "diff --git a/bar.py b/bar.py\n+pass\n", encoding="utf-8"
+    )
+
+    # A dry-run pass must never launch a worker. Guard against the launch
+    # helper being invoked at all -- if it is, the dry-run gate failed.
+    def fake_launch(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
+        raise AssertionError("dry-run dispatch_reviews must not launch a worker")
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
+
+    # Snapshot state.json's raw bytes so a no-op dry-run can be proven by
+    # byte-equality, not just by re-reading parsed fields.
+    state_path = app.paths.state_file
+    state_before = state_path.read_bytes()
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The empty-diff PR is excluded from the would-dispatch count; the
+    # non-empty PR is the only one that would be dispatched.
+    assert result.data["selected_count"] == 1
+    assert result.data["attempted_count"] == 1
+    assert result.data["launched_count"] == 0
+    # deferred_count = all_candidates - dry_selected = 2 - 1 = 1 (the empty
+    # PR is counted as deferred in the dry-run preview, mirroring how the
+    # real path's deferred_count = candidates - dispatchable treats a
+    # pre-flight-skipped PR as not-selected).
+    assert result.data["deferred_count"] == 1
+    # The empty-diff PR is reported in skipped_empty_diff; the non-empty is not.
+    assert result.data["skipped_empty_diff"] == [100]
+    # Read-only contract: no review_skipped_empty_diff event emitted.
+    skip_events = query_events(app.paths.state_file, kind="review_skipped_empty_diff")
+    assert skip_events == []
+    # Read-only contract: state.json bytes unchanged.
+    assert state_path.read_bytes() == state_before
+    # Read-only contract: no attempt_count mutation for either PR.
+    state = load_state(state_path)
+    assert "100" not in state["prs"]
+    assert "200" not in state["prs"]
 
 
 def test_dispatch_reviews_forwards_orchestrator_config_to_launch(
@@ -42140,6 +42416,240 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     assert payload["exit_code"] == 0
 
 
+def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Path) -> None:
+    """Issue #1230: a dead dispatched worker with no open PR whose issue already
+    carries ``agent:human-needed`` (applied by a mention-flag escalation) is
+    invisible to the #417 ground-truth label reclaim (no active labels to
+    remove) and invisible to the redispatch cap (never re-dispatched because the
+    terminal label excludes it).  The no-open-PR drift branch sets
+    ``orphan_flagged_at`` but never set ``orphan_drift_at``, so the
+    ``dead_dispatched_reap_minutes`` time-based backstop — which keys off
+    ``orphan_drift_at`` — never fired.  The issue wedged in ``dispatched``
+    indefinitely: not dispatchable (status says a worker owns it), not
+    sweepable (status is not ``escalated``), and the label promises a human
+    review the state machine cannot act on.
+
+    The fix: the no-open-PR drift branch must also stamp ``orphan_drift_at`` so
+    the existing ``dead_dispatched_reap_minutes`` backstop converges the status
+    to ``escalated`` after the grace period, regardless of concurrent
+    label-side transitions.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the jc #1421 shape: dispatched, dead PID, no open PR, and the issue
+    # already carries agent:human-needed from a mention-flag escalation
+    # (merged_pr_mention_flagged_at set).  No active labels are present, so the
+    # #417 reclaim is a no-op and the issue is excluded from dispatch.
+    state = load_state(paths.state_file)
+    state["issues"]["1421"] = {
+        "status": "dispatched",
+        "worker_pid": 45292,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2026-08-09T07:33:24Z",
+        "merged_pr_mention_flagged_at": "2026-08-10T12:00:00Z",
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues = [
+        {
+            "number": 1421,
+            "title": "call_model cascade timeout",
+            "url": "https://example.test/issues/1421",
+            "body": "",
+            # Only the terminal human-needed label — no active labels.
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Pass 1: the no-open-PR drift branch fires (no active labels to reclaim,
+    # no pushed branch).  It must stamp orphan_drift_at so the time-based
+    # backstop can fire on a later pass.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("orphan_flagged_at") is not None
+    assert entry.get("orphan_drift_at") is not None, (
+        "no-open-PR drift branch must set orphan_drift_at so the "
+        "dead_dispatched_reap_minutes backstop can converge the wedge"
+    )
+    # Status is still dispatched — the grace period has not elapsed.
+    assert entry.get("status") == "dispatched"
+
+    # Simulate the grace period elapsing: rewind orphan_drift_at to 120 minutes
+    # ago (past the 60-minute reap window).
+    old_drift_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    st["issues"]["1421"]["orphan_drift_at"] = old_drift_at
+    save_state(paths.state_file, st)
+
+    # Pass 2: the dead_dispatched_reap_minutes backstop must fire and converge
+    # status to escalated, even though the escalation label is already present.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+
+    # The reap event must be recorded.
+    reaped_events = [
+        e for e in st.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 1421
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
+
+
+def test_orphaned_worker_no_open_pr_already_flagged_backstop_backfills(tmp_path: Path) -> None:
+    """Issue #1230 regression: the real wedge precondition is an entry that was
+    flagged on a prior pass (``orphan_flagged_at`` set) but never received an
+    ``orphan_drift_at`` stamp -- either because it was flagged by a pre-#1230
+    build (which set only ``orphan_flagged_at``) or via the reclaim-success
+    branch (which deliberately omits ``orphan_drift_at``).  The original #1230
+    fix placed the ``orphan_drift_at`` stamp behind the
+    ``orphan_flagged_at`` early-return guard, so already-flagged entries hit
+    ``continue`` before the stamp was written and remained permanently
+    unreachable -- the backstop never armed and the issue never escalated.
+
+    The fix decouples the backfill from the guard: ``orphan_drift_at`` is
+    backfilled from ``orphan_flagged_at`` whenever it is missing, BEFORE the
+    duplicate-event guard's early-return.  This test seeds the exact wedge
+    precondition (``orphan_flagged_at`` set, ``orphan_drift_at`` absent, grace
+    period already elapsed) and verifies the backstop arms on the next sweep
+    pass and the issue escalates.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, dead_dispatched_reap_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed the wedge precondition: orphan_flagged_at is set to 120 minutes ago
+    # (past the 60-minute reap grace) but orphan_drift_at is ABSENT.  This is
+    # the state a pre-#1230-flagged entry (or a reclaim-success entry that
+    # later fell through to the drift branch) would be in.
+    flagged_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
+    state = load_state(paths.state_file)
+    state["issues"]["1421"] = {
+        "status": "dispatched",
+        "worker_pid": 45292,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": (datetime.now(UTC) - timedelta(days=4))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "merged_pr_mention_flagged_at": (datetime.now(UTC) - timedelta(days=3))
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "orphan_flagged_at": flagged_at,
+        # orphan_drift_at deliberately ABSENT -- the wedge precondition.
+    }
+    save_state(paths.state_file, state)
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues = [
+        {
+            "number": 1421,
+            "title": "call_model cascade timeout",
+            "url": "https://example.test/issues/1421",
+            "body": "",
+            # Only the terminal human-needed label -- no active labels, so the
+            # #417 reclaim is a no-op and the issue is excluded from dispatch.
+            "labels": [{"name": config.labels.human_needed}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    def _run_sweep() -> None:
+        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+
+    # Pass 1: the drift branch is reached (no active labels to reclaim).  The
+    # duplicate-event guard sees orphan_flagged_at already set, but the
+    # backfill must run BEFORE the early-return so orphan_drift_at is armed.
+    # The backstop at the top of the loop already ran this pass with
+    # orphan_drift_at absent, so escalation cannot happen yet -- but the stamp
+    # must now be present for the next pass.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("orphan_drift_at") is not None, (
+        "already-flagged entry must have orphan_drift_at backfilled from "
+        "orphan_flagged_at so the backstop can arm on the next sweep pass"
+    )
+    # Backfill must use the original flag timestamp (not utc_now()) so an
+    # already-wedged entry converges immediately instead of waiting another
+    # full grace window.
+    assert entry.get("orphan_drift_at") == flagged_at
+    # The duplicate-event guard still suppresses the drift event -- no new
+    # orphaned_worker_drift for this issue on this pass.
+    drift_events = [
+        e
+        for e in st.get("events", [])
+        if e.get("kind") == "orphaned_worker_drift"
+        and e.get("payload", {}).get("issue_number") == 1421
+    ]
+    assert len(drift_events) == 0
+    # Status is still dispatched -- the backstop runs at the top of the loop,
+    # before the drift branch, so it could not fire this pass.
+    assert entry.get("status") == "dispatched"
+
+    # Pass 2: the backstop at the top of the loop now sees orphan_drift_at
+    # (backfilled to 120 minutes ago, past the 60-minute grace) and must
+    # escalate.
+    _run_sweep()
+    st = load_state(paths.state_file)
+    entry = st["issues"]["1421"]
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "dead_dispatched_worker_reap"
+    assert entry.get("reason_class") == "mechanical"
+
+    reaped_events = [
+        e for e in st.get("events", []) if e.get("kind") == "dead_dispatched_worker_reaped"
+    ]
+    assert len(reaped_events) == 1
+    payload = reaped_events[0]["payload"]
+    assert payload["issue_number"] == 1421
+    assert payload["previous_status"] == "dispatched"
+    assert payload["reason"] == "dead_dispatched_worker_reap"
+    assert payload["reap_minutes"] == 60
+
+
 def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -> None:
     """Issue #654: a dead dispatched worker whose drift was surfaced recently
     (within ``dead_dispatched_reap_minutes``) must NOT be time-escalated.  The
@@ -44333,6 +44843,305 @@ def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path)
     state = json.loads(state_file.read_text(encoding="utf-8"))
     events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
     assert len(events) == 1
+
+
+def test_classify_dead_sessions_skips_salvage_when_issue_closed(tmp_path: Path) -> None:
+    """Issue #1221 (check 1): salvage refuses to open a PR when the linked
+    issue is already CLOSED. The dead session's snapshot is stale -- an
+    operator/sibling merged the work and closed the issue inside the staleness
+    window -- so salvage re-checks live issue state at fire time and downgrades
+    to a ``salvage_skipped_already_landed`` event instead of a vestigial PR.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    # Closed issue still carrying an active label (the secondary defect in
+    # #1221): the active-label gate lets the lane proceed, and salvage's own
+    # closed-issue check must refuse the PR.
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "CLOSED",
+        }
+    ]
+    gh.pr_create_return = 999  # would-be vestigial salvage PR
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    # No vestigial PR opened.
+    assert not gh.prs_created
+    # Active label is NOT stripped by the skip path (label cleanup is the
+    # reconcile lane's job); the issue is not re-dispatched.
+    assert (1221, config.labels.in_progress) not in gh.labels_removed
+    assert (1221, config.labels.ready) not in gh.labels_added
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "issue_closed"
+    # The skip path does NOT remove labels -- the payload records active_labels
+    # (what the issue carried at skip time), not removed_labels.
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
+    # No session_salvaged event was emitted.
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_skips_salvage_when_pr_merged(tmp_path: Path) -> None:
+    """Issue #1221 (check 2): salvage refuses to open a PR when a PR binding to
+    the issue is already MERGED, even if the GitHub issue is still OPEN (the
+    close event lags or the merge closed it after the snapshot)."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    # A merged PR whose head ref binds to issue 1221 via the branch prefix.
+    gh.prs = [
+        {
+            "number": 1217,
+            "title": "Fix #1221",
+            "url": "https://example.test/pull/1217",
+            "headRefName": branch,
+            "baseRefName": "main",
+            "headRefOid": "sha-merged",
+            "body": "Closes #1221",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "MERGED",
+        }
+    ]
+    gh.pr_create_return = 999
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    assert not gh.prs_created
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "pr_merged"
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_skips_salvage_when_branch_empty_diff(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3): salvage refuses to open a PR when the branch's
+    tree is identical to current main's tree -- the work already landed, so a
+    salvage PR would be vestigial.
+
+    Reproduces the exact race: ``inspect_worktree_state`` resolves its base
+    against a *stale* ``origin/main`` tracking ref (so it sees COMPLETED, ahead
+    of the old tip), while the live remote main has already advanced to include
+    the branch's work. Salvage fetches the live tip before opening a PR and
+    detects the empty tree diff.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    # Push the worker branch so a second clone can merge it into main.
+    _git(repo_root, "push", "origin", branch)
+
+    # Advance origin/main to include the branch's work via a SECOND clone,
+    # leaving repo_root's origin/main tracking ref stale -- the race window
+    # between the merge landing and the dead session's staleness tripping.
+    clone2 = tmp_path / "clone2"
+    clone2.mkdir(parents=True, exist_ok=True)
+    _git(clone2, "init", "--initial-branch=main")
+    _git(clone2, "config", "user.email", "test@example.test")
+    _git(clone2, "config", "user.name", "Test User")
+    _git(clone2, "config", "commit.gpgSign", "false")
+    _git(clone2, "remote", "add", "origin", str(remote))
+    _git(clone2, "fetch", "origin")
+    _git(clone2, "merge", "--ff-only", f"origin/{branch}")
+    _git(clone2, "push", "origin", "main")
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 999
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    # No vestigial PR: the branch contributes nothing beyond current main.
+    assert not gh.prs_created
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    skip_events = [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    assert len(skip_events) == 1
+    assert skip_events[0]["payload"]["issue_number"] == 1221
+    assert skip_events[0]["payload"]["reason"] == "empty_diff"
+    assert "removed_labels" not in skip_events[0]["payload"]
+    assert skip_events[0]["payload"]["active_labels"] == [config.labels.in_progress]
+    assert not [e for e in state["events"] if e["kind"] == "session_salvaged"]
+
+
+def test_classify_dead_sessions_salvage_proceeds_when_merged_pr_search_fails(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 2 fail-safe): when ``merged_prs_for_issue`` returns
+    ``ok=False``, salvage must NOT treat that as evidence of a merge. It falls
+    through to the empty-diff check (check 3) and, if the branch has real work,
+    opens a PR -- a human reviews salvage PRs anyway.
+
+    The result carries a non-empty list with ``ok=False`` so the test exercises
+    the ``ok`` flag specifically: without it, ``len(merged) > 0`` alone would
+    trigger ``pr_merged`` and suppress the PR.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1221)
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1221, branch, worktree_path)
+
+    config = OrchestratorConfig()
+
+    class FakeGitHubFailingMergeSearch(FakeGitHub):
+        def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+            # Non-empty list with ok=False: a failed search that happened to
+            # return items must NOT be treated as a merge.
+            return github_module._MergedPRSearchResult(
+                [{"number": 1217, "state": "MERGED"}], ok=False
+            )
+
+    gh = FakeGitHubFailingMergeSearch(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1221,
+            "title": "Salvage race",
+            "url": "https://example.test/issues/1221",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 888
+
+    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+
+    # Salvage proceeded: the ok=False search fell through to the empty-diff
+    # check, which also did not fire (branch has real work), so a PR was opened.
+    assert len(gh.prs_created) == 1
+    assert gh.prs_created[0]["head"] == branch
+    # No skip event -- the fail-safe worked.
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert not [e for e in state["events"] if e["kind"] == "salvage_skipped_already_landed"]
+    salvaged = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert len(salvaged) == 1
+    assert salvaged[0]["payload"]["pr_number"] == 888
+
+
+def test_salvage_branch_empty_diff_returns_false_on_fetch_failure(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3 fail-safe): ``salvage_branch_empty_diff`` returns
+    False (do not skip salvage) when ``git fetch origin <base>`` fails -- a
+    transient network error falls back to opening the PR, which a human reviews
+    anyway. This is the fail-safe branch the design relies on but had no test.
+    """
+    from charlie_work.worktree import salvage_branch_empty_diff
+
+    # A git repo with NO origin remote: ``git fetch origin main`` fails.
+    repo_root = tmp_path / "no-remote-clone"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    _git(repo_root, "init", "--initial-branch=main")
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "Test User")
+    _git(repo_root, "config", "commit.gpgSign", "false")
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(repo_root, "add", "README.md")
+    _git(repo_root, "commit", "-m", "initial commit")
+
+    # No origin remote configured -- fetch will fail.
+    result = salvage_branch_empty_diff(repo_root, "agent/issue-1221", "main")
+    assert result is False
+
+
+def test_salvage_already_landed_proceeds_when_empty_diff_fetch_fails(
+    tmp_path: Path,
+) -> None:
+    """Issue #1221 (check 3 fail-safe, integration): when the git fetch inside
+    ``salvage_branch_empty_diff`` fails, the function returns False and
+    ``_salvage_already_landed`` returns ``(False, None)`` -- salvage proceeds
+    (does not skip) instead of treating the git error as evidence the work
+    already landed. A human reviews salvage PRs anyway.
+    """
+    from charlie_work.workflow import _salvage_already_landed
+
+    # A git repo with NO origin remote: ``git fetch origin main`` fails.
+    repo_root = tmp_path / "no-remote-clone"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    _git(repo_root, "init", "--initial-branch=main")
+    _git(repo_root, "config", "user.email", "test@example.test")
+    _git(repo_root, "config", "user.name", "Test User")
+    _git(repo_root, "config", "commit.gpgSign", "false")
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(repo_root, "add", "README.md")
+    _git(repo_root, "commit", "-m", "initial commit")
+
+    config = OrchestratorConfig()
+
+    class FakeGitHubEmptyMergeSearch(FakeGitHub):
+        def merged_prs_for_issue(self, issue_number: int, branch_prefix: str):
+            return github_module._MergedPRSearchResult([], ok=True)
+
+    gh = FakeGitHubEmptyMergeSearch()
+
+    # Issue is OPEN, no merged PR binds to it, and the fetch inside
+    # salvage_branch_empty_diff fails (no origin remote). The fail-safe
+    # must let salvage proceed: _salvage_already_landed returns (False, None).
+    already_landed, reason = _salvage_already_landed(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch="agent/issue-1221",
+        base_ref="main",
+        issue_number=1221,
+        issue={"state": "OPEN"},
+    )
+    assert already_landed is False
+    assert reason is None
 
 
 def test_session_failed_relabeled_payload_requires_reason() -> None:

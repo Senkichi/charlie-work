@@ -210,6 +210,7 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # (the 2026-08-05 scratch-clone repoint shape). The pass is refused
         # before config load, so this is terminal for the pass -> error.
         "venv_editable_anchor_violation": "error",
+        "venv_pth_repair_failed": "error",
         # -----------------------------------------------------------------
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
@@ -230,6 +231,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "cross_family_regen_not_reached": "warning",
         "dead_dispatched_worker_reaped": "warning",
         "deescalation_cap_exhausted": "warning",
+        # Issue #1000: a path:line citation in a dispatch-ready issue no longer
+        # matches the working tree (file renamed/deleted, line out of range, or
+        # blank). Warning, not error: dispatch is not gated on drift -- the flag
+        # comment is the signal, not a hold -- but a repeating burst on one issue
+        # means its citations keep rotting faster than anyone corrects them.
+        "dispatch_citation_drift_flagged": "warning",
         "dispatch_merged_pr_mention_flagged": "warning",
         "dispatch_merged_pr_references_closed": "warning",
         "dispatch_skip_blocked": "warning",
@@ -262,6 +269,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "review_dispatch_lifecycle_reaped": "warning",
         "review_packet_template_stale": "warning",
         "review_quota_exhausted": "warning",
+        # Issue #1251: a PR whose diff.patch is empty (zero-file diff vs base)
+        # was skipped before claiming a paid reviewer session. Warning, not
+        # info: an empty diff is a symptom of an upstream bug (e.g. #1221's
+        # vestigial duplicate PRs), not a routine dispatch outcome. A
+        # repeating burst on one PR is the signal that a salvage/duplicate
+        # path keeps producing zero-delta PRs.
+        "review_skipped_empty_diff": "warning",
         # The stale-claim recovery sweep (issue #487's "never claimed/dispatched"
         # path) skipped a PR without acting on it -- prompt_path was missing from
         # state or the file it names no longer exists on disk. Warning, not info:
@@ -291,6 +305,8 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_rate_limit_deferred": "warning",
         "supervise_relaunch_cap_reached": "warning",
         "unauthorized_merge_check_skipped": "warning",
+        "venv_pth_mismatch": "warning",
+        "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",
         # Issue #849: rescue capture preserves work before a reset. Warning
         # level because it means a worktree had uncommitted work that was
@@ -372,6 +388,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # publish and will otherwise be redispatched over.
         "salvage_pushed_stranded_commits": "info",
         "salvage_push_failed": "warning",
+        # Issue #1221: the pre-open re-check found the work already landed
+        # (issue closed, a PR already merged, or the branch's diff against
+        # main is empty) and skipped opening a vestigial duplicate PR. Info,
+        # not warning: this is the intended outcome of the fix -- the caller
+        # treats the skip as "handled" (no redispatch), sibling to
+        # ``salvage_pushed_stranded_commits`` rather than to
+        # ``salvage_push_failed`` (which is a genuine failure to publish).
+        "salvage_skipped_already_landed": "info",
         "quota_probe_succeeded": "info",
         "readiness_no_ci_rework_requested": "info",
         "reconcile": "info",
@@ -432,6 +456,20 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
 # that refer to ``_ERROR_KINDS`` / ``_WARNING_KINDS`` continue to work.
 _ERROR_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "error"})
 _WARNING_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "warning"})
+
+# Issue #1271: re-exported, not declared here. ``heartbeat_check.py`` is
+# stdlib-only by design (see ``scripts/README.md``) and this module imports
+# ``ci_fleet.observability``/``ci_fleet.provenance`` below at module load, so
+# declaring the frozenset in this module and having the script import it
+# from here would make a broken ``ci_fleet`` install crash the script with
+# an unhandled ImportError on exactly the failure class it exists to report.
+# ``charlie_work.event_kinds`` is the genuine leaf (stdlib-only, no further
+# charlie_work/ci_fleet imports) that both this module and
+# ``heartbeat_check.py`` import from -- see its module docstring. Every
+# member must be registered in ``_LEVEL_BY_KIND`` at ``"warning"`` --
+# bucketing only makes sense for warnings -- which
+# ``test_expected_operational_kinds_are_all_registered_warnings`` enforces.
+from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS  # noqa: E402,F401
 
 
 def _now_iso() -> str:

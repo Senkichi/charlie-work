@@ -43,6 +43,12 @@ from .checks import (
     _is_failing_run,
     summarize_checks,
 )
+from .citation_check import (
+    CitationVerdict,
+    drift_fingerprint as citation_drift_fingerprint,
+    drifted_verdicts as drifted_citation_verdicts,
+    verify_citations,
+)
 from .config import (
     AutoMergeConfig,
     CrossFamilyConfig,
@@ -58,7 +64,7 @@ from . import layout
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
-from .subprocess_runner import no_console_window_kwargs
+from .subprocess_runner import no_console_window_kwargs, run_captured
 from .cross_family import (
     CrossFamilyResult,
     LEGACY_VACUOUS_SUMMARY,
@@ -146,6 +152,7 @@ from .worktree import (
     remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
+    salvage_branch_empty_diff,
     salvage_push_stranded_commits,
     summarize_branch_work,
     worktree_ahead_of_sha,
@@ -5859,10 +5866,44 @@ def _detect_and_handle_orphaned_workers(
                 # Issue #259: mark the entry so it is not re-flagged every pass.
                 # Suppress ONLY the duplicate no-open-PR event; with-PR recovery
                 # paths must run regardless of the flag.
+                # Issue #1230: ``orphan_drift_at`` arms the
+                # ``dead_dispatched_reap_minutes`` time-based backstop checked
+                # at the top of this loop.  It must be backfilled whenever it
+                # is missing, INDEPENDENTLY of the ``orphan_flagged_at``
+                # duplicate-event guard below.  An entry that was flagged
+                # before this stamp existed (pre-#1230 builds set only
+                # ``orphan_flagged_at``) or via the reclaim-success branch
+                # above (which deliberately omits ``orphan_drift_at``) has
+                # ``orphan_flagged_at`` set but ``orphan_drift_at`` absent, so
+                # the guard's early-return permanently blocks the backstop
+                # from ever arming.  That is the wedge: the issue is not
+                # re-dispatchable (a terminal label like ``agent:human-needed``
+                # excludes it from the dispatchable pool), not sweepable
+                # (status is not ``escalated``), and the backstop never fires
+                # because ``orphan_drift_at`` was never set.  Backfill from
+                # ``orphan_flagged_at`` so the grace period is measured from
+                # when the drift was first observed -- an already-wedged entry
+                # (e.g. jc #1421, flagged 4+ days ago) converges on the very
+                # next sweep pass instead of waiting another full grace window.
+                # The reclaim-success branch above deliberately does NOT set
+                # ``orphan_drift_at`` -- that path leaves the issue ``ready``
+                # and re-dispatchable, so the backstop should not fire on the
+                # pass that reclaimed it.  This backfill only arms the backstop
+                # for entries that reach THIS drift branch (nothing to reclaim
+                # or reclaim failed), which means the issue is not on the
+                # normal re-dispatch path and the backstop is the correct
+                # convergence mechanism.
+                if (
+                    entry.get("orphan_drift_at") is None
+                    and entry.get("orphan_flagged_at") is not None
+                ):
+                    entry["orphan_drift_at"] = entry["orphan_flagged_at"]
                 if entry.get("orphan_flagged_at"):
                     state["issues"][str(issue_number)] = entry
                     continue
-                entry["orphan_flagged_at"] = utc_now()
+                drift_ts = utc_now()
+                entry["orphan_flagged_at"] = drift_ts
+                entry["orphan_drift_at"] = drift_ts
                 sweep_events.append(
                     (
                         "orphaned_worker_drift",
@@ -7921,6 +7962,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                         state_file=state_file,
                         failure_kind=failure_kind,
                         issue_title=issue.get("title") if issue else None,
+                        issue=issue,
                     )
                     if salvaged:
                         continue
@@ -8218,6 +8260,55 @@ def _open_salvage_pr(
     return pr_number, None, closing_ref
 
 
+def _salvage_already_landed(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    issue: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """Return ``(already_landed, reason)`` if salvage should be skipped.
+
+    Issue #1221: a dead session's snapshot (issue, pr_number, branch) can be
+    stale by the time staleness trips and salvage fires -- the linked issue may
+    have been closed and/or its PR merged by an operator or sibling worker
+    inside the staleness threshold window. Re-check LIVE terminal state at fire
+    time instead of trusting the snapshot. Any one of these means a salvage PR
+    would be vestigial (a duplicate of already-landed work):
+
+    1. the linked issue is CLOSED (``issue`` carries ``state`` from the
+       caller's ``gh.issue_view`` -- one call, already made).
+    2. a PR binding to this issue is MERGED (``gh.merged_prs_for_issue`` -- one
+       call). A failed search (``ok=False``) is treated as "unknown", which
+       falls through to opening the PR; a human reviews salvage PRs anyway.
+    3. the salvage branch's tree contributes an empty diff against current main
+       (``salvage_branch_empty_diff`` -- a fetch + two rev-parse calls). This
+       is the belt-and-suspenders for the case where (1)/(2) miss (e.g. a
+       squash-merge that closed the issue but whose PR search lags, or work
+       landed via a sibling branch). Fails safe (returns False) on git error.
+
+    ``reason`` is a short string identifying which check fired, recorded in the
+    ``salvage_skipped_already_landed`` event for diagnosis.
+    """
+    # (1) Issue closed.
+    if issue is not None and str(issue.get("state") or "").upper() == "CLOSED":
+        return True, "issue_closed"
+
+    # (2) A merged PR binds to this issue.
+    merged = gh.merged_prs_for_issue(issue_number, config.dispatch.branch_prefix)
+    if getattr(merged, "ok", True) and len(merged) > 0:
+        return True, "pr_merged"
+
+    # (3) The branch's tree is identical to current main's tree.
+    if salvage_branch_empty_diff(repo_root, branch, base_ref):
+        return True, "empty_diff"
+
+    return False, None
+
+
 def _attempt_salvage(
     *,
     gh: GitHubLike,
@@ -8232,6 +8323,7 @@ def _attempt_salvage(
     state_file: Path,
     failure_kind: str | None,
     issue_title: str | None = None,
+    issue: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None]:
     """Push a completed branch and open a PR, then move labels to ``pr_open``.
 
@@ -8239,7 +8331,45 @@ def _attempt_salvage(
     ``ok`` is ``True`` once the PR is created, even if the label swap failed;
     in that case ``error`` describes the label failure and the
     ``session_salvaged`` event records ``label_write_ok=False``.
+
+    ``ok`` is also ``True`` (with ``error=None``) when salvage is *skipped*
+    because the work already landed (issue #1221): the dead session's snapshot
+    can be stale, so before opening a PR we re-check live terminal state. A
+    skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
+    duplicate PR, and the caller treats it as "handled" (no redispatch).
     """
+    already_landed, skip_reason = _salvage_already_landed(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+        issue=issue,
+    )
+    if already_landed:
+        with state_lock(state_file):
+            state = load_state(state_file)
+            # Issue #282: preserve the liveness fingerprint so the recovery
+            # path can verify the worker is dead before the worktree is
+            # reclaimed.
+            state = append_event(
+                state,
+                "salvage_skipped_already_landed",
+                {
+                    "issue_number": issue_number,
+                    "failure_kind": failure_kind,
+                    "reason": skip_reason,
+                    # The skip path does NOT remove labels -- label cleanup is the
+                    # reconcile lane's job. Record the active labels at skip time
+                    # for diagnosis (what state the issue was in), not as removed.
+                    "active_labels": sorted(active_labels),
+                },
+                state_path=state_file,
+            )
+            save_state(state_file, state)
+        return True, None
+
     push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
     if not push_ok:
         return False, push_error
@@ -10529,6 +10659,11 @@ class OrchestratorApp:
         adapter_choices: dict[int, AdapterChoice] = {}
         api_enabled = self.config.api_worker.enabled
         routing_inputs = self._routing_inputs() if api_enabled else None
+        # Issue #1000: per-issue citation-drift verdicts and the fingerprint that
+        # dedups the flag-comment across passes. Populated in the loop below;
+        # consumed in the second state-lock section to stamp the issue record and
+        # emit one ``dispatch_citation_drift_flagged`` event per drift change.
+        citation_drift_stamps: dict[int, tuple[str, list[CitationVerdict]]] = {}
         # Issue #1010: pre-flight cross-repo gate. Issues whose referenced
         # file paths are all absent from the target repo are escalated to
         # human-needed instead of dispatching a worker that will wander to a
@@ -10562,6 +10697,18 @@ class OrchestratorApp:
                     template = self.config.api_worker.worker_template
 
             prompt_path = self._write_worker_prompt(full_issue, template=template)
+
+            # Issue #1000: verify path:line citations in the issue body against
+            # the working tree before a worker is sent to them. Drift is flagged
+            # (a comment on the issue, which the worker sees via $issue_comments)
+            # rather than auto-edited -- the correction needs judgment. The flag
+            # is deduped by fingerprint so a still-stale issue is not re-commented
+            # every pass, and a newly-stale citation re-alerts. Non-blocking: a
+            # verification failure never aborts dispatch, and dispatch itself is
+            # not gated on drift -- the comment is the signal, not a hold.
+            citation_drift_stamps.update(
+                self._check_issue_citations(issue_number, full_issue, previous_entries)
+            )
 
             # Check if this is a dead-worker recovery: the issue has a previous
             # dispatch record with the same branch name (i.e., our own crashed attempt)
@@ -10780,6 +10927,42 @@ class OrchestratorApp:
                     if result and result.pid is not None:
                         entry["worker_pid"] = result.pid
                         entry["worker_process_start_time"] = result.process_start_time
+                # Issue #1000: stamp the citation-drift fingerprint computed in
+                # the outside-lock loop. The comment was already posted there
+                # (best-effort); this persists the dedup marker so a still-stale
+                # issue is not re-commented next pass, and emits one event per
+                # drift change. ``citation_drift_flagged_at`` records the last
+                # time drift was observed, not the first -- it moves with every
+                # newly-detected drift state, matching the fingerprint's
+                # re-alert semantics.
+                drift_stamp = citation_drift_stamps.get(request.issue_number)
+                if drift_stamp is not None:
+                    fp, drift_verdicts = drift_stamp
+                    entry["citation_drift_fingerprint"] = fp
+                    if fp:
+                        entry["citation_drift_flagged_at"] = utc_now()
+                        state = self._record_event(
+                            state,
+                            "dispatch_citation_drift_flagged",
+                            {
+                                "issue": request.issue_number,
+                                "drifted_citations": [
+                                    {
+                                        "citation": v.citation.raw,
+                                        "path": v.citation.path,
+                                        "line": v.citation.line,
+                                        "end_line": v.citation.end_line,
+                                        "status": v.status.value,
+                                    }
+                                    for v in drift_verdicts
+                                ],
+                            },
+                        )
+                    else:
+                        # Drift resolved since the last pass: clear the marker
+                        # so a future regression re-alerts. No event -- the
+                        # interesting transition is into drift, not out of it.
+                        entry.pop("citation_drift_flagged_at", None)
                 state["issues"][str(request.issue_number)] = entry
                 # Issue #482: record the adapter choice (including fallback
                 # choices) into adapter_history so every routing decision is
@@ -13737,16 +13920,28 @@ class OrchestratorApp:
                 limit,
                 probe_mode_dry,
             )
+            # Issue #1251: mirror the real path's empty-diff pre-flight gate
+            # in the dry-run preview so the two cannot diverge. Read-only:
+            # no events emitted, no state mutation.
+            dry_selected: list[dict[str, Any]] = []
+            dry_skipped_empty_diff: list[int] = []
+            for c in selection.selected:
+                diff_text = self._read_packet_diff(c["pr"])
+                if diff_text is not None and not diff_text.strip():
+                    dry_skipped_empty_diff.append(c["pr"])
+                else:
+                    dry_selected.append(c)
             return CommandResult(
                 True,
-                f"dry-run: would dispatch {len(selection.selected)} reviewer(s)",
+                f"dry-run: would dispatch {len(dry_selected)} reviewer(s)",
                 {
-                    "selected_count": len(selection.selected),
-                    "attempted_count": len(selection.selected),
+                    "selected_count": len(dry_selected),
+                    "attempted_count": len(dry_selected),
                     "failed_count": 0,
                     "launched_count": 0,
-                    "deferred_count": len(all_candidates) - len(selection.selected),
+                    "deferred_count": len(all_candidates) - len(dry_selected),
                     "escalated_skipped": selection.escalated_skipped,
+                    "skipped_empty_diff": dry_skipped_empty_diff,
                     "merge_conflict_routed": [c["pr"] for c in selection.merge_conflict_routed],
                     "rescue_marked_excluded": [c["pr"] for c in rescue_marked_dry],
                     "recorded_verdicts": recorded_verdicts,
@@ -13958,6 +14153,43 @@ class OrchestratorApp:
         dispatchable = selection.dispatchable
         local_cap = selection.local_cap
         selected = selection.selected
+
+        # Issue #1251: pre-flight empty-diff gate. A PR whose diff.patch is
+        # empty (zero-file diff vs base) must not burn a paid reviewer
+        # session reviewing nothing. The packet build (review()) already
+        # fetches and writes diff.patch; an empty patch is the signal. Skip
+        # dispatch for these PRs and emit review_skipped_empty_diff instead
+        # of claiming. review_dispatch_attempt_count is NOT incremented --
+        # an empty diff is not a review attempt and must not walk toward
+        # escalation. Do not auto-close the PR from this path; closing is a
+        # separate judgment (the #1221 fix owns the duplicate-PR lifecycle).
+        # A missing diff.patch is NOT treated as empty -- that is a missing
+        # packet (a different problem), not a zero-delta PR.
+        skipped_empty_diff: list[int] = []
+        skipped_empty_diff_issues: dict[int, int | None] = {}
+        selected_with_diff: list[dict[str, Any]] = []
+        for c in selected:
+            diff_text = self._read_packet_diff(c["pr"])
+            if diff_text is not None and not diff_text.strip():
+                skipped_empty_diff.append(c["pr"])
+                skipped_empty_diff_issues[c["pr"]] = c.get("issue")
+            else:
+                selected_with_diff.append(c)
+        selected = selected_with_diff
+        if skipped_empty_diff:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for pr_number in skipped_empty_diff:
+                    state = self._record_event(
+                        state,
+                        "review_skipped_empty_diff",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": skipped_empty_diff_issues.get(pr_number),
+                        },
+                        level="warning",
+                    )
+                save_state(self.paths.state_file, state)
 
         # Escalate PRs whose dispatch attempt count has reached the cap.
         # These PRs are stuck (every reviewer died without a verdict) and
@@ -14437,6 +14669,7 @@ class OrchestratorApp:
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
             "escalated_skipped": escalated_skipped,
+            "skipped_empty_diff": skipped_empty_diff,
             "merge_conflict_results": merge_conflict_results,
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
@@ -25200,6 +25433,117 @@ class OrchestratorApp:
         try:
             return diff_path.read_text(encoding="utf-8")
         except OSError:
+            return None
+
+    def _check_issue_citations(
+        self,
+        issue_number: int,
+        full_issue: dict[str, Any],
+        previous_entries: dict[int, dict[str, Any]],
+    ) -> dict[int, tuple[str, list[CitationVerdict]]]:
+        """Verify ``path:line`` citations in ``full_issue``'s body (issue #1000).
+
+        Returns ``{issue_number: (fingerprint, drifted_verdicts)}`` when the
+        drift fingerprint changed since the last pass (including a change to
+        empty when drift resolved), and ``{}`` otherwise -- the caller only
+        stamps/emit-vents on a change, so an unchanged-stale issue is not
+        re-commented every pass. When drift is newly detected a flag comment is
+        posted on the issue (best-effort; a failure is logged and swallowed so
+        it can never abort dispatch). The comment is visible to the dispatched
+        worker through ``$issue_comments`` (issue #872), which is the point: a
+        worker that sees "these line numbers have drifted, grep for the symbol"
+        is not silently misled onto unrelated code.
+
+        This is the "cheap check" backstop. It catches coordinate drift
+        (file missing / out of range / blank line); it does not catch in-range
+        content drift, which the filing convention (``CONTRIBUTING.md``) is the
+        durable fix for. See ``citation_check`` for the full rationale.
+        """
+        body = str(full_issue.get("body") or "")
+        if not body.strip():
+            return {}
+        try:
+            verdicts = verify_citations(body, self.repo_root)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "citation_check failed issue=%d", issue_number, exc_info=True
+            )
+            return {}
+        drifted = drifted_citation_verdicts(verdicts)
+        new_fp = citation_drift_fingerprint(verdicts)
+        prev_entry = previous_entries.get(issue_number, {})
+        prev_fp = prev_entry.get("citation_drift_fingerprint")
+        # ``None`` (never stamped) and "" (no drift) both mean "no current drift
+        # marker" for the comparison; treat them as equal so the first pass on a
+        # clean issue does not stamp an empty fingerprint as a "change".
+        if (prev_fp or "") == new_fp:
+            return {}
+        if new_fp:
+            self._post_citation_drift_comment(issue_number, drifted)
+        return {issue_number: (new_fp, drifted)}
+
+    def _post_citation_drift_comment(
+        self, issue_number: int, drifted: list[CitationVerdict]
+    ) -> None:
+        """Post a best-effort flag comment listing drifted citations (issue #1000).
+
+        Never raises: a comment-posting failure is logged and swallowed so it
+        cannot abort the dispatch pass. The comment is stamped with the current
+        ``HEAD`` sha (the commit the check ran against) per the issue's
+        recommendation 2, so a reader can tell a drifted citation from one that
+        was always wrong.
+        """
+        head_sha = self._read_head_sha_best_effort()
+        lines = [
+            f"{ORCHESTRATOR_COMMENT_MARKER}",
+            "",
+            "## Citation drift detected (issue #1000)",
+            "",
+            "One or more ``path:line`` citations in this issue no longer match the"
+            " working tree. A worker reading the bare line number would land on"
+            " unrelated code and may infer the defect was already fixed. **Grep for"
+            " the cited symbol or surrounding context instead of trusting the line"
+            " number**, and consider re-filing with a symbol citation (see"
+            ' ``CONTRIBUTING.md`` -- "Citing code in issues").',
+            "",
+        ]
+        if head_sha:
+            lines.append(f"Verified against `HEAD` = `{head_sha}`.")
+            lines.append("")
+        lines.append("| citation | status |")
+        lines.append("|---|---|")
+        for v in drifted:
+            status_cell = v.status.value
+            if v.resolved_path:
+                # Surface where the file actually moved to for STALE_PREFIX
+                # verdicts so the worker can grep in the right place.
+                resolved_display = v.resolved_path.replace("\\", "/")
+                status_cell = f"{status_cell} (now at `{resolved_display}`)"
+            lines.append(f"| `{v.citation.raw}` | {status_cell} |")
+        body = "\n".join(lines)
+        issue_dir = self.paths.issues / f"issue-{issue_number}"
+        try:
+            issue_dir.mkdir(parents=True, exist_ok=True)
+            body_path = issue_dir / "citation-drift-comment.md"
+            body_path.write_text(body, encoding="utf-8")
+            self.gh.issue_comment(issue_number, body_path)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "citation drift comment post failed issue=%d", issue_number, exc_info=True
+            )
+
+    def _read_head_sha_best_effort(self) -> str | None:
+        """Return the current ``HEAD`` sha of ``repo_root``, or ``None``."""
+        try:
+            res = run_captured(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.repo_root,
+                timeout_seconds=15,
+            )
+            if not res.ok:
+                return None
+            return res.stdout.strip() or None
+        except Exception:
             return None
 
     def _comment_pr(self, pr_number: int, summary: str) -> None:
