@@ -28,16 +28,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
 from .github import (
     GitHubError,
     GitHubLike,
     GraphQLBudgetError,
+    PR_CLOSING_ISSUES_FIELDS,
     _LIST_LIMIT,
     label_names,
     linked_issue_number,
 )
-from .instrumentation import query_events
+from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, transition
 from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
@@ -2432,6 +2434,29 @@ def apply_fixes(
                             )
                             if branch_summary:
                                 salvage_body = f"{salvage_body}\n\n{branch_summary}"
+                            # cw#1263: canonicalize/validate the closing-reference
+                            # line the same way workflow.py's `_open_salvage_pr`
+                            # does, via the shared `closing_reference` module.
+                            # `workflow.py` imports `reconcile.py` (for
+                            # `apply_fixes`/`detect_drift`), so importing
+                            # `workflow._open_salvage_pr` back into this module
+                            # would cycle -- the standalone third module is what
+                            # lets both salvage-body builders share one
+                            # implementation without either importing the other.
+                            closing_ref = validate_closing_reference(
+                                salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
+                            )
+                            salvage_body = closing_ref.body
+                            if closing_ref.changed and state_path is not None:
+                                log_event(
+                                    state_path,
+                                    "pr_closing_ref_rewritten",
+                                    {
+                                        "issue_number": item.issue_number,
+                                        "findings": list(closing_ref.findings),
+                                        "source": "session_unpublished_work_salvaged",
+                                    },
+                                )
                             pr_number = pr_create(
                                 head=item.branch,
                                 base=item.base_branch,
@@ -2440,6 +2465,33 @@ def apply_fixes(
                             )
                         if pr_number is not None:
                             salvage_ok = True
+                            # `pr_number` is falsy (0) under `dry_run`, where no
+                            # real PR was opened -- only probe a real, truthy PR
+                            # number (mirrors workflow.py::_open_salvage_pr).
+                            if pr_number and state_path is not None:
+                                query_ok = True
+                                try:
+                                    pr_view = gh.pr_view(
+                                        pr_number, fields=PR_CLOSING_ISSUES_FIELDS
+                                    )
+                                except Exception:
+                                    pr_view = {}
+                                    query_ok = False
+                                linked_numbers = closing_issues_referenced_numbers(pr_view)
+                                # Only log when the query itself succeeded --
+                                # a transient `gh` failure must not be conflated
+                                # with a genuine unlinked-PR miss (see
+                                # workflow.py::_open_salvage_pr for rationale).
+                                if query_ok and item.issue_number not in linked_numbers:
+                                    log_event(
+                                        state_path,
+                                        "pr_closing_ref_unlinked",
+                                        {
+                                            "issue_number": item.issue_number,
+                                            "pr_number": pr_number,
+                                            "linked_issue_numbers": sorted(linked_numbers),
+                                        },
+                                    )
                         else:
                             salvage_error = "gh pr create failed or returned no PR number"
                     else:
