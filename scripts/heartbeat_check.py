@@ -32,15 +32,22 @@ import psutil
 import yaml
 
 # Issue #1271: the single declared source of truth for which warning-level
-# kinds are normal-operation signals (see the frozenset's own docstring in
-# instrumentation.py). Imported, never re-declared or hardcoded here, so
-# check_warning_events' bucketing stays correct as that set changes without
-# this file needing an edit. Unlike the rest of this module (see the
-# stale-open-issue-mention section docstring below for why it otherwise
-# avoids importing charlie_work), this one string-literal set is worth
-# importing directly: duplicating it here would be exactly the kind of
-# hardcoded list that drifts from the registry it is supposed to mirror.
-from charlie_work.instrumentation import EXPECTED_OPERATIONAL_KINDS
+# kinds are normal-operation signals (see the frozenset's own docstring).
+# Imported, never re-declared or hardcoded here, so check_warning_events'
+# bucketing stays correct as that set changes without this file needing an
+# edit. Unlike the rest of this module (see the stale-open-issue-mention
+# section docstring below for why it otherwise avoids importing
+# charlie_work), this one string-literal set is worth importing directly:
+# duplicating it here would be exactly the kind of hardcoded list that
+# drifts from the registry it is supposed to mirror.
+#
+# Imported from `charlie_work.event_kinds` specifically, NEVER from
+# `charlie_work.instrumentation` -- that module imports `ci_fleet` at
+# module load, and this script must stay importable even when `ci_fleet`
+# isn't (that's the entire reason it is stdlib-only; see scripts/README.md).
+# `event_kinds` is a genuine leaf: no charlie_work or ci_fleet imports of
+# its own, so importing it can never reach ci_fleet transitively.
+from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS
 
 # --------------------------------------------------------------------------
 # CONSTANTS
@@ -384,10 +391,12 @@ def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
 # charlie_work.github already has `issue_numbers_mentioned_by_pr` (a same-repo
 # PR title/body scanner) and `iter_unnegated_closing_keyword_matches` (a
 # negation-aware `#N` scanner used by `closing_keyword_gate.py`). This script
-# deliberately does NOT import charlie_work (see the module docstring and
-# `fleet_dir`), so the small negation/quote-stripping heuristics below are a
-# minimal, self-contained reimplementation for this one check rather than a
-# reuse of those functions. Two differences from `issue_numbers_mentioned_by_pr`
+# deliberately does NOT import charlie_work.github, or any other
+# ci_fleet-reachable charlie_work module (see the module docstring, `fleet_dir`,
+# and the `charlie_work.event_kinds` import's own comment for the one narrow,
+# stdlib-only exception), so the small negation/quote-stripping heuristics
+# below are a minimal, self-contained reimplementation for this one check
+# rather than a reuse of those functions. Two differences from `issue_numbers_mentioned_by_pr`
 # are intentional, not drift:
 #
 # 1. Bare `#N` is matched, not just `issue #N` / closing-keyword `#N`. Issue
@@ -1201,9 +1210,11 @@ def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> 
     against `_WARNING_KINDS` there), so filtering on the persisted
     `level = 'warning'` column here picks up every current and future
     warning kind without restating the kind list. This one check does import
-    `charlie_work.instrumentation` (see the module-level import's own
-    comment) -- but only for `EXPECTED_OPERATIONAL_KINDS`, the presentation
-    bucketing below, which is a distinct question from coverage.
+    `charlie_work.event_kinds` (see the module-level import's own comment,
+    and NOT `charlie_work.instrumentation` -- that module reaches `ci_fleet`
+    at import time, which this stdlib-only script must never depend on) --
+    but only for `EXPECTED_OPERATIONAL_KINDS`, the presentation bucketing
+    below, which is a distinct question from coverage.
 
     Deliberately different from `check_error_events` in exactly one place:
     a new warning-level event is reported via `report.warn`, not

@@ -402,29 +402,19 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
 _ERROR_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "error"})
 _WARNING_KINDS = frozenset({k for k, v in _LEVEL_BY_KIND.items() if v == "warning"})
 
-# Issue #1271: warning-level kinds that are normal-operation signals, not
-# faults -- ``scripts/heartbeat_check.py``'s own ``check_warning_events``
-# docstring already named these as such (``session_exited``: process
-# liveness proving the worker is gone, not that it failed, per #873;
-# ``dispatch_stale``: a paused fleet with a non-empty backlog;
-# ``runner_capacity_starved`` / ``draft_pr_ready_held``: self-pacing, not
-# damage). They fire at high volume relative to genuinely rare warnings, so
-# ``check_warning_events`` buckets them into a summarized count instead of
-# interleaving them with the flat detailed listing every other warning kind
-# still gets. This is the single declared source of truth for that bucket:
-# ``heartbeat_check.py`` imports it rather than hardcoding kind strings, so
-# adding a member here needs no change on that side. Every member must be
-# registered in ``_LEVEL_BY_KIND`` at ``"warning"`` -- bucketing only makes
-# sense for warnings -- which
+# Issue #1271: re-exported, not declared here. ``heartbeat_check.py`` is
+# stdlib-only by design (see ``scripts/README.md``) and this module imports
+# ``ci_fleet.observability``/``ci_fleet.provenance`` below at module load, so
+# declaring the frozenset in this module and having the script import it
+# from here would make a broken ``ci_fleet`` install crash the script with
+# an unhandled ImportError on exactly the failure class it exists to report.
+# ``charlie_work.event_kinds`` is the genuine leaf (stdlib-only, no further
+# charlie_work/ci_fleet imports) that both this module and
+# ``heartbeat_check.py`` import from -- see its module docstring. Every
+# member must be registered in ``_LEVEL_BY_KIND`` at ``"warning"`` --
+# bucketing only makes sense for warnings -- which
 # ``test_expected_operational_kinds_are_all_registered_warnings`` enforces.
-EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset(
-    {
-        "session_exited",
-        "dispatch_stale",
-        "runner_capacity_starved",
-        "draft_pr_ready_held",
-    }
-)
+from charlie_work.event_kinds import EXPECTED_OPERATIONAL_KINDS  # noqa: E402,F401
 
 
 def _now_iso() -> str:
