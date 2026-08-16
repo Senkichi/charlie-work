@@ -24,15 +24,26 @@ class _SalvageTestGitHub:
         pr_create_return: int | None = 101,
         remove_ok: bool = True,
         add_ok: bool = True,
+        repo_slug: str = "owner/repo",
+        closing_issue_numbers: list[int] | None = None,
+        pr_view_raises: bool = False,
     ) -> None:
         self.repo_root = repo_root
         self.dry_run = False
         self.pr_create_return = pr_create_return
         self._remove_ok = remove_ok
         self._add_ok = add_ok
+        self._repo_slug = repo_slug
+        # None means "same as the created PR's own issue number" -- set by
+        # each test via `closing_issue_numbers_override` when it needs to
+        # simulate a mismatch; the default keeps existing tests (which never
+        # exercise the post-create probe) unaffected.
+        self._closing_issue_numbers = closing_issue_numbers
+        self._pr_view_raises = pr_view_raises
         self.prs_created: list[dict[str, Any]] = []
         self.labels_removed: list[tuple[int, str]] = []
         self.labels_added: list[tuple[int, str]] = []
+        self.pr_view_calls: list[int] = []
 
     def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
         self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
@@ -55,6 +66,18 @@ class _SalvageTestGitHub:
         self.labels_added.append((number, label))
         return self._add_ok
 
+    def name_with_owner(self) -> str:
+        return self._repo_slug
+
+    def pr_view(self, number: int, *, fields: str = "") -> dict[str, Any]:
+        self.pr_view_calls.append(number)
+        if self._pr_view_raises:
+            raise RuntimeError("gh pr view unavailable")
+        numbers = self._closing_issue_numbers
+        if numbers is None:
+            return {"closingIssuesReferences": []}
+        return {"closingIssuesReferences": [{"number": n} for n in numbers]}
+
 
 def _salvage_labels(config: OrchestratorConfig) -> tuple[set[str], set[str]]:
     active = {config.labels.in_progress}
@@ -70,7 +93,7 @@ def test_open_salvage_pr_creates_pr_and_moves_labels(tmp_path: Path) -> None:
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path)
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=tmp_path,
@@ -126,7 +149,7 @@ def test_open_salvage_pr_returns_none_on_pr_create_failure(tmp_path: Path) -> No
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path, pr_create_return=None)
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=tmp_path,
@@ -151,7 +174,7 @@ def test_open_salvage_pr_returns_pr_and_error_on_label_write_failure(tmp_path: P
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path, remove_ok=False)
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=tmp_path,
@@ -176,7 +199,7 @@ def test_open_salvage_pr_refuses_missing_repo_root() -> None:
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub()
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=None,
@@ -200,7 +223,7 @@ def test_open_pr_for_orphaned_branch_refuses_missing_repo_root() -> None:
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub()
 
-    pr_number, error = _open_pr_for_orphaned_branch(
+    pr_number, error, _closing_ref = _open_pr_for_orphaned_branch(
         gh=gh,
         config=config,
         repo_root=None,
@@ -224,7 +247,7 @@ def test_open_pr_for_orphaned_branch_uses_issue_title(tmp_path: Path) -> None:
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path)
 
-    pr_number, error = _open_pr_for_orphaned_branch(
+    pr_number, error, _closing_ref = _open_pr_for_orphaned_branch(
         gh=gh,
         config=config,
         repo_root=tmp_path,
