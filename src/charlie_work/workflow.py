@@ -12538,8 +12538,9 @@ class OrchestratorApp:
 
             # See _detect_ci_run_never_created for why this check exists
             # (job-cannon measured 11 PRs stuck 4+ days behind an ambiguous
-            # "Required check(s) missing" janitor failure). Detection only --
-            # no retry or retrigger here; that is follow-up policy.
+            # "Required check(s) missing" janitor failure). Detection lives
+            # entirely in that method; the retrigger policy below (issue
+            # #1274, W17) is this method's follow-up.
             ci_run_never_created_head_sha = self._detect_ci_run_never_created(
                 pr,
                 verdict,
@@ -12609,6 +12610,47 @@ class OrchestratorApp:
                         {"pr_number": pr_number, "failures": list(verdict.failures)},
                     )
                 save_state(self.paths.state_file, state)
+
+            # Issue #1274 (W17): follow-up retrigger policy for the detection
+            # above. `_detect_ci_run_never_created` dedupes per (pr, head_sha)
+            # -- once a head is recorded (`pr_state_update["ci_run_never_created_head"]`
+            # just above, which carries forward across passes via its
+            # `**existing_pr_state` spread regardless of whether THIS pass's
+            # own detector call fired), it returns None on every later pass
+            # for that SAME head -- the ordinary steady state (no new
+            # commits, checks still absent). Gating retrigger eligibility on
+            # this pass's live detector return alone would make the feature
+            # inert after its first pass, so read the marker that was just
+            # persisted above (which already reflects either this pass's own
+            # fresh positive or an earlier pass's) instead. Combine it with
+            # the LIVE "still missing" signal (`verdict.missing_required_checks`,
+            # recomputed fresh every pass by `run_janitor` regardless of the
+            # detector's own dedup) to decide whether a retrigger is in scope
+            # at all this pass. Deliberately NOT gated on
+            # `is_missing_checks_only_block` (binding comment item 5 on issue
+            # #1274): a retriggered run is harmless alongside an unrelated
+            # co-occurring janitor failure (merge conflict, empty body, ...)
+            # and gives the rework loop real signal -- the three PRs this
+            # item exists to fix (#1186/#1192/#1214) all carry a co-occurring
+            # failure.
+            stale_checks_head_sha = str(pr.get("headRefOid") or "") or None
+            stale_checks_retrigger_in_scope = (
+                issue_number is not None
+                and stale_checks_head_sha is not None
+                and pr_state_update.get("ci_run_never_created_head") == stale_checks_head_sha
+                and bool(verdict.missing_required_checks)
+            )
+            if stale_checks_retrigger_in_scope:
+                stale_checks_retrigger_result = self._attempt_stale_checks_retrigger(
+                    pr,
+                    pr_number=pr_number,
+                    issue_number=issue_number,
+                    head_sha=stale_checks_head_sha,
+                    existing_pr_state=pr_state_update,
+                )
+                if stale_checks_retrigger_result is not None:
+                    return stale_checks_retrigger_result
+
             return CommandResult(
                 False,
                 f"janitor gate blocked PR #{pr_number}: " + "; ".join(verdict.failures),
@@ -19392,6 +19434,254 @@ class OrchestratorApp:
             summary,
             "no_op_rework_repair_requested",
             extra_state=extra_state,
+        )
+
+    def _attempt_stale_checks_retrigger(
+        self,
+        pr: dict[str, Any],
+        *,
+        pr_number: int,
+        issue_number: int,
+        head_sha: str,
+        existing_pr_state: dict[str, Any],
+    ) -> CommandResult | None:
+        """Follow-up retrigger policy for ``_detect_ci_run_never_created``
+        (issue #1274, W17).
+
+        Called from ``review()``'s main (non-escalated) janitor-gate path
+        only, once the caller has already established the current head is
+        marked (persisted or freshly detected) as never having had an
+        Actions run created for it, and that ``verdict.missing_required_checks``
+        is still non-empty this pass. This method owns only the *policy*
+        layer on top of that: the attempt cap, the post-retrigger grace
+        wait, and the mechanical retrigger itself. It never re-derives the
+        "never created" signal on its own -- that stays the sole
+        responsibility of ``_detect_ci_run_never_created`` (binding comment
+        item 2 on issue #1274: two independently-tuned grace periods gating
+        the same underlying condition is the invalid-state smell this
+        codebase's design explicitly avoids).
+
+        Mechanism, in order (binding comment item 5): close then reopen the
+        PR; an empty-commit push to its branch is a fallback used only when
+        close/reopen does not mechanically succeed. Both paths increment the
+        SAME ``stale_checks_retrigger_attempts`` counter -- one shared
+        budget, not two. A transient ``gh`` API error consumes no attempt
+        (mirrors the flake-rerun block's "record the error but do not
+        consume the attempt" convention a few hundred lines up in
+        ``review()``) -- it simply returns None so the caller falls through
+        to the existing passive ``janitor_blocked`` bookkeeping, unchanged.
+
+        NOTE (unverified -- see ``GitHub.pr_reopen``'s docstring, flagged
+        per issue #1274's binding comment item 6): whether reopening a PR
+        actually causes GitHub Actions to create a fresh check-suite run for
+        the PR's CURRENT head has not been confirmed against a live
+        repository; it cannot be verified with a real ``gh`` call inside a
+        sandboxed/mocked test environment. The empty-commit fallback exists
+        specifically because of that uncertainty.
+
+        Makes GitHub calls (via ``self.gh``) only when eligibility (cap,
+        grace wait) has already been decided with no lock held -- mirrors
+        every other rerun/retrigger block in this method (flake-aware
+        rerun, infra rerun): external I/O never happens while
+        ``state_lock`` is held.
+
+        Returns a ``CommandResult`` in two cases: a retrigger attempt was
+        actually made (mechanically succeeded, bookkeeping persisted), or
+        the attempt cap was already exhausted on entry and this call escalates
+        to the W9 operator queue (issue #1274 item 7) instead. Returns None
+        in every other case (still inside the post-retrigger grace wait, or a
+        mechanical failure that consumed no attempt) so the caller falls
+        through unchanged to the pre-existing janitor-gate bookkeeping below.
+
+        Exhaustion -> escalation routing (issue #1274 item 7): once
+        ``stale_checks_retrigger_attempts >= stale_checks_max_retriggers``
+        AND the caller has already established the check suite is still
+        missing this pass (a precondition of even being called -- see
+        ``review()``'s ``stale_checks_retrigger_in_scope`` gate), escalate
+        via ``_escalate_issue`` (``reason="stale_checks_retrigger_exhausted"``,
+        ``reason_class="mechanical"``) followed by
+        ``transition(..., "escalated")`` -- the same mechanism every other
+        cap-exhaustion escalation in this file relies on to actually land
+        ``agent:human-needed`` (mirrors the infra-rerun exhaustion block,
+        a few hundred lines up in ``review()``: mechanical cap exceeded, no
+        code-fix rework path, straight to a human instead of looping
+        forever). Re-firing on a later pass is guarded explicitly below,
+        although it is also structurally prevented: once escalated,
+        ``review()``'s top-of-function escalated-visibility early return
+        (``status == "escalated"``) makes this whole method unreachable on
+        every subsequent pass, the same way it already does for the
+        retrigger action itself (scope fence item 3/b on issue #1274).
+        """
+        raw_attempts = existing_pr_state.get("stale_checks_retrigger_attempts", 0)
+        attempts = raw_attempts if isinstance(raw_attempts, int) else 0
+        max_retriggers = self.config.review.stale_checks_max_retriggers
+        if attempts >= max_retriggers:
+            return self._escalate_stale_checks_exhaustion(
+                pr_number=pr_number,
+                issue_number=issue_number,
+                head_sha=head_sha,
+                attempts=attempts,
+                max_retriggers=max_retriggers,
+                existing_pr_state=existing_pr_state,
+            )
+
+        last_retrigger_at = existing_pr_state.get("stale_checks_last_retrigger_at")
+        if last_retrigger_at:
+            last_dt = _parse_iso_timestamp(str(last_retrigger_at))
+            if last_dt is not None:
+                grace_minutes = self.config.review.stale_checks_grace_minutes
+                elapsed_minutes = (datetime.now(UTC) - last_dt).total_seconds() / 60.0
+                if elapsed_minutes < grace_minutes:
+                    # Still inside the post-retrigger grace wait: skip this
+                    # pass silently -- no event, no bookkeeping change
+                    # (binding comment item 5 on issue #1274).
+                    return None
+
+        close_result = self.gh.pr_close(pr_number)
+        if close_result.ok:
+            reopen_result = self.gh.pr_reopen(pr_number)
+            mechanically_succeeded = reopen_result.ok
+        else:
+            mechanically_succeeded = False
+        method = "close_reopen"
+        if not mechanically_succeeded:
+            method = "empty_commit"
+            branch = str(pr.get("headRefName") or "")
+            empty_commit_result = self.gh.push_empty_commit(branch) if branch else None
+            mechanically_succeeded = empty_commit_result is not None and empty_commit_result.ok
+
+        if not mechanically_succeeded:
+            # Record it, but do not consume the attempt (same convention as
+            # the flake-rerun / infra-rerun API-error branches above): a
+            # transient gh error must not burn the bounded retrigger budget.
+            return None
+
+        new_attempts = attempts + 1
+        now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            state["prs"][str(pr_number)] = {
+                **state["prs"].get(str(pr_number), {}),
+                "number": pr_number,
+                "issue_number": issue_number,
+                "stale_checks_retrigger_attempts": new_attempts,
+                "stale_checks_last_retrigger_at": now_iso,
+            }
+            state = self._record_event(
+                state,
+                "ci_retriggered_stale_checks",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "head_sha": head_sha,
+                    "method": method,
+                    "attempt": new_attempts,
+                },
+            )
+            save_state(self.paths.state_file, state)
+        return CommandResult(
+            False,
+            f"CI retrigger attempted for PR #{pr_number} "
+            f"(attempt {new_attempts}/{max_retriggers}, method={method})",
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "stale_checks_retriggered": True,
+                "stale_checks_retrigger_method": method,
+                "stale_checks_retrigger_attempts": new_attempts,
+            },
+        )
+
+    def _escalate_stale_checks_exhaustion(
+        self,
+        *,
+        pr_number: int,
+        issue_number: int,
+        head_sha: str,
+        attempts: int,
+        max_retriggers: int,
+        existing_pr_state: dict[str, Any],
+    ) -> CommandResult | None:
+        """Exhaustion -> escalation routing for the stale-checks retrigger
+        lane (issue #1274 item 7, the W9 operator queue).
+
+        Called only from ``_attempt_stale_checks_retrigger`` once
+        ``attempts >= max_retriggers`` on entry, with the check suite
+        confirmed still missing this pass by the caller's own
+        ``stale_checks_retrigger_in_scope`` precondition. Escalates via
+        ``_escalate_issue`` + ``transition(..., "escalated")`` -- the same
+        pair every other ``reason_class="mechanical"`` cap-exhaustion
+        escalation in this file (``dead_dispatched_worker_reap``,
+        ``orphan_sweep_redispatch_cap_exceeded``, ``redispatch_cap_exceeded``,
+        ``infra_rerun_cap_exceeded``) uses to actually land
+        ``agent:human-needed`` -- never a second queue or a hardcoded label.
+
+        Dedup guard: skips re-escalating once this PR/issue already carries
+        ``escalation_reason == "stale_checks_retrigger_exhausted"``. This
+        mirrors ``_route_janitor_gate_failure_to_rework``'s
+        ``current_escalation_reasons`` dedup convention, but is
+        belt-and-suspenders here rather than load-bearing: once escalated,
+        ``status`` becomes ``"escalated"``, and ``review()``'s top-of-function
+        escalated-visibility early return (``_escalation_flags``, matched on
+        status alone) makes this entire method structurally unreachable on
+        every later pass -- the same structural guarantee that already
+        excludes the retrigger action itself from that branch (scope fence
+        item 3/b). The explicit check here only matters if something resets
+        ``status`` while ``escalation_reason`` survives; it is kept for
+        readability parity with the rest of this file and because it is
+        directly testable independent of that structural argument.
+
+        Returns None (never re-escalates, never emits a duplicate event) when
+        the dedup guard trips; otherwise always returns a ``CommandResult``
+        (``ok=False``) describing the escalation, mirroring the infra-rerun
+        exhaustion block's return shape.
+        """
+        exhaustion_reason = "stale_checks_retrigger_exhausted"
+        if existing_pr_state.get("escalation_reason") == exhaustion_reason:
+            return None
+
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            state = _escalate_issue(
+                state,
+                issue_number,
+                reason=exhaustion_reason,
+                reason_class="mechanical",
+                pr_number=pr_number,
+                pr_extra={"stale_checks_retrigger_attempts": attempts},
+            )
+            state = self._record_event(
+                state,
+                "stale_checks_retrigger_exhausted",
+                {
+                    "pr_number": pr_number,
+                    "issue_number": issue_number,
+                    "head_sha": head_sha,
+                    "attempts": attempts,
+                    "max_retriggers": max_retriggers,
+                },
+            )
+            save_state(self.paths.state_file, state)
+
+        result = transition(self.gh, self.config.labels, issue_number, "escalated")
+        label_error = None
+        if result.outcome != TransitionOutcome.APPLIED:
+            label_error = {
+                "edge": "escalated",
+                "outcome": result.outcome.value,
+                "add_failures": result.add_failures,
+                "remove_failures": result.remove_failures,
+            }
+        return CommandResult(
+            False,
+            f"PR #{pr_number} exhausted stale-checks retrigger cap "
+            f"({attempts}/{max_retriggers}); escalated to human",
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "stale_checks_retrigger_exhausted": True,
+                "label_error": label_error,
+            },
         )
 
     def _detect_ci_run_never_created(

@@ -359,6 +359,28 @@ class ReviewConfig:
     # CLI's `--comment` flag remains a force-on override on top of this,
     # not replaced by it.
     post_verdict_comment: bool = True
+    # Issue #1274 (W17): follow-up policy for `_detect_ci_run_never_created`'s
+    # existing "zero check suites" signal (workflow.py) -- close/reopen (or an
+    # empty-commit fallback) the PR to try to force GitHub Actions to create
+    # the missing check-suite run. This field governs ONLY the wait between
+    # successive retrigger attempts on the SAME still-missing head; it is
+    # never consulted by the detector itself, which has its own independent
+    # grace window (auto_merge.ci_run_never_created_grace_minutes) before it
+    # will even report a head as never-created. Two grace periods gating the
+    # same underlying condition would be the invalid-state smell this
+    # codebase's design explicitly avoids -- keep them separate by contract,
+    # not just by accident. 15 minutes gives a retriggered run enough time to
+    # actually appear before another attempt is considered.
+    stale_checks_grace_minutes: int = 15
+    # Same issue: bounds how many retrigger attempts (close/reopen or
+    # empty-commit, combined -- one shared counter, not two) a single PR gets
+    # before this codebase escalates it to a human via `_escalate_issue`
+    # instead of retrying forever. Mirrors max_conflict_rework_attempts /
+    # max_no_op_rework_attempts's role for their respective failure modes: a
+    # small bound that absorbs transient GitHub-side propagation lag without
+    # spinning indefinitely on a PR where retriggering mechanically cannot
+    # help (e.g. a workflow file itself is broken).
+    stale_checks_max_retriggers: int = 3
 
 
 @dataclass(frozen=True)
@@ -1777,7 +1799,34 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 f"config section 'dispatch' key 'max_open_agent_prs' must be >= 0, got {_mop}"
             )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
-    review = _build_section(ReviewConfig, "review", _section(data, "review"))
+    review_data = _section(data, "review")
+    stale_checks_grace_minutes = review_data.get("stale_checks_grace_minutes")
+    if stale_checks_grace_minutes is not None:
+        if isinstance(stale_checks_grace_minutes, bool) or not isinstance(
+            stale_checks_grace_minutes, int
+        ):
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_grace_minutes' must be an "
+                f"int, got {type(stale_checks_grace_minutes).__name__}"
+            )
+        if stale_checks_grace_minutes < 0:
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_grace_minutes' must not be negative"
+            )
+    stale_checks_max_retriggers = review_data.get("stale_checks_max_retriggers")
+    if stale_checks_max_retriggers is not None:
+        if isinstance(stale_checks_max_retriggers, bool) or not isinstance(
+            stale_checks_max_retriggers, int
+        ):
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_max_retriggers' must be an "
+                f"int, got {type(stale_checks_max_retriggers).__name__}"
+            )
+        if stale_checks_max_retriggers < 0:
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_max_retriggers' must not be negative"
+            )
+    review = _build_section(ReviewConfig, "review", review_data)
     review_dispatch_data = _section(data, "review_dispatch")
     for rd_bool_key in ("enabled",):
         rd_bool_value = review_dispatch_data.get(rd_bool_key)

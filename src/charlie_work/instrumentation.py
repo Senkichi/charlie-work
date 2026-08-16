@@ -202,6 +202,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_salvaged": "error",
         "session_stalled": "error",
         "spec_review_failed": "error",
+        # Issue #1274 (W17): stale_checks_retrigger_attempts reached
+        # stale_checks_max_retriggers and the check suite is still missing --
+        # no code-fix rework path exists for a run GitHub never created, so
+        # this escalates straight to a human via _escalate_issue +
+        # transition(..., "escalated"), the same pair infra_rerun_escalated /
+        # janitor_rework_escalated use. Terminal for the lane -> error, like
+        # the other *_escalated kinds in this section.
+        "stale_checks_retrigger_exhausted": "error",
         "supervisor_restart_watchdog_disabled": "error",
         # The supervise-loop wrapper's WedgeWatchdog detected that the
         # supervisor child was alive but had not updated its heartbeat in
@@ -337,6 +345,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # other ordinary lifecycle events
         # -----------------------------------------------------------------
         "check_failure_rework_requested": "info",
+        # Issue #1274 (W17): a mechanical retrigger (close/reopen, or an
+        # empty-commit push fallback) was actually issued for a PR whose
+        # head was marked ci_run_never_created. Info, not warning: this is
+        # the intended follow-up mechanism working as designed, mirroring
+        # flake_rerun_triggered / infra_rerun_triggered below.
+        "ci_retriggered_stale_checks": "info",
         "ci_run_never_created": "info",
         "closed_unmerged_pr_state_converged": "info",
         "containment_check": "info",
