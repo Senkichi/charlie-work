@@ -52,6 +52,7 @@ from typing import Any
 
 import pytest
 
+import charlie_work.rework_prompts as rework_prompts
 import charlie_work.workflow as workflow
 from charlie_work.workflow import OrchestratorApp, _existing_round_numbers
 
@@ -231,8 +232,17 @@ def test_ac8_mutation_ii_head_only_compare_breaks_distinct_verdict_isolation(
     reintroducing the rejected head-advanced-only rule. AC2(b) must fail
     specifically because round-1's archived content was overwritten/lost
     when a distinct verdict arrived on an unchanged head -- this is the
-    mutation that reproduces the actual data-loss bug W11 exists to fix."""
-    monkeypatch.setattr(workflow, "_ROUND_COMPARE_KEYS", ("reviewed_head_sha",))
+    mutation that reproduces the actual data-loss bug W11 exists to fix.
+
+    Issue #1283 Phase A (discovered during this PR's own hazard sweep, not
+    in the dispatch prompt's 4-item list -- flagged by Preflight and fixed
+    here since it is the same inverse-direction class as the other three
+    monkeypatch repoints and lives in a file this PR already touches):
+    `_ROUND_COMPARE_KEYS` and its sole reader `_next_round_number` both
+    moved to charlie_work/rework_prompts.py, so `_next_round_number` now
+    resolves the constant from rework_prompts's own module globals, not
+    workflow.py's facade re-export."""
+    monkeypatch.setattr(rework_prompts, "_ROUND_COMPARE_KEYS", ("reviewed_head_sha",))
 
     app, paths = _round_archive_app(tmp_path)
     with pytest.raises(AssertionError, match="must survive a distinct"):
@@ -271,11 +281,26 @@ def _ac6_call_func_name(node: ast.Call) -> str | None:
 
 
 def test_ac6_module_wide_write_sites_for_archived_filenames_are_atomic() -> None:
-    source = inspect.getsource(workflow)
-    tree = ast.parse(source)
+    # Issue #1283 Phase A: `_write_text_atomic` and its only in-family
+    # caller, `_write_rework_prompt`, moved to charlie_work/rework_prompts.py
+    # -- taking with them the two live writes this test protects
+    # (rework-prompt.md, rework-dispatch-note.txt). This is purely a
+    # call-site scan (it never resolves where a called name is *defined*),
+    # so `record_review`'s own archive-copy calls -- which stay in
+    # workflow.py, untouched -- would keep the violations check green on
+    # their own. But the positive-existence check below exists specifically
+    # so the guard can't pass by seeing only the archive copies while going
+    # blind to the live writes it exists to protect; scanning workflow.py
+    # alone would still find `_write_text_atomic`'s own def gone (harmless,
+    # it's an approved-writer exemption with nothing left to skip) but would
+    # never see the moved call sites at all. Both files' ASTs are unioned
+    # before either check runs.
+    sources = [inspect.getsource(workflow), inspect.getsource(rework_prompts)]
+    trees = [ast.parse(source) for source in sources]
 
     function_nodes = [
         node
+        for tree in trees
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
