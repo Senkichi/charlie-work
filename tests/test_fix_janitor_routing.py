@@ -86,8 +86,10 @@ def test_janitor_conflict_attempts_count_cycles_not_passes(tmp_path: Path) -> No
     failed cycle and consumes one attempt (bounding the
     push-conflicted-heads-forever loop); past ``max_conflict_rework_
     attempts`` escalate via the same ``transition()`` helper the other
-    escalation call sites use so ``agent:human-needed`` actually lands
-    (pr-lifecycle.md Finding 3).
+    escalation call sites use so the escalation label actually lands
+    (pr-lifecycle.md Finding 3). Issue #1266: this is a mechanical
+    reason (an attempt-cap limit, not a judgment call), so it lands
+    agent:operator-queue, not agent:human-needed.
     """
     app = _conflicting_app(tmp_path, review=ReviewConfig(max_conflict_rework_attempts=2))
     _set_decision(app, 456, "request_changes")
@@ -129,7 +131,7 @@ def test_janitor_conflict_attempts_count_cycles_not_passes(tmp_path: Path) -> No
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["prs"]["456"]["conflict_rework_attempts"] == 3
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
     escalated_events = [e for e in state["events"] if e["kind"] == "janitor_rework_escalated"]
     assert len(escalated_events) == 1
@@ -330,7 +332,10 @@ def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(tmp_path: Path) 
     ``max_no_op_rework_attempts`` the issue escalates with the label
     actually applied. Re-entry requires the pending status to be lost again
     (simulated here); in normal operation the pending-guard makes this
-    unreachable and dispatch-side caps bound the pending cycles.
+    unreachable and dispatch-side caps bound the pending cycles. Issue
+    #1266: this is a mechanical reason (an attempt-cap limit, not a
+    judgment call), so it lands agent:operator-queue, not
+    agent:human-needed.
     """
     config = OrchestratorConfig(review=ReviewConfig(max_no_op_rework_attempts=2))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -358,7 +363,7 @@ def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(tmp_path: Path) 
     state = load_state(app.paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
 
 def test_janitor_conflict_with_failed_required_check_still_routes_to_conflict_rework(
@@ -838,7 +843,8 @@ def test_janitor_conflict_stalled_rework_requested_escalates(tmp_path: Path) -> 
     # The stall path never burns an attempt -- it is a distinct escalation
     # reason from the cap, not a disguised extra cap check.
     assert state["prs"]["456"]["conflict_rework_attempts"] == 1
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    # Issue #1266: a stall is a mechanical reason -- lands agent:operator-queue.
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
     stalled_events = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
     assert len(stalled_events) == 1
@@ -987,7 +993,8 @@ def test_janitor_no_op_rework_stalled_escalates(tmp_path: Path) -> None:
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["prs"]["456"].get("no_op_rework_attempts", 0) == 0
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    # Issue #1266: a stall is a mechanical reason -- lands agent:operator-queue.
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
     stalled_events = [e for e in state["events"] if e["kind"] == "janitor_rework_stalled"]
     assert len(stalled_events) == 1

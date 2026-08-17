@@ -1566,6 +1566,75 @@ def test_label_config_is_frozen() -> None:
         labels.complexity_high = "x"  # type: ignore[misc]
 
 
+# ---------------------------------------------------------------------------
+# LabelConfig — operator_queue (issue #1266: mechanical-escalation routing)
+# ---------------------------------------------------------------------------
+
+
+def test_label_config_operator_queue_default() -> None:
+    from charlie_work.config import LabelConfig
+
+    assert LabelConfig().operator_queue == "agent:operator-queue"
+
+
+def test_label_config_operator_queue_in_terminal_set() -> None:
+    """A mechanically-escalated issue must never re-enter dispatch.
+
+    ``operator_queue`` has to be a member of ``terminal`` -- that set is what
+    ``OrchestratorApp._is_dispatchable`` (and the standalone dispatch-backlog
+    reachability check) intersect against to exclude an issue from selection.
+    Without this membership, an operator-queued issue would still carry
+    ``automated-ready`` and get redispatched out from under the operator.
+    """
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.operator_queue in labels.terminal
+
+
+def test_label_config_operator_queue_in_workflow_labels() -> None:
+    """Unlike ``prose_only_deps``, operator_queue is actively added/removed by
+    automated ``labels.py`` transitions (the operator_queued/
+    redispatch_operator_queued edges, and the de-escalation cap-exhaustion
+    path), so it must be a ``workflow_labels`` member -- otherwise
+    ``_compute_remove`` would never strip it on a transition away from it.
+    """
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.operator_queue in labels.workflow_labels
+
+
+def test_label_config_operator_queue_in_all_for_bootstrap() -> None:
+    """The label is in ``all`` so bootstrap_labels creates it on GitHub."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.operator_queue in labels.all
+
+
+def test_label_config_operator_queue_not_in_active_set() -> None:
+    """A terminal escalation state is not an "actively being worked" state."""
+    from charlie_work.config import LabelConfig
+
+    labels = LabelConfig()
+    assert labels.operator_queue not in labels.active
+
+
+def test_label_config_operator_queue_is_overridable(tmp_path: Path) -> None:
+    """The label string is configurable via the labels: section like every
+    other label -- issue #1266 forbids hardcoding it anywhere but here."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    _write_config(
+        config_file,
+        """labels:
+  operator_queue: agent:needs-operator
+""",
+    )
+    config = load_config(config_file)
+    assert config.labels.operator_queue == "agent:needs-operator"
+
+
 # --- Issue #600: runner_allocation is host-wide only; cross-validate floors ---
 
 

@@ -106,7 +106,9 @@ def test_rework_cycle_cap_with_rescue_already_attempted_escalates_normally(
     tmp_path: Path,
 ) -> None:
     """One rescue per PR: a PR that already spent its rescue attempt must
-    escalate exactly as it would with rescue disabled."""
+    escalate exactly as it would with rescue disabled. Issue #1266:
+    max_rework_cycles_exceeded is a mechanical reason, so it lands
+    agent:operator-queue, not agent:human-needed."""
     config = OrchestratorConfig(rescue=RescueConfig(enabled=True))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -129,13 +131,15 @@ def test_rework_cycle_cap_with_rescue_already_attempted_escalates_normally(
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["issues"]["123"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert _events(state, "rescue_dispatched") == []
 
 
 def test_rework_cycle_cap_disabled_config_matches_legacy_escalation(tmp_path: Path) -> None:
     """rescue.enabled defaults False: an absent/disabled config block must
-    reproduce byte-for-byte the pre-rescue escalation behavior."""
+    reproduce byte-for-byte the pre-rescue escalation behavior. Issue
+    #1266: max_rework_cycles_exceeded is a mechanical reason, so it lands
+    agent:operator-queue, not agent:human-needed."""
     config = OrchestratorConfig()  # rescue.enabled defaults False
     assert config.rescue.enabled is False
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -153,7 +157,7 @@ def test_rework_cycle_cap_disabled_config_matches_legacy_escalation(tmp_path: Pa
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["issues"]["123"]["status"] == "escalated"
     assert "rescue_attempted" not in state["prs"]["456"]
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 # --- Site 1b/1c: _route_janitor_gate_failure_to_rework (conflict/no-op caps) ---
@@ -233,7 +237,11 @@ def test_review_dispatch_attempt_cap_ineligible_still_escalates_with_rescue_enab
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["issues"]["123"]["status"] == "escalated"
     assert "rescue_attempted" not in state["prs"]["456"]
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: max_review_dispatch_attempts_exceeded is a mechanical
+    # reason (an attempt-cap limit), so it lands agent:operator-queue,
+    # not agent:human-needed -- "escalates straight to human" here means
+    # "skips the rescue tier", not "lands the judgment label".
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert len(_events(state, "review_dispatch_escalated")) == 1
     assert _events(state, "rescue_dispatched") == []
 
@@ -398,6 +406,10 @@ def _fake_cross_family_review(decision: str, summary: str):
 def test_process_rescue_review_request_changes_escalates_with_both_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Issue #1266: a "request_changes" rescue verdict is not a "blocked"
+    judgment call -- the rescue tier structurally cannot loop again, so
+    this is mechanical and lands agent:operator-queue, not
+    agent:human-needed."""
     captured_comments: list[tuple[int, str]] = []
 
     class CapturingGitHub(FakeGitHub):
@@ -423,7 +435,7 @@ def test_process_rescue_review_request_changes_escalates_with_both_artifacts(
     state = load_state(paths.state_file)
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["issues"]["123"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     events = _events(state, "rescue_review_escalated")
     assert len(events) == 1
@@ -441,6 +453,40 @@ def test_process_rescue_review_request_changes_escalates_with_both_artifacts(
     assert "agent/issue-123-fix-search" in comment_body
     assert "sha-abc123" in comment_body
     assert "rescue-review-report.md" in comment_body
+
+
+def test_process_rescue_review_blocked_verdict_still_escalates_to_human_needed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1266 behavior preservation: an explicit "blocked" rescue
+    verdict is a human product/security decision (the same judgment call as
+    record_review's own "blocked" path per issue #783), so it must keep
+    routing to agent:human-needed unchanged -- unlike "request_changes" and
+    an unparseable report (both mechanical, covered above), this is the one
+    rescue-review outcome _process_rescue_review classifies as reason_class
+    "judgment" (see the ``rescue_reason_class`` derivation in
+    ``_process_rescue_review``)."""
+    app = _rescue_marked_app(tmp_path)
+    monkeypatch.setattr(
+        "charlie_work.workflow.run_cross_family_review",
+        _fake_cross_family_review("blocked", "security concern, needs a human"),
+    )
+
+    result = app._process_rescue_review({"pr": 456, "issue": 123})
+
+    assert result.data["rescue_review_decision"] == "blocked"
+    assert result.data["escalated"] is True
+
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["456"]["status"] == "escalated"
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["reason_class"] == "judgment"
+    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) not in app.gh.labels_added
+
+    events = _events(state, "rescue_review_escalated")
+    assert len(events) == 1
+    assert events[0]["payload"]["verdict_decision"] == "blocked"
 
 
 def test_process_rescue_review_approved_takes_normal_merge_path(

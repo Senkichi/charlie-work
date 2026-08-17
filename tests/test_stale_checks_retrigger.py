@@ -404,7 +404,7 @@ def test_exhausted_bound_makes_zero_mechanical_calls(tmp_path: Path) -> None:
     a subsequent pass must make EXACTLY ZERO close/reopen/empty-commit calls
     (call-count assertion, not merely "no error"). This same pass is also
     where exhaustion -> escalation (AC7) fires -- see the dedicated
-    escalation assertions below, and ``test_exhausted_bound_escalates_to_human``
+    escalation assertions below, and ``test_exhausted_bound_escalates_to_operator_queue``
     for the fuller AC7 fixture (label edge + event payload + dedup).
     """
     app = _app_with_conflict_and_missing_checks(tmp_path, stale_checks_max_retriggers=2)
@@ -449,17 +449,18 @@ def test_exhausted_bound_makes_zero_mechanical_calls(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_exhausted_bound_escalates_to_human(tmp_path: Path) -> None:
+def test_exhausted_bound_escalates_to_operator_queue(tmp_path: Path) -> None:
     """Once exhausted AND the check suite is still missing, the linked issue
     is escalated via ``_escalate_issue`` with a distinct reason and
     ``reason_class="mechanical"`` -- and the SAME ``_escalate_issue`` +
-    ``transition(...)``-backed ``agent:human-needed`` label edge every other
-    cap-exhaustion escalation in this file relies on actually fires. Assert
-    the label transition call landed (``fake_gh.labels_added``), not just the
-    state.json write -- mirrors the concern
-    ``_route_janitor_gate_failure_to_rework``'s docstring raises about a past
-    regression here (a write with no label is functionally invisible: the
-    issue never reaches a human's queue).
+    ``transition(...)``-backed label edge every other cap-exhaustion
+    escalation in this file relies on actually fires. Issue #1266: a
+    mechanical reason_class lands ``agent:operator-queue``, not
+    ``agent:human-needed``. Assert the label transition call landed
+    (``fake_gh.labels_added``), not just the state.json write -- mirrors the
+    concern ``_route_janitor_gate_failure_to_rework``'s docstring raises
+    about a past regression here (a write with no label is functionally
+    invisible: the issue never reaches the operator queue).
     """
     app = _app_with_conflict_and_missing_checks(tmp_path, stale_checks_max_retriggers=1)
     with state_lock(app.paths.state_file):
@@ -483,7 +484,7 @@ def test_exhausted_bound_escalates_to_human(tmp_path: Path) -> None:
     assert result.ok is False
     assert result.data.get("stale_checks_retrigger_exhausted") is True
     assert result.data.get("label_error") is None
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
     state = load_state(app.paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
@@ -711,7 +712,7 @@ def test_full_chain_detection_through_retrigger_to_exhaustion_escalation(
     assert state["issues"]["123"]["escalation_reason"] == "stale_checks_retrigger_exhausted"
     assert state["issues"]["123"]["reason_class"] == "mechanical"
     assert state["prs"]["456"]["status"] == "escalated"
-    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_added
 
     # The full event trail, in order, is exactly what the three passes
     # should have produced: one detection, two retriggers, one exhaustion.
