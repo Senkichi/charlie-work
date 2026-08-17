@@ -48665,8 +48665,15 @@ def test_dispatch_rework_regenerates_brief_after_renderer_change(
 
     Monkeypatching the renderer reproduces that exactly: same decision, same
     mtimes, different output. The brief must pick the change up at dispatch.
+
+    Issue #1283 Phase A: ``_render_required_changes_section`` moved to
+    ``charlie_work/rework_prompts.py``. Its sole in-family caller,
+    ``_render_rework_prompt``, moved with it and resolves the name from
+    ``rework_prompts``'s own module globals, not workflow.py's facade
+    re-export -- so the monkeypatch target below must be
+    ``rework_prompts_module``, not ``workflow_module``.
     """
-    from charlie_work import workflow as workflow_module
+    from charlie_work import rework_prompts as rework_prompts_module
     from charlie_work.workflow import _is_verdict_newer_than_brief
 
     config = OrchestratorConfig(
@@ -48733,7 +48740,7 @@ def test_dispatch_rework_regenerates_brief_after_renderer_change(
 
     # Now the renderer changes, with the decision untouched.
     monkeypatch.setattr(
-        workflow_module,
+        rework_prompts_module,
         "_render_required_changes_section",
         lambda decision: "## Required changes\n\nRENDERED-BY-NEW-CODE\n",
     )
@@ -48837,8 +48844,11 @@ def test_dispatch_rework_does_not_regenerate_when_sidecar_is_unreadable(
     sidecar is readable there. That one regenerates and this one must not, so
     "no regeneration" here is attributable to the sidecar rather than to the
     PR never being selected for dispatch at all.
+
+    Issue #1283 Phase A: see the sibling test's docstring above for why the
+    monkeypatch target is ``rework_prompts_module``, not ``workflow_module``.
     """
-    from charlie_work import workflow as workflow_module
+    from charlie_work import rework_prompts as rework_prompts_module
 
     config = OrchestratorConfig(
         devin=DevinConfig(
@@ -48896,7 +48906,7 @@ def test_dispatch_rework_does_not_regenerate_when_sidecar_is_unreadable(
     os.utime(brief_path, (now + 10, now + 10))
 
     monkeypatch.setattr(
-        workflow_module,
+        rework_prompts_module,
         "_render_required_changes_section",
         lambda decision: "## Required changes\n\nRENDERED-BY-NEW-CODE\n",
     )

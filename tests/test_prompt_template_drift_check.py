@@ -243,17 +243,25 @@ def test_worker_prompt_keys_match_real_writer(tmp_path: Path, monkeypatch) -> No
 
 def test_rework_prompt_keys_match_real_writer(tmp_path: Path, monkeypatch) -> None:
     """``REWORK_PROMPT_KEYS`` must be exactly the keys
-    ``_render_rework_prompt`` passes to ``render_prompt``."""
-    import charlie_work.workflow as workflow_mod
+    ``_render_rework_prompt`` passes to ``render_prompt``.
 
-    real_render = workflow_mod.render_prompt
+    Issue #1283 Phase A: ``_render_rework_prompt`` moved to
+    ``charlie_work/rework_prompts.py`` and resolves ``render_prompt`` from
+    that module's own globals (imported there from ``.prompts``), not
+    workflow.py's -- so the capturing patch must target ``rework_prompts``,
+    not ``workflow``. ``REWORK_PROMPT_KEYS`` itself stays in workflow.py
+    (excluded drift-checker cluster); only the patch target moves.
+    """
+    import charlie_work.rework_prompts as rework_prompts_mod
+
+    real_render = rework_prompts_mod.render_prompt
     captured: dict[str, set[str]] = {}
 
     def capturing_render(template_name, values, **kwargs):
         captured.setdefault(template_name, set()).update(values.keys())
         return real_render(template_name, values, **kwargs)
 
-    monkeypatch.setattr(workflow_mod, "render_prompt", capturing_render)
+    monkeypatch.setattr(rework_prompts_mod, "render_prompt", capturing_render)
 
     config = OrchestratorConfig()
     state_file = tmp_path / ".var" / "charlie-work" / "state.json"
