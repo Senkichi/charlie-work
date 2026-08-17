@@ -316,27 +316,30 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
     function would compare unequal-but-structurally-similar in ways that are
     easy to miss.
 
-    The ``len(names) == 20`` assertion below is a second, independent
+    The ``len(names) == 23`` assertion below is a second, independent
     anti-vacuity guard, not mere brittleness: it is the only thing in this
     file that proves ``_module_level_defined_names`` is still walking the
-    ``Assign``/``AnnAssign`` branches (the 10 module constants) and the
+    ``Assign``/``AnnAssign`` branches (the 12 module constants) and the
     ``ClassDef`` branch (``ReviewSessionOutcome``), not just
     ``FunctionDef``. A regression that silently dropped either branch would
-    shrink ``names`` to the 9 functions, and every remaining assertion in
+    shrink ``names`` to the 10 functions, and every remaining assertion in
     this test -- and in the AC5 completeness test below, which draws its own
     candidate set from this same helper -- would keep passing while quietly
-    stopping to cover 11 of the 20 moved units. This count is also a genuine
+    stopping to cover 13 of the 23 moved units. This count is also a genuine
     tripwire, not just a guard: a later Phase-A/B PR that adds a symbol to
     ``verdict_parsing.py`` will legitimately trip it, and should update the
-    count (and the comment above it) rather than deleting the check.
+    count (and the comment above it) rather than deleting the check -- issue
+    #1269 (W12) is exactly that PR, adding ``REVIEW_SESSION_FAILED_HEADING``,
+    ``REVIEW_SESSION_SUMMARY_HEADING`` (2 constants: 10 -> 12) and
+    ``body_has_crash_signature`` (1 function: 9 -> 10), for 20 -> 23 overall.
     """
     import charlie_work.verdict_parsing as verdict_parsing
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_VERDICT_PARSING_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 20, (
-        f"expected 20 moved units (9 functions + ReviewSessionOutcome + 10 constants), "
+    assert len(names) == 23, (
+        f"expected 23 moved units (10 functions + ReviewSessionOutcome + 12 constants), "
         f"found {len(names)}: {sorted(names)}"
     )
 
@@ -485,17 +488,25 @@ def test_facade_reexports_every_name_consumers_reach_through_workflow() -> None:
     from a list restated by hand in this test (which is exactly the kind of
     copy that drifts the moment a consumer changes).
 
-    Only 6 of verdict_parsing.py's 20 module-level names have any consumer
+    Only 6 of verdict_parsing.py's 23 module-level names have any consumer
     reference outside workflow.py at all -- the core-chain functions
     ``_validate_review_verdict``, ``_extract_verdict_from_text``,
     ``_parse_review_verdict_from_log``, ``_parse_review_verdict_from_events``,
     ``_parse_review_verdict_from_files``, ``_extract_review_session_summary``.
     ``ReviewSessionOutcome``, ``_log_tail_throttled``,
-    ``_reviewer_session_metrics``, and all 10 module constants are reached
-    only by bare-name call sites inside OrchestratorApp methods that stay in
-    workflow.py, so this scan imposes no obligation for them. They are still
-    required to be re-exported by the unconditional facade-obligation rule
-    (AC4 covers that), just not because this live scan demands it.
+    ``_reviewer_session_metrics``, and all 12 module constants are reached
+    only by bare-name call sites inside workflow.py (OrchestratorApp methods,
+    and -- since issue #1269, W12 -- the module-level
+    ``_collect_external_findings``), so this scan imposes no obligation for
+    them. They are still required to be re-exported by the unconditional
+    facade-obligation rule (AC4 covers that), just not because this live
+    scan demands it. ``body_has_crash_signature`` and the two
+    ``REVIEW_SESSION_*_HEADING`` constants (W12) join this same
+    reached-only-by-bare-name set: their other consumers
+    (``rework_prompts.py``, ``scripts/backfill_stale_rework_briefs.py``, and
+    this issue's new tests) import directly from ``charlie_work.verdict_parsing``,
+    never through ``charlie_work.workflow``, so they add no new obligation
+    here either.
     """
     candidates = set(_module_level_defined_names(_VERDICT_PARSING_PATH))
     referenced = _consumer_referenced_names(
@@ -685,3 +696,164 @@ def test_write_event_surface_pattern_has_a_positive_control() -> None:
         "the write/event-emission pattern found zero hits in workflow.py itself -- "
         "the pattern is broken, not evidence that verdict_parsing.py is clean"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1269 (W12): body_has_crash_signature -- crash-comment noise
+# suppression. REVIEW_SESSION_FAILED_HEADING/REVIEW_SESSION_SUMMARY_HEADING
+# are the wire contract between _extract_review_session_summary (the
+# emitter) and two independent downstream consumers (workflow.py's
+# collector-side filter, rework_prompts.py's render-side guard); these tests
+# pin the predicate's behavior directly against the module under test.
+# ---------------------------------------------------------------------------
+
+
+def test_body_has_crash_signature_matches_a_synthetic_summary_heading() -> None:
+    """A body opening with REVIEW_SESSION_SUMMARY_HEADING is recognized.
+
+    Built from the shared constant itself (never a hardcoded copy of the
+    literal string) -- open question 1 of the W12 implementation plan: this
+    is the real, frequently-observed shape (jc#1394's 6 unstamped crash
+    comments all carry this exact heading, never the launch-failed one).
+    """
+    from charlie_work.verdict_parsing import (
+        REVIEW_SESSION_SUMMARY_HEADING,
+        body_has_crash_signature,
+    )
+
+    body = (
+        f"{REVIEW_SESSION_SUMMARY_HEADING}\n\n"
+        "The automated reviewer ran for 4 turns (2 tool calls) but did not "
+        "produce a structured verdict.\n"
+    )
+    assert body_has_crash_signature(body) is True
+
+
+def test_body_has_crash_signature_matches_a_synthetic_failed_heading() -> None:
+    """A body opening with REVIEW_SESSION_FAILED_HEADING is recognized.
+
+    Open question 1's other branch: no captured fixture carries this
+    heading (jc#1394's population happens to be entirely the summary
+    variant), so this specimen is synthetic -- built from the shared
+    constant, never a hardcoded copy, exactly per the plan's resolution.
+    """
+    from charlie_work.verdict_parsing import (
+        REVIEW_SESSION_FAILED_HEADING,
+        body_has_crash_signature,
+    )
+
+    body = (
+        f"{REVIEW_SESSION_FAILED_HEADING}\n\n"
+        "The automated reviewer exited before running a single turn, so no "
+        "review was performed.\n"
+    )
+    assert body_has_crash_signature(body) is True
+
+
+def test_review_session_failed_heading_exact_literal() -> None:
+    """Value-pins REVIEW_SESSION_FAILED_HEADING to its exact literal text.
+
+    test_body_has_crash_signature_matches_a_synthetic_failed_heading (above)
+    derives its test body FROM the constant, so it would keep passing even
+    if the constant's literal value silently drifted -- it only proves the
+    predicate is self-consistent with whatever the constant currently says,
+    not that the constant still says the right thing.
+    test_body_has_crash_signature_real_captured_specimen_with_crlf pins
+    REVIEW_SESSION_SUMMARY_HEADING the same way a real captured specimen
+    does, hardcoding literal text independent of the constant. No real
+    captured specimen carries the FAILED heading (see this file's docstring
+    a few tests up), so this test does the equivalent job directly: hardcode
+    the literal and assert the constant still equals it.
+    """
+    from charlie_work.verdict_parsing import REVIEW_SESSION_FAILED_HEADING
+
+    assert REVIEW_SESSION_FAILED_HEADING == "## Reviewer session failed to start"
+
+
+def test_body_has_crash_signature_real_captured_specimen_with_crlf() -> None:
+    """A real, unmodified crash comment (jc#1394, GitHub comment id
+    5067515891) is recognized, CRLF line endings and all.
+
+    Captured verbatim via the GitHub API (``\\r\\n``, not normalized) --
+    the one specimen in this file not derived from the shared constant, kept
+    specifically because a synthetic ``\\n``-only body would not exercise
+    the real line-ending shape GitHub actually returns, and would not catch
+    a future rewrite of the predicate that started splitting on lines
+    instead of a plain prefix check. Written as escaped ``\\r\\n`` sequences
+    (not literal CR bytes) so the source text itself -- not just the string
+    value -- is immune to git's line-ending normalization. No secrets: the
+    body is boilerplate crash/hook-failure text plus a local tool path, both
+    already public on the source PR.
+    """
+    from charlie_work.verdict_parsing import body_has_crash_signature
+
+    real_specimen = (
+        "## Reviewer session summary (no verdict produced)\r\n"
+        "\r\n"
+        "The automated reviewer did not produce a structured verdict.\r\n"
+        "\r\n"
+        "\r\n"
+        "### Recent analysis from the reviewer:\r\n"
+        "\r\n"
+        "Error: When using --print, --output-format=stream-json requires --verbose\r\n"
+        "\r\n"
+        "---\r\n"
+        "\r\n"
+        'SessionEnd hook ["C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" '
+        '-NoProfile -File "C:\\Users\\senki\\repos\\llibrary\\hooks\\session-end.ps1"] '
+        "failed: Hook cancelled\r\n"
+        "\r\n"
+        "---\r\n"
+    )
+    assert "\r\n" in real_specimen, "control: this specimen must actually carry CRLF"
+    assert body_has_crash_signature(real_specimen) is True
+
+
+def test_body_has_crash_signature_prefix_not_substring() -> None:
+    """A GitHub "Quote reply" that quotes a crash comment is NOT flagged.
+
+    Mirrors ``_is_orchestrator_comment``'s own rationale in workflow.py:
+    GitHub's quote-reply blockquotes every line of the quoted body with
+    ``"> "``, so the heading no longer sits at the start of the
+    (``lstrip()``-ped) text. A substring match would still catch this and
+    wrongly discard a genuine human reply discussing the crash; the prefix
+    check must not.
+    """
+    from charlie_work.verdict_parsing import (
+        REVIEW_SESSION_SUMMARY_HEADING,
+        body_has_crash_signature,
+    )
+
+    quoted_reply = (
+        f"> {REVIEW_SESSION_SUMMARY_HEADING}\n"
+        "> \n"
+        "> The automated reviewer ran for 4 turns...\n"
+        "\n"
+        "This looks like a session crash, not a real review -- can we re-run it?\n"
+    )
+    assert body_has_crash_signature(quoted_reply) is False
+
+
+def test_body_has_crash_signature_false_for_unrelated_finding() -> None:
+    """Control: ordinary reviewer/human finding text is never flagged.
+
+    Without this, a predicate that had quietly become unconditionally True
+    (or matched on a much broader substring) would pass every test above
+    vacuously.
+    """
+    from charlie_work.verdict_parsing import body_has_crash_signature
+
+    assert body_has_crash_signature("The retry loop does not cap its backoff.") is False
+    assert body_has_crash_signature("") is False
+
+
+def test_body_has_crash_signature_tolerates_leading_blank_lines() -> None:
+    """A body with leading blank lines before the heading is still matched
+    (``lstrip()`` in the predicate), mirroring GitHub occasionally rendering
+    a leading newline before the first Markdown heading."""
+    from charlie_work.verdict_parsing import (
+        REVIEW_SESSION_FAILED_HEADING,
+        body_has_crash_signature,
+    )
+
+    assert body_has_crash_signature(f"\n\n{REVIEW_SESSION_FAILED_HEADING}\nbody\n") is True

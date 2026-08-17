@@ -18,10 +18,15 @@ point they occur rather than silently:
 
 * No cross_family-independence test. verdict_parsing.py's precedent guards
   against re-deduplicating a regex against ``cross_family.py`` -- a concern
-  specific to that family's own fenced-JSON parsing. Nothing in this
-  family's 14 moved units touches ``cross_family.py`` at all (confirmed: it
-  is not among this module's imports, and no exclusion cluster in COMMON
-  mentions it), so there is no analogous hazard to test for.
+  specific to that family's own fenced-JSON parsing. As of issue #1269
+  (W12), ``rework_prompts.py`` does import one name from ``cross_family.py``
+  (``LEGACY_VACUOUS_SUMMARY``, a plain constant reference, not a
+  re-implementation of any cross_family logic), so "not among this module's
+  imports" is no longer literally true -- but that import creates no cycle
+  (``cross_family.py`` imports neither ``rework_prompts`` nor ``workflow``,
+  confirmed by ``test_rework_prompts_has_no_workflow_import``'s sibling
+  concern) and duplicates no regex, so there remains no analogous hazard
+  for a dedicated test to guard against.
 * The write/event-emission surface re-confirmation (AC9) asserts a
   non-empty result -- exactly two real call sites, both
   ``_write_text_atomic`` -- rather than zero. Unlike verdict_parsing.py
