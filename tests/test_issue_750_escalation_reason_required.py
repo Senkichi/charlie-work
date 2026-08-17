@@ -33,6 +33,7 @@ from _fakes_github import FakeGitHub
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+SRC_ROOT = REPO_ROOT / "src"
 SRC_WORKFLOW = REPO_ROOT / "src" / "charlie_work" / "workflow.py"
 SRC_STATE = REPO_ROOT / "src" / "charlie_work" / "state.py"
 
@@ -243,30 +244,86 @@ def test_escalated_status_literal_is_only_in_helper() -> None:
     fails closed instead. Both sites above are legitimate -- each sits in a
     function that calls the helper, so a reason is written -- and tier B
     exempts them without an allowlist of line numbers to drift.
-    """
-    source = SRC_WORKFLOW.read_text(encoding="utf-8")
-    violations = find_escalation_violations(source, str(SRC_WORKFLOW))
 
-    assert not violations, (
-        "Found status='escalated' write(s) outside _escalate_issue: " + ", ".join(violations)
+    Issue #1283 Phase A: ``_escalate_issue`` itself moved out of
+    ``workflow.py`` into ``charlie_work/escalation.py``. A single-file scan
+    anchored on ``SRC_WORKFLOW`` would silently stop covering the file that
+    now most needs it -- ``_escalate_issue``'s own body, and any future
+    hand-rolled ``status="escalated"`` write someone adds directly to
+    ``escalation.py``, would go unseen without ever failing loud. Worse, the
+    anti-vacuity ``helper is not None`` anchor below would find no
+    ``_escalate_issue`` ``FunctionDef`` in ``SRC_WORKFLOW`` post-move (it is
+    now an ``ImportFrom`` alias there, not a definition) and fail outright.
+    The fix sweeps every file under ``src/**/*.py`` independently -- the
+    ``_in_helper``/``_function_calls_helper`` exemption logic is already
+    per-function-body and name-based, so it composes across files unmodified;
+    only the outer file-selection loop and the anti-vacuity anchors (which
+    must now search across the same multi-file sweep for whichever file
+    actually defines the helper) change.
+    """
+    scanned_paths = sorted(SRC_ROOT.rglob("*.py"))
+    assert scanned_paths, "no src/**/*.py files found -- the sweep itself is broken"
+
+    # Positive control for the sweep's own reach. "scanned_paths is non-empty"
+    # is satisfied by a single file, so it does not by itself prove the loop
+    # still reaches escalation.py -- a future narrowing back to a two-file
+    # union, a glob() instead of rglob(), or an added filter would keep this
+    # assertion green while silently un-covering the file that now defines
+    # _escalate_issue. Assert both anchors by name.
+    scanned_names = {p.relative_to(REPO_ROOT).as_posix() for p in scanned_paths}
+    assert "src/charlie_work/workflow.py" in scanned_names
+    assert "src/charlie_work/escalation.py" in scanned_names, (
+        "the sweep no longer reaches escalation.py -- the file that defines "
+        "_escalate_issue post cw#1283 Phase A is unscanned and this guard is hollow"
+    )
+
+    all_violations: list[str] = []
+    indirect_seen: list[ast.AST] = []
+    helper: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    helper_path: Path | None = None
+
+    for path in scanned_paths:
+        source = path.read_text(encoding="utf-8")
+        display = path.relative_to(REPO_ROOT).as_posix()
+
+        violations = find_escalation_violations(source, str(path))
+        all_violations.extend(f"{display}: {v}" for v in violations)
+
+        tree = ast.parse(source, filename=str(path))
+        _annotate_parents(tree)
+
+        indirect_seen.extend(
+            node
+            for node, value in _status_writes(tree)
+            if not _is_direct_constant(value)
+            and (
+                _mentions_forbidden(value)
+                or _name_bound_to_forbidden(value, _enclosing_function(node))
+            )
+        )
+
+        if helper is None:
+            helper = next(
+                (
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "_escalate_issue"
+                ),
+                None,
+            )
+            if helper is not None:
+                helper_path = path
+
+    assert not all_violations, (
+        "Found status='escalated' write(s) outside _escalate_issue: " + ", ".join(all_violations)
     )
 
     # The scan above returning empty is only meaningful if it actually looked at
     # the indirect sites. Assert it saw them, so a future refactor that makes
     # them unparseable fails loudly instead of passing as "no violations".
-    tree = ast.parse(source, filename=str(SRC_WORKFLOW))
-    _annotate_parents(tree)
-    indirect_seen = [
-        node
-        for node, value in _status_writes(tree)
-        if not _is_direct_constant(value)
-        and (
-            _mentions_forbidden(value)
-            or _name_bound_to_forbidden(value, _enclosing_function(node))
-        )
-    ]
     assert indirect_seen, (
-        "No indirect status='escalated' writes found at all. Either workflow.py "
+        "No indirect status='escalated' writes found at all. Either the src tree "
         "changed shape or the tier-B detector stopped matching; an empty result "
         "here is not evidence the invariant holds."
     )
@@ -275,17 +332,11 @@ def test_escalated_status_literal_is_only_in_helper() -> None:
     # call site routes through the helper, so an empty result is not by itself
     # evidence that the invariant holds -- it is equally consistent with the
     # helper having been removed. Assert the subject of the invariant still
-    # exists and still owns the escalated status.
-    helper = next(
-        (
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "_escalate_issue"
-        ),
-        None,
-    )
+    # exists (in whichever file the sweep found it -- charlie_work/escalation.py
+    # post cw#1283 Phase A, charlie_work/workflow.py before it) and still owns
+    # the escalated status.
     assert helper is not None, "_escalate_issue helper is gone; this guard would pass vacuously"
+    assert helper_path is not None
 
     kwonly = dict(zip(helper.args.kwonlyargs, helper.args.kw_defaults, strict=True))
     status_default = next(
@@ -293,12 +344,14 @@ def test_escalated_status_literal_is_only_in_helper() -> None:
         None,
     )
     assert isinstance(status_default, ast.Constant) and status_default.value == "escalated", (
-        "_escalate_issue no longer defaults status to 'escalated'; the guard above "
-        "would no longer be checking the escalation path"
+        f"_escalate_issue ({helper_path.relative_to(REPO_ROOT).as_posix()}) no longer "
+        "defaults status to 'escalated'; the guard above would no longer be checking "
+        "the escalation path"
     )
     assert any(arg.arg == "reason" for arg in helper.args.kwonlyargs), (
-        "_escalate_issue no longer takes a keyword-only 'reason'; "
-        "status='escalated' without a reason is representable again"
+        f"_escalate_issue ({helper_path.relative_to(REPO_ROOT).as_posix()}) no longer "
+        "takes a keyword-only 'reason'; status='escalated' without a reason is "
+        "representable again"
     )
 
 
