@@ -25,7 +25,7 @@ from pathlib import Path
 import pytest
 
 import charlie_work.state as cw_state
-import charlie_work.workflow as cw_workflow
+import charlie_work.stalled_review_reap as cw_stalled_review_reap
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig, RuntimeConfig
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, state_lock
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
@@ -111,7 +111,7 @@ def test_stalled_sweep_does_not_clobber_concurrent_unescalate(
     # Inject the concurrent unescalate commit the first time the sweep calls
     # iter_workers (after its snapshot load, before its save). This is the
     # exact window the live incident exploited.
-    real_iter_workers = cw_workflow.iter_workers
+    real_iter_workers = cw_stalled_review_reap.iter_workers
     injected = {"done": False}
 
     def _injecting_iter_workers(reviews_dir_arg: Path):
@@ -127,7 +127,7 @@ def test_stalled_sweep_does_not_clobber_concurrent_unescalate(
                 save_state(state_file, fresh)
         return real_iter_workers(reviews_dir_arg)
 
-    monkeypatch.setattr(cw_workflow, "iter_workers", _injecting_iter_workers)
+    monkeypatch.setattr(cw_stalled_review_reap, "iter_workers", _injecting_iter_workers)
 
     _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
 
@@ -254,7 +254,9 @@ def test_orphaned_reap_sweep_does_not_clobber_concurrent_unescalate(
         }
     ]
 
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
+    )
 
     # Inject the concurrent unescalate commit the first time the sweep calls
     # gh.pr_view (after its snapshot load, before its save) -- the exact

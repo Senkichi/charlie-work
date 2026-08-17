@@ -203,7 +203,7 @@ def test_reap_orphaned_review_checkouts_clears_merged_pr_dispatch_state(
         return True
 
     monkeypatch.setattr(
-        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+        "charlie_work.stalled_review_reap.remove_review_checkout", fake_remove_review_checkout
     )
 
     reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
@@ -292,7 +292,7 @@ def test_reap_orphaned_review_checkouts_defers_while_reviewer_alive(
         return True
 
     monkeypatch.setattr(
-        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+        "charlie_work.stalled_review_reap.remove_review_checkout", fake_remove_review_checkout
     )
 
     # Live reviewer: defer the reap.
@@ -375,7 +375,9 @@ def test_reap_orphaned_review_checkouts_reaps_sidecar_stops_stalled_ping_pong(
         }
     ]
 
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
+    )
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
 
     reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
@@ -451,7 +453,7 @@ def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failu
         return False
 
     monkeypatch.setattr(
-        "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+        "charlie_work.stalled_review_reap.remove_review_checkout", fake_remove_review_checkout
     )
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
 
@@ -486,7 +488,9 @@ def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failu
     assert len(warning_events) == 1
 
     # Third pass succeeds: the marker is cleared and the reap is recorded.
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
+    )
     reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
     assert reaped == [100]
     assert call_count == 2  # the lambda does not increment the nested counter
@@ -550,7 +554,9 @@ def test_reap_orphaned_review_checkouts_overwrites_stale_reviewing_status(
         }
     ]
 
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
+    )
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
 
     reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
