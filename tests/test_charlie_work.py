@@ -1422,6 +1422,213 @@ def test_config_accepts_full_test_adequacy_override(tmp_path: Path) -> None:
     assert config.test_adequacy.min_diff_coverage == 0.5
 
 
+def test_default_config_disables_coverage_probe() -> None:
+    """CoverageProbeConfig defaults to disabled with all default values
+    (issues #1260/#1261) -- an absent config block is a no-op."""
+    from charlie_work.config import CoverageProbeConfig
+
+    config = load_config()
+
+    assert config.coverage_probe == CoverageProbeConfig()
+    assert config.coverage_probe.enabled is False
+
+
+def test_coverage_probe_config_is_frozen() -> None:
+    from charlie_work.config import CoverageProbeConfig
+    from dataclasses import FrozenInstanceError
+
+    config = CoverageProbeConfig()
+    try:
+        config.enabled = True  # type: ignore[misc]
+        raise AssertionError("expected FrozenInstanceError")
+    except FrozenInstanceError:
+        pass
+
+
+def test_orchestrator_config_ctor_wires_coverage_probe_field() -> None:
+    """OrchestratorConfig() carries a coverage_probe field with defaults."""
+    from charlie_work.config import CoverageProbeConfig
+
+    config = OrchestratorConfig()
+
+    assert config.coverage_probe == CoverageProbeConfig()
+
+
+def test_config_coverage_probe_coerces_tuple_fields_to_tuple(tmp_path: Path) -> None:
+    """YAML lists in coverage_probe tuple fields round-trip to tuples."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """coverage_probe:
+  enabled: true
+  test_path_globs:
+    - "tests/**"
+    - "test_*.py"
+  exempt_path_globs:
+    - "*.md"
+  comment_prefixes:
+    - "#"
+    - "//"
+  branch_tokens:
+    - "if "
+    - "elif "
+  assertion_markers:
+    - "assert "
+    - "pytest.raises"
+  branch_to_assert_ratio_threshold: 3.5
+  check_unwired_symbols: false
+  test_function_prefix: "def check_"
+  private_name_prefix: "__"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.coverage_probe.enabled is True
+    assert isinstance(config.coverage_probe.test_path_globs, tuple)
+    assert config.coverage_probe.test_path_globs == ("tests/**", "test_*.py")
+    assert config.coverage_probe.exempt_path_globs == ("*.md",)
+    assert config.coverage_probe.comment_prefixes == ("#", "//")
+    assert config.coverage_probe.branch_tokens == ("if ", "elif ")
+    assert config.coverage_probe.assertion_markers == ("assert ", "pytest.raises")
+    assert config.coverage_probe.branch_to_assert_ratio_threshold == 3.5
+    assert config.coverage_probe.check_unwired_symbols is False
+    assert config.coverage_probe.test_function_prefix == "def check_"
+    assert config.coverage_probe.private_name_prefix == "__"
+
+
+def test_config_rejects_non_list_coverage_probe_tuple_field(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "coverage_probe:\n  branch_tokens: 'if '\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for non-list tuple field")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for non-list tuple field")
+
+    assert "coverage_probe" in message
+    assert "branch_tokens" in message
+    assert "must be a list" in message
+
+
+def test_config_rejects_bad_type_branch_to_assert_ratio_threshold(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "coverage_probe:\n  branch_to_assert_ratio_threshold: high\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for bad type")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for bad type")
+
+    assert "coverage_probe" in message
+    assert "branch_to_assert_ratio_threshold" in message
+    assert "must be a float" in message
+
+
+def test_config_rejects_non_bool_coverage_probe_flags(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    for bool_key in ("enabled", "check_unwired_symbols"):
+        config_path = tmp_path / "orchestrator.config.yaml"
+        config_path.write_text(
+            f'coverage_probe:\n  {bool_key}: "true"\n',
+            encoding="utf-8",
+        )
+
+        try:
+            load_config(config_path)
+            raise AssertionError(f"expected ConfigError for non-bool {bool_key}")
+        except ConfigError as exc:
+            message = str(exc)
+        else:  # pragma: no cover
+            raise AssertionError(f"expected ConfigError for non-bool {bool_key}")
+
+        assert "coverage_probe" in message
+        assert bool_key in message
+        assert "must be a bool" in message
+
+
+def test_load_config_rejects_unknown_coverage_probe_key(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        "coverage_probe:\n  enabled: true\n  bad_key: value\n",
+        encoding="utf-8",
+    )
+
+    try:
+        load_config(config_path)
+        raise AssertionError("expected ConfigError for unknown coverage_probe key")
+    except ConfigError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected ConfigError for unknown coverage_probe key")
+
+    assert "section 'coverage_probe'" in message
+    assert "bad_key" in message
+    assert "enabled" in message
+
+
+def test_config_accepts_full_coverage_probe_override(tmp_path: Path) -> None:
+    """A YAML block overriding every field loads correctly and does NOT
+    disturb TestAdequacyConfig's reserved Tier-3 fields (independent
+    sections -- issues #1260/#1261 design item 2)."""
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text(
+        """coverage_probe:
+  enabled: true
+  test_path_globs:
+    - "custom_tests/**"
+  exempt_path_globs:
+    - "*.txt"
+  comment_prefixes:
+    - "//"
+  branch_tokens:
+    - "if "
+  assertion_markers:
+    - "custom_assert"
+  branch_to_assert_ratio_threshold: 2.0
+  check_unwired_symbols: false
+  test_function_prefix: "def scenario_"
+  private_name_prefix: "__"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert config.coverage_probe.enabled is True
+    assert config.coverage_probe.test_path_globs == ("custom_tests/**",)
+    assert config.coverage_probe.exempt_path_globs == ("*.txt",)
+    assert config.coverage_probe.comment_prefixes == ("//",)
+    assert config.coverage_probe.branch_tokens == ("if ",)
+    assert config.coverage_probe.assertion_markers == ("custom_assert",)
+    assert config.coverage_probe.branch_to_assert_ratio_threshold == 2.0
+    assert config.coverage_probe.check_unwired_symbols is False
+    assert config.coverage_probe.test_function_prefix == "def scenario_"
+    assert config.coverage_probe.private_name_prefix == "__"
+    # TestAdequacyConfig's reserved Tier-3 fields are untouched defaults.
+    assert config.test_adequacy.coverage_enabled is False
+    assert config.test_adequacy.min_diff_coverage == 0.0
+
+
 def test_config_accepts_watchdog_terminal_error_markers(tmp_path: Path) -> None:
     """A YAML block with terminal_error_markers loads correctly."""
     config_path = tmp_path / "orchestrator.config.yaml"
@@ -16865,6 +17072,231 @@ def test_test_adequacy_section_not_in_review_packet_when_disabled(tmp_path: Path
     assert "## Test-adequacy facts (Tier 1, deterministic)" not in packet_text
     # Verify no unresolved placeholder
     assert "$test_adequacy_section" not in packet_text
+
+
+def test_render_static_probe_section_unit() -> None:
+    """Unit test for render_static_probe_section (issues #1260/#1261)."""
+    from charlie_work.diff_coverage_probe import (
+        BranchCoverageFinding,
+        StaticProbeVerdict,
+        UnwiredSymbolFinding,
+    )
+    from charlie_work.workflow import render_static_probe_section
+
+    # Disabled (probe never ran) -> "".
+    assert render_static_probe_section(None) == ""
+
+    # Enabled, zero findings, zero warnings -> explicit visible "no findings"
+    # line, never a bare "" -- an advisory probe that goes silent on a clean
+    # run must not read as "never ran".
+    clean_section = render_static_probe_section(StaticProbeVerdict())
+    assert clean_section == "Static probe: no findings.\n"
+
+    # Enabled, internal error -> visible degradation warning, not silent-empty.
+    degraded = StaticProbeVerdict(
+        warnings=("static probe degraded: branch-coverage heuristic failed: boom",)
+    )
+    degraded_section = render_static_probe_section(degraded)
+    assert "static probe degraded" in degraded_section
+
+    # Enabled, findings present -> both W3 and W20 findings concatenated
+    # into the one section.
+    verdict = StaticProbeVerdict(
+        branch_findings=(BranchCoverageFinding("src/foo.py", 3, 0, "no_test_adds"),),
+        unwired_findings=(UnwiredSymbolFinding("helper", "src/bar.py", "function"),),
+    )
+    section = render_static_probe_section(verdict)
+    assert "Branch-coverage heuristic (W3)" in section
+    assert "src/foo.py" in section
+    assert "Unwired-symbol probe (W20)" in section
+    assert "helper" in section
+    assert "src/bar.py" in section
+
+
+def test_static_probe_section_not_in_review_packet_when_disabled(tmp_path: Path) -> None:
+    """When coverage_probe.enabled=False (default), the computed section is
+    empty and no dynamic probe content leaks into the packet. The STATIC
+    '## Static probe' heading + rubric prose (W20 item 2) are permanent
+    template text and remain present regardless -- mirrors the always-
+    present '## Test adequacy' template heading precedent."""
+    from charlie_work.config import CoverageProbeConfig
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = (
+        "diff --git a/src/feature.py b/src/feature.py\n"
+        "index 123..456 100644\n"
+        "--- a/src/feature.py\n"
+        "+++ b/src/feature.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        " def feature():\n"
+        "     pass\n"
+        "+def new_feature(x):\n"
+        "+    if x:\n"
+        "+        return 1\n"
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    # Static template heading + rubric prose (W20 item 2) always present.
+    assert "## Static probe" in packet_text
+    assert "Name the production caller." in packet_text
+    assert "Classify test strength." in packet_text
+    assert "existence < type < status < value <" in packet_text
+    # No dynamic probe content and no unresolved placeholder.
+    assert "Branch-coverage heuristic (W3)" not in packet_text
+    assert "Static probe: no findings." not in packet_text
+    assert "$static_probe_section" not in packet_text
+
+
+def test_static_probe_section_in_review_packet_when_enabled_with_findings(
+    tmp_path: Path,
+) -> None:
+    """Integration test: findings from both probe halves land in
+    $static_probe_section, adjacent to (not folded into) ## Test adequacy.
+
+    ``repo_root`` (``tmp_path``) is given a real ``src/`` tree containing a
+    file that does NOT reference the flagged symbol, so
+    ``_collect_repo_referenced_names`` actually walks it and the line-295
+    collision filter runs live (issue #1260/#1261 review finding A5) instead
+    of short-circuiting on a missing ``src/`` directory. The flagged symbol
+    uses a distinctive name (not ``helper``) precisely so it cannot
+    accidentally collide with anything incidental in that tree.
+    """
+    from charlie_work.config import CoverageProbeConfig
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Real src/ tree under repo_root, unrelated to the diffed symbol below --
+    # exercises the collision filter live rather than short-circuiting it.
+    unrelated_src = tmp_path / "src" / "unrelated_module.py"
+    unrelated_src.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_src.write_text(
+        "def totally_unrelated_function(value):\n    return value * 2\n",
+        encoding="utf-8",
+    )
+
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = (
+        "diff --git a/src/feature.py b/src/feature.py\n"
+        "index 123..456 100644\n"
+        "--- a/src/feature.py\n"
+        "+++ b/src/feature.py\n"
+        "@@ -1,2 +1,5 @@\n"
+        " def feature():\n"
+        "     pass\n"
+        "+def compute_shard_checksum(x):\n"
+        "+    if x:\n"
+        "+        return 1\n"
+        "diff --git a/tests/test_feature.py b/tests/test_feature.py\n"
+        "index 123..456 100644\n"
+        "--- a/tests/test_feature.py\n"
+        "+++ b/tests/test_feature.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        " def test_existing():\n"
+        "     pass\n"
+        "+def test_compute_shard_checksum():\n"
+        "+    assert compute_shard_checksum(True) == 1\n"
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+
+    assert "## Static probe" in packet_text
+    # compute_shard_checksum() is defined in src/feature.py, referenced only
+    # from the test, and absent from the real (live-walked) src/ tree -- the
+    # collision filter runs and correctly does not suppress it.
+    assert "Unwired-symbol probe (W20)" in packet_text
+    assert "compute_shard_checksum" in packet_text
+    assert "$static_probe_section" not in packet_text
+    assert packet_text.index("## Test adequacy") < packet_text.index("## Static probe")
+
+
+def test_static_probe_section_no_findings_renders_visible_clean_line(tmp_path: Path) -> None:
+    """Enabled + zero findings still renders visible text, not "" (mirrors
+    render_test_adequacy_section's own always-visible-when-enabled shape)."""
+    from charlie_work.config import CoverageProbeConfig
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.diffs[456] = (
+        "diff --git a/README.md b/README.md\n"
+        "index 123..456 100644\n"
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1 +1,2 @@\n"
+        " Hello\n"
+        "+World\n"
+    )
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+    assert "Static probe: no findings." in packet_text
+
+
+def test_static_probe_section_shows_visible_degradation_on_internal_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An internal exception in the probe must render a visible warning
+    line in the packet, never a silently empty section (design item 7)."""
+    from charlie_work.config import CoverageProbeConfig
+
+    def _boom(diff, config):
+        raise ValueError("synthetic failure")
+
+    monkeypatch.setattr("charlie_work.diff_coverage_probe.check_branch_coverage", _boom)
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=True))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456" / "review-prompt.md"
+    packet_text = packet.read_text(encoding="utf-8")
+    assert "static probe degraded" in packet_text
+    assert "branch-coverage heuristic failed" in packet_text
+
+
+def test_coverage_probe_never_called_when_disabled(tmp_path: Path, monkeypatch) -> None:
+    """When coverage_probe.enabled=False (default), run_static_probe is
+    never invoked -- mirrors test_review_test_adequacy_disabled_is_noop."""
+    from charlie_work.config import CoverageProbeConfig
+
+    calls = {"n": 0}
+
+    def _fake_run_static_probe(diff, repo_root, config):
+        calls["n"] += 1
+        raise AssertionError("run_static_probe should not be called when disabled")
+
+    monkeypatch.setattr("charlie_work.workflow.run_static_probe", _fake_run_static_probe)
+
+    config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    result = app.review(456)
+
+    assert calls["n"] == 0
+    assert result.ok is True
 
 
 def test_review_prompt_uses_fenced_json_verdict(tmp_path: Path) -> None:

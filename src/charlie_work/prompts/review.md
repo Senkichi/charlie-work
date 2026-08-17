@@ -62,6 +62,24 @@ against the diff, not a fact to accept — a reason that doesn't hold up
 (e.g. "n/a" on a diff with real product logic) should draw
 `request_changes`.
 
+## Static probe
+
+Two mechanical, advisory pre-checks below flag candidates for you to verify
+by reading the diff — a flag is a lead, not a verdict, and a clean run is
+not proof either heuristic is sound for this PR. Regardless of what the
+checks below find:
+
+- **Name the production caller.** For every new public function, method, or
+  class this diff adds, name the specific `src/` call site that invokes it.
+  "Tested but never called" is a blocking (Important-or-higher) finding, not
+  a Minor one, even when the probe below stayed silent.
+- **Classify test strength.** For every new test this diff adds, name its
+  strongest assertion on this scale: existence < type < status < value <
+  behavioral. Flag any test whose expected value is derived by calling the
+  code under test — that is a self-consistency check, not a regression test.
+
+$static_probe_section
+
 ## Approval criteria
 
 Approve only if all of these are true:

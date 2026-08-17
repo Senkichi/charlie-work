@@ -231,6 +231,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # warning-level kinds: handled-but-notable conditions
         # -----------------------------------------------------------------
         "ci_fleet_worktree_dirty": "warning",
+        # Issue #1260: the diff-coverage static probe (W3) flagged one or more
+        # non-test files whose added branch logic outran the diff's added
+        # tests. Warning, not error: the probe is advisory-only and never
+        # blocks -- the flag is the signal, not a hold -- but this is the
+        # substrate for the 2-week false-positive measurement window before
+        # any promotion to a hard gate is considered.
+        "coverage_probe_flagged": "warning",
         "cross_family_verdict_unparseable": "warning",
         # The packet was forced stale so an unusable cross-family report gets
         # regenerated. The lane recovers, but it needed repair to get there and
@@ -332,6 +339,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "session_rate_limit_deferred": "warning",
         "supervise_relaunch_cap_reached": "warning",
         "unauthorized_merge_check_skipped": "warning",
+        # Issue #1261: the unwired-symbol static probe (W20 item 1) flagged a
+        # new public function/method/class referenced only from tests/ and
+        # nowhere in src/. Warning, not error: same posture as
+        # coverage_probe_flagged above -- advisory-only, never blocking, and
+        # the substrate for the same 2-week false-positive measurement window.
+        "unwired_symbol": "warning",
         "venv_pth_mismatch": "warning",
         "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",

@@ -1339,6 +1339,64 @@ class TestAdequacyConfig:
 
 
 @dataclass(frozen=True)
+class CoverageProbeConfig:
+    """Config for the advisory-only static diff-coverage / unwired-symbol
+    probes (``diff_coverage_probe.run_static_probe``, issues #1260/#1261).
+
+    ``enabled`` defaults False so an absent config block is a no-op --
+    mirrors ``CrossFamilyConfig``/``TestAdequacyConfig``. This is a new,
+    independent config section: it does NOT read, gate on, or repurpose any
+    field of ``TestAdequacyConfig``, including that class's reserved Tier-3
+    ``coverage_enabled``/``coverage_command``/``min_diff_coverage`` fields
+    above, which describe an unrelated, deferred, subprocess-based
+    numeric-coverage design.
+
+    Both probe halves are advisory-only in v1 -- they only add text to the
+    review packet and never block dispatch, review, or merge. Promotion to a
+    hard gate is explicitly deferred past a 2-week false-positive
+    measurement window (see the #1260/#1261 scoping comment); this config
+    intentionally has no auto-reject knob.
+    """
+
+    enabled: bool = False
+
+    # -- W3: branch-token-vs-test-add heuristic ------------------------------
+    # Path-classification defaults mirror TestAdequacyConfig's own, kept as
+    # an independent copy (not a shared reference) so the two gates can be
+    # configured separately without coupling.
+    test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
+    exempt_path_globs: tuple[str, ...] = (
+        "*.md",
+        "docs/**",
+        "examples/**",
+        ".github/workflows/**",
+        "*.lock",
+        "*.toml",
+        "*.cfg",
+        "*.ini",
+    )
+    comment_prefixes: tuple[str, ...] = ("#",)
+    branch_tokens: tuple[str, ...] = ("if ", "elif ", "except ", " and ", " or ", " else ")
+    assertion_markers: tuple[str, ...] = (
+        "assert ",
+        "pytest.raises",
+        "raises(",
+        "assert_called",
+        "self.assert",
+    )
+    test_function_prefix: str = "def test_"
+    # branch_adds:test_adds ratio above this threshold flags even when
+    # test_adds > 0.
+    branch_to_assert_ratio_threshold: float = 4.0
+
+    # -- W20 item 1: unwired-symbol AST probe --------------------------------
+    check_unwired_symbols: bool = True
+    # Leading-underscore names are excluded -- the probe only flags *public*
+    # new symbols.
+    private_name_prefix: str = "_"
+
+
+@dataclass(frozen=True)
 class FleetConfig:
     """Fleet-wide configuration for multi-repo coordination.
 
@@ -1570,6 +1628,7 @@ class OrchestratorConfig:
         default_factory=WorktreeReclamationConfig
     )
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
+    coverage_probe: CoverageProbeConfig = field(default_factory=CoverageProbeConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
@@ -2716,6 +2775,55 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             )
 
     test_adequacy = _build_section(TestAdequacyConfig, "test_adequacy", test_adequacy_data)
+    coverage_probe_data = _section(data, "coverage_probe")
+
+    # Five tuple-of-str fields: reject non-list, coerce elements to str.
+    _COVERAGE_PROBE_TUPLE_FIELDS = (
+        "test_path_globs",
+        "exempt_path_globs",
+        "comment_prefixes",
+        "branch_tokens",
+        "assertion_markers",
+    )
+    for key in _COVERAGE_PROBE_TUPLE_FIELDS:
+        value = coverage_probe_data.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{key}' must be a list of "
+                f"strings, got {type(value).__name__}"
+            )
+        for item in value:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    f"config section 'coverage_probe' key '{key}' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        coverage_probe_data[key] = tuple(value)
+
+    branch_ratio = coverage_probe_data.get("branch_to_assert_ratio_threshold")
+    if branch_ratio is not None and not isinstance(branch_ratio, (int, float)):
+        raise ConfigError(
+            "config section 'coverage_probe' key 'branch_to_assert_ratio_threshold' must be "
+            f"a float, got {type(branch_ratio).__name__}"
+        )
+    for str_key in ("test_function_prefix", "private_name_prefix"):
+        str_value = coverage_probe_data.get(str_key)
+        if str_value is not None and not isinstance(str_value, str):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{str_key}' must be a string, "
+                f"got {type(str_value).__name__}"
+            )
+    for bool_key in ("enabled", "check_unwired_symbols"):
+        bool_value = coverage_probe_data.get(bool_key)
+        if bool_value is not None and not isinstance(bool_value, bool):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{bool_key}' must be a bool, "
+                f"got {type(bool_value).__name__}"
+            )
+
+    coverage_probe = _build_section(CoverageProbeConfig, "coverage_probe", coverage_probe_data)
     fleet_data = _section(data, "fleet")
     global_max = fleet_data.get("global_max_concurrent_sessions")
     if global_max is not None and not isinstance(global_max, int):
@@ -2962,6 +3070,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         watchdog=watchdog,
         worktree_reclamation=worktree_reclamation,
         test_adequacy=test_adequacy,
+        coverage_probe=coverage_probe,
         fleet=fleet,
         notify=notify,
         runners=runners,
