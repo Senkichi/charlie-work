@@ -120,6 +120,17 @@ class LabelConfig:
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
     merge_hold: str = "agent:merge-hold"
+    # Issue #1266: mechanical escalations (reason_class == "mechanical") land
+    # here instead of ``human_needed``, so human attention is reserved for
+    # judgment calls. Unlike ``prose_only_deps`` -- the only other
+    # terminal-but-not-workflow_labels label -- this one IS actively
+    # added/removed by automated ``labels.py`` transitions (the
+    # "operator_queued"/"redispatch_operator_queued" edges and the
+    # de-escalation cap-exhaustion path), so it must be a member of
+    # ``workflow_labels`` (so a transition away from it correctly strips it
+    # via ``_compute_remove``) and of ``all`` (so ``bootstrap_labels``
+    # creates it on GitHub).
+    operator_queue: str = "agent:operator-queue"
     # Routing hint, NOT a workflow state (issue #481). Never a member of
     # ``active``/``terminal``/``workflow_labels`` — it must not affect issue
     # selection or exclusion. Included in ``all`` so ``bootstrap_labels``
@@ -130,7 +141,13 @@ class LabelConfig:
 
     @property
     def terminal(self) -> set[str]:
-        return {self.blocked, self.done, self.human_needed, self.prose_only_deps}
+        return {
+            self.blocked,
+            self.done,
+            self.human_needed,
+            self.prose_only_deps,
+            self.operator_queue,
+        }
 
     @property
     def active(self) -> set[str]:
@@ -151,6 +168,7 @@ class LabelConfig:
             self.prose_only_deps,
             self.merge_hold,
             self.complexity_high,
+            self.operator_queue,
         ]
 
     @property
@@ -173,6 +191,7 @@ class LabelConfig:
             self.blocked,
             self.done,
             self.human_needed,
+            self.operator_queue,
         }
 
 

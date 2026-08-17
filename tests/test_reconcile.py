@@ -2202,9 +2202,15 @@ def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
 
 def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path) -> None:
     """Issue #261 F5: apply_fixes must transition session_failed_escalated
-    via the 'redispatch_escalated' label edge (adds human_needed, removes
+    via the 'redispatch_escalated' label edge (adds operator_queue, removes
     the other workflow labels) rather than removing active labels /
-    re-adding ready like session_failed_relabeled does."""
+    re-adding ready like session_failed_relabeled does.
+
+    Issue #1266: this DriftItem only ever fires for a deterministic
+    failure_kind (see detect_drift), which workflow.py's own equivalent
+    dead-session sweeps always treat as reason_class="mechanical" -- so the
+    edge resolves to operator_queued, landing agent:operator-queue rather
+    than agent:human-needed."""
     config = OrchestratorConfig()
     gh = FakeGitHub(
         prs=[],
@@ -2227,7 +2233,7 @@ def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path)
 
     new_state = apply_fixes(gh, state, drift, config)
 
-    assert (42, config.labels.human_needed) in gh.labels_added
+    assert (42, config.labels.operator_queue) in gh.labels_added
     assert (42, config.labels.ready) not in gh.labels_added
     # ready must never be added for an escalated worker_blocked session.
 

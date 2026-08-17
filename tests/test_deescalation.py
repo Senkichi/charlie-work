@@ -208,6 +208,12 @@ def test_deescalation_cap_exhausted_stops_clearing_and_notifies_once(tmp_path: P
     green PR -- and must emit ``deescalation_cap_exhausted`` exactly once,
     not on every subsequent pass, via the ``deescalation_cap_notified_at``
     dedup marker.
+
+    Issue #1266: cap exhaustion also applies a real "escalated" label
+    transition (human_needed added, operator_queue and every other
+    workflow label stripped) so a human actually sees the issue -- a
+    capped-out mechanical escalation must not sit silently in
+    operator_queue forever.
     """
     app = _app(tmp_path)
     assert app.config.deescalation.max_auto_deescalations == 2
@@ -238,8 +244,8 @@ def test_deescalation_cap_exhausted_stops_clearing_and_notifies_once(tmp_path: P
     assert issue_123["status"] == "escalated"
     assert issue_123["reason_class"] == "mechanical"
     assert issue_123["deescalation_cap_notified_at"]
-    assert app.gh.labels_added == []
-    assert app.gh.labels_removed == []
+    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_removed
 
     exhausted = _events(state, "deescalation_cap_exhausted")
     assert len(exhausted) == 1

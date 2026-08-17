@@ -2924,6 +2924,58 @@ def test_dispatch_excludes_issue_with_open_tracked_pr(tmp_path: Path) -> None:
     assert (123, "agent:in-progress") not in fake_gh.labels_added
 
 
+def test_dispatch_selects_ready_issue_without_operator_queue_label(tmp_path: Path) -> None:
+    """Positive control for the operator_queue dispatch-exclusion test below:
+    the exact same fixture (ready label, no open tracked PR) but with no
+    ``operator_queue`` label present must dispatch normally. Without this
+    control, a dispatch-exclusion assertion of ``selected_count == 0`` would
+    be equally consistent with "the terminal check works" and with "this
+    fixture never dispatches for an unrelated reason" (see issue #257 above --
+    the default fixture's open tracked PR is exactly that trap)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Clear the default fixture's open tracked PR so it cannot mask the
+    # terminal-label check under test.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert (123, "agent:queued") in fake_gh.labels_added
+
+
+def test_dispatch_excludes_issue_with_operator_queue_label(tmp_path: Path) -> None:
+    """Issue #1266: an issue carrying ``agent:operator-queue`` (a mechanical
+    escalation awaiting operator triage) must never be selected for dispatch,
+    even though it still carries ``automated-ready`` -- exactly the same
+    invariant ``human_needed`` already has via ``LabelConfig.terminal``.
+    Drives the real ``OrchestratorApp.dispatch`` -> ``_is_dispatchable`` path,
+    not the label-set membership in isolation (that is
+    ``test_label_config_operator_queue_in_terminal_set`` in test_config.py).
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.prs[0]["state"] = "CLOSED"
+    fake_gh.issues[0]["labels"] = [
+        {"name": config.labels.ready},
+        {"name": config.labels.operator_queue},
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.dispatch(limit=1)
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 0
+    prompt_path = tmp_path / ".var" / "charlie-work" / "issues" / "issue-123" / "worker-prompt.md"
+    assert not prompt_path.exists()
+    assert (123, "agent:queued") not in fake_gh.labels_added
+    assert (123, "agent:in-progress") not in fake_gh.labels_added
+
+
 def _seed_backdated_dispatch_event(state_path: Path, ts: str, issue_numbers: list[int]) -> None:
     """Write one ``dispatch`` event to events.db with a caller-chosen ``ts``.
 
@@ -12822,7 +12874,7 @@ def test_string_dispatch_command_rejects_issue_title(tmp_path: Path) -> None:
     assert (123, "agent:in-progress") not in fake_gh.labels_added
 
 
-def test_rework_cap_escalates_to_human(tmp_path: Path) -> None:
+def test_rework_cap_escalates_to_operator_queue(tmp_path: Path) -> None:
     config = OrchestratorConfig()  # max_rework_cycles = 2
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -12851,7 +12903,8 @@ def test_rework_cap_escalates_to_human(tmp_path: Path) -> None:
     assert third.data["escalated"] is True
     assert third.data["rework_path"] is None  # no third rework prompt
     assert fake_gh.labels_added.count((123, "agent:needs-rework")) == 2
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Issue #1266: max_rework_cycles_exceeded is a mechanical escalation.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_loop_isolates_per_pr_errors(tmp_path: Path) -> None:
@@ -16202,6 +16255,10 @@ def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> N
     issue #841 fixes). A check that DOES carry a run id instead gets one
     auto-rerun first -- see
     test_janitor_infra_failed_first_cancel_triggers_rerun_without_failed_flag.
+
+    Issue #1266: this escalates through the same infra_rerun_cap_exceeded
+    site as the cap-exhaustion case, which is a mechanical reason, so it
+    lands agent:operator-queue, not agent:human-needed.
     """
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -16225,11 +16282,13 @@ def test_janitor_required_check_infra_failure_stays_blocked(tmp_path: Path) -> N
     # Issue #841: escalated to a human instead of blocking silently forever.
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["issues"]["123"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> None:
-    """Issue #376: repeated check-failure reworks escalate to human_needed via the request_changes cap."""
+    """Issue #376: repeated check-failure reworks escalate via the
+    request_changes cap. Issue #1266: max_rework_cycles_exceeded is
+    mechanical, so this lands agent:operator-queue, not agent:human-needed."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     checks = [
@@ -16270,7 +16329,7 @@ def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> No
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
     assert state["prs"]["456"]["request_changes_count"] == 2
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_janitor_required_check_failure_noop_does_not_reroute(tmp_path: Path) -> None:
@@ -17122,10 +17181,12 @@ def test_janitor_infra_failed_first_cancel_triggers_rerun_without_failed_flag(
     assert "123" not in state.get("issues", {})
 
 
-def test_janitor_infra_failed_cap_exhausted_escalates_to_human_needed(tmp_path: Path) -> None:
+def test_janitor_infra_failed_cap_exhausted_escalates_to_operator_queue(tmp_path: Path) -> None:
     """Criterion 2: once the infra rerun attempt cap (default 2) is exhausted,
-    there is no code-fix rework path -- the PR must escalate to
-    agent:human-needed instead of looping forever."""
+    there is no code-fix rework path -- the PR must escalate instead of
+    looping forever. Issue #1266: infra_rerun_cap_exceeded is a mechanical
+    reason (a process-attempt-cap limit, not a judgment call), so it lands
+    agent:operator-queue, not agent:human-needed."""
     config = _required_checks_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
@@ -17161,7 +17222,7 @@ def test_janitor_infra_failed_cap_exhausted_escalates_to_human_needed(tmp_path: 
     assert state["issues"]["123"]["escalation_reason"] == "infra_rerun_cap_exceeded"
     assert state["issues"]["123"]["reason_class"] == "mechanical"
     assert state["prs"]["456"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert any(event["kind"] == "infra_rerun_escalated" for event in state.get("events", []))
 
 
@@ -18771,7 +18832,8 @@ def test_rework_cap_survives_event_log_truncation(tmp_path: Path) -> None:
 
     assert third.data["escalated"] is True
     assert third.data["rework_path"] is None
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Issue #1266: max_rework_cycles_exceeded is a mechanical escalation.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_record_review_approved_transitions_labels(tmp_path: Path) -> None:
@@ -18839,6 +18901,30 @@ def test_record_review_request_changes_transition_failure_recorded(tmp_path: Pat
     assert label_error["edge"] == "rework_requested"
     assert label_error["outcome"] == TransitionOutcome.PARTIAL_FAILURE.value
     assert len(label_error["add_failures"]) > 0
+
+
+def test_record_review_blocked_transitions_to_human_needed(tmp_path: Path) -> None:
+    """Issue #1266 behavior preservation: "blocked" is judgment-only by
+    construction (a reviewer-flagged security/product concern is never
+    mechanical), so record_review's "blocked" decision must keep routing to
+    agent:human-needed unchanged -- it has no operator-queue counterpart in
+    _MECHANICAL_ESCALATION_EDGES. Representative judgment site #2 (site #1 is
+    test_cross_family_regen_reachability.py's
+    test_the_escalating_pass_does_not_strip_the_human_needed_label)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456, "blocked", summary="security concern", verdict_provenance="fresh_llm_review"
+    )
+
+    assert result.ok is True
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["reason_class"] == "judgment"
+    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
 
 
 def test_record_review_blocked_transition_failure_recorded(tmp_path: Path) -> None:
@@ -19570,7 +19656,9 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
         assert state["issues"]["123"]["status"] == "rework_requested"
         assert len(state["issues"]["123"].get("redispatch_at", [])) == i + 1
 
-    # Third failure exceeds the cap and escalates to human-needed.
+    # Third failure exceeds the cap and escalates. Issue #1266:
+    # redispatch_cap_exceeded is mechanical, so this lands
+    # agent:operator-queue, not agent:human-needed.
     result = app.dispatch_rework()
     assert result.ok is False
     assert result.data["failed_count"] == 1
@@ -19578,7 +19666,7 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
     assert len(state["issues"]["123"]["redispatch_at"]) == 3
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) in fake_gh.labels_removed
 
 
@@ -23896,10 +23984,13 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     # Issue status should now be escalated (cleared from rework_requested)
     assert state["issues"]["123"]["status"] == "escalated"
 
-    # Step 5: Verify the escalated label transition was fired (adds human_needed, removes reviewing)
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Step 5: Verify the escalated label transition was fired (adds
+    # operator_queue, removes reviewing). Issue #1266: max_rework_cycles_exceeded
+    # is a mechanical escalation, so it now routes to operator_queue instead of
+    # human_needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     # The escalated transition removes reviewing but does NOT remove needs_rework
-    # (this is by design per labels.py: "escalated": ((labels.human_needed,), (labels.reviewing,)))
+    # (this is by design per labels.py's redispatch_escalated/escalated edges)
 
     # Step 6: dispatch_rework should still NOT select the escalated issue
     # because the issue status is "escalated" (not "rework_requested")
@@ -25884,7 +25975,9 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
     assert entry["escalation_reason"] == "worker_death_loop"
     assert len(entry["redispatch_at"]) == 4
     assert len(entry["worker_death_at"]) == 4
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: worker_death_loop is mechanical, so this lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
@@ -26160,7 +26253,10 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "worktree_unsafe"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: a deterministic failure_kind escalation is mechanical
+    # (same _escalate_issue site as worker_death_loop/redispatch_cap_exceeded
+    # in _reap_restore_rework_requested), so this lands agent:operator-queue.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
@@ -26242,7 +26338,9 @@ def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediate
     entry = state["issues"]["123"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "rework_branch_conflict"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: same mechanical _escalate_issue site as the
+    # worktree_unsafe/worker_death_loop cases above -> operator_queue.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
     assert (123, config.labels.needs_rework) not in fake_gh.labels_added
 
     event_kinds = [e["kind"] for e in state["events"] if e["payload"].get("issue_number") == 123]
@@ -26432,9 +26530,11 @@ def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispat
     assert (42, config.labels.ready) not in fake_gh.labels_added
 
     # The escalation transition (redispatch_escalated) must have actually run:
-    # human_needed added, in_progress removed — proving escalation took the
-    # GitHub-mutating path rather than silently no-oping.
-    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    # operator_queue added, in_progress removed — proving escalation took the
+    # GitHub-mutating path rather than silently no-oping. Issue #1266:
+    # worker_blocked is mechanical, so it lands agent:operator-queue, not
+    # agent:human-needed.
+    assert (42, config.labels.operator_queue) in fake_gh.labels_added
     assert (42, config.labels.in_progress) in fake_gh.labels_removed
 
     # (b) escalation_reason recorded as worker_blocked, not the generic cap.
@@ -26545,8 +26645,9 @@ def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_s
     # No hot relabel-to-ready — same structural proof as the DB-based test.
     assert (42, config.labels.ready) not in fake_gh.labels_added
 
-    # Escalation transition actually ran.
-    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    # Escalation transition actually ran. Issue #1266: worker_blocked is
+    # mechanical, so it lands agent:operator-queue, not agent:human-needed.
+    assert (42, config.labels.operator_queue) in fake_gh.labels_added
     assert (42, config.labels.in_progress) in fake_gh.labels_removed
 
     # escalation_reason recorded as worker_blocked, not the generic cap or
@@ -26629,8 +26730,9 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
 
     # No hot relabel-to-ready.
     assert (42, config.labels.ready) not in fake_gh.labels_added
-    # Escalation transition added human_needed.
-    assert (42, config.labels.human_needed) in fake_gh.labels_added
+    # Escalation transition added operator_queue. Issue #1266: worktree_unsafe
+    # is mechanical, so it lands agent:operator-queue, not agent:human-needed.
+    assert (42, config.labels.operator_queue) in fake_gh.labels_added
     # The launch never succeeded, so the issue should not be marked in_progress.
     assert (42, config.labels.in_progress) not in fake_gh.labels_added
 
@@ -26643,7 +26745,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
     assert "session_failed_relabeled" not in event_kinds
     assert "session_failed_escalated" in event_kinds
 
-    fake_gh.issues[0]["labels"].append({"name": config.labels.human_needed})
+    fake_gh.issues[0]["labels"].append({"name": config.labels.operator_queue})
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch(limit=1)
     assert result.data["selected_count"] == 0
@@ -29507,7 +29609,10 @@ def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
             "isCrossRepository": False,
         },
     ]
-    fake_gh.issues[0]["labels"] = [{"name": config.labels.human_needed}]
+    # Issue #1266: redispatch_cap_exceeded is mechanical, so a real prior
+    # escalation for this reason would have landed agent:operator-queue, not
+    # agent:human-needed -- seed the fixture to match.
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.operator_queue}]
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     app.record_review(456, "approved", summary="lgtm", verdict_provenance="fresh_llm_review")
@@ -29518,6 +29623,7 @@ def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
             **state["issues"]["123"],
             "status": "escalated",
             "escalation_reason": "redispatch_cap_exceeded",
+            "reason_class": "mechanical",
             "redispatch_at": unrelated_redispatch_at,
         }
         save_state(paths.state_file, state)
@@ -29541,7 +29647,7 @@ def test_merge_ready_conflict_escalated_for_unrelated_reason_routes_to_rework(
     assert len(conflict_events) == 1
     assert conflict_events[0]["payload"]["issue_number"] == 123
     assert (123, config.labels.needs_rework) in fake_gh.labels_added
-    assert (123, config.labels.human_needed) in fake_gh.labels_removed
+    assert (123, config.labels.operator_queue) in fake_gh.labels_removed
     # Reason X's own budget must survive remediating unrelated Y: the
     # watchdog redispatch timestamps that drove the ORIGINAL escalation are
     # untouched, so a later re-escalation for the same reason X is not
@@ -29749,7 +29855,9 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "worktree_unsafe"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: this deterministic-failure-kind escalation is mechanical,
+    # so it lands agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     # The attempt counted by the (now-unified) conflict-rework dispatch must
     # survive this SEPARATE escalation lane untouched -- it lives on the PR
@@ -34690,10 +34798,11 @@ def test_review_started_fires_when_head_advanced_after_request_changes(tmp_path:
 def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path) -> None:
     """Issue #384: an escalated issue must stay terminal on re-review.
 
-    After record_review escalates an issue to agent:human-needed, a later
-    review() pass (e.g., from loop()) that sees a newly-advanced head must not
-    regenerate a packet or fire review_started, which would strip the human-needed
-    label and put the PR back into an active-automation state.
+    After record_review escalates an issue to agent:operator-queue (issue
+    #1266: max_rework_cycles_exceeded is mechanical), a later review() pass
+    (e.g., from loop()) that sees a newly-advanced head must not regenerate a
+    packet or fire review_started, which would strip the escalation label
+    and put the PR back into an active-automation state.
     """
     config = OrchestratorConfig()  # max_rework_cycles = 2
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -34724,7 +34833,9 @@ def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path)
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["status"] == "escalated"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: max_rework_cycles_exceeded is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     # Clear label tracking to isolate the review() call
     fake_gh.labels_added.clear()
@@ -34736,9 +34847,9 @@ def test_review_does_not_clobber_escalated_label_on_head_advance(tmp_path: Path)
 
     result = app.review(456)
 
-    # review() must short-circuit and must not touch the human-needed label
+    # review() must short-circuit and must not touch the escalation label
     assert result.ok is True
-    assert (123, config.labels.human_needed) not in fake_gh.labels_removed
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_removed
     assert (123, config.labels.pr_open) not in fake_gh.labels_added
     assert (123, config.labels.reviewing) not in fake_gh.labels_added
 
@@ -40509,7 +40620,9 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     assert entry["worker_pid"] == 99999
 
     # The ``escalated`` label edge must have been applied via transition().
-    assert (207, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: dead_dispatched_worker_reap is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (207, config.labels.operator_queue) in fake_gh.labels_added
     assert (207, config.labels.in_progress) in fake_gh.labels_removed
 
     # A dedicated reap event must be recorded.
@@ -45449,7 +45562,8 @@ def test_dispatch_failed_retries_are_capped_and_escalate(tmp_path: Path) -> None
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "dispatch_failed_cap_exceeded"
     assert len(state["issues"]["123"]["dispatch_failed_at"]) == 2
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Issue #1266: repeated dispatch failure is a mechanical escalation.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     # Third dispatch no longer selects the escalated issue.
     result3 = app.dispatch(limit=1)
@@ -45480,7 +45594,8 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     Drives ``OrchestratorApp.dispatch`` (the ``_dispatch_impl`` path that decides
     to escalate instead of dispatch), not ``cross_repo_gate`` in isolation, and
     asserts the three observable effects of the wiring: the label transition to
-    ``agent:human-needed``, the ``dispatch_cross_repo_escalated`` event, and
+    ``agent:operator-queue`` (issue #1266: mechanical reason_class), the
+    ``dispatch_cross_repo_escalated`` event, and
     exclusion from ``session_requests`` (``selected_count == 0``). A regression
     in the wiring that calls the gate would silently reintroduce the exact bug
     this PR fixes with every unit test green, so this test exercises the wiring.
@@ -45504,8 +45619,10 @@ def test_dispatch_cross_repo_gate_escalates_when_all_paths_absent(tmp_path: Path
     # No dispatch_results were produced for the escalated issue.
     assert result.data["dispatch_results"] == []
 
-    # Label transition to human-needed (the redispatch_escalated edge).
-    assert (123, "agent:human-needed") in fake_gh.labels_added
+    # Label transition to operator-queue (the redispatch_escalated edge,
+    # mechanical reason_class per issue #1266 -- a cross-repo target
+    # mismatch is a structural/mechanical failure, not a judgment call).
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
     # The dispatch_cross_repo_escalated event was recorded with the issue number
     # and a cross_repo_target reason.
@@ -48627,7 +48744,9 @@ def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "rework_branch_conflict"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: a deterministic failure_kind escalation is mechanical, so
+    # it lands agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
@@ -48682,7 +48801,9 @@ def test_dispatch_rework_no_op_rework_cap_escalates(tmp_path: Path) -> None:
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "redispatch_cap_exceeded"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: no_op_rework_escalated is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_dispatch_rework_worker_deaths_dont_count_as_no_op(tmp_path: Path) -> None:
@@ -48742,7 +48863,9 @@ def test_dispatch_rework_worker_deaths_dont_count_as_no_op(tmp_path: Path) -> No
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["issues"]["123"]["escalation_reason"] == "worker_death_loop"
-    assert (123, config.labels.human_needed) in fake_gh.labels_added
+    # Issue #1266: worker_death_loop is mechanical, so it lands
+    # agent:operator-queue, not agent:human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
 
 
 def test_dispatch_rework_mixed_deaths_and_no_ops_no_op_dominates(tmp_path: Path) -> None:

@@ -354,11 +354,14 @@ def test_facade_reexports_every_name_consumers_reach_through_workflow() -> None:
     tests/scripts/src, not from a list restated by hand in this test (which
     is exactly the kind of copy that drifts the moment a consumer changes).
 
-    Only 2 of escalation.py's 5 module-level names have any consumer
+    Only 2 of escalation.py's 9 module-level names have any consumer
     reference outside workflow.py at all (`_escalate_issue` and
     `_collect_escalated_label_subjects`) -- `_escalation_flags`,
-    `_deescalation_skip`, and `_escalated_label_needs_repair` are reached
-    only by bare-name call sites inside OrchestratorApp methods that stay in
+    `_deescalation_skip`, `_escalated_label_needs_repair`, and the four
+    names issue #1266 added (`_MECHANICAL_ESCALATION_EDGES`,
+    `_escalation_edge`, `_escalation_label`, `_repair_reason_class`) are
+    reached only by bare-name call sites inside OrchestratorApp methods (or,
+    for the constant, only from within escalation.py itself) that stay in
     workflow.py, so this scan imposes no obligation for them. They are still
     required to be re-exported by the unconditional facade-obligation rule
     (AC4 covers that), just not because this live scan demands it.
@@ -395,8 +398,8 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     completeness test above.
 
     Unlike A1's dispatch_selection control (3 anchors), only 2 of
-    escalation.py's 5 names have any external reference at all -- see the
-    completeness test's docstring above for why the other 3 are legitimately
+    escalation.py's 9 names have any external reference at all -- see the
+    completeness test's docstring above for why the other 7 are legitimately
     absent, not a scan failure.
 
     ``_escalate_issue`` itself is checked for presence only, not a specific

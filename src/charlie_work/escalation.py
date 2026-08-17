@@ -11,9 +11,106 @@ monkeypatch targets keep working unchanged.
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Any
 
-from .state import escalation_reason_class, utc_now
+from .config import LabelConfig
+from .labels import _edges
+from .state import ESCALATION_REASON_CLASSES, escalation_reason_class, utc_now
+
+# Issue #1266: the two labels.py edges every escalation call site otherwise
+# hardcodes ("escalated" and "redispatch_escalated") get a mechanical
+# counterpart that lands LabelConfig.operator_queue instead of human_needed.
+# This table is the ONLY place that pairing is recorded — _escalation_edge()
+# is the single point every escalation call site (and both label-repair
+# consumers) goes through to pick between them.
+_MECHANICAL_ESCALATION_EDGES: MappingProxyType[str, str] = MappingProxyType(
+    {
+        "escalated": "operator_queued",
+        "redispatch_escalated": "redispatch_operator_queued",
+    }
+)
+
+
+def _escalation_edge(edge: str, reason_class: str) -> str:
+    """Map a labels.py transition edge + escalation reason_class to the edge to call.
+
+    ``edge`` is the event name a call site would otherwise hardcode --
+    ``"escalated"`` or ``"redispatch_escalated"``, the two edges every
+    escalation call site in workflow.py resolves to before this helper
+    existed. For ``reason_class == "mechanical"``, returns the
+    operator-queue counterpart edge instead (issue #1266), so a mechanical
+    escalation lands ``LabelConfig.operator_queue`` and reserves
+    ``agent:human-needed`` for judgment calls. Any other ``edge`` (e.g.
+    ``"blocked"``, which state.py's taxonomy makes judgment-only by
+    construction -- the rework-cycle-cap "blocked" status is always a
+    reviewer decision, never an automated one) has no operator-queue
+    counterpart and passes through unchanged for every reason_class,
+    including ``"mechanical"`` -- there is deliberately no "blocked but
+    mechanical" cell in this mapping.
+
+    Validates ``reason_class`` via ``escalation_reason_class`` first, so an
+    unrecognized value raises ``ValueError`` here rather than silently
+    falling through to the identity return -- the same fail-loud contract
+    state.py documents for the persisted field. Callers that read a
+    possibly-missing/legacy ``reason_class`` out of state (the label-repair
+    self-heal sweep, reconcile's drift converger) must normalize it to a
+    valid value themselves before calling this helper -- normalizing inside
+    the helper would let an unclassified escalation silently default to
+    either label instead of the caller making that choice explicitly.
+    """
+    escalation_reason_class(reason_class)
+    if reason_class == "mechanical":
+        return _MECHANICAL_ESCALATION_EDGES.get(edge, edge)
+    return edge
+
+
+def _escalation_label(labels: LabelConfig, edge: str) -> str | None:
+    """The label a labels.py transition ``edge`` adds, derived from ``_edges()``.
+
+    Both label-repair consumers (workflow.py's ``_repair_escalated_labels``
+    self-heal sweep and reconcile.py's ``escalated_labels_converged`` drift
+    check) need to know "is the right label already present" without
+    re-deciding what "right" means -- that decision belongs to
+    ``_edges()`` alone. Returns ``None`` for an edge whose add-tuple is
+    empty (no escalation edge is one of these today, but the contract holds
+    for any future edge that only removes).
+    """
+    add, _ = _edges(labels)[edge]
+    return add[0] if add else None
+
+
+def _repair_reason_class(issue_entry: dict[str, Any] | None) -> str:
+    """The label-repair target reason_class for an escalated issue's state entry.
+
+    The label-repair self-heal sweep (workflow.py's
+    ``_repair_escalated_labels``) and reconcile's ``escalated_labels_converged``
+    drift check both need "what label should this issue carry right now",
+    which is not always the same as its stored ``reason_class``:
+
+    - Missing/legacy ``reason_class`` (an escalation predating issue #797's
+      field, not yet touched by ``_backfill_missing_reason_classes``) or any
+      other unrecognized value falls back to ``"judgment"`` (``human_needed``)
+      -- the same fail-closed default state.py's own
+      ``DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS`` handling uses: an
+      unclassified escalation must never be silently assumed mechanical.
+    - ``deescalation_cap_notified_at`` set means ``_deescalate_mechanical_issue``'s
+      cap-exhaustion branch already moved this issue off ``operator_queue``
+      onto ``human_needed`` (issue #1266) -- deliberately treated as
+      ``"judgment"`` here even though the stored ``reason_class`` is still
+      ``"mechanical"``, so neither repair consumer re-applies operator_queue
+      to an issue the auto-clear sweep has already given up on.
+
+    Centralized here (rather than inlined at each of the two call sites) so
+    both consumers share the exact same rule instead of two
+    independently-maintained copies of it.
+    """
+    if not isinstance(issue_entry, dict):
+        return "judgment"
+    if issue_entry.get("deescalation_cap_notified_at"):
+        return "judgment"
+    raw = issue_entry.get("reason_class")
+    return raw if raw in ESCALATION_REASON_CLASSES else "judgment"
 
 
 def _escalation_flags(

@@ -30,6 +30,7 @@ from typing import Any
 
 from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .escalation import _escalation_edge, _escalation_label, _repair_reason_class
 from .github import (
     GitHubError,
     GitHubLike,
@@ -1516,15 +1517,27 @@ def detect_drift(
                 )
 
         if tracked_status == "escalated" and _issue_state(issue) == "OPEN":
-            needs_human_needed = labels_cfg.human_needed not in issue_labels
-            if needs_human_needed or active_present:
+            # Issue #1266: a mechanical escalation's correct label is
+            # operator_queue, not human_needed -- deriving the target from
+            # the issue's reason_class (via the same helpers the label-repair
+            # self-heal sweep uses) is what stops this convergence check from
+            # clobbering a correctly operator-queued issue back to
+            # human_needed on every reconcile pass.
+            repair_reason_class = _repair_reason_class(
+                tracked_entry if isinstance(tracked_entry, dict) else None
+            )
+            expected_label = _escalation_label(
+                labels_cfg, _escalation_edge("escalated", repair_reason_class)
+            )
+            needs_expected_label = (
+                expected_label is not None and expected_label not in issue_labels
+            )
+            if needs_expected_label or active_present:
                 fix_actions = []
                 add_labels: tuple[str, ...] = ()
-                if needs_human_needed:
-                    fix_actions.append(
-                        f"add label '{labels_cfg.human_needed}' to issue #{issue_number}"
-                    )
-                    add_labels = (labels_cfg.human_needed,)
+                if needs_expected_label:
+                    fix_actions.append(f"add label '{expected_label}' to issue #{issue_number}")
+                    add_labels = (expected_label,)
                 for label in sorted(active_present):
                     fix_actions.append(f"remove label '{label}' from issue #{issue_number}")
                 drift.append(
@@ -2222,10 +2235,11 @@ def apply_fixes(
                         label_ok = False
                 # Issue #417: issue_active_label_no_open_pr now carries
                 # add_labels=(ready,) when the ready label is missing;
-                # escalated_labels_converged carries add_labels=(human_needed,)
-                # when the escalation label never landed --
-                # done_label_with_active_labels never sets add_labels, so this
-                # loop is a no-op for that sibling kind.
+                # escalated_labels_converged carries add_labels=(<expected
+                # terminal label>,) when it never landed -- human_needed for
+                # a judgment escalation, operator_queue for a mechanical one
+                # (issue #1266) -- done_label_with_active_labels never sets
+                # add_labels, so this loop is a no-op for that sibling kind.
                 for label in item.add_labels:
                     if not gh.add_issue_label(item.issue_number, label):
                         label_ok = False
@@ -2386,8 +2400,19 @@ def apply_fixes(
             # Issue #261: worker was killed by a push-gate hook — escalate
             # via the same "redispatch_escalated" label edge workflow.py's
             # reaper uses, instead of relabeling to ready.
+            # Issue #1266: this DriftItem is only ever raised when
+            # failure_kind is in DETERMINISTIC_ESCALATION_FAILURE_KINDS (see
+            # detect_drift) -- the exact gate workflow.py's own dead-session
+            # reapers use to set reason_class="mechanical" unconditionally.
+            # This is a first-escalation path (reconcile.py detected a dead
+            # worker before any workflow.py sweep did), not a label-repair
+            # path, so it must independently resolve the mechanical edge
+            # rather than hardcoding "redispatch_escalated" -- otherwise the
+            # same dead-worker condition lands on a different label purely
+            # because reconcile.py's drift pass caught it first.
             if item.issue_number is not None:
-                result = transition(gh, config.labels, item.issue_number, "redispatch_escalated")
+                edge = _escalation_edge("redispatch_escalated", "mechanical")
+                result = transition(gh, config.labels, item.issue_number, edge)
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
                     fix_actions.append(

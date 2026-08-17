@@ -254,6 +254,10 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _escalate_issue,
     _escalated_label_needs_repair,
     _collect_escalated_label_subjects,
+    _escalation_edge,
+    _escalation_label,
+    _repair_reason_class,
+    _MECHANICAL_ESCALATION_EDGES,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -4445,7 +4449,7 @@ def _detect_and_handle_orphaned_workers(
     # re-escalate (status is no longer ``dispatched``), but reconcile's
     # ground-truth label sweep will eventually converge the label.
     for issue_number in reap_escalations:
-        transition(gh, config.labels, issue_number, "escalated")
+        transition(gh, config.labels, issue_number, _escalation_edge("escalated", "mechanical"))
 
 
 def _sweep_orphan_processes_for_dead_sessions(
@@ -4814,9 +4818,14 @@ def _reap_restore_rework_requested(
             )
             save_state(state_file, state)
 
-    # Transition labels: escalate to human_needed, or rework_requested
-    # (needs_rework), removing the stale in_progress label from the failed launch.
-    edge = "redispatch_escalated" if should_escalate else "rework_requested"
+    # Transition labels: escalate (operator_queue for mechanical reasons,
+    # human_needed reserved for judgment), or rework_requested (needs_rework),
+    # removing the stale in_progress label from the failed launch.
+    edge = (
+        _escalation_edge("redispatch_escalated", "mechanical")
+        if should_escalate
+        else "rework_requested"
+    )
     result = transition(gh, config.labels, worker.issue_number, edge)
     if result.outcome != TransitionOutcome.APPLIED:
         with state_lock(state_file):
@@ -5451,14 +5460,15 @@ def _route_dead_worker_to_pre_review_rework(
                 },
             )
             save_state(state_file, state)
-            result = transition(gh, config.labels, issue_number, "redispatch_escalated")
+            edge = _escalation_edge("redispatch_escalated", "mechanical")
+            result = transition(gh, config.labels, issue_number, edge)
             if result.outcome != TransitionOutcome.APPLIED:
                 entry = state["issues"].get(str(issue_number), {})
                 if isinstance(entry, dict):
                     entry = {
                         **entry,
                         "label_error": {
-                            "edge": "redispatch_escalated",
+                            "edge": edge,
                             "outcome": result.outcome.value,
                             "add_failures": result.add_failures,
                             "remove_failures": result.remove_failures,
@@ -5691,7 +5701,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                     state["issues"][str(w.issue_number)].pop("worker_pid", None)
                     state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
                     save_state(state_file, state)
-                    transition(gh, config.labels, w.issue_number, "redispatch_escalated")
+                    transition(
+                        gh,
+                        config.labels,
+                        w.issue_number,
+                        _escalation_edge("redispatch_escalated", "mechanical"),
+                    )
                     state = append_event(
                         state,
                         "session_failed_escalated",
@@ -5961,7 +5976,12 @@ def _classify_dead_sessions_and_update_throttle_state(
                         # time we reach this branch, but clearing it removes the
                         # only signal the recovery probe can cross-check.
                         save_state(state_file, state)
-                        transition(gh, config.labels, w.issue_number, "redispatch_escalated")
+                        transition(
+                            gh,
+                            config.labels,
+                            w.issue_number,
+                            _escalation_edge("redispatch_escalated", "mechanical"),
+                        )
                         state = append_event(
                             state,
                             "session_failed_escalated",
@@ -7276,6 +7296,7 @@ class OrchestratorApp:
             self.config.labels.blocked: "Automation is blocked and needs intervention.",
             self.config.labels.done: "Automation completed and the issue was merged or resolved.",
             self.config.labels.human_needed: "A human product or security decision is needed.",
+            self.config.labels.operator_queue: "A mechanical failure exhausted its automated retries; needs operator triage.",
             self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
             self.config.labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
             self.config.labels.complexity_high: (
@@ -9007,15 +9028,16 @@ class OrchestratorApp:
                     # deterministic launch failure that retrying cannot fix
                     # (escalation_reason carries the failure_kind) — escalate to
                     # human-needed and remove the issue from the dispatch pool.
+                    edge = _escalation_edge("redispatch_escalated", "mechanical")
                     result = transition(
                         self.gh,
                         self.config.labels,
                         request.issue_number,
-                        "redispatch_escalated",
+                        edge,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {
-                            "edge": "redispatch_escalated",
+                            "edge": edge,
                             "outcome": result.outcome.value,
                             "add_failures": result.add_failures,
                             "remove_failures": result.remove_failures,
@@ -9060,17 +9082,18 @@ class OrchestratorApp:
                     state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
-                # Transition labels to human-needed, following the same pattern
-                # as the redispatch_escalated path above.
+                # Transition labels (operator_queue for mechanical, following
+                # the same pattern as the redispatch_escalated path above).
+                edge = _escalation_edge("redispatch_escalated", "mechanical")
                 result = transition(
                     self.gh,
                     self.config.labels,
                     issue_number,
-                    "redispatch_escalated",
+                    edge,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
-                        "edge": "redispatch_escalated",
+                        "edge": edge,
                         "outcome": result.outcome.value,
                         "add_failures": result.add_failures,
                         "remove_failures": result.remove_failures,
@@ -10070,11 +10093,12 @@ class OrchestratorApp:
                         state_path=self.paths.state_file,
                     )
                     save_state(self.paths.state_file, state)
-                result = transition(self.gh, self.config.labels, issue_number, "escalated")
+                edge = _escalation_edge("escalated", "mechanical")
+                result = transition(self.gh, self.config.labels, issue_number, edge)
                 label_error = None
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
-                        "edge": "escalated",
+                        "edge": edge,
                         "outcome": result.outcome.value,
                         "add_failures": result.add_failures,
                         "remove_failures": result.remove_failures,
@@ -11830,11 +11854,20 @@ class OrchestratorApp:
             # abort the pass. Skip it and retry next pass -- the escalated status
             # is already durable in state, so deferring loses no ground truth.
             try:
+                # Issue #1266: a mechanical escalation's correct label is
+                # operator_queue, not human_needed -- re-deriving from the
+                # issue's reason_class (rather than hardcoding "escalated"
+                # here) is what stops this sweep from clobbering a correctly
+                # operator-queued issue back to human_needed every pass.
+                fresh_issue_entry = fresh.get("issues", {}).get(str(issue_number), {})
+                repair_reason_class = _repair_reason_class(fresh_issue_entry)
+                edge = _escalation_edge("escalated", repair_reason_class)
+                expected_label = _escalation_label(self.config.labels, edge)
                 issue_view = self.gh.issue_view(int(issue_number))
-                if self.config.labels.human_needed in label_names(issue_view):
+                if expected_label is not None and expected_label in label_names(issue_view):
                     outcomes.append((int(issue_number), None))
                     continue
-                result = transition(self.gh, self.config.labels, int(issue_number), "escalated")
+                result = transition(self.gh, self.config.labels, int(issue_number), edge)
             except Exception:
                 logging.getLogger(__name__).warning(
                     "escalated label repair for issue %s deferred (GitHub fetch "
@@ -11851,7 +11884,7 @@ class OrchestratorApp:
                     (
                         int(issue_number),
                         {
-                            "edge": "escalated",
+                            "edge": edge,
                             "outcome": result.outcome.value,
                             "add_failures": result.add_failures,
                             "remove_failures": result.remove_failures,
@@ -12440,17 +12473,22 @@ class OrchestratorApp:
         # Gated by dry_run: --dry-run must not perform live GitHub label
         # mutations or state.json writes (review finding on PR #670).
         if not self.dry_run:
+            # Issue #1266: every producer feeding escalated_for_labels above
+            # escalates with reason_class="mechanical" (max_review_dispatch_
+            # attempts_exceeded is a process-attempt-cap limit, never a
+            # judgment call), so the edge is resolved once for the batch.
+            escalated_edge = _escalation_edge("escalated", "mechanical")
             escalated_label_outcomes: list[tuple[int, dict[str, Any] | None]] = []
             for _pr_num, issue_num in escalated_for_labels:
                 if issue_num is None:
                     continue
-                result = transition(self.gh, self.config.labels, int(issue_num), "escalated")
+                result = transition(self.gh, self.config.labels, int(issue_num), escalated_edge)
                 if result.outcome != TransitionOutcome.APPLIED:
                     escalated_label_outcomes.append(
                         (
                             int(issue_num),
                             {
-                                "edge": "escalated",
+                                "edge": escalated_edge,
                                 "outcome": result.outcome.value,
                                 "add_failures": result.add_failures,
                                 "remove_failures": result.remove_failures,
@@ -13035,10 +13073,11 @@ class OrchestratorApp:
             )
             save_state(self.paths.state_file, state)
         if issue_number is not None:
-            result = transition(self.gh, self.config.labels, int(issue_number), "escalated")
+            rescue_edge = _escalation_edge("escalated", rescue_reason_class)
+            result = transition(self.gh, self.config.labels, int(issue_number), rescue_edge)
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
-                    "edge": "escalated",
+                    "edge": rescue_edge,
                     "outcome": result.outcome.value,
                     "add_failures": result.add_failures,
                     "remove_failures": result.remove_failures,
@@ -13738,7 +13777,13 @@ class OrchestratorApp:
         label_error: dict[str, Any] | None = None
         if issue_number is not None:
             if decision == "request_changes":
-                target = "escalated" if escalated else "rework_requested"
+                # Issue #1266: escalated here is always max_rework_cycles_
+                # exceeded (mechanical) -- see the _escalate_issue call above.
+                target = (
+                    _escalation_edge("escalated", "mechanical")
+                    if escalated
+                    else "rework_requested"
+                )
                 result = transition(
                     self.gh,
                     self.config.labels,
@@ -13753,7 +13798,17 @@ class OrchestratorApp:
                         "remove_failures": result.remove_failures,
                     }
             elif decision == "blocked":
-                result = transition(self.gh, self.config.labels, issue_number, "blocked")
+                # Issue #1266: "blocked" has no operator-queue counterpart --
+                # a reviewer-blocked verdict is judgment-only by
+                # construction -- so this is an inert pass-through, kept
+                # here for uniformity with every other escalation-label
+                # call site now routing through the same helper.
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    _escalation_edge("blocked", "judgment"),
+                )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
                         "edge": "blocked",
@@ -17468,11 +17523,12 @@ class OrchestratorApp:
             )
             save_state(self.paths.state_file, state)
 
-        result = transition(self.gh, self.config.labels, issue_number, "escalated")
+        edge = _escalation_edge("escalated", "mechanical")
+        result = transition(self.gh, self.config.labels, issue_number, edge)
         label_error = None
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {
-                "edge": "escalated",
+                "edge": edge,
                 "outcome": result.outcome.value,
                 "add_failures": result.add_failures,
                 "remove_failures": result.remove_failures,
@@ -17880,11 +17936,12 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, state)
-            result = transition(self.gh, self.config.labels, issue_number, "escalated")
+            edge = _escalation_edge("escalated", "mechanical")
+            result = transition(self.gh, self.config.labels, issue_number, edge)
             label_error = None
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
-                    "edge": "escalated",
+                    "edge": edge,
                     "outcome": result.outcome.value,
                     "add_failures": result.add_failures,
                     "remove_failures": result.remove_failures,
@@ -18180,11 +18237,12 @@ class OrchestratorApp:
                 },
             )
             save_state(self.paths.state_file, state)
-        result = transition(self.gh, self.config.labels, issue_number, "escalated")
+        edge = _escalation_edge("escalated", "mechanical")
+        result = transition(self.gh, self.config.labels, issue_number, edge)
         label_error = None
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {
-                "edge": "escalated",
+                "edge": edge,
                 "outcome": result.outcome.value,
                 "add_failures": result.add_failures,
                 "remove_failures": result.remove_failures,
@@ -19736,6 +19794,20 @@ class OrchestratorApp:
                     },
                 )
                 save_state(self.paths.state_file, fresh_state)
+            # Issue #1266: the auto-clearing sweep has given up on this
+            # mechanical escalation -- move it off operator_queue onto
+            # human_needed so a human actually sees it (operator_queue is
+            # meant to be a self-clearing holding area, not a place a
+            # capped-out issue silently stays forever). The "escalated" edge
+            # already does this unconditionally: it adds human_needed and
+            # strips every other workflow_labels member, operator_queue
+            # included. Best-effort outside the lock, matching every other
+            # label transition here -- the label-repair self-heal sweep
+            # (_repair_escalated_labels) backstops a failed write, and it
+            # correctly re-targets human_needed once reason_class stays
+            # "mechanical" but this cap-exhaustion path has already run
+            # (repair reads state fresh, not this function's return value).
+            transition(self.gh, self.config.labels, issue_number, "escalated")
             return {"cap_exhausted": True, "issue_number": issue_number}
 
         pr_number: int | None = None
@@ -21257,7 +21329,7 @@ class OrchestratorApp:
                     self.gh,
                     self.config.labels,
                     issue_number,
-                    "redispatch_escalated",
+                    _escalation_edge("redispatch_escalated", "mechanical"),
                 )
 
         # Issue #1134: escalate worker-death loops separately from no-op
@@ -21335,7 +21407,7 @@ class OrchestratorApp:
                     self.gh,
                     self.config.labels,
                     issue_number,
-                    "redispatch_escalated",
+                    _escalation_edge("redispatch_escalated", "mechanical"),
                 )
 
         # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
@@ -21853,15 +21925,16 @@ class OrchestratorApp:
                         )
                         entry = state["issues"][str(request.issue_number)]
                         save_state(self.paths.state_file, state)
+                        edge = _escalation_edge("redispatch_escalated", "mechanical")
                         result = transition(
                             self.gh,
                             self.config.labels,
                             request.issue_number,
-                            "redispatch_escalated",
+                            edge,
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
                             label_error = {
-                                "edge": "redispatch_escalated",
+                                "edge": edge,
                                 "outcome": result.outcome.value,
                                 "add_failures": result.add_failures,
                                 "remove_failures": result.remove_failures,
@@ -21932,15 +22005,16 @@ class OrchestratorApp:
                         )
                         entry = state["issues"][str(request.issue_number)]
                         save_state(self.paths.state_file, state)
+                        edge = _escalation_edge("redispatch_escalated", "mechanical")
                         result = transition(
                             self.gh,
                             self.config.labels,
                             request.issue_number,
-                            "redispatch_escalated",
+                            edge,
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
                             label_error = {
-                                "edge": "redispatch_escalated",
+                                "edge": edge,
                                 "outcome": result.outcome.value,
                                 "add_failures": result.add_failures,
                                 "remove_failures": result.remove_failures,
@@ -23923,11 +23997,18 @@ class OrchestratorApp:
         # is no issue to carry the label. Do not "fix" that by inventing a label
         # target -- the PR record is the surface for that case.
         if (escalated_now or repair_label_edge) and issue_number is not None:
-            result = transition(self.gh, self.config.labels, int(issue_number), "escalated")
+            # Issue #1266: this call site's own _escalate_issue above always
+            # passes reason_class="judgment" (an unusable cross-family
+            # report is a human product/process decision, never mechanical),
+            # so this resolves to the identity "escalated" edge -- routed
+            # through the helper anyway for uniformity with every other
+            # escalation-label call site.
+            edge = _escalation_edge("escalated", "judgment")
+            result = transition(self.gh, self.config.labels, int(issue_number), edge)
             label_error: dict[str, Any] | None = None
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
-                    "edge": "escalated",
+                    "edge": edge,
                     "outcome": result.outcome.value,
                     "add_failures": result.add_failures,
                     "remove_failures": result.remove_failures,
