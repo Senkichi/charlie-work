@@ -15746,6 +15746,191 @@ def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> 
     assert "No interdiff is needed" in packet
 
 
+def test_review_round_history_shows_approved_round_required_changes_with_summary(
+    tmp_path: Path,
+) -> None:
+    """Issue #1270 review round 1 (blocker): an approved archived round can
+    legitimately carry a non-empty required_changes left over from an
+    earlier round (rework_prompts.py's own docstring names this population
+    explicitly). _render_required_changes_section returns "" for `approved`
+    by design -- that verdict is out of its scope, since its findings
+    belong in $prior_review_section (i.e. exactly this round-history
+    section) rather than the worker's brief. Before the fix,
+    _render_round_findings inherited that "" unconditionally and the caller
+    printed the affirmatively false "_No findings recorded for this
+    round._" even though the round's archive held a real finding."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "approved",
+        "summary": "looks good overall, one leftover item",
+        "required_changes": ["leftover from earlier: tighten the input regex"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "leftover from earlier: tighten the input regex" in packet
+    assert "looks good overall, one leftover item" in packet
+    assert "_No findings recorded for this round._" not in packet
+
+
+def test_review_round_history_shows_approved_round_required_changes_without_summary(
+    tmp_path: Path,
+) -> None:
+    """Same population as the sibling test above (an approved round with
+    leftover required_changes), but with an empty summary -- the bullets
+    must render on their own, not only when a summary happens to also be
+    present."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "approved",
+        "summary": "",
+        "required_changes": ["leftover finding: add a test for the empty-input case"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "leftover finding: add a test for the empty-input case" in packet
+    assert "_No findings recorded for this round._" not in packet
+
+
+def test_review_round_history_shows_blocked_round_required_changes_with_summary(
+    tmp_path: Path,
+) -> None:
+    """Issue #1270 review round 1 (blocker): a blocked archived round's
+    tiers 1-2 are intentionally suppressed by
+    _render_required_changes_section for the WORKER's rework brief (the
+    "what must change before this PR can be approved" framing is wrong for
+    the decision-agnostic routes that produce a blocked verdict). That
+    suppression is specific to the worker's brief -- it must not also
+    delete the finding from the REVIEWER's round-history entry, which is a
+    different audience with a different, legitimate use for the same
+    content."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "blocked",
+        "summary": "blocked pending an external dependency update",
+        "required_changes": ["blocked-round finding: pin the vendored SDK version"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "blocked-round finding: pin the vendored SDK version" in packet
+    assert "blocked pending an external dependency update" in packet
+    assert "_No findings recorded for this round._" not in packet
+
+
+def test_review_round_history_shows_blocked_round_required_changes_without_summary(
+    tmp_path: Path,
+) -> None:
+    """Same population as the sibling test above (a blocked round with
+    required_changes), but with an empty summary -- the bullets must render
+    on their own."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "blocked",
+        "summary": "",
+        "required_changes": ["blocked-round finding: rotate the leaked credential"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "blocked-round finding: rotate the leaked credential" in packet
+    assert "_No findings recorded for this round._" not in packet
+
+
+def test_review_round_history_falls_back_when_round_dir_unreadable(tmp_path: Path) -> None:
+    """Issue #1270 review round 1 (fix 2): _round_history_entries used to
+    gate its fallback-to-the-flat-mirror on `not numbers` (whether any
+    round-K directory existed at all) rather than `not entries` (whether
+    any round-K directory's decision file was actually readable).
+    workflow.py's OrchestratorApp._write_json creates the round directory
+    via mkdir strictly before its atomic tmp_path.replace(), so a crash in
+    that window leaves an empty round-K/ with no review-decision.json
+    inside -- exactly what this test simulates by mkdir-ing round-1/
+    without writing anything into it. Before the fix, that left `numbers`
+    non-empty (the directory exists) but `entries` empty (nothing readable
+    inside it), so the fallback never fired and the whole prior-review
+    section silently vanished even though the flat mirror
+    (review-decision.json) held a perfectly valid verdict."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    flat_decision = {
+        "decision": "request_changes",
+        "summary": "fallback summary text",
+        "required_changes": ["fallback finding: fix the retry loop"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)  # directory exists, decision file does not
+    (decision_dir / "review-decision.json").write_text(json.dumps(flat_decision), encoding="utf-8")
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "fallback finding: fix the retry loop" in packet
+
+
 def test_review_ci_failure_with_annotations_populates_required_changes(tmp_path: Path) -> None:
     """Issue #771: a required-check failure whose check run carries GitHub
     annotations yields required_changes naming the real file/line, and the

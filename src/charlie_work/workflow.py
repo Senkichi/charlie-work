@@ -310,6 +310,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
 from .rework_prompts import (  # noqa: F401  (deliberate re-export)
     _EXTERNAL_FINDINGS_POINTER,
     _EXTERNAL_FINDINGS_SECTION_INTRO,
+    _REQUIRED_CHANGES_TIER1_INTRO,
     _ROUND_COMPARE_KEYS,
     _existing_round_numbers,
     _finish_required_changes_section,
