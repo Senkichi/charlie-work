@@ -37,8 +37,8 @@ from charlie_work.instrumentation import _LEVEL_BY_KIND, close_db, query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import (
-    FakeGitHub,
+from _fakes_github import FakeGitHub
+from _merge_tripwire_fixtures import (
     _arm_unauthorized_merge_tripwire,
     _merge_check_app,
     _merged_worker_pr,

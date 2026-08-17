@@ -64,8 +64,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import FakeGitHub
-from test_fix_event_dedup import FakeGitHubWithMissingRequiredAndRuns
+from _fakes_github import FakeGitHub, FakeGitHubWithMissingRequiredAndRuns
 
 _STALE_HEAD = "abc123abc123"
 

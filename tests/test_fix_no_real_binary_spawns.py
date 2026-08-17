@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work.claude_code import launch_claude_worker
-from test_claude_code_adapter import _install_fake_create_worktree
+from _claude_adapter_fixtures import _install_fake_create_worktree
 
 
 def test_default_template_launch_never_resolves_a_real_cli(

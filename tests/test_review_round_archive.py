@@ -53,52 +53,14 @@ from typing import Any
 import pytest
 
 import charlie_work.workflow as workflow
-from charlie_work.config import OrchestratorConfig
-from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp, _existing_round_numbers
 
-from test_charlie_work import FakeGitHub
-
-_PR_NUMBER = 456
-
-
-def _round_archive_app(tmp_path: Path) -> tuple[OrchestratorApp, Any]:
-    """Same minimal-fixture shape as test_verdict_provenance_enforcement's
-    ``_carry_forward_app``: bare state.json, default config, default
-    FakeGitHub (PR #456, linked to issue #123, head ``sha-abc123``)."""
-    config = OrchestratorConfig()
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    paths.root.mkdir(parents=True, exist_ok=True)
-    (paths.root / "state.json").write_text(
-        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
-        encoding="utf-8",
-    )
-    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
-    return app, paths
-
-
-def _record(app: OrchestratorApp, *, head: str, summary: str, required_changes: list[str]):
-    # FakeGitHub.pr_view honors pr_head_shas[number] as an override for the
-    # PR's headRefOid -- the same mechanism test_charlie_work.py's own
-    # rework-cap tests use to control reviewed_head_sha between calls.
-    app.gh.pr_head_shas[_PR_NUMBER] = head
-    result = app.record_review(
-        _PR_NUMBER,
-        "request_changes",
-        summary=summary,
-        required_changes=required_changes,
-        verdict_provenance="fresh_llm_review",
-    )
-    assert result.ok is True, result.message
-    return result
-
-
-def _round_dir(paths: Any, round_number: int) -> Path:
-    return paths.prs / f"pr-{_PR_NUMBER}" / "rounds" / f"round-{round_number}"
-
-
-def _pr_dir(paths: Any) -> Path:
-    return paths.prs / f"pr-{_PR_NUMBER}"
+from _review_fixtures import (
+    _pr_dir,
+    _record,
+    _round_archive_app,
+    _round_dir,
+)
 
 
 _ARCHIVE_FILES = ("review-decision.json", "rework-prompt.md", "rework-dispatch-note.txt")

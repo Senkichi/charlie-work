@@ -46,7 +46,7 @@ from charlie_work.workflow import (
     _write_text_atomic,
 )
 
-from test_review_round_archive import _PR_NUMBER, _pr_dir, _record, _round_archive_app, _round_dir
+from _review_fixtures import _PR_NUMBER, _pr_dir, _record, _round_archive_app, _round_dir
 
 # ---------------------------------------------------------------------------
 # AC3 -- events.db payload carries summary/required_changes, size-bounded

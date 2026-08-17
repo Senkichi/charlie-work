@@ -50,8 +50,8 @@ from charlie_work.config import OrchestratorConfig, ReviewConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import ORCHESTRATOR_COMMENT_MARKER, OrchestratorApp
 
-from test_charlie_work import FakeGitHub
-from test_review_round_archive import _PR_NUMBER
+from _fakes_github import FakeGitHub
+from _review_fixtures import _PR_NUMBER
 
 
 def _body_after_marker(body: str) -> str:

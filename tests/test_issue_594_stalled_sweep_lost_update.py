@@ -30,7 +30,7 @@ from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig, Runtim
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, state_lock
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
 
-from test_charlie_work import _init_git_repo
+from _helpers import _init_git_repo
 
 _THROTTLE_LINE = "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n"
 
@@ -234,7 +234,7 @@ def test_orphaned_reap_sweep_does_not_clobber_concurrent_unescalate(
     load and its save is silently reverted, identically to the original
     #594 incident.
     """
-    from test_charlie_work import FakeGitHub
+    from _fakes_github import FakeGitHub
 
     repo_root, reviews_dir, config, state_file = _seed(tmp_path)
 

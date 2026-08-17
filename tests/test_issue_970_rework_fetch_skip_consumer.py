@@ -45,7 +45,7 @@ from charlie_work.github import GitHubError
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import _build_rework_issue_fetch_skip_payload
 
-from test_fix_janitor_routing import _conflicting_app, _set_decision
+from _janitor_routing_fixtures import _conflicting_app, _set_decision
 
 
 def _write_skip_event(

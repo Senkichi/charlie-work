@@ -21,7 +21,8 @@ from charlie_work.prompts import prompt_template_digest
 from charlie_work.workflow import OrchestratorApp
 
 # Reuse the shared FakeGitHub whose default PR #456 is janitor-green.
-from test_charlie_work import FakeGitHub, _make_loop_app
+from _fakes_github import FakeGitHub
+from _review_fixtures import _make_loop_app
 
 
 def _write(directory: Path, name: str, text: str) -> Path:

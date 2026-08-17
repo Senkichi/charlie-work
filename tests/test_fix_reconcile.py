@@ -36,7 +36,7 @@ from charlie_work.state import (
 )
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
 
-from test_reconcile import FakeGitHub, _issue, _pr
+from _reconcile_fixtures import FakeGitHub, _issue, _pr
 
 
 def test_orphan_no_active_label_with_open_pr_is_drift() -> None:

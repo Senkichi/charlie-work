@@ -26,7 +26,7 @@ from typing import Any
 from charlie_work.instrumentation import close_db, query_events
 from charlie_work.state import load_state, save_state, state_lock
 
-from test_charlie_work import (
+from _review_fixtures import (
     _dispatch_reviews_app,
     _write_review_packet,
 )
