@@ -158,6 +158,7 @@ def test_packaged_review_template_is_satisfied_by_its_call_site() -> None:
             "cross_family_section": "",
             "janitor_section": "",
             "test_adequacy_section": "",
+            "static_probe_section": "",
             "diff_size_section": "",
             "ci_status_section": "",
             "prior_review_section": "",

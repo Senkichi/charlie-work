@@ -17159,11 +17159,30 @@ def test_static_probe_section_in_review_packet_when_enabled_with_findings(
     tmp_path: Path,
 ) -> None:
     """Integration test: findings from both probe halves land in
-    $static_probe_section, adjacent to (not folded into) ## Test adequacy."""
+    $static_probe_section, adjacent to (not folded into) ## Test adequacy.
+
+    ``repo_root`` (``tmp_path``) is given a real ``src/`` tree containing a
+    file that does NOT reference the flagged symbol, so
+    ``_collect_repo_referenced_names`` actually walks it and the line-295
+    collision filter runs live (issue #1260/#1261 review finding A5) instead
+    of short-circuiting on a missing ``src/`` directory. The flagged symbol
+    uses a distinctive name (not ``helper``) precisely so it cannot
+    accidentally collide with anything incidental in that tree.
+    """
     from charlie_work.config import CoverageProbeConfig
 
     config = OrchestratorConfig(coverage_probe=CoverageProbeConfig(enabled=True))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Real src/ tree under repo_root, unrelated to the diffed symbol below --
+    # exercises the collision filter live rather than short-circuiting it.
+    unrelated_src = tmp_path / "src" / "unrelated_module.py"
+    unrelated_src.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_src.write_text(
+        "def totally_unrelated_function(value):\n    return value * 2\n",
+        encoding="utf-8",
+    )
+
     fake_gh = FakeGitHub()
     fake_gh.diffs[456] = (
         "diff --git a/src/feature.py b/src/feature.py\n"
@@ -17173,7 +17192,7 @@ def test_static_probe_section_in_review_packet_when_enabled_with_findings(
         "@@ -1,2 +1,5 @@\n"
         " def feature():\n"
         "     pass\n"
-        "+def helper(x):\n"
+        "+def compute_shard_checksum(x):\n"
         "+    if x:\n"
         "+        return 1\n"
         "diff --git a/tests/test_feature.py b/tests/test_feature.py\n"
@@ -17183,8 +17202,8 @@ def test_static_probe_section_in_review_packet_when_enabled_with_findings(
         "@@ -1,2 +1,4 @@\n"
         " def test_existing():\n"
         "     pass\n"
-        "+def test_helper():\n"
-        "+    assert helper(True) == 1\n"
+        "+def test_compute_shard_checksum():\n"
+        "+    assert compute_shard_checksum(True) == 1\n"
     )
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
@@ -17195,9 +17214,11 @@ def test_static_probe_section_in_review_packet_when_enabled_with_findings(
     packet_text = packet.read_text(encoding="utf-8")
 
     assert "## Static probe" in packet_text
-    # helper() is defined in src/feature.py and referenced only from the test.
+    # compute_shard_checksum() is defined in src/feature.py, referenced only
+    # from the test, and absent from the real (live-walked) src/ tree -- the
+    # collision filter runs and correctly does not suppress it.
     assert "Unwired-symbol probe (W20)" in packet_text
-    assert "helper" in packet_text
+    assert "compute_shard_checksum" in packet_text
     assert "$static_probe_section" not in packet_text
     assert packet_text.index("## Test adequacy") < packet_text.index("## Static probe")
 
