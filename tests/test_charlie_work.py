@@ -13495,7 +13495,9 @@ def test_detect_and_handle_stalled_reviews_skips_terminal_pr_reaps_sidecar(
     (reviews_dir / "issue-200.claude.log").write_text("ordinary crash output\n", encoding="utf-8")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
+    )
 
     stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
 
@@ -13566,7 +13568,9 @@ def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
     (reviews_dir / "issue-100.claude.log").write_text("ordinary crash output\n", encoding="utf-8")
 
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: False
+    )
 
     stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
 
@@ -48447,8 +48451,10 @@ def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
         _make_dead_review_sidecar(reviews_dir, pr, "no verdict")
 
     monkeypatch.setattr(WorkerView, "is_alive", lambda self: False)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda *_: False)
-    monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", lambda *a, **k: True)
+    monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", lambda *_: False)
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
+    )
 
     stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
 

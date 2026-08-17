@@ -1483,7 +1483,7 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="workflow.py",
+        path="stalled_review_reap.py",
         scope="_append_sweep_events",
         source="kind",
         reason=(
@@ -1494,7 +1494,7 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="workflow.py",
+        path="stalled_review_reap.py",
         scope="_append_sweep_events",
         source="f'{kind}_sweep'",
         reason="Same `kind` loop variable as above, with the `_sweep` suffix appended.",
