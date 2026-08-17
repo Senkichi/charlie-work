@@ -110,6 +110,7 @@ from .janitor import (
     TestAdequacyFacts,
     TestAdequacyVerdict,
 )
+from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
 from .paths import ResolvedLayout, RuntimePaths, resolved_layout
 from .prompts import (
@@ -983,6 +984,58 @@ def render_test_adequacy_summary(verdict: TestAdequacyVerdict, exempt_marker: st
         f"To exempt this PR from the test-adequacy gate, add "
         f"'{exempt_marker} <reason>' to the PR body with a clear justification."
     )
+
+
+def render_static_probe_section(verdict: StaticProbeVerdict | None) -> str:
+    """Render the $static_probe_section packet block from a StaticProbeVerdict.
+
+    Returns "" when ``verdict`` is None (probe disabled -- the caller in
+    review() passes None in that case), mirroring
+    ``render_test_adequacy_section``'s disabled contract.
+
+    When enabled, this ALWAYS renders visible text -- even with zero findings
+    and zero warnings -- rather than "" for a clean pass. This mirrors
+    render_test_adequacy_section's own behavior of never going silent once
+    its gate is enabled (that function always shows its facts block
+    regardless of whether there is a problem to report): an advisory probe
+    that goes silent on a clean run is indistinguishable, from the rendered
+    packet alone, from one that never ran at all (issue #1260/#1261 design
+    item 7's "zero-reads-as-green" concern applies to the clean case too,
+    not only to internal errors).
+    """
+    if verdict is None:
+        return ""
+
+    lines: list[str] = []
+    if verdict.warnings:
+        lines.extend(f"- {warning}" for warning in verdict.warnings)
+
+    if verdict.branch_findings:
+        if lines:
+            lines.append("")
+        lines.append("**Branch-coverage heuristic (W3):**")
+        for finding in verdict.branch_findings:
+            reason = (
+                "no added test/assertion lines in this diff"
+                if finding.reason == "no_test_adds"
+                else f"branch:test-add ratio high ({finding.branch_adds}:{finding.test_adds})"
+            )
+            lines.append(f"- `{finding.filename}`: {finding.branch_adds} branch-adds, {reason}")
+
+    if verdict.unwired_findings:
+        if lines:
+            lines.append("")
+        lines.append("**Unwired-symbol probe (W20):**")
+        for finding in verdict.unwired_findings:
+            lines.append(
+                f"- `{finding.symbol}` ({finding.kind}) in `{finding.filename}`: referenced "
+                "only from tests/, no src/ caller found"
+            )
+
+    if not lines:
+        return "Static probe: no findings.\n"
+
+    return "\n".join(lines) + "\n"
 
 
 def slugify(value: str, *, max_length: int = 48) -> str:
@@ -10507,6 +10560,51 @@ class OrchestratorApp:
                 test_adequacy_verdict.facts, test_adequacy_verdict.warnings
             )
 
+        # Static diff-coverage / unwired-symbol probe (issues #1260/#1261).
+        # Advisory-only, never blocking -- see CoverageProbeConfig's docstring.
+        # Computed in the same packet-build phase as the Tier-1/2 test-adequacy
+        # gate above, on the same diff text already in hand; no PR-branch
+        # checkout is created for this (see diff_coverage_probe module docstring).
+        static_probe_section = ""
+        if self.config.coverage_probe.enabled:
+            static_probe_verdict = run_static_probe(
+                diff, self.repo_root, self.config.coverage_probe
+            )
+            static_probe_section = render_static_probe_section(static_probe_verdict)
+            if static_probe_verdict.branch_findings or static_probe_verdict.unwired_findings:
+                # These two kinds are the substrate for the 2-week
+                # false-positive measurement window -- a flag that isn't
+                # logged can't be measured.
+                with state_lock(self.paths.state_file):
+                    state = load_state(self.paths.state_file)
+                    if static_probe_verdict.branch_findings:
+                        state = self._record_event(
+                            state,
+                            "coverage_probe_flagged",
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "flagged_files": [
+                                    f.filename for f in static_probe_verdict.branch_findings
+                                ],
+                            },
+                            level="warning",
+                        )
+                    if static_probe_verdict.unwired_findings:
+                        state = self._record_event(
+                            state,
+                            "unwired_symbol",
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "symbols": [
+                                    f.symbol for f in static_probe_verdict.unwired_findings
+                                ],
+                            },
+                            level="warning",
+                        )
+                    save_state(self.paths.state_file, state)
+
         # Run containment check for worker edits leaked into operator checkout
         containment_warnings = check_operator_containment(self.repo_root, diff, pr_number)
         # Merge containment warnings with janitor warnings
@@ -10662,6 +10760,7 @@ class OrchestratorApp:
                 "cross_family_section": cross_family_section,
                 "janitor_section": _janitor_section(merged_warnings),
                 "test_adequacy_section": test_adequacy_section,
+                "static_probe_section": static_probe_section,
                 "diff_size_section": diff_size_section,
                 "ci_status_section": ci_status_section,
                 "prior_review_section": prior_review_section,
