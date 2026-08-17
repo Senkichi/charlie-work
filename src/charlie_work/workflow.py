@@ -289,6 +289,9 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _reviewer_session_metrics,
     _log_tail_throttled,
     _extract_review_session_summary,
+    REVIEW_SESSION_FAILED_HEADING,
+    REVIEW_SESSION_SUMMARY_HEADING,
+    body_has_crash_signature,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -5135,7 +5138,8 @@ def _collect_external_findings(
     Returns a flat list of markdown bodies ready to be folded into
     ``review-decision.json`` at record time.
 
-    Two provenance filters apply, and they are deliberately different in kind:
+    Three provenance/content filters apply, and they are deliberately
+    different in kind:
 
     * **Bots** are excluded by author (``user.type == "Bot"``) -- GitHub Apps
       such as Aviator have their own identity, so identity is a sound
@@ -5145,6 +5149,15 @@ def _collect_external_findings(
       indistinguishable by identity from a genuine human review by the same
       person, and filtering on that login would drop exactly the findings #950
       exists to ingest. See ``ORCHESTRATOR_COMMENT_MARKER``.
+    * **Reviewer-session crash summaries** are excluded by *body content*
+      (issue #1269, W12): ``_extract_review_session_summary`` posts these
+      when a reviewer dies without a verdict, and every one predating the
+      ``ORCHESTRATOR_COMMENT_MARKER`` stamp (added #1242/55cecd9) carries no
+      marker for the filter above to catch -- they were ingested as if they
+      were genuine human findings. See ``body_has_crash_signature``. This
+      filter only stops *new* ingestion; already-persisted poisoned records
+      are cleaned separately, at render time, by
+      ``rework_prompts._render_required_changes_section``.
 
     ``since``, when given, is the previous round's *upper* bound -- the
     ``before`` timestamp that round persisted in ``review-decision.json``
@@ -5192,6 +5205,19 @@ def _collect_external_findings(
     Likewise, if ``before`` cannot be parsed (or the commit timestamp could
     not be resolved at the call site) the upper bound is not applied -- the
     filter fails toward ingestion, never toward silent suppression.
+
+    Issue #1269 (W12): the three surfaces are walked and combined into one
+    list first, and *that* combined list is deduplicated by exact-string
+    equality (``dict.fromkeys``, first-occurrence order preserved) at the
+    end -- the end-position dedup is required precisely because duplicates
+    are cross-surface, not just within one: a reviewer-session crash summary
+    is frequently reposted byte-for-byte across issue comments and review
+    bodies within the same round (the crash-recovery path posts to more
+    than one surface), so deduplicating each surface independently before
+    combining would miss exactly the duplicates this exists to catch. Exact
+    equality only, no whitespace normalization beyond the existing
+    ``.strip()`` above: two genuinely different findings that happen to
+    share a substring must stay distinct.
     """
     bodies: list[str] = []
     owner_repo = "{owner}/{repo}"
@@ -5218,11 +5244,16 @@ def _collect_external_findings(
                     continue
                 if before_dt is not None and item_dt > before_dt:
                     continue
-            body = (item.get("body") or "").strip()
-            if body:
+            body_value = item.get("body")
+            if not isinstance(body_value, str):
+                continue
+            body = body_value.strip()
+            if body and not body_has_crash_signature(body):
                 bodies.append(body)
 
-    return bodies
+    # Issue #1269 (W12): collapse exact-duplicate bodies (see docstring
+    # above). dict.fromkeys preserves first-occurrence order in O(n).
+    return list(dict.fromkeys(bodies))
 
 
 # Issue #1268 (W11), item 2: bound how much verdict prose a single

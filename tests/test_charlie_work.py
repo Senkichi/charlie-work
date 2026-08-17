@@ -105,6 +105,10 @@ from charlie_work.state import (
     state_lock,
 )
 import charlie_work.state as state_module
+from charlie_work.verdict_parsing import (
+    REVIEW_SESSION_FAILED_HEADING,
+    REVIEW_SESSION_SUMMARY_HEADING,
+)
 from charlie_work.workflow import (
     ORCHESTRATOR_COMMENT_MARKER,
     CommandResult,
@@ -23401,6 +23405,238 @@ def test_human_comment_in_before_to_reviewed_at_gap_surfaces_next_round(
     )
     # The round-2 internal finding survives alongside it.
     assert "internal-2" in changes2
+
+
+# --------------------------------------------------------------------------
+# Issue #1269 (W12): _collect_external_findings filters out reviewer-session
+# crash summaries -- posted by _extract_review_session_summary when a
+# reviewer dies without a verdict -- so they are never ingested as if they
+# were genuine human/peer-agent findings. This is the collector-side half of
+# the fix; the render-side guard (tested above, near
+# _render_required_changes_section) is what reaches records already
+# persisted before this filter existed.
+# --------------------------------------------------------------------------
+
+
+def test_record_review_does_not_ingest_an_unstamped_crash_summary(tmp_path: Path) -> None:
+    """A reviewer-session crash summary posted before the
+    ORCHESTRATOR_COMMENT_MARKER provenance stamp existed (#1242/55cecd9) --
+    or before this filter itself -- carries no marker for
+    _is_orchestrator_comment to catch, so it used to be ingested as if it
+    were a genuine external finding. It must not be, while a genuine human
+    finding posted alongside it is still ingested."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    crash_body = (
+        f"{REVIEW_SESSION_SUMMARY_HEADING}\n\n"
+        "The automated reviewer ran for 4 turns (2 tool calls) but did not "
+        "produce a structured verdict.\n"
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": crash_body,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        },
+        {
+            "body": "The migration script drops the index without a guard.",
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:05:00Z",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    external = decision.get("external_findings", [])
+    assert not any(REVIEW_SESSION_SUMMARY_HEADING in item for item in external), (
+        "the crash summary must not be ingested as an external finding"
+    )
+    assert any("migration script drops the index" in item for item in external), (
+        "the genuine human finding must still be ingested"
+    )
+
+
+def test_record_review_does_not_ingest_a_synthetic_launch_failed_crash_summary(
+    tmp_path: Path,
+) -> None:
+    """The other crash-summary heading (REVIEW_SESSION_FAILED_HEADING, for a
+    reviewer that died before its first turn) is filtered too. No captured
+    fixture carries this heading (the jc#1394 population happens to be
+    entirely the summary variant), so this specimen is synthetic -- built
+    from the shared constant, never a hardcoded copy."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    crash_body = (
+        f"{REVIEW_SESSION_FAILED_HEADING}\n\n"
+        "The automated reviewer exited before running a single turn, so no "
+        "review was performed.\n"
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": crash_body,
+            "user": {"login": "Senkichi", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    assert decision.get("external_findings", []) == []
+
+
+def test_human_quote_reply_to_a_crash_summary_is_still_ingested(tmp_path: Path) -> None:
+    """A genuine human reply that GitHub-quotes a crash summary (to discuss
+    or dispute it) is preserved -- mirrors
+    test_human_quote_reply_to_orchestrator_comment_is_still_ingested's
+    rationale for ORCHESTRATOR_COMMENT_MARKER, applied to the crash-heading
+    prefix check instead. A substring match would wrongly discard this
+    reply along with the quoted heading; the prefix check must not."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    quoted_reply = (
+        f"> {REVIEW_SESSION_SUMMARY_HEADING}\n"
+        "> \n"
+        "> The automated reviewer ran for 4 turns...\n"
+        "\n"
+        "This looks like a session crash, not a real review -- can we re-run it?"
+    )
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": quoted_reply,
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    external = decision.get("external_findings", [])
+    assert any("can we re-run it" in item for item in external), (
+        "a genuine human reply quoting a crash summary must still be ingested"
+    )
+
+
+def test_record_review_dedups_identical_bodies_within_a_round(tmp_path: Path) -> None:
+    """Issue #1269 part (c): the same finding posted byte-for-byte on two
+    different surfaces within one round (e.g. an issue comment and a review
+    body -- the crash-recovery path reposts across more than one surface)
+    collapses to a single entry, so a rework brief does not present N
+    duplicate copies of the same finding as if they were N distinct ones."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    duplicated_body = "The migration script drops the index without a guard."
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": duplicated_body,
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        }
+    ]
+    fake_gh.pr_external_reviews[456] = [
+        {
+            "body": duplicated_body,
+            "user": {"login": "a-real-human", "type": "User"},
+            "submitted_at": "2026-08-09T12:01:00Z",
+        }
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    external = decision.get("external_findings", [])
+    assert external.count(duplicated_body) == 1, (
+        f"expected the duplicated body collapsed to one entry, found: {external}"
+    )
+
+
+def test_record_review_dedup_does_not_over_merge_similar_but_distinct_findings(
+    tmp_path: Path,
+) -> None:
+    """Over-aggression guard: two genuinely different findings that happen
+    to share a substring must stay distinct -- the dedup is exact-string
+    equality only (dict.fromkeys), never a whitespace/substring merge."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    finding_a = "The retry wrapper swallows the exception type in the fetch path."
+    finding_b = "The retry wrapper swallows the exception type in the push path."
+    fake_gh.pr_external_issue_comments[456] = [
+        {
+            "body": finding_a,
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:00:00Z",
+        },
+        {
+            "body": finding_b,
+            "user": {"login": "a-real-human", "type": "User"},
+            "created_at": "2026-08-09T12:01:00Z",
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.record_review(
+        456,
+        "request_changes",
+        summary="internal summary",
+        required_changes=["keep me"],
+        verdict_provenance="fresh_llm_review",
+    )
+
+    assert result.ok is True
+    decision = json.loads(
+        (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
+    )
+    external = decision.get("external_findings", [])
+    assert finding_a in external
+    assert finding_b in external
+    assert len(external) == 2, f"two distinct findings must not be merged into one: {external}"
 
 
 def test_record_review_never_rejects_for_empty_required_changes(tmp_path: Path) -> None:
@@ -48721,6 +48957,202 @@ def test_render_required_changes_section_defangs_live_keyword_in_summary_tier() 
 
     assert "does not fix issue 649" in section
     assert _CLOSING_KEYWORD_REF.search(section) is None, "live keyword survived"
+
+
+# --------------------------------------------------------------------------
+# Issue #1269 (W12): the render-side crash-signature guard is the single
+# enforcement point that reaches records already persisted before the
+# collector-side fix in _collect_external_findings shipped -- these tests
+# cover both the new-shape (external_findings field) and old-shape
+# (findings_channel == "external", merged into required_changes) paths.
+# --------------------------------------------------------------------------
+
+
+def test_render_required_changes_section_strips_crash_signature_from_external_findings() -> None:
+    """New shape: a crash-comment body sitting in `external_findings` from
+    before the collector-side fix is stripped at render time; a genuine
+    external finding alongside it survives untouched."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": "Reviewer summary text.",
+        "required_changes": ["fix the off-by-one"],
+        "external_findings": ["A human found a real bug in the retry loop.", crash_body],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "A human found a real bug in the retry loop." in section
+    assert crash_body not in section
+    assert "did not produce a structured verdict" not in section
+    assert "## Findings posted on the PR itself" in section, "new_shape must still be True"
+
+
+def test_render_required_changes_section_all_crash_external_findings_falls_back_to_pointer() -> (
+    None
+):
+    """New shape, entirely crash noise: external_findings ends up empty
+    after filtering, so `new_shape` becomes False and this falls to the
+    ordinary pointer-style ending (_finish_required_changes_section) rather
+    than rendering an external-findings section with nothing real in it."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["fix the off-by-one"],
+        "external_findings": [crash_body],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "fix the off-by-one" in section
+    assert crash_body not in section
+    assert "## Findings posted on the PR itself" not in section
+    assert "none of which reach this brief" in section, (
+        "the ordinary external-findings pointer must reappear once external_findings "
+        "filters down to empty"
+    )
+
+
+def test_render_required_changes_section_old_shape_strips_crash_signature_from_changes() -> None:
+    """Old shape (findings_channel == "external"): a crash comment merged
+    into required_changes before the collector-side fix is stripped; the
+    reviewer's own genuine item survives (defense-in-depth for a reopened
+    old-shape PR, per issue #1269 open question 3)."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["fix the off-by-one", crash_body],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "- fix the off-by-one" in section
+    assert crash_body not in section
+
+
+def test_render_required_changes_section_old_shape_vacuous_all_crash_changes_renders_tier3() -> (
+    None
+):
+    """Old shape, all-crash: when the crash filter empties `changes`
+    entirely AND the leftover summary is the vacuous placeholder
+    (record_review's vacuous-replace path -- the only way this exact
+    combination is reachable), the section must render tier 3, NOT fall
+    through to tier 2 and present the content-free placeholder as if it
+    were real findings. This is the failure mode the "vacuous" marker
+    branch already guards against, reached here through the old-shape
+    "external" path instead of a fresh "vacuous" marker."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [crash_body],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+    assert LEGACY_VACUOUS_SUMMARY not in section
+    assert crash_body not in section
+    assert "did not record a structured findings list" not in section, (
+        "must not fall through to the tier-2 verbatim-summary rendering"
+    )
+
+
+def test_render_required_changes_section_old_shape_blank_summary_all_crash_changes_renders_tier3() -> (
+    None
+):
+    """Same guard, other half of the "vacuous" OR-condition: a blank
+    summary (not the LEGACY_VACUOUS_SUMMARY placeholder) alongside an
+    all-crash `changes` list also renders tier 3, not tier 2's empty-prose
+    rendering."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": [crash_body],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section
+    assert crash_body not in section
+
+
+def test_render_required_changes_section_old_shape_all_crash_changes_preserves_genuine_summary() -> (
+    None
+):
+    """Guard against over-aggression: when the crash filter empties
+    `changes` entirely but the summary is genuine, non-vacuous reviewer
+    prose (the pre-#999 "reviewer chose prose over an itemized list"
+    population -- see `_is_carry_forward_eligible`'s docstring), tier 2
+    must still fire and render that real summary. The vacuous-neutralization
+    guard must only fire on the two known placeholder shapes (blank or
+    LEGACY_VACUOUS_SUMMARY), never on genuine content."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    genuine_summary = (
+        "The retry wrapper swallows the exception type; callers cannot distinguish causes."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": genuine_summary,
+        "required_changes": [crash_body],
+        "findings_channel": "external",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert genuine_summary in section
+    assert crash_body not in section
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section, (
+        "a genuine, non-vacuous summary must not be discarded down to tier 3"
+    )
+
+
+def test_render_required_changes_section_vacuous_guard_does_not_drop_populated_external_findings() -> (
+    None
+):
+    """Hardening (review of 63ce581): the vacuous-neutralization guard's
+    `and not external_findings` clause must not let a co-persisted, populated
+    `external_findings` field get silently discarded.
+
+    No current writer produces this exact shape -- `findings_channel ==
+    "external"` old-shape records and populated `external_findings` are
+    disjoint in every writer today -- but the guard's condition must not
+    silently assume that forever. Before the `and not external_findings`
+    clause, an all-crash old-shape `changes` plus a vacuous summary would
+    neutralize summary_text to "" regardless of `external_findings`, landing
+    in the tier-3 "both empty" branch below -- which returns immediately
+    without ever consulting `external_findings` at all, dropping genuine
+    findings on the floor. With the clause, a populated `external_findings`
+    keeps the guard from firing, so the section falls through to the
+    tier-2 summary-fallback branch instead, which -- because `new_shape` is
+    True -- still calls `_render_external_findings_section` and renders
+    every genuine finding."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    genuine_external_finding = "the retry wrapper swallows the exception type"
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [crash_body],
+        "findings_channel": "external",
+        "external_findings": [genuine_external_finding],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert genuine_external_finding in section, (
+        "populated external_findings must still be rendered, not dropped by "
+        "the vacuous-neutralization guard"
+    )
+    assert crash_body not in section
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section, (
+        "must not fall through to tier 3 and discard the genuine external findings"
+    )
 
 
 def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) -> None:

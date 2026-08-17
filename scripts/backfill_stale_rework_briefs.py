@@ -105,11 +105,13 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from charlie_work.github import GitHub, GitHubError
 from charlie_work.global_config import load_layered_config
 from charlie_work.paths import find_repo_root, runtime_paths
 from charlie_work.subprocess_runner import no_console_window_kwargs
+from charlie_work.verdict_parsing import body_has_crash_signature
 from charlie_work.workflow import _is_verdict_newer_than_brief, _read_review_decision
 
 # Nanoseconds of margin added on top of the brief's mtime when bumping the
@@ -327,11 +329,56 @@ def derive_entries(prs_root: Path, gh: GitHub) -> tuple[list[RequestChangesEntry
     return resolved, counts
 
 
+def _decision_has_crash_signature(decision: dict[str, Any]) -> bool:
+    """True when a persisted decision's findings channel carries a
+    reviewer-session crash summary (issue #1269, W12).
+
+    Checks both shapes the render path
+    (``rework_prompts._render_required_changes_section``) understands:
+    old-shape ``required_changes`` (only when ``findings_channel ==
+    "external"`` -- mirroring that function's own guard, since an
+    ``"external"``-tagged ``required_changes`` is the only shape known to
+    ever contain merged-in external comment bodies) and new-shape
+    ``external_findings`` (checked unconditionally, also mirroring the
+    render guard -- a new-shape record can carry a crash comment too, since
+    the collector-side fix only stops future ingestion).
+    """
+    findings_channel = decision.get("findings_channel")
+    if findings_channel == "external":
+        raw_required_changes = decision.get("required_changes")
+        if isinstance(raw_required_changes, list) and any(
+            body_has_crash_signature(str(item))
+            for item in raw_required_changes
+            if str(item).strip()
+        ):
+            return True
+    raw_external = decision.get("external_findings")
+    if isinstance(raw_external, list) and any(
+        body_has_crash_signature(str(item)) for item in raw_external if str(item).strip()
+    ):
+        return True
+    return False
+
+
 def select_candidates(
-    entries: list[RequestChangesEntry], *, exclude: set[int]
+    entries: list[RequestChangesEntry], *, exclude: set[int], crash_signature_only: bool = False
 ) -> tuple[list[Candidate], list[int]]:
     """Narrow request_changes entries to the backfill-candidate set:
     will-not-regenerate, currently open, and not excluded.
+
+    ``crash_signature_only``, when True, additionally narrows the result to
+    candidates whose persisted decision carries a reviewer-session crash
+    summary (issue #1269, W12 -- see ``_decision_has_crash_signature``).
+    This is an ADDITIVE, opt-in narrowing, off by default: the original F6
+    selection (every will-not-regenerate, open, request_changes PR) is
+    unchanged unless an operator explicitly asks to target only the
+    crash-noise population with ``--crash-signature-only``. Neither
+    selection needs to become crash-content-aware to make the render-side
+    fix reach already-persisted records -- the #800 drift reconciler
+    already re-renders and diffs every will-not-regenerate brief once the
+    fix ships, with no help from this script -- but this flag lets an
+    operator run a narrower, faster, auditable pass over just the known-
+    poisoned population when that is preferred over the broad run.
 
     Returns (candidates, excluded_pr_numbers_actually_present) so the caller
     can report which --exclude entries actually mattered.
@@ -346,6 +393,8 @@ def select_candidates(
             excluded_present.append(e.pr_number)
             continue
         decision = _read_review_decision(e.decision_path) or {}
+        if crash_signature_only and not _decision_has_crash_signature(decision):
+            continue
         candidates.append(
             Candidate(
                 pr_number=e.pr_number,
@@ -600,6 +649,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--crash-signature-only",
+        action="store_true",
+        help=(
+            "Additionally narrow the candidate set to PRs whose persisted "
+            "verdict carries a reviewer-session crash summary (issue #1269, "
+            "W12) in required_changes/external_findings. Opt-in; the "
+            "default selection is unchanged (every will-not-regenerate, "
+            "open, request_changes PR, this script's original F6 "
+            "population)."
+        ),
+    )
+    parser.add_argument(
         "--manifest-path",
         type=Path,
         default=None,
@@ -665,7 +726,9 @@ def main(argv: list[str] | None = None) -> int:
 
     gh = GitHub(repo_root=repo_root)
     entries, counts = derive_entries(prs_root, gh)
-    candidates, excluded_present = select_candidates(entries, exclude=exclude)
+    candidates, excluded_present = select_candidates(
+        entries, exclude=exclude, crash_signature_only=args.crash_signature_only
+    )
 
     print()
     _print_funnel(counts, prs_root)

@@ -430,6 +430,57 @@ class ReviewSessionOutcome:
         return self.reason != REVIEW_MISS_LAUNCH_FAILED
 
 
+# Crash-comment noise suppression (issue #1269, W12). These are the only
+# two headings `_extract_review_session_summary` ever emits (see the
+# `parts = [...]` assignments below) -- they are the wire contract between
+# this emitter and two independent downstream consumers that need to
+# recognize a posted crash summary after the fact: the collector-side
+# filter in `workflow._collect_external_findings` (stops new ingestion) and
+# the render-side guard in `rework_prompts._render_required_changes_section`
+# (retroactively cleans records already persisted before the collector fix
+# shipped, or before the provenance-marker stamping fix that predates it,
+# #1242/55cecd9, existed at all). Read from these constants, never
+# re-declare the literal strings.
+REVIEW_SESSION_FAILED_HEADING = "## Reviewer session failed to start"
+REVIEW_SESSION_SUMMARY_HEADING = "## Reviewer session summary (no verdict produced)"
+
+
+def body_has_crash_signature(text: str) -> bool:
+    """True when ``text`` is (or GitHub-quotes) a reviewer-session crash summary.
+
+    Matches on a **prefix**, not a substring -- mirroring
+    ``_is_orchestrator_comment``'s rationale in ``workflow.py``: GitHub's
+    "Quote reply" inserts the quoted body as a blockquote (every line
+    prefixed with ``"> "``) above new text. A genuine human reply that
+    quotes a crash comment to discuss or dispute it would ``lstrip()`` to
+    something that does NOT start with either heading -- the heading text
+    only appears after the ``"> "`` marker, which ``lstrip()`` does not
+    strip. A substring (``in``) check would still match that quoted crash
+    heading and wrongly discard the human's reply along with it; the prefix
+    check catches the crash comment itself (which starts with the heading
+    at column 0, modulo leading blank lines) while preserving the reply.
+
+    Content-based, not marker-based, by deliberate departure from
+    ``docs/plans/rework-findings-channel.md``'s (issue #1242) "one marker,
+    no prose matching anywhere" principle: that principle governs vacuity
+    detection over the orchestrator's *own current* output, where a marker
+    is always available because the same code that would emit one is the
+    code being asked to recognize it. A crash comment posted before the
+    ``ORCHESTRATOR_COMMENT_MARKER`` provenance stamp existed carries no
+    marker to match, ever -- recognizing it is only possible by its
+    content, which is exactly what this function does. Precedented by
+    ``cross_family.LEGACY_VACUOUS_SUMMARY``: an exact-string match against a
+    specific, known, historical placeholder, not a general classifier over
+    reviewer prose (a general classifier was evaluated and rejected for
+    ``_summary_is_vacuous``, per that function's own docstring, because it
+    misclassified genuine terse findings as content-free).
+    """
+    stripped = text.lstrip()
+    return stripped.startswith(REVIEW_SESSION_FAILED_HEADING) or stripped.startswith(
+        REVIEW_SESSION_SUMMARY_HEADING
+    )
+
+
 def _extract_review_session_summary(
     events_path: Path,
     log_path: Path,
@@ -582,7 +633,7 @@ def _extract_review_session_summary(
         reason = REVIEW_MISS_DIED_MID_SESSION
 
     if reason == REVIEW_MISS_LAUNCH_FAILED:
-        parts = ["## Reviewer session failed to start\n"]
+        parts = [f"{REVIEW_SESSION_FAILED_HEADING}\n"]
         parts.append(
             "The automated reviewer exited before running a single turn, so no "
             "review was performed. This is an environmental or launch failure, "
@@ -590,7 +641,7 @@ def _extract_review_session_summary(
         )
         parts.append("\n### Error output from the reviewer process:\n")
     else:
-        parts = ["## Reviewer session summary (no verdict produced)\n"]
+        parts = [f"{REVIEW_SESSION_SUMMARY_HEADING}\n"]
         if reason == REVIEW_MISS_TURN_LIMIT:
             parts.append(
                 f"The automated reviewer hit the {max_turns}-turn limit before "

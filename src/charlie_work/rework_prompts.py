@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .config import OrchestratorConfig
+from .cross_family import LEGACY_VACUOUS_SUMMARY
 from .github import defang_closing_keywords
 from .markdown_fence import fenced_block
 from .prompts import (
@@ -29,6 +30,7 @@ from .prompts import (
     assert_no_merge_contract,
     render_prompt,
 )
+from .verdict_parsing import body_has_crash_signature
 
 
 def _rework_prompt_search_dirs(
@@ -228,6 +230,19 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     a live closing keyword (``Fixes #649``), rewriting it to ``Fixes issue
     649`` keeps the issue number legible while removing the syntax that
     would trigger GitHub auto-close or a false label-transition binding.
+
+    Issue #1269 (W12): both ``external_findings`` and (old-shape,
+    ``findings_channel == "external"``) ``required_changes`` are filtered
+    for ``verdict_parsing.body_has_crash_signature`` before rendering. This
+    is the retroactive half of the crash-comment-noise fix -- the collector
+    (``workflow._collect_external_findings``) only stops *new* ingestion, so
+    this render path is what reaches records already persisted before that
+    fix shipped (or before the provenance-marker stamp it also relies on,
+    #1242, existed at all). This function is the single point every render
+    path bottlenecks through (``_render_rework_prompt`` calls it once, and
+    ``dispatch_rework``'s #800 drift reconciler re-renders and diffs against
+    it every pass), so a guard here reaches every persisted record without
+    needing the one-off backfill script to run against it.
     """
     if not isinstance(decision, dict):
         return ""
@@ -235,25 +250,108 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     if verdict not in ("request_changes", "blocked"):
         return ""
 
+    findings_channel = decision.get("findings_channel")
+
     raw_required_changes = decision.get("required_changes")
-    changes = (
+    pre_filter_changes = (
         [str(item).strip() for item in raw_required_changes if str(item).strip()]
         if isinstance(raw_required_changes, list)
         else []
     )
-    raw_summary = decision.get("summary")
-    summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
-    findings_channel = decision.get("findings_channel")
+    # Issue #1269 (W12): old-shape records merge external findings directly
+    # into `required_changes` (see the "Old shape" section above), so a
+    # reviewer-session-crash summary posted before the collector-side fix in
+    # `workflow._collect_external_findings` -- or before the provenance-marker
+    # stamping fix that predates it, #1242 -- can be sitting in this list on
+    # an already-persisted record today. Filtered here too, defense-in-depth
+    # for a reopened old-shape PR: the collector-side fix only prevents
+    # *new* ingestion and cannot retroactively clean a record already
+    # written before it shipped, and this render path is the single place
+    # every one of them is read back.
+    changes = (
+        [item for item in pre_filter_changes if not body_has_crash_signature(item)]
+        if findings_channel == "external"
+        else pre_filter_changes
+    )
+    # LOAD-BEARING: body_has_crash_signature has no fallback for a
+    # marker-STAMPED crash body (the ORCHESTRATOR_COMMENT_MARKER line
+    # precedes the "## Reviewer session..." heading, and the predicate's
+    # `lstrip()` does not remove a full preceding line, only leading
+    # whitespace) -- that is safe here ONLY because a stamped body never
+    # reaches this render path at all: the collector's
+    # `_is_orchestrator_comment` marker filter drops every stamped body
+    # before it is ever ingested into `required_changes`/`external_findings`,
+    # so persisted records only ever contain pre-stamp body text, which is
+    # exactly what this prefix match is written against. If that collector
+    # filter is ever weakened or removed, this predicate would need a
+    # marker-aware fallback too.
+    #
     # Issue #999: new-shape records carry external findings in their own
     # field. Old-shape records (pre-#999, or the vacuous-replace case) have
     # no such field and render exactly as before this fix.
+    #
+    # Issue #1269 (W12): filtered for the same crash-signature content
+    # unconditionally (not gated on `findings_channel`) -- a new-shape record
+    # can carry a crash comment too, since the collector-side fix only stops
+    # *future* ingestion; jc#1386 and jc#1394 both had crash comments already
+    # persisted in this field from before it shipped. Computed here, ABOVE
+    # the vacuous-old-shape guard below, so that guard can check it directly
+    # rather than assuming (unasserted) that an "external"-channel record
+    # never co-persists a populated `external_findings` alongside old-shape
+    # `required_changes`.
     raw_external = decision.get("external_findings")
     external_findings = (
-        [str(item).strip() for item in raw_external if str(item).strip()]
+        [
+            stripped
+            for item in raw_external
+            if (stripped := str(item).strip()) and not body_has_crash_signature(stripped)
+        ]
         if isinstance(raw_external, list)
         else []
     )
     new_shape = bool(external_findings)
+
+    raw_summary = decision.get("summary")
+    summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
+    if (
+        findings_channel == "external"
+        and pre_filter_changes
+        and not changes
+        and not external_findings
+        and (not summary_text or summary_text == LEGACY_VACUOUS_SUMMARY)
+    ):
+        # The filter above can legitimately empty `changes` entirely: the
+        # vacuous-replace old-shape population (`record_review`'s
+        # `findings_channel == "vacuous"` branch in workflow.py) unconditionally
+        # replaces `required_changes` with `external_findings` whenever the
+        # reviewer's own summary was vacuous, so an all-crash external-findings
+        # set leaves nothing else behind. `summary_text` in that population is
+        # exactly the placeholder `record_review` discarded to reach this path
+        # (`cross_family.LEGACY_VACUOUS_SUMMARY`, or blank -- `record_review`
+        # rejects a truly empty summary outright for `request_changes`/
+        # `blocked`, so blank can only reach here on an older, hand-edited, or
+        # differently-produced record) -- never real reviewer prose, since a
+        # genuine non-vacuous summary is never routed through the
+        # vacuous-replace branch (see `_summary_is_vacuous`). Treating it as
+        # absent here routes to tier 3 below instead of rendering that
+        # placeholder as if it were real findings -- exactly the failure the
+        # `"vacuous"` marker branch below already guards against, just reached
+        # through the old-shape `"external"` path instead of a fresh
+        # `"vacuous"` marker. A pre-#999 record where the reviewer's OWN
+        # summary was genuine but `required_changes` held only external items
+        # is a different, legitimate population and is not swept in here: the
+        # guard above only fires on the two known placeholder shapes, so that
+        # case falls through unchanged to the summary_text fallback tier below.
+        #
+        # `and not external_findings` (added on review) makes this branch's
+        # cross-field assumption explicit rather than implicit: every writer
+        # today only ever populates `external_findings` on new-shape records,
+        # never alongside an "external"-channel old-shape `required_changes`,
+        # so this condition is currently always true when the others are --
+        # but a hypothetical future writer that co-persisted both must not
+        # have its genuine `external_findings` silently dropped by routing to
+        # the "both empty" tier below when they are not, in fact, empty.
+        summary_text = ""
 
     # issue #792: a verdict recorded by the current record_review carries an
     # explicit marker for exactly this distinction -- handle it before the

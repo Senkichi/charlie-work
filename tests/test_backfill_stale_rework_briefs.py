@@ -13,6 +13,7 @@ so it can never silently drift from what dispatch_rework actually checks.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -259,6 +260,123 @@ def test_parse_exclude(bf: ModuleType) -> None:
     assert bf._parse_exclude("696") == {696}
     assert bf._parse_exclude("696,700, 683") == {696, 700, 683}
     assert bf._parse_exclude("696,696") == {696}
+
+
+# ---------------------------------------------------------------------------
+# Issue #1269 (W12): _decision_has_crash_signature + --crash-signature-only.
+# ---------------------------------------------------------------------------
+
+_CRASH_BODY = "## Reviewer session summary (no verdict produced)\n\nNo verdict was produced."
+
+
+def test_decision_has_crash_signature_new_shape_external_findings(bf: ModuleType) -> None:
+    decision = {"decision": "request_changes", "external_findings": [_CRASH_BODY]}
+    assert bf._decision_has_crash_signature(decision) is True
+
+
+def test_decision_has_crash_signature_old_shape_external_channel(bf: ModuleType) -> None:
+    decision = {
+        "decision": "request_changes",
+        "findings_channel": "external",
+        "required_changes": [_CRASH_BODY],
+    }
+    assert bf._decision_has_crash_signature(decision) is True
+
+
+def test_decision_has_crash_signature_old_shape_non_external_channel_ignored(
+    bf: ModuleType,
+) -> None:
+    # required_changes is only ever known to carry merged-in external comment
+    # bodies when findings_channel == "external" -- mirrors the render
+    # guard's own condition. A non-external channel (or missing channel)
+    # must not be scanned, matching _render_required_changes_section.
+    decision = {
+        "decision": "request_changes",
+        "required_changes": [_CRASH_BODY],
+    }
+    assert bf._decision_has_crash_signature(decision) is False
+
+
+def test_decision_has_crash_signature_false_for_genuine_findings(bf: ModuleType) -> None:
+    decision = {
+        "decision": "request_changes",
+        "findings_channel": "external",
+        "required_changes": ["the migration script drops the index without a guard"],
+        "external_findings": ["the migration script drops the index without a guard"],
+    }
+    assert bf._decision_has_crash_signature(decision) is False
+
+
+def _write_pr_json(
+    prs_root: Path,
+    pr_number: int,
+    decision_json: dict,
+    *,
+    verdict_mtime_ns: int,
+    brief_mtime_ns: int,
+    brief: str = "brief content",
+) -> tuple[Path, Path]:
+    """Like _write_pr, but with full control over the decision JSON body so
+    findings_channel/required_changes/external_findings can be set (_write_pr
+    only ever writes {"decision": ..., "pr_number": ...})."""
+    import os
+
+    pr_dir = prs_root / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True)
+    decision_path = pr_dir / "review-decision.json"
+    decision_path.write_text(json.dumps(decision_json), encoding="utf-8")
+    os.utime(decision_path, ns=(verdict_mtime_ns, verdict_mtime_ns))
+
+    brief_path = pr_dir / "rework-prompt.md"
+    brief_path.write_text(brief, encoding="utf-8")
+    os.utime(brief_path, ns=(brief_mtime_ns, brief_mtime_ns))
+    return decision_path, brief_path
+
+
+def test_select_candidates_crash_signature_only_narrows_pool(
+    tmp_path: Path, bf: ModuleType
+) -> None:
+    prs_root = tmp_path / "prs"
+    base = 1_700_000_000_000_000_000
+    margin = 5_000_000  # will-not-regenerate: brief mtime >= verdict mtime
+
+    # PR 30: crash-signature poisoned, will-not-regenerate, open.
+    _write_pr_json(
+        prs_root,
+        30,
+        {
+            "decision": "request_changes",
+            "pr_number": 30,
+            "external_findings": [_CRASH_BODY],
+        },
+        verdict_mtime_ns=base,
+        brief_mtime_ns=base + margin,
+    )
+    # PR 31: genuine findings only, same bucket/open state.
+    _write_pr_json(
+        prs_root,
+        31,
+        {
+            "decision": "request_changes",
+            "pr_number": 31,
+            "external_findings": ["a genuine, non-crash finding"],
+        },
+        verdict_mtime_ns=base,
+        brief_mtime_ns=base + margin,
+    )
+    gh = FakeGitHub(open_prs={30, 31})
+    entries, _ = bf.derive_entries(prs_root, gh)
+
+    # Default: crash_signature_only=False is a strict no-op -- both PRs
+    # selected, identical to the pre-W12 behavior.
+    default_candidates, _ = bf.select_candidates(entries, exclude=set())
+    assert {c.pr_number for c in default_candidates} == {30, 31}
+
+    # Opt-in narrowing: only the crash-poisoned PR survives.
+    narrowed_candidates, _ = bf.select_candidates(
+        entries, exclude=set(), crash_signature_only=True
+    )
+    assert [c.pr_number for c in narrowed_candidates] == [30]
 
 
 # ---------------------------------------------------------------------------
