@@ -75,12 +75,12 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
 from charlie_work.workflow import VERDICT_PROVENANCE_VALUES, OrchestratorApp
 
-from test_charlie_work import (
-    FakeGitHub,
-    _cross_family_app,
+from _fakes_github import FakeGitHub
+from _helpers import _cross_family_app
+from _merge_tripwire_fixtures import _merge_check_app
+from _review_fixtures import (
     _dispatch_reviews_app,
     _make_dead_review_sidecar,
-    _merge_check_app,
     _set_review_dispatched_state,
     _write_review_packet,
 )

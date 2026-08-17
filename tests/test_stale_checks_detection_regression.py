@@ -50,7 +50,7 @@ from charlie_work.janitor import JanitorVerdict
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
 _WORKFLOW_PY = _SRC_ROOT / "workflow.py"

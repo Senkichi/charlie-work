@@ -60,8 +60,8 @@ from charlie_work.state import (
 from charlie_work.worktree import worktree_path_for_branch
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import _second_mergequeue_pr
-from test_fix_unescalate import _app, _events
+from _helpers import _second_mergequeue_pr
+from _unescalate_fixtures import _app, _events
 
 
 def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(

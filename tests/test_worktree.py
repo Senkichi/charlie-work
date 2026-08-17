@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
+from _worktree_fixtures import _clone_repo, _git
 from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig, WatchdogConfig
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
@@ -148,22 +149,6 @@ def _init_repo(repo_root: Path, bare: bool = False) -> None:
         (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
         run(["git", "add", "README.md"])
         run(["git", "commit", "-m", "initial commit"])
-
-
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
-    subprocess.run(
-        ["git", "clone", str(remote_repo), str(repo_root)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    # A fresh clone has no committer identity on CI runners.
-    _git(repo_root, "config", "user.email", "test@example.test")
-    _git(repo_root, "config", "user.name", "Test User")
 
 
 def test_create_and_remove_round_trip(tmp_path: Path) -> None:

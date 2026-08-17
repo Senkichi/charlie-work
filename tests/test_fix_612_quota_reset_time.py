@@ -38,11 +38,8 @@ from charlie_work.workflow import (
     _set_reviewer_quota_exhausted_with_backoff,
 )
 
-from test_charlie_work import (
-    _dispatch_reviews_app,
-    _init_git_repo,
-    _write_review_packet,
-)
+from _helpers import _init_git_repo
+from _review_fixtures import _dispatch_reviews_app, _write_review_packet
 
 
 # Claude Code's session-limit notice, verbatim as observed 2026-07-21.

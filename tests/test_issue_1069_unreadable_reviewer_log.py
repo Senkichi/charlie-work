@@ -26,7 +26,7 @@ from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
 
-from test_charlie_work import _init_git_repo
+from _helpers import _init_git_repo
 
 
 def _seed(tmp_path: Path, pr_number: int = 100, attempt_count: int = 1):

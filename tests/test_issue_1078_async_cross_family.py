@@ -44,7 +44,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 
 # A body with a real severity marker — passes report_body_is_valid.

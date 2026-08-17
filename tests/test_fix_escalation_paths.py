@@ -38,7 +38,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp, _collect_escalated_label_subjects
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 
 def _events(state, kind: str) -> list[dict]:

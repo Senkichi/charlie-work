@@ -29,37 +29,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from _unescalate_fixtures import _app, _events
 from charlie_work import cli
-from charlie_work.config import OrchestratorConfig, PostMortemConfig
+from charlie_work.config import OrchestratorConfig
 from charlie_work.labels import TransitionOutcome, transition
-from charlie_work.paths import runtime_paths
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, state_lock
-from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import FakeGitHub
-from test_cli import _FakeGitHub, _make_repo
-
-
-def _events(state, kind: str) -> list[dict]:
-    return [e for e in state.get("events", []) if e.get("kind") == kind]
-
-
-def _app(tmp_path: Path) -> OrchestratorApp:
-    # Isolate post_mortem.db_path from the real Devin sessions.db. The default
-    # (db_path="") resolves to %APPDATA%\devin\cli\sessions.db at read time;
-    # on a self-hosted CI runner that file exists with real session data, so
-    # issue_worker_liveness's real-activity probe could surface a stale
-    # timestamp for the test PID and flip the verdict from inconclusive-defer
-    # (live=True, refuse) to conclusive-stale (live=False, proceed) -- dropping
-    # the ``issue_worker_alive`` key the refusal branch sets. Pointing at a
-    # nonexistent path under tmp_path makes every probe source error out
-    # (inconclusive), which is the condition both #625 tests depend on.
-    config = OrchestratorConfig(
-        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+from _cli_fixtures import _FakeGitHub, _make_repo
+from _fakes_github import FakeGitHub
 
 
 # --- labels.py: the two new label edges, tested directly via transition() ---
