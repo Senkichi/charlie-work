@@ -117,6 +117,18 @@ def _render_external_findings_section(
     return "\n".join(lines)
 
 
+# Issue #1270 (W13) review round 1: the literal opening sentence of
+# `_render_required_changes_section`'s tier-1 (itemized `required_changes`)
+# intro -- the ONLY tier that opens with it (tiers 2/3/"vacuous"/"derived" all
+# use different wording). `_render_round_findings` keys its tier-1-detection
+# sentinel off this exact text; before this constant existed, the sentinel
+# restated the literal separately from the emit site below, so a copy edit to
+# either could silently decouple them without either failing loudly. Repo
+# convention (verdict_parsing.py's heading constants) is read from a
+# constant, never re-declare the literal.
+_REQUIRED_CHANGES_TIER1_INTRO = "Address every item below."
+
+
 def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     """Render the ``$required_changes_section`` for a rework brief.
 
@@ -390,13 +402,13 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     if verdict == "request_changes" and changes:
         if findings_channel == "external":
             intro = (
-                "Address every item below. These include the reviewer's "
+                f"{_REQUIRED_CHANGES_TIER1_INTRO} These include the reviewer's "
                 "own findings and verified findings posted on the PR itself as "
                 "comments, review bodies, or inline review threads."
             )
         else:
             intro = (
-                "Address every item below. These are the reviewer's structured "
+                f"{_REQUIRED_CHANGES_TIER1_INTRO} These are the reviewer's structured "
                 "findings — the authoritative list of what must change before this "
                 "PR can be approved."
             )
@@ -564,6 +576,165 @@ def _next_round_number(rounds_dir: Path, decision_payload: Mapping[str, Any]) ->
         prior_decision.get(key) == decision_payload.get(key) for key in _ROUND_COMPARE_KEYS
     )
     return highest if is_retry else highest + 1
+
+
+def _round_history_entries(
+    rounds_dir: Path,
+    fallback_decision: Mapping[str, Any] | None = None,
+) -> list[tuple[int, dict[str, Any]]]:
+    """Return every archived review round under ``rounds_dir``, oldest first.
+
+    Issue #1270 (W13): reads exclusively from the ``rounds/round-K`` layout
+    W11 built (issue #1268) -- never events.db, never
+    ``request_changes_count``, per the binding decision on #1270. Each
+    element is ``(round_number, decision_payload)``; the payload is read
+    fresh from ``rounds/round-K/review-decision.json`` via
+    ``_read_review_decision``, not derived from ``fallback_decision``, so a
+    hand-edited round archive (an operator correction) is reflected exactly.
+
+    ``fallback_decision`` exists for two cases, both gated on ``not entries``
+    (i.e. checked AFTER attempting to read every archived round, not merely
+    on ``rounds_dir`` having no subdirectories -- issue #1270 review round 1
+    found the original ``not numbers`` gate left a PR's prior review
+    silently invisible whenever a round directory existed but its decision
+    file did not parse):
+
+    * The transition window around the W11 deploy: a PR whose only recorded
+      verdict predates W11 has a flat ``review-decision.json`` but no
+      ``rounds/`` directory at all (``numbers`` is empty).
+    * A round directory exists (``numbers`` is non-empty) but every
+      ``round-K/review-decision.json`` under it is missing or fails to
+      parse -- e.g. ``OrchestratorApp._write_json`` (workflow.py), the method
+      ``record_review`` uses to archive each round, creates the round
+      directory via ``mkdir`` strictly before its atomic ``tmp_path.replace()``,
+      so a crash in that window leaves an empty, decision-file-less
+      ``round-K/`` that ``_existing_round_numbers`` still counts.
+
+    Without a fallback in either case, such a PR would silently lose its
+    prior-round findings even though the caller's own round-2 gate
+    (``is_round2_review`` in ``workflow.py``, unchanged by this issue)
+    already says a prior verdict exists. The fallback is surfaced as a
+    synthetic round 1 -- ``fallback_decision`` itself, not a disk read --
+    and is consulted ONLY when every attempted read came back empty; once at
+    least one round is actually read successfully, the archive is
+    authoritative and the fallback is never consulted, matching "exclusively
+    from that layout" for every PR reviewed since W11 shipped.
+    """
+    numbers = sorted(_existing_round_numbers(rounds_dir))
+    entries: list[tuple[int, dict[str, Any]]] = []
+    for number in numbers:
+        payload = _read_review_decision(rounds_dir / f"round-{number}" / "review-decision.json")
+        if payload is not None:
+            entries.append((number, payload))
+    if not entries:
+        if fallback_decision is not None:
+            return [(1, dict(fallback_decision))]
+        return []
+    return entries
+
+
+def _render_round_findings(decision: dict[str, Any]) -> str:
+    """Render one archived round's findings for the reviewer-facing
+    round-history section (issue #1270/W13's ``$prior_review_section``).
+
+    Composes with, rather than bypasses, the crash-signature and
+    vacuous-summary guards ``_render_required_changes_section`` enforces for
+    the worker's rework brief (issue #1269/W12): aggregating every prior
+    round into one prompt -- instead of only the single latest decision,
+    the pre-W13 shape -- widens the set of persisted records a reviewer can
+    be shown, including rounds recorded before the W12 collector-side fix
+    existed. A round whose ``required_changes``/``external_findings`` still
+    carries a pre-fix crash comment must not resurface it just because it
+    is now reachable through history instead of only through the latest
+    verdict.
+
+    For a ``request_changes``/``blocked`` round WITH a non-empty itemized
+    tier-1 rendering, this delegates straight to
+    ``_render_required_changes_section`` and reuses that rendering verbatim
+    -- no filtering logic is re-derived here. But that function returns
+    ``""`` for two populations this call site must NOT drop, both named in
+    its own docstring: every ``approved`` verdict (out of its scope by
+    design -- an approved round's leftover ``required_changes`` reaches the
+    reviewer via ``$prior_review_section``, i.e. exactly this call site,
+    never the worker's brief), and a ``blocked`` verdict whose tiers 1-2 it
+    intentionally suppresses even though populated. Issue #1270 review round
+    1 found this empirically: an approved or blocked archived round carrying
+    real ``required_changes`` rendered nothing here, and the caller then
+    printed the affirmatively false "_No findings recorded for this
+    round._" -- pre-W13 code rendered ``required_changes`` bullets
+    verdict-agnostically, so this was a real regression, not a pre-existing
+    gap. For both of those populations, this function renders the round's
+    OWN ``required_changes`` directly as bullets -- each filtered through
+    ``body_has_crash_signature`` (unconditionally; unlike
+    ``_render_required_changes_section``'s tier-1 old-shape filtering, which
+    stays conditional on ``findings_channel`` and is out of scope to change
+    here) and through ``defang_closing_keywords`` -- IN ADDITION to, not
+    instead of, the round's own summary (subject to the same three
+    usability checks used everywhere else in this function).
+
+    Two further departures from a literal pass-through of the delegated
+    tiers, both because this call site's audience (a reviewer reading round
+    history) is not ``_render_required_changes_section``'s audience (a
+    worker reading a single rework brief):
+
+    * Tier 1 (an itemized ``required_changes`` list) renders its own intro
+      sentence but, by design (issue #792), never the round's ``summary`` --
+      a single derived item rendered as a one-line bullet would otherwise
+      dump a multi-paragraph summary onto one line, which is the right call
+      for a worker's brief written once. For a round-history entry that
+      tradeoff drops information the pre-#1270 single-round renderer used to
+      show, which cuts against #1270's whole purpose (show MORE than the
+      latest round, never less). Detected via ``_REQUIRED_CHANGES_TIER1_INTRO``
+      -- present on that tier only, never tiers 2/3/"vacuous"/"derived" --
+      so the decision-shape logic is not re-derived a second time; the
+      summary is appended once it passes the same three checks the
+      no-tier-1-rendering branch below already applies.
+    * ``_EXTERNAL_FINDINGS_POINTER`` is worker-brief-framed ("...none of
+      which reach *this brief*") and, unlike the brief (rendered once per
+      PR), a round-history section renders one entry per prior round --
+      repeating a worker-framed imperative once per round is wrong on both
+      counts for this audience. Stripped here; the caller
+      (``OrchestratorApp._build_prior_review_section`` in ``workflow.py``)
+      emits one reviewer-framed reminder for the whole section instead.
+    """
+    rendered = _render_required_changes_section(decision)
+    raw_summary = decision.get("summary")
+    summary_text = raw_summary.strip() if isinstance(raw_summary, str) else ""
+    summary_is_usable = bool(
+        summary_text
+        and summary_text != LEGACY_VACUOUS_SUMMARY
+        and not body_has_crash_signature(summary_text)
+    )
+    if rendered:
+        if _EXTERNAL_FINDINGS_POINTER in rendered:
+            rendered = rendered.replace(_EXTERNAL_FINDINGS_POINTER, "").rstrip("\n") + "\n"
+        if summary_is_usable and _REQUIRED_CHANGES_TIER1_INTRO in rendered:
+            rendered = f"{rendered.rstrip()}\n\nSummary: {defang_closing_keywords(summary_text)}\n"
+        return rendered
+
+    # `_render_required_changes_section` declined to render anything for
+    # this verdict -- approved (always) or blocked-with-content
+    # (intentionally suppressed there). Its decision to render nothing is
+    # correct for the WORKER's rework brief; it is wrong for the
+    # REVIEWER's round-history entry, which must never silently drop real
+    # findings the round's archive actually holds. Render required_changes
+    # directly, filtered and defanged exactly as every other rendering path
+    # in this module does, in addition to the summary fallback below.
+    raw_changes = decision.get("required_changes")
+    changes = raw_changes if isinstance(raw_changes, list) else []
+    safe_changes = [
+        stripped
+        for item in changes
+        if isinstance(item, str)
+        and (stripped := item.strip())
+        and not body_has_crash_signature(stripped)
+    ]
+    parts: list[str] = []
+    if safe_changes:
+        parts.append("\n".join(f"- {defang_closing_keywords(item)}" for item in safe_changes))
+    if summary_is_usable:
+        parts.append(f"Summary: {defang_closing_keywords(summary_text)}")
+    return "\n\n".join(parts)
 
 
 def _render_rework_prompt(
