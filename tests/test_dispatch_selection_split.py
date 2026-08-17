@@ -98,6 +98,14 @@ def _workflow_imports_in(source: str, *, filename: str = "<string>") -> list[str
     can never false-positive the check, and so the check isn't fooled by
     formatting a plain grep might not anticipate (``as`` aliases, multi-line
     ``from ... import (...)`` blocks).
+
+    Covers three distinct import spellings that all resolve to the same
+    module at runtime: ``from .workflow import X`` (module-qualified
+    relative), ``from . import workflow`` (bare package-relative -- parses as
+    ``ImportFrom(module=None, level=1, names=[alias("workflow")])``, a shape
+    the module-qualified branch below does not match since its own
+    ``node.module`` is ``None``, not ``"workflow"``), and both ``from
+    charlie_work.workflow import X`` / ``import charlie_work.workflow``.
     """
     tree = ast.parse(source, filename=filename)
     offenders: list[str] = []
@@ -105,6 +113,10 @@ def _workflow_imports_in(source: str, *, filename: str = "<string>") -> list[str
         if isinstance(node, ast.ImportFrom):
             if node.level == 1 and node.module == "workflow":
                 offenders.append(f"line {node.lineno}: from .workflow import ...")
+            elif node.level == 1 and node.module is None:
+                for alias in node.names:
+                    if alias.name == "workflow":
+                        offenders.append(f"line {node.lineno}: from . import workflow")
             elif node.module == "charlie_work.workflow":
                 offenders.append(f"line {node.lineno}: from charlie_work.workflow import ...")
         elif isinstance(node, ast.Import):
@@ -139,8 +151,18 @@ def test_workflow_import_detector_flags_a_real_violation() -> None:
     Without this, a detector that had quietly become incapable of finding
     anything (e.g. a typo'd node-type check) would leave the assertion above
     vacuously true forever.
+
+    Includes the bare ``from . import workflow`` package-relative spelling
+    (``ImportFrom(module=None, level=1, names=[alias("workflow")])``)
+    alongside the module-qualified relative, absolute-``from``, and plain
+    ``import`` spellings -- a prior version of this control omitted that
+    form, which meant it could not reveal that the detector itself failed
+    open on it (the detector matched nothing, the assertion above passed
+    vacuously, and only the separate behavioral smoke test caught the
+    resulting cycle via a real ``ImportError``).
     """
     relative_violation = "from .workflow import OrchestratorApp\n"
+    relative_package_violation = "from . import workflow\n"
     absolute_violation = "import charlie_work.workflow\n"
     absolute_from_violation = "from charlie_work.workflow import OrchestratorApp\n"
     innocent = (
@@ -148,6 +170,7 @@ def test_workflow_import_detector_flags_a_real_violation() -> None:
     )
 
     assert _workflow_imports_in(relative_violation) != []
+    assert _workflow_imports_in(relative_package_violation) != []
     assert _workflow_imports_in(absolute_violation) != []
     assert _workflow_imports_in(absolute_from_violation) != []
     assert _workflow_imports_in(innocent) == [], "prose mention must not be flagged"
