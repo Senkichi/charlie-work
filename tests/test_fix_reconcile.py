@@ -454,13 +454,21 @@ def test_mechanical_escalated_status_zero_labels_converges_to_operator_queue() -
 
 def test_mechanical_escalated_status_with_correct_label_does_not_clobber() -> None:
     """Issue #1266: a mechanically escalated issue that already carries
-    ``agent:operator-queue`` on GitHub must produce NO convergence drift at
-    all -- proving the reason_class-aware expected-label derivation, not
-    just a hardcoded ``human_needed`` membership check, decides
-    "already correct". Before #1266 this exact shape (operator_queue
-    present, human_needed absent) would have been misread as missing its
-    terminal label and converged to human_needed, clobbering a correctly
-    routed mechanical escalation on every reconcile pass."""
+    ``agent:operator-queue`` on GitHub must produce NO *convergence* drift --
+    proving the reason_class-aware expected-label derivation, not just a
+    hardcoded ``human_needed`` membership check, decides "already correct".
+    Before #1266 this exact shape (operator_queue present, human_needed
+    absent) would have been misread as missing its terminal label and
+    converged to human_needed, clobbering a correctly routed mechanical
+    escalation on every reconcile pass.
+
+    The orthogonal issue #947 ``terminal_state_stale`` alert still fires
+    (age never observed, no timestamp seeded here) -- extended by #1266 to
+    watch ``operator_queue`` the same way it already watched
+    ``human_needed`` (see ``test_escalated_status_with_correct_labels_is_no_drift``
+    for the pre-existing human_needed case this mirrors), so a mechanical
+    escalation parked here forever is no longer invisible either.
+    """
     config = OrchestratorConfig()
     gh = FakeGitHub(
         prs=[_pr(50, "OPEN", head_ref="agent/issue-40-x")],
@@ -472,7 +480,11 @@ def test_mechanical_escalated_status_with_correct_label_does_not_clobber() -> No
     full_drift = detect_drift(gh, state, config)
     issue_40_items = [item for item in full_drift if item.issue_number == 40]
 
-    assert issue_40_items == []
+    convergence_items = [
+        item for item in issue_40_items if item.kind == "escalated_labels_converged"
+    ]
+    assert convergence_items == []
+    assert {item.kind for item in issue_40_items} == {"terminal_state_stale"}
 
 
 def test_escalated_status_with_stale_active_label_strips_it() -> None:

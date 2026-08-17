@@ -1119,7 +1119,12 @@ def _collect_escalated_label_repair_events(repo_key: str, data: Any) -> list[dic
                 "issue_number": (errored or failures)[0],
                 "type": "escalated_label_repair_error",
                 "error": (
-                    "agent:human-needed edge still owed -- "
+                    # Issue #1266: the owed label is human_needed for a
+                    # judgment escalation but operator_queue for a
+                    # mechanical one -- this aggregates possibly-mixed
+                    # subjects into one message, so name the edge (shared by
+                    # both) rather than hardcoding one specific label.
+                    "escalated-label repair edge still owed -- "
                     f"{len(errored)} unreachable {errored}, "
                     f"{len(failures)} not applied {failures}"
                 ),

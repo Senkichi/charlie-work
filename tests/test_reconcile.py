@@ -703,6 +703,37 @@ def test_detect_drift_finds_terminal_state_stale_via_terminal_since(tmp_path: Pa
     assert matches[0].fix_actions == ()
 
 
+def test_detect_drift_finds_terminal_state_stale_for_operator_queue(tmp_path: Path) -> None:
+    """Issue #1266 counterpart of the test above: a mechanical escalation
+    parks on `agent:operator-queue` instead of `agent:human-needed`, and the
+    #947 staleness alert must watch that label too -- otherwise an issue
+    whose de-escalation sweep stopped clearing it (e.g. sweep itself broken,
+    not merely mid-retry) would sit in the sink forever with no alert at
+    all, silently reintroducing the exact invisibility #947 fixed for the
+    judgment-escalation case. The detail message must name the label that is
+    actually present (`operator-queue`), not hardcode `human-needed`."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(894, [config.labels.operator_queue])])
+    state = empty_state()
+    now = datetime(2026, 1, 10, tzinfo=UTC)
+    state["issues"]["894"] = {
+        "number": 894,
+        "status": "escalated",
+        "reason_class": "mechanical",
+        "terminal_since": "2026-01-05T00:00:00Z",  # 5 days before `now`
+    }
+
+    drift = detect_drift(gh, state, config, now=now)
+
+    matches = [item for item in drift if item.kind == "terminal_state_stale"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 894
+    assert "5.0 day" in matches[0].detail
+    assert config.labels.operator_queue in matches[0].detail
+    assert config.labels.human_needed not in matches[0].detail
+    assert matches[0].fix_actions == ()
+
+
 def test_detect_drift_terminal_state_stale_not_yet_due(tmp_path: Path) -> None:
     """A fresh escalation (age below the configured threshold) must not fire
     -- this is the negative control for the positive case above."""

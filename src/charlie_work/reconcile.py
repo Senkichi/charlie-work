@@ -821,6 +821,16 @@ def detect_drift(
     now = now if now is not None else datetime.now(UTC)
 
     labels_cfg = config.labels
+    # Issue #1266: a mechanical escalation parks on operator_queue instead of
+    # human_needed, so "terminal escalation label present" must watch both --
+    # derived from _escalation_edge's own mechanical-edge table (via
+    # _escalation_label) rather than a second hardcoded label pair, so the
+    # label-repair consumers below and the staleness alert further down can
+    # never drift out of sync about what "escalated and parked" looks like.
+    escalation_parked_labels = {
+        _escalation_label(labels_cfg, "escalated"),
+        _escalation_label(labels_cfg, _escalation_edge("escalated", "mechanical")),
+    }
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
@@ -1449,6 +1459,12 @@ def detect_drift(
         # unconditionally ``continue``s -- inserting after it would silently
         # skip the common case.
         #
+        # Issue #1266: ``escalation_parked_labels`` extends this same alert
+        # to ``operator_queue`` -- a mechanical escalation that never clears
+        # (e.g. the de-escalation sweep itself stops running) must not sit
+        # silently forever just because it parked on the *other* terminal
+        # label instead of ``human_needed``.
+        #
         # Age is resolved with a 3-tier fallback so a legacy escalation
         # (predating this check) still gets a real age instead of
         # masquerading as fresh:
@@ -1468,7 +1484,8 @@ def detect_drift(
         # unknown age as healthy is exactly the failure mode
         # ``classify_backlog_reachability``'s ``observed: False`` return
         # exists to avoid.
-        if labels_cfg.human_needed in issue_labels and _issue_state(issue) == "OPEN":
+        stale_terminal_labels = issue_labels & escalation_parked_labels
+        if stale_terminal_labels and _issue_state(issue) == "OPEN":
             since_raw: str | None = None
             if isinstance(tracked_entry, dict):
                 since_raw = tracked_entry.get("terminal_since") or tracked_entry.get(
@@ -1497,12 +1514,26 @@ def detect_drift(
 
             threshold_days = config.reconcile_pass.terminal_state_alert_days
             if age_days is None or age_days >= threshold_days:
+                # Issue #1266: name whichever parked label is actually
+                # present -- human_needed for a judgment escalation,
+                # operator_queue for a mechanical one -- instead of
+                # hardcoding human_needed into the message regardless of
+                # which label is really there. Both are never present
+                # together (labels.py's edges remove each other), but pick
+                # deterministically (prefer human_needed) for the
+                # pathological case where a manual label add put both on
+                # the issue at once.
+                stale_label = (
+                    labels_cfg.human_needed
+                    if labels_cfg.human_needed in stale_terminal_labels
+                    else labels_cfg.operator_queue
+                )
                 detail = (
                     f"issue #{issue_number} has been parked in "
-                    f"'{labels_cfg.human_needed}' for {age_days:.1f} day(s)"
+                    f"'{stale_label}' for {age_days:.1f} day(s)"
                     if age_days is not None
                     else (
-                        f"issue #{issue_number} carries '{labels_cfg.human_needed}' with no "
+                        f"issue #{issue_number} carries '{stale_label}' with no "
                         "recorded escalation timestamp (age never observed)"
                     )
                 )

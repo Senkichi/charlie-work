@@ -1786,8 +1786,11 @@ def sink_census(state: dict[str, Any]) -> set[int]:
 
     The sink is the set of issues whose state entry carries a terminal
     ``status`` of ``"escalated"`` or ``"blocked"`` -- the in-state mirror of
-    the ``agent:human-needed`` GitHub label. This is a point-in-time census
-    read directly from ``state.json``'s ``issues`` map, deliberately not a
+    the escalation GitHub labels (``agent:human-needed`` for a judgment
+    escalation, ``agent:operator-queue`` for a mechanical one since issue
+    #1266; both share the same ``status`` value, so this census counts both
+    without needing to know which). This is a point-in-time census read
+    directly from ``state.json``'s ``issues`` map, deliberately not a
     GitHub-label query: it is cheap, deterministic, and matches the same
     source of truth the orchestrator's own de-escalation sweep selects
     candidates from, so the metric and the sweep agree on the population.
