@@ -116,6 +116,14 @@ def _module_imports_in(
     several) can never false-positive the check, and so the check isn't
     fooled by formatting a plain grep might not anticipate (``as`` aliases,
     multi-line ``from ... import (...)`` blocks).
+
+    Covers four distinct import spellings that all resolve to the same
+    module at runtime: ``from .<relative_module> import X`` (module-qualified
+    relative), ``from . import <relative_module>`` (bare package-relative --
+    parses as ``ImportFrom(module=None, level=1, names=[alias(relative_module)])``,
+    a shape the module-qualified branch below does not match since its own
+    ``node.module`` is ``None``, not ``relative_module``), ``from
+    <absolute_module> import X``, and ``import <absolute_module>``.
     """
     tree = ast.parse(source, filename=filename)
     offenders: list[str] = []
@@ -123,6 +131,10 @@ def _module_imports_in(
         if isinstance(node, ast.ImportFrom):
             if node.level == 1 and node.module == relative_module:
                 offenders.append(f"line {node.lineno}: from .{relative_module} import ...")
+            elif node.level == 1 and node.module is None:
+                for alias in node.names:
+                    if alias.name == relative_module:
+                        offenders.append(f"line {node.lineno}: from . import {relative_module}")
             elif node.module == absolute_module:
                 offenders.append(f"line {node.lineno}: from {absolute_module} import ...")
         elif isinstance(node, ast.Import):
@@ -196,8 +208,18 @@ def test_workflow_import_detector_flags_a_real_violation() -> None:
     Without this, a detector that had quietly become incapable of finding
     anything (e.g. a typo'd node-type check) would leave the assertion above
     vacuously true forever.
+
+    Includes the bare ``from . import workflow`` package-relative spelling
+    (``ImportFrom(module=None, level=1, names=[alias("workflow")])``)
+    alongside the module-qualified relative, absolute-``from``, and plain
+    ``import`` spellings -- a prior version of this control omitted that
+    form, which meant it could not reveal that the detector itself failed
+    open on it (the detector matched nothing, the assertion above passed
+    vacuously, and only the separate behavioral smoke test caught the
+    resulting cycle via a real ``ImportError``).
     """
     relative_violation = "from .workflow import OrchestratorApp\n"
+    relative_package_violation = "from . import workflow\n"
     absolute_violation = "import charlie_work.workflow\n"
     absolute_from_violation = "from charlie_work.workflow import OrchestratorApp\n"
     innocent = (
@@ -205,6 +227,7 @@ def test_workflow_import_detector_flags_a_real_violation() -> None:
     )
 
     assert _workflow_imports_in(relative_violation) != []
+    assert _workflow_imports_in(relative_package_violation) != []
     assert _workflow_imports_in(absolute_violation) != []
     assert _workflow_imports_in(absolute_from_violation) != []
     assert _workflow_imports_in(innocent) == [], "prose mention must not be flagged"
@@ -224,8 +247,16 @@ def test_cross_family_import_detector_flags_a_real_violation() -> None:
     in ``test_verdict_parsing_has_no_cross_family_import`` vacuously true
     forever -- the exact failure mode the workflow-side control exists to
     rule out, just for the sibling detector.
+
+    Includes the bare ``from . import cross_family`` package-relative
+    spelling alongside the module-qualified relative, absolute-``from``, and
+    plain ``import`` spellings, for the same reason the workflow-side
+    control above does: a prior version omitted this form, which meant it
+    could not reveal that the shared ``_module_imports_in`` walk failed open
+    on it.
     """
     relative_violation = "from .cross_family import _VERDICT_FENCE_RE\n"
+    relative_package_violation = "from . import cross_family\n"
     absolute_violation = "import charlie_work.cross_family\n"
     absolute_from_violation = "from charlie_work.cross_family import _VERDICT_FENCE_RE\n"
     innocent = (
@@ -234,6 +265,7 @@ def test_cross_family_import_detector_flags_a_real_violation() -> None:
     )
 
     assert _cross_family_imports_in(relative_violation) != []
+    assert _cross_family_imports_in(relative_package_violation) != []
     assert _cross_family_imports_in(absolute_violation) != []
     assert _cross_family_imports_in(absolute_from_violation) != []
     assert _cross_family_imports_in(innocent) == [], "prose mention must not be flagged"
