@@ -559,12 +559,6 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
     assert "check_dispatch_staleness" in referenced
     assert referenced["check_dispatch_staleness"] == "tests/test_dispatch_staleness.py"
 
-    assert "_annotation_to_required_change" in referenced
-    assert referenced["_annotation_to_required_change"] == "tests/test_charlie_work.py"
-
-    assert "_required_changes_from_checks" in referenced
-    assert referenced["_required_changes_from_checks"] == "tests/test_charlie_work.py"
-
     # The 4 behaviorally-only-exercised names have no anchor anywhere, in
     # either scope -- adding scripts/src does not surface one for this
     # family (unlike the rework_prompts precedent's _read_review_decision).
@@ -573,6 +567,8 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
         "_backlog_is_non_empty",
         "_latest_non_empty_dispatch",
         "_parse_iso_ts",
+        "_annotation_to_required_change",
+        "_required_changes_from_checks",
     }
     for name in no_anchor:
         assert name not in referenced, f"{name} unexpectedly has a tests/-only anchor"
@@ -586,8 +582,6 @@ def test_consumer_reference_scan_finds_the_known_anchors() -> None:
         == {
             "_non_required_check_findings",
             "check_dispatch_staleness",
-            "_annotation_to_required_change",
-            "_required_changes_from_checks",
         }
     )
 
