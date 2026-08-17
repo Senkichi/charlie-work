@@ -15601,6 +15601,110 @@ def test_review_corrupted_decision_file_has_no_prior_review_section(tmp_path: Pa
     assert "## Prior review" not in packet
 
 
+def test_review_round3_surfaces_findings_from_every_prior_round(tmp_path: Path) -> None:
+    """Issue #1270 (W13): a round-3 review must surface findings from EVERY
+    prior round, not only the most recent one -- a finding raised in round 1
+    and not repeated in round 2 must still reach the round-3 reviewer.
+    Reads exclusively from the rounds/round-K archive W11 built (#1268),
+    mirroring what record_review actually writes to disk (the flat mirror
+    review-decision.json always equals the latest archived round)."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    round1_decision = {
+        "decision": "request_changes",
+        "summary": "round-1 summary text",
+        "required_changes": ["round-1 finding: add null check"],
+        "reviewed_head_sha": "sha-r1",
+    }
+    round2_decision = {
+        "decision": "request_changes",
+        "summary": "round-2 summary text",
+        "required_changes": ["round-2 finding: handle empty list"],
+        "reviewed_head_sha": "sha-r2",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round2_dir = decision_dir / "rounds" / "round-2"
+    round1_dir.mkdir(parents=True)
+    round2_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (round2_dir / "review-decision.json").write_text(json.dumps(round2_decision), encoding="utf-8")
+    # The flat mirror _review_decision reads always equals the latest
+    # archived round -- record_review writes both together, same call.
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round2_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "### Round 1" in packet
+    assert "### Round 2" in packet
+    assert packet.index("### Round 1") < packet.index("### Round 2")
+    assert "round-1 finding: add null check" in packet
+    assert "round-2 finding: handle empty list" in packet
+    # #1270 follow-up: a round whose required_changes list is non-empty now
+    # ALSO carries its own summary (appended after the itemized list) --
+    # the pre-#792 tier-1/tier-2 exclusivity is a worker-brief-only
+    # tradeoff; the reviewer's round-history entry shows both.
+    assert "round-1 summary text" in packet
+    assert "round-2 summary text" in packet
+
+    # The interdiff compares the LATEST round's head to the live head, not
+    # round 1's -- round 1's head must not leak into the interdiff.
+    interdiff_path = decision_dir / "interdiff.patch"
+    assert interdiff_path.exists()
+    interdiff_text = interdiff_path.read_text(encoding="utf-8")
+    assert "sha-r2" in interdiff_text
+    assert "sha-abc123" in interdiff_text
+    assert "sha-r1" not in interdiff_text
+
+
+def test_review_round_history_strips_crash_signature_findings(tmp_path: Path) -> None:
+    """Issue #1270 (W13) composes with the #1269 (W12) crash-signature
+    guard: a prior round whose required_changes still carries a
+    pre-collector-fix crash comment (old-shape findings_channel ==
+    "external") must render with the crash text absent from the
+    round-history section -- the same guarantee
+    _render_required_changes_section already gives the worker's rework
+    brief, now also true for the reviewer's aggregated prior-review
+    section. Without this, aggregating every prior round (instead of only
+    the latest decision) would widen a poisoned old round's exposure
+    instead of narrowing it."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()  # PR 456 headRefOid is "sha-abc123"
+    decision_dir = paths.prs / "pr-456"
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    round1_decision = {
+        "decision": "request_changes",
+        "summary": "",
+        "required_changes": ["fix the off-by-one", crash_body],
+        "findings_channel": "external",
+        "reviewed_head_sha": "sha-r1",
+    }
+    round1_dir = decision_dir / "rounds" / "round-1"
+    round1_dir.mkdir(parents=True)
+    (round1_dir / "review-decision.json").write_text(json.dumps(round1_decision), encoding="utf-8")
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps(round1_decision), encoding="utf-8"
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    assert result.ok is True
+    packet = (decision_dir / "review-prompt.md").read_text(encoding="utf-8")
+    assert "## Prior review" in packet
+    assert "fix the off-by-one" in packet
+    assert crash_body not in packet
+    assert REVIEW_SESSION_SUMMARY_HEADING not in packet
+
+
 def test_review_same_head_terminal_verdict_surfaces_findings(tmp_path: Path) -> None:
     """Issue #632 defect 3: a terminal verdict on disk for the SAME head (a
     PR parked on agent:human-needed whose head has not advanced, or an

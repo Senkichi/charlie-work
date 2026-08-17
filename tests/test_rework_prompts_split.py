@@ -271,25 +271,34 @@ def test_all_rework_prompts_names_are_reexported_by_identity() -> None:
     function would compare unequal-but-structurally-similar in ways that are
     easy to miss.
 
-    The ``len(names) == 14`` assertion below is a second, independent
+    The ``len(names) == 16`` assertion below is a second, independent
     anti-vacuity guard: it is the only thing in this file that proves
     ``_module_level_defined_names`` is still walking the ``Assign`` branch
     (the 3 module constants: ``_EXTERNAL_FINDINGS_POINTER``,
     ``_EXTERNAL_FINDINGS_SECTION_INTRO``, ``_ROUND_COMPARE_KEYS``), not just
     ``FunctionDef``. A regression that silently dropped that branch would
-    shrink ``names`` to the 11 functions, and every remaining assertion in
+    shrink ``names`` to the 13 functions, and every remaining assertion in
     this test -- and in the AC5 completeness test below, which draws its own
     candidate set from this same helper -- would keep passing while quietly
-    stopping to cover 11 of the 14 moved units.
+    stopping to cover 13 of the 16 moved/added units.
+
+    Issue #1270 (W13) added two more free functions here --
+    ``_round_history_entries`` and ``_render_round_findings`` -- bringing the
+    count from 14 to 16 (12 core-chain functions + _write_text_atomic + 3
+    constants). Neither is reached by this file's own consumer-reference
+    scan (AC5 below): both are called only by bare-name call sites inside
+    ``OrchestratorApp._build_prior_review_section``, which stays in
+    workflow.py, so they join the "reached only by bare-name call sites"
+    bucket AC5's docstring already describes for 8 of the original 14 names.
     """
     import charlie_work.rework_prompts as rework_prompts
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_REWORK_PROMPTS_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 14, (
-        f"expected 14 moved units (10 core-chain functions + _write_text_atomic + "
-        f"3 constants), found {len(names)}: {sorted(names)}"
+    assert len(names) == 16, (
+        f"expected 16 moved/added units (12 core-chain functions + "
+        f"_write_text_atomic + 3 constants), found {len(names)}: {sorted(names)}"
     )
 
     missing_from_facade = [n for n in names if not hasattr(workflow, n)]
@@ -431,19 +440,20 @@ def test_facade_reexports_every_name_consumers_reach_through_workflow() -> None:
     tests/scripts/src, not from a list restated by hand in this test (which
     is exactly the kind of copy that drifts the moment a consumer changes).
 
-    Only 6 of rework_prompts.py's 14 module-level names have any consumer
+    Only 6 of rework_prompts.py's 16 module-level names have any consumer
     reference outside workflow.py at all -- ``_render_required_changes_section``,
     ``_is_verdict_newer_than_brief``, ``_read_review_decision``,
     ``_existing_round_numbers``, ``_write_text_atomic``, and
-    ``_write_rework_prompt``. The other 8 (``_rework_prompt_search_dirs``,
+    ``_write_rework_prompt``. The other 10 (``_rework_prompt_search_dirs``,
     ``_finish_required_changes_section``, ``_render_external_findings_section``,
     ``_EXTERNAL_FINDINGS_POINTER``, ``_EXTERNAL_FINDINGS_SECTION_INTRO``,
-    ``_next_round_number``, ``_ROUND_COMPARE_KEYS``, ``_render_rework_prompt``)
-    are reached only by bare-name call sites inside OrchestratorApp methods
-    that stay in workflow.py, so this scan imposes no obligation for them.
-    They are still required to be re-exported by the unconditional
-    facade-obligation rule (AC4 covers that), just not because this live
-    scan demands it.
+    ``_next_round_number``, ``_ROUND_COMPARE_KEYS``, ``_render_rework_prompt``,
+    and, since issue #1270/W13, ``_round_history_entries`` and
+    ``_render_round_findings``) are reached only by bare-name call sites
+    inside OrchestratorApp methods that stay in workflow.py, so this scan
+    imposes no obligation for them. They are still required to be
+    re-exported by the unconditional facade-obligation rule (AC4 covers
+    that), just not because this live scan demands it.
     """
     candidates = set(_module_level_defined_names(_REWORK_PROMPTS_PATH))
     referenced = _consumer_referenced_names(

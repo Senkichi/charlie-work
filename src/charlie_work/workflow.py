@@ -318,7 +318,9 @@ from .rework_prompts import (  # noqa: F401  (deliberate re-export)
     _read_review_decision,
     _render_external_findings_section,
     _render_required_changes_section,
+    _render_round_findings,
     _render_rework_prompt,
+    _round_history_entries,
     _rework_prompt_search_dirs,
     _write_rework_prompt,
     _write_text_atomic,
@@ -16306,21 +16308,39 @@ class OrchestratorApp:
         """Render ``$prior_review_section`` for a round-2+ review packet.
 
         Called when the prior decision is a terminal, non-pending verdict
-        with a recorded ``reviewed_head_sha``. Two cases:
+        with a recorded ``reviewed_head_sha``. Issue #1270 (W13): surfaces
+        EVERY archived round, not only the single most recent one -- a
+        finding raised in round 1, dropped in round 2, and reintroduced in
+        round 3 must be visible as such, not silently collapsed into "the
+        latest decision". Round content is read exclusively from the
+        ``rounds/round-K`` archive W11 built (``_round_history_entries`` in
+        ``rework_prompts.py``) -- never events.db, never
+        ``request_changes_count`` -- per the binding decision on #1270.
+        ``prior_decision`` (the flat, latest-verdict mirror the caller
+        already read) is consulted only as a fallback when the archive is
+        empty -- see ``_round_history_entries``'s docstring.
 
-        - **Moved head** (prior head != live head): a genuine rework round.
-          Surfaces round-1 findings plus an interdiff (prior reviewed head
-          -> new head) so the reviewer has somewhere to start, without
-          losing sight of the full diff: the interdiff is "start here,"
-          never "only look here" -- the full diff stays attached and
-          remains authoritative for findings outside it.
-        - **Same head** (prior head == live head, issue #632 defect 3): a
-          PR parked on ``agent:human-needed`` whose head has not advanced,
-          or an operator-corrected verdict. The diff is identical, so no
-          interdiff is generated; the findings are surfaced so a re-review
-          can verify whether they still apply or whether the verdict was
-          corrected. Without this branch the corrected verdict was
-          invisible to the reviewer (the #510 case).
+        Two cases, the same distinction the pre-W13 single-round renderer
+        drew, now keyed off the MOST RECENT archived round instead of the
+        one ``prior_decision`` argument (which, once at least one round is
+        archived, is always exactly that round's own payload -- writer and
+        flat mirror are the same ``record_review`` call):
+
+        - **Moved head** (latest round's head != live head): a genuine
+          rework round. Every prior round's findings are listed, oldest
+          first, followed by an interdiff (latest reviewed head -> new
+          head) so the reviewer has somewhere to start, without losing
+          sight of the full diff: the interdiff is "start here," never
+          "only look here" -- the full diff stays attached and remains
+          authoritative for findings outside it.
+        - **Same head** (latest round's head == live head, issue #632
+          defect 3): a PR parked on ``agent:human-needed`` whose head has
+          not advanced, or an operator-corrected verdict. The diff is
+          identical, so no interdiff is generated; every round's findings
+          are still surfaced so a re-review can verify whether they still
+          apply or whether the verdict was corrected. Without this branch
+          the corrected verdict was invisible to the reviewer (the #510
+          case).
 
         Fail-safe posture mirrors janitor.py's patch-id carry-forward
         (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call
@@ -16329,58 +16349,69 @@ class OrchestratorApp:
         rebase/divergence, gh failure) just omits the interdiff and says so
         -- it never blocks packet generation.
         """
-        prior_head_sha = prior_decision.get("reviewed_head_sha")
-        decision = prior_decision.get("decision") or "unknown"
-        summary = str(prior_decision.get("summary") or "").strip()
-        required_changes = prior_decision.get("required_changes")
-        if not isinstance(required_changes, list):
-            required_changes = []
+        rounds_dir = pr_dir / "rounds"
+        entries = _round_history_entries(rounds_dir, fallback_decision=prior_decision)
+        if not entries:
+            return ""
 
+        latest_decision = entries[-1][1]
+        prior_head_sha = latest_decision.get("reviewed_head_sha")
         same_head = bool(prior_head_sha) and prior_head_sha == new_head_sha
+        round_word = "round" if len(entries) == 1 else "rounds"
+
+        lines = ["", f"## Prior review{' (same head)' if same_head else ''}", ""]
+        if same_head:
+            lines.append(
+                f"A prior review of this head (`{prior_head_sha}`) recorded decision "
+                f"**{latest_decision.get('decision') or 'unknown'}**. The diff has not "
+                "changed since that review. Findings from every prior "
+                f"{round_word} are listed below, oldest first -- verify whether "
+                "each still applies or whether the verdict was corrected (e.g. "
+                "by an operator hand-edit)."
+            )
+        else:
+            lines.append(
+                f"This PR has {len(entries)} prior review {round_word}. Findings "
+                "from EVERY round are listed below, oldest first -- a finding "
+                "raised in an earlier round is still in scope even if a later "
+                "round's summary did not repeat it."
+            )
+        lines.append("")
+
+        for round_number, round_decision in entries:
+            decision_label = round_decision.get("decision") or "unknown"
+            round_head = round_decision.get("reviewed_head_sha") or "unknown"
+            lines.append(
+                f"### Round {round_number} (decision: {decision_label}, head `{round_head}`)"
+            )
+            lines.append("")
+            findings = _render_round_findings(round_decision)
+            lines.append(findings if findings else "_No findings recorded for this round._")
+            lines.append("")
+
+        # #1270 (W13): `_render_round_findings` strips
+        # `_EXTERNAL_FINDINGS_POINTER` from each round's rendering -- its
+        # wording is worker-brief-framed ("...none of which reach this
+        # brief") and, unlike the brief (rendered once per PR), a
+        # round-history section would otherwise repeat it once per round.
+        # One reviewer-framed reminder for the whole section replaces it.
+        lines.append(
+            "The findings above come from the orchestrator's own reviewer, "
+            "across every round. They are not necessarily the only ones -- "
+            "a human or a peer agent may have posted verified findings as "
+            "PR comments, review bodies, or inline review threads. Read the "
+            "PR's review comments and review threads on GitHub before you "
+            "start, and address what you find there too."
+        )
+        lines.append("")
 
         if same_head:
-            lines = [
-                "",
-                "## Prior review (same head)",
-                "",
-                f"A prior review of this head (`{prior_head_sha}`) recorded "
-                f"decision **{decision}**. The diff has not changed since that "
-                "review -- the findings below are from the same code you are "
-                "reviewing now. Verify whether they still apply or whether the "
-                "verdict was corrected (e.g. by an operator hand-edit).",
-                "",
-            ]
-            if summary:
-                lines.append(f"Prior summary: {summary}")
-                lines.append("")
-            if required_changes:
-                lines.append("Prior required changes:")
-                lines.extend(f"- {change}" for change in required_changes)
-                lines.append("")
             lines.append(
                 "No interdiff is needed -- the head is unchanged. Re-examine "
                 "the full diff and confirm or overturn the prior verdict."
             )
             lines.append("")
             return "\n".join(lines)
-
-        lines = [
-            "",
-            "## Prior review (round 1, earlier head)",
-            "",
-            f"A previous review round on an earlier head (`{prior_head_sha}`) "
-            f"recorded decision **{decision}**. These are round-1 findings on "
-            "a DIFFERENT diff than the one you are reviewing now -- verify "
-            "each one against the current code, don't assume it still applies.",
-            "",
-        ]
-        if summary:
-            lines.append(f"Round-1 summary: {summary}")
-            lines.append("")
-        if required_changes:
-            lines.append("Round-1 required changes:")
-            lines.extend(f"- {change}" for change in required_changes)
-            lines.append("")
 
         interdiff_text = None
         if prior_head_sha and new_head_sha:
@@ -16389,8 +16420,8 @@ class OrchestratorApp:
             interdiff_path = pr_dir / "interdiff.patch"
             interdiff_path.write_text(interdiff_text, encoding="utf-8")
             lines.append(
-                f"Interdiff (round-1 head to this head): `{interdiff_path}`. Verify "
-                "each required change above is addressed there first -- but the "
+                f"Interdiff (most recent reviewed head to this head): `{interdiff_path}`. "
+                "Verify the findings above are addressed there first -- but the "
                 "full diff remains authoritative; findings outside the interdiff "
                 "are still in scope."
             )
@@ -16398,7 +16429,7 @@ class OrchestratorApp:
             lines.append(
                 "Prior-head comparison was unavailable (rebase, divergence, or an "
                 "API error) -- no interdiff could be generated. Review the full "
-                "diff as usual, with the round-1 findings above in mind."
+                "diff as usual, with the findings above in mind."
             )
         lines.append("")
         return "\n".join(lines)
