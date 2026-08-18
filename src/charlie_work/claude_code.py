@@ -103,6 +103,43 @@ _PROVIDER_AUTH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern for provider account-suspension / insufficient-balance responses
+# (issue #1342). Matched against the log tail of api-kind sessions only. A
+# suspended/depleted provider account is a TERMINAL billing failure — it will
+# not self-heal on any retry backoff and needs human intervention (recharge).
+# Classifying it as ``rate_limited`` (15-min cooldown) or ``quota_exhausted``
+# (24h cooldown) burns the issue's auto-redispatch cap on a deterministic
+# external failure before the operator ever hears about the billing problem.
+#
+# Matched by response semantics (HTTP status + error code/message the provider
+# documents), not by a brittle full-string comparison:
+# * ``exceeded_current_quota_error`` — Moonshot's documented error type for
+#   insufficient balance / suspended account / overdue / expired voucher
+#   (https://www.kimi.com/help/kimi-api/api-error-codes). The message wording
+#   varies for the same type (confirmed by Moonshot's own kimi-code PR #1857),
+#   so the structured type is the reliable discriminator.
+# * ``suspended due to insufficient balance`` — Moonshot's documented
+#   suspension message (observed verbatim 2026-08-18 in the live failure this
+#   issue was filed from).
+# * ``insufficient balance`` / ``recharge your account`` — billing-depleted
+#   semantics shared across providers' insufficient-funds responses.
+# * ``\b402\b`` — HTTP 402 Payment Required, anchored with word boundaries for
+#   the same false-positive reason as the 401/403 codes above.
+#
+# Deliberately NOT matched: genuine transient 429 rate-limits
+# (``engine_overloaded_error``, ``rate_limit_reached_error``, "rate limit",
+# "too many requests") — those keep the existing ``rate_limited`` backoff
+# behavior (acceptance criterion 4). The suspension/billing semantics above
+# are disjoint from the transient-overload semantics.
+_PROVIDER_SUSPENDED_PATTERN = re.compile(
+    r"exceeded_current_quota_error"
+    r"|suspended due to insufficient balance"
+    r"|insufficient balance"
+    r"|recharge your account"
+    r"|\b402\b",
+    re.IGNORECASE,
+)
+
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
@@ -130,7 +167,8 @@ class ClaudeWorkerRecord:
     log_path: str
     error: str | None = None
     failure_kind: str | None = (
-        None  # "rate_limited" | "quota_exhausted" | "provider_auth" | "budget_exceeded" | ...
+        None  # "rate_limited" | "quota_exhausted" | "provider_auth" |
+        # "provider_suspended" | "budget_exceeded" | ...
     )
     process_start_time: float | None = None  # Unix timestamp in seconds (process creation time)
     reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
@@ -528,8 +566,10 @@ def _classify_session_failure(
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
     Returns a tuple of (failure_kind, throttled_until_iso):
-    - failure_kind: "rate_limited" | "quota_exhausted" | "provider_auth" | None
-    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
+    - failure_kind: "rate_limited" | "quota_exhausted" | "provider_auth" |
+      "provider_suspended" | None
+    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if
+      not applicable (None for ``provider_suspended`` — terminal, no cooldown)
 
     This is called after a session exits to detect provider throttling and set a cool-down window.
 
@@ -538,8 +578,10 @@ def _classify_session_failure(
     floors, not guarantees, and dispatching at T+0 races the actual reset
     (issue #499).
 
-    ``adapter_kind`` selects provider-auth classification (issue #484): when
-    ``"api"``, the log tail is also matched against 401/403/authentication
+    ``adapter_kind`` selects provider-auth and provider-suspended
+    classification (issues #484, #1342): when ``"api"``, the log tail is also
+    matched against account-suspension / insufficient-balance patterns
+    (checked first — terminal, no cooldown) and 401/403/authentication
     patterns. Auth failures are checked BEFORE throttle markers so a dead API
     key does not masquerade as a generic throttle. On a ``provider_auth`` match,
     the cooldown reuses the existing quota-exhaustion constant (24h) — a dead
@@ -562,6 +604,17 @@ def _classify_session_failure(
 
     # Check the last 2KB of the log (where error messages appear)
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    # Provider-suspended classification (api only, issue #1342). Checked
+    # BEFORE auth/quota/throttle because a suspended/depleted account is the
+    # most specific and most severe condition: it is TERMINAL (no cooldown —
+    # the account needs a recharge, not a retry window) and a suspension
+    # response that also carries a 403 must not be downgraded to the 24h
+    # provider_auth cooldown. Genuine transient 429 rate-limits
+    # (engine_overloaded_error / rate_limit_reached_error / "rate limit") do
+    # not match this pattern and keep the existing backoff behavior.
+    if adapter_kind == "api" and _PROVIDER_SUSPENDED_PATTERN.search(tail):
+        return "provider_suspended", None
 
     # Provider-auth classification (api only, issue #484). Checked before
     # quota/throttle so an auth failure is never relabeled as a generic
@@ -605,6 +658,31 @@ def _classify_session_failure(
         )
 
     return None, None
+
+
+def detect_provider_suspended(log_path: Path) -> bool:
+    """Return True when ``log_path`` contains a provider account-suspension /
+    insufficient-balance signature (issue #1342).
+
+    Unlike ``_classify_session_failure`` (which scans only the last 2KB of the
+    log tail for post-mortem classification), this scans the FULL log text so
+    the stalled-session supervision loop can detect a suspension on the FIRST
+    request cycle — before the CLI's internal retry backoff has scrolled the
+    message past a 2KB tail window. A suspended account is terminal; the
+    caller kills the process immediately instead of letting the CLI burn its
+    retry budget against a permanently-failing endpoint.
+
+    The pattern (``_PROVIDER_SUSPENDED_PATTERN``) is api-provider-specific and
+    disjoint from genuine transient 429 rate-limit signatures, so a transient
+    rate-limit log returns False here and keeps the existing backoff behavior.
+    """
+    if not log_path.exists():
+        return False
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(_PROVIDER_SUSPENDED_PATTERN.search(log_text))
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -1670,6 +1748,7 @@ __all__ = [
     "probe_claude",
     "is_worker_alive",
     "update_worker_record_with_failure_classification",
+    "detect_provider_suspended",
     "_sidecar_path",
     "ClaudeProgress",
     "parse_claude_events",

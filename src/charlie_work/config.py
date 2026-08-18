@@ -59,13 +59,19 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 
 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict"}
+    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict", "provider_suspended"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
 # transient contention, not a confirmed-dirty worktree — it must take the
 # ordinary redispatch-cap path instead of escalating on first occurrence
 # (issue #288 follow-up, PR #314).
+#
+# "provider_suspended" (issue #1342): a suspended/depleted provider account is
+# a deterministic external billing failure — it will not self-heal on any
+# retry backoff. Escalating on the first occurrence routes the issue straight
+# to operator-queue with a provider-billing reason instead of burning the full
+# auto-redispatch cap (~35 minutes) on a permanently-failing endpoint.
 
 
 class ConfigError(ValueError):

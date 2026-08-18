@@ -3905,6 +3905,186 @@ def test_classify_session_failure_provider_auth_cooldown_24h(tmp_path: Path) -> 
     assert parsed == expected
 
 
+# ---------------------------------------------------------------------------
+# Issue #1342: provider-suspended / insufficient-balance classification
+# (terminal, no cooldown) for api workers.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_session_failure_provider_suspended_moonshot(tmp_path: Path) -> None:
+    """Issue #1342: Moonshot's documented account-suspension message classifies
+    as ``provider_suspended`` (terminal) for api sessions, with NO cooldown —
+    not a retryable rate-limit/quota. The observed message is verbatim from
+    the live failure (issue body) and Moonshot's documented error shape
+    (https://www.kimi.com/help/kimi-api/api-error-codes: 429 with
+    ``exceeded_current_quota_error`` for insufficient balance / suspended
+    account)."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        '{"error":{"message":"Your account org-43e0df7dc53d44ceb5c2857745342b25 '
+        "<ak-...> is suspended due to insufficient balance, please recharge "
+        'your account or check your plan and billing details",'
+        '"type":"exceeded_current_quota_error"}}\n',
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    # Terminal: no cooldown — a suspended account needs human intervention
+    # (recharge), not a 15-minute or 24h retry window.
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_quota_type(tmp_path: Path) -> None:
+    """Issue #1342: the structured ``exceeded_current_quota_error`` type alone
+    is a reliable discriminator (the message wording varies for the same type
+    — confirmed by Moonshot's own kimi-code PR #1857), so it classifies as
+    ``provider_suspended`` even with a different message body."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        'Error: {"error":{"type":"exceeded_current_quota_error",'
+        '"message":"Token quota is insufficient"}}\n',
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_insufficient_balance(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: the ``insufficient balance`` billing semantic (without the
+    full Moonshot phrasing) classifies as ``provider_suspended``."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: insufficient balance, please top up your account\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_not_for_claude_code(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: the suspension pattern must NOT fire for claude-code
+    sessions (only api) — a claude-code session hitting Anthropic directly
+    does not route through a paid provider whose billing can suspend."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: Your account is suspended due to insufficient balance\n",
+        encoding="utf-8",
+    )
+
+    # Default adapter_kind="claude-code" — suspension patterns are not checked.
+    failure_kind, throttled_until = _classify_session_failure(log_path)
+
+    assert failure_kind is None
+    assert throttled_until is None
+
+
+def test_classify_session_failure_provider_suspended_takes_precedence_over_auth(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: a suspension message that also contains a 403 (e.g. the
+    provider returns 403 Payment Required semantics) classifies as
+    ``provider_suspended`` (terminal), not ``provider_auth`` (24h cooldown).
+    Suspension is the more specific and more severe condition."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Error: 403 Your account is suspended due to insufficient balance, "
+        "please recharge your account\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
+
+
+def test_classify_session_failure_transient_rate_limit_not_suspended(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342 acceptance criterion 4: a genuine transient 429 rate-limit
+    keeps the existing ``rate_limited`` backoff behavior — it must NOT be
+    misclassified as ``provider_suspended``. Uses the same throttle-marker
+    phrasing the existing ``rate_limited`` classification matches (mirrors
+    ``test_classify_session_failure_throttle_not_misclassified_as_auth``)."""
+    from charlie_work.claude_code import _classify_session_failure
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, adapter_kind="api")
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until is not None
+
+
+def test_update_worker_record_api_provider_suspended_classification(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: update_worker_record_with_failure_classification with
+    adapter_kind='api' reads the api sidecar and classifies a suspension as
+    ``provider_suspended`` with no cooldown."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    sidecar_path = sessions_dir / "issue-42.api.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 42,
+                "log_path": str(sessions_dir / "issue-42.claude.log"),
+                "error": None,
+                "failure_kind": None,
+                "adapter_kind": "api",
+            }
+        ),
+        encoding="utf-8",
+    )
+    log_path = sessions_dir / "issue-42.claude.log"
+    log_path.write_text(
+        "Error: Your account is suspended due to insufficient balance, "
+        "please recharge your account\n",
+        encoding="utf-8",
+    )
+
+    failure_kind, throttled_until = update_worker_record_with_failure_classification(
+        sessions_dir, 42, fallback_kind="stalled", adapter_kind="api"
+    )
+
+    assert failure_kind == "provider_suspended"
+    assert throttled_until is None
+
+    updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert updated_sidecar["failure_kind"] == "provider_suspended"
+
+
 def test_update_worker_record_api_provider_auth_classification(
     tmp_path: Path,
 ) -> None:

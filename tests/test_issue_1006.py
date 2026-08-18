@@ -39,6 +39,15 @@ def test_none_not_in_deterministic_escalation_failure_kinds() -> None:
     assert None not in DETERMINISTIC_ESCALATION_FAILURE_KINDS
 
 
+def test_provider_suspended_in_deterministic_escalation_failure_kinds() -> None:
+    """Issue #1342: ``provider_suspended`` must be a member of
+    ``DETERMINISTIC_ESCALATION_FAILURE_KINDS`` so the dead-session lane
+    escalates on the FIRST occurrence instead of burning the auto-redispatch
+    cap on a permanently-failing endpoint. A regression that drops it from the
+    set reopens the ~35-minute backoff loop the issue was filed to close."""
+    assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+
 @pytest.mark.parametrize(
     ("repo_root_value", "is_valid_path"),
     [

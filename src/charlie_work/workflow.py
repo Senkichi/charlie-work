@@ -1282,7 +1282,10 @@ def _detect_and_handle_stalled_sessions(
     Returns a list of {issue, pid} dicts for stalled sessions (for exclusion from
     dispatch in the same pass).
     """
-    from .claude_code import update_worker_record_with_failure_classification
+    from .claude_code import (
+        detect_provider_suspended,
+        update_worker_record_with_failure_classification,
+    )
     from .devin_shell import (
         get_rate_limit_defer_until,
         update_session_record_with_failure_classification,
@@ -1301,6 +1304,7 @@ def _detect_and_handle_stalled_sessions(
         return []
 
     stalled_entries: list[dict[str, int]] = []
+    suspended_entries: list[dict[str, Any]] = []
     if now is None:
         now = datetime.now(UTC)
 
@@ -1352,6 +1356,79 @@ def _detect_and_handle_stalled_sessions(
         # phantom-sidecar window.
         new_count = _next_inconclusive_probe_deferred_count(w, probe, health)
         update_worker_log_stat(sessions_dir, w, inconclusive_probe_deferred_count=new_count)
+
+        # Issue #1342: in-flight api provider-suspension kill. Independent of
+        # the STALLED/DEAD classification below — an api worker whose log
+        # shows an account-suspension / insufficient-balance signature is
+        # killed immediately and sidecar-marked ``provider_suspended``. A
+        # suspended/depleted account is a TERMINAL billing failure: the CLI's
+        # internal retry backoff cannot fix it (the account needs a recharge,
+        # not a retry window), so leaving the session alive burns the issue's
+        # auto-redispatch cap (~35 minutes) on a permanently-failing endpoint
+        # before the operator ever hears about the billing problem. Killing
+        # the process here ends the session within one request cycle and lets
+        # the dead-session lane escalate on the first occurrence (via
+        # ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``) instead of relabel/retry.
+        # Non-api workers are never suspension-evaluated. The kill uses the
+        # shared ``kill_process_tree`` helper (no-console-window discipline on
+        # Windows, full process tree reaped) — not reimplemented here.
+        if w.adapter_kind == "api" and detect_provider_suspended(Path(w.log_path)):
+            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            orphan_pids_suspended: list[int] = []
+            orphan_processes = sweep_orphan_processes(w.worktree_path)
+            if orphan_processes:
+                for orphan in orphan_processes:
+                    kill_orphan_pid(orphan["pid"])
+                    killed_pids.append(orphan["pid"])
+                orphan_pids_suspended = [o["pid"] for o in orphan_processes]
+
+            # Set failure_kind="provider_suspended" on the sidecar via the
+            # shared atomic-write helper. Written directly (not through
+            # update_worker_record_with_failure_classification) so the
+            # suspension verdict is not overridden by a coincidental
+            # throttle/auth log-tail match. The dead-session lane's
+            # classification call then short-circuits on the already-set
+            # failure_kind.
+            from .claude_code import _sidecar_path as _api_sidecar_path
+            from .claude_code import _write_json_atomic as _api_write_json_atomic
+
+            api_sidecar = _api_sidecar_path(sessions_dir, w.issue_number, "api")
+            try:
+                with api_sidecar.open("r", encoding="utf-8") as handle:
+                    api_payload = json.load(handle)
+                if isinstance(api_payload, dict):
+                    api_payload["failure_kind"] = "provider_suspended"
+                    _api_write_json_atomic(api_sidecar, api_payload)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+            with state_lock(state_file):
+                state = load_state(state_file)
+                state = append_event(
+                    state,
+                    "api_worker_provider_suspended",
+                    {
+                        "issue_number": w.issue_number,
+                        "pid": w.pid,
+                        "process_start_time": w.process_start_time,
+                        "killed_pids": killed_pids,
+                        "orphan_pids": orphan_pids_suspended if orphan_pids_suspended else None,
+                        "provider": w.provider,
+                    },
+                    state_path=state_file,
+                )
+                save_state(state_file, state)
+
+            suspended_entries.append(
+                {
+                    "issue": w.issue_number,
+                    "pid": w.pid,
+                    "reason": "provider_suspended",
+                    "provider": w.provider,
+                    "killed_pids": killed_pids,
+                }
+            )
+            continue
 
         # Issue #484: in-flight api per-session budget kill. Independent of the
         # STALLED/DEAD classification below — an api worker over its
@@ -1605,6 +1682,11 @@ def _detect_and_handle_stalled_sessions(
 
             stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
 
+    # Issue #1342: provider-suspended kills are reported alongside stalled
+    # sessions so the caller excludes them from dispatch in the same pass.
+    # The suspended entries carry the same {issue, pid} shape (plus extra
+    # diagnostic fields) the caller's exclusion loop keys on.
+    stalled_entries.extend(suspended_entries)
     return stalled_entries
 
 
@@ -3411,6 +3493,13 @@ def _reap_restore_rework_requested(
                 reason = "worker_death_loop"
             else:
                 reason = "redispatch_cap_exceeded"
+            # Issue #1342: a provider-suspended failure is an external billing
+            # outage, not a redispatch attempt. Skip the redispatch_at
+            # increment so the issue's dispatch history is not polluted.
+            if failure_kind == "provider_suspended":
+                redispatch_at = _windowed_redispatch_at(
+                    entry, window_minutes=config.watchdog.redispatch_window_minutes
+                )
             # Preserve worker_pid/worker_process_start_time (issue #282): the
             # recovery probe still needs the fingerprint even after escalation.
             issue_extra: dict[str, Any] = {
@@ -4124,6 +4213,13 @@ def _route_dead_worker_to_pre_review_rework(
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+            # Issue #1342: a provider-suspended failure is an external billing
+            # outage, not a redispatch attempt. Skip the redispatch_at
+            # increment so the issue's dispatch history is not polluted.
+            if failure_kind == "provider_suspended":
+                redispatch_at = _windowed_redispatch_at(
+                    entry, window_minutes=config.watchdog.redispatch_window_minutes
+                )
             # Issue #783: merge conflict / rework-branch conflict / stale-CI
             # redispatch cap are all process failures, not judgment calls.
             state = _escalate_issue(
@@ -4409,6 +4505,15 @@ def _classify_dead_sessions_and_update_throttle_state(
                         redispatch_at = _windowed_redispatch_at(
                             entry, window_minutes=config.watchdog.redispatch_window_minutes
                         ) + [now.isoformat().replace("+00:00", "Z")]
+                        # Issue #1342: a provider-suspended failure is an
+                        # external billing outage, not a redispatch attempt.
+                        # Skip the redispatch_at increment so the issue's
+                        # dispatch history is not polluted.
+                        if failure_kind == "provider_suspended":
+                            redispatch_at = _windowed_redispatch_at(
+                                entry,
+                                window_minutes=config.watchdog.redispatch_window_minutes,
+                            )
                         # Issue #783: a deterministic launch failure kind is a
                         # process failure, not a judgment call -- mechanical.
                         state = _escalate_issue(
@@ -4703,6 +4808,19 @@ def _classify_dead_sessions_and_update_throttle_state(
                             if terminal_failure and failure_kind is not None
                             else "redispatch_cap_exceeded"
                         )
+                        # Issue #1342: a provider-suspended failure is an
+                        # external billing outage, not a redispatch attempt
+                        # that could have fixed the issue. Skip the
+                        # redispatch_at increment so the issue's own dispatch
+                        # history is not polluted by the provider outage —
+                        # if the operator later de-escalates (after
+                        # recharging), the issue is not left worse off in
+                        # dispatch bookkeeping than it was before.
+                        if failure_kind == "provider_suspended":
+                            redispatch_at = _windowed_redispatch_at(
+                                entry,
+                                window_minutes=config.watchdog.redispatch_window_minutes,
+                            )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
                         state = _escalate_issue(
@@ -7632,7 +7750,19 @@ class OrchestratorApp:
                         failed_result is not None
                         and failed_result.failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
                     )
-                    entry["dispatch_failed_at"] = all_attempts
+                    # Issue #1342: a provider-suspended failure is an external
+                    # billing outage, not a dispatch attempt. Skip the
+                    # dispatch_failed_at increment so the issue's dispatch
+                    # history is not polluted by the provider outage.
+                    if (
+                        failed_result is not None
+                        and failed_result.failure_kind == "provider_suspended"
+                    ):
+                        entry["dispatch_failed_at"] = [
+                            t for t in all_attempts if t != now.isoformat()
+                        ]
+                    else:
+                        entry["dispatch_failed_at"] = all_attempts
                     if terminal_failure or len(recent) > self.config.watchdog.max_auto_redispatch:
                         status = "escalated"
                         dispatched_at = None
@@ -20812,6 +20942,15 @@ class OrchestratorApp:
                     ):
                         # Escalate to human review
                         reason = failure_kind if terminal_failure else "redispatch_cap_exceeded"
+                        # Issue #1342: a provider-suspended failure is an
+                        # external billing outage, not a redispatch attempt.
+                        # Skip the redispatch_at increment so the issue's
+                        # dispatch history is not polluted.
+                        if failure_kind == "provider_suspended":
+                            redispatch_at = _windowed_redispatch_at(
+                                entry,
+                                window_minutes=self.config.watchdog.redispatch_window_minutes,
+                            )
                         # Issue #783: dead worker session / redispatch cap is a
                         # process failure, not a judgment call -- mechanical.
                         state = _escalate_issue(

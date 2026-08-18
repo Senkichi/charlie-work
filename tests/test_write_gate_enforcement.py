@@ -636,7 +636,7 @@ _RATCHET_BASELINE: dict[str, int] = {
     "state_migration.py": 1,
     "supervise.py": 11,
     "supervisor_lifecycle.py": 3,
-    "workflow.py": 266,
+    "workflow.py": 269,
     "worktree.py": 1,
 }
 

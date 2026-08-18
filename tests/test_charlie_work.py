@@ -43344,6 +43344,149 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
     assert budget_events[0]["payload"]["provider"] == "example"
 
 
+def test_stall_lane_api_provider_suspended_kill(tmp_path: Path) -> None:
+    """Issue #1342: the provider-suspended kill block in
+    ``_detect_and_handle_stalled_sessions`` (workflow.py) fires for an api
+    worker whose log contains an account-suspension / insufficient-balance
+    signature: the process tree is killed immediately (no multi-minute
+    backoff loop), ``failure_kind="provider_suspended"`` is written directly
+    to the api sidecar, and an ``api_worker_provider_suspended`` event is
+    emitted on first detection. A wiring regression that drops this block
+    leaves the session stuck in the CLI's internal retry backoff and the
+    operator hears about the billing problem only after the redispatch cap
+    drains."""
+    from _api_budget_fixtures import api_worker_config, write_api_sidecar
+
+    # No budget cap (dormant) so the budget-kill block does not fire; the
+    # suspension block fires regardless of health, like the budget block.
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_api_sidecar(sessions_dir, 4806, provider="example", pid=99995)
+
+    # Write the Moonshot suspension message into the log. The log mtime is
+    # fresh — the suspension block must fire regardless of stall status (the
+    # CLI is actively retrying with backoff, so the log is growing).
+    log_path = sessions_dir / "issue-4806.claude.log"
+    log_path.write_text(
+        '{"error":{"message":"Your account org-... is suspended due to '
+        "insufficient balance, please recharge your account or check your "
+        'plan and billing details","type":"exceeded_current_quota_error"}}\n',
+        encoding="utf-8",
+    )
+
+    killed_pids: list[int] = []
+    with (
+        patch("charlie_work.worker.is_worker_alive", return_value=True),
+        patch(
+            "charlie_work.workflow.kill_process_tree",
+            side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
+        ),
+        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+    ):
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    # The suspended session is reported in the stalled entries (excluded from
+    # dispatch this pass).
+    assert any(entry["issue"] == 4806 for entry in result)
+    # kill_process_tree was invoked on the api worker's pid — the session is
+    # ended immediately, not left in the CLI's retry backoff loop.
+    assert 99995 in killed_pids
+
+    # The api sidecar is marked provider_suspended directly (not via the
+    # log-tail classification helper, so a coincidental throttle/auth match
+    # cannot override the verdict).
+    from charlie_work.claude_code import _sidecar_path as _api_sidecar_path
+
+    sidecar = json.loads(_api_sidecar_path(sessions_dir, 4806, "api").read_text(encoding="utf-8"))
+    assert sidecar["failure_kind"] == "provider_suspended"
+
+    # An api_worker_provider_suspended event was emitted with the issue +
+    # provider (the first operator-visible signal for the billing problem).
+    state = load_state(paths.state_file)
+    suspended_events = [
+        e for e in state.get("events", []) if e.get("kind") == "api_worker_provider_suspended"
+    ]
+    assert len(suspended_events) == 1
+    assert suspended_events[0]["payload"]["issue_number"] == 4806
+    assert suspended_events[0]["payload"]["provider"] == "example"
+
+
+def test_stall_lane_api_provider_suspended_not_for_transient_rate_limit(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342 acceptance criterion 4: a genuine transient 429 rate-limit
+    in an api worker's log does NOT trigger the provider-suspended kill — the
+    session keeps the existing rate-limit defer/backoff behavior. Only
+    account-suspension / insufficient-balance signatures are terminal."""
+    from _api_budget_fixtures import api_worker_config, write_api_sidecar
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_api_sidecar(sessions_dir, 4807, provider="example", pid=99994)
+
+    # A genuine transient rate-limit message (matches the throttle markers,
+    # NOT the suspension pattern).
+    log_path = sessions_dir / "issue-4807.claude.log"
+    log_path.write_text(
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+    # Stale the log mtime so the worker is STALLED — the suspension block must
+    # NOT fire (the message is a transient rate-limit, not a suspension).
+    old_time = datetime.now(UTC) - timedelta(minutes=25)
+    import os
+
+    os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
+
+    killed_pids: list[int] = []
+    with (
+        patch("charlie_work.worker.is_worker_alive", return_value=True),
+        patch(
+            "charlie_work.workflow.kill_process_tree",
+            side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
+        ),
+        patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
+    ):
+        from charlie_work.workflow import _detect_and_handle_stalled_sessions
+
+        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+
+    # No api_worker_provider_suspended event was emitted.
+    state = load_state(paths.state_file)
+    suspended_events = [
+        e for e in state.get("events", []) if e.get("kind") == "api_worker_provider_suspended"
+    ]
+    assert len(suspended_events) == 0
+
+    # The sidecar was NOT marked provider_suspended (the worker was killed as
+    # stalled and classified rate_limited via the normal log-tail path).
+    from charlie_work.claude_code import _sidecar_path as _api_sidecar_path
+
+    sidecar = json.loads(_api_sidecar_path(sessions_dir, 4807, "api").read_text(encoding="utf-8"))
+    assert sidecar.get("failure_kind") != "provider_suspended"
+
+
 def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
     """Issue #484 review finding: the ``elif w.adapter_kind == "api"`` branch in
     ``_detect_and_handle_stalled_sessions`` (workflow.py stall lane) classifies
@@ -43460,6 +43603,83 @@ def test_classify_dead_sessions_api_provider_auth_classification(
     assert throttled_until is not None
     throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
     assert before + timedelta(hours=23) <= throttle_time <= before + timedelta(hours=25)
+
+
+def test_classify_dead_sessions_api_provider_suspended_escalates(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342: the dead-session lane classifies a dead api worker whose
+    log tail contains an account-suspension signature as
+    ``provider_suspended`` (terminal, no cooldown) and escalates on the FIRST
+    occurrence — not relabel/retry. The sidecar is reaped by this lane, so
+    the classification is asserted via the returned reaped-entry. No
+    ``throttled_until`` is persisted (terminal, not a cooldown condition)."""
+    from _api_budget_fixtures import api_worker_config, write_api_sidecar
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    config = OrchestratorConfig(
+        api_worker=api_worker_config(),
+        post_mortem=PostMortemConfig(enabled=False),
+    )
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    write_api_sidecar(sessions_dir, 4808, provider="example", pid=99993)
+
+    # Account-suspension log tail — the dead-session lane classifies it as
+    # provider_suspended (terminal).
+    log_path = sessions_dir / "issue-4808.claude.log"
+    log_path.write_text(
+        "Error: Your account is suspended due to insufficient balance, "
+        "please recharge your account\n",
+        encoding="utf-8",
+    )
+
+    gh = FakeGitHub()
+    gh.issues = [
+        {
+            "number": 4808,
+            "title": "Test issue",
+            "url": "https://example.test/issues/4808",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.prs = []
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=False):
+        reaped = _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+        )
+
+    # The reaped entry carries the resolved failure_kind (provider_suspended,
+    # not the fallback "stalled"/"unpublished_work").
+    api_reaped = [r for r in reaped if r["issue_number"] == 4808]
+    assert len(api_reaped) == 1
+    assert api_reaped[0]["failure_kind"] == "provider_suspended"
+    assert api_reaped[0]["adapter_kind"] == "api"
+
+    # No cooldown persisted to state.json — provider_suspended is terminal.
+    state = load_state(state_file)
+    assert state.get("throttled_until") is None
+
+    # Issue #1342 acceptance criterion 3: the issue's dispatch history is not
+    # polluted by the provider outage — redispatch_at is empty (no increment
+    # for a provider-suspended failure, since it is an external billing
+    # outage, not a redispatch attempt that could have fixed the issue).
+    issue_entry = state.get("issues", {}).get("4808", {})
+    assert issue_entry.get("redispatch_at", []) == []
+
+    # The issue was escalated to operator-queue on the first occurrence
+    # (provider_suspended is in DETERMINISTIC_ESCALATION_FAILURE_KINDS).
+    assert (4808, config.labels.operator_queue) in gh.labels_added
+
+    # A session_failed_escalated event was emitted with the provider_suspended
+    # failure_kind.
+    escalated_events = [
+        e for e in state.get("events", []) if e.get("kind") == "session_failed_escalated"
+    ]
+    assert len(escalated_events) == 1
+    assert escalated_events[0]["payload"]["failure_kind"] == "provider_suspended"
 
 
 def test_classify_dead_sessions_launch_failed_api_provider_auth(

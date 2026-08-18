@@ -149,6 +149,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # -----------------------------------------------------------------
         # error-level kinds: conditions that ended a lane or lost work
         # -----------------------------------------------------------------
+        # Issue #1342: a provider account is suspended / out of balance — a
+        # deterministic billing failure that ended the api worker's session.
+        # Error, not warning: this is the FIRST operator-visible signal for a
+        # billing problem (emitted on detection, before the redispatch cap
+        # drains), so it must surface in the error-level stream a heartbeat
+        # check consumes, not vanish into pass-by-pass warning noise.
+        "api_worker_provider_suspended": "error",
         "cross_family_verdict_abandoned": "error",
         # The head-SHA guard could not adjudicate, so no verdict is recorded on
         # this pass. Since #1081 an unusable report is regenerated (bounded per
