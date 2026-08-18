@@ -203,6 +203,7 @@ from .process_utils import (
 )
 from .worker import WorkerHealth, WorkerView, iter_workers
 from .routing import AdapterChoice, record_adapter_choice, select_adapter
+from .write_gate import WriteGate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -5322,6 +5323,9 @@ class OrchestratorApp:
         self._layout = resolved_layout(config, repo_root)
         self.gh = gh
         self.dry_run = dry_run
+        self.write_gate = WriteGate(
+            dry_run=self.dry_run, state_path=self.paths.state_file, repo=self.repo_root.name
+        )
         self.fleet_dir_override = fleet_dir_override
         # Issue #1001: same-instance once-only escalation flag for the
         # worker-github-token gate. A missing token is a standing condition;
