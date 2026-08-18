@@ -33147,6 +33147,62 @@ def test_dispatch_rework_routes_to_review_instead_of_relaunch_when_head_moved(
     assert any(e["kind"] == "rework_already_pushed" for e in state["events"])
 
 
+def test_dispatch_rework_launches_for_conflicted_pr_with_unknown_mergeable_pr_view(
+    tmp_path: Path,
+) -> None:
+    """Issue #1349 pr_view fallback: pr_list's ``mergeable`` can be UNKNOWN
+    (GitHub computes it asynchronously). When pr_list is indeterminate, the
+    #339 filter must re-check with a fresh pr_view before routing to review,
+    so a persistently-conflicting PR whose conflict only shows on pr_view is
+    still dispatched rather than deadlocked.
+    """
+
+    class PrViewConflictingGitHub(FakeGitHub):
+        def pr_view(self, number: int):
+            pr_copy = dict(super().pr_view(number))
+            # pr_list reports UNKNOWN; the authoritative pr_view reveals
+            # the conflict.
+            pr_copy["mergeable"] = "CONFLICTING"
+            pr_copy["mergeStateStatus"] = "DIRTY"
+            return pr_copy
+
+    config = _dispatch_rework_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = PrViewConflictingGitHub()
+    # pr_list's mergeable is UNKNOWN (not a definite CONFLICTING/MERGEABLE)
+    # and mergeStateStatus is CLEAN, so the pr_view fallback path is taken.
+    fake_gh.prs[0]["mergeable"] = "UNKNOWN"
+    fake_gh.prs[0]["mergeStateStatus"] = "CLEAN"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+first"
+    )
+    app.record_review(
+        456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
+    )
+
+    fake_gh.prs[0]["headRefOid"] = "sha-new-head"
+    fake_gh.pr_head_shas[456] = "sha-new-head"
+    fake_gh.diffs[456] = (
+        "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
+    )
+
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert result.data["selected_count"] == 1
+    assert result.data["routed_to_review"] == []
+    assert result.data["sessions"][0]["issue_number"] == 123
+    state = load_state(paths.state_file)
+    assert not any(e["kind"] == "rework_already_pushed" for e in state["events"])
+
+
 def test_dispatch_rework_launches_when_head_matches_reviewed_sha(tmp_path: Path) -> None:
     """Regression pin (issue #339 acceptance criterion 2): dispatch_rework
     must still launch exactly as before when the PR head is unchanged since
@@ -33284,20 +33340,25 @@ def test_dispatch_rework_launches_when_head_moved_by_sync_merge_only(tmp_path: P
     assert (123, "agent:in-progress") in fake_gh.labels_added
 
 
-def test_dispatch_rework_head_moved_but_review_blocked_by_janitor_retries_next_pass(
+def test_dispatch_rework_dispatches_conflicted_pr_with_advanced_head_no_deadlock(
     tmp_path: Path,
 ) -> None:
-    """Issue #339 finding 1 (reviewer repro): a candidate whose PR head moved
-    with a real content change gets routed to review() — but if the PR is
-    CONFLICTING, review()'s deterministic janitor gate returns ok=False
-    *before* writing a packet or firing the review_started transition, and
-    without touching reviewed_head_sha. The routing helper must not
-    force-flip the issue's status to "reviewing" in that case: doing so would
-    desync state.json from GitHub reality (labels still say needs-rework, no
-    packet exists) and strand the issue outside dispatch_rework's own
-    candidate pool forever, with no automated recovery path. The issue must
-    stay rework_requested so the next pass retries (the janitor block is
-    often transient, e.g. a merge-train branch sync resolving the conflict).
+    """Issue #1349: a candidate whose PR head moved with a real content
+    change (live_patch_id != reviewed_patch_id) AND whose PR is
+    CONFLICTING/DIRTY must receive a rework worker, not be routed to
+    review(). Previously the #339 "already pushed" filter routed such a PR
+    to review(), whose janitor gate bounced it back to rework_requested
+    without writing a packet or touching reviewed_head_sha -- deadlocking
+    the issue between dispatch_rework and review() forever (the only exit
+    being the #765 stall escalation to a human, not a dispatch). The
+    "already pushed" inference is unsound in exactly this state: whatever
+    was pushed since the last verdict did NOT resolve the conflict the
+    rework was requested for, so the rework is still outstanding.
+
+    The desync guard the original #339 finding 1 test exercised (don't
+    force-flip status to "reviewing" when review() blocks without a packet)
+    remains covered for the non-conflict case by
+    test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass.
     """
     config = _dispatch_rework_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -33313,10 +33374,12 @@ def test_dispatch_rework_head_moved_but_review_blocked_by_janitor_retries_next_p
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
     )
 
-    # Head advances with a real content change (routes to review) AND the PR
-    # is now conflicting (janitor blocks review() before any packet/label write).
+    # Head advances with a real content change (the #339 "already pushed"
+    # condition) AND the PR is now conflicting: the advance did not resolve
+    # the conflict, so the rework is still outstanding.
     fake_gh.prs[0]["headRefOid"] = "sha-new-head"
     fake_gh.prs[0]["mergeable"] = "CONFLICTING"
+    fake_gh.prs[0]["mergeStateStatus"] = "DIRTY"
     fake_gh.pr_head_shas[456] = "sha-new-head"
     fake_gh.diffs[456] = (
         "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+second"
@@ -33331,25 +33394,19 @@ def test_dispatch_rework_head_moved_but_review_blocked_by_janitor_retries_next_p
     result = app.dispatch_rework()
 
     assert result.ok is True
-    assert result.data["selected_count"] == 0
-    # Not reported as successfully routed — review() never produced a packet.
+    # A rework worker is dispatched -- the conflicted PR is kept as a
+    # legitimate launch candidate, not routed to the review lane.
+    assert result.data["selected_count"] == 1
     assert result.data["routed_to_review"] == []
-    assert result.data["review_blocked_retry"] == [123]
+    assert result.data["review_blocked_retry"] == []
+    assert result.data["sessions"][0]["issue_number"] == 123
+    assert (123, "agent:in-progress") in fake_gh.labels_added
 
-    # No label churn at all: neither a launch nor a review_started transition.
-    assert (123, "agent:in-progress") not in fake_gh.labels_added
-    assert (123, "agent:reviewing") not in fake_gh.labels_added
-    assert (123, "agent:needs-rework") not in fake_gh.labels_removed
-
-    # Not stranded: still rework_requested so the next pass retries.
+    # The rework_already_pushed -> janitor-blocked -> rework_already_pushed
+    # cycle cannot recur: no rework_already_pushed event fires because the
+    # issue was never misrouted to review().
     state = load_state(paths.state_file)
-    assert state["issues"]["123"]["status"] == "rework_requested"
-    # PR record shows the janitor block, not a flipped "reviewing" state.
-    assert state["prs"]["456"]["status"] == "janitor_blocked"
-    assert any(
-        e["kind"] == "rework_already_pushed" and e["payload"].get("routed") is False
-        for e in state["events"]
-    )
+    assert not any(e["kind"] == "rework_already_pushed" for e in state["events"])
 
 
 def test_dispatch_rework_skips_when_live_head_ref_oid_missing(tmp_path: Path) -> None:
