@@ -9420,12 +9420,15 @@ class OrchestratorApp:
                 },
             )
 
-        # Single read of review-decision.json, BEFORE rendering: reused both to
-        # build the round-2 $prior_review_section below and, after rendering,
-        # by the stale-verdict reset a few lines down. Previously that reset
-        # was the only reader, and it ran after the prompt was already
-        # rendered — so a prior round's verdict/summary/required_changes were
-        # on disk at render time but never surfaced to the reviewer.
+        # Single read of review-decision.json, BEFORE rendering: used to build
+        # the round-2 $prior_review_section below. The stale-verdict reset a
+        # few lines down re-reads the file inside the state lock (issue #1340:
+        # the outside-lock read here may be stale w.r.t. a concurrent
+        # record_review, and the reset write must be atomic with the state
+        # write). Previously that reset was the only reader, and it ran after
+        # the prompt was already rendered — so a prior round's
+        # verdict/summary/required_changes were on disk at render time but
+        # never surfaced to the reviewer.
         existing_decision = self._review_decision(pr_number)
         prior_reviewed_head_sha = existing_decision.get("reviewed_head_sha")
         # Issue #632 defect 3: a terminal verdict on disk must reach the
@@ -9482,20 +9485,6 @@ class OrchestratorApp:
             # entirely looks identical to one that never considered it).
             "verdict_provenance": None,
         }
-        if not decision_path.exists():
-            self._write_json(decision_path, decision_template)
-        else:
-            # A verdict is pinned to a specific head. If the PR has moved on,
-            # the old verdict is void and must not survive into the new packet.
-            # This applies to all terminal decisions (approved, request_changes,
-            # blocked), not just approvals: a request_changes on an old head is
-            # equally stale when the head has advanced, and carrying forward its
-            # summary/required_changes misleads the reviewer into re-issuing the
-            # same verdict without examining the new diff.
-            if existing_decision.get("decision") not in ("pending", None) and (
-                prior_reviewed_head_sha is None or prior_reviewed_head_sha != pr.get("headRefOid")
-            ):
-                self._write_json(decision_path, decision_template)
         # Issue #868: review_dispatch.enabled gates whether landing this PR in
         # "reviewing" is safe. Disabled means dispatch_reviews()'s launch+reap
         # machinery never services this state (its own internal gate skips
@@ -9506,6 +9495,45 @@ class OrchestratorApp:
         dispatch_disabled = not self.config.review_dispatch.enabled
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            # Issue #1340: the pending-reset decision-file write is inside the
+            # state lock, and when a stale-head terminal verdict is voided the
+            # state.json ``decision`` field is cleared in the same locked
+            # section, so the file and state can never diverge (file "pending"
+            # while state carries the stale decision).
+            # The ``existing_decision`` read at line ~9429 was outside any lock
+            # and may be stale w.r.t. a concurrent record_review; re-read the
+            # on-disk decision here, inside the lock. The #1036 compare-and-swap
+            # above already proved the PR head is stable, so the only concurrent
+            # writer of this file is record_review, which holds this same lock.
+            live_decision = self._review_decision(pr_number)
+            live_decision_value = live_decision.get("decision")
+            live_reviewed_head_sha = live_decision.get("reviewed_head_sha")
+            # A verdict is pinned to a specific head. If the PR has moved on,
+            # the old verdict is void and must not survive into the new packet.
+            # This applies to all terminal decisions (approved, request_changes,
+            # blocked), not just approvals: a request_changes on an old head is
+            # equally stale when the head has advanced, and carrying forward its
+            # summary/required_changes misleads the reviewer into re-issuing the
+            # same verdict without examining the new diff.
+            #
+            # Only a real terminal decision (approved/request_changes/blocked)
+            # on disk can be voided. ``_review_decision`` returns
+            # ``{"decision": "missing"}`` when the file does not exist and
+            # ``{"decision": "invalid"}`` on a corrupt read; neither is a
+            # terminal verdict, so neither triggers the void path -- the
+            # fresh-template write below handles the missing-file case, and
+            # an invalid file is left for a human rather than silently
+            # overwritten (mirroring the original code's ``else`` branch,
+            # which only reset on a real terminal decision).
+            voided_stale_verdict = live_decision_value in (
+                "approved",
+                "request_changes",
+                "blocked",
+            ) and (
+                live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            if not decision_path.exists() or voided_stale_verdict:
+                self._write_json(decision_path, decision_template)
             # Merge-update, never replace: wholesale assignment here used to erase
             # recorded review decisions on repeated review()/loop() passes
             # (production-confirmed, pr-497).
@@ -9516,6 +9544,18 @@ class OrchestratorApp:
                 "issue_number": issue_number,
                 "prompt_path": str(prompt_path),
                 "decision_path": str(decision_path),
+                # Issue #1340: when the decision file was just voided back to
+                # "pending" (stale head), mirror that into state.json so the two
+                # stores agree on the decision. Without this, state.json
+                # retained the stale ``decision`` while the file said
+                # "pending" -- a file-trusting consumer (the packet-current skip
+                # in loop()) saw "pending" while state-trusting paths acted on
+                # the stale verdict. ``reviewed_head_sha`` is intentionally
+                # NOT cleared: ``_route_rework_candidate_to_review`` uses it
+                # to detect whether ``review()`` recorded a new decision vs.
+                # just wrote a fresh pending packet, and clearing it would
+                # break that detection (issue #339).
+                **({"decision": "pending"} if voided_stale_verdict else {}),
                 **({} if dispatch_disabled else {"status": "reviewing"}),
                 "janitor_ok": True,
                 "janitor_failures": [],
@@ -10157,6 +10197,12 @@ class OrchestratorApp:
                 required_changes=verdict["required_changes"],
                 session_metrics=session_metrics,
                 verdict_provenance="fresh_llm_review",
+                # Issue #1340: thread the parser-level provenance into the
+                # decision file so a later reader can distinguish a
+                # log-extracted verdict (dead reviewer) from a clean
+                # structured completion. ``verdict_source`` is the same value
+                # already threaded into ``session_metrics`` above.
+                verdict_source=verdict_source,
             )
             if result.ok:
                 recorded.append(
@@ -11928,6 +11974,7 @@ class OrchestratorApp:
         *,
         verdict_provenance: str,
         allow_stale_head: bool = False,
+        verdict_source: str | None = None,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -12270,6 +12317,18 @@ class OrchestratorApp:
         # ``since`` to recover -- it falls back to ``reviewed_at``).
         if ingestion_before is not None:
             decision_payload["before"] = ingestion_before
+        # Issue #1340: persist the parser-level provenance (which extractor
+        # found the verdict block: "log", "events", "file:<source>") into the
+        # decision file so a later reader can distinguish a log-extracted
+        # verdict (the reviewer process died before emitting a structured
+        # result) from a clean structured completion. Distinct from
+        # ``verdict_provenance`` (the mechanism that produced the verdict --
+        # "fresh_llm_review", "ci_gate_auto_reject", ...). Only present when a
+        # caller supplied it; the reap path threads ``session_metrics``'s
+        # ``verdict_source`` here, while direct operator/CI-gate callers leave
+        # it absent (no parser was involved).
+        if verdict_source is not None:
+            decision_payload["verdict_source"] = verdict_source
         decision_path = pr_dir / "review-decision.json"
         # Issue #1268 (W11): per-round archive directory. ``round_number`` is
         # declared here (rather than inside the lock below) so it survives
