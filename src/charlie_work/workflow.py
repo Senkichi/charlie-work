@@ -10934,7 +10934,7 @@ class OrchestratorApp:
                             .replace("+00:00", "Z"),
                         },
                     }
-                    save_state(self.paths.state_file, state)
+                    self.write_gate.save_state(state)
 
         # System-wide reviewer quota gate. If the quota is exhausted and we are
         # not yet due to probe again, defer without touching any PR state.
@@ -10955,7 +10955,7 @@ class OrchestratorApp:
                     # sinks may do network I/O.
                     quota = state.get("reviewer_quota") or {}
                     if not quota.get("alerted_at") and self.config.notify.enabled:
-                        save_state(self.paths.state_file, mark_reviewer_quota_alerted(state))
+                        self.write_gate.save_state(mark_reviewer_quota_alerted(state))
                         quota_alert = dict(quota)
                     probe_mode = False
                 else:
@@ -11131,7 +11131,7 @@ class OrchestratorApp:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 for pr_number in skipped_empty_diff:
-                    state = self._record_event(
+                    state = self.write_gate.record_event(
                         state,
                         "review_dispatch_skipped_empty_diff",
                         {
@@ -11140,7 +11140,7 @@ class OrchestratorApp:
                         },
                         level="warning",
                     )
-                save_state(self.paths.state_file, state)
+                self.write_gate.save_state(state)
 
         # Escalate PRs whose dispatch attempt count has reached the cap.
         # These PRs are stuck (every reviewer died without a verdict) and
@@ -11196,7 +11196,7 @@ class OrchestratorApp:
                             "reviewer_process_start_time": None,
                         },
                     )
-                    state = append_event(
+                    state = self.write_gate.append_event(
                         state,
                         "review_dispatch_escalated",
                         {
@@ -11205,12 +11205,11 @@ class OrchestratorApp:
                             "attempt_count": attempt_count,
                             "reason": "max_review_dispatch_attempts_exceeded",
                         },
-                        state_path=self.paths.state_file,
                     )
                     changed = True
                     escalated_for_labels.append((int(c["pr"]), issue_num))
             if changed:
-                save_state(self.paths.state_file, state)
+                self.write_gate.save_state(state)
 
         # Apply the human-needed label edge for each fresh escalation, outside
         # the state lock (transition() makes GitHub API calls). This was the
@@ -11234,7 +11233,9 @@ class OrchestratorApp:
             for _pr_num, issue_num in escalated_for_labels:
                 if issue_num is None:
                     continue
-                result = transition(self.gh, self.config.labels, int(issue_num), escalated_edge)
+                result = self.write_gate.transition(
+                    self.gh, self.config.labels, int(issue_num), escalated_edge
+                )
                 if result.outcome != TransitionOutcome.APPLIED:
                     escalated_label_outcomes.append(
                         (
@@ -11259,7 +11260,7 @@ class OrchestratorApp:
                             "number": issue_num,
                             "label_error": label_error,
                         }
-                    save_state(self.paths.state_file, state)
+                    self.write_gate.save_state(state)
 
         # Issue #1497: route merge-conflicting candidates to rework outside the
         # state lock. ``_route_janitor_gate_failure_to_rework`` acquires its own
@@ -11360,7 +11361,7 @@ class OrchestratorApp:
                     }
                 )
             if selected:
-                state = append_event(
+                state = self.write_gate.append_event(
                     state,
                     "review_dispatch_claim",
                     {
@@ -11368,9 +11369,8 @@ class OrchestratorApp:
                         "count": len(selected),
                         "review_effort_assignments": review_effort_assignments,
                     },
-                    state_path=self.paths.state_file,
                 )
-            save_state(self.paths.state_file, state)
+            self.write_gate.save_state(state)
 
         # Launch reviewers concurrently: each launch is non-blocking (subprocess.Popen),
         # so this loop quickly spawns all selected processes. Worktree creation

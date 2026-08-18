@@ -620,7 +620,14 @@ def _is_event_call(func: ast.expr) -> bool:
     if isinstance(func, ast.Name):
         return func.id in ("append_event", "_record_event")
     if isinstance(func, ast.Attribute):
-        return func.attr == "_record_event"
+        # Issue #1264/#1329 (W6 PR4): WriteGate-routed sites call
+        # self.write_gate.append_event(...)/self.write_gate.record_event(...)
+        # instead of the bare functions above -- same event-kind vocabulary,
+        # different call shape. Without this, a migrated escalation-kind
+        # emit site becomes invisible to this scanner, and the mapping
+        # completeness check silently stops covering it (exactly the
+        # fail-closed-forever failure mode this test exists to prevent).
+        return func.attr in ("_record_event", "append_event", "record_event")
     return False
 
 
@@ -642,10 +649,12 @@ def _dict_literal_keys(node: ast.expr) -> set[str]:
 def _escalation_event_kinds_from_workflow() -> set[str]:
     """Discover escalation-transition event kinds by inspecting workflow.py.
 
-    An escalation event is an ``append_event`` / ``_record_event`` call whose
-    ``kind`` ends with ``_escalated``, or a ``_record_event`` call in a function
-    that also assigns a ``reason_class`` and whose payload carries an
-    ``escalated`` key.
+    An escalation event is an ``append_event`` / ``_record_event`` call --
+    bare, or WriteGate-routed as ``self.write_gate.append_event(...)`` /
+    ``self.write_gate.record_event(...)`` (issue #1264/#1329, W6 PR4) --
+    whose ``kind`` ends with ``_escalated``, or a ``_record_event``-shaped
+    call in a function that also assigns a ``reason_class`` and whose
+    payload carries an ``escalated`` key.
 
     The test is deliberately conservative: only kinds that unambiguously mark
     an ``escalated``/``blocked`` status transition with a ``reason_class`` are
