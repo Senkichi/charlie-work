@@ -379,6 +379,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # events.db rather than reading as idleness.
         "dispatch_backpressure": "info",
         "dispatch_closed_unmerged_ready_stripped": "info",
+        # Issue #1336: an operator deliberately re-armed a mention-only
+        # flagged issue (removed agent:human-needed), so the mention-only
+        # dispatch exclusion lifted and the issue re-entered candidates.
+        # Info, not warning: this is the sanctioned operator re-queue path
+        # doing its job, not a fault -- the warning-level
+        # dispatch_merged_pr_mention_flagged already records the original
+        # judgment escalation; this records its deliberate resolution.
+        "dispatch_merged_pr_mention_rearmed": "info",
         "dispatch_rework": "info",
         "draft_pr_ready_triggered": "info",
         "escalated_label_repaired": "info",
