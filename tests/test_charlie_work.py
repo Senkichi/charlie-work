@@ -4295,6 +4295,228 @@ def test_dispatch_merged_pr_mention_flag_skips_dedup_marker_on_partial_failure(
     assert flagged_events_2[0]["payload"]["issue_numbers"] == [123]
 
 
+def test_dispatch_merged_pr_mention_rearmed_re_enters_dispatch(tmp_path: Path) -> None:
+    """Issue #1336: an operator who reviews a mention-only flag and
+    deliberately re-arms the issue (removes agent:human-needed) must get it
+    dispatched again on the next pass. Before the fix, the mention-only
+    dispatch exclusion keyed off the raw mention scan, which recomputed
+    from the merged PR's immutable text on every pass and blocked the issue
+    forever -- the #564 point-2 limitation.
+
+    This pins acceptance criterion 1 (re-arm re-enters dispatch) and the
+    one-shot flag preservation (no re-flag on the re-arm pass). Uses a
+    label-mutating fake so the issue's labels genuinely reflect the
+    operator's removal, exercising the re-arm detection path that reads
+    the already-loaded issue labels.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),  # avoid real worker launch
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    human_needed = config.labels.human_needed
+
+    class LabelMutatingFakeGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] != number:
+                    continue
+                names = {item.get("name") for item in issue["labels"]}
+                if label not in names:
+                    issue["labels"].append({"name": label})
+                break
+            return True
+
+        def remove_issue_label(self, number: int, label: str) -> bool:
+            super().remove_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] == number:
+                    issue["labels"] = [
+                        item for item in issue["labels"] if item.get("name") != label
+                    ]
+                    break
+            return True
+
+    fake_gh = LabelMutatingFakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Merged PR #456 only *mentions* issue #123 in free text -- no
+    # branch-prefix binding, no closing keyword -- so only the loose
+    # mention scan finds it.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+    assert fake_gh.prs[0]["isCrossRepository"] is False
+
+    # --- Pass 1: never-flagged mention-only -> flagged, excluded, not dispatched
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is True
+    assert result1.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert result1.data["merged_pr_mention_rearmed_issue_numbers"] == []
+    assert result1.data["selected_count"] == 0  # mention-only exclusion applies
+    assert (123, human_needed) in fake_gh.labels_added
+    state1 = load_state(paths.state_file)
+    assert state1["issues"]["123"].get("merged_pr_mention_flagged_at") is not None
+    assert state1["issues"]["123"].get("mention_rearmed_at") is None
+
+    # --- Operator re-arm: remove agent:human-needed (deliberate ruling).
+    assert fake_gh.remove_issue_label(123, human_needed)
+
+    # --- Pass 2: re-arm detected -> exclusion lifts, issue dispatched, no re-flag
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    assert result2.data["merged_pr_flagged_issue_numbers"] == []  # one-shot preserved
+    assert result2.data["merged_pr_mention_rearmed_issue_numbers"] == [123]
+    assert result2.data["selected_count"] == 1  # re-entered dispatch candidates
+    assert 123 in [s["issue_number"] for s in result2.data["sessions"]]
+    state2 = load_state(paths.state_file)
+    assert state2["issues"]["123"].get("mention_rearmed_at") is not None
+    # The durable re-arm marker is recorded as an event.
+    rearmed_events = [
+        e
+        for e in state2.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_rearmed"
+    ]
+    assert len(rearmed_events) == 1
+    assert rearmed_events[0]["payload"]["issue_numbers"] == [123]
+
+    # --- Pass 3: durable marker persists -> exclusion stays lifted. The issue
+    # is now dispatched (active labels), so it is not re-selected; the point is
+    # that the mention-only exclusion does NOT re-assert and block recovery.
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is True
+    state3 = load_state(paths.state_file)
+    assert state3["issues"]["123"].get("mention_rearmed_at") is not None
+    # No second re-arm event -- the durable marker suppresses re-detection.
+    rearmed_events_3 = [
+        e
+        for e in state3.get("events", [])
+        if e.get("kind") == "dispatch_merged_pr_mention_rearmed"
+    ]
+    assert len(rearmed_events_3) == 1
+
+
+def test_dispatch_merged_pr_mention_still_carries_human_needed_stays_excluded(
+    tmp_path: Path,
+) -> None:
+    """Issue #1336 acceptance criterion 2: a mention-only issue that was flagged
+    and still carries agent:human-needed must remain excluded -- the operator
+    has not re-armed, so the safe default from #564 is preserved. A regression
+    that lifts the exclusion purely on the flag timestamp (without checking the
+    label / durable re-arm marker) makes this test fail.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class LabelMutatingFakeGitHub(FakeGitHub):
+        def add_issue_label(self, number: int, label: str) -> bool:
+            super().add_issue_label(number, label)
+            for issue in self.issues:
+                if issue["number"] != number:
+                    continue
+                names = {item.get("name") for item in issue["labels"]}
+                if label not in names:
+                    issue["labels"].append({"name": label})
+                break
+            return True
+
+    fake_gh = LabelMutatingFakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+
+    # Pass 1: flagged, human_needed applied (and retained on the issue).
+    result1 = app.dispatch(limit=1)
+    assert result1.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert result1.data["selected_count"] == 0
+
+    # Pass 2: operator did NOT remove human_needed -> still excluded.
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is True
+    assert result2.data["merged_pr_flagged_issue_numbers"] == []  # one-shot
+    assert result2.data["merged_pr_mention_rearmed_issue_numbers"] == []
+    assert result2.data["selected_count"] == 0  # still excluded
+    state2 = load_state(paths.state_file)
+    assert state2["issues"]["123"].get("mention_rearmed_at") is None
+
+
+def test_dispatch_merged_pr_mention_never_flagged_stays_excluded(tmp_path: Path) -> None:
+    """Issue #1336 acceptance criterion 2 (never-reviewed half): a
+    mention-only issue that has never been flagged must remain excluded this
+    pass while it is being flagged for the first time -- the re-arm lift only
+    applies to issues flagged in a PRIOR pass. A regression that lifts the
+    exclusion for any issue with the flag timestamp set this pass (before the
+    operator has had a chance to rule) makes this test fail.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "cleanup-unrelated-branch"
+    fake_gh.prs[0]["title"] = "chore: unrelated cleanup"
+    fake_gh.prs[0]["body"] = "While in the area, this also happens to fix issue #123."
+
+    result = app.dispatch(limit=1)
+    assert result.ok is True
+    # First-time flag: excluded this pass (flagged, not dispatched), no re-arm.
+    assert result.data["merged_pr_flagged_issue_numbers"] == [123]
+    assert result.data["merged_pr_mention_rearmed_issue_numbers"] == []
+    assert result.data["selected_count"] == 0
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"].get("mention_rearmed_at") is None
+
+
+def test_dispatch_merged_pr_bound_exclusion_unaffected_by_rearm(tmp_path: Path) -> None:
+    """Issue #1336 acceptance criterion 3: ``bound`` exclusions (branch-prefix
+    / closing-verb linkage) stay scan-based and are never lifted by a re-arm.
+    A bound PR genuinely addressed the issue, so even an issue carrying the
+    durable ``mention_rearmed_at`` marker must remain excluded and be closed.
+    A regression that subtracts rearmed issues from the bound set (instead of
+    only the mention-only set) makes this test fail.
+    """
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # PR #456 binds to issue #123 via the branch prefix -> bound, not mention.
+    fake_gh.prs[0]["state"] = "MERGED"
+    fake_gh.prs[0]["headRefName"] = "agent/issue-123-fix-search"
+    fake_gh.prs[0]["title"] = "Fix #123: search"
+    fake_gh.prs[0]["body"] = "Closes #123\n\nTests: regression coverage added."
+
+    # Pre-seed state with both a mention flag timestamp AND a re-arm marker to
+    # prove the bound exclusion ignores re-arm entirely.
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "merged_pr_mention_flagged_at": "2026-01-01T00:00:00Z",
+        "mention_rearmed_at": "2026-01-02T00:00:00Z",
+    }
+    save_state(paths.state_file, seed)
+
+    result = app.dispatch(limit=1)
+    assert result.ok is True
+    # Bound issue stays excluded and is closed -- re-arm does not lift bound.
+    assert 123 in result.data["merged_pr_referenced_issue_numbers"]
+    assert 123 in fake_gh.closed_issues
+    assert result.data["selected_count"] == 0
+
+
 def test_dispatch_ignores_cross_repo_pr_mentioning_ready_issue(tmp_path: Path) -> None:
     """Regression for the isCrossRepository guard (workflow.py,
     _merged_pr_referenced_issue_numbers): a merged PR whose provenance is
