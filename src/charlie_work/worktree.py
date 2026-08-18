@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import stat
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -662,6 +663,37 @@ def _remote_branch_head_sha(repo_root: Path, branch: str) -> str | None:
     return stdout.split()[0]
 
 
+def remote_branch_head_sha(repo_root: Path, branch: str) -> str | None:
+    """Public wrapper for ``_remote_branch_head_sha``.
+
+    Returns the commit SHA for ``origin/{branch}`` if it exists, else ``None``.
+    Used by the orphan-sweep redispatch cap (issue #1243) to measure branch
+    progress across no-open-PR redispatches: an unchanged remote head SHA across
+    attempts is evidence the worker pushed nothing new.
+    """
+    return _remote_branch_head_sha(repo_root, branch)
+
+
+def worktree_head_sha(worktree_path: Path) -> str | None:
+    """Return the HEAD commit SHA of the worktree at ``worktree_path``.
+
+    Returns ``None`` when the worktree does not exist or ``git rev-parse HEAD``
+    fails. Used by the orphan-sweep redispatch cap (issue #1243) to detect
+    stranded commits -- work the worker completed but never pushed. A moving
+    local head with a dead worker is the salvage path's job, not an escalation.
+    """
+    if not worktree_path.is_dir():
+        return None
+    result = run_captured(
+        ["git", "rev-parse", "HEAD"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return None
+    return result.stdout.strip() or None
+
+
 def remote_branch_ahead_count(
     repo_root: Path, branch: str, base_ref: str = ""
 ) -> tuple[int | None, str | None]:
@@ -774,6 +806,174 @@ def worktree_ahead_of_sha(worktree_path: Path, base_sha: str) -> tuple[int | Non
         return int(count_result.stdout.strip()), None
     except ValueError:
         return None, f"rev-list returned non-integer: {count_result.stdout!r}"
+
+
+@dataclass(frozen=True)
+class SalvagePushResult:
+    """Outcome of a salvage-push attempt on a dead worker's worktree (#1248).
+
+    Three shapes, discriminated by ``pushed``/``skip_reason``/``error``:
+    ``pushed=True`` (work published), ``skip_reason`` set (preconditions not
+    met -- nothing was attempted, the worktree is untouched), or ``error``
+    set (the push itself was attempted and failed; ``old_remote_sha`` and
+    ``commit_count`` still carry what was known at attempt time).
+    """
+
+    pushed: bool
+    skip_reason: str | None = None
+    error: str | None = None
+    old_remote_sha: str | None = None
+    new_remote_sha: str | None = None
+    commit_count: int | None = None
+
+
+def salvage_push_stranded_commits(
+    repo_root: Path,
+    branch: str,
+    worktree_path: Path,
+    *,
+    base_ref: str = "",
+) -> SalvagePushResult:
+    """Fast-forward-push committed-but-unpushed work from a dead worker's worktree.
+
+    A worker that completed its work locally but died before ``git push``
+    presents to the orphan sweep exactly like a worker that did nothing: zero
+    remote delta. This helper publishes that stranded work so the sweep can
+    classify against the real head instead of redispatching (issue #1248).
+
+    Safety properties, in order of enforcement:
+
+    - The caller must have already established the worker is dead (state PID
+      records); this helper additionally refuses when the worktree carries a
+      live or operator writer marker.
+    - Push happens only when the remote tip is an ancestor of the local branch
+      tip (a pure fast-forward), or when the branch does not exist on origin
+      yet and the worktree has commits beyond the base branch. **Never** a
+      force push -- and ``push_branch`` is a plain push, so even a race with a
+      concurrent remote write fails closed on the server side.
+    - Ancestry is only consulted after ``_object_exists`` confirms the remote
+      SHA is present locally: ``merge-base --is-ancestor`` cannot distinguish
+      "not an ancestor" from "unknown object", and a remote tip this worktree
+      has never seen means someone else pushed -- diverged, skip.
+
+    Never raises; every failure comes back as a value.
+    """
+    try:
+        branch = require_valid_ref_name(branch, context="salvage_push branch")
+    except ValueError as exc:
+        return SalvagePushResult(pushed=False, skip_reason=f"invalid_branch: {exc}")
+
+    if not worktree_path.is_dir():
+        return SalvagePushResult(pushed=False, skip_reason="no_worktree")
+
+    marker = read_worktree_marker(worktree_path)
+    if marker is not None:
+        if marker.get("kind") == OPERATOR_MARKER_KIND:
+            return SalvagePushResult(pushed=False, skip_reason="operator_claimed")
+        marker_pid = marker.get("pid")
+        if isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid):
+            return SalvagePushResult(pushed=False, skip_reason="live_writer_marker")
+
+    local_result = run_captured(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+        cwd=worktree_path,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not local_result.ok:
+        return SalvagePushResult(pushed=False, skip_reason="branch_ref_missing")
+    local_sha = local_result.stdout.strip()
+
+    remote_exists = _remote_branch_exists(worktree_path, branch)
+    if remote_exists is None:
+        return SalvagePushResult(pushed=False, skip_reason="remote_probe_failed")
+
+    old_remote_sha: str | None = None
+    if remote_exists:
+        old_remote_sha = _remote_branch_head_sha(worktree_path, branch)
+        if old_remote_sha is None:
+            return SalvagePushResult(pushed=False, skip_reason="remote_probe_failed")
+        if old_remote_sha == local_sha:
+            return SalvagePushResult(
+                pushed=False, skip_reason="up_to_date", old_remote_sha=old_remote_sha
+            )
+        if not _object_exists(worktree_path, old_remote_sha):
+            return SalvagePushResult(
+                pushed=False,
+                skip_reason="remote_head_not_local",
+                old_remote_sha=old_remote_sha,
+            )
+        if not _is_ancestor(worktree_path, old_remote_sha, local_sha):
+            return SalvagePushResult(
+                pushed=False, skip_reason="diverged", old_remote_sha=old_remote_sha
+            )
+        count_result = run_captured(
+            ["git", "rev-list", "--count", f"{old_remote_sha}..{local_sha}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not count_result.ok:
+            return SalvagePushResult(
+                pushed=False, skip_reason="count_failed", old_remote_sha=old_remote_sha
+            )
+        try:
+            commit_count = int(count_result.stdout.strip())
+        except ValueError:
+            return SalvagePushResult(
+                pushed=False, skip_reason="count_failed", old_remote_sha=old_remote_sha
+            )
+        if commit_count == 0:
+            return SalvagePushResult(
+                pushed=False,
+                skip_reason="no_stranded_commits",
+                old_remote_sha=old_remote_sha,
+            )
+    else:
+        # Branch never made it to origin. Only publish it when the worktree
+        # actually carries commits beyond the base branch -- creating an empty
+        # remote branch would feed the #935 open-PR lane a PR with no diff.
+        base_branch = resolve_base_branch_name(repo_root, base_ref)
+        base_result = run_captured(
+            ["git", "rev-parse", "--verify", f"origin/{base_branch}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not base_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="base_unresolvable")
+        merge_base_result = run_captured(
+            ["git", "merge-base", base_result.stdout.strip(), local_sha],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not merge_base_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="base_unresolvable")
+        count_result = run_captured(
+            ["git", "rev-list", "--count", f"{merge_base_result.stdout.strip()}..{local_sha}"],
+            cwd=worktree_path,
+            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        if not count_result.ok:
+            return SalvagePushResult(pushed=False, skip_reason="count_failed")
+        try:
+            commit_count = int(count_result.stdout.strip())
+        except ValueError:
+            return SalvagePushResult(pushed=False, skip_reason="count_failed")
+        if commit_count == 0:
+            return SalvagePushResult(pushed=False, skip_reason="no_commits_beyond_base")
+
+    ok, push_error = push_branch(repo_root, branch, worktree_path)
+    if not ok:
+        return SalvagePushResult(
+            pushed=False,
+            error=f"push_failed: {push_error}",
+            old_remote_sha=old_remote_sha,
+            commit_count=commit_count,
+        )
+    return SalvagePushResult(
+        pushed=True,
+        old_remote_sha=old_remote_sha,
+        new_remote_sha=local_sha,
+        commit_count=commit_count,
+    )
 
 
 def _object_exists(repo_root: Path, sha: str) -> bool:
@@ -3712,6 +3912,53 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
     return "main"
 
 
+def salvage_branch_empty_diff(repo_root: Path, branch: str, base_ref: str) -> bool:
+    """Return True if ``branch``'s tree is identical to current main's tree.
+
+    A salvage PR whose net diff is empty is definitionally vestigial -- there is
+    nothing to preserve that is not already on the default branch. This is the
+    cheap tree-level check (issue #1221, check 3): compare the branch tip's
+    tree SHA against the live default branch's tree SHA.
+
+    ``git fetch origin <base>`` is run first so the comparison sees the *live*
+    remote tip, not a stale tracking ref. The race this exists for is exactly a
+    tracking ref that lags behind a merge that just landed: ``inspect_worktree_state``
+    resolved its base against the same stale ref and saw COMPLETED (ahead of the
+    old tip), so without this fetch the salvage would open a duplicate PR for
+    work that is already on main.
+
+    Fails safe (returns False = "do not skip salvage") on any git error -- a
+    transient fetch/rev-parse failure falls back to opening the PR, which a
+    human reviews anyway. ``git fetch`` does not move HEAD and is safe to run
+    against a checkout a supervisor is actively using (see ``main_ci_reclaim``
+    for the same rationale).
+    """
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+    fetch = _run_remote_captured(
+        ["git", "fetch", "origin", base_branch],
+        cwd=repo_root,
+    )
+    if not fetch.ok:
+        return False
+    base_ref_resolved = f"origin/{base_branch}"
+    branch_ref = _resolve_salvage_branch_ref(repo_root, branch)
+    if branch_ref is None:
+        return False
+    base_tree = run_captured(
+        ["git", "rev-parse", "--verify", "--quiet", f"{base_ref_resolved}^{{tree}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    branch_tree = run_captured(
+        ["git", "rev-parse", "--verify", "--quiet", f"{branch_ref}^{{tree}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not base_tree.ok or not branch_tree.ok:
+        return False
+    return base_tree.stdout.strip() == branch_tree.stdout.strip()
+
+
 # Cap on commit subjects rendered into a salvage body. A runaway branch should
 # not paste hundreds of lines into a PR description; the count is reported so
 # the elision is visible rather than silent.
@@ -4000,6 +4247,81 @@ def _top_level_package_names(repo_root: Path) -> frozenset[str]:
     return frozenset(names)
 
 
+def _package_directories(src_root: Path) -> frozenset[str]:
+    """Return names of importable *packages* (dirs with ``__init__.py``) under ``src_root``.
+
+    Unlike :func:`_top_level_package_names` this deliberately excludes loose
+    ``.py`` stems.  A loose stem like ``ci.py`` or ``probe.py`` is a substring
+    of foreign ``.pth`` filenames (``_editable_impl_ci_fleet.pth``,
+    ``ci_fleet_probe.pth``) and caused the self-arming false-match described in
+    issue #969: widening the verification filter to those names would have
+    auto-rewritten a foreign editable to ``repo_root/src``, producing a hard
+    ``ImportError``.  Restricting to real packages removes that coupling
+    without losing any legitimate editable target.
+    """
+    if not src_root.is_dir():
+        return frozenset()
+    return frozenset(
+        child.name
+        for child in src_root.iterdir()
+        if child.is_dir() and (child / "__init__.py").is_file()
+    )
+
+
+def _configured_editable_roots(
+    repo_root: Path,
+) -> list[tuple[Path, frozenset[str]]]:
+    """Return ``(src_root, package_names)`` for every configured editable install.
+
+    Covers this repo's own packages under ``repo_root/src`` plus each relative
+    editable dependency declared in ``[tool.uv.sources]`` of ``pyproject.toml``
+    (e.g. ``ci-fleet = { path = "../ci_runners", editable = true }``).  Only
+    package directories are collected (see :func:`_package_directories`).
+
+    A root that does not exist on disk is omitted: it contributes no valid
+    target for either verification or repair, and a worktree that is not a
+    sibling of the real peer checkout must not be blocked by its absence
+    (mirrors ``ci_fleet_anchor.declared_ci_fleet_root``'s abstention).
+
+    The returned list is the single source of truth for "which trees does this
+    orchestrator own" used by both :func:`verify_shared_venv` (the
+    resolved-target test, issue #969 gap 2) and
+    :func:`supervise._repair_venv_pth` (per-package root targeting, gap 1).
+    """
+    roots: list[tuple[Path, frozenset[str]]] = []
+    main_src = (repo_root / "src").resolve()
+    if main_src.is_dir():
+        names = _package_directories(main_src)
+        if names:
+            roots.append((main_src, names))
+    pyproject = repo_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return roots
+    try:
+        with pyproject.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return roots
+    sources = data.get("tool", {}).get("uv", {}).get("sources", {})
+    if not isinstance(sources, dict):
+        return roots
+    for spec in sources.values():
+        if not isinstance(spec, dict):
+            continue
+        if not spec.get("editable"):
+            continue
+        raw_path = spec.get("path")
+        if not isinstance(raw_path, str):
+            continue
+        dep_src = (repo_root / raw_path / "src").resolve()
+        if not dep_src.is_dir():
+            continue
+        names = _package_directories(dep_src)
+        if names:
+            roots.append((dep_src, names))
+    return roots
+
+
 def _venv_python(venv_path: Path) -> Path:
     if os.name == "nt":
         return venv_path / "Scripts" / "python.exe"
@@ -4050,36 +4372,48 @@ def _verify_shared_venv_by_import(repo_root: Path, venv_path: Path) -> tuple[boo
 
 
 def verify_shared_venv(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
-    """Verify the shared venv's editable ``.pth`` points to the main checkout src.
+    """Verify every editable ``.pth`` path line resolves into a configured checkout.
 
-    Searches ``site-packages`` for ``.pth`` files whose names contain a top-level
-    package name from ``repo_root/src``. For each matching ``.pth``, every path
-    line must resolve to ``repo_root/src``; a path pointing anywhere else is the
-    poisoned-editable-pth case and surfaces the ``--reinstall-package`` recovery
-    hint.
+    Replaces the former filename-substring filter (issue #969 gap 2).  The old
+    filter kept only ``.pth`` files whose *filename* contained a top-level
+    package name from this repo's ``src``, which made peer-repo editables like
+    ``_editable_impl_ci_fleet.pth`` structurally invisible -- both editables
+    were repointed in the incident and the filter saw neither.  It was also
+    self-arming: loose ``.py`` stems (``ci``, ``fleet``, ``impl``, ``probe``)
+    substring-matched foreign filenames, so widening it would have auto-written
+    an ``ImportError``.
+
+    The resolved-target test asks the question actually being asked: "does this
+    path line point into a tree I own?"  Every ``.pth`` in site-packages is
+    scanned; each path-bearing line is resolved and checked against
+    :func:`_configured_editable_roots` (this repo's ``src`` plus relative
+    editable deps from ``[tool.uv.sources]``).  A line resolving outside *all*
+    configured roots is the poisoned-editable case.  Comment/import/empty lines
+    are skipped by :func:`_resolve_pth_line` returning an empty path.
+
+    When no configured roots are derivable (no ``src`` directory and no
+    editable deps), falls back to the import-based check so a cold or
+    misconfigured checkout is not silently green.
     """
     site_packages = _site_packages_dir(venv_path)
     if not site_packages:
         return False, "could not locate site-packages in shared venv"
-    main_src = (repo_root / "src").resolve()
-    package_names = _top_level_package_names(repo_root)
-    project_pth_files: list[Path] = []
-    for pth in site_packages.glob("*.pth"):
-        if any(name in pth.name for name in package_names):
-            project_pth_files.append(pth)
-    if not project_pth_files:
+    roots = _configured_editable_roots(repo_root)
+    if not roots:
         return _verify_shared_venv_by_import(repo_root, venv_path)
-    for pth in project_pth_files:
+    for pth in site_packages.glob("*.pth"):
         content = pth.read_text(encoding="utf-8", errors="replace")
         for raw_line in content.splitlines():
             target = _resolve_pth_line(site_packages, raw_line)
-            if target == Path() or target == main_src:
+            if target == Path():
+                continue
+            if any(contains(root, target) for root, _ in roots):
                 continue
             return False, (
-                f"editable .pth {pth.name} points outside main checkout: {target} "
-                "(hint: uv sync --all-extras --reinstall-package charlie-work)"
+                f"editable .pth {pth.name} points outside all configured "
+                f"checkouts: {target} (hint: uv sync --all-extras)"
             )
-    return True, "shared venv editable .pth points to main checkout src"
+    return True, "shared venv editable .pth targets all resolve to configured checkouts"
 
 
 def _find_linked_pr_number(

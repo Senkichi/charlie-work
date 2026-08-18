@@ -39,7 +39,7 @@ from typing import Any
 
 from charlie_work.state import load_state, save_state, state_lock
 
-from test_charlie_work import (
+from _review_fixtures import (
     _dispatch_reviews_app,
     _make_dead_review_sidecar,
     _set_review_dispatched_state,
@@ -180,7 +180,7 @@ def test_dispatch_reviews_still_dispatches_non_escalated_pr(monkeypatch, tmp_pat
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
     _write_review_packet(tmp_path, 100, "sha-100")
 
-    from test_charlie_work import _fake_claude_worker_record
+    from _review_fixtures import _fake_claude_worker_record
 
     launched: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 

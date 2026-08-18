@@ -19,6 +19,16 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".venv/Scripts/python.exe scripts/worker_stop_gate.py"
+          }
+        ]
+      }
     ]
   }
 }

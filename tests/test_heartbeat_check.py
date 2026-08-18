@@ -1401,6 +1401,119 @@ def test_check_warning_events_covers_synthetic_kind_not_hardcoded(
     assert "totally_novel_warning_kind_xyz" in report.lines[-1]
 
 
+def test_check_warning_events_buckets_expected_operational_separately_from_rare(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """AC2 (#1271, corrected AC from the binding-decisions comment): a mixed
+    fixture with expected-operational kinds at volume plus one rare genuine
+    warning kind. The expected kinds must appear ONLY in the summarized
+    count line; the rare kind must appear in the detailed list; and the
+    COMBINED expected-operational share -- not just one kind -- must be
+    absent from the detailed list."""
+    repo = _make_repo(hb, tmp_path)
+    rows = (
+        [(_iso(1), "session_exited", "warning") for _ in range(5)]
+        + [(_iso(1), "dispatch_stale", "warning") for _ in range(3)]
+        + [(_iso(1), "worktree_foreign_writer", "warning")]
+    )
+    _write_events_db(repo.state_dir, rows)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+
+    detail_lines = [line for line in report.lines if "new warning-level event(s)" in line]
+    summary_lines = [line for line in report.lines if "routine operational warnings" in line]
+    assert len(detail_lines) == 1, report.lines
+    assert len(summary_lines) == 1, report.lines
+
+    # The rare kind is in the detailed list, never the summary.
+    assert "worktree_foreign_writer" in detail_lines[0]
+    assert "worktree_foreign_writer" not in summary_lines[0]
+
+    # The expected-operational kinds are in the summary, absent (combined,
+    # not just one of them) from the detailed list.
+    assert "session_exited" in summary_lines[0]
+    assert "dispatch_stale" in summary_lines[0]
+    assert "session_exited" not in detail_lines[0]
+    assert "dispatch_stale" not in detail_lines[0]
+
+    # Counts and sorted-by-kind-name ordering within the summary.
+    assert "dispatch_stale=3" in summary_lines[0]
+    assert "session_exited=5" in summary_lines[0]
+    assert summary_lines[0].index("dispatch_stale=3") < summary_lines[0].index("session_exited=5")
+    assert "8 routine operational warnings" in summary_lines[0]
+
+
+def test_check_warning_events_all_expected_operational_omits_detail_line(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """When every new warning is expected-operational, no detailed-listing
+    line is emitted at all -- only the summary. The summary line must still
+    carry the `warning_rows=`/`new_since_last_beat=` facts the operator's
+    digest relies on -- this is the dominant production case (#1271's own
+    7-day sample: expected-operational kinds were the majority of all
+    warnings), so those facts cannot be conditional on a detail line also
+    firing."""
+    repo = _make_repo(hb, tmp_path)
+    rows = [(_iso(1), "runner_capacity_starved", "warning") for _ in range(2)] + [
+        (_iso(1), "draft_pr_ready_held", "warning")
+    ]
+    _write_events_db(repo.state_dir, rows)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = hb.Report()
+    hb.check_warning_events(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    assert not any("new warning-level event(s)" in line for line in report.lines)
+    assert any("routine operational warnings" in line for line in report.lines)
+    assert any("warning_rows=" in line for line in report.lines)
+    assert any("new_since_last_beat=3" in line for line in report.lines)
+
+
+def test_check_warning_events_deterministic_across_runs(hb: ModuleType, tmp_path: Path) -> None:
+    """AC4 (#1271): running check_warning_events twice over the same fixture
+    yields byte-identical report lines -- this script feeds the operator's
+    deterministic heartbeat digest, so no dict/set-order dependent output."""
+    repo = _make_repo(hb, tmp_path)
+    rows = (
+        [(_iso(1), "session_exited", "warning") for _ in range(5)]
+        + [(_iso(1), "dispatch_stale", "warning") for _ in range(3)]
+        + [(_iso(1), "runner_capacity_starved", "warning") for _ in range(2)]
+        + [(_iso(1), "draft_pr_ready_held", "warning")]
+        + [(_iso(1), "worktree_foreign_writer", "warning")]
+    )
+    _write_events_db(repo.state_dir, rows)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    report1 = hb.Report()
+    hb.check_warning_events(report1, repo, baseline)
+    report2 = hb.Report()
+    hb.check_warning_events(report2, repo, baseline)
+
+    assert report1.lines == report2.lines
+    assert not report1.anomaly
+
+
+def test_heartbeat_check_source_has_no_hardcoded_expected_operational_kind_literals() -> None:
+    """AC3 (#1271): heartbeat_check.py must reach every
+    EXPECTED_OPERATIONAL_KINDS member only via the imported frozenset --
+    never as a hardcoded literal anywhere in the file (code, comments, or
+    docstrings alike). Source-derived from the live frozenset, not a
+    maintained list here, so adding a member later needs no change to this
+    test or to heartbeat_check.py."""
+    from charlie_work.instrumentation import EXPECTED_OPERATIONAL_KINDS
+
+    source_path = Path(__file__).parent.parent / "scripts" / "heartbeat_check.py"
+    source = source_path.read_text(encoding="utf-8")
+
+    assert EXPECTED_OPERATIONAL_KINDS, "the set must not be empty for this test to mean anything"
+    for kind in EXPECTED_OPERATIONAL_KINDS:
+        assert kind not in source, (
+            f"{kind!r} appears as a literal in heartbeat_check.py -- it must be "
+            "reached only via the imported EXPECTED_OPERATIONAL_KINDS frozenset"
+        )
+
+
 def test_check_warning_events_excludes_old_row(hb: ModuleType, tmp_path: Path) -> None:
     """Positive control mirroring
     `test_check_error_events_excludes_old_row_despite_sql_trap_shape`: a row

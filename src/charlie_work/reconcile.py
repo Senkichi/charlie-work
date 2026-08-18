@@ -28,18 +28,22 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
+from .escalation import _escalation_edge, _escalation_label, _repair_reason_class
 from .github import (
     GitHubError,
     GitHubLike,
     GraphQLBudgetError,
+    PR_CLOSING_ISSUES_FIELDS,
     _LIST_LIMIT,
     label_names,
     linked_issue_number,
 )
-from .instrumentation import query_events
+from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, transition
 from .paths import resolved_layout, runtime_paths
+from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
@@ -817,6 +821,16 @@ def detect_drift(
     now = now if now is not None else datetime.now(UTC)
 
     labels_cfg = config.labels
+    # Issue #1266: a mechanical escalation parks on operator_queue instead of
+    # human_needed, so "terminal escalation label present" must watch both --
+    # derived from _escalation_edge's own mechanical-edge table (via
+    # _escalation_label) rather than a second hardcoded label pair, so the
+    # label-repair consumers below and the staleness alert further down can
+    # never drift out of sync about what "escalated and parked" looks like.
+    escalation_parked_labels = {
+        _escalation_label(labels_cfg, "escalated"),
+        _escalation_label(labels_cfg, _escalation_edge("escalated", "mechanical")),
+    }
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
@@ -1452,6 +1466,12 @@ def detect_drift(
         # unconditionally ``continue``s -- inserting after it would silently
         # skip the common case.
         #
+        # Issue #1266: ``escalation_parked_labels`` extends this same alert
+        # to ``operator_queue`` -- a mechanical escalation that never clears
+        # (e.g. the de-escalation sweep itself stops running) must not sit
+        # silently forever just because it parked on the *other* terminal
+        # label instead of ``human_needed``.
+        #
         # Age is resolved with a 3-tier fallback so a legacy escalation
         # (predating this check) still gets a real age instead of
         # masquerading as fresh:
@@ -1471,7 +1491,8 @@ def detect_drift(
         # unknown age as healthy is exactly the failure mode
         # ``classify_backlog_reachability``'s ``observed: False`` return
         # exists to avoid.
-        if labels_cfg.human_needed in issue_labels and _issue_state(issue) == "OPEN":
+        stale_terminal_labels = issue_labels & escalation_parked_labels
+        if stale_terminal_labels and _issue_state(issue) == "OPEN":
             since_raw: str | None = None
             if isinstance(tracked_entry, dict):
                 since_raw = tracked_entry.get("terminal_since") or tracked_entry.get(
@@ -1500,12 +1521,26 @@ def detect_drift(
 
             threshold_days = config.reconcile_pass.terminal_state_alert_days
             if age_days is None or age_days >= threshold_days:
+                # Issue #1266: name whichever parked label is actually
+                # present -- human_needed for a judgment escalation,
+                # operator_queue for a mechanical one -- instead of
+                # hardcoding human_needed into the message regardless of
+                # which label is really there. Both are never present
+                # together (labels.py's edges remove each other), but pick
+                # deterministically (prefer human_needed) for the
+                # pathological case where a manual label add put both on
+                # the issue at once.
+                stale_label = (
+                    labels_cfg.human_needed
+                    if labels_cfg.human_needed in stale_terminal_labels
+                    else labels_cfg.operator_queue
+                )
                 detail = (
                     f"issue #{issue_number} has been parked in "
-                    f"'{labels_cfg.human_needed}' for {age_days:.1f} day(s)"
+                    f"'{stale_label}' for {age_days:.1f} day(s)"
                     if age_days is not None
                     else (
-                        f"issue #{issue_number} carries '{labels_cfg.human_needed}' with no "
+                        f"issue #{issue_number} carries '{stale_label}' with no "
                         "recorded escalation timestamp (age never observed)"
                     )
                 )
@@ -1520,15 +1555,27 @@ def detect_drift(
                 )
 
         if tracked_status == "escalated" and _issue_state(issue) == "OPEN":
-            needs_human_needed = labels_cfg.human_needed not in issue_labels
-            if needs_human_needed or active_present:
+            # Issue #1266: a mechanical escalation's correct label is
+            # operator_queue, not human_needed -- deriving the target from
+            # the issue's reason_class (via the same helpers the label-repair
+            # self-heal sweep uses) is what stops this convergence check from
+            # clobbering a correctly operator-queued issue back to
+            # human_needed on every reconcile pass.
+            repair_reason_class = _repair_reason_class(
+                tracked_entry if isinstance(tracked_entry, dict) else None
+            )
+            expected_label = _escalation_label(
+                labels_cfg, _escalation_edge("escalated", repair_reason_class)
+            )
+            needs_expected_label = (
+                expected_label is not None and expected_label not in issue_labels
+            )
+            if needs_expected_label or active_present:
                 fix_actions = []
                 add_labels: tuple[str, ...] = ()
-                if needs_human_needed:
-                    fix_actions.append(
-                        f"add label '{labels_cfg.human_needed}' to issue #{issue_number}"
-                    )
-                    add_labels = (labels_cfg.human_needed,)
+                if needs_expected_label:
+                    fix_actions.append(f"add label '{expected_label}' to issue #{issue_number}")
+                    add_labels = (expected_label,)
                 for label in sorted(active_present):
                     fix_actions.append(f"remove label '{label}' from issue #{issue_number}")
                 drift.append(
@@ -2226,10 +2273,11 @@ def apply_fixes(
                         label_ok = False
                 # Issue #417: issue_active_label_no_open_pr now carries
                 # add_labels=(ready,) when the ready label is missing;
-                # escalated_labels_converged carries add_labels=(human_needed,)
-                # when the escalation label never landed --
-                # done_label_with_active_labels never sets add_labels, so this
-                # loop is a no-op for that sibling kind.
+                # escalated_labels_converged carries add_labels=(<expected
+                # terminal label>,) when it never landed -- human_needed for
+                # a judgment escalation, operator_queue for a mechanical one
+                # (issue #1266) -- done_label_with_active_labels never sets
+                # add_labels, so this loop is a no-op for that sibling kind.
                 for label in item.add_labels:
                     if not gh.add_issue_label(item.issue_number, label):
                         label_ok = False
@@ -2390,8 +2438,19 @@ def apply_fixes(
             # Issue #261: worker was killed by a push-gate hook — escalate
             # via the same "redispatch_escalated" label edge workflow.py's
             # reaper uses, instead of relabeling to ready.
+            # Issue #1266: this DriftItem is only ever raised when
+            # failure_kind is in DETERMINISTIC_ESCALATION_FAILURE_KINDS (see
+            # detect_drift) -- the exact gate workflow.py's own dead-session
+            # reapers use to set reason_class="mechanical" unconditionally.
+            # This is a first-escalation path (reconcile.py detected a dead
+            # worker before any workflow.py sweep did), not a label-repair
+            # path, so it must independently resolve the mechanical edge
+            # rather than hardcoding "redispatch_escalated" -- otherwise the
+            # same dead-worker condition lands on a different label purely
+            # because reconcile.py's drift pass caught it first.
             if item.issue_number is not None:
-                result = transition(gh, config.labels, item.issue_number, "redispatch_escalated")
+                edge = _escalation_edge("redispatch_escalated", "mechanical")
+                result = transition(gh, config.labels, item.issue_number, edge)
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
                     fix_actions.append(
@@ -2420,8 +2479,8 @@ def apply_fixes(
                 if repo_root is not None:
                     push_ok, push_error = push_branch(repo_root, item.branch)
                     if push_ok:
-                        pr_create = getattr(gh, "pr_create", None)
-                        if pr_create is not None:
+                        has_pr_create = getattr(gh, "pr_create", None) is not None
+                        if has_pr_create:
                             # Same janitor body gate as a worker-authored PR --
                             # boilerplate alone can never satisfy it. Derive the
                             # rationale from the worker's own commit log rather
@@ -2439,14 +2498,72 @@ def apply_fixes(
                             )
                             if branch_summary:
                                 salvage_body = f"{salvage_body}\n\n{branch_summary}"
-                            pr_number = pr_create(
+                            # cw#1263: canonicalize/validate the closing-reference
+                            # line the same way workflow.py's `_open_salvage_pr`
+                            # does, via the shared `closing_reference` module.
+                            # `workflow.py` imports `reconcile.py` (for
+                            # `apply_fixes`/`detect_drift`), so importing
+                            # `workflow._open_salvage_pr` back into this module
+                            # would cycle -- the standalone third module is what
+                            # lets both salvage-body builders share one
+                            # implementation without either importing the other.
+                            closing_ref = validate_closing_reference(
+                                salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
+                            )
+                            salvage_body = closing_ref.body
+                            if closing_ref.changed and state_path is not None:
+                                log_event(
+                                    state_path,
+                                    "pr_closing_ref_rewritten",
+                                    {
+                                        "issue_number": item.issue_number,
+                                        "findings": list(closing_ref.findings),
+                                        "source": "session_unpublished_work_salvaged",
+                                    },
+                                )
+                            # cw#1273: route through the bounded outer retry
+                            # + duplicate-PR guard instead of calling
+                            # gh.pr_create directly, matching workflow.py's
+                            # _open_salvage_pr (the other pr_create call site).
+                            retry_result = create_pr_with_retry(
+                                gh,
                                 head=item.branch,
                                 base=item.base_branch,
                                 title=f"Salvaged work for issue #{item.issue_number}",
                                 body=salvage_body,
+                                max_retries=config.runtime.pr_create_retry_max_attempts,
+                                base_seconds=config.runtime.pr_create_retry_base_seconds,
                             )
+                            pr_number = retry_result.pr_number
                         if pr_number is not None:
                             salvage_ok = True
+                            # `pr_number` is falsy (0) under `dry_run`, where no
+                            # real PR was opened -- only probe a real, truthy PR
+                            # number (mirrors workflow.py::_open_salvage_pr).
+                            if pr_number and state_path is not None:
+                                query_ok = True
+                                try:
+                                    pr_view = gh.pr_view(
+                                        pr_number, fields=PR_CLOSING_ISSUES_FIELDS
+                                    )
+                                except Exception:
+                                    pr_view = {}
+                                    query_ok = False
+                                linked_numbers = closing_issues_referenced_numbers(pr_view)
+                                # Only log when the query itself succeeded --
+                                # a transient `gh` failure must not be conflated
+                                # with a genuine unlinked-PR miss (see
+                                # workflow.py::_open_salvage_pr for rationale).
+                                if query_ok and item.issue_number not in linked_numbers:
+                                    log_event(
+                                        state_path,
+                                        "pr_closing_ref_unlinked",
+                                        {
+                                            "issue_number": item.issue_number,
+                                            "pr_number": pr_number,
+                                            "linked_issue_numbers": sorted(linked_numbers),
+                                        },
+                                    )
                         else:
                             salvage_error = "gh pr create failed or returned no PR number"
                     else:

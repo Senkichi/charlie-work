@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from collections.abc import Callable
@@ -99,3 +100,67 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     that single knob for suite-wide isolation.
     """
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ambient_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strip ambient credential env vars so no test's premise depends on what
+    happens to be set on the host.
+
+    The 2026-08-15 host reboot made a User-scope ``MOONSHOT_API_KEY`` visible
+    to the self-hosted CI runner and every fresh shell. Any test that builds
+    an api_worker config without explicitly setting the key (relying on
+    "the key is absent, so preflight falls back to devin-shell") silently
+    changed routing: dispatch went to the api adapter instead of the
+    monkeypatched devin-shell path and hit real ``git worktree add`` calls
+    (``test_dispatch_partitioned_homogeneous_batch_labels_with_single_kind``
+    turned main red).
+
+    The deny-set is derived from the naming convention rather than
+    enumerated: ``api_worker``'s ``api_key_env`` contract names credential
+    variables ``*_API_KEY`` (api_worker.py), so every ambient variable with
+    that suffix is removed. A test that needs a credential sets it explicitly
+    with ``monkeypatch.setenv`` in its own body — autouse fixtures run first,
+    so the per-test value wins.
+    """
+    for name in [key for key in os.environ if key.endswith("_API_KEY")]:
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let ``pr_create_retry.create_pr_with_retry`` really sleep.
+
+    cw#1273: its default backoff is 10s/30s/90s, spanning the ~45s TLS blips
+    observed on this host -- exactly the point of the feature. But that
+    means any *existing* test that drives a failing ``gh pr create`` through
+    ``_open_salvage_pr``/``apply_fixes`` (written before this module
+    existed, with no reason to know about a ``sleep_fn`` parameter) now
+    silently costs 130s of real wall-clock time instead of failing fast,
+    the same "misbehaves everywhere without going red" hazard the sibling
+    ``_no_real_cli_binaries`` fixture above guards against for a different
+    real side effect. A test that specifically wants to assert on backoff
+    timing (e.g. "sleep_fn saw 10 then 30") passes its own ``sleep_fn``
+    directly to ``create_pr_with_retry``, or overrides this patch with its
+    own ``monkeypatch.setattr`` -- either wins over this default no-op.
+
+    Patches ``pr_create_retry._default_sleep`` -- a module-local name that
+    function's body looks up fresh on every call -- rather than the shared
+    stdlib ``time`` module's ``sleep`` attribute. An earlier version of this
+    fixture patched ``pr_create_retry.time.sleep``, which (a) did nothing
+    for its stated purpose, since ``create_pr_with_retry``'s old
+    ``sleep_fn: ... = time.sleep`` default parameter was already bound to
+    the original function object at module-import time and is insensitive
+    to a later attribute reassignment, and (b) being global-module
+    reassignment via ``monkeypatch.setattr(module.time, "sleep", ...)``
+    actually mutates the *shared* ``time`` module object every other test
+    file also imports, so it silently zeroed out real ``time.sleep(...)``
+    calls in unrelated tests for the fixture's entire autouse scope --
+    caught when it made ``test_fleet_registry_touch_repo_second_call``'s
+    real ``time.sleep(2.0)`` a no-op, collapsing two timestamps that must
+    differ. See ``pr_create_retry._default_sleep``'s docstring for why the
+    indirection is required for a fixture to reach this at all.
+    """
+    import charlie_work.pr_create_retry as pr_create_retry_module
+
+    monkeypatch.setattr(pr_create_retry_module, "_default_sleep", lambda seconds: None)

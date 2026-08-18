@@ -435,6 +435,7 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "cross_family_section",
     "janitor_section",
     "test_adequacy_section",
+    "static_probe_section",
     "diff_size_section",
     "ci_status_section",
     "prior_review_section",
@@ -530,6 +531,7 @@ def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
         "cross_family_section": "",
         "janitor_section": "",
         "test_adequacy_section": "",
+        "static_probe_section": "",
         "diff_size_section": "",
         "ci_status_section": "",
         "prior_review_section": "",
@@ -584,6 +586,7 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
         "cross_family_section": "",
         "janitor_section": "",
         "test_adequacy_section": "",
+        "static_probe_section": "",
         "diff_size_section": "",
         "ci_status_section": "",
         "prior_review_section": "",
@@ -721,6 +724,23 @@ def _workflow_py_source() -> tuple[list[str], ast.Module]:
     return text.splitlines(), ast.parse(text)
 
 
+def _rework_prompts_py_source() -> tuple[list[str], ast.Module]:
+    """Read rework_prompts.py's source lines and parsed AST.
+
+    Issue #1283 Phase A moved three of this file's cited symbols
+    (``_write_rework_prompt``, ``_render_rework_prompt``,
+    ``_render_required_changes_section``) out of workflow.py into this
+    module. The citation strings in ``_CITATION_EXPECTATIONS`` still read
+    ``workflow.py::<Symbol>`` -- the facade re-export keeps the public name
+    stable -- so resolution must consider both files, not just workflow.py.
+    """
+    import charlie_work.rework_prompts as rework_prompts_module
+
+    src_path = Path(rework_prompts_module.__file__)
+    text = src_path.read_text(encoding="utf-8")
+    return text.splitlines(), ast.parse(text)
+
+
 def _resolve_symbols(tree: ast.Module) -> dict[str, tuple[int, int]]:
     """Map every ``Class.method`` / module-level ``function`` qualified name
     defined in workflow.py's AST to its ``(lineno, end_lineno)`` span
@@ -846,13 +866,37 @@ def test_workflow_py_citations_are_not_stale() -> None:
     survive unrelated workflow.py edits (this guard's whole point), but that
     is not the same as the citation being *right*: the marker check still
     catches a citation that resolves cleanly but points at the wrong code.
+
+    Issue #1283 Phase A: three cited symbols moved to
+    ``charlie_work/rework_prompts.py``. Rather than change
+    ``_collect_citation_failures``'s signature (a single flat
+    ``symbol_spans``/``wf_lines`` pair), workflow.py's and rework_prompts.py's
+    lines are concatenated and rework_prompts.py's spans are offset by
+    ``len(wf_lines)`` so a single ``(start, end)`` pair still slices the
+    right lines regardless of which file actually defines the symbol -- a
+    name resolved in both files is dropped as ambiguous, the same rule
+    ``_resolve_symbols`` already applies within one file.
     """
     wf_lines, wf_tree = _workflow_py_source()
-    symbol_spans = _resolve_symbols(wf_tree)
+    rp_lines, rp_tree = _rework_prompts_py_source()
+    wf_spans = _resolve_symbols(wf_tree)
+    rp_spans = _resolve_symbols(rp_tree)
+
+    offset = len(wf_lines)
+    combined_lines = wf_lines + rp_lines
+    symbol_spans: dict[str, tuple[int, int]] = dict(wf_spans)
+    for name, (start, end) in rp_spans.items():
+        if name in symbol_spans:
+            del symbol_spans[name]
+            continue
+        symbol_spans[name] = (start + offset, end + offset)
+
     this_file = Path(__file__)
     this_src = this_file.read_text(encoding="utf-8").splitlines()
 
-    failures = _collect_citation_failures(this_src, _CITATION_EXPECTATIONS, symbol_spans, wf_lines)
+    failures = _collect_citation_failures(
+        this_src, _CITATION_EXPECTATIONS, symbol_spans, combined_lines
+    )
 
     assert not failures, (
         "stale or missing workflow.py symbol citations (issue #1054/#1213 "

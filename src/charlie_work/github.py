@@ -127,6 +127,15 @@ PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # object, and on the REST path it is already present in the payload as
 # head.sha, so adding it costs neither an extra request nor a graph walk.
 MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,headRefOid"
+# Fields the REST normalizer emits BEYOND MERGED_PR_LIST_FIELDS. These cannot
+# join the constant: it doubles as the literal `gh pr list --json` field list,
+# and gh has no `mergeCommitOid` spelling (only the `mergeCommit` object), so
+# adding it there would break the gh query in merged_prs_for_issue(). That is
+# safe only because every consumer of these extras reads merged_pr_list(),
+# which is REST-only by construction, and treats an absent key as "cannot
+# verify" (the #1194 queue-sync predicate fails closed without it). Adding an
+# entry here means accepting that the gh-backed path will never carry it.
+MERGED_PR_REST_ONLY_FIELDS = ("mergeCommitOid",)
 # Fields needed by `charlie closing-keyword-check` (issue #790): the gate only
 # scans PR body/title text for closing keywords and resolves the PR's own
 # declared-target binding via linked_issue_number(), which reads headRefName
@@ -145,6 +154,13 @@ MERGED_PR_LIST_FIELDS = "number,title,body,headRefName,isCrossRepository,state,h
 # whole class of integration-context permission gaps instead of chasing them
 # field by field.
 CLOSING_KEYWORD_PR_FIELDS = "title,body,headRefName,isCrossRepository"
+# Fields for the post-create closing-reference verification (cw#1263): the
+# only field needed is GitHub's own GraphQL resolution of which issues this
+# PR will close on merge -- as opposed to `linked_issue_number`'s regex-based
+# guess, `closingIssuesReferences` is GitHub's authoritative answer. Kept as
+# narrow as `CLOSING_KEYWORD_PR_FIELDS` for the same reason: no CI/review
+# state is needed, so no `statusCheckRollup` token-scope risk.
+PR_CLOSING_ISSUES_FIELDS = "closingIssuesReferences"
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
 # 'Unknown JSON field: "databaseId"' and exit non-zero. Because pr_checks() calls
@@ -353,6 +369,13 @@ class GitHub:
             # GraphQL name. Without this mapping every consumer reading
             # headRefOid off a merged PR silently sees None.
             "headRefOid": head.get("sha"),
+            # Issue #1194: the merge commit that landed this PR on the base
+            # branch. Its FIRST parent is the base tip immediately before
+            # this merge — the only post-merge anchor from which "was this
+            # content already on main?" can still be answered, since after
+            # the merge everything the PR carried is main-reachable through
+            # the merge commit itself.
+            "mergeCommitOid": pr.get("merge_commit_sha"),
         }
 
     def run(
@@ -1470,6 +1493,215 @@ class GitHub:
         assert isinstance(result, GitHubRunResult)
         return result
 
+    def pr_close(self, number: int) -> GitHubRunResult:
+        """Close a PR via ``gh pr close`` (issue #1274, W17).
+
+        Half of the close/reopen stale-checks retrigger mechanism: closing
+        and then reopening a PR is a common way to force GitHub to
+        re-evaluate branch protection / re-create a check-suite run for a
+        head where Actions never created one. Modeled exactly on
+        ``pr_ready`` -- structured result, dry-run synthetic ok=True guard,
+        never raises.
+        """
+        args = ["pr", "close", str(number)]
+        if self.dry_run and _is_mutating(args):
+            return GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        result = self.run(args, allow_failure=True)
+        assert isinstance(result, GitHubRunResult)
+        return result
+
+    def pr_reopen(self, number: int) -> GitHubRunResult:
+        """Reopen a PR via ``gh pr reopen`` (issue #1274, W17).
+
+        Paired with ``pr_close`` for the close/reopen stale-checks
+        retrigger mechanism. Modeled exactly on ``pr_ready``.
+
+        NOTE (unverified, flagged per issue #1274's binding comment item 6):
+        whether reopening a PR actually causes GitHub Actions to create a
+        fresh check-suite run for the PR's CURRENT head (as opposed to
+        being a no-op for check-suite purposes) has not been confirmed
+        against a live repository -- it cannot be verified with a real `gh`
+        call inside a sandboxed/mocked test environment. The
+        ``push_empty_commit`` fallback exists specifically because this is
+        uncertain; an operator should confirm close/reopen's effect against
+        a disposable fixture PR before relying on it as the primary
+        mechanism in production.
+        """
+        args = ["pr", "reopen", str(number)]
+        if self.dry_run and _is_mutating(args):
+            return GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+        result = self.run(args, allow_failure=True)
+        assert isinstance(result, GitHubRunResult)
+        return result
+
+    def push_empty_commit(self, branch: str) -> GitHubRunResult:
+        """Push a content-free commit onto ``branch`` via the Git Data API
+        (issue #1274, W17).
+
+        Fallback CI-retrigger mechanism, used only when ``pr_close`` +
+        ``pr_reopen`` does not mechanically succeed (either call returns
+        not-ok). Moves the branch tip to a new commit that has the exact
+        same tree as the current tip (i.e. no content change) so a
+        push-triggered workflow re-evaluates the branch at a fresh head
+        SHA, without altering any file. Four `gh api` reads/writes, in
+        order:
+
+        1. GET the branch ref to find the current tip commit SHA.
+        2. GET that commit object to find its tree SHA (the new commit
+           reuses it unchanged).
+        3. POST a new commit object with that tree and the old tip as its
+           sole parent.
+        4. PATCH the branch ref to point at the new commit.
+
+        Every step returns errors as values -- this method never raises,
+        per this repo's external-process-errors-as-values convention, and
+        stops at the first failing step rather than attempting later steps
+        against inconsistent state. Dry-run mode returns a synthetic
+        ok=True result before any `gh` call is made at all (not just before
+        the final PATCH): this operation is unconditionally mutating end to
+        end -- there is no read-only prefix of it worth letting a
+        --dry-run caller observe, unlike e.g. ``workflow_runs_for_head``.
+        """
+        if self.dry_run:
+            return GitHubRunResult(
+                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
+            )
+
+        ref_result = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if not isinstance(ref_result, GitHubRunResult) or not ref_result.ok:
+            error = (
+                ref_result.error
+                if isinstance(ref_result, GitHubRunResult)
+                else f"unexpected response reading ref for branch {branch!r}"
+            )
+            return GitHubRunResult(
+                ok=False,
+                returncode=ref_result.returncode if isinstance(ref_result, GitHubRunResult) else 0,
+                stdout="",
+                stderr="",
+                value=None,
+                error=error or f"failed to read ref for branch {branch!r}",
+            )
+        ref_value = ref_result.value
+        tip_sha = ref_value.get("object", {}).get("sha") if isinstance(ref_value, dict) else None
+        if not isinstance(tip_sha, str) or not tip_sha:
+            return GitHubRunResult(
+                ok=False,
+                returncode=0,
+                stdout="",
+                stderr="",
+                value=None,
+                error=f"could not determine tip SHA for branch {branch!r}",
+            )
+
+        commit_lookup = self.run(
+            ["api", f"repos/{{owner}}/{{repo}}/git/commits/{tip_sha}"],
+            json_output=True,
+            allow_failure=True,
+        )
+        if not isinstance(commit_lookup, GitHubRunResult) or not commit_lookup.ok:
+            error = (
+                commit_lookup.error
+                if isinstance(commit_lookup, GitHubRunResult)
+                else f"unexpected response reading commit {tip_sha!r}"
+            )
+            return GitHubRunResult(
+                ok=False,
+                returncode=(
+                    commit_lookup.returncode if isinstance(commit_lookup, GitHubRunResult) else 0
+                ),
+                stdout="",
+                stderr="",
+                value=None,
+                error=error or f"failed to read commit {tip_sha!r}",
+            )
+        commit_value = commit_lookup.value
+        tree_sha = (
+            commit_value.get("tree", {}).get("sha") if isinstance(commit_value, dict) else None
+        )
+        if not isinstance(tree_sha, str) or not tree_sha:
+            return GitHubRunResult(
+                ok=False,
+                returncode=0,
+                stdout="",
+                stderr="",
+                value=None,
+                error=f"could not determine tree SHA for commit {tip_sha!r}",
+            )
+
+        new_commit = self.run(
+            [
+                "api",
+                "-X",
+                "POST",
+                "repos/{owner}/{repo}/git/commits",
+                "-f",
+                "message=chore: retrigger CI (empty commit)",
+                "-f",
+                f"tree={tree_sha}",
+                "-f",
+                f"parents[]={tip_sha}",
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if not isinstance(new_commit, GitHubRunResult) or not new_commit.ok:
+            error = (
+                new_commit.error
+                if isinstance(new_commit, GitHubRunResult)
+                else "unexpected response creating empty commit"
+            )
+            return GitHubRunResult(
+                ok=False,
+                returncode=new_commit.returncode if isinstance(new_commit, GitHubRunResult) else 0,
+                stdout="",
+                stderr="",
+                value=None,
+                error=error or "failed to create empty commit",
+            )
+        new_commit_value = new_commit.value
+        new_sha = new_commit_value.get("sha") if isinstance(new_commit_value, dict) else None
+        if not isinstance(new_sha, str) or not new_sha:
+            return GitHubRunResult(
+                ok=False,
+                returncode=0,
+                stdout="",
+                stderr="",
+                value=None,
+                error="empty-commit creation response had no sha",
+            )
+
+        ref_update = self.run(
+            [
+                "api",
+                "-X",
+                "PATCH",
+                f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}",
+                "-f",
+                f"sha={new_sha}",
+            ],
+            json_output=True,
+            allow_failure=True,
+        )
+        if not isinstance(ref_update, GitHubRunResult):
+            return GitHubRunResult(
+                ok=False,
+                returncode=0,
+                stdout="",
+                stderr="",
+                value=None,
+                error=f"unexpected response updating ref for branch {branch!r}",
+            )
+        return ref_update
+
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
         """Check which of the given issue numbers are currently open.
 
@@ -1864,6 +2096,8 @@ class GitHubLike(Protocol):
 
     def close_issue(self, number: int) -> bool: ...
 
+    def issue_comment(self, number: int, body_file: Path) -> None: ...
+
     def pr_comment(self, number: int, body_file: Path) -> None: ...
 
     def label_list(self) -> list[dict[str, Any]]: ...
@@ -1879,6 +2113,12 @@ class GitHubLike(Protocol):
     def pr_update_branch(self, pr_number: int) -> bool: ...
 
     def pr_ready(self, number: int) -> GitHubRunResult: ...
+
+    def pr_close(self, number: int) -> GitHubRunResult: ...
+
+    def pr_reopen(self, number: int) -> GitHubRunResult: ...
+
+    def push_empty_commit(self, branch: str) -> GitHubRunResult: ...
 
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]: ...
 

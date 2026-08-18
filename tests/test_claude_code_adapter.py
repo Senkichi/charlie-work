@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _claude_adapter_fixtures import _fake_worktree, _install_fake_create_worktree
 from _worker_marker_wait import read_worker_marker
 
 from charlie_work import claude_code
@@ -40,69 +41,6 @@ from charlie_work.claude_code import (
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.subprocess_runner import RunResult
 from charlie_work.worktree import WorktreeForeignWriterError, WorktreeInfo
-
-
-def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
-    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
-
-
-def _fake_worktree_with_venv(tmp_path: Path, branch: str) -> WorktreeInfo:
-    """Create a fake worktree with a .venv directory.
-
-    This makes sanitize_env actively SET VIRTUAL_ENV (instead of POP-ing it),
-    which makes the merge order testable: if worker_env is merged first,
-    sanitize_env will clobber the override.
-    """
-    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    (worktree_path / ".venv").mkdir()
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
-
-
-def _install_fake_create_worktree(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    calls: list[dict] | None = None,
-    with_venv: bool = False,
-) -> None:
-    def fake_create_worktree(
-        repo_root,
-        branch,
-        *,
-        base_ref="HEAD",
-        worktrees_dir=None,
-        venv_source=None,
-        materialize_dirs=(),
-        rework=False,
-        recovery=None,
-        issue_number=None,
-        config=None,
-        sessions_dir=None,
-    ):
-        if calls is not None:
-            calls.append(
-                {
-                    "repo_root": repo_root,
-                    "branch": branch,
-                    "base_ref": base_ref,
-                    "worktrees_dir": worktrees_dir,
-                    "venv_source": venv_source,
-                    "materialize_dirs": materialize_dirs,
-                    "rework": rework,
-                    "recovery": recovery,
-                    "issue_number": issue_number,
-                    "config": config,
-                    "sessions_dir": sessions_dir,
-                }
-            )
-        if with_venv:
-            return _fake_worktree_with_venv(tmp_path, branch)
-        return _fake_worktree(tmp_path, branch)
-
-    monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
 
 
 def _fake_claude_script(tmp_path: Path) -> tuple[str, ...]:
@@ -3165,6 +3103,35 @@ def test_launch_claude_worker_honors_configured_model_override(
     assert record.command.count("--model") == 1
     idx = record.command.index("--model")
     assert record.command[idx + 1] == "claude-opus-4-8"
+
+
+def test_launch_claude_worker_model_override_wins_over_claude_code_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1245: an explicit ``model_override`` is pinned as the ``--model``
+    value instead of ``claude_code.model``. This is the seam the api adapter
+    uses to pin the provider's model. The two values deliberately differ so a
+    regression that ignores the override is caught."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-sonnet-5"))
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+        model_override="kimi-k3",
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == "kimi-k3"
+    assert record.command[idx + 1] != "claude-sonnet-5"
 
 
 def test_launch_claude_worker_review_pins_configured_model_by_default(

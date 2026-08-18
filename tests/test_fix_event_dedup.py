@@ -30,12 +30,8 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import (
-    FakeGitHub,
-    FakeGitHubWithChecks,
-    FakeGitHubWithMissingRequired,
-    _required_checks_config,
-)
+from _fakes_github import FakeGitHub, FakeGitHubWithChecks, FakeGitHubWithMissingRequiredAndRuns
+from _review_fixtures import _required_checks_config
 
 
 def _events(state, kind: str) -> list[dict]:
@@ -187,21 +183,6 @@ def test_janitor_gate_emits_once_then_silent_until_failures_change(tmp_path: Pat
     state = load_state(app.paths.state_file)
     assert len(_events(state, "janitor_gate")) == 2
     assert state["prs"]["456"]["janitor_failures"] != first_failures
-
-
-class FakeGitHubWithMissingRequiredAndRuns(FakeGitHubWithMissingRequired):
-    """No required checks reported at all (so every required check is
-    "missing" per the janitor gate), plus a configurable
-    ``workflow_runs_for_head`` response so tests can control whether GitHub
-    Actions ever created a run for the head SHA.
-    """
-
-    def __init__(self, runs: list[dict[str, Any]] | None) -> None:
-        super().__init__()
-        self._runs = runs
-
-    def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
-        return self._runs
 
 
 def test_ci_run_never_created_emitted_once_per_head_with_control(tmp_path: Path) -> None:
@@ -404,3 +385,176 @@ def test_blocked_chain_dead_alerts_once_per_transition(tmp_path: Path) -> None:
     app.dispatch(limit=10)
     state = load_state(app.paths.state_file)
     assert len(_events(state, "dispatch_blocked_chain_dead")) == 2
+
+
+def _blocked_app_with_blocker_pr(tmp_path: Path) -> OrchestratorApp:
+    """Like ``_blocked_app`` but the blocker issue #743 has a tracked open PR.
+
+    The PR (#1627) links to #743 via its branch name (``agent/issue-743-...``)
+    so ``linked_issue_number`` binds it, making ``pr_by_issue[743]`` resolve
+    during dispatch. The PR's janitor-blocked status is seeded directly into
+    state.json by each test (mirroring how ``review()`` persists it).
+    """
+    app = _blocked_app(tmp_path)
+    # Add an open PR linked to the blocker issue #743.
+    app.gh.prs.append(
+        {
+            "number": 1627,
+            "title": "fix: foundation work for #743",
+            "url": "https://example.test/pull/1627",
+            "headRefName": "agent/issue-743-foundation",
+            "baseRefName": "main",
+            "headRefOid": "sha-743-head",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #743\n\nTests: regression coverage added.",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    )
+    # Keep the default PR #456 (linked to #123) closed so it stays out of the
+    # way -- ``_blocked_app`` already closes it, but ``pr_list`` filters on
+    # OPEN so this is belt-and-suspenders.
+    return app
+
+
+def _seed_blocker_pr_state(
+    app: OrchestratorApp,
+    *,
+    status: str,
+    is_missing_checks_only_block: bool = False,
+    ci_run_never_created_head: str | None = None,
+    janitor_failures: list[str] | None = None,
+) -> None:
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        pr_entry: dict[str, Any] = {
+            "number": 1627,
+            "issue_number": 743,
+            "status": status,
+            "janitor_ok": False,
+        }
+        if janitor_failures is not None:
+            pr_entry["janitor_failures"] = janitor_failures
+        if is_missing_checks_only_block:
+            pr_entry["is_missing_checks_only_block"] = True
+        if ci_run_never_created_head is not None:
+            pr_entry["ci_run_never_created_head"] = ci_run_never_created_head
+        state["prs"]["1627"] = pr_entry
+        save_state(app.paths.state_file, state)
+
+
+def test_blocked_chain_dead_no_alert_for_transient_missing_checks_only_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #1133: a blocker whose fresh PR is ``janitor_blocked`` ONLY
+    because its required checks haven't reported yet (``is_missing_checks_only_block``
+    with no ``ci_run_never_created_head``) is transient, not dead -- it
+    self-heals within one CI cycle. ``dispatch_blocked_chain_dead`` must NOT
+    fire for this population.
+    """
+    app = _blocked_app_with_blocker_pr(tmp_path)
+    _seed_blocker_pr_state(
+        app,
+        status="janitor_blocked",
+        is_missing_checks_only_block=True,
+        janitor_failures=["Required check(s) missing: Tests passed"],
+    )
+
+    app.dispatch(limit=10)
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "dispatch_blocked_chain_dead")) == 0
+    # The chain-dead marker must not be set (no transition recorded).
+    assert state["issues"]["752"].get("chain_dead_alerted_blockers") is None
+
+
+def test_blocked_chain_dead_alerts_when_missing_checks_pr_confirmed_ci_never_created(
+    tmp_path: Path,
+) -> None:
+    """Issue #1133 durable variant: the same missing-checks-only PR, but CI
+    was confirmed to have never started for this head
+    (``ci_run_never_created_head`` set by ``_detect_ci_run_never_created``).
+    That is the durable population the alert exists for, so it MUST fire.
+    """
+    app = _blocked_app_with_blocker_pr(tmp_path)
+    _seed_blocker_pr_state(
+        app,
+        status="janitor_blocked",
+        is_missing_checks_only_block=True,
+        ci_run_never_created_head="sha-743-head",
+        janitor_failures=["Required check(s) missing: Tests passed"],
+    )
+
+    app.dispatch(limit=10)
+    state = load_state(app.paths.state_file)
+    chain_events = _events(state, "dispatch_blocked_chain_dead")
+    assert len(chain_events) == 1
+    assert chain_events[0]["payload"] == {"issue": 752, "chain_root": [743]}
+
+
+def test_blocked_chain_dead_alerts_for_durable_janitor_blocked_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #1133: a ``janitor_blocked`` PR with a durable failure (merge
+    conflict, not a missing-checks-only block) is dead and MUST alert.
+    ``is_missing_checks_only_block`` is False here, so the transient carve-out
+    does not apply regardless of ``ci_run_never_created_head``.
+    """
+    app = _blocked_app_with_blocker_pr(tmp_path)
+    _seed_blocker_pr_state(
+        app,
+        status="janitor_blocked",
+        is_missing_checks_only_block=False,
+        janitor_failures=["PR has merge conflicts (mergeable=CONFLICTING)"],
+    )
+
+    app.dispatch(limit=10)
+    state = load_state(app.paths.state_file)
+    chain_events = _events(state, "dispatch_blocked_chain_dead")
+    assert len(chain_events) == 1
+    assert chain_events[0]["payload"] == {"issue": 752, "chain_root": [743]}
+
+
+def test_blocked_chain_dead_recovers_when_transient_pr_clears(
+    tmp_path: Path,
+) -> None:
+    """Issue #1133 recovery: once the transient PR's checks report and the
+    janitor clears it (status leaves ``janitor_blocked``), the blocker is
+    alive again. A subsequent durable death (e.g. the issue escalates) must
+    alert fresh, proving the transient carve-out did not permanently suppress
+    the chain-dead machinery.
+    """
+    app = _blocked_app_with_blocker_pr(tmp_path)
+
+    # Start transient: no alert.
+    _seed_blocker_pr_state(
+        app,
+        status="janitor_blocked",
+        is_missing_checks_only_block=True,
+        janitor_failures=["Required check(s) missing: Tests passed"],
+    )
+    app.dispatch(limit=10)
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "dispatch_blocked_chain_dead")) == 0
+
+    # CI reports, janitor passes -> PR is no longer blocked (reviewing).
+    _seed_blocker_pr_state(
+        app,
+        status="reviewing",
+        is_missing_checks_only_block=False,
+        janitor_failures=[],
+    )
+    app.dispatch(limit=10)
+    state = load_state(app.paths.state_file)
+    assert len(_events(state, "dispatch_blocked_chain_dead")) == 0
+
+    # Now the blocker issue escalates -> fresh death, must alert.
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"]["743"] = {"number": 743, "status": "escalated"}
+        save_state(app.paths.state_file, state)
+    app.dispatch(limit=10)
+    state = load_state(app.paths.state_file)
+    chain_events = _events(state, "dispatch_blocked_chain_dead")
+    assert len(chain_events) == 1
+    assert chain_events[0]["payload"] == {"issue": 752, "chain_root": [743]}

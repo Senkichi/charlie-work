@@ -29,7 +29,7 @@ from charlie_work.paths import resolved_layout
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import _set_reviewer_quota_exhausted_with_backoff
 
-from test_charlie_work import _dispatch_reviews_app, _fake_claude_worker_record
+from _review_fixtures import _dispatch_reviews_app, _fake_claude_worker_record
 
 
 def _probe_after(state: dict[str, Any]) -> datetime:

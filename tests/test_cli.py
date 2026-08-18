@@ -8,8 +8,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from _cli_fixtures import _FakeGitHub, _make_repo
 from charlie_work import cli
-from charlie_work import github as github_module
 from charlie_work.config import (
     ConfigError,
     NotifyConfig,
@@ -29,75 +29,9 @@ from charlie_work.quiesce import QuiesceReport
 from charlie_work.dirty_tree import DirtyTreeReport
 from charlie_work.state_migration import MigrationChild, MigrationOutcome, MigrationPlan
 from charlie_work.supervise import SelfDeployResult
-from charlie_work.workflow import CommandResult
+from charlie_work.workflow import ORCHESTRATOR_COMMENT_MARKER, CommandResult
 from ci_fleet.runner_allocation import AllocationPlan
 from ci_fleet.runner_allocation_pass import AllocationPassResult
-
-
-class _FakeGitHub:
-    """Stub GitHub client sufficient to drive cli.main through the verdict path."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def name_with_owner(self) -> str:
-        return "owner/repo"
-
-    def pr_view(self, number: int) -> dict[str, Any]:
-        return {
-            "number": number,
-            "title": "Fix search",
-            "url": "https://example.test/pull/1",
-            "headRefName": "agent/issue-1-fix-search",
-            "baseRefName": "main",
-            "headRefOid": "sha-abc",
-            "mergeStateStatus": "CLEAN",
-            "body": "Closes #1\n\nTests: regression coverage added.",
-            "labels": [],
-            "isCrossRepository": False,
-            "state": "OPEN",
-        }
-
-    def pr_diff(self, number: int) -> str:
-        return "diff content"
-
-    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
-        return [] if json_output else ""
-
-    def add_issue_label(self, number: int, label: str) -> bool:
-        return True
-
-    def remove_issue_label(self, number: int, label: str) -> bool:
-        return True
-
-    def commit(self, sha: str) -> github_module.GitHubRunResult:
-        # This stub does not model commit metadata, so the committer-date
-        # timestamp cannot be resolved. Returning a failed GitHubRunResult
-        # (errors-as-values invariant) makes _commit_timestamp yield None,
-        # which tells _collect_external_findings to skip the upper bound and
-        # fail toward ingestion -- a no-op here, since ``run`` returns ``[]``
-        # for JSON output so no external comments are ever surfaced. These
-        # tests exercise required_changes derivation, not external-findings
-        # filtering (see test_charlie_work.py for that coverage).
-        return github_module.GitHubRunResult(
-            ok=False,
-            returncode=1,
-            stdout="",
-            stderr="",
-            value=None,
-            error=f"commit {sha} not modeled by _FakeGitHub",
-        )
-
-
-def _make_repo(tmp_path: Path) -> Path:
-    (tmp_path / ".git").mkdir()
-    state_dir = tmp_path / ".var" / "charlie-work"
-    state_dir.mkdir(parents=True)
-    (state_dir / "state.json").write_text(
-        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}),
-        encoding="utf-8",
-    )
-    return tmp_path
 
 
 def test_cli_verdict_missing_summary_file_exits_nonzero(
@@ -133,7 +67,8 @@ def test_cli_verdict_success_records_decision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Happy path: a readable summary file records the verdict and exits 0."""
-    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    fake_gh = _FakeGitHub()
+    monkeypatch.setattr(cli, "GitHub", lambda *a, **k: fake_gh)
     repo = _make_repo(tmp_path)
     summary = repo / "summary.md"
     summary.write_text("lgtm", encoding="utf-8")
@@ -160,6 +95,16 @@ def test_cli_verdict_success_records_decision(
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     assert decision["decision"] == "approved"
     assert decision["summary"] == "lgtm"
+
+    # Issue #1268 (W11) AC4/AC5: post_verdict_comment defaults to True, so
+    # this terminal decision must also post exactly one PR comment carrying
+    # the round header -- see workflow.py's record_review comment gate and
+    # tests/test_review_pr_comment.py for the dedicated coverage.
+    assert len(fake_gh.pr_comment_calls) == 1
+    posted_number, posted_body = fake_gh.pr_comment_calls[0]
+    assert posted_number == 1
+    assert posted_body.startswith(ORCHESTRATOR_COMMENT_MARKER + "\n")
+    assert "## Fleet review - round 1 - approved" in posted_body
 
 
 def test_cli_verdict_reviewed_head_flag_records_source(
@@ -783,7 +728,7 @@ def test_run_fleet_bash_rats_emits_attention_digest_on_venv_repaired(
             changed=False,
             synced=False,
             venv_repaired=True,
-            message="venv editable target repaired: shared venv editable .pth points to main checkout src",
+            message="venv editable target repaired: shared venv editable .pth targets all resolve to configured checkouts",
         )
     )
     monkeypatch.setattr(cli, "self_deploy", deploy_mock)
@@ -1904,7 +1849,7 @@ def test_migrate_state_dir_apply_happy_path_actuates_when_quiescent(tmp_path: Pa
         "fleet supervise",
     )
     quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
-    outcome = MigrationOutcome(ok=True, moved=("issues",))
+    outcome = MigrationOutcome(ok=True, moved=("issues",), rewritten_paths=7)
 
     result = cli.run_migrate_state_dir_command(
         args,
@@ -1916,6 +1861,87 @@ def test_migrate_state_dir_apply_happy_path_actuates_when_quiescent(tmp_path: Pa
 
     assert result.ok is True
     assert "moved 1 children" in result.message
+    # Issue #735: rewritten_paths is surfaced in both the data dict and the
+    # human-readable message so the operator can see the rewrite happened.
+    assert result.data["rewritten_paths"] == 7
+    assert "rewrote 7 embedded paths" in result.message
+
+
+def test_migrate_state_dir_apply_reports_zero_rewrites_in_message(tmp_path: Path) -> None:
+    """When the rewrite found no embedded paths, the message still carries the
+    ``rewrote 0 embedded paths`` suffix and ``rewritten_paths`` is 0 in data --
+    a migration with no state.json or no embedded paths is a legitimate success.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+    outcome = MigrationOutcome(ok=True, moved=("issues",), rewritten_paths=0)
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=_clean_tree,
+        actuator=lambda plan_arg: outcome,
+    )
+
+    assert result.ok is True
+    assert result.data["rewritten_paths"] == 0
+    assert "rewrote 0 embedded paths" in result.message
+
+
+def test_migrate_state_dir_apply_rewrite_failure_surfaces_in_data_and_message(
+    tmp_path: Path,
+) -> None:
+    """Issue #735: when the state.json path rewrite fails, ``rewritten_paths``
+    is 0 in the data dict and the failure message names the rewrite error --
+    the children already moved, so this is an incomplete migration needing
+    manual attention, not a rollback.
+    """
+    repo = _make_repo(tmp_path)
+    src, dst = tmp_path / "src-state", tmp_path / "dst-state"
+    args = _migrate_args(
+        repo,
+        "--src",
+        str(src),
+        "--dst",
+        str(dst),
+        "--apply",
+        "--quiesce-pattern",
+        "fleet supervise",
+    )
+    quiescent = QuiesceReport(ok=True, matched=(), excluded_pids=frozenset(), summary="quiescent")
+    outcome = MigrationOutcome(
+        ok=False,
+        moved=("issues",),
+        rewritten_paths=0,
+        error="children moved but state.json path rewrite failed: missing target",
+    )
+
+    result = cli.run_migrate_state_dir_command(
+        args,
+        planner=lambda **kwargs: _fake_migration_plan(tmp_path),
+        quiescence_checker=lambda **kwargs: quiescent,
+        dirty_tree_checker=_clean_tree,
+        actuator=lambda plan_arg: outcome,
+    )
+
+    assert result.ok is False
+    assert result.data["rewritten_paths"] == 0
+    assert result.data["applied"] is False
+    assert "migration failed after 1 moved" in result.message
+    assert "path rewrite failed" in result.message
+    assert "missing target" in result.message
 
 
 def test_migrate_state_dir_apply_refuses_when_working_tree_is_dirty(tmp_path: Path) -> None:

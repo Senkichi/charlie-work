@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
+from _worktree_fixtures import _clone_repo, _git
 from charlie_work.config import DevinConfig, OrchestratorConfig, PostMortemConfig, WatchdogConfig
 from charlie_work.github import GitHubRunResult
 from charlie_work.process_utils import get_process_start_time
@@ -33,6 +34,7 @@ from charlie_work.worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
     ReworkMergeConflict,
+    SalvagePushResult,
     _clear_declared_scaffolding_collisions,
     _default_worktrees_dir,
     _eligible_for_scaffolding_repair,
@@ -55,7 +57,9 @@ from charlie_work.worktree import (
     read_worktree_marker,
     remove_review_checkout,
     remove_worktree,
+    salvage_push_stranded_commits,
     verify_shared_venv,
+    worktree_head_sha,
     write_worktree_marker,
     _is_git_tracked,
     _materialize_directory,
@@ -145,22 +149,6 @@ def _init_repo(repo_root: Path, bare: bool = False) -> None:
         (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
         run(["git", "add", "README.md"])
         run(["git", "commit", "-m", "initial commit"])
-
-
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
-    subprocess.run(
-        ["git", "clone", str(remote_repo), str(repo_root)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    # A fresh clone has no committer identity on CI runners.
-    _git(repo_root, "config", "user.email", "test@example.test")
-    _git(repo_root, "config", "user.name", "Test User")
 
 
 def test_create_and_remove_round_trip(tmp_path: Path) -> None:
@@ -5602,8 +5590,8 @@ def test_verify_shared_venv_catches_pth_pointing_outside_main_checkout(tmp_path:
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert not ok
-    assert "points outside main checkout" in message
-    assert "uv sync --all-extras --reinstall-package charlie-work" in message
+    assert "points outside all configured checkouts" in message
+    assert "uv sync --all-extras" in message
 
 
 def test_verify_shared_venv_approves_pth_pointing_at_main_checkout(tmp_path: Path) -> None:
@@ -5616,7 +5604,130 @@ def test_verify_shared_venv_approves_pth_pointing_at_main_checkout(tmp_path: Pat
     ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
 
     assert ok
-    assert "main checkout" in message
+    assert "configured checkouts" in message
+
+
+def _setup_repo_with_peer_dep(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a repo with a relative editable dep on a peer repo.
+
+    Returns ``(repo_root, peer_src)`` where ``repo_root/pyproject.toml``
+    declares ``ci-fleet = { path = "../ci_runners", editable = true }`` and
+    ``peer_src`` is the peer repo's ``src`` directory containing
+    ``ci_fleet/__init__.py``.
+    """
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    (repo_root / "pyproject.toml").write_text(
+        '[project]\nname = "charlie-work"\nversion = "0.1.0"\n'
+        '[tool.uv.sources]\nci-fleet = { path = "../ci_runners", editable = true }\n',
+        encoding="utf-8",
+    )
+    peer_root = tmp_path / "ci_runners"
+    peer_src = peer_root / "src"
+    (peer_src / "ci_fleet").mkdir(parents=True)
+    (peer_src / "ci_fleet" / "__init__.py").write_text("", encoding="utf-8")
+    return repo_root, peer_src
+
+
+def test_verify_shared_venv_detects_poisoned_foreign_editable(tmp_path: Path) -> None:
+    """A peer-repo editable .pth pointing at a scratch dir is caught (issue #969 gap 2).
+
+    The old filename filter excluded ``_editable_impl_ci_fleet.pth`` because
+    ``ci_fleet`` is not a top-level package under this repo's ``src``.  The
+    resolved-target test scans every ``.pth`` and flags any path line outside
+    all configured roots.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    # Main repo .pth is healthy; foreign .pth is poisoned.
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(scratch.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+    assert "points outside all configured checkouts" in message
+
+
+def test_verify_shared_venv_approves_healthy_foreign_editable(tmp_path: Path) -> None:
+    """A peer-repo editable .pth pointing at the correct peer src is approved."""
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(peer_src.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert ok
+    assert "configured checkouts" in message
+
+
+def test_verify_shared_venv_catches_foreign_editable_when_main_is_healthy(
+    tmp_path: Path,
+) -> None:
+    """The false-green scenario from issue #969: main .pth healthy, foreign poisoned.
+
+    The old filter + repair would flag the main .pth, repair it, re-verify
+    only the main .pth, and report success while the foreign editable was still
+    pointing into a scratch tree.  The resolved-target test scans every .pth,
+    so the foreign mismatch is surfaced directly.
+    """
+    repo_root, peer_src = _setup_repo_with_peer_dep(tmp_path)
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "_editable_impl_ci_fleet.pth").write_text(
+        str(scratch.resolve()) + "\n", encoding="utf-8"
+    )
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert not ok
+    assert "_editable_impl_ci_fleet.pth" in message
+
+
+def test_verify_shared_venv_ignores_non_path_pth_lines(tmp_path: Path) -> None:
+    """``import``/comment ``.pth`` lines are not treated as path targets.
+
+    ``ci_fleet_probe.pth`` and ``_virtualenv.pth`` contain ``import`` lines
+    that :func:`_resolve_pth_line` returns an empty path for.  They must not
+    trigger a false mismatch under the resolved-target test.
+    """
+    repo_root, _peer_src = _setup_repo_with_peer_dep(tmp_path)
+    site_packages = repo_root / "shared-venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "_editable_impl_charlie_work.pth").write_text(
+        str((repo_root / "src").resolve()) + "\n", encoding="utf-8"
+    )
+    (site_packages / "ci_fleet_probe.pth").write_text(
+        "import sys; exec(__import__('importlib').import_module('ci_fleet_probe')._probe())\n",
+        encoding="utf-8",
+    )
+    (site_packages / "_virtualenv.pth").write_text("import _virtualenv\n", encoding="utf-8")
+
+    ok, message = verify_shared_venv(repo_root, repo_root / "shared-venv")
+
+    assert ok
+    assert "configured checkouts" in message
 
 
 def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
@@ -5650,7 +5761,7 @@ def test_clean_worktrees_removes_merged_worktree_and_verifies_shared_venv(
     assert len(result.data["removed"]) == 1
     assert not info.path.exists()
     assert result.data["venv_ok"] is True
-    assert "main checkout" in result.data["venv_message"]
+    assert "configured checkouts" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_dirty_worktree(tmp_path: Path) -> None:
@@ -6236,7 +6347,7 @@ def test_clean_worktrees_surfaces_poisoned_venv_after_removal(tmp_path: Path) ->
     assert result.ok is False
     assert len(result.data["removed"]) == 1
     assert result.data["venv_ok"] is False
-    assert "points outside main checkout" in result.data["venv_message"]
+    assert "points outside all configured checkouts" in result.data["venv_message"]
 
 
 def test_clean_worktrees_skips_open_pr(tmp_path: Path) -> None:
@@ -7735,3 +7846,254 @@ def test_rework_reuse_capture_cleans_worktree_before_ff(
 
     # Clean up.
     remove_worktree(repo, info2.path, branch=branch_name)
+
+
+def test_worktree_head_sha_returns_real_head(tmp_path: Path) -> None:
+    """Issue #1243: worktree_head_sha against a real repo returns the actual
+    HEAD SHA -- the local half of the orphan-sweep progress fingerprint."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    expected = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert worktree_head_sha(repo) == expected
+
+    # A new commit moves the reported SHA (stranded-commit detection).
+    (repo / "work.txt").write_text("stranded\n", encoding="utf-8")
+    _git(repo, "add", "work.txt")
+    _git(repo, "commit", "-m", "stranded work")
+    new_expected = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    assert new_expected != expected
+    assert worktree_head_sha(repo) == new_expected
+
+
+def test_worktree_head_sha_missing_dir_returns_none(tmp_path: Path) -> None:
+    assert worktree_head_sha(tmp_path / "does-not-exist") is None
+
+
+def test_worktree_head_sha_non_repo_dir_returns_none(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert worktree_head_sha(plain) is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #1248: salvage_push_stranded_commits
+# ---------------------------------------------------------------------------
+#
+# All tests here use real local git repos (a bare "origin" remote + a clone
+# that owns the linked worktrees under test) -- the established pattern for
+# worktree.py functions in this file. No network, no gh.
+
+
+def test_salvage_push_stranded_fast_forward(tmp_path: Path) -> None:
+    """Remote at X, worktree has 2 unpushed commits on top -> pure FF push."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a1"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    old_remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    for name in ("first.txt", "second.txt"):
+        (info.path / name).write_text(f"{name}\n", encoding="utf-8")
+        _git(info.path, "add", name)
+        _git(info.path, "commit", "-m", f"add {name}")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert isinstance(result, SalvagePushResult)
+    assert result.pushed is True
+    assert result.skip_reason is None
+    assert result.error is None
+    assert result.old_remote_sha == old_remote_sha
+    assert result.new_remote_sha == local_tip
+    assert result.commit_count == 2
+
+    assert _git(remote, "rev-parse", branch).stdout.strip() == local_tip
+
+
+def test_salvage_push_diverged_leaves_remote_untouched(tmp_path: Path) -> None:
+    """Remote advanced with a commit the worktree has fetched but is not an
+    ancestor of the local tip -> skip_reason="diverged", remote unchanged.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a2"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    old_remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    # Local, unpushed commit.
+    (info.path / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(info.path, "add", "local.txt")
+    _git(info.path, "commit", "-m", "local unpushed commit")
+
+    # A second clone pushes a sibling commit on the same branch, advancing
+    # origin without the first worktree's knowledge.
+    other_clone = tmp_path / "other-clone"
+    _clone_repo(remote, other_clone)
+    _git(other_clone, "checkout", branch)
+    (other_clone / "remote.txt").write_text("remote\n", encoding="utf-8")
+    _git(other_clone, "add", "remote.txt")
+    _git(other_clone, "commit", "-m", "remote sibling commit")
+    _git(other_clone, "push", "origin", branch)
+
+    # Fetch the new remote tip into the worktree's object store so
+    # `_object_exists` succeeds and the divergence (not "unknown object") is
+    # what `_is_ancestor` actually detects.
+    _git(info.path, "fetch", "origin", branch)
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "diverged"
+    assert result.error is None
+    assert result.old_remote_sha != old_remote_sha  # remote moved via other_clone
+    assert _git(remote, "rev-parse", branch).stdout.strip() == result.old_remote_sha
+
+
+def test_salvage_push_remote_head_not_local(tmp_path: Path) -> None:
+    """Remote tip is unknown to the worktree's object store (never fetched)
+    -> skip_reason="remote_head_not_local", distinct from "diverged".
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a3"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+
+    (info.path / "local.txt").write_text("local\n", encoding="utf-8")
+    _git(info.path, "add", "local.txt")
+    _git(info.path, "commit", "-m", "local unpushed commit")
+
+    other_clone = tmp_path / "other-clone"
+    _clone_repo(remote, other_clone)
+    _git(other_clone, "checkout", branch)
+    (other_clone / "remote.txt").write_text("remote\n", encoding="utf-8")
+    _git(other_clone, "add", "remote.txt")
+    _git(other_clone, "commit", "-m", "remote sibling commit")
+    _git(other_clone, "push", "origin", branch)
+
+    # Deliberately do NOT fetch -- the worktree has never heard of the new
+    # remote tip.
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "remote_head_not_local"
+    assert result.error is None
+
+
+def test_salvage_push_up_to_date_skips(tmp_path: Path) -> None:
+    """Local branch tip already equals the remote tip -> no push attempted."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a4"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    ok, error = push_branch(repo, branch, worktree_path=info.path)
+    assert ok, error
+    remote_sha = _git(remote, "rev-parse", branch).stdout.strip()
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "up_to_date"
+    assert result.old_remote_sha == remote_sha
+    assert _git(remote, "rev-parse", branch).stdout.strip() == remote_sha
+
+
+def test_salvage_push_never_pushed_creates_branch(tmp_path: Path) -> None:
+    """Branch never reached origin, worktree has commits beyond the base ->
+    pushed=True, old_remote_sha=None, branch created on the bare repo.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a5"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # Confirm the branch is genuinely absent on origin before salvage.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is True
+    assert result.skip_reason is None
+    assert result.old_remote_sha is None
+    assert result.new_remote_sha == local_tip
+    assert result.commit_count == 1
+    assert _git(remote, "rev-parse", branch).stdout.strip() == local_tip
+
+
+def test_salvage_push_never_pushed_no_commits_beyond_base_skips(tmp_path: Path) -> None:
+    """Branch never reached origin AND has no commits beyond the base ->
+    skip_reason="no_commits_beyond_base", no branch created.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a6"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+    # No commits made -- worktree HEAD is exactly origin/main's tip.
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "no_commits_beyond_base"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+def test_salvage_push_no_worktree_skips(tmp_path: Path) -> None:
+    """Worktree directory does not exist -> skip_reason="no_worktree"."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    missing_path = tmp_path / "does-not-exist"
+
+    result = salvage_push_stranded_commits(repo, "agent/issue-1248-a7", missing_path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "no_worktree"
+
+
+def test_salvage_push_live_writer_marker_skips(tmp_path: Path) -> None:
+    """A live (this-process) worker writer marker refuses the push."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a8-worker"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+
+    # The current test process's own pid is alive by construction.
+    write_worktree_marker(info.path, os.getpid(), "worker-session-1", kind="worker")
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "live_writer_marker"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+
+
+def test_salvage_push_operator_claimed_marker_skips(tmp_path: Path) -> None:
+    """An operator-claim marker refuses the push regardless of pid liveness."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1248-a8-operator"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+
+    write_worktree_marker(
+        info.path, os.getpid(), OPERATOR_MARKER_SESSION_ID, kind=OPERATOR_MARKER_KIND
+    )
+
+    result = salvage_push_stranded_commits(repo, branch, info.path)
+
+    assert result.pushed is False
+    assert result.skip_reason == "operator_claimed"
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
