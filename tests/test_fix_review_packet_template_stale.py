@@ -186,6 +186,162 @@ def test_loop_regenerates_same_head_packet_when_template_stale(tmp_path: Path) -
     assert "stale-digest" != current_sha
 
 
+# ---------------------------------------------------------------------------
+# Issue #1338: escalated PRs must not re-fire review_packet_template_stale
+# every pass. Escalation is terminal -- review() early-returns before the
+# regen path, so the staleness WARNING would fire identically every pass
+# without ever converging. The recovery procedure (unescalate +
+# why-charlie-hate) regenerates the packet with the current template, so the
+# staleness check and regen attempt are skipped entirely while escalated.
+# ---------------------------------------------------------------------------
+
+
+def _seed_pr_escalated(app: OrchestratorApp, pr_number: int, issue_number: int) -> None:
+    """Mark a PR and its linked issue as escalated in state.json."""
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "issue_number": issue_number,
+            "status": "escalated",
+            "escalation_reason": "test_escalation",
+        }
+        state["issues"][str(issue_number)] = {
+            "number": issue_number,
+            "status": "escalated",
+            "escalation_reason": "test_escalation",
+        }
+        save_state(app.paths.state_file, state)
+
+
+def _seed_issue_escalated(app: OrchestratorApp, issue_number: int) -> None:
+    """Mark only the linked issue as escalated (PR status left non-escalated)."""
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"][str(issue_number)] = {
+            "number": issue_number,
+            "status": "escalated",
+            "escalation_reason": "test_escalation",
+        }
+        save_state(app.paths.state_file, state)
+
+
+def test_loop_skips_template_stale_warning_for_escalated_pr(tmp_path: Path) -> None:
+    """An escalated PR with a stale-template packet must NOT emit
+    ``review_packet_template_stale`` on every pass -- the regen is
+    unreachable (review() early-returns "escalated; review skipped") and the
+    WARNING would spam events.db identically every pass without converging
+    (issue #1338). The recovery procedure regenerates the packet, so the
+    staleness check is skipped entirely while escalated."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_pr_escalated(app, pr_number=456, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
+    # Run two passes -- the bug fired the WARNING every pass.
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    # review() was never invoked for the escalated PR (regen is unreachable).
+    assert 456 not in review_calls
+    # No staleness WARNING was emitted at all -- escalation is terminal and
+    # the recovery procedure handles regen, so the check is skipped entirely.
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+def test_loop_skips_template_stale_warning_for_issue_escalated(tmp_path: Path) -> None:
+    """A PR whose linked ISSUE is escalated (even if the PR's own status is
+    not "escalated") must likewise skip the staleness check -- review()'s
+    entry gate checks both pr_escalated and issue_escalated, so the regen is
+    unreachable here too and the WARNING would spam identically."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_issue_escalated(app, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    assert 456 not in review_calls
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+def test_loop_regenerates_template_stale_after_unescalate(tmp_path: Path) -> None:
+    """Once the PR is de-escalated, the staleness check and regen must resume
+    -- the #592 behavior is preserved for non-escalated PRs. This proves the
+    #1338 skip is scoped to the escalated window only, not a permanent
+    suppression."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_pr_escalated(app, pr_number=456, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    # Pass 1 while escalated: no warning, no review() call.
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+    app.loop(limit=0)
+    assert 456 not in review_calls
+    assert not any(
+        e.get("pr_number") == 456
+        for e in _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    )
+
+    # De-escalate: clear the escalated status so the staleness check resumes.
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"]["status"] = "reviewing"
+        state["issues"]["123"]["status"] = "reviewing"
+        save_state(app.paths.state_file, state)
+
+    # Pass 2 after unescalate: review() is invoked and the staleness event
+    # fires exactly as today (#592 preserved).
+    app.loop(limit=0)
+    assert 456 in review_calls
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert any(e.get("pr_number") == 456 for e in events)
+
+
 def test_loop_skips_same_head_packet_when_template_matches(tmp_path: Path) -> None:
     """Same head AND current template -> skip regeneration (the deliberate
     idempotence guard is preserved)."""

@@ -19337,6 +19337,31 @@ class OrchestratorApp:
                             )
                             self._record_merge_or_error(merge_result, errors, merges)
                     else:
+                        # Issue #1338: an escalated PR's packet regeneration is
+                        # unreachable -- review() early-returns "escalated;
+                        # review skipped" before the regen path -- so the
+                        # staleness check below would re-emit an identical
+                        # review_packet_template_stale WARNING every pass
+                        # without ever converging. Escalation means "awaiting
+                        # a human", and the recovery procedure (unescalate +
+                        # why-charlie-hate) already regenerates the packet with
+                        # the current template, so skip the staleness check
+                        # and regen attempt entirely while escalated. This
+                        # mirrors review()'s own entry gate
+                        # (_escalation_flags) and the already_approved
+                        # branch's exclusion of "escalated" above. A
+                        # non-escalated stale-template PR still regenerates
+                        # exactly as today (#592 preserved).
+                        issue_state_for_esc = (
+                            state.get("issues", {}).get(str(issue_number), {})
+                            if issue_number is not None
+                            else None
+                        )
+                        pr_escalated_now, issue_escalated_now = _escalation_flags(
+                            pr_state, issue_state_for_esc
+                        )
+                        if pr_escalated_now or issue_escalated_now:
+                            continue
                         # Emit a distinct event when regeneration fires
                         # because the template changed while the head stayed
                         # put, so a fleet-wide template edit is visible as a
