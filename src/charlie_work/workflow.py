@@ -7235,6 +7235,17 @@ class OrchestratorApp:
             # pass, or flagged and still carrying agent:human-needed stays
             # excluded. ``bound`` exclusions are never lifted -- those PRs
             # genuinely bound to the issue by a hijack-safe signal.
+            #
+            # The durable stamp + event emission is routed through
+            # ``_stamp_mention_rearm`` (Convention A: ``self.write_gate.*``)
+            # rather than raw ``append_event``/``save_state`` so the R9
+            # shrink-only ratchet on workflow.py's raw-primitive count
+            # (issue #1264 W6 PR4) is not increased -- the re-arm writes are
+            # new territory this wave does not convert, and a raw
+            # ``append_event``+``save_state`` pair would trip the ratchet
+            # (baseline 266). The existing flag block above stays raw (it is
+            # part of the ratchet's baseline); only the NEW re-arm writes go
+            # through the gate.
             rearmed_mention_issues, newly_rearmed_mention_issues = (
                 self._mention_rearmed_issue_numbers(
                     merged_pr_mention_only_issue_numbers,
@@ -7243,22 +7254,7 @@ class OrchestratorApp:
                     already_flagged_mention_issues,
                 )
             )
-            for issue_number in newly_rearmed_mention_issues:
-                _ra_key = str(issue_number)
-                _ra_entry = state["issues"].get(_ra_key, {})
-                state["issues"][_ra_key] = {
-                    **_ra_entry,
-                    "number": issue_number,
-                    "mention_rearmed_at": utc_now(),
-                }
-            if newly_rearmed_mention_issues:
-                state = append_event(
-                    state,
-                    "dispatch_merged_pr_mention_rearmed",
-                    {"issue_numbers": sorted(newly_rearmed_mention_issues)},
-                    state_path=self.paths.state_file,
-                )
-                save_state(self.paths.state_file, state)
+            state = self._stamp_mention_rearm(state, newly_rearmed_mention_issues)
             # Recompute the exclusion set so the candidate filter below and
             # the result payload reflect the lifted mention-only exclusions.
             # ``bound`` exclusions are never lifted.
@@ -21343,6 +21339,45 @@ class OrchestratorApp:
                 rearmed.add(issue_number)
                 newly_detected.append(issue_number)
         return rearmed, newly_detected
+
+    def _stamp_mention_rearm(
+        self,
+        state: dict[str, Any],
+        newly_rearmed: list[int],
+    ) -> dict[str, Any]:
+        """Issue #1336: durably stamp ``mention_rearmed_at`` and emit the
+        ``dispatch_merged_pr_mention_rearmed`` event for issues the operator
+        re-armed this pass.
+
+        Routed through WriteGate (Convention A: ``self.write_gate.*``) so the
+        R9 shrink-only ratchet on workflow.py's raw-primitive count (issue
+        #1264 W6 PR4) is not increased -- the re-arm writes are new territory
+        this wave does not convert, and a raw ``append_event``/``save_state``
+        pair would trip the ratchet (baseline 266). The existing flag block in
+        ``_dispatch_impl`` stays raw (it is part of the ratchet's baseline);
+        only the NEW re-arm writes go through the gate.
+
+        Returns ``state`` (possibly updated by ``append_event``). In dry-run
+        mode the gate no-ops and ``state`` is returned unchanged -- but this
+        method is only called from the non-dry-run dispatch path (the dry-run
+        early return precedes it), so the dry-run no-op is defence-in-depth.
+        """
+        for issue_number in newly_rearmed:
+            _ra_key = str(issue_number)
+            _ra_entry = state["issues"].get(_ra_key, {})
+            state["issues"][_ra_key] = {
+                **_ra_entry,
+                "number": issue_number,
+                "mention_rearmed_at": utc_now(),
+            }
+        if newly_rearmed:
+            state = self.write_gate.append_event(
+                state,
+                "dispatch_merged_pr_mention_rearmed",
+                {"issue_numbers": sorted(newly_rearmed)},
+            )
+            self.write_gate.save_state(state)
+        return state
 
     def _is_dispatchable(
         self,
