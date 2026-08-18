@@ -14371,7 +14371,9 @@ def test_orphaned_worker_sweep_runs_with_watchdog_disabled(tmp_path: Path) -> No
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # The #935 salvage backstop fired despite watchdog being disabled: a PR was
     # opened for the pushed branch and the issue moved to open_passive.
@@ -24278,7 +24280,7 @@ def test_classify_dead_sessions_relabel_idempotent(tmp_path: Path) -> None:
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify first pass relabeled the issue
@@ -24307,7 +24309,7 @@ def test_classify_dead_sessions_relabel_idempotent(tmp_path: Path) -> None:
 
     # Second pass: run classification again
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify second pass did NOT emit duplicate event (idempotency)
@@ -24407,7 +24409,7 @@ def test_classify_dead_sessions_preserves_state_record_branch(tmp_path: Path) ->
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify branch and worktree_path are preserved byte-identical
@@ -24505,7 +24507,7 @@ def test_classify_dead_sessions_dispatch_recovery_integration(tmp_path: Path) ->
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify the issue was relabeled to ready
@@ -24635,7 +24637,7 @@ def test_classify_dead_sessions_with_closed_pr_triggers_relabel(tmp_path: Path) 
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify relabel fired despite CLOSED PR (OPEN filter works)
@@ -24727,7 +24729,7 @@ def test_classify_dead_sessions_with_open_pr_suppresses_relabel(tmp_path: Path) 
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify relabel did NOT fire (OPEN PR guard works)
@@ -24841,7 +24843,7 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
 
     # Run the reap pass.
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # Verify state was restored to rework_requested for the owning lane.
@@ -24973,7 +24975,7 @@ def test_classify_dead_rework_session_stale_prompt_does_not_reopen_approved_head
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -25075,7 +25077,7 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -25177,7 +25179,7 @@ def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -25265,7 +25267,7 @@ def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -25356,7 +25358,7 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -25441,7 +25443,7 @@ def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediate
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -25533,7 +25535,9 @@ def test_classify_dead_rework_session_completed_worktree_not_rolled_back(
         }
         save_state(state_file, state)
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     entry = state["issues"]["315"]
@@ -25629,7 +25633,7 @@ def test_classify_dead_sessions_worker_blocked_escalates_and_suppresses_redispat
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # (a) No hot relabel-to-ready — the escalation path must never grant the
@@ -25749,7 +25753,7 @@ def test_classify_dead_sessions_worker_blocked_log_tail_fallback_escalates_and_s
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # No hot relabel-to-ready — same structural proof as the DB-based test.
@@ -25835,7 +25839,7 @@ def test_worktree_unsafe_launch_failure_escalates_and_suppresses_redispatch(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # No hot relabel-to-ready.
@@ -25929,7 +25933,7 @@ def test_worktree_probe_failed_launch_failure_does_not_escalate(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     # No escalation transition — human_needed must NOT be added, and the
@@ -26033,7 +26037,7 @@ def test_classify_dead_sessions_retains_sidecar_on_inconclusive_probe(
 
     with patch("charlie_work.worker.is_session_alive", return_value=False):
         _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, paths.state_file, fake_gh, config
+            sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
         )
 
     assert sidecar_path.exists(), "sidecar must be RETAINED when the probe is inconclusive"
@@ -26112,7 +26116,7 @@ def test_classify_dead_sessions_reaps_sidecar_when_probe_conclusively_stale(
         patch("charlie_work.worker.real_activity_probe_for", return_value=stale_probe),
     ):
         _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, paths.state_file, fake_gh, config
+            sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
         )
 
     assert not sidecar_path.exists(), "a conclusively-stale probe must still allow reaping"
@@ -26218,6 +26222,7 @@ def test_stall_and_dead_lane_increment_deferral_counter_at_most_once_per_pass(
             fake_gh,
             config,
             persist_inconclusive_probe_counter=False,
+            write_gate=_wg(paths.state_file),
         )
 
     assert sidecar_path.exists(), "sidecar must be RETAINED when the probe is inconclusive"
@@ -26348,6 +26353,7 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
                 fake_gh,
                 config,
                 persist_inconclusive_probe_counter=False,
+                write_gate=_wg(paths.state_file),
             )
 
     def _run_pass() -> None:
@@ -29277,7 +29283,7 @@ def test_reap_restore_sets_startup_death_flag(
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     state = load_state(paths.state_file)
@@ -29403,6 +29409,7 @@ def test_reap_restore_startup_death_stalled_real_pid_under_classification_delay(
         open_prs_by_issue,
         worker,
         failure_kind="stalled",
+        write_gate=_wg(paths.state_file),
     )
 
     state = load_state(paths.state_file)
@@ -29510,6 +29517,7 @@ def test_reap_restore_stalled_long_runtime_not_startup_death(
         open_prs_by_issue,
         worker,
         failure_kind="stalled",
+        write_gate=_wg(paths.state_file),
     )
 
     state = load_state(paths.state_file)
@@ -36654,7 +36662,9 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _sweep_orphan_processes_for_dead_sessions(sessions_dir, paths.state_file, config)
+        _sweep_orphan_processes_for_dead_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # Verify taskkill was called for the orphan PIDs
     assert len(taskkill_calls) == 3
@@ -38729,7 +38739,9 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify the transition
     state = load_state(paths.state_file)
@@ -38819,7 +38831,9 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1108"]
@@ -38900,7 +38914,9 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -38998,7 +39014,9 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -39100,7 +39118,9 @@ def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Pa
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     # Pass 1: the no-open-PR drift branch fires (no active labels to reclaim,
     # no pushed branch).  It must stamp orphan_drift_at so the time-based
@@ -39216,7 +39236,9 @@ def test_orphaned_worker_no_open_pr_already_flagged_backstop_backfills(tmp_path:
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     # Pass 1: the drift branch is reached (no active labels to reclaim).  The
     # duplicate-event guard sees orphan_flagged_at already set, but the
@@ -39338,7 +39360,9 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -39425,7 +39449,9 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -39498,7 +39524,9 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Issue 207 has a linked open PR (number 100), so no_pr_orphans is empty
     # and the bulk issue-list sweep must not run.
@@ -39565,7 +39593,9 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -39651,7 +39681,9 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -39722,7 +39754,9 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify NO auto-reset
     state = load_state(paths.state_file)
@@ -39785,7 +39819,9 @@ def test_orphaned_worker_detection_with_live_pid(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify NO changes
     state = load_state(paths.state_file)
@@ -39858,7 +39894,9 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify it was treated as dead
     state = load_state(paths.state_file)
@@ -39911,7 +39949,9 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # Load state and verify NO status auto-reset
     state = load_state(paths.state_file)
@@ -39971,7 +40011,9 @@ def test_orphaned_worker_detection_no_open_pr_emits_once(tmp_path: Path) -> None
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         for _ in range(3):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     state = load_state(paths.state_file)
     drift_events = [e for e in state.get("events", []) if e.get("kind") == "orphaned_worker_drift"]
@@ -40030,7 +40072,9 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -40090,7 +40134,9 @@ def test_orphaned_worker_detection_bulk_sweep_excludes_pre_flagged(tmp_path: Pat
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -40148,7 +40194,9 @@ def test_orphaned_worker_detection_bulk_sweep_does_not_flood_event_buffer(tmp_pa
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state["events"]
@@ -40224,7 +40272,9 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # The stale active label must have been removed -- this is exactly what
     # _is_dispatchable requires (ready present, no active label) for the
@@ -40263,7 +40313,9 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     fake_gh.labels_added = []
     fake_gh.labels_removed = []
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     assert fake_gh.labels_added == []
     assert fake_gh.labels_removed == []
@@ -40322,7 +40374,9 @@ def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path:
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         # Pass 1: the gh API call fails.
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1176"]
@@ -40342,7 +40396,9 @@ def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path:
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     assert (1176, config.labels.in_progress) in fake_gh.labels_removed
     assert (1176, config.labels.ready) in fake_gh.labels_added
@@ -40484,7 +40540,9 @@ def test_orphaned_worker_pushed_branch_opens_pr(tmp_path: Path) -> None:
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["935"]
@@ -40581,7 +40639,9 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     fake_gh = FakeGitHubForFailedPr()
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["935"]
@@ -40691,8 +40751,12 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
     fake_gh = FakeGitHubForFailedPr()
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["935"]
@@ -40722,7 +40786,9 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
     save_state(paths.state_file, state)
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -40797,7 +40863,7 @@ def test_classify_dead_sessions_no_open_pr_happy_path_reclaims_in_one_pass(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     assert (99, config.labels.in_progress) in fake_gh.labels_removed
@@ -40862,7 +40928,9 @@ def test_orphaned_worker_no_open_pr_terminal_label_only_is_left_alone(tmp_path: 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     # No GitHub label call at all -- not even a redundant re-add of a label
     # that was already there.
@@ -40941,7 +41009,7 @@ def test_classify_dead_sessions_terminal_label_only_is_left_alone(tmp_path: Path
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, paths.state_file, fake_gh, config
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
     )
 
     assert fake_gh.labels_added == []
@@ -41396,7 +41464,9 @@ def test_classify_dead_sessions_salvages_completed_unpublished_work(
     ]
     gh.pr_create_return = 101
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     # Branch pushed and PR created
     remote_refs = _git(remote, "show-ref")
@@ -41441,7 +41511,9 @@ def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path)
     ]
     gh.pr_create_return = 101
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     # No PR created, active label removed, ready label added
     assert not gh.prs_created
@@ -41484,7 +41556,9 @@ def test_classify_dead_sessions_skips_salvage_when_issue_closed(tmp_path: Path) 
     ]
     gh.pr_create_return = 999  # would-be vestigial salvage PR
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     # No vestigial PR opened.
     assert not gh.prs_created
@@ -41546,7 +41620,9 @@ def test_classify_dead_sessions_skips_salvage_when_pr_merged(tmp_path: Path) -> 
     ]
     gh.pr_create_return = 999
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     assert not gh.prs_created
     state = json.loads(state_file.read_text(encoding="utf-8"))
@@ -41610,7 +41686,9 @@ def test_classify_dead_sessions_skips_salvage_when_branch_empty_diff(
     ]
     gh.pr_create_return = 999
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     # No vestigial PR: the branch contributes nothing beyond current main.
     assert not gh.prs_created
@@ -41666,7 +41744,9 @@ def test_classify_dead_sessions_salvage_proceeds_when_merged_pr_search_fails(
     ]
     gh.pr_create_return = 888
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     # Salvage proceeded: the ok=False search fell through to the empty-diff
     # check, which also did not fire (branch has real work), so a PR was opened.
@@ -41801,7 +41881,9 @@ def test_classify_dead_sessions_relabel_carries_required_reason(tmp_path: Path) 
     ]
     gh.pr_create_return = 101
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     state = json.loads(state_file.read_text(encoding="utf-8"))
     events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
@@ -41854,7 +41936,9 @@ def test_orphaned_worker_reclaim_carries_required_reason(tmp_path: Path) -> None
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
@@ -41921,7 +42005,9 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     def _simulate_redispatch(dispatch_index: int) -> None:
         """Simulate a dispatch between sweeps: reset the issue's GitHub labels
@@ -42072,7 +42158,9 @@ def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> No
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=new_sha),
         patch("charlie_work.workflow.worktree_head_sha", return_value=None),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
@@ -42191,7 +42279,9 @@ def test_orphan_sweep_redispatch_cap_resets_on_stranded_local_commits(
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=remote_sha),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
@@ -42283,7 +42373,9 @@ def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
 
     # First orphan-sweep pass through the cap code for this issue.
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
@@ -42370,7 +42462,9 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     def _simulate_dispatch(dispatch_index: int) -> None:
         """Simulate a real dispatch between sweeps WITHOUT touching
@@ -42486,7 +42580,9 @@ def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     # Run 5 sweep passes -- well past max_auto_redispatch=3 -- WITHOUT ever
     # changing dispatched_at/worker_pid, simulating the #417 reclaim leaving
@@ -42567,7 +42663,9 @@ def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
 
     def _run_sweep() -> None:
         with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     def _simulate_redispatch(worker_pid: int) -> None:
         """A genuine redispatch always assigns a new worker_pid -- change the
@@ -42639,7 +42737,9 @@ def test_classify_dead_sessions_no_commits_relabels_to_ready(tmp_path: Path) -> 
     ]
     gh.pr_create_return = 101
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     assert not gh.prs_created
     assert (254, config.labels.in_progress) in gh.labels_removed
@@ -42676,7 +42776,9 @@ def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) ->
         "simulated push failure",
     )
     try:
-        _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+        _classify_dead_sessions_and_update_throttle_state(
+            sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+        )
     finally:
         workflow_module.push_branch = original_push_branch
 
@@ -42745,7 +42847,9 @@ def test_classify_dead_sessions_dead_api_session_settles_budget_ledger(
     ]
     gh.prs = []
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     sessions = ledger_entries(state_file.parent)
     assert len(sessions) == 1, "dead api session must settle into the ledger"
@@ -42797,7 +42901,9 @@ def test_classify_dead_sessions_launch_failed_api_session_settles_budget_ledger(
     ]
     gh.prs = []
 
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
 
     sessions = ledger_entries(state_file.parent)
     assert len(sessions) == 1, "launch-failed api session must settle into the ledger"
@@ -42998,7 +43104,7 @@ def test_classify_dead_sessions_api_provider_auth_classification(
     before = datetime.now(UTC)
     with patch("charlie_work.worker.is_worker_alive", return_value=False):
         reaped = _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, state_file, gh, config
+            sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
         )
 
     # The reaped entry carries the resolved failure_kind (provider_auth, not
@@ -43057,7 +43163,7 @@ def test_classify_dead_sessions_launch_failed_api_provider_auth(
 
     with patch("charlie_work.worker.is_worker_alive", return_value=False):
         reaped = _classify_dead_sessions_and_update_throttle_state(
-            sessions_dir, state_file, gh, config
+            sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
         )
 
     api_reaped = [r for r in reaped if r["issue_number"] == 4804]
@@ -43553,7 +43659,9 @@ def test_orphaned_worker_routes_merge_conflict_to_rework(tmp_path: Path) -> None
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+    _detect_and_handle_orphaned_workers(
+        sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+    )
 
     state = load_state(paths.state_file)
     assert state["issues"]["42"]["status"] == "rework_requested"
@@ -43632,7 +43740,9 @@ def test_orphaned_worker_routes_stale_empty_checks_to_rework(tmp_path: Path) -> 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+    _detect_and_handle_orphaned_workers(
+        sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+    )
 
     state = load_state(paths.state_file)
     assert state["issues"]["42"]["status"] == "rework_requested"
@@ -43992,7 +44102,12 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            review_callback=fake_review,
+            write_gate=_wg(paths.state_file),
         )
 
     state = load_state(paths.state_file)
@@ -44061,7 +44176,12 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            review_callback=fake_review,
+            write_gate=_wg(paths.state_file),
         )
 
     state = load_state(paths.state_file)
@@ -44082,7 +44202,12 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     # Second pass must not re-emit the drift.
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, review_callback=fake_review
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            review_callback=fake_review,
+            write_gate=_wg(paths.state_file),
         )
 
     state = load_state(paths.state_file)
@@ -44137,7 +44262,9 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         for _ in range(3):
-            _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+            _detect_and_handle_orphaned_workers(
+                sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+            )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -44204,7 +44331,9 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1109"]
@@ -44301,7 +44430,9 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1109"]
@@ -44376,7 +44507,9 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1109"]
@@ -44459,7 +44592,9 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -44507,7 +44642,9 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
 
     # Force the identical drift conditions again after the redispatch.
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -44585,7 +44722,9 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1578"]
@@ -44616,7 +44755,9 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
     # A second pass must not re-advance or re-emit (status is no longer
     # dispatched, so the sweep skips it entirely).
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     events = state.get("events", [])
@@ -44694,7 +44835,9 @@ def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1578"]
@@ -44793,7 +44936,9 @@ def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1578"]
@@ -46850,12 +46995,19 @@ def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
     assert set(sweep[0]["payload"]["pr_numbers"]) == set(prs)
 
 
-def test_review_dispatch_noise_loop_aggregation_preserves_history() -> None:
+def test_review_dispatch_noise_loop_aggregation_preserves_history(tmp_path: Path) -> None:
     """Issue #525: a repeating per-pass noise loop cannot evict unrelated events.
 
     Simulates 5 ghost reviewer sessions x 2 events per pass for 250 passes.
     Without aggregation the events array would hold 2501 entries and evict the
     diagnostic event; with per-kind aggregation it stays at 501.
+
+    Issue #1264 (W6 PR3): this test predates the ``write_gate`` requirement
+    and operates on an in-memory ``state`` dict with no ``state_file``
+    fixture. ``_append_sweep_events`` now requires a real ``WriteGate``, so a
+    ``tmp_path``-scoped one (``dry_run=False``, matching the pre-conversion
+    always-write behavior this test exercises) is threaded through purely to
+    satisfy that contract -- it is never read from disk.
     """
     state = empty_state()
     state = append_event(state, "diagnostic_event", {"note": "keep me"}, max_size=2000)
@@ -46872,7 +47024,9 @@ def test_review_dispatch_noise_loop_aggregation_preserves_history() -> None:
             )
             for pr in prs
         ]
-        state = _append_sweep_events(state, sweep_events, max_size=2000)
+        state = _append_sweep_events(
+            state, sweep_events, max_size=2000, write_gate=_wg(tmp_path / "state.json")
+        )
 
     diagnostic = [e for e in state["events"] if e.get("kind") == "diagnostic_event"]
     assert len(diagnostic) == 1
@@ -48658,7 +48812,9 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     assert len(salvage_calls) == 1
     assert salvage_calls[0][1] == "agent/issue-1248"
@@ -48761,7 +48917,9 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1248"]
@@ -48838,7 +48996,9 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1248"]
@@ -48908,6 +49068,8 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     assert salvage_calls == []

@@ -21,8 +21,13 @@ from charlie_work.config import (
 )
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state
 from charlie_work.workflow import _detect_and_handle_orphaned_workers
+from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
+
+
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_none_not_in_deterministic_escalation_failure_kinds() -> None:
@@ -141,7 +146,9 @@ def test_orphan_salvage_repo_root_guard(
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
         patch("charlie_work.workflow._open_pr_for_orphaned_branch", side_effect=fake_open_pr),
     ):
-        _detect_and_handle_orphaned_workers(sessions_dir, state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, state_file, config, fake_gh, write_gate=_wg(state_file)
+        )
 
     state = load_state(state_file)
     issue_state = state["issues"][str(issue_number)]

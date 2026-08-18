@@ -1,12 +1,13 @@
-"""Tests for ``charlie_work.write_gate`` (issue #1264, W6 PR1).
+"""Tests for ``charlie_work.write_gate`` (issue #1264, W6 PR1; kill_process
+added W6 PR3, R6a).
 
 Covers the design doc's §8 test plan items 1-5: frozen/immutability,
 construction/equality, dry_run=True zero-call/nothing-happened behavior for
-each of the 5 gated methods, dry_run=False exact passthrough (including
-auto-bound ``state_path``/``repo``), ``require_write_gate``'s raise-on-
-missing-gate contract, and that ``OrchestratorApp.__init__`` constructs
-``self.write_gate`` with fields matching its own ``dry_run``/``paths``/
-``repo_root``.
+each of the 6 gated methods (5 from PR1 plus ``kill_process`` from PR3),
+dry_run=False exact passthrough (including auto-bound ``state_path``/
+``repo``), ``require_write_gate``'s raise-on-missing-gate contract, and that
+``OrchestratorApp.__init__`` constructs ``self.write_gate`` with fields
+matching its own ``dry_run``/``paths``/``repo_root``.
 
 All external effects (state.py/instrumentation.py/labels.py primitives) are
 monkeypatched at the module level ``write_gate.py`` looks them up at --
@@ -118,6 +119,15 @@ def test_transition_dry_run_true_never_calls_primitive(monkeypatch: pytest.Monke
     result = gate.transition(object(), object(), 123, "escalated")
     assert calls == []
     assert result == TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])
+
+
+def test_kill_process_dry_run_true_never_calls_primitive(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(write_gate, "kill_orphan_pid", lambda *a, **k: calls.append((a, k)))
+    gate = _gate(dry_run=True)
+    result = gate.kill_process(99999)
+    assert calls == []
+    assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +268,20 @@ def test_transition_dry_run_false_passes_through(monkeypatch: pytest.MonkeyPatch
     result = gate.transition(gh_sentinel, labels_sentinel, 123, "escalated")
     assert calls == [(gh_sentinel, labels_sentinel, 123, "escalated")]
     assert result is expected
+
+
+def test_kill_process_dry_run_false_passes_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def fake_kill_orphan_pid(pid):
+        calls.append(pid)
+        return None  # the real primitive is best-effort and always returns None
+
+    monkeypatch.setattr(write_gate, "kill_orphan_pid", fake_kill_orphan_pid)
+    gate = _gate(dry_run=False)
+    result = gate.kill_process(99999)
+    assert calls == [99999]
+    assert result is None
 
 
 # ---------------------------------------------------------------------------

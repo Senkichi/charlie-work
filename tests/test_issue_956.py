@@ -11,6 +11,11 @@ import pytest
 
 from _salvage_fixtures import _SalvageTestGitHub, _salvage_labels
 from charlie_work.config import OrchestratorConfig
+from charlie_work.write_gate import WriteGate
+
+
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_open_salvage_pr_creates_pr_and_moves_labels(tmp_path: Path) -> None:
@@ -220,6 +225,7 @@ def test_attempt_salvage_records_salvaged_event(
         state_file=state_file,
         failure_kind="unpublished_work",
         issue_title="Completed but unpublished",
+        write_gate=_wg(state_file),
     )
 
     assert salvaged is True
@@ -259,6 +265,7 @@ def test_attempt_salvage_records_label_write_failure(
         state_file=state_file,
         failure_kind="unpublished_work",
         issue_title="Completed but labels fail",
+        write_gate=_wg(state_file),
     )
 
     assert salvaged is True

@@ -5,8 +5,6 @@ import json
 import logging
 import os
 import re
-import signal
-import subprocess
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field, replace as dataclasses_replace
@@ -55,7 +53,7 @@ from . import layout
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from . import rescue as rescue_helpers
-from .subprocess_runner import no_console_window_kwargs, run_captured
+from .subprocess_runner import run_captured
 from .cross_family import (
     CrossFamilyResult,
     LEGACY_VACUOUS_SUMMARY,
@@ -198,12 +196,13 @@ from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
 from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,
+    kill_orphan_pid,
     kill_process_tree,
     sweep_orphan_processes,
 )
 from .worker import WorkerHealth, WorkerView, iter_workers
 from .routing import AdapterChoice, record_adapter_choice, select_adapter
-from .write_gate import WriteGate
+from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -914,6 +913,7 @@ def _emit_session_failed_relabeled(
     added_ready: bool = False,
     label_write_ok: bool = True,
     state_path: Path | None = None,
+    write_gate: WriteGate,
     **extra: Any,
 ) -> dict[str, Any]:
     """Emit a ``session_failed_relabeled`` event via the shared payload builder.
@@ -921,8 +921,18 @@ def _emit_session_failed_relabeled(
     Thin wrapper around :func:`_session_failed_relabeled_payload` plus
     :func:`append_event`; see the payload builder's docstring for the
     required-``reason`` invariant (issue #978).
+
+    Issue #1264 (W6 PR3): ``write_gate`` is declared explicitly (not folded
+    into ``**extra``) so a caller that forgets it gets ``require_write_gate``'s
+    loud ``TypeError`` instead of the gate silently landing in the event
+    payload. ``state_path`` is consequently now vestigial (the gate
+    auto-binds its own ``state_path``) but kept as a parameter rather than
+    removed, the same call PR2 made for the analogous
+    ``_merge_on_write_save`` seam (adversarial-review finding F3), to avoid
+    churning callers for no behavioral gain.
     """
-    return append_event(
+    write_gate = require_write_gate(write_gate)
+    return write_gate.append_event(
         state,
         "session_failed_relabeled",
         _session_failed_relabeled_payload(
@@ -934,7 +944,6 @@ def _emit_session_failed_relabeled(
             label_write_ok=label_write_ok,
             **extra,
         ),
-        state_path=state_path,
     )
 
 
@@ -1215,26 +1224,15 @@ def _detect_stalled_sessions(
     return stalled_entries
 
 
-def _kill_orphan_pid(pid: int) -> None:
-    """Best-effort kill of a single orphan PID, cross-platform.
-
-    Mirrors the OS branch used by kill_process_tree: taskkill on Windows,
-    os.kill(SIGKILL) on POSIX. Never raises - callers treat this as best-effort
-    and always record the PID as killed regardless of outcome.
-    """
-    try:
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True,
-                text=True,
-                **no_console_window_kwargs(),
-            )
-        else:
-            os.kill(pid, signal.SIGKILL)
-    except (OSError, subprocess.SubprocessError, FileNotFoundError):
-        # Best-effort kill - don't fail if the kill attempt fails
-        pass
+# NOTE: the former `_kill_orphan_pid` free function that lived here was
+# hoisted to `process_utils.kill_orphan_pid` verbatim (issue #1264, W6 PR3,
+# R6a) so that `write_gate.py` can wrap it as `WriteGate.kill_process`
+# without importing this module. The two call sites below
+# (`_detect_and_handle_stalled_sessions`) are unconditional and out of this
+# PR's scope -- see issue #1311's sibling filing for that function's own
+# dry-run leak -- so they call the hoisted primitive raw, unchanged in
+# behavior. The one in-scope call site (`_sweep_orphan_processes_for_dead_sessions`)
+# now goes through `write_gate.kill_process` instead.
 
 
 def _detect_and_handle_stalled_sessions(
@@ -1372,7 +1370,7 @@ def _detect_and_handle_stalled_sessions(
             orphan_processes = sweep_orphan_processes(w.worktree_path)
             if orphan_processes:
                 for orphan in orphan_processes:
-                    _kill_orphan_pid(orphan["pid"])
+                    kill_orphan_pid(orphan["pid"])
                     killed_pids.append(orphan["pid"])
                 orphan_pids_budget = [o["pid"] for o in orphan_processes]
 
@@ -1468,7 +1466,7 @@ def _detect_and_handle_stalled_sessions(
             if orphan_processes:
                 # Kill detected orphans to prevent them from running rejected code
                 for orphan in orphan_processes:
-                    _kill_orphan_pid(orphan["pid"])
+                    kill_orphan_pid(orphan["pid"])
                     killed_pids.append(orphan["pid"])
                 orphan_pids = [o["pid"] for o in orphan_processes]
 
@@ -1910,6 +1908,7 @@ def _detect_and_handle_orphaned_workers(
     config: OrchestratorConfig,
     gh: GitHubLike,
     *,
+    write_gate: WriteGate,
     review_callback: Callable[[int], Any] | None = None,
 ) -> None:
     """Detect and handle orphaned workers using state.json PID records.
@@ -1957,6 +1956,7 @@ def _detect_and_handle_orphaned_workers(
     reclaim, or the orphan drift diagnostics -- all of which are keyed off
     state.json PID records, not log mtimes.
     """
+    write_gate = require_write_gate(write_gate)
 
     def _drift_fingerprint(**parts: Any) -> str:
         """Stable fingerprint for an orphaned-worker drift finding."""
@@ -2230,6 +2230,7 @@ def _detect_and_handle_orphaned_workers(
                 issue_number,
                 reason,
                 failure_kind=None,
+                write_gate=write_gate,
             )
             if route_result is not None:
                 pre_review_routed.add(issue_number)
@@ -3009,9 +3010,13 @@ def _detect_and_handle_orphaned_workers(
             state["issues"][str(issue_number)] = entry
 
         state = _append_sweep_events(
-            state, sweep_events, max_size=config.runtime.event_ring_size, state_file=state_file
+            state,
+            sweep_events,
+            max_size=config.runtime.event_ring_size,
+            state_file=state_file,
+            write_gate=write_gate,
         )
-        save_state(state_file, state)
+        write_gate.save_state(state)
 
     # Route head-advanced request_changes findings to the review lane outside
     # the state lock. review() generates the packet, fires the review_started
@@ -3078,7 +3083,7 @@ def _detect_and_handle_orphaned_workers(
                     "orphan_drift_fingerprint": fingerprint,
                     "orphan_drift_at": utc_now(),
                 }
-            state = append_event(
+            state = write_gate.append_event(
                 state,
                 "orphaned_worker_routed_to_review"
                 if review_result.ok
@@ -3092,9 +3097,8 @@ def _detect_and_handle_orphaned_workers(
                     "reviewed_head_sha": reviewed_head_sha_before,
                     "reason": "dead_worker_with_head_change",
                 },
-                state_path=state_file,
             )
-            save_state(state_file, state)
+            write_gate.save_state(state)
 
     # Issue #654: apply the ``escalated`` label edge for dead dispatched
     # workers that exceeded the reap grace period. The state.json update
@@ -3106,11 +3110,17 @@ def _detect_and_handle_orphaned_workers(
     # re-escalate (status is no longer ``dispatched``), but reconcile's
     # ground-truth label sweep will eventually converge the label.
     for issue_number in reap_escalations:
-        transition(gh, config.labels, issue_number, _escalation_edge("escalated", "mechanical"))
+        write_gate.transition(
+            gh, config.labels, issue_number, _escalation_edge("escalated", "mechanical")
+        )
 
 
 def _sweep_orphan_processes_for_dead_sessions(
-    sessions_dir: Path, state_file: Path, config: OrchestratorConfig
+    sessions_dir: Path,
+    state_file: Path,
+    config: OrchestratorConfig,
+    *,
+    write_gate: WriteGate,
 ) -> None:
     """Sweep for orphan processes in worktrees of dead sessions.
 
@@ -3123,7 +3133,15 @@ def _sweep_orphan_processes_for_dead_sessions(
     On POSIX: Not implemented (returns empty list).
 
     Detected orphans are killed automatically and logged to state.json.
+
+    Issue #1264 (W6 PR3): this is one of the three unconditional
+    ``_loop_body`` call sites named by issue #1311's dry-run leak. Both the
+    orphan kill and the event/state write below now go through
+    ``write_gate`` -- the kill via the 6th gate method, ``kill_process``
+    (R6a: wraps the ``_kill_orphan_pid`` primitive hoisted to
+    ``process_utils.kill_orphan_pid``).
     """
+    write_gate = require_write_gate(write_gate)
     from .devin_shell import is_session_alive, read_session_records
     from .claude_code import is_worker_alive, read_worker_records
 
@@ -3155,14 +3173,14 @@ def _sweep_orphan_processes_for_dead_sessions(
             # Kill detected orphans
             killed_orphans: list[int] = []
             for orphan in orphan_processes:
-                _kill_orphan_pid(orphan["pid"])
+                write_gate.kill_process(orphan["pid"])
                 killed_orphans.append(orphan["pid"])
 
             # Log the event with image/cmdline of each killed process so the
             # respawn source in dead worktrees can be identified and shut off.
             with state_lock(state_file):
                 state = load_state(state_file)
-                state = append_event(
+                state = write_gate.append_event(
                     state,
                     "orphan_processes_killed",
                     {
@@ -3178,9 +3196,8 @@ def _sweep_orphan_processes_for_dead_sessions(
                             for o in orphan_processes
                         ],
                     },
-                    state_path=state_file,
                 )
-                save_state(state_file, state)
+                write_gate.save_state(state)
 
 
 def _log_worker_census(sessions_dir: Path) -> None:
@@ -3275,6 +3292,8 @@ def _reap_restore_rework_requested(
     open_prs_by_issue: dict[int, list[dict[str, Any]]],
     worker: WorkerView,
     failure_kind: str | None = None,
+    *,
+    write_gate: WriteGate,
 ) -> None:
     """Restore a dead/launch-failed rework worker to ``rework_requested``, or
     escalate it to a human when the redispatch cap is exhausted or the
@@ -3317,6 +3336,7 @@ def _reap_restore_rework_requested(
     ``redispatch_cap_exceeded`` (triage: "worker is spinning"), and
     includes ``stranded_commits`` in the escalation payload.
     """
+    write_gate = require_write_gate(write_gate)
     pr_data = _rework_pr_for_worker(open_prs_by_issue, worker)
     if pr_data is None:
         return
@@ -3429,13 +3449,12 @@ def _reap_restore_rework_requested(
                 reason_class="mechanical",
                 issue_extra=issue_extra,
             )
-            state = append_event(
+            state = write_gate.append_event(
                 state,
                 "session_failed_escalated",
                 event_payload,
-                state_path=state_file,
             )
-            save_state(state_file, state)
+            write_gate.save_state(state)
         else:
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
@@ -3458,7 +3477,7 @@ def _reap_restore_rework_requested(
                 "last_rework_failure_kind": failure_kind,
                 "last_rework_was_startup_death": startup_death,
             }
-            state = append_event(
+            state = write_gate.append_event(
                 state,
                 "rework_requeued",
                 {
@@ -3471,9 +3490,8 @@ def _reap_restore_rework_requested(
                     "has_rework_prompt": has_rework_prompt,
                     "startup_death": startup_death,
                 },
-                state_path=state_file,
             )
-            save_state(state_file, state)
+            write_gate.save_state(state)
 
     # Transition labels: escalate (operator_queue for mechanical reasons,
     # human_needed reserved for judgment), or rework_requested (needs_rework),
@@ -3483,7 +3501,7 @@ def _reap_restore_rework_requested(
         if should_escalate
         else "rework_requested"
     )
-    result = transition(gh, config.labels, worker.issue_number, edge)
+    result = write_gate.transition(gh, config.labels, worker.issue_number, edge)
     if result.outcome != TransitionOutcome.APPLIED:
         with state_lock(state_file):
             state = load_state(state_file)
@@ -3495,7 +3513,7 @@ def _reap_restore_rework_requested(
                 "remove_failures": result.remove_failures,
             }
             state["issues"][str(worker.issue_number)] = entry
-            save_state(state_file, state)
+            write_gate.save_state(state)
 
 
 # Issue #713: canonical key sets each prompt writer supplies to
@@ -4055,6 +4073,7 @@ def _route_dead_worker_to_pre_review_rework(
     reason: str,
     *,
     failure_kind: str | None = None,
+    write_gate: WriteGate,
 ) -> dict[str, Any] | None:
     """Route a dead worker's stuck pre-review PR to the rework pipeline.
 
@@ -4065,6 +4084,7 @@ def _route_dead_worker_to_pre_review_rework(
     Enforces ``watchdog.max_auto_redispatch`` and escalates deterministic
     failures immediately, mirroring the existing redispatch-escalation logic.
     """
+    write_gate = require_write_gate(write_gate)
     pr_number = int(pr["number"])
     if reason == "merge_conflict":
         summary = (
@@ -4116,9 +4136,9 @@ def _route_dead_worker_to_pre_review_rework(
                     "pre_review_rework_reason": reason,
                 },
             )
-            save_state(state_file, state)
+            write_gate.save_state(state)
             edge = _escalation_edge("redispatch_escalated", "mechanical")
-            result = transition(gh, config.labels, issue_number, edge)
+            result = write_gate.transition(gh, config.labels, issue_number, edge)
             if result.outcome != TransitionOutcome.APPLIED:
                 entry = state["issues"].get(str(issue_number), {})
                 if isinstance(entry, dict):
@@ -4132,7 +4152,7 @@ def _route_dead_worker_to_pre_review_rework(
                         },
                     }
                     state["issues"][str(issue_number)] = entry
-                    save_state(state_file, state)
+                    write_gate.save_state(state)
             return {
                 "issue_number": issue_number,
                 "pr_number": pr_number,
@@ -4157,7 +4177,7 @@ def _route_dead_worker_to_pre_review_rework(
             "issue_number": issue_number,
             "status": "rework_requested",
         }
-        state = append_event(
+        state = write_gate.append_event(
             state,
             "pre_review_rework_routed",
             {
@@ -4166,11 +4186,10 @@ def _route_dead_worker_to_pre_review_rework(
                 "reason": reason,
                 "failure_kind": failure_kind,
             },
-            state_path=state_file,
         )
-        save_state(state_file, state)
+        write_gate.save_state(state)
 
-    result = transition(gh, config.labels, issue_number, "rework_requested")
+    result = write_gate.transition(gh, config.labels, issue_number, "rework_requested")
     label_error = None
     if result.outcome != TransitionOutcome.APPLIED:
         label_error = {
@@ -4185,7 +4204,7 @@ def _route_dead_worker_to_pre_review_rework(
             if isinstance(entry, dict):
                 entry = {**entry, "label_error": label_error}
                 state["issues"][str(issue_number)] = entry
-                save_state(state_file, state)
+                write_gate.save_state(state)
 
     return {
         "issue_number": issue_number,
@@ -4201,6 +4220,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     gh: GitHubLike,
     config: OrchestratorConfig,
     *,
+    write_gate: WriteGate,
     persist_inconclusive_probe_counter: bool = True,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
@@ -4253,10 +4273,11 @@ def _classify_dead_sessions_and_update_throttle_state(
     exact equality on the resulting ``throttled_until`` instead of a
     wall-clock-tolerance proximity check.
     """
+    write_gate = require_write_gate(write_gate)
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
     from .post_mortem import classify_and_record
-    from .state import append_event, load_state, save_state, set_throttled_until, state_lock
+    from .state import load_state, set_throttled_until, state_lock
     from .worker import (
         is_worker_confirmed_dead,
         iter_workers,
@@ -4327,7 +4348,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                         reason=failure_kind,
                         adapter_kind=w.adapter_kind,
                     )
-                    save_state(state_file, state)
+                    write_gate.save_state(state)
 
             if (
                 failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
@@ -4357,14 +4378,14 @@ def _classify_dead_sessions_and_update_throttle_state(
                     )
                     state["issues"][str(w.issue_number)].pop("worker_pid", None)
                     state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
-                    save_state(state_file, state)
-                    transition(
+                    write_gate.save_state(state)
+                    write_gate.transition(
                         gh,
                         config.labels,
                         w.issue_number,
                         _escalation_edge("redispatch_escalated", "mechanical"),
                     )
-                    state = append_event(
+                    state = write_gate.append_event(
                         state,
                         "session_failed_escalated",
                         {
@@ -4373,9 +4394,8 @@ def _classify_dead_sessions_and_update_throttle_state(
                             "removed_labels": sorted(active_labels),
                             "redispatch_count": len(redispatch_at),
                         },
-                        state_path=state_file,
                     )
-                    save_state(state_file, state)
+                    write_gate.save_state(state)
 
             w.reap_sidecar(
                 sessions_dir,
@@ -4394,7 +4414,13 @@ def _classify_dead_sessions_and_update_throttle_state(
             # Issue #295: a launch-failed rework session must still be returned to
             # rework_requested so its owning lane can re-dispatch it.
             _reap_restore_rework_requested(
-                state_file, gh, config, open_prs_by_issue, w, failure_kind=failure_kind
+                state_file,
+                gh,
+                config,
+                open_prs_by_issue,
+                w,
+                failure_kind=failure_kind,
+                write_gate=write_gate,
             )
             continue
         if not w.is_alive():
@@ -4522,7 +4548,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                         reason=failure_kind,
                         adapter_kind=w.adapter_kind,
                     )
-                    save_state(state_file, state)
+                    write_gate.save_state(state)
 
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
             # Delete the sidecar file after the session is detected as dead and classified
@@ -4588,6 +4614,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                         failure_kind=failure_kind,
                         issue_title=issue.get("title") if issue else None,
                         issue=issue,
+                        write_gate=write_gate,
                     )
                     if salvaged:
                         continue
@@ -4632,14 +4659,14 @@ def _classify_dead_sessions_and_update_throttle_state(
                         # recovery path. The PID is already verified dead by the
                         # time we reach this branch, but clearing it removes the
                         # only signal the recovery probe can cross-check.
-                        save_state(state_file, state)
-                        transition(
+                        write_gate.save_state(state)
+                        write_gate.transition(
                             gh,
                             config.labels,
                             w.issue_number,
                             _escalation_edge("redispatch_escalated", "mechanical"),
                         )
-                        state = append_event(
+                        state = write_gate.append_event(
                             state,
                             "session_failed_escalated",
                             {
@@ -4648,14 +4675,13 @@ def _classify_dead_sessions_and_update_throttle_state(
                                 "removed_labels": sorted(active_labels),
                                 "redispatch_count": len(redispatch_at),
                             },
-                            state_path=state_file,
                         )
-                        save_state(state_file, state)
+                        write_gate.save_state(state)
                         continue
                     else:
                         entry["redispatch_at"] = redispatch_at
                         state["issues"][str(w.issue_number)] = entry
-                        save_state(state_file, state)
+                        write_gate.save_state(state)
                 # Remove all active labels and ensure ready label is present.
                 # Issue #417: check (and record) the bool return values instead
                 # of silently discarding them. A False here means this pass's
@@ -4690,8 +4716,9 @@ def _classify_dead_sessions_and_update_throttle_state(
                         salvage_failed=is_completed,
                         salvage_error=salvage_error,
                         state_path=state_file,
+                        write_gate=write_gate,
                     )
-                    save_state(state_file, state)
+                    write_gate.save_state(state)
             else:
                 # Issue #295: open PR with request_changes or rework prompt =>
                 # restore to rework_requested for its owning lane.
@@ -4725,6 +4752,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                                 w.issue_number,
                                 reason,
                                 failure_kind=failure_kind,
+                                write_gate=write_gate,
                             )
                         else:
                             _reap_restore_rework_requested(
@@ -4734,6 +4762,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                                 open_prs_by_issue,
                                 w,
                                 failure_kind=failure_kind,
+                                write_gate=write_gate,
                             )
                     else:
                         _reap_restore_rework_requested(
@@ -4743,6 +4772,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             open_prs_by_issue,
                             w,
                             failure_kind=failure_kind,
+                            write_gate=write_gate,
                         )
 
     return reaped
@@ -4969,6 +4999,7 @@ def _attempt_salvage(
     failure_kind: str | None,
     issue_title: str | None = None,
     issue: dict[str, Any] | None = None,
+    write_gate: WriteGate,
 ) -> tuple[bool, str | None]:
     """Push a completed branch and open a PR, then move labels to ``pr_open``.
 
@@ -4982,7 +5013,18 @@ def _attempt_salvage(
     can be stale, so before opening a PR we re-check live terminal state. A
     skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
     duplicate PR, and the caller treats it as "handled" (no redispatch).
+
+    NOTE (issue #1264, W6 PR3 disclosure): the ``push_branch`` call below is
+    an unconditional, unguarded real ``git push`` -- outside WriteGate's
+    declared 6-primitive surface (state.json/events.db/label-transition/
+    process-kill) and therefore NOT gated by ``write_gate`` here. This is a
+    real dry-run leak (filed separately; see the PR3 handoff) that this PR
+    does not fix -- gating an external git push was never in R6's scope
+    (kill_process was the one sanctioned new primitive) and freelancing a
+    7th WriteGate primitive without design review would repeat exactly the
+    mistake R6b's STOP-and-report exists to prevent.
     """
+    write_gate = require_write_gate(write_gate)
     already_landed, skip_reason = _salvage_already_landed(
         gh=gh,
         config=config,
@@ -4998,7 +5040,7 @@ def _attempt_salvage(
             # Issue #282: preserve the liveness fingerprint so the recovery
             # path can verify the worker is dead before the worktree is
             # reclaimed.
-            state = append_event(
+            state = write_gate.append_event(
                 state,
                 "salvage_skipped_already_landed",
                 {
@@ -5010,9 +5052,8 @@ def _attempt_salvage(
                     # for diagnosis (what state the issue was in), not as removed.
                     "active_labels": sorted(active_labels),
                 },
-                state_path=state_file,
             )
-            save_state(state_file, state)
+            write_gate.save_state(state)
         return True, None
 
     push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
@@ -5039,7 +5080,7 @@ def _attempt_salvage(
         state = load_state(state_file)
         # Issue #282: preserve the liveness fingerprint so the recovery path
         # can verify the worker is dead before the worktree is reclaimed.
-        state = append_event(
+        state = write_gate.append_event(
             state,
             "session_salvaged",
             {
@@ -5050,9 +5091,8 @@ def _attempt_salvage(
                 "label_write_ok": pr_error is None,
                 "label_error": pr_error,
             },
-            state_path=state_file,
         )
-        save_state(state_file, state)
+        write_gate.save_state(state)
     return True, pr_error
 
 
@@ -18973,6 +19013,7 @@ class OrchestratorApp:
             self.paths.state_file,
             self.gh,
             self.config,
+            write_gate=self.write_gate,
             persist_inconclusive_probe_counter=False,
             now=now,
         )
@@ -19009,7 +19050,9 @@ class OrchestratorApp:
 
         # Sweep for orphan processes in dead session worktrees (issue #139)
         # This catches detached/daemonized processes that survived session kills
-        _sweep_orphan_processes_for_dead_sessions(sessions_dir, self.paths.state_file, self.config)
+        _sweep_orphan_processes_for_dead_sessions(
+            sessions_dir, self.paths.state_file, self.config, write_gate=self.write_gate
+        )
 
         # Detect and handle orphaned workers using state.json PID records (issue #207)
         # This fallback detects dead workers even when session sidecar files are orphaned.
@@ -19020,6 +19063,7 @@ class OrchestratorApp:
             self.paths.state_file,
             self.config,
             self.gh,
+            write_gate=self.write_gate,
             review_callback=self.review,
         )
 
@@ -21102,6 +21146,7 @@ class OrchestratorApp:
                     worktree_state=inspection.state.value,
                     reported_push=reported_push,
                     state_path=self.paths.state_file,
+                    write_gate=self.write_gate,
                 )
                 return "dispatch_failed", None, state
 
@@ -21128,6 +21173,7 @@ class OrchestratorApp:
                 added_ready=False,
                 label_write_ok=True,
                 state_path=self.paths.state_file,
+                write_gate=self.write_gate,
             )
             return "dispatch_failed", None, state
 
@@ -21148,6 +21194,7 @@ class OrchestratorApp:
             added_ready=needs_ready,
             label_write_ok=label_write_ok,
             state_path=self.paths.state_file,
+            write_gate=self.write_gate,
         )
         return "dispatch_failed", None, state
 
