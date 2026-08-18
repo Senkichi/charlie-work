@@ -3248,8 +3248,10 @@ def test_detect_drift_completed_unpublished_work_salvaged(tmp_path: Path) -> Non
     assert not relabel
 
 
-def test_detect_drift_dirty_worktree_relabels(tmp_path: Path) -> None:
-    """Issue #252: dead session with dirty worktree still relabels to ready."""
+def test_detect_drift_dirty_worktree_with_commits_salvaged(tmp_path: Path) -> None:
+    """Issue #1130: dead session with a dirty worktree that has commits ahead
+    of base emits salvage drift, not relabel-to-ready. The committed work is
+    salvageable regardless of working-tree dirt (shim/scaffolding artifacts)."""
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     worktree_path, branch = _setup_completed_worktree(repo_root, 253, dirty=True)
 
@@ -3267,10 +3269,10 @@ def test_detect_drift_dirty_worktree_relabels(tmp_path: Path) -> None:
     drift = detect_drift(gh, state, config, repo_root=repo_root)
 
     salvage = [d for d in drift if d.kind == "session_unpublished_work_salvaged"]
-    assert not salvage
+    assert len(salvage) == 1
+    assert salvage[0].issue_number == 253
     relabel = [d for d in drift if d.kind == "session_failed_relabeled"]
-    assert len(relabel) == 1
-    assert relabel[0].issue_number == 253
+    assert not relabel
 
 
 def test_detect_drift_no_commits_relabels(tmp_path: Path) -> None:
