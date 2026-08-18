@@ -479,17 +479,28 @@ def test_dispatch_reviews_write_gate_dry_run_true_prevents_writes_even_past_the_
     """C2.d, cluster-level: dispatch_reviews's own ``if not self.dry_run``
     guards (workflow.py ~10699 and ~10786) already prevent every write when
     ``self.dry_run`` is True in the normal case -- a plain
-    ``dispatch_reviews(dry_run=True)`` call never even reaches the three
-    write_gate-threaded call sites this PR converted. R7's point is that
-    those call sites are no longer safe ONLY because of those guards. This
-    test proves it directly: build a normal (non-dry-run) app so control
-    flow reaches the sweep calls, but swap ``app.write_gate`` for a
-    dry_run=True gate right before calling ``dispatch_reviews`` -- simulating
-    "the outer guard didn't fire" without needing to actually break it. If
-    write_gate threading had a gap (a raw primitive slipped back in, or a
-    site never got converted), this is the test that would catch it; the
+    ``dispatch_reviews(dry_run=True)`` call never even reaches the
+    write_gate-threaded call sites downstream. R7's point is that those call
+    sites are no longer safe ONLY because of those guards. This test proves
+    it directly: build a normal (non-dry-run) app so control flow reaches
+    the sweep calls, but swap ``app.write_gate`` for a dry_run=True gate
+    right before calling ``dispatch_reviews`` -- simulating "the outer guard
+    didn't fire" without needing to actually break it. If write_gate
+    threading had a gap (a raw primitive slipped back in, or a site never
+    got converted), this is the test that would catch it; the
     guard-decorator flags alone cannot, since they never let control flow
-    reach that far under dry_run in the first place."""
+    reach that far under dry_run in the first place.
+
+    Issue #1264/#1329 (W6 PR4): the pre-launch claim write
+    (``review_dispatch_claim`` append_event + the save_state that follows,
+    workflow.py ~11363/11373) used to be a separate, raw, out-of-scope write
+    that landed on disk regardless of ``write_gate`` -- PR2 converted only
+    the R7 block below it. PR4 converts the claim write too, closing that
+    exact gap, so this test's assertions now cover the claim write as well:
+    under ``write_gate.dry_run=True`` the PR is never claimed at all, not
+    merely rolled back by the R7 tail. ``quota_hit`` in the result payload
+    (computed by the launch loop from ``fake_launch``'s error, independent
+    of any write) is the reachability proof that survives this change."""
     # A real, selectable candidate PR (open, linked issue, matching review
     # packet) so review_queue() returns a non-empty candidate list --
     # otherwise dispatch_reviews early-returns at the "no candidates" check
@@ -565,28 +576,25 @@ def test_dispatch_reviews_write_gate_dry_run_true_prevents_writes_even_past_the_
     assert append_calls == []
     assert save_calls == []
 
-    # Not a byte-identity check: workflow.py claims the candidate PR
-    # (review_dispatch_status="review_dispatch_pending") in a separate, raw,
-    # out-of-scope write (~11282-11333, upstream of R7) BEFORE the launch
-    # loop runs, so state.json legitimately changes on disk regardless of
-    # write_gate. What must NOT happen is the R7 block's own effect: on a
-    # real (non-gated) run, the quota-hit rollback inside the SAME
-    # state_lock block clears the claim back to
-    # review_dispatch_status=None (see test_dispatch_reviews_probe_failure_
-    # sets_reviewer_quota_and_rolls_back) and persists it via
-    # self.write_gate.save_state(state). Under write_gate.dry_run=True that
-    # save is a no-op, so the on-disk claim must still read
-    # "review_dispatch_pending", not None.
+    # Byte-identity now holds where it did not before PR4: the pre-launch
+    # claim write (~11362-11373) is write_gate-threaded as of issue #1329,
+    # so under write_gate.dry_run=True the claim itself never lands on
+    # disk -- not merely the R7 block's downstream rollback. "100" must be
+    # entirely absent from state["prs"], not present-with-a-stale-status.
     final_state = load_state(app.paths.state_file)
-    assert final_state["prs"]["100"].get("review_dispatch_status") == "review_dispatch_pending", (
-        "the R7 block's quota-hit rollback must not reach disk under write_gate.dry_run=True"
+    assert "100" not in final_state["prs"], (
+        "the pre-launch claim must not reach disk under write_gate.dry_run=True "
+        "now that it is write_gate-threaded (issue #1329)"
     )
 
-    # events.db corroboration (same mutation-hardening as the earlier test):
-    # the pre-launch claim's own raw append_event ("review_dispatch_claim")
-    # proves the run executed for real up to that point, while the two
-    # R7-owned kinds must be absent.
+    # events.db corroboration: every event kind this call would emit on a
+    # real (non-gated) run -- the claim, the quota-hit-specific kind, and
+    # the unconditional review_dispatch kind -- is now write_gate-threaded,
+    # so all three must be absent. quota_hit=True above is the sole
+    # reachability proof (computed from fake_launch's error, independent of
+    # any write), replacing the claim-event count this test used before the
+    # claim write was converted.
     counts = event_counts_by_kind(app.paths.state_file)
-    assert counts.get("review_dispatch_claim", 0) >= 1
+    assert counts.get("review_dispatch_claim", 0) == 0
     assert counts.get("review_quota_exhausted", 0) == 0
     assert counts.get("review_dispatch", 0) == 0
