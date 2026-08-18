@@ -41488,8 +41488,11 @@ def test_classify_dead_sessions_salvages_completed_unpublished_work(
     assert events[0]["payload"]["pr_number"] == 101
 
 
-def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path) -> None:
-    """Issue #252: a dirty worktree is not salvaged; it relabels to ready."""
+def test_classify_dead_sessions_dirty_worktree_with_commits_salvaged(tmp_path: Path) -> None:
+    """Issue #1130: a dirty worktree that has commits ahead of base IS salvaged.
+    The committed work is pushed and a PR is opened; the working-tree dirt
+    (e.g. shim/scaffolding artifacts not in ``injected_paths``) is irrelevant
+    to the push and survives in the worktree for later inspection."""
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
@@ -41515,14 +41518,347 @@ def test_classify_dead_sessions_dirty_worktree_relabels_to_ready(tmp_path: Path)
         sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
     )
 
-    # No PR created, active label removed, ready label added
-    assert not gh.prs_created
+    # Branch pushed and PR created — the committed work is salvaged.
+    remote_refs = _git(remote, "show-ref")
+    assert branch in remote_refs.stdout
+    assert len(gh.prs_created) == 1
+    assert gh.prs_created[0]["head"] == branch
+    # Labels moved to pr_open, not ready.
     assert (253, config.labels.in_progress) in gh.labels_removed
-    assert (253, config.labels.ready) in gh.labels_added
+    assert (253, config.labels.pr_open) in gh.labels_added
+    assert (253, config.labels.ready) not in gh.labels_added
 
     state = json.loads(state_file.read_text(encoding="utf-8"))
-    events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
     assert len(events) == 1
+    assert events[0]["payload"]["issue_number"] == 253
+
+
+def test_classify_dead_sessions_no_commits_relabels_to_ready_issue_1130(
+    tmp_path: Path,
+) -> None:
+    """Issue #1130: a dead session whose worktree has NO commits ahead of base
+    is not salvaged (there is nothing to push); it relabels to ready. This
+    guards the relaxed ``ahead_count > 0`` condition against false positives
+    on empty worktrees."""
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    branch = "agent/issue-1130-empty"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    worktree_path = info.path
+    sessions_dir, state_file = _make_classify_state(tmp_path)
+    _write_dead_session_sidecar(sessions_dir, 1130, branch, worktree_path)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(repo_root=repo_root)
+    gh.issues = [
+        {
+            "number": 1130,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1130",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    gh.pr_create_return = 101
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+    )
+
+    # No PR created — nothing to salvage.
+    assert not gh.prs_created
+    # Active label removed, ready label added — the ordinary relabel path.
+    assert (1130, config.labels.in_progress) in gh.labels_removed
+    assert (1130, config.labels.ready) in gh.labels_added
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    salvage_events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert not salvage_events
+    relabel_events = [e for e in state["events"] if e["kind"] == "session_failed_relabeled"]
+    assert len(relabel_events) == 1
+
+
+def test_worktree_unsafe_launch_failure_with_commits_salvages_before_escalation(
+    tmp_path: Path,
+) -> None:
+    """Issue #1130: a ``worktree_unsafe`` launch failure whose worktree has
+    commits ahead of base must attempt salvage (push + PR) before escalating
+    to ``agent:human-needed``. Salvage-the-commit is the cheap safe action;
+    human adjudication is the fallback only when salvage fails."""
+
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    # Create a worktree with one commit beyond origin/main — the stranded
+    # work that ``worktree_unsafe`` refused to reset.
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1130)
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub(repo_root=repo_root)
+    fake_gh.issues = [
+        {
+            "number": 1130,
+            "title": "Salvage test",
+            "url": "https://example.test/issues/1130",
+            "body": "Salvage does not fire",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []  # No open PR.
+    fake_gh.pr_create_return = 200
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-1130.log"
+    log_path.write_text("worktree contains local work, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-1130.json"
+    record = SessionRecord(
+        issue_number=1130,
+        branch=branch,
+        worktree_path=str(worktree_path),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,  # Launch failure — process never started
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local work",
+        failure_kind="worktree_unsafe",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
+    )
+
+    # Salvage fired: branch pushed and PR created.
+    remote_refs = _git(remote, "show-ref")
+    assert branch in remote_refs.stdout
+    assert len(fake_gh.prs_created) == 1
+    assert fake_gh.prs_created[0]["head"] == branch
+
+    # Labels moved to pr_open, NOT human_needed.
+    assert (1130, config.labels.in_progress) in fake_gh.labels_removed
+    assert (1130, config.labels.pr_open) in fake_gh.labels_added
+    assert (1130, config.labels.human_needed) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    salvage_events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert len(salvage_events) == 1
+    assert salvage_events[0]["payload"]["issue_number"] == 1130
+    # No escalation event.
+    escalate_events = [e for e in state["events"] if e["kind"] == "session_failed_escalated"]
+    assert not escalate_events
+
+
+def test_worktree_unsafe_launch_failure_no_commits_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """Issue #1130: a ``worktree_unsafe`` launch failure whose worktree has NO
+    commits ahead of base (e.g. dirty working tree with no commits) still
+    escalates to ``agent:human-needed``. Salvage is only attempted when there
+    is committed work to push."""
+
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.state import load_state
+
+    now = datetime.now(UTC)
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    # A worktree with no commits ahead, just a dirty file.
+    branch = "agent/issue-1130-no-commits"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    worktree_path = info.path
+    (worktree_path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; print('ok')"),
+        ),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub(repo_root=repo_root)
+    fake_gh.issues = [
+        {
+            "number": 1130,
+            "title": "Salvage test",
+            "url": "https://example.test/issues/1130",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+    fake_gh.pr_create_return = 200
+
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-1130.log"
+    log_path.write_text("worktree contains local work, cannot reset\n", encoding="utf-8")
+
+    sidecar_path = sessions_dir / "issue-1130.json"
+    record = SessionRecord(
+        issue_number=1130,
+        branch=branch,
+        worktree_path=str(worktree_path),
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,
+        started_at=now.isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error="worktree creation failed: worktree contains local work",
+        failure_kind="worktree_unsafe",
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
+    )
+
+    # No salvage: no PR created.
+    assert not fake_gh.prs_created
+    # Escalation fired: a deterministic (mechanical) launch failure parks on
+    # operator_queue (issue #1266), not human_needed.
+    assert (1130, config.labels.operator_queue) in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    salvage_events = [e for e in state["events"] if e["kind"] == "session_salvaged"]
+    assert not salvage_events
+    escalate_events = [e for e in state["events"] if e["kind"] == "session_failed_escalated"]
+    assert len(escalate_events) == 1
+
+
+def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #1130: a phantom live worker whose worktree is PARTIAL (dirty
+    working tree but commits ahead of base) must NOT have its sidecar reaped.
+    The committed work is salvageable; reaping the sidecar would destroy the
+    salvage path. This guards the relaxed ``ahead_count > 0`` preserve
+    condition against the previous ``COMPLETED``-only check."""
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1130, dirty=True)
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=8282,
+            started_at="2026-08-10T11:15:39Z",
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=5_678_901.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:in-progress"},
+            ],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": branch,
+                "worktree_path": str(worktree_path),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 8282,
+                "started_at": "2026-08-10T11:15:39Z",
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 5_678_901.0,
+                "session_id": "test-session-1130",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": branch,
+        "worker_pid": 8282,
+        "worker_process_start_time": 5_678_901.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    # The phantom live worker is detected but the sidecar is PRESERVED.
+    assert result.data["phantom_live_worker_count"] == 1
+    assert sidecar_path.exists(), (
+        "Sidecar must not be reaped so the reaper lane can salvage the committed work"
+    )
+
+    # Labels are NOT stripped.
+    assert (123, "agent:in-progress") not in fake_gh.labels_removed
+    assert (123, "automated-ready") not in fake_gh.labels_removed
+
+    state = load_state(paths.state_file)
+    preserve_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "session_failed_relabeled"
+        and e["payload"]["issue_number"] == 123
+        and e["payload"]["reason"] == "phantom_live_worker_completed_work_preserved"
+    ]
+    assert len(preserve_events) == 1
 
 
 def test_classify_dead_sessions_skips_salvage_when_issue_closed(tmp_path: Path) -> None:
@@ -41863,7 +42199,11 @@ def test_classify_dead_sessions_relabel_carries_required_reason(tmp_path: Path) 
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
-    worktree_path, branch = _setup_completed_worktree(repo_root, 978, dirty=True)
+    # Issue #1130: use a no-commits worktree so the relabel path (not salvage)
+    # is taken. A worktree with commits (even dirty) is now salvaged.
+    branch = "agent/issue-978"
+    info = create_worktree(repo_root, branch, base_ref="origin/main")
+    worktree_path = info.path
     sessions_dir, state_file = _make_classify_state(tmp_path)
     _write_dead_session_sidecar(sessions_dir, 978, branch, worktree_path)
 
