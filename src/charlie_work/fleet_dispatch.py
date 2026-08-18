@@ -2995,11 +2995,25 @@ def _spawn_supervise_child(
         cwd=str(orchestrator_root()),
         **no_console_window_kwargs(),
     )
+    watchdog = None
+    watchdog_thread = None
     if wedge_watchdog_factory is not None:
         watchdog = wedge_watchdog_factory(process)
         if watchdog is not None:
-            watchdog.start()
-    return process.wait()
+            watchdog_thread = watchdog.start()
+    exit_code = process.wait()
+    if watchdog is not None and watchdog_thread is not None and watchdog.killed:
+        # The watchdog records its supervisor_wedged_killed event *after*
+        # process.kill() succeeds — which is also the moment wait() returns
+        # here. Without this bounded join the wrapper exits and tears down
+        # the daemon thread mid-write, silently losing the forensic event
+        # (144 kills / 0 recorded rows during the #1333 incident). The
+        # timeout bounds a wedged event write so it cannot wedge the
+        # wrapper. ``killed`` is set between kill() and the event write, so
+        # a lost GIL-switch race here degrades to the old lost-event
+        # behavior at worst — it never blocks a healthy exit.
+        watchdog_thread.join(timeout=10.0)
+    return exit_code
 
 
 def _default_wedge_watchdog(process: subprocess.Popen[Any]) -> WedgeWatchdog:
