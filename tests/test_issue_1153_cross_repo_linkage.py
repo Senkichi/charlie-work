@@ -59,8 +59,13 @@ from charlie_work.config import (
 from charlie_work.paths import runtime_paths
 from charlie_work.reconcile import apply_fixes, detect_drift
 from charlie_work.state import load_state, save_state
+from charlie_work.write_gate import WriteGate
 
 from test_reconcile import FakeGitHub, _issue, _pr
+
+
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +513,9 @@ def test_orphan_sweep_escalates_zero_artifact_loop(tmp_path: Path) -> None:
     fake_gh.prs = []
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["1497"]
@@ -580,7 +587,9 @@ def test_orphan_sweep_relabels_when_not_zero_artifact_loop(tmp_path: Path) -> No
     fake_gh.prs = []
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        _detect_and_handle_orphaned_workers(sessions_dir, paths.state_file, config, fake_gh)
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
