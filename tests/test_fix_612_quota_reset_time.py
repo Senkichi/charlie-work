@@ -37,9 +37,17 @@ from charlie_work.workflow import (
     _detect_and_handle_stalled_reviews,
     _set_reviewer_quota_exhausted_with_backoff,
 )
+from charlie_work.write_gate import WriteGate
 
 from _helpers import _init_git_repo
 from _review_fixtures import _dispatch_reviews_app, _write_review_packet
+
+
+# Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
+# as state_path -- WriteGate.save_state() writes to self.state_path, not to
+# whatever path the converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 # Claude Code's session-limit notice, verbatim as observed 2026-07-21.
@@ -236,7 +244,9 @@ def test_stalled_sweep_emits_review_quota_exhausted_with_parsed_reset(
     repo_root, reviews_dir, config, state_file = _seed_stalled(tmp_path, [100])
     _write_session_limit_reviewer(reviews_dir, 100, tmp_path)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     quota = state.get("reviewer_quota", {})
@@ -294,7 +304,9 @@ def test_stalled_sweep_falls_back_when_no_clock_reset(tmp_path: Path) -> None:
     # test_charlie_work.py, which offsets +1h because a later dispatch()
     # call reads real wall clock).
     frozen_now = datetime.now(UTC)
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root, now=frozen_now)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file), now=frozen_now
+    )
 
     state = load_state(state_file)
     qe_events = [e for e in state.get("events", []) if e.get("kind") == "review_quota_exhausted"]

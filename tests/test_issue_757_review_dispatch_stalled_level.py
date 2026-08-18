@@ -28,10 +28,18 @@ from charlie_work.state import (
     state_lock,
 )
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
+from charlie_work.write_gate import WriteGate
 
 from _helpers import _init_git_repo
 
 _THROTTLE_LINE = "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n"
+
+
+# Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
+# as state_path -- WriteGate.save_state() writes to self.state_path, not to
+# whatever path the converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def _write_throttled_reviewer(reviews_dir: Path, pr_number: int, tmp_path: Path) -> Path:
@@ -177,7 +185,9 @@ def test_provider_throttled_is_warning(tmp_path: Path) -> None:
     repo_root, reviews_dir, config, state_file = _seed(tmp_path, [100])
     _write_throttled_reviewer(reviews_dir, 100, tmp_path)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     stalled = query_events(
         state_file,
@@ -201,7 +211,9 @@ def test_provider_throttled_turn_limit_counted_is_warning(tmp_path: Path) -> Non
     repo_root, reviews_dir, config, state_file = _seed_with_attempt(tmp_path, 100, 1)
     _write_throttled_reviewer(reviews_dir, 100, tmp_path)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     stalled = query_events(
         state_file,
@@ -234,7 +246,9 @@ def test_unclaimed_review_packet_is_warning(tmp_path: Path) -> None:
     """
     repo_root, reviews_dir, config, state_file, _ = _seed_unclaimed(tmp_path, 100)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     warnings = query_events(
         state_file,
@@ -258,7 +272,9 @@ def test_dead_reviewer_without_throttle_stays_error(tmp_path: Path) -> None:
     repo_root, reviews_dir, config, state_file = _seed(tmp_path, [100])
     _write_dead_reviewer(reviews_dir, 100, tmp_path)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     warnings = query_events(
         state_file,
@@ -319,7 +335,9 @@ def test_stale_pending_claim_stays_error(tmp_path: Path) -> None:
     """
     repo_root, reviews_dir, config, state_file = _seed_stale_pending(tmp_path, 100)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     warnings = query_events(
         state_file,
@@ -354,7 +372,9 @@ def test_stale_dispatched_claim_no_sidecar_stays_error(tmp_path: Path) -> None:
     # through the ``review_dispatch_dispatched`` stale-claim branch.
     repo_root, reviews_dir, config, state_file = _seed(tmp_path, [100])
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     warnings = query_events(
         state_file,

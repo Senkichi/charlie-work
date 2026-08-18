@@ -16,6 +16,16 @@ from charlie_work.workflow import (
     _detect_and_handle_stalled_reviews,
     _reap_orphaned_review_checkouts,
 )
+from charlie_work.write_gate import WriteGate
+
+
+# Issue #1264 (W6 PR2): every WriteGate the tests below construct must carry
+# THAT test's own state_file as state_path -- WriteGate.save_state() writes
+# to self.state_path, not to whatever path a converted function was also
+# given, so a gate built with a different path would silently write to the
+# wrong file while every assertion below keeps reading the real state_file.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_reap_completed_review_checkouts_removes_checkout_once_reviewer_exited(
@@ -206,7 +216,9 @@ def test_reap_orphaned_review_checkouts_clears_merged_pr_dispatch_state(
         "charlie_work.stalled_review_reap.remove_review_checkout", fake_remove_review_checkout
     )
 
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
 
     assert reaped == [100]
     assert len(removed_calls) == 1
@@ -297,7 +309,9 @@ def test_reap_orphaned_review_checkouts_defers_while_reviewer_alive(
 
     # Live reviewer: defer the reap.
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: True)
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
     assert reaped == []
     assert removed_calls == []
     new_state = load_state(state_file)
@@ -306,7 +320,9 @@ def test_reap_orphaned_review_checkouts_defers_while_reviewer_alive(
     # Dead reviewer: proceed with the reap.
     removed_calls.clear()
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
     assert reaped == [100]
     assert len(removed_calls) == 1
     assert removed_calls[0][1] == 100
@@ -380,7 +396,9 @@ def test_reap_orphaned_review_checkouts_reaps_sidecar_stops_stalled_ping_pong(
     )
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
 
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
 
     assert reaped == [100]
     assert not sidecar_path.exists()
@@ -388,7 +406,9 @@ def test_reap_orphaned_review_checkouts_reaps_sidecar_stops_stalled_ping_pong(
     # A following stalled-sweep pass sees nothing left to reap: the sidecar
     # is gone (iter_workers yields no worker for PR 100) and the state's
     # review_dispatch_status is already None -- the ping-pong is dead.
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert stalled == []
     state_after = load_state(state_file)
@@ -458,7 +478,9 @@ def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failu
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
 
     # First pass: failure is reported once, PR is not claimed as reaped.
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
     assert reaped == []
     assert call_count == 1
     state_after = load_state(state_file)
@@ -476,7 +498,9 @@ def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failu
     assert len(warning_events) == 1
 
     # Second pass: retry without re-emitting the warning.
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
     assert reaped == []
     assert call_count == 2
     state_after = load_state(state_file)
@@ -491,7 +515,9 @@ def test_reap_orphaned_review_checkouts_warns_once_and_retries_on_checkout_failu
     monkeypatch.setattr(
         "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
     )
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
     assert reaped == [100]
     assert call_count == 2  # the lambda does not increment the nested counter
     state_after = load_state(state_file)
@@ -559,7 +585,9 @@ def test_reap_orphaned_review_checkouts_overwrites_stale_reviewing_status(
     )
     monkeypatch.setattr("charlie_work.worker.WorkerView.is_alive", lambda self: False)
 
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
     assert reaped == [200]
     state_after = load_state(state_file)
     assert state_after["prs"]["200"]["status"] == "closed"
@@ -605,7 +633,9 @@ def test_reap_orphaned_review_checkouts_aggregates_same_pass_events(
         for pr in prs
     ]
 
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
 
     assert reaped == prs
     state_after = load_state(state_file)
