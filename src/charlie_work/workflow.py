@@ -19524,11 +19524,49 @@ class OrchestratorApp:
                             )
                             self._record_merge_or_error(merge_result, errors, merges)
                     else:
+                        # Issue #1338: an escalated PR's packet regeneration is
+                        # unreachable -- review() early-returns "escalated;
+                        # review skipped" before its regen path -- so the
+                        # staleness WARNING below would re-emit an identical
+                        # review_packet_template_stale event every pass without
+                        # ever converging, and the cross-family regen-budget
+                        # charge (attempts_before /
+                        # _charge_cross_family_regen_not_reached) would bill a
+                        # regen that was deliberately not run. Escalation means
+                        # "awaiting a human", and the recovery procedure
+                        # (unescalate + why-charlie-hate) already regenerates
+                        # the packet with the current template, so skip ONLY
+                        # those two meaningless side effects while escalated.
+                        #
+                        # self.review(pr_number) is still called: its own
+                        # _escalation_flags entry gate no-ops packet regen and
+                        # label transitions, but it is the ONLY per-pass path
+                        # that refreshes janitor_ok/janitor_failures/
+                        # ci_run_never_created and runs the #776
+                        # merge-conflict/no-op-rework remediation for
+                        # judgment-class escalations (PRs #1397/#1443). Skipping
+                        # it entirely would reintroduce the exact frozen-
+                        # diagnostics staleness class the job-cannon fix
+                        # addressed, just via a different trigger. A
+                        # non-escalated stale-template PR still regenerates
+                        # exactly as today (#592 preserved).
+                        issue_state_for_esc = (
+                            state.get("issues", {}).get(str(issue_number), {})
+                            if issue_number is not None
+                            else None
+                        )
+                        pr_escalated_now, issue_escalated_now = _escalation_flags(
+                            pr_state, issue_state_for_esc
+                        )
+                        escalated_now = pr_escalated_now or issue_escalated_now
                         # Emit a distinct event when regeneration fires
                         # because the template changed while the head stayed
                         # put, so a fleet-wide template edit is visible as a
-                        # burst rather than unexplained review churn.
-                        if head_current and not template_current:
+                        # burst rather than unexplained review churn. Suppressed
+                        # while escalated (#1338): the regen is unreachable, so
+                        # the WARNING would fire identically every pass without
+                        # converging.
+                        if head_current and not template_current and not escalated_now:
                             log_event(
                                 self.paths.state_file,
                                 "review_packet_template_stale",
@@ -19544,9 +19582,12 @@ class OrchestratorApp:
                         # "the regenerator never ran" from "it ran and failed".
                         # After the fact the two are indistinguishable from the
                         # report alone -- both leave it unusable (issue #1099).
+                        # While escalated the charge is skipped (#1338), so the
+                        # sample is unused -- fold escalated_now into the
+                        # early-zero to avoid a pointless regen-record read.
                         attempts_before = (
                             0
-                            if cross_family_current
+                            if escalated_now or cross_family_current
                             else int(
                                 self._cross_family_regen_record(
                                     pr_number=pr_number, head_sha=live_head_sha
@@ -19555,8 +19596,10 @@ class OrchestratorApp:
                             )
                         )
                         review = self.review(pr_number)
-                        if not cross_family_current and not review.data.get(
-                            "cross_family_pending"
+                        if (
+                            not escalated_now
+                            and not cross_family_current
+                            and not review.data.get("cross_family_pending")
                         ):
                             # review() has now run for the express purpose of
                             # regenerating this report. If it is still unusable
@@ -19566,6 +19609,10 @@ class OrchestratorApp:
                             # the case where the regenerator WAS reached — it
                             # launched the async review — but the report is not
                             # yet written because the subprocess is still running.
+                            # Suppressed while escalated (#1338): review()'s
+                            # own entry gate no-ops the regen, so charging a
+                            # not-reached regen here would bill work that was
+                            # deliberately not run.
                             self._charge_cross_family_regen_not_reached(
                                 pr_number=pr_number,
                                 issue_number=issue_number,
