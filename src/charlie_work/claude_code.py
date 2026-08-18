@@ -123,20 +123,29 @@ _PROVIDER_AUTH_PATTERN = re.compile(
 #   issue was filed from).
 # * ``insufficient balance`` / ``recharge your account`` — billing-depleted
 #   semantics shared across providers' insufficient-funds responses.
-# * ``\b402\b`` — HTTP 402 Payment Required, anchored with word boundaries for
-#   the same false-positive reason as the 401/403 codes above.
 #
-# Deliberately NOT matched: genuine transient 429 rate-limits
-# (``engine_overloaded_error``, ``rate_limit_reached_error``, "rate limit",
-# "too many requests") — those keep the existing ``rate_limited`` backoff
-# behavior (acceptance criterion 4). The suspension/billing semantics above
-# are disjoint from the transient-overload semantics.
+# Deliberately NOT matched:
+# * HTTP 402 Payment Required as a bare ``\b402\b`` numeric token. Unlike the
+#   401/403 codes in ``_PROVIDER_AUTH_PATTERN`` (which are scanned against the
+#   2KB log tail only), ``_PROVIDER_SUSPENDED_PATTERN`` is also scanned against
+#   the FULL log by ``detect_provider_suspended`` (the in-flight kill scan).
+#   A bare ``\b402\b`` in a full-log scan matches an incidental standalone
+#   number anywhere in the session — an issue/PR reference (``#402``), a line
+#   count, a token count — and would kill a live, healthy session on a
+#   false positive. HTTP 402 is also non-standard and rarely used by
+#   providers in practice (Moonshot returns 429 with
+#   ``exceeded_current_quota_error``), so dropping it loses no real coverage.
+#   The billing-semantic phrases above are the reliable discriminators.
+# * Genuine transient 429 rate-limits (``engine_overloaded_error``,
+#   ``rate_limit_reached_error``, "rate limit", "too many requests") — those
+#   keep the existing ``rate_limited`` backoff behavior (acceptance criterion
+#   4). The suspension/billing semantics above are disjoint from the
+#   transient-overload semantics.
 _PROVIDER_SUSPENDED_PATTERN = re.compile(
     r"exceeded_current_quota_error"
     r"|suspended due to insufficient balance"
     r"|insufficient balance"
-    r"|recharge your account"
-    r"|\b402\b",
+    r"|recharge your account",
     re.IGNORECASE,
 )
 

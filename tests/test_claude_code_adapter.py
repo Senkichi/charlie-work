@@ -4230,3 +4230,71 @@ def test_classify_session_failure_provider_auth_word_boundary_still_matches(
             f"real auth tail no longer matched for tail: {tail!r}"
         )
         assert throttled_until is not None
+
+
+# ---------------------------------------------------------------------------
+# Issue #1342 review rework: detect_provider_suspended full-log scan tests.
+# ---------------------------------------------------------------------------
+
+
+def test_detect_provider_suspended_benign_numeric_mention_no_false_positive(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342 review finding: a benign standalone ``#402``-style mention
+    (issue/PR reference, line count, token count) anywhere in the full session
+    log must NOT trigger ``detect_provider_suspended`` — the full-log scan
+    (unlike ``_classify_session_failure``'s 2KB tail scan) sees every line, so
+    a bare numeric alternative would kill a live, healthy session on a false
+    positive. The pattern matches billing-semantic phrases only, not bare
+    HTTP status numbers."""
+    from charlie_work.claude_code import detect_provider_suspended
+
+    log_path = tmp_path / "session.claude.log"
+    # A log that mentions "402" as an issue reference and a line count but
+    # contains NO account-suspension / insufficient-balance signature.
+    log_path.write_text(
+        "Resolving issue #402 — the fix touches 402 lines across 3 files.\n"
+        "PR #402 was opened by another contributor.\n"
+        "Token usage so far: 402 tokens in, 198 out.\n"
+        "Working...\n",
+        encoding="utf-8",
+    )
+
+    assert detect_provider_suspended(log_path) is False
+
+
+def test_detect_provider_suspended_detects_signature_outside_tail_2kb(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342 review finding: ``detect_provider_suspended`` scans the
+    FULL log text (unlike ``_classify_session_failure``, which scans only the
+    last 2KB tail per its own docstring). A suspension signature that appears
+    early in the log — before the CLI's internal retry backoff has scrolled
+    it past a 2KB tail window — must be detected. This is the distinguishing
+    behavior that justifies the separate full-log scan function: the in-flight
+    kill can fire on the FIRST request cycle instead of waiting for a
+    post-mortem tail classification that would never see the message."""
+    from charlie_work.claude_code import _classify_session_failure, detect_provider_suspended
+
+    # Build a log where the suspension signature is in the first ~100 bytes,
+    # followed by >2KB of retry-backoff noise that pushes it out of the 2KB
+    # tail window. The tail contains only benign retry noise.
+    suspension_line = (
+        '{"error":{"message":"Your account is suspended due to insufficient '
+        'balance, please recharge your account","type":"exceeded_current_quota_error"}}\n'
+    )
+    # >2KB of benign retry noise (no suspension/auth/throttle markers).
+    benign_noise = "Retrying in 30 seconds...\n" * 200  # ~4.8KB
+    log_text = suspension_line + benign_noise
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(log_text, encoding="utf-8")
+
+    # The full-log scan detects the suspension signature.
+    assert detect_provider_suspended(log_path) is True
+
+    # The 2KB tail scan does NOT — the signature is outside the tail window.
+    # This proves the two scans are distinct and the full-log scan is
+    # necessary for in-flight detection.
+    failure_kind, _ = _classify_session_failure(log_path, adapter_kind="api")
+    assert failure_kind != "provider_suspended"

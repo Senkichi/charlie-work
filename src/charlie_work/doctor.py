@@ -383,7 +383,14 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
     if not sessions_dir.is_dir():
         add("launched sessions", True, "no sessions directory yet", severity="warning")
         return
-    records = [*read_session_records(sessions_dir), *read_worker_records(sessions_dir)]
+    # adapter_kind=None reads BOTH claude-code and api sidecars — the
+    # ``provider_auth`` / ``budget_exceeded`` / ``provider_suspended`` failure
+    # kinds are api-only, so the default (claude-code-only) read would leave
+    # those rollups dead code (issue #1342: operator-visibility goal).
+    records = [
+        *read_session_records(sessions_dir),
+        *read_worker_records(sessions_dir, adapter_kind=None),
+    ]
     failed = [record for record in records if record.error is not None]
     # is_session_alive only reads .pid, so both record kinds duck-type through.
     exited = [
@@ -403,6 +410,9 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
         budget_exceeded = [
             r for r in records if getattr(r, "failure_kind", None) == "budget_exceeded"
         ]
+        provider_suspended = [
+            r for r in records if getattr(r, "failure_kind", None) == "provider_suspended"
+        ]
         if rate_limited:
             rl_issues = sorted({r.issue_number for r in rate_limited})
             detail += f" | rate-limited: {rl_issues}"
@@ -415,6 +425,9 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
         if budget_exceeded:
             be_issues = sorted({r.issue_number for r in budget_exceeded})
             detail += f" | budget-exceeded: {be_issues}"
+        if provider_suspended:
+            ps_issues = sorted({r.issue_number for r in provider_suspended})
+            detail += f" | provider-suspended: {ps_issues}"
 
     add("launched sessions", not failed, detail, severity="warning")
 

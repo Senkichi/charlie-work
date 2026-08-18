@@ -268,6 +268,59 @@ def test_doctor_adapter_probe_runs_devin_probe_and_surfaces_sessions(
     assert ok is True  # a warning-only sessions finding must not fail doctor
 
 
+def test_doctor_surfaces_provider_suspended_rollup(tmp_path: Path, monkeypatch) -> None:
+    """Issue #1342: a dead api worker sidecar marked
+    ``failure_kind="provider_suspended"`` surfaces in the "launched sessions"
+    doctor check's rollup — matching the existing rate-limited /
+    quota-exhausted / provider-auth / budget-exceeded rollups — so the CLI
+    operator surface is consistent with the issue's operator-visibility goal.
+    Requires ``read_worker_records(adapter_kind=None)`` so api sidecars are
+    actually read (the default claude-code-only read would skip them)."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    # An api sidecar for a worker that was killed in-flight by the
+    # provider-suspended block: error is None (launch succeeded), pid is
+    # implausible (dead → exited), failure_kind is provider_suspended.
+    _write_sidecar(
+        sessions_dir,
+        "issue-402.api.json",
+        {
+            "issue_number": 402,
+            "branch": "agent/issue-402",
+            "worktree_path": "/tmp/wt/issue-402",
+            "prompt_path": "p.md",
+            "command": ["claude", "-p"],
+            "pid": 999_999_999,
+            "started_at": "2026-01-01T00:00:00Z",
+            "log_path": "issue-402.claude.log",
+            "error": None,
+            "failure_kind": "provider_suspended",
+            "adapter_kind": "api",
+            "provider": "example",
+        },
+    )
+    monkeypatch.setattr(
+        "charlie_work.devin_shell.probe_devin",
+        lambda repo_root, **kwargs: RunResult(returncode=0, stdout="devin 1.2.3", stderr=""),
+    )
+
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(adapter="devin-shell", sessions_dir="sessions"),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+
+    ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh, adapter_probe=True)
+
+    by_name = {check.name: check for check in checks}
+    sessions = by_name["launched sessions"]
+    # The provider-suspended rollup surfaces the issue number.
+    assert "provider-suspended: [402]" in sessions.detail
+    assert sessions.severity == "warning"
+    assert ok is True
+
+
 def test_doctor_surfaces_post_mortem_terminal_cause_and_attempt_ref(
     tmp_path: Path, monkeypatch
 ) -> None:
