@@ -80,6 +80,22 @@ _PATH_RE = re.compile(
 # ``|domain.com/x.aspx|src/real.py |`` — does not swallow its neighbor.
 _DOMAIN_PATH = r"\b(?:[\w-]+\.)+[a-zA-Z]{2,24}/[^\s|`)\]]*"
 
+# A placeholder path segment: a template stand-in that can never name a real
+# file. Issue #1343: a templated documentation path in an issue body (e.g. a
+# runtime-state example ``<state-dir>/prs/pr-N/review-decision.json``) was
+# extracted as a path candidate and, because the runtime state dir is a real
+# top-level directory in the checkout, false-positived as a cross-repo
+# target. A placeholder segment can never be a genuine cross-repo reference,
+# so candidates containing one are dropped before existence checks.
+#
+# Matches either:
+#   - an angle-bracket placeholder (``<state-dir>``, ``<pr-N>``, ``<...>``) —
+#     any segment containing ``<`` or ``>``; or
+#   - a placeholder-numbered segment (``pr-N``, ``issue-N``) — one or more
+#     letters, a dash, then a literal capital ``N`` standing in for an
+#     unknown number.
+_PLACEHOLDER_SEGMENT = re.compile(r"^(?:[A-Za-z]+-N|.*[<>].*)$")
+
 
 @dataclass(frozen=True)
 class CrossRepoGateResult:
@@ -116,6 +132,11 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
     Scheme-less domain-shaped tokens (e.g. a bare ``example.com/path`` pasted
     into prose, with no ``https://`` prefix) are excluded for the same
     reason.
+
+    Candidates containing a placeholder path segment (``<state-dir>``,
+    ``pr-N``, ``issue-N``, ``<...>``) are dropped — a template stand-in can
+    never name a real file, so a templated documentation path in an issue
+    body cannot fire the gate (issue #1343).
     """
     # Strip URLs before matching so the POSIX absolute-path alternation does
     # not capture the path portion of ``https://example.com/foo.py``.
@@ -130,10 +151,27 @@ def extract_referenced_paths(issue_body: str) -> list[str]:
         raw = next((g for g in match.groups() if g is not None), "")
         if not raw:
             continue
+        # Drop templated/placeholder paths: a segment like ``pr-N`` or
+        # ``<state-dir>`` is documentation template text, not a real file
+        # reference, and can never be a genuine cross-repo target.
+        if _has_placeholder_segment(raw):
+            continue
         if raw not in seen:
             seen.add(raw)
             candidates.append(raw)
     return candidates
+
+
+def _has_placeholder_segment(candidate: str) -> bool:
+    """Return ``True`` when any segment of ``candidate`` is a template placeholder.
+
+    A placeholder segment (``<state-dir>``, ``pr-N``, ``<...>``) can never
+    name a real file — it is documentation template text, not a cross-repo
+    reference.  Candidates containing one are dropped before existence
+    checks so a templated example path in an issue body cannot fire the gate
+    (issue #1343).
+    """
+    return any(_PLACEHOLDER_SEGMENT.match(seg) for seg in re.split(r"[\\/]+", candidate))
 
 
 def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
@@ -167,6 +205,47 @@ def _top_level_dirs(repo_root: Path) -> set[str]:
         return set()
 
 
+def _gitignored_top_level_names(repo_root: Path) -> set[str]:
+    """Return top-level names ignored by the repo's ``.gitignore``.
+
+    Derived from the repo's ``.gitignore`` — never a hardcoded name list —
+    so the "repo-shaped" exclusion tracks the repo's actual ignore policy
+    rather than a brittle hand-maintained set.  Issue #1343: the runtime
+    state dir (``.var``) is a real top-level directory in the checkout but
+    is gitignored; a templated documentation path keyed on its name must
+    not count as "repo-shaped" evidence.
+
+    Only simple literal patterns are collected — a bare ``name`` or
+    ``name/`` line with no nested slash, no wildcard, and no negation.
+    Complex patterns (globs, negations, nested paths) are left to git
+    itself and do not participate in this exclusion; they cannot name a
+    single top-level directory unambiguously, and over-collecting them
+    would risk excluding a real tracked directory.
+    """
+    gitignore = repo_root / ".gitignore"
+    if not gitignore.is_file():
+        return set()
+    ignored: set[str] = set()
+    try:
+        text = gitignore.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return set()
+    for line in text.splitlines():
+        pattern = line.strip()
+        if not pattern or pattern.startswith("#") or pattern.startswith("!"):
+            continue
+        # Drop a trailing slash (directory marker); the bare name is what
+        # would appear as the first segment of a relative path.
+        name = pattern.rstrip("/")
+        # Only collect simple literal top-level names: no slash (nested
+        # patterns do not name a top-level dir), no wildcard/bracket sets
+        # (they cannot name a single directory unambiguously).
+        if "/" in name or "*" in name or "?" in name or "[" in name:
+            continue
+        ignored.add(name)
+    return ignored
+
+
 def _is_absolute_path(candidate: str) -> bool:
     """Return ``True`` when ``candidate`` is absolute, on any host platform.
 
@@ -187,7 +266,8 @@ def _is_absolute_path(candidate: str) -> bool:
 
 def _is_repo_shaped_relative_candidate(candidate: str, repo_root: Path) -> bool:
     """Return ``True`` when ``candidate`` is a *relative* path whose first
-    path segment names a directory that actually exists in ``repo_root``.
+    path segment names a directory that actually exists in ``repo_root`` and
+    is not gitignored.
 
     Absolute candidates are never repo-shaped by this definition — callers
     that need to keep escalating on a missing absolute path must check
@@ -200,11 +280,22 @@ def _is_repo_shaped_relative_candidate(candidate: str, repo_root: Path) -> bool:
     relative-looking token like ``Scripts/charlie.exe`` (first segment
     ``Scripts`` names no directory in this repo — it is a venv path, not a
     reference to this repo's code).
+
+    A real top-level directory that is *gitignored* (the runtime state dir,
+    a venv, build artifacts) does not count as repo-shaped evidence: a path
+    keyed on such a name is typically a templated documentation path (e.g. a
+    runtime-state example), not a reference to this repo's tracked code
+    (issue #1343).  The exclusion is derived from the repo's ``.gitignore``,
+    not a hardcoded name list, so it tracks the repo's actual ignore policy.
     """
     if _is_absolute_path(candidate):
         return False
     first_segment = re.split(r"[\\/]+", candidate, maxsplit=1)[0]
-    return first_segment in _top_level_dirs(repo_root)
+    if first_segment not in _top_level_dirs(repo_root):
+        return False
+    if first_segment in _gitignored_top_level_names(repo_root):
+        return False
+    return True
 
 
 def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
