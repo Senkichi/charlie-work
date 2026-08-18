@@ -28,8 +28,13 @@ from charlie_work.config import DevinConfig, OrchestratorConfig, ReviewConfig, W
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp
+from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
+
+
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_janitor_conflict_routes_to_rework_when_request_changes(tmp_path: Path) -> None:
@@ -763,6 +768,7 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
             paths.state_file,
             config,
             fake_gh,
+            write_gate=_wg(paths.state_file),
             review_callback=app.review,
         )
 

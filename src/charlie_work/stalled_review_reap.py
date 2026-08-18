@@ -50,7 +50,6 @@ from .instrumentation import log_event
 from .process_utils import is_pid_alive
 from .state import (
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
-    append_event,
     is_claim_stale,
     load_state,
     load_state_locked,
@@ -1069,7 +1068,11 @@ def _detect_and_handle_stalled_reviews(
 
     if changed:
         state = _append_sweep_events(
-            state, sweep_events, max_size=config.runtime.event_ring_size, state_file=state_file
+            state,
+            sweep_events,
+            max_size=config.runtime.event_ring_size,
+            state_file=state_file,
+            write_gate=write_gate,
         )
         # Merge-on-write (issue #594) -- see ``_merge_on_write_save`` for why a
         # bare ``save_state(state_file, state)`` here would clobber a
@@ -1271,7 +1274,11 @@ def _reap_orphaned_review_checkouts(
 
     if changed:
         state = _append_sweep_events(
-            state, sweep_events, max_size=config.runtime.event_ring_size, state_file=state_file
+            state,
+            sweep_events,
+            max_size=config.runtime.event_ring_size,
+            state_file=state_file,
+            write_gate=write_gate,
         )
         # Merge-on-write (issue #594) -- see ``_merge_on_write_save`` for why a
         # bare ``save_state(state_file, state)`` here would clobber a
@@ -1311,6 +1318,7 @@ def _append_sweep_events(
     max_size: int | None = None,
     *,
     state_file: Path | None = None,
+    write_gate: WriteGate,
 ) -> dict[str, Any]:
     """Append events collected during a sweep, aggregating same-kind runs.
 
@@ -1318,7 +1326,17 @@ def _append_sweep_events(
     Multiple occurrences of the same kind are emitted as one ``{kind}_sweep`` event
     with a count and a numbers list. This prevents a single bulk sweep from
     flooding the bounded event buffer and evicting unrelated diagnostic history.
+
+    Issue #1264 (W6 PR3, R5 completion): both ``append_event`` calls below now
+    go through ``write_gate``, which auto-binds ``state_path`` from its own
+    ``state_path`` field. ``state_file`` is consequently now vestigial at
+    every call site (equal to ``write_gate.state_path`` in every current
+    caller, but unenforced) -- kept as a parameter rather than removed, the
+    same call PR2 made for the analogous ``_merge_on_write_save`` seam
+    (adversarial-review finding F3), to avoid churning callers for no
+    behavioral gain.
     """
+    write_gate = require_write_gate(write_gate)
     grouped: dict[str, list[dict[str, Any]]] = {}
     for kind, payload in sweep_events:
         grouped.setdefault(kind, []).append(payload)
@@ -1332,9 +1350,7 @@ def _append_sweep_events(
     # its own level is exempt from kind verification. See #1029.
     for kind, payloads in grouped.items():
         if len(payloads) == 1:
-            state = append_event(
-                state, kind, payloads[0], max_size=max_size, state_path=state_file
-            )
+            state = write_gate.append_event(state, kind, payloads[0], max_size=max_size)
         else:
             numbers: list[int] = []
             numbers_key = "numbers"
@@ -1348,7 +1364,7 @@ def _append_sweep_events(
                         numbers_key = "pr_numbers"
                 elif payload.get("number") is not None:
                     numbers.append(payload["number"])
-            state = append_event(
+            state = write_gate.append_event(
                 state,
                 f"{kind}_sweep",
                 {
@@ -1356,6 +1372,5 @@ def _append_sweep_events(
                     numbers_key: numbers,
                 },
                 max_size=max_size,
-                state_path=state_file,
             )
     return state

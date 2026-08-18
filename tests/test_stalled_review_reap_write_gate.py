@@ -29,15 +29,19 @@ positive control run against an identical seed in a separate state
 directory, so "zero rows" is evidenced as a real zero, not an unreachable
 query (per the "control must be positive by evidence" discipline).
 
-A sixth test documents the R5 boundary deliberately left open by this PR:
-``_append_sweep_events`` (the batched "dispatched claim went stale" path)
-still calls the RAW, unconverted ``append_event`` regardless of
-``write_gate.dry_run`` -- it is PR3's territory, not PR2's -- while the
-``_merge_on_write_save`` call immediately after it (which persists
-``state.json`` itself) IS gated. This is not an oversight to fix here; it is
-the documented shape of the R5 deferral, and this test exists so a future
-PR3 reader has a passing regression to diff against instead of having to
-re-derive the boundary from source.
+A sixth test originally documented the R5 boundary deliberately left open by
+PR2: ``_append_sweep_events`` (the batched "dispatched claim went stale"
+path) called the RAW, unconverted ``append_event`` regardless of
+``write_gate.dry_run``, because that batcher's conversion was PR3's
+territory, not PR2's. Issue #1264 (W6 PR3, R5 completion) closes that
+boundary: ``_append_sweep_events`` now requires a real ``WriteGate`` and
+routes both its ``append_event`` calls through it, so the same PR-100
+dead-reviewer-claim scenario that used to prove the raw call fired now
+proves the opposite -- the sweep path is gated exactly like the direct
+call sites the fifth test covers, and events.db gets zero rows for it under
+dry_run=True (with a dry_run=False positive control, per this file's
+established mutation-hardening discipline, proving the query itself is
+decisive).
 
 A seventh, cluster-level test drives ``OrchestratorApp.dispatch_reviews``
 (Convention A) through its three ``write_gate``-threaded call sites with the
@@ -70,7 +74,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import charlie_work.stalled_review_reap as stalled_review_reap
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import event_counts_by_kind
@@ -296,57 +299,83 @@ def test_detect_and_handle_stalled_reviews_dry_run_true_gates_direct_writes_but_
     )
 
 
-def test_detect_and_handle_stalled_reviews_dry_run_true_does_not_change_the_r5_deferred_sweep_events_path(
+def test_detect_and_handle_stalled_reviews_dry_run_true_now_gates_the_sweep_events_path(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """R5 boundary regression: a stale ``review_dispatch_dispatched`` claim
-    (a dead reviewer PID past the stale-claim timeout) is queued into the
-    sweep's batched ``sweep_events`` list and flushed through
-    ``_append_sweep_events`` -- which W6 PR2 deliberately leaves calling the
-    RAW ``append_event`` primitive (issue #1264 R5: shared with workflow.py's
-    ``_detect_and_handle_orphaned_workers``, PR3's territory). This test
-    proves that boundary is real, not accidental: the raw primitive is still
-    invoked (events.db still gets the row) even though ``write_gate.dry_run``
-    is True, while the immediately-following ``_merge_on_write_save`` call
-    (which persists state.json itself) IS gated, so state.json stays
-    byte-identical on disk regardless."""
+    """R5 completion regression (issue #1264, W6 PR3): a stale
+    ``review_dispatch_dispatched`` claim (a dead reviewer PID past the
+    stale-claim timeout) is queued into the sweep's batched
+    ``sweep_events`` list and flushed through ``_append_sweep_events``.
+    Before PR3, that batcher called the RAW ``append_event`` primitive
+    regardless of ``write_gate.dry_run`` (see the module docstring's sixth
+    test note) -- PR3 threads a required ``write_gate`` through it, so this
+    is now the same C1.2 shape as every other converted call site: the
+    underlying primitive must never be reached, and events.db must show
+    zero rows for it, under dry_run=True.
+
+    A dry_run=False positive control (a byte-identical PR-100 seed in a
+    separate state directory, run BEFORE any monkeypatch touches
+    ``charlie_work.write_gate.append_event``) proves the events.db query
+    below is decisive rather than silently broken -- the same discipline
+    the fifth test above already applies to the direct write sites.
+    """
     repo_root = tmp_path / "repo"
     reviews_dir = tmp_path / "reviews"
     reviews_dir.mkdir()
     state_file = tmp_path / "state.json"
 
-    state = empty_state()
-    state["prs"]["100"] = {
-        "number": 100,
-        "review_dispatch_status": "review_dispatch_dispatched",
-        "review_dispatched_at": "2026-08-01T00:00:00Z",
-        "reviewer_pid": 99999,
-        "reviewer_process_start_time": 1.0,
-    }
-    save_state(state_file, state)
+    def _seed(dead_pid_state_file: Path) -> None:
+        seed_state = empty_state()
+        seed_state["prs"]["100"] = {
+            "number": 100,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": "2026-08-01T00:00:00Z",
+            "reviewer_pid": 99999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(dead_pid_state_file, seed_state)
+
+    _seed(state_file)
     before_bytes = state_file.read_bytes()
+
+    now = datetime(2026, 8, 1, 0, 30, tzinfo=UTC)  # 30 min after dispatch: past the 5-min timeout
 
     monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", lambda *a, **k: False)
     monkeypatch.setattr(
         "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
     )
 
-    raw_append_calls: list[tuple[tuple, dict]] = []
-    real_append_event = stalled_review_reap.append_event
-
-    def _spy_append_event(*a, **k):
-        raw_append_calls.append((a, k))
-        return real_append_event(*a, **k)
-
-    monkeypatch.setattr("charlie_work.stalled_review_reap.append_event", _spy_append_event)
-
-    gated_save_calls: list[tuple[tuple, dict]] = []
-    monkeypatch.setattr(
-        "charlie_work.write_gate.save_state",
-        lambda *a, **k: gated_save_calls.append((a, k)) or {"BUG": "raw save_state was called"},
+    # Positive control -- run to completion with dry_run=False, in a separate
+    # directory, BEFORE any monkeypatch touches write_gate.append_event.
+    control_dir = tmp_path / "control"
+    control_dir.mkdir()
+    (control_dir / "reviews").mkdir()
+    control_state_file = control_dir / "state.json"
+    _seed(control_state_file)
+    _detect_and_handle_stalled_reviews(
+        control_dir / "reviews",
+        control_state_file,
+        OrchestratorConfig(),
+        control_dir / "repo",
+        write_gate=_wg(control_state_file, dry_run=False),
+        now=now,
+    )
+    control_counts = event_counts_by_kind(control_state_file)
+    assert control_counts.get("review_dispatch_stalled", 0) >= 1, (
+        "positive control: the same sweep with dry_run=False must produce a "
+        "real review_dispatch_stalled row, proving the query itself works"
     )
 
-    now = datetime(2026, 8, 1, 0, 30, tzinfo=UTC)  # 30 min after dispatch: past the 5-min timeout
+    append_calls: list[tuple[tuple, dict]] = []
+    save_calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        "charlie_work.write_gate.append_event",
+        lambda *a, **k: append_calls.append((a, k)) or {"BUG": "raw append_event was called"},
+    )
+    monkeypatch.setattr(
+        "charlie_work.write_gate.save_state",
+        lambda *a, **k: save_calls.append((a, k)) or {"BUG": "raw save_state was called"},
+    )
 
     _detect_and_handle_stalled_reviews(
         reviews_dir,
@@ -357,17 +386,18 @@ def test_detect_and_handle_stalled_reviews_dry_run_true_does_not_change_the_r5_d
         now=now,
     )
 
-    # R5: the raw, unconverted _append_sweep_events path still runs for real.
-    assert raw_append_calls, (
-        "the R5-deferred _append_sweep_events path must still call the raw "
-        "append_event primitive under dry_run=True -- converting it is PR3's job"
+    # R5 completion: the sweep's batched append_event call is now gated too.
+    assert append_calls == [], (
+        "the _append_sweep_events path must now be gated under dry_run=True "
+        "-- issue #1264 W6 PR3 closes the R5 boundary PR2 left open"
     )
-    assert any(a[1] == "review_dispatch_stalled" for a, _k in raw_append_calls)
-
-    # But the state.json persistence immediately after IS gated (via
-    # _merge_on_write_save -> write_gate.save_state), so nothing lands on disk.
-    assert gated_save_calls == []
+    assert save_calls == []
     assert state_file.read_bytes() == before_bytes
+
+    dry_run_counts = event_counts_by_kind(state_file)
+    assert dry_run_counts.get("review_dispatch_stalled", 0) == 0, (
+        "the sweep's direct write site must not reach events.db under dry_run=True"
+    )
 
 
 def test_reap_orphaned_review_checkouts_dry_run_true_writes_nothing(

@@ -1,17 +1,21 @@
 """Additive dry-run write gate for ``OrchestratorApp`` (issue #1264, W6 PR1).
 
-``WriteGate`` is a per-instance wrapper around the five write primitives an
+``WriteGate`` is a per-instance wrapper around the six write primitives an
 ``OrchestratorApp`` method can reach: ``state.save_state``,
 ``state.append_event``, the ``_record_event``-shaped forwarding wrapper
-(``record_event`` here), ``instrumentation.log_event``, and
-``labels.transition``. Each gate method takes the same arguments as the
+(``record_event`` here), ``instrumentation.log_event``, ``labels.transition``,
+and (issue #1264, W6 PR3, R6a) ``process_utils.kill_orphan_pid`` via
+``kill_process``. Each gate method takes the same arguments as the
 primitive it wraps (minus the ``state_path``/``repo`` binding, which the
 gate auto-supplies from its own fields, mirroring how
 ``OrchestratorApp._record_event`` auto-binds those today) and adds exactly
-one behavior: under ``dry_run=True`` it performs **zero writes and zero
-event emissions** and returns the natural "nothing happened" value for its
-shape (the input state dict unchanged for the state-threading methods,
-``None`` for ``log_event``, and the library's own
+one behavior: under ``dry_run=True`` it performs **zero writes, zero process
+kills, and zero event emissions** and returns the natural "nothing happened"
+value for its shape (the input state dict unchanged for the state-threading
+methods, ``None`` for ``log_event`` and ``kill_process`` alike -- the raw
+``kill_orphan_pid`` primitive itself always returns ``None``, so this is not
+a synthetic dry-run-only value but the same value a real call already
+produces -- and the library's own
 ``TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])`` for
 ``transition``).
 
@@ -51,12 +55,13 @@ from .config import LabelConfig
 from .github import GitHubLike
 from .instrumentation import log_event
 from .labels import TransitionOutcome, TransitionResult, transition
+from .process_utils import kill_orphan_pid
 from .state import append_event, save_state
 
 
 @dataclass(frozen=True)
 class WriteGate:
-    """Per-instance dry-run gate around the five write primitives.
+    """Per-instance dry-run gate around the six write primitives.
 
     ``state_path`` and ``repo`` are the same auto-bound values
     ``OrchestratorApp._record_event`` already supplies on every call
@@ -161,6 +166,22 @@ class WriteGate:
         if self.dry_run:
             return TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])
         return transition(gh, labels, issue_number, event)
+
+    def kill_process(self, pid: int) -> None:
+        """Gate ``process_utils.kill_orphan_pid``. Dry-run: no kill, returns ``None``.
+
+        Issue #1264 (W6 PR3, R6a): the primitive was hoisted from
+        ``workflow.py`` to ``process_utils.py`` so this module can wrap it
+        without importing ``workflow.py`` (see the module docstring on why
+        that import direction is forbidden). ``kill_orphan_pid`` never
+        raises and always returns ``None`` regardless of outcome (best-
+        effort kill), so the dry-run short-circuit below returns exactly
+        the same value a real call already would -- not a synthetic
+        dry-run-only sentinel.
+        """
+        if self.dry_run:
+            return None
+        return kill_orphan_pid(pid)
 
 
 def require_write_gate(write_gate: object) -> "WriteGate":
