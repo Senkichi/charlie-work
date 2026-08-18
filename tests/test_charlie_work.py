@@ -123,6 +123,14 @@ from charlie_work.workflow import (
 from charlie_work.worktree import create_worktree
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.devin_shell import SessionRecord
+from charlie_work.write_gate import WriteGate
+
+
+# Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
+# as state_path -- WriteGate.save_state() writes to self.state_path, not to
+# whatever path the converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def _load_external_fixture(name: str) -> list[dict[str, Any]]:
@@ -8947,7 +8955,13 @@ def test_dispatch_reviews_recorded_verdict_suppresses_later_stalled_throttle(
         }
         save_state(app.paths.state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, app.paths.state_file, app.config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir,
+        app.paths.state_file,
+        app.config,
+        repo_root,
+        write_gate=_wg(app.paths.state_file),
+    )
 
     state = load_state(app.paths.state_file)
     assert not is_reviewer_quota_exhausted(state)
@@ -9300,7 +9314,9 @@ def test_detect_and_handle_stalled_reviews_removes_review_checkout(tmp_path: Pat
         }
         save_state(state_file, state)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert any(entry.get("pr") == 100 for entry in stalled)
     assert not checkout.path.exists()
@@ -9369,7 +9385,9 @@ def test_detect_and_handle_stalled_reviews_backs_off_on_provider_throttle_in_log
         }
         save_state(state_file, state)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert any(
         entry.get("pr") == 100 and entry.get("reason") == "provider_throttled" for entry in stalled
@@ -9462,7 +9480,9 @@ def test_detect_and_handle_stalled_reviews_suppresses_backoff_after_probe_recove
         }
         save_state(state_file, state)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert any(
         entry.get("pr") == 100 and entry.get("reason") == "provider_throttled" for entry in stalled
@@ -9556,7 +9576,9 @@ def test_detect_and_handle_stalled_reviews_applies_backoff_when_probe_predates_d
         }
         save_state(state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = _load_state(state_file)
     quota = state.get("reviewer_quota", {})
@@ -9805,7 +9827,9 @@ def test_stale_claim_recovery_skipped_logs_when_decision_already_recorded(
         }
         save_state(state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     # The PR was not reaped -- recovery declined because a verdict exists.
@@ -9861,7 +9885,9 @@ def test_stale_claim_recovery_skipped_logs_when_packet_not_stale(
         }
         save_state(state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     assert state["prs"]["100"].get("review_dispatch_status") is None
@@ -13184,7 +13210,9 @@ def test_detect_and_handle_stalled_reviews_skips_terminal_pr_reaps_sidecar(
         "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
     )
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert not sidecar_100.exists()
     assert not sidecar_200.exists()
@@ -13257,7 +13285,9 @@ def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
         "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: False
     )
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert [entry["pr"] for entry in stalled] == [100]
     state_after = load_state(state_file)
@@ -45489,7 +45519,11 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_dispatched"
 
     stalled = _detect_and_handle_stalled_reviews(
-        reviews_dir, app.paths.state_file, app.config, repo_root
+        reviews_dir,
+        app.paths.state_file,
+        app.config,
+        repo_root,
+        write_gate=_wg(app.paths.state_file),
     )
     assert any(entry.get("pr") == 100 for entry in stalled)
 
@@ -46803,7 +46837,9 @@ def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
         "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
     )
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     assert {entry["pr"] for entry in stalled} == set(prs)
     state_after = load_state(state_file)
@@ -47429,7 +47465,11 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
     monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
 
     stalled = _detect_and_handle_stalled_reviews(
-        reviews_dir, app.paths.state_file, app.config, repo_root
+        reviews_dir,
+        app.paths.state_file,
+        app.config,
+        repo_root,
+        write_gate=_wg(app.paths.state_file),
     )
     assert any(entry.get("pr") == 100 for entry in stalled)
 

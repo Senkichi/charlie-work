@@ -10714,11 +10714,17 @@ class OrchestratorApp:
                 self.paths.state_file,
                 self.config,
                 self.repo_root,
+                write_gate=self.write_gate,
                 now=resolved_now,
             )
             _reap_completed_review_checkouts(self.repo_root, reviews_dir, self.paths.state_file)
             _reap_orphaned_review_checkouts(
-                self.gh, self.repo_root, reviews_dir, self.paths.state_file, self.config
+                self.gh,
+                self.repo_root,
+                reviews_dir,
+                self.paths.state_file,
+                self.config,
+                write_gate=self.write_gate,
             )
         recorded_verdicts = verdict_result.get("recorded", [])
         missed_verdicts = verdict_result.get("missed", [])
@@ -11523,7 +11529,17 @@ class OrchestratorApp:
                 # Distinct, queryable event for a launch-time quota hit
                 # (issue #612): mirrors the stalled-sweep event so a quota
                 # exhaustion is diagnosable from either detection path.
-                state = append_event(
+                #
+                # Routed through self.write_gate (issue #1264, W6 PR2) rather
+                # than a bare append_event: this whole block sits under
+                # ``with state_lock(...)`` with no local dry_run check of its
+                # own -- the only thing keeping it from running under
+                # dry_run=True today is the exhaustive early return several
+                # hundred lines above, in a different branch of this same
+                # method. Gate-internal checking makes that protection
+                # structural instead of relying on the distant guard staying
+                # correct (R7).
+                state = self.write_gate.append_event(
                     state,
                     "review_quota_exhausted",
                     {
@@ -11535,10 +11551,9 @@ class OrchestratorApp:
                         ),
                         "source": "launch_quota_hit",
                     },
-                    state_path=self.paths.state_file,
                 )
 
-            state = append_event(
+            state = self.write_gate.append_event(
                 state,
                 "review_dispatch",
                 {
@@ -11546,9 +11561,8 @@ class OrchestratorApp:
                     "failed": [x["pr"] for x in failed],
                     "quota_hit": quota_hit,
                 },
-                state_path=self.paths.state_file,
             )
-            save_state(self.paths.state_file, state)
+            self.write_gate.save_state(state)
 
         ok = not failed and not quota_hit
 

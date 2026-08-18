@@ -29,10 +29,18 @@ import charlie_work.stalled_review_reap as cw_stalled_review_reap
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig, RuntimeConfig
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state, state_lock
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
+from charlie_work.write_gate import WriteGate
 
 from _helpers import _init_git_repo
 
 _THROTTLE_LINE = "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n"
+
+
+# Issue #1264 (W6 PR2): every WriteGate constructed below must carry THAT
+# test's own state_file as state_path -- WriteGate.save_state() writes to
+# self.state_path, not to whatever path a converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def _write_throttled_reviewer(reviews_dir: Path, pr_number: int, tmp_path: Path) -> Path:
@@ -129,7 +137,9 @@ def test_stalled_sweep_does_not_clobber_concurrent_unescalate(
 
     monkeypatch.setattr(cw_stalled_review_reap, "iter_workers", _injecting_iter_workers)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
 
@@ -205,7 +215,9 @@ def test_stalled_sweep_events_survive_merge_when_ring_is_at_cap(
         ]
         save_state(state_file, state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
 
@@ -283,7 +295,9 @@ def test_orphaned_reap_sweep_does_not_clobber_concurrent_unescalate(
 
     from charlie_work.workflow import _reap_orphaned_review_checkouts
 
-    reaped = _reap_orphaned_review_checkouts(fake_gh, repo_root, reviews_dir, state_file, config)
+    reaped = _reap_orphaned_review_checkouts(
+        fake_gh, repo_root, reviews_dir, state_file, config, write_gate=_wg(state_file)
+    )
 
     assert reaped == [100]
 

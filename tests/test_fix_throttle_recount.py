@@ -29,10 +29,18 @@ from pathlib import Path
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
+from charlie_work.write_gate import WriteGate
 
 from _helpers import _init_git_repo
 
 _THROTTLE_LINE = "You've hit your session limit · resets 4:40pm (America/Los_Angeles)\n"
+
+
+# Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
+# as state_path -- WriteGate.save_state() writes to self.state_path, not to
+# whatever path the converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def _write_throttled_reviewer(reviews_dir: Path, pr_number: int, tmp_path: Path) -> Path:
@@ -95,7 +103,9 @@ def test_throttled_dead_reviewer_backoff_counted_once_across_sweeps(tmp_path: Pa
     repo_root, reviews_dir, config, state_file = _seed(tmp_path, [100])
     sidecar_path = _write_throttled_reviewer(reviews_dir, 100, tmp_path)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     quota = state.get("reviewer_quota", {})
@@ -110,7 +120,9 @@ def test_throttled_dead_reviewer_backoff_counted_once_across_sweeps(tmp_path: Pa
 
     # Second sweep: the dead session is gone; nothing may re-increment the
     # backoff or re-emit the stalled event for it.
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     assert state.get("reviewer_quota", {}).get("consecutive_probe_failures") == 1
@@ -122,7 +134,9 @@ def test_wave_of_throttled_reviewers_is_one_backoff_increment(tmp_path: Path) ->
     path_a = _write_throttled_reviewer(reviews_dir, 100, tmp_path)
     path_b = _write_throttled_reviewer(reviews_dir, 200, tmp_path)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     # Both reviewers are individually rolled back, reaped, and reported ...
     assert {entry["pr"] for entry in stalled if entry.get("reason") == "provider_throttled"} == {
@@ -189,7 +203,9 @@ def test_throttled_death_with_turn_limit_miss_counts_attempt(tmp_path: Path) -> 
     repo_root, reviews_dir, config, state_file = _seed_with_attempt(tmp_path, 100, 1)
     sidecar_path = _write_throttled_reviewer(reviews_dir, 100, tmp_path)
 
-    stalled = _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    stalled = _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
 
@@ -238,7 +254,9 @@ def test_pure_throttle_death_without_turn_limit_still_rolls_back(tmp_path: Path)
         save_state(state_file, state)
     sidecar_path = _write_throttled_reviewer(reviews_dir, 100, tmp_path)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, state_file, config, repo_root)
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
 
     state = load_state(state_file)
     # Quota backoff applied.

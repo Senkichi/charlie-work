@@ -55,7 +55,6 @@ from .state import (
     load_state,
     load_state_locked,
     reviewer_quota_last_probe_cleared_at,
-    save_state,
     set_reviewer_quota_exhausted,
     state_lock,
     utc_now,
@@ -64,6 +63,7 @@ from .state import (
 from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
 from .worker import _alive_review_worker_issue_numbers, iter_workers
 from .worktree import remove_review_checkout
+from .write_gate import WriteGate, require_write_gate
 
 
 def _remove_review_checkout_with_warning(
@@ -71,6 +71,7 @@ def _remove_review_checkout_with_warning(
     repo_root: Path,
     reviews_dir: Path,
     pr_number: int,
+    write_gate: WriteGate,
     *,
     state_file: Path | None = None,
 ) -> tuple[dict[str, Any], bool]:
@@ -82,7 +83,15 @@ def _remove_review_checkout_with_warning(
     The marker is cleared when removal succeeds so a future failure can alert
     again. Retry happens on the next sweep pass; the warning is never re-emitted
     per pass.
+
+    ``state_file`` is now vestigial at this call site: the sole write below
+    goes through ``write_gate`` (which carries its own bound ``state_path``)
+    rather than the raw ``append_event(state_path=state_file)`` this used to
+    call directly. Kept rather than removed -- W6 PR2 (#1264) is a signature
+    addition, not a signature cleanup, and every existing caller already
+    passes it.
     """
+    write_gate = require_write_gate(write_gate)
     removed = remove_review_checkout(repo_root, pr_number, reviews_dir=reviews_dir)
     pr_key = str(pr_number)
     prs = state.get("prs")
@@ -105,11 +114,10 @@ def _remove_review_checkout_with_warning(
             **state,
             "prs": {**prs, pr_key: {**pr_state, "review_checkout_removal_warned": True}},
         }
-        state = append_event(
+        state = write_gate.append_event(
             state,
             "review_checkout_removal_failed",
             {"pr_number": pr_number, "reviews_dir": str(reviews_dir)},
-            state_path=state_file,
         )
     return state, False
 
@@ -194,6 +202,7 @@ def _set_reviewer_quota_exhausted_with_backoff(
 def _merge_on_write_save(
     state_file: Path,
     state: dict[str, Any],
+    write_gate: WriteGate,
     *,
     snapshot_prs: dict[str, Any],
     snapshot_reviewer_quota: Any,
@@ -230,6 +239,7 @@ def _merge_on_write_save(
     before this call; this only keeps the bounded ``state.json`` event ring
     consistent by appending the sweep's new events onto the fresh ring.
     """
+    write_gate = require_write_gate(write_gate)
     with state_lock(state_file):
         fresh = load_state(state_file)
         fresh_prs = dict(fresh.get("prs") or {})
@@ -281,7 +291,7 @@ def _merge_on_write_save(
             if len(ring) > event_ring_cap:
                 ring = ring[-event_ring_cap:]
             merged["events"] = ring
-        save_state(state_file, merged)
+        write_gate.save_state(merged)
 
 
 class _ThrottleClassification(Enum):
@@ -315,6 +325,7 @@ def _detect_and_handle_stalled_reviews(
     state_file: Path,
     config: OrchestratorConfig,
     repo_root: Path,
+    write_gate: WriteGate,
     *,
     now: datetime | None = None,
 ) -> list[dict[str, Any]]:
@@ -356,6 +367,7 @@ def _detect_and_handle_stalled_reviews(
     exact equality on the resulting ``throttled_until`` instead of a
     wall-clock-tolerance proximity check.
     """
+    write_gate = require_write_gate(write_gate)
     resolved_now = now if now is not None else datetime.now(UTC)
     stalled: list[dict[str, Any]] = []
     sweep_events: list[tuple[str, dict[str, Any]]] = []
@@ -528,7 +540,7 @@ def _detect_and_handle_stalled_reviews(
                     # exhaustion rather than collapsing into a generic
                     # "no verdict" / "provider_throttled" stall. Emitted once per
                     # sweep alongside the single backoff increment.
-                    state = append_event(
+                    state = write_gate.append_event(
                         state,
                         "review_quota_exhausted",
                         {
@@ -540,7 +552,6 @@ def _detect_and_handle_stalled_reviews(
                             ),
                             "source": "stalled_review_sweep",
                         },
-                        state_path=state_file,
                     )
                 throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
             # A session that exhausted its full turn budget did real
@@ -580,11 +591,10 @@ def _detect_and_handle_stalled_reviews(
                     "throttled_until": throttled_until,
                     "backoff_suppressed": backoff_suppressed,
                 }
-                state = append_event(
+                state = write_gate.append_event(
                     state,
                     "review_dispatch_stalled",
                     event_payload,
-                    state_path=state_file,
                     level=_classify_review_dispatch_stalled_level(event_payload),
                 )
                 changed = True
@@ -620,11 +630,10 @@ def _detect_and_handle_stalled_reviews(
                 "throttled_until": throttled_until,
                 "backoff_suppressed": backoff_suppressed,
             }
-            state = append_event(
+            state = write_gate.append_event(
                 state,
                 "review_dispatch_stalled",
                 event_payload,
-                state_path=state_file,
                 level=_classify_review_dispatch_stalled_level(event_payload),
             )
             changed = True
@@ -712,11 +721,10 @@ def _detect_and_handle_stalled_reviews(
                     "reason": "review_log_persistently_unreadable",
                     "streak": streak,
                 }
-                state = append_event(
+                state = write_gate.append_event(
                     state,
                     "review_dispatch_stalled",
                     event_payload,
-                    state_path=state_file,
                     level=_classify_review_dispatch_stalled_level(event_payload),
                 )
                 changed = True
@@ -751,11 +759,10 @@ def _detect_and_handle_stalled_reviews(
                 "reason": "review_log_unreadable",
                 "streak": streak,
             }
-            state = append_event(
+            state = write_gate.append_event(
                 state,
                 "review_dispatch_stalled",
                 event_payload,
-                state_path=state_file,
                 level=_classify_review_dispatch_stalled_level(event_payload),
             )
             changed = True
@@ -799,7 +806,12 @@ def _detect_and_handle_stalled_reviews(
         changed = True
         stalled.append({"pr": w.issue_number, "pid": w.pid, "started_at": w.started_at})
         state, _ = _remove_review_checkout_with_warning(
-            state, repo_root, reviews_dir, w.issue_number, state_file=state_file
+            state,
+            repo_root,
+            reviews_dir,
+            w.issue_number,
+            write_gate=write_gate,
+            state_file=state_file,
         )
         # The failed record above is now the source of truth for redispatch;
         # the dead session's sidecar must go with the checkout or it re-enters
@@ -845,7 +857,12 @@ def _detect_and_handle_stalled_reviews(
                 )
                 if pr_key.isdigit():
                     state, _ = _remove_review_checkout_with_warning(
-                        state, repo_root, reviews_dir, int(pr_key), state_file=state_file
+                        state,
+                        repo_root,
+                        reviews_dir,
+                        int(pr_key),
+                        write_gate=write_gate,
+                        state_file=state_file,
                     )
         elif status == "review_dispatch_dispatched":
             reviewer_pid = pr_state.get("reviewer_pid")
@@ -884,7 +901,12 @@ def _detect_and_handle_stalled_reviews(
                 )
                 if pr_key.isdigit():
                     state, _ = _remove_review_checkout_with_warning(
-                        state, repo_root, reviews_dir, int(pr_key), state_file=state_file
+                        state,
+                        repo_root,
+                        reviews_dir,
+                        int(pr_key),
+                        write_gate=write_gate,
+                        state_file=state_file,
                     )
         elif status is None and pr_state.get("status") == "reviewing":
             # Issue #487: a review packet was generated but was never claimed or
@@ -1022,11 +1044,10 @@ def _detect_and_handle_stalled_reviews(
                 "status": "unclaimed",
                 "prompt_mtime": packet_age,
             }
-            state = append_event(
+            state = write_gate.append_event(
                 state,
                 "review_dispatch_stalled",
                 unclaimed_payload,
-                state_path=state_file,
                 level="warning",
             )
             changed = True
@@ -1038,7 +1059,12 @@ def _detect_and_handle_stalled_reviews(
             )
             if pr_key.isdigit():
                 state, _ = _remove_review_checkout_with_warning(
-                    state, repo_root, reviews_dir, int(pr_key), state_file=state_file
+                    state,
+                    repo_root,
+                    reviews_dir,
+                    int(pr_key),
+                    write_gate=write_gate,
+                    state_file=state_file,
                 )
 
     if changed:
@@ -1051,6 +1077,7 @@ def _detect_and_handle_stalled_reviews(
         _merge_on_write_save(
             state_file,
             state,
+            write_gate=write_gate,
             snapshot_prs=snapshot_prs,
             snapshot_reviewer_quota=snapshot_reviewer_quota,
             snapshot_events=snapshot_events,
@@ -1122,6 +1149,7 @@ def _reap_orphaned_review_checkouts(
     reviews_dir: Path,
     state_file: Path,
     config: OrchestratorConfig,
+    write_gate: WriteGate,
 ) -> list[int]:
     """Remove isolated review checkouts for PRs whose GitHub lifecycle has
     already reached ``MERGED`` or ``CLOSED`` and whose reviewer process has
@@ -1135,6 +1163,7 @@ def _reap_orphaned_review_checkouts(
     reviewer sidecar is still alive is deferred to a later pass so the live
     session is not interrupted.
     """
+    write_gate = require_write_gate(write_gate)
     state = load_state_locked(state_file)
     # Capture the entry-pass snapshot so the save block below can merge-on-write
     # instead of restoring this stale snapshot wholesale (issue #594). The
@@ -1220,7 +1249,12 @@ def _reap_orphaned_review_checkouts(
         changed = True
 
         state, removed = _remove_review_checkout_with_warning(
-            state, repo_root, reviews_dir, pr_number, state_file=state_file
+            state,
+            repo_root,
+            reviews_dir,
+            pr_number,
+            write_gate=write_gate,
+            state_file=state_file,
         )
         # Reap the sidecar with the checkout: leaving it resurrects the dead
         # session as a phantom failed claim in the stalled sweep next pass,
@@ -1248,6 +1282,7 @@ def _reap_orphaned_review_checkouts(
         _merge_on_write_save(
             state_file,
             state,
+            write_gate=write_gate,
             snapshot_prs=snapshot_prs,
             snapshot_reviewer_quota=snapshot_reviewer_quota,
             snapshot_events=snapshot_events,

@@ -35,8 +35,16 @@ from charlie_work.state import (
     save_state,
 )
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
+from charlie_work.write_gate import WriteGate
 
 from _reconcile_fixtures import FakeGitHub, _issue, _pr
+
+
+# Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
+# as state_path -- WriteGate.save_state() writes to self.state_path, not to
+# whatever path the converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_orphan_no_active_label_with_open_pr_is_drift() -> None:
@@ -327,7 +335,13 @@ def test_pr_status_normalization_does_not_trip_stalled_review_sweep(
     assert new_state["prs"]["100"]["status"] == PASSIVE_OPEN_STATUS
     save_state(paths.state_file, new_state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, paths.state_file, config, tmp_path / "repo")
+    _detect_and_handle_stalled_reviews(
+        reviews_dir,
+        paths.state_file,
+        config,
+        tmp_path / "repo",
+        write_gate=_wg(paths.state_file),
+    )
 
     final_state = load_state(paths.state_file)
     assert final_state["prs"]["100"]["status"] == PASSIVE_OPEN_STATUS

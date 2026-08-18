@@ -49,26 +49,30 @@ This module is EXPECTED to exceed the repo's normal 800-line-per-module cap
 decision on issue #1283 (staged-split final comment, 2026-08-17). In place
 of the 800-line gate, this file asserts two things:
 
-* A HARD equality on the member-content-only body span (first ``def`` to
-  EOF): must be exactly 1258 lines, matching the raw contiguous physical
-  fragment Preflight measured at both the authoring-time snapshot
-  (``adcee931``, lines 1814-3071) and the dispatch-time re-validation
-  (``812279a4``, lines 1885-3142) -- the fragment's *length* survived the
-  intervening +71 line shift from PRs #1318/#1319 landing upstream of it.
-* A BAND on the new module's total line count (docstring + imports + body),
-  derived live at this PR's Preflight step from ``ci_findings.py``'s own
-  header/import-surface ratio (the nearest same-lineage precedent), recorded
-  in this run's ``wf-a6-notes.md`` as ``capBandMin=1308, capBandMax=1338``
-  (member-content 1258 + a [50, 80]-line header estimate, cross-validated
-  by two independent ratios -- import-line density and a rejected naive
-  body-length scaling, both derived from a live ``ci_findings.py``
-  re-measurement, not a hardcoded guess). This band is a recorded PR-level
-  decision, not a value this file re-derives from scratch at collection
-  time (the docstring-length component of the header estimate is a
-  thematic judgment call, not mechanically reproducible) -- but the
-  mechanical half of the arithmetic (ci_findings.py's live header/import
-  line counts) is re-measured directly below as a drift guard on the band's
-  own justification.
+* An AST-derived name-set equality on the member-content-only body span
+  (first ``def``/``class`` to EOF): its top-level definitions must be
+  exactly the 10 known moved names, no more, no fewer. Originally (A6) this
+  was a HARD LINE-COUNT equality (1258 lines) against the raw contiguous
+  physical fragment Preflight measured -- a premise that held only while the
+  module stayed an untouched verbatim move. W6 PR2 (issue #1264) legitimately
+  invalidates that premise: threading a required ``write_gate: WriteGate``
+  parameter (plus a ``require_write_gate`` call) through 4 of the 10 moved
+  functions grows their body length by design, not by drift. The name-set
+  form (see ``test_member_content_defines_exactly_the_ten_moved_symbols``)
+  preserves what the original gate actually protected against -- a top-level
+  unit silently added, dropped, or renamed during a mechanical edit -- without
+  re-asserting a byte count the PR is deliberately changing.
+* A BAND on the new module's total line count (docstring + imports + body).
+  A6's Preflight step derived the original ``[1308, 1338]`` band live from
+  ``ci_findings.py``'s own header/import-surface ratio (recorded in that
+  run's ``wf-a6-notes.md`` as member-content 1258 + a [50, 80]-line header
+  estimate). W6 PR2 widens the upper bound to ``1391`` (the real
+  post-conversion total this PR measured, 1361 lines, plus a 30-line
+  headroom margin) to accommodate the same write_gate-threading growth
+  described above -- a documented, PR-recorded widening of the existing
+  band, not a silent loosening or a removal of the gate. The lower bound
+  (1308) is unchanged: the module only grows from here, so it remains a
+  safe floor.
 
 Three ways the facade promise can quietly break, same three failure modes
 every prior split suite in this lineage documents:
@@ -113,13 +117,15 @@ _MOVED_NAMES = (
     "_append_sweep_events",
 )
 
-# Recorded at this run's Preflight step (wf-a6-notes.md Step 6/10), not
-# re-derived here -- see the module docstring above for why the band's
-# docstring-length component is a judgment call, not mechanically
-# reproducible from ci_findings.py alone.
-_MEMBER_CONTENT_LINES = 1258
+# _CAP_BAND_MIN is A6's original Preflight-derived floor (wf-a6-notes.md
+# Step 6/10) -- unchanged, since the module only grows from here. _CAP_BAND_MAX
+# was widened by W6 PR2 (issue #1264) from A6's original 1338 to the real
+# post-conversion total this PR measured (1361) plus a 30-line headroom
+# margin: PR2's write_gate: WriteGate signature additions + require_write_gate
+# calls grow the module by design, so the original band (derived assuming an
+# untouched verbatim move) no longer fits. See the module docstring above.
 _CAP_BAND_MIN = 1308
-_CAP_BAND_MAX = 1338
+_CAP_BAND_MAX = 1391
 
 
 # ---------------------------------------------------------------------------
@@ -432,39 +438,55 @@ def _member_content_line_count(path: Path) -> int:
     return total_lines - first_member_lineno + 1
 
 
-def test_member_content_span_is_exactly_1258_lines() -> None:
-    """HARD equality gate: the member-content-only body (first top-level
-    def/class through EOF) must be exactly 1258 lines -- the raw contiguous
-    physical fragment Preflight measured, unchanged in length across the
-    +71 line position shift caused by PRs #1318/#1319 landing upstream of
-    it. This is the number the byte-identity diff against workflow.py's
-    pre-move span was checked against, not workflow.py's own numstat
-    deletion count (1266 -- see the module docstring above for why those
-    two numbers differ: 1266 also includes 6 dead-import prunes and the
-    facade block's own 27 inserted lines' counterpart deletions).
+def test_member_content_defines_exactly_the_ten_moved_symbols() -> None:
+    """Structural replacement for the retired byte/line-count equality gate
+    (issue #1264, W6 PR2): the original ``test_member_content_span_is_exactly_1258_lines``
+    asserted a HARD LINE-COUNT equality whose premise -- "this module is an
+    untouched verbatim move from workflow.py, so its content span's length
+    stays pinned" -- is intentionally invalidated by this PR. Threading a
+    required ``write_gate: WriteGate`` parameter (plus a
+    ``require_write_gate`` call) through 4 of the 10 moved functions grows
+    their body length by design, so re-asserting the old byte count would
+    fail on the very change this PR is authorized to make.
+
+    What the retired gate actually protected against -- content silently
+    lost, duplicated, or a top-level unit added/dropped/renamed during a
+    mechanical edit -- is still enforced here, just via a name-set equality
+    instead of a length equality: every top-level definition in the
+    member-content span must be one of the 10 known moved names, no more,
+    no fewer. This reuses the same ``_module_level_defined_names``
+    derivation ``test_all_ten_names_are_reexported_by_identity`` already
+    exercises (deliberately -- both tests are meant to agree), but stands as
+    its own independent guard scoped to just this claim.
     """
-    actual = _member_content_line_count(_MODULE_PATH)
-    assert actual == _MEMBER_CONTENT_LINES, (
-        f"stalled_review_reap.py's member-content span is {actual} lines, expected exactly "
-        f"{_MEMBER_CONTENT_LINES} -- a mismatch here means either content was lost/duplicated "
-        "during the move, or the moved span drifted from what Preflight verified"
+    names = _module_level_defined_names(_MODULE_PATH)
+    assert names, "AST derivation found zero module-level names -- derivation is broken"
+    assert set(names) == set(_MOVED_NAMES), (
+        f"stalled_review_reap.py's top-level definitions are {sorted(names)}, expected "
+        f"exactly the 10 moved names {sorted(_MOVED_NAMES)} -- a mismatch here means a "
+        "top-level unit was added, dropped, or renamed (growing an EXISTING member's body, "
+        "e.g. adding a write_gate parameter, is expected and does not change this set)"
     )
 
 
 def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     """BAND gate: the new module's total (docstring + imports + body) must
-    fall within [1308, 1338] -- the band this run's Preflight step derived
-    live from ci_findings.py's own header/import-surface ratio (recorded in
-    wf-a6-notes.md Step 10), NOT the repo's normal 800-line cap (explicitly
-    waived for this extraction by operator decision).
+    fall within [1308, 1391]. A6's Preflight step originally derived
+    [1308, 1338] live from ci_findings.py's own header/import-surface ratio
+    (recorded in wf-a6-notes.md Step 10). W6 PR2 (issue #1264) widened the
+    upper bound to 1391 -- the real post-conversion total this PR measured
+    (1361 lines) plus a 30-line headroom margin -- to accommodate the
+    write_gate: WriteGate signature additions + require_write_gate calls
+    the conversion adds. This is NOT the repo's normal 800-line cap
+    (explicitly waived for this extraction by operator decision).
     """
     total = len(_MODULE_PATH.read_text(encoding="utf-8").splitlines())
     assert _CAP_BAND_MIN <= total <= _CAP_BAND_MAX, (
         f"stalled_review_reap.py is {total} lines total, expected within the recorded "
-        f"cap-exemption band [{_CAP_BAND_MIN}, {_CAP_BAND_MAX}] (member-content "
-        f"{_MEMBER_CONTENT_LINES} + a live-derived [50, 80]-line header estimate) -- if this "
-        "module's header genuinely needs to grow or shrink beyond the band, the band itself "
-        "(not this assertion) should be re-derived and re-recorded, not silently widened here"
+        f"cap-exemption band [{_CAP_BAND_MIN}, {_CAP_BAND_MAX}] -- if this module's header "
+        "or member content genuinely needs to grow or shrink beyond the band, the band "
+        "itself (not this assertion) should be re-derived and re-recorded, not silently "
+        "widened here"
     )
 
 
