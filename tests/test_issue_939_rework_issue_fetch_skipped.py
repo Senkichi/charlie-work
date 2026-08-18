@@ -23,7 +23,7 @@ from charlie_work.workflow import (
     _build_rework_issue_fetch_skip_payload,
 )
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 
 def _make_app(tmp_path: Path, fake_gh: FakeGitHub, **kwargs) -> tuple[OrchestratorApp, object]:

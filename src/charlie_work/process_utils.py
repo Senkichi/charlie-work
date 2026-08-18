@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -717,3 +718,30 @@ def popen_worker(
     popen_kwargs.update(hidden_console_kwargs(extra_flags | process_group_flag))
 
     return subprocess.Popen(args, **popen_kwargs)
+
+
+def kill_orphan_pid(pid: int) -> None:
+    """Best-effort kill of a single orphan PID, cross-platform.
+
+    Mirrors the OS branch used by ``kill_process_tree``: ``taskkill`` on
+    Windows, ``os.kill(SIGKILL)`` on POSIX. Never raises - callers treat this
+    as best-effort and always record the PID as killed regardless of outcome.
+
+    Hoisted here from ``workflow.py`` (issue #1264, W6 PR3, R6a) so that
+    ``write_gate.py`` can wrap it as ``WriteGate.kill_process`` without
+    importing ``workflow.py`` (that would create an import cycle, since
+    ``workflow.py`` is ``write_gate.py``'s only production importer).
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+                **no_console_window_kwargs(),
+            )
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError, FileNotFoundError):
+        # Best-effort kill - don't fail if the kill attempt fails
+        pass

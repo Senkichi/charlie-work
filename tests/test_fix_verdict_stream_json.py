@@ -35,7 +35,7 @@ from charlie_work.workflow import (
     _parse_review_verdict_from_files,
     _parse_review_verdict_from_log,
 )
-from test_charlie_work import (
+from _review_fixtures import (
     _dispatch_reviews_app,
     _make_dead_review_sidecar,
     _set_review_dispatched_state,

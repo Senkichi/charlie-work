@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work.instrumentation import (
+    EXPECTED_OPERATIONAL_KINDS,
     _LEVEL_BY_KIND,
     close_db,
     correlation_context,
@@ -1043,7 +1044,7 @@ def test_jsonl_migration_malformed_tolerance_preserved(tmp_path: Path) -> None:
 # becomes resolvable (or is rewritten) can't leave stale cover behind.
 # ---------------------------------------------------------------------------
 
-_EMIT_FUNCS = {"log_event", "append_event", "_record_event"}
+_EMIT_FUNCS = {"log_event", "append_event", "_record_event", "record_event"}
 _WRAPPER_FUNCS = {"_route_to_rework"}
 _VALID_LEVELS = {"info", "warning", "error"}
 
@@ -1482,7 +1483,7 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="workflow.py",
+        path="stalled_review_reap.py",
         scope="_append_sweep_events",
         source="kind",
         reason=(
@@ -1493,7 +1494,7 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="workflow.py",
+        path="stalled_review_reap.py",
         scope="_append_sweep_events",
         source="f'{kind}_sweep'",
         reason="Same `kind` loop variable as above, with the `_sweep` suffix appended.",
@@ -1506,6 +1507,42 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
             "_self_deploy_event_kind(result) returns one of "
             "self_deploy_{failed,succeeded,skipped}; every branch is "
             "verified by test_self_deploy_event_kind_only_returns_registered_kinds."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="write_gate.py",
+        scope="append_event",
+        source="kind",
+        reason=(
+            "WriteGate.append_event forwards its own `kind` parameter to "
+            "state.append_event. Same pass-through as the existing "
+            "state.py/append_event entry above; the literal is chosen at "
+            "each call site, and every self.write_gate.append_event(...) "
+            "call site is scanned there."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="write_gate.py",
+        scope="record_event",
+        source="kind",
+        reason=(
+            "WriteGate.record_event forwards its own `kind` parameter to "
+            "state.append_event, mirroring OrchestratorApp._record_event's "
+            "own forwarding shape (see the workflow.py/_record_event entry "
+            "above). Every self.write_gate.record_event(...) call site is "
+            "scanned there; `record_event` is itself in _EMIT_FUNCS so no "
+            "coverage gap opens once a call site migrates onto it."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="write_gate.py",
+        scope="log_event",
+        source="kind",
+        reason=(
+            "WriteGate.log_event forwards its own `kind` parameter to "
+            "instrumentation.log_event. The literal is chosen at each call "
+            "site, and every self.write_gate.log_event(...) call site is "
+            "scanned there."
         ),
     ),
 )
@@ -1563,6 +1600,58 @@ def test_event_kind_registry_exhaustive() -> None:
         "site -- remove it or update it to match the current source: "
         + "; ".join(f"{site.path} in {site.scope}(): `{site.source}`" for site in stale)
     )
+
+
+def test_review_dispatch_skipped_ci_red_kind_registered_matches_family() -> None:
+    """Issue #1258: the janitor's CI-red short-circuit (sole-failure and the
+    new co-occurring-failure branch alike) must have a dedicated, registered
+    provenance kind -- previously it only produced whatever generic
+    ``record_review`` itself logs, with nothing naming the deterministic
+    gate as the decision's source.
+
+    Pinned to the ``review_dispatch_*`` family per the issue's binding
+    comment (which corrects the plan body's originally-proposed
+    ``review_skipped_ci_red`` naming) so it groups with
+    ``review_dispatch_claim``/``review_dispatch`` for ``event_counts_by_kind``
+    roll-ups, and pinned to level ``info``: this is the deterministic gate
+    doing its routine job (routing to rework without ever starting a paid
+    reviewer session), not a condition that ended a lane or lost work.
+    """
+    assert "review_dispatch_skipped_ci_red" in _LEVEL_BY_KIND
+    assert _LEVEL_BY_KIND["review_dispatch_skipped_ci_red"] == "info"
+    assert "review_dispatch_skipped_ci_red".startswith("review_dispatch_")
+
+    # Deferral (d): the stale/absent-checks auto-retrigger is W17's, landing
+    # after this item in the lane -- no retrigger emitter exists yet, so no
+    # retrigger-family kind may be registered here. A registered-but-unused
+    # kind would be exactly as misleading as an emitted-but-unregistered one:
+    # it would claim a mechanism exists that this diff never builds.
+    retrigger_kinds = {
+        kind
+        for kind in _LEVEL_BY_KIND
+        if kind.startswith("review_dispatch_") and "retrigger" in kind
+    }
+    assert not retrigger_kinds, (
+        f"no retrigger-family kind may be registered by this item (W17's job): {retrigger_kinds}"
+    )
+
+
+def test_expected_operational_kinds_are_all_registered_warnings() -> None:
+    """#1271: bucketing only makes sense for warnings.
+
+    Every member of ``EXPECTED_OPERATIONAL_KINDS`` must be registered in
+    ``_LEVEL_BY_KIND`` at ``"warning"`` -- an info or error kind (or an
+    unregistered one) accidentally added to the set would silently vanish
+    from ``check_error_events``'s coverage or from the info stream, since
+    ``check_warning_events`` only ever queries ``level = 'warning'`` rows.
+    """
+    assert EXPECTED_OPERATIONAL_KINDS, "the set must not be empty"
+    for kind in EXPECTED_OPERATIONAL_KINDS:
+        assert kind in _LEVEL_BY_KIND, f"{kind} is not registered in _LEVEL_BY_KIND"
+        assert _LEVEL_BY_KIND[kind] == "warning", (
+            f"{kind} is registered at level {_LEVEL_BY_KIND[kind]!r}, not 'warning' -- "
+            "bucketing only makes sense for warning-level kinds"
+        )
 
 
 def test_self_deploy_event_kind_only_returns_registered_kinds() -> None:

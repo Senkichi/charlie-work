@@ -2261,6 +2261,11 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
                 summary_file=args.summary_file,
                 comment=args.comment,
                 reviewed_head=args.reviewed_head,
+                # Issue #1265: a human running this command is, by
+                # definition, the operator-manual provenance -- no flag to
+                # thread through, this is the one caller for which the value
+                # is always the same.
+                verdict_provenance="operator_manual",
                 # Issue #1072: the operator CLI is the one caller that may
                 # legitimately pin a verdict to a superseded head (issue #467's
                 # explicit-choice design). Automated callers use the default

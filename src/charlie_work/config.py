@@ -120,6 +120,17 @@ class LabelConfig:
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
     merge_hold: str = "agent:merge-hold"
+    # Issue #1266: mechanical escalations (reason_class == "mechanical") land
+    # here instead of ``human_needed``, so human attention is reserved for
+    # judgment calls. Unlike ``prose_only_deps`` -- the only other
+    # terminal-but-not-workflow_labels label -- this one IS actively
+    # added/removed by automated ``labels.py`` transitions (the
+    # "operator_queued"/"redispatch_operator_queued" edges and the
+    # de-escalation cap-exhaustion path), so it must be a member of
+    # ``workflow_labels`` (so a transition away from it correctly strips it
+    # via ``_compute_remove``) and of ``all`` (so ``bootstrap_labels``
+    # creates it on GitHub).
+    operator_queue: str = "agent:operator-queue"
     # Routing hint, NOT a workflow state (issue #481). Never a member of
     # ``active``/``terminal``/``workflow_labels`` — it must not affect issue
     # selection or exclusion. Included in ``all`` so ``bootstrap_labels``
@@ -130,7 +141,13 @@ class LabelConfig:
 
     @property
     def terminal(self) -> set[str]:
-        return {self.blocked, self.done, self.human_needed, self.prose_only_deps}
+        return {
+            self.blocked,
+            self.done,
+            self.human_needed,
+            self.prose_only_deps,
+            self.operator_queue,
+        }
 
     @property
     def active(self) -> set[str]:
@@ -151,6 +168,7 @@ class LabelConfig:
             self.prose_only_deps,
             self.merge_hold,
             self.complexity_high,
+            self.operator_queue,
         ]
 
     @property
@@ -173,6 +191,7 @@ class LabelConfig:
             self.blocked,
             self.done,
             self.human_needed,
+            self.operator_queue,
         }
 
 
@@ -345,6 +364,42 @@ class ReviewConfig:
     # mode to hours instead of the unbounded, indefinite spin this issue was
     # filed over.
     rework_stall_minutes: int = 240
+    # Issue #1268 (W11), item 3: record_review's PR-comment gate used to
+    # fire only for request_changes and only when a caller passed
+    # comment=True (the CLI's `charlie verdict --comment`). Every other
+    # terminal decision (approved, blocked) and every automated caller
+    # (dispatch_reviews' reap path, rescue's approved exit, etc.) recorded a
+    # verdict with no corresponding PR-visible trace -- a human or peer
+    # agent reading the PR thread saw nothing. True posts a
+    # "## Fleet review - round K - <decision>" comment for every terminal
+    # decision (still excluding an in-call escalation, which the rescue
+    # tier and the rework-cap path already comment on themselves -- see
+    # record_review's gate). False restores the old silent default; the
+    # CLI's `--comment` flag remains a force-on override on top of this,
+    # not replaced by it.
+    post_verdict_comment: bool = True
+    # Issue #1274 (W17): follow-up policy for `_detect_ci_run_never_created`'s
+    # existing "zero check suites" signal (workflow.py) -- close/reopen (or an
+    # empty-commit fallback) the PR to try to force GitHub Actions to create
+    # the missing check-suite run. This field governs ONLY the wait between
+    # successive retrigger attempts on the SAME still-missing head; it is
+    # never consulted by the detector itself, which has its own independent
+    # grace window (auto_merge.ci_run_never_created_grace_minutes) before it
+    # will even report a head as never-created. Two grace periods gating the
+    # same underlying condition would be the invalid-state smell this
+    # codebase's design explicitly avoids -- keep them separate by contract,
+    # not just by accident. 15 minutes gives a retriggered run enough time to
+    # actually appear before another attempt is considered.
+    stale_checks_grace_minutes: int = 15
+    # Same issue: bounds how many retrigger attempts (close/reopen or
+    # empty-commit, combined -- one shared counter, not two) a single PR gets
+    # before this codebase escalates it to a human via `_escalate_issue`
+    # instead of retrying forever. Mirrors max_conflict_rework_attempts /
+    # max_no_op_rework_attempts's role for their respective failure modes: a
+    # small bound that absorbs transient GitHub-side propagation lag without
+    # spinning indefinitely on a PR where retriggering mechanically cannot
+    # help (e.g. a workflow file itself is broken).
+    stale_checks_max_retriggers: int = 3
 
 
 @dataclass(frozen=True)
@@ -515,6 +570,21 @@ class ReviewDispatchConfig:
     # verdict (e.g. every reviewer hits the session limit) is re-dispatched
     # indefinitely, burning quota every stale-claim interval.
     max_review_dispatch_attempts: int = 3
+    # Maximum consecutive UNDETERMINED (unreadable/empty reviewer log)
+    # classifications for the same PR before the rollback stops preserving
+    # the attempt budget (issue #1069). The first N consecutive undetermined
+    # deaths are treated as transient I/O hiccups — the claim is rolled back
+    # and the attempt counter decremented, exactly like the throttle path but
+    # without arming fleet-wide backoff. Once the streak exceeds this value
+    # the condition is persistent, not transient: subsequent undetermined
+    # deaths become counted failures (attempt counter NOT decremented) so the
+    # existing ``max_review_dispatch_attempts`` cap can converge and escalate
+    # rather than redispatching forever with no cap and no backoff — the same
+    # outage shape as #1342-1346 via a new path. The streak resets on any
+    # definitive outcome (throttled, not-throttled, verdict recorded, new
+    # packet, operator unescalate). 0 disables the bound (preserves the
+    # pre-fix unbounded rollback — not recommended).
+    max_consecutive_review_log_unreadable: int = 3
     # Maximum agentic turns for a reviewer session. Caps token spend per
     # review by limiting how many tool-call round-trips the reviewer can make.
     # 0 means unlimited (preserves pre-existing behavior). 40 is generous for
@@ -769,6 +839,18 @@ class RuntimeConfig:
     # help a call that never returns — only a timeout converts the hang into a
     # failure the existing retry/next-pass machinery can absorb.
     gh_timeout_seconds: float = 120.0
+    # cw#1273: outer retry for `gh pr create` specifically, layered on top of
+    # GitHub.run()'s inner pre-connection-only retry above. The inner retry's
+    # ~7s default span is far shorter than the ~45s TLS blips observed on
+    # this host, and mutations are deliberately excluded from the inner
+    # retry's post-send-failure case (at-most-once semantics) -- see
+    # pr_create_retry.py's module docstring for the composition rationale.
+    # `pr_create_retry_max_attempts` additional attempts follow the first on
+    # failure (mirrors `gh_max_retries`'s "N retries, N+1 total tries"
+    # naming); backoff before retry n is `pr_create_retry_base_seconds *
+    # (3 ** (n - 1))` -- 10s/30s/90s with the defaults.
+    pr_create_retry_max_attempts: int = 3
+    pr_create_retry_base_seconds: float = 10.0
     # Pre-emptive GraphQL rate-limit guard. Before starting quota-heavy phases
     # (mop-up sweeps, merged-PR listings), GitHub.check_graphql_rate_limit()
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
@@ -1257,6 +1339,64 @@ class TestAdequacyConfig:
 
 
 @dataclass(frozen=True)
+class CoverageProbeConfig:
+    """Config for the advisory-only static diff-coverage / unwired-symbol
+    probes (``diff_coverage_probe.run_static_probe``, issues #1260/#1261).
+
+    ``enabled`` defaults False so an absent config block is a no-op --
+    mirrors ``CrossFamilyConfig``/``TestAdequacyConfig``. This is a new,
+    independent config section: it does NOT read, gate on, or repurpose any
+    field of ``TestAdequacyConfig``, including that class's reserved Tier-3
+    ``coverage_enabled``/``coverage_command``/``min_diff_coverage`` fields
+    above, which describe an unrelated, deferred, subprocess-based
+    numeric-coverage design.
+
+    Both probe halves are advisory-only in v1 -- they only add text to the
+    review packet and never block dispatch, review, or merge. Promotion to a
+    hard gate is explicitly deferred past a 2-week false-positive
+    measurement window (see the #1260/#1261 scoping comment); this config
+    intentionally has no auto-reject knob.
+    """
+
+    enabled: bool = False
+
+    # -- W3: branch-token-vs-test-add heuristic ------------------------------
+    # Path-classification defaults mirror TestAdequacyConfig's own, kept as
+    # an independent copy (not a shared reference) so the two gates can be
+    # configured separately without coupling.
+    test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
+    exempt_path_globs: tuple[str, ...] = (
+        "*.md",
+        "docs/**",
+        "examples/**",
+        ".github/workflows/**",
+        "*.lock",
+        "*.toml",
+        "*.cfg",
+        "*.ini",
+    )
+    comment_prefixes: tuple[str, ...] = ("#",)
+    branch_tokens: tuple[str, ...] = ("if ", "elif ", "except ", " and ", " or ", " else ")
+    assertion_markers: tuple[str, ...] = (
+        "assert ",
+        "pytest.raises",
+        "raises(",
+        "assert_called",
+        "self.assert",
+    )
+    test_function_prefix: str = "def test_"
+    # branch_adds:test_adds ratio above this threshold flags even when
+    # test_adds > 0.
+    branch_to_assert_ratio_threshold: float = 4.0
+
+    # -- W20 item 1: unwired-symbol AST probe --------------------------------
+    check_unwired_symbols: bool = True
+    # Leading-underscore names are excluded -- the probe only flags *public*
+    # new symbols.
+    private_name_prefix: str = "_"
+
+
+@dataclass(frozen=True)
 class FleetConfig:
     """Fleet-wide configuration for multi-repo coordination.
 
@@ -1488,6 +1628,7 @@ class OrchestratorConfig:
         default_factory=WorktreeReclamationConfig
     )
     test_adequacy: TestAdequacyConfig = field(default_factory=TestAdequacyConfig)
+    coverage_probe: CoverageProbeConfig = field(default_factory=CoverageProbeConfig)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
@@ -1736,7 +1877,34 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 f"config section 'dispatch' key 'max_open_agent_prs' must be >= 0, got {_mop}"
             )
     dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
-    review = _build_section(ReviewConfig, "review", _section(data, "review"))
+    review_data = _section(data, "review")
+    stale_checks_grace_minutes = review_data.get("stale_checks_grace_minutes")
+    if stale_checks_grace_minutes is not None:
+        if isinstance(stale_checks_grace_minutes, bool) or not isinstance(
+            stale_checks_grace_minutes, int
+        ):
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_grace_minutes' must be an "
+                f"int, got {type(stale_checks_grace_minutes).__name__}"
+            )
+        if stale_checks_grace_minutes < 0:
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_grace_minutes' must not be negative"
+            )
+    stale_checks_max_retriggers = review_data.get("stale_checks_max_retriggers")
+    if stale_checks_max_retriggers is not None:
+        if isinstance(stale_checks_max_retriggers, bool) or not isinstance(
+            stale_checks_max_retriggers, int
+        ):
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_max_retriggers' must be an "
+                f"int, got {type(stale_checks_max_retriggers).__name__}"
+            )
+        if stale_checks_max_retriggers < 0:
+            raise ConfigError(
+                "config section 'review' key 'stale_checks_max_retriggers' must not be negative"
+            )
+    review = _build_section(ReviewConfig, "review", review_data)
     review_dispatch_data = _section(data, "review_dispatch")
     for rd_bool_key in ("enabled",):
         rd_bool_value = review_dispatch_data.get(rd_bool_key)
@@ -1774,6 +1942,19 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be >= 1, "
             f"got {rd_max_attempts}"
+        )
+    rd_max_unreadable = review_dispatch_data.get("max_consecutive_review_log_unreadable")
+    if rd_max_unreadable is not None and (
+        isinstance(rd_max_unreadable, bool) or not isinstance(rd_max_unreadable, int)
+    ):
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_consecutive_review_log_unreadable' must be an int, "
+            f"got {type(rd_max_unreadable).__name__}"
+        )
+    if rd_max_unreadable is not None and rd_max_unreadable < 0:
+        raise ConfigError(
+            "config section 'review_dispatch' key 'max_consecutive_review_log_unreadable' must be >= 0, "
+            f"got {rd_max_unreadable}"
         )
     rd_probe_max_interval = review_dispatch_data.get("quota_probe_max_interval_minutes")
     if rd_probe_max_interval is not None and (
@@ -2090,6 +2271,22 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
                 f"got {gh_timeout_seconds}"
             )
+    pr_create_retry_max_attempts = runtime_data.get("pr_create_retry_max_attempts")
+    if pr_create_retry_max_attempts is not None and not isinstance(
+        pr_create_retry_max_attempts, int
+    ):
+        raise ConfigError(
+            "config section 'runtime' key 'pr_create_retry_max_attempts' must be an int, "
+            f"got {type(pr_create_retry_max_attempts).__name__}"
+        )
+    pr_create_retry_base_seconds = runtime_data.get("pr_create_retry_base_seconds")
+    if pr_create_retry_base_seconds is not None and not isinstance(
+        pr_create_retry_base_seconds, (int, float)
+    ):
+        raise ConfigError(
+            "config section 'runtime' key 'pr_create_retry_base_seconds' must be a number, "
+            f"got {type(pr_create_retry_base_seconds).__name__}"
+        )
     graphql_rate_limit_threshold = runtime_data.get("graphql_rate_limit_threshold")
     if graphql_rate_limit_threshold is not None:
         if not isinstance(graphql_rate_limit_threshold, int):
@@ -2578,6 +2775,55 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             )
 
     test_adequacy = _build_section(TestAdequacyConfig, "test_adequacy", test_adequacy_data)
+    coverage_probe_data = _section(data, "coverage_probe")
+
+    # Five tuple-of-str fields: reject non-list, coerce elements to str.
+    _COVERAGE_PROBE_TUPLE_FIELDS = (
+        "test_path_globs",
+        "exempt_path_globs",
+        "comment_prefixes",
+        "branch_tokens",
+        "assertion_markers",
+    )
+    for key in _COVERAGE_PROBE_TUPLE_FIELDS:
+        value = coverage_probe_data.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, list):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{key}' must be a list of "
+                f"strings, got {type(value).__name__}"
+            )
+        for item in value:
+            if not isinstance(item, str):
+                raise ConfigError(
+                    f"config section 'coverage_probe' key '{key}' must be a list of "
+                    f"strings, got element of type {type(item).__name__}"
+                )
+        coverage_probe_data[key] = tuple(value)
+
+    branch_ratio = coverage_probe_data.get("branch_to_assert_ratio_threshold")
+    if branch_ratio is not None and not isinstance(branch_ratio, (int, float)):
+        raise ConfigError(
+            "config section 'coverage_probe' key 'branch_to_assert_ratio_threshold' must be "
+            f"a float, got {type(branch_ratio).__name__}"
+        )
+    for str_key in ("test_function_prefix", "private_name_prefix"):
+        str_value = coverage_probe_data.get(str_key)
+        if str_value is not None and not isinstance(str_value, str):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{str_key}' must be a string, "
+                f"got {type(str_value).__name__}"
+            )
+    for bool_key in ("enabled", "check_unwired_symbols"):
+        bool_value = coverage_probe_data.get(bool_key)
+        if bool_value is not None and not isinstance(bool_value, bool):
+            raise ConfigError(
+                f"config section 'coverage_probe' key '{bool_key}' must be a bool, "
+                f"got {type(bool_value).__name__}"
+            )
+
+    coverage_probe = _build_section(CoverageProbeConfig, "coverage_probe", coverage_probe_data)
     fleet_data = _section(data, "fleet")
     global_max = fleet_data.get("global_max_concurrent_sessions")
     if global_max is not None and not isinstance(global_max, int):
@@ -2824,6 +3070,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         watchdog=watchdog,
         worktree_reclamation=worktree_reclamation,
         test_adequacy=test_adequacy,
+        coverage_probe=coverage_probe,
         fleet=fleet,
         notify=notify,
         runners=runners,

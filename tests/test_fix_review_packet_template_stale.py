@@ -21,7 +21,8 @@ from charlie_work.prompts import prompt_template_digest
 from charlie_work.workflow import OrchestratorApp
 
 # Reuse the shared FakeGitHub whose default PR #456 is janitor-green.
-from test_charlie_work import FakeGitHub, _make_loop_app
+from _fakes_github import FakeGitHub
+from _review_fixtures import _make_loop_app
 
 
 def _write(directory: Path, name: str, text: str) -> Path:
@@ -183,6 +184,287 @@ def test_loop_regenerates_same_head_packet_when_template_stale(tmp_path: Path) -
     assert any(e.get("pr_number") == 456 for e in events)
     # Sanity: the stale digest really was different from the current one.
     assert "stale-digest" != current_sha
+
+
+# ---------------------------------------------------------------------------
+# Issue #1338: escalated PRs must not re-fire review_packet_template_stale
+# every pass. Escalation is terminal -- review() early-returns before the
+# regen path, so the staleness WARNING would fire identically every pass
+# without ever converging. The recovery procedure (unescalate +
+# why-charlie-hate) regenerates the packet with the current template, so the
+# staleness WARNING and the cross-family regen-budget charge are suppressed
+# while escalated. self.review() is still called -- its own _escalation_flags
+# entry gate no-ops packet regen/label transitions, but it is the only
+# per-pass path that refreshes janitor_ok/janitor_failures and runs the #776
+# remediation for judgment-class escalations (PRs #1397/#1443).
+# ---------------------------------------------------------------------------
+
+
+def _seed_pr_escalated(app: OrchestratorApp, pr_number: int, issue_number: int) -> None:
+    """Mark a PR and its linked issue as escalated in state.json."""
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "issue_number": issue_number,
+            "status": "escalated",
+            "escalation_reason": "test_escalation",
+        }
+        state["issues"][str(issue_number)] = {
+            "number": issue_number,
+            "status": "escalated",
+            "escalation_reason": "test_escalation",
+        }
+        save_state(app.paths.state_file, state)
+
+
+def _seed_issue_escalated(app: OrchestratorApp, issue_number: int) -> None:
+    """Mark only the linked issue as escalated (PR status left non-escalated)."""
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["issues"][str(issue_number)] = {
+            "number": issue_number,
+            "status": "escalated",
+            "escalation_reason": "test_escalation",
+        }
+        save_state(app.paths.state_file, state)
+
+
+def test_loop_skips_template_stale_warning_for_escalated_pr(tmp_path: Path) -> None:
+    """An escalated PR with a stale-template packet must NOT emit
+    ``review_packet_template_stale`` on every pass -- the regen is
+    unreachable (review() early-returns "escalated; review skipped") and the
+    WARNING would spam events.db identically every pass without converging
+    (issue #1338). The recovery procedure regenerates the packet, so the
+    staleness WARNING is suppressed while escalated.
+
+    self.review() is still called each pass -- its own _escalation_flags
+    entry gate no-ops packet regen/label transitions, but it refreshes
+    janitor diagnostics and runs the #776 remediation lane. Skipping it
+    entirely would freeze janitor_ok/janitor_failures (PRs #1397/#1443)."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_pr_escalated(app, pr_number=456, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
+    # Run two passes -- the bug fired the WARNING every pass.
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    # review() WAS invoked each pass -- it no-ops packet regen via its own
+    # escalation gate but still refreshes janitor diagnostics / the #776 lane.
+    assert review_calls.count(456) == 2
+    # No staleness WARNING was emitted -- escalation is terminal and the
+    # recovery procedure handles regen, so the WARNING is suppressed while
+    # escalated.
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+def test_loop_skips_template_stale_warning_for_issue_escalated(tmp_path: Path) -> None:
+    """A PR whose linked ISSUE is escalated (even if the PR's own status is
+    not "escalated") must likewise suppress the staleness WARNING --
+    review()'s entry gate checks both pr_escalated and issue_escalated, so
+    the regen is unreachable here too and the WARNING would spam identically.
+    self.review() is still called each pass for the same reason as the
+    pr-escalated case (janitor diagnostics + #776 lane)."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_issue_escalated(app, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
+    app.loop(limit=0)
+    app.loop(limit=0)
+
+    assert review_calls.count(456) == 2
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
+
+
+def test_loop_regenerates_template_stale_after_unescalate(tmp_path: Path) -> None:
+    """Once the PR is de-escalated, the staleness WARNING and regen must
+    resume -- the #592 behavior is preserved for non-escalated PRs. This
+    proves the #1338 suppression is scoped to the escalated window only, not
+    a permanent suppression. While escalated, review() is still called (for
+    janitor diagnostics); after unescalate, the staleness WARNING fires too."""
+    pr = _pr456("sha-same")
+    app, _ = _make_loop_app(tmp_path, prs=[pr])
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    _seed_pr_escalated(app, pr_number=456, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    # Pass 1 while escalated: no warning, but review() IS called (janitor
+    # diagnostics refresh; packet regen no-ops via review()'s own gate).
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+    app.loop(limit=0)
+    assert 456 in review_calls
+    assert not any(
+        e.get("pr_number") == 456
+        for e in _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    )
+
+    # De-escalate: clear the escalated status so the staleness check resumes.
+    from charlie_work.state import load_state, save_state, state_lock
+
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"]["status"] = "reviewing"
+        state["issues"]["123"]["status"] = "reviewing"
+        save_state(app.paths.state_file, state)
+
+    # Pass 2 after unescalate: review() is invoked again and the staleness
+    # event fires exactly as today (#592 preserved).
+    app.loop(limit=0)
+    assert review_calls.count(456) == 2
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert any(e.get("pr_number") == 456 for e in events)
+
+
+def _make_loop_app_with_required_checks(
+    tmp_path: Path, *, prs: list[dict], required_checks: tuple[str, ...]
+) -> tuple[OrchestratorApp, FakeGitHub]:
+    """Build a loop() app whose janitor gate enforces ``required_checks``.
+
+    Mirrors ``_make_loop_app`` but configures required checks so the janitor
+    can actually fail (and then heal) on them -- the default
+    ``_approved_automerge`` leaves ``required_checks=()`` and the janitor is
+    vacuously green, which cannot exercise the janitor-diagnostics refresh
+    path the #1338 rework needs to prove.
+    """
+    from charlie_work.config import AutoMergeConfig, ReviewConfig
+
+    config = OrchestratorConfig(
+        cross_family=CrossFamilyConfig(enabled=False),
+        review=ReviewConfig(require_tests_or_rationale=False),
+        auto_merge=AutoMergeConfig(required_checks=required_checks, require_approved_review=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    for pr in prs:
+        pr.setdefault("state", "OPEN")
+    fake_gh.prs = prs
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    return app, fake_gh
+
+
+def test_loop_refreshes_janitor_diagnostics_for_escalated_pr_with_stale_packet(
+    tmp_path: Path,
+) -> None:
+    """A judgment-class escalated PR with a stale packet must still have its
+    janitor diagnostics (janitor_ok/janitor_failures) refreshed across passes
+    -- self.review() is called each pass and its escalated branch recomputes
+    run_janitor for visibility only (PRs #1397/#1443). The #1338 rework scopes
+    the skip to the staleness WARNING + cross-family regen-budget charge, so
+    review() -- the only per-pass path that refreshes these diagnostics --
+    stays reachable.
+
+    This is the behavior the round-1 review identified as missing: the
+    original #1338 fix skipped self.review() entirely via ``continue``,
+    freezing janitor_ok/janitor_failures at whatever value they held when the
+    PR escalated. This test fails against that ``continue`` (review() is
+    never called, so the diagnostics never update) and passes against the
+    narrowed skip.
+    """
+    from charlie_work.state import load_state
+
+    pr = _pr456("sha-same")
+    app, fake_gh = _make_loop_app_with_required_checks(
+        tmp_path, prs=[pr], required_checks=("Tests passed",)
+    )
+    current_sha = app._review_template_sha()
+
+    _plant_packet(tmp_path, 456, head_sha="sha-same", template_sha="stale-digest")
+    # Judgment-class escalation: the PR escalated from a review verdict, not
+    # from a janitor-gate failure. The janitor gate is therefore an
+    # independent, still-meaningful signal to refresh while escalated.
+    _seed_pr_escalated(app, pr_number=456, issue_number=123)
+    assert "stale-digest" != current_sha
+
+    # Drive the janitor verdict across two states: a failed required check on
+    # pass 1, then the same check green on pass 2. review()'s escalated
+    # branch calls self.gh.pr_checks once per pass, so a counter-based fake
+    # flips the verdict between passes.
+    checks_sequence: list[list[dict]] = [
+        [{"name": "Tests passed", "state": "FAILURE"}],
+        [{"name": "Tests passed", "state": "SUCCESS"}],
+    ]
+    checks_calls: list[int] = []
+
+    def fake_pr_checks(number: int) -> list[dict]:
+        checks_calls.append(number)
+        return checks_sequence[min(len(checks_calls) - 1, len(checks_sequence) - 1)]
+
+    fake_gh.pr_checks = fake_pr_checks  # type: ignore[method-assign]
+
+    review_calls: list[int] = []
+    original_review = app.review
+
+    def tracking_review(pr_number: int) -> object:
+        review_calls.append(pr_number)
+        return original_review(pr_number)
+
+    app.review = tracking_review  # type: ignore[method-assign]
+
+    # Pass 1: required check FAILED -> janitor_ok=False, failures non-empty.
+    app.loop(limit=0)
+    assert 456 in review_calls
+    state_after_pass1 = load_state(app.paths.state_file)
+    pr_state_1 = state_after_pass1["prs"]["456"]
+    assert pr_state_1.get("janitor_ok") is False
+    assert pr_state_1.get("janitor_failures")  # non-empty -> check failed
+
+    # Pass 2: required check now SUCCESS -> janitor_ok=True, failures empty.
+    # The diagnostics REFRESHED across passes -- they did not stay frozen at
+    # the pass-1 failure, which is the regression the round-1 review flagged.
+    app.loop(limit=0)
+    assert review_calls.count(456) == 2
+    state_after_pass2 = load_state(app.paths.state_file)
+    pr_state_2 = state_after_pass2["prs"]["456"]
+    assert pr_state_2.get("janitor_ok") is True
+    assert pr_state_2.get("janitor_failures") == []
+
+    # The #1338 staleness WARNING is still suppressed while escalated -- the
+    # narrowed skip did not re-introduce the WARNING spam the original fix
+    # addressed.
+    events = _events_of_kind(paths_from_app(app), "review_packet_template_stale")
+    assert not any(e.get("pr_number") == 456 for e in events)
 
 
 def test_loop_skips_same_head_packet_when_template_matches(tmp_path: Path) -> None:

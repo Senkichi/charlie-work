@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import stat
+import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -3911,6 +3912,53 @@ def resolve_base_branch_name(repo_root: Path, base_ref: str) -> str:
     return "main"
 
 
+def salvage_branch_empty_diff(repo_root: Path, branch: str, base_ref: str) -> bool:
+    """Return True if ``branch``'s tree is identical to current main's tree.
+
+    A salvage PR whose net diff is empty is definitionally vestigial -- there is
+    nothing to preserve that is not already on the default branch. This is the
+    cheap tree-level check (issue #1221, check 3): compare the branch tip's
+    tree SHA against the live default branch's tree SHA.
+
+    ``git fetch origin <base>`` is run first so the comparison sees the *live*
+    remote tip, not a stale tracking ref. The race this exists for is exactly a
+    tracking ref that lags behind a merge that just landed: ``inspect_worktree_state``
+    resolved its base against the same stale ref and saw COMPLETED (ahead of the
+    old tip), so without this fetch the salvage would open a duplicate PR for
+    work that is already on main.
+
+    Fails safe (returns False = "do not skip salvage") on any git error -- a
+    transient fetch/rev-parse failure falls back to opening the PR, which a
+    human reviews anyway. ``git fetch`` does not move HEAD and is safe to run
+    against a checkout a supervisor is actively using (see ``main_ci_reclaim``
+    for the same rationale).
+    """
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+    fetch = _run_remote_captured(
+        ["git", "fetch", "origin", base_branch],
+        cwd=repo_root,
+    )
+    if not fetch.ok:
+        return False
+    base_ref_resolved = f"origin/{base_branch}"
+    branch_ref = _resolve_salvage_branch_ref(repo_root, branch)
+    if branch_ref is None:
+        return False
+    base_tree = run_captured(
+        ["git", "rev-parse", "--verify", "--quiet", f"{base_ref_resolved}^{{tree}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    branch_tree = run_captured(
+        ["git", "rev-parse", "--verify", "--quiet", f"{branch_ref}^{{tree}}"],
+        cwd=repo_root,
+        timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+    )
+    if not base_tree.ok or not branch_tree.ok:
+        return False
+    return base_tree.stdout.strip() == branch_tree.stdout.strip()
+
+
 # Cap on commit subjects rendered into a salvage body. A runaway branch should
 # not paste hundreds of lines into a PR description; the count is reported so
 # the elision is visible rather than silent.
@@ -4199,6 +4247,81 @@ def _top_level_package_names(repo_root: Path) -> frozenset[str]:
     return frozenset(names)
 
 
+def _package_directories(src_root: Path) -> frozenset[str]:
+    """Return names of importable *packages* (dirs with ``__init__.py``) under ``src_root``.
+
+    Unlike :func:`_top_level_package_names` this deliberately excludes loose
+    ``.py`` stems.  A loose stem like ``ci.py`` or ``probe.py`` is a substring
+    of foreign ``.pth`` filenames (``_editable_impl_ci_fleet.pth``,
+    ``ci_fleet_probe.pth``) and caused the self-arming false-match described in
+    issue #969: widening the verification filter to those names would have
+    auto-rewritten a foreign editable to ``repo_root/src``, producing a hard
+    ``ImportError``.  Restricting to real packages removes that coupling
+    without losing any legitimate editable target.
+    """
+    if not src_root.is_dir():
+        return frozenset()
+    return frozenset(
+        child.name
+        for child in src_root.iterdir()
+        if child.is_dir() and (child / "__init__.py").is_file()
+    )
+
+
+def _configured_editable_roots(
+    repo_root: Path,
+) -> list[tuple[Path, frozenset[str]]]:
+    """Return ``(src_root, package_names)`` for every configured editable install.
+
+    Covers this repo's own packages under ``repo_root/src`` plus each relative
+    editable dependency declared in ``[tool.uv.sources]`` of ``pyproject.toml``
+    (e.g. ``ci-fleet = { path = "../ci_runners", editable = true }``).  Only
+    package directories are collected (see :func:`_package_directories`).
+
+    A root that does not exist on disk is omitted: it contributes no valid
+    target for either verification or repair, and a worktree that is not a
+    sibling of the real peer checkout must not be blocked by its absence
+    (mirrors ``ci_fleet_anchor.declared_ci_fleet_root``'s abstention).
+
+    The returned list is the single source of truth for "which trees does this
+    orchestrator own" used by both :func:`verify_shared_venv` (the
+    resolved-target test, issue #969 gap 2) and
+    :func:`supervise._repair_venv_pth` (per-package root targeting, gap 1).
+    """
+    roots: list[tuple[Path, frozenset[str]]] = []
+    main_src = (repo_root / "src").resolve()
+    if main_src.is_dir():
+        names = _package_directories(main_src)
+        if names:
+            roots.append((main_src, names))
+    pyproject = repo_root / "pyproject.toml"
+    if not pyproject.is_file():
+        return roots
+    try:
+        with pyproject.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return roots
+    sources = data.get("tool", {}).get("uv", {}).get("sources", {})
+    if not isinstance(sources, dict):
+        return roots
+    for spec in sources.values():
+        if not isinstance(spec, dict):
+            continue
+        if not spec.get("editable"):
+            continue
+        raw_path = spec.get("path")
+        if not isinstance(raw_path, str):
+            continue
+        dep_src = (repo_root / raw_path / "src").resolve()
+        if not dep_src.is_dir():
+            continue
+        names = _package_directories(dep_src)
+        if names:
+            roots.append((dep_src, names))
+    return roots
+
+
 def _venv_python(venv_path: Path) -> Path:
     if os.name == "nt":
         return venv_path / "Scripts" / "python.exe"
@@ -4249,36 +4372,48 @@ def _verify_shared_venv_by_import(repo_root: Path, venv_path: Path) -> tuple[boo
 
 
 def verify_shared_venv(repo_root: Path, venv_path: Path) -> tuple[bool, str]:
-    """Verify the shared venv's editable ``.pth`` points to the main checkout src.
+    """Verify every editable ``.pth`` path line resolves into a configured checkout.
 
-    Searches ``site-packages`` for ``.pth`` files whose names contain a top-level
-    package name from ``repo_root/src``. For each matching ``.pth``, every path
-    line must resolve to ``repo_root/src``; a path pointing anywhere else is the
-    poisoned-editable-pth case and surfaces the ``--reinstall-package`` recovery
-    hint.
+    Replaces the former filename-substring filter (issue #969 gap 2).  The old
+    filter kept only ``.pth`` files whose *filename* contained a top-level
+    package name from this repo's ``src``, which made peer-repo editables like
+    ``_editable_impl_ci_fleet.pth`` structurally invisible -- both editables
+    were repointed in the incident and the filter saw neither.  It was also
+    self-arming: loose ``.py`` stems (``ci``, ``fleet``, ``impl``, ``probe``)
+    substring-matched foreign filenames, so widening it would have auto-written
+    an ``ImportError``.
+
+    The resolved-target test asks the question actually being asked: "does this
+    path line point into a tree I own?"  Every ``.pth`` in site-packages is
+    scanned; each path-bearing line is resolved and checked against
+    :func:`_configured_editable_roots` (this repo's ``src`` plus relative
+    editable deps from ``[tool.uv.sources]``).  A line resolving outside *all*
+    configured roots is the poisoned-editable case.  Comment/import/empty lines
+    are skipped by :func:`_resolve_pth_line` returning an empty path.
+
+    When no configured roots are derivable (no ``src`` directory and no
+    editable deps), falls back to the import-based check so a cold or
+    misconfigured checkout is not silently green.
     """
     site_packages = _site_packages_dir(venv_path)
     if not site_packages:
         return False, "could not locate site-packages in shared venv"
-    main_src = (repo_root / "src").resolve()
-    package_names = _top_level_package_names(repo_root)
-    project_pth_files: list[Path] = []
-    for pth in site_packages.glob("*.pth"):
-        if any(name in pth.name for name in package_names):
-            project_pth_files.append(pth)
-    if not project_pth_files:
+    roots = _configured_editable_roots(repo_root)
+    if not roots:
         return _verify_shared_venv_by_import(repo_root, venv_path)
-    for pth in project_pth_files:
+    for pth in site_packages.glob("*.pth"):
         content = pth.read_text(encoding="utf-8", errors="replace")
         for raw_line in content.splitlines():
             target = _resolve_pth_line(site_packages, raw_line)
-            if target == Path() or target == main_src:
+            if target == Path():
+                continue
+            if any(contains(root, target) for root, _ in roots):
                 continue
             return False, (
-                f"editable .pth {pth.name} points outside main checkout: {target} "
-                "(hint: uv sync --all-extras --reinstall-package charlie-work)"
+                f"editable .pth {pth.name} points outside all configured "
+                f"checkouts: {target} (hint: uv sync --all-extras)"
             )
-    return True, "shared venv editable .pth points to main checkout src"
+    return True, "shared venv editable .pth targets all resolve to configured checkouts"
 
 
 def _find_linked_pr_number(

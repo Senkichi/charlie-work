@@ -25,7 +25,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import FakeGitHub
+from _fakes_github import FakeGitHub
 
 
 def _counting_run(counter: dict[str, int]):

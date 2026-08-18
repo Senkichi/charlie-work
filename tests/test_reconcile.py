@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -11,6 +10,13 @@ from typing import Any
 
 import pytest
 
+from _reconcile_fixtures import (
+    FakeGitHub,
+    _init_bare_remote_and_clone,
+    _issue,
+    _pr,
+    _setup_completed_worktree,
+)
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import (
     LabelConfig,
@@ -52,140 +58,6 @@ from charlie_work.workflow import OrchestratorApp
 # Module-level default label config for parametrize decorators that need
 # label strings at collection time (before any test creates an OrchestratorConfig).
 _config_labels = LabelConfig()
-
-
-class FakeGitHub:
-    """Records every call so tests can assert detect_drift never mutates."""
-
-    def __init__(
-        self,
-        *,
-        prs: list[dict[str, Any]],
-        issues: list[dict[str, Any]],
-        fail_add_labels: set[tuple[int, str]] | None = None,
-        fail_remove_labels: set[tuple[int, str]] | None = None,
-        repo_root: Any = None,
-        pr_create_return: int | None = None,
-        rate_limit_sufficient: bool = True,
-        rate_limit_remaining: int = 10000,
-        rate_limit_reset: int = 0,
-    ) -> None:
-        self._prs = prs
-        self._issues = issues
-        self.run_calls: list[list[str]] = []
-        self.labels_added: list[tuple[int, str]] = []
-        self.labels_removed: list[tuple[int, str]] = []
-        self._fail_add_labels = fail_add_labels or set()
-        self._fail_remove_labels = fail_remove_labels or set()
-        self.repo_root = repo_root
-        self.prs_created: list[dict[str, Any]] = []
-        self.pr_create_return = pr_create_return
-        self._rate_limit_sufficient = rate_limit_sufficient
-        self._rate_limit_remaining = rate_limit_remaining
-        self._rate_limit_reset = rate_limit_reset
-        # PR-scoped label tracking, distinct from the issue-scoped lists above.
-        self.pr_labels_added: list[tuple[int, str]] = []
-        self.pr_labels_removed: list[tuple[int, str]] = []
-        self._fail_add_pr_labels: set[tuple[int, str]] = set()
-        self._fail_remove_pr_labels: set[tuple[int, str]] = set()
-        # sha -> list of check-run dicts, for detect_aviator_stale_blocked.
-        self.check_runs_by_sha: dict[str, list[dict[str, Any]]] = {}
-        self.commit_check_runs_calls: list[str] = []
-
-    def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
-        self.run_calls.append(args)
-        if args[:2] == ["pr", "list"]:
-            return self._prs
-        if args[:2] == ["issue", "list"]:
-            # Model the real ``gh issue list --state all --limit 500`` cap for
-            # mutation tests that revert _fetch_issues to the pre-#762 path.
-            return self._issues[:reconcile_list_limit]
-        if args[0] == "api" and "pulls?state=all" in args[1]:
-            url = args[1]
-            page_match = re.search(r"[?&]page=(\d+)", url)
-            page = int(page_match.group(1)) if page_match else 1
-            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
-            per_page = int(per_page_match.group(1)) if per_page_match else 100
-            start = (page - 1) * per_page
-            return self._prs[start : start + per_page]
-        if args[0] == "api" and "issues?state=all" in args[1]:
-            url = args[1]
-            page_match = re.search(r"[?&]page=(\d+)", url)
-            page = int(page_match.group(1)) if page_match else 1
-            per_page_match = re.search(r"[?&]per_page=(\d+)", url)
-            per_page = int(per_page_match.group(1)) if per_page_match else 100
-            start = (page - 1) * per_page
-            return self._issues[start : start + per_page]
-        if args[0] == "api":
-            return [] if json_output else ""
-        raise AssertionError(f"unexpected gh.run call: {args}")
-
-    def add_issue_label(self, number: int, label: str) -> bool:
-        self.labels_added.append((number, label))
-        return (number, label) not in self._fail_add_labels
-
-    def remove_issue_label(self, number: int, label: str) -> bool:
-        self.labels_removed.append((number, label))
-        return (number, label) not in self._fail_remove_labels
-
-    def add_pr_label(self, number: int, label: str) -> bool:
-        self.pr_labels_added.append((number, label))
-        return (number, label) not in self._fail_add_pr_labels
-
-    def remove_pr_label(self, number: int, label: str) -> bool:
-        self.pr_labels_removed.append((number, label))
-        return (number, label) not in self._fail_remove_pr_labels
-
-    def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None:
-        self.commit_check_runs_calls.append(sha)
-        return self.check_runs_by_sha.get(sha)
-
-    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
-        self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
-        return self.pr_create_return
-
-    def check_graphql_rate_limit(self, threshold: int) -> tuple[bool, int, int | None]:
-        return (
-            self._rate_limit_sufficient,
-            self._rate_limit_remaining,
-            self._rate_limit_reset,
-        )
-
-    def name_with_owner(self) -> str:
-        return "owner/test-repo"
-
-
-def _pr(
-    number: int,
-    state: str = "OPEN",
-    *,
-    head_ref: str | None = None,
-    body: str = "",
-    title: str = "",
-    is_cross_repository: bool = False,
-) -> dict[str, Any]:
-    return {
-        "number": number,
-        "title": title,
-        "url": f"https://example.test/pull/{number}",
-        "headRefName": head_ref or f"agent/issue-{number}-x",
-        "baseRefName": "main",
-        "body": body,
-        "state": state,
-        "labels": [],
-        "isCrossRepository": is_cross_repository,
-    }
-
-
-def _issue(number: int, labels: list[str], state: str = "OPEN") -> dict[str, Any]:
-    return {
-        "number": number,
-        "title": f"issue {number}",
-        "url": f"https://example.test/issues/{number}",
-        "body": "",
-        "labels": [{"name": label} for label in labels],
-        "state": state,
-    }
 
 
 def _raw_rest_pr(
@@ -828,6 +700,37 @@ def test_detect_drift_finds_terminal_state_stale_via_terminal_since(tmp_path: Pa
     assert len(matches) == 1
     assert matches[0].issue_number == 894
     assert "5.0 day" in matches[0].detail
+    assert matches[0].fix_actions == ()
+
+
+def test_detect_drift_finds_terminal_state_stale_for_operator_queue(tmp_path: Path) -> None:
+    """Issue #1266 counterpart of the test above: a mechanical escalation
+    parks on `agent:operator-queue` instead of `agent:human-needed`, and the
+    #947 staleness alert must watch that label too -- otherwise an issue
+    whose de-escalation sweep stopped clearing it (e.g. sweep itself broken,
+    not merely mid-retry) would sit in the sink forever with no alert at
+    all, silently reintroducing the exact invisibility #947 fixed for the
+    judgment-escalation case. The detail message must name the label that is
+    actually present (`operator-queue`), not hardcode `human-needed`."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[_issue(894, [config.labels.operator_queue])])
+    state = empty_state()
+    now = datetime(2026, 1, 10, tzinfo=UTC)
+    state["issues"]["894"] = {
+        "number": 894,
+        "status": "escalated",
+        "reason_class": "mechanical",
+        "terminal_since": "2026-01-05T00:00:00Z",  # 5 days before `now`
+    }
+
+    drift = detect_drift(gh, state, config, now=now)
+
+    matches = [item for item in drift if item.kind == "terminal_state_stale"]
+    assert len(matches) == 1
+    assert matches[0].issue_number == 894
+    assert "5.0 day" in matches[0].detail
+    assert config.labels.operator_queue in matches[0].detail
+    assert config.labels.human_needed not in matches[0].detail
     assert matches[0].fix_actions == ()
 
 
@@ -2330,9 +2233,15 @@ def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
 
 def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path) -> None:
     """Issue #261 F5: apply_fixes must transition session_failed_escalated
-    via the 'redispatch_escalated' label edge (adds human_needed, removes
+    via the 'redispatch_escalated' label edge (adds operator_queue, removes
     the other workflow labels) rather than removing active labels /
-    re-adding ready like session_failed_relabeled does."""
+    re-adding ready like session_failed_relabeled does.
+
+    Issue #1266: this DriftItem only ever fires for a deterministic
+    failure_kind (see detect_drift), which workflow.py's own equivalent
+    dead-session sweeps always treat as reason_class="mechanical" -- so the
+    edge resolves to operator_queued, landing agent:operator-queue rather
+    than agent:human-needed."""
     config = OrchestratorConfig()
     gh = FakeGitHub(
         prs=[],
@@ -2355,7 +2264,7 @@ def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path)
 
     new_state = apply_fixes(gh, state, drift, config)
 
-    assert (42, config.labels.human_needed) in gh.labels_added
+    assert (42, config.labels.operator_queue) in gh.labels_added
     assert (42, config.labels.ready) not in gh.labels_added
     # ready must never be added for an escalated worker_blocked session.
 
@@ -3162,39 +3071,6 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
-def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a bare remote repo and a local clone, return (remote, clone)."""
-    remote = tmp_path / "remote"
-    remote.mkdir(parents=True, exist_ok=True)
-    _git(remote, "init", "--bare", "--initial-branch=main")
-    clone = tmp_path / "clone"
-    clone.mkdir(parents=True, exist_ok=True)
-    _git(clone, "init", "--initial-branch=main")
-    _git(clone, "config", "user.email", "test@example.test")
-    _git(clone, "config", "user.name", "Test User")
-    _git(clone, "config", "commit.gpgSign", "false")
-    _git(clone, "remote", "add", "origin", str(remote))
-    (clone / "README.md").write_text("hello\n", encoding="utf-8")
-    _git(clone, "add", "README.md")
-    _git(clone, "commit", "-m", "initial commit")
-    _git(clone, "push", "-u", "origin", "main")
-    return remote, clone
-
-
-def _setup_completed_worktree(
-    repo_root: Path, issue_number: int, dirty: bool = False
-) -> tuple[Path, str]:
-    """Create a worktree with one commit beyond origin/main. Return (worktree_path, branch)."""
-    branch = f"agent/issue-{issue_number}"
-    info = create_worktree(repo_root, branch, base_ref="origin/main")
-    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
-    _git(info.path, "add", "feature.txt")
-    _git(info.path, "commit", "-m", "feature commit")
-    if dirty:
-        (info.path / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
-    return info.path, branch
-
-
 def _write_dead_session_sidecar(
     sessions_dir: Path, issue_number: int, branch: str, worktree_path: Path
 ) -> None:
@@ -3372,8 +3248,10 @@ def test_detect_drift_completed_unpublished_work_salvaged(tmp_path: Path) -> Non
     assert not relabel
 
 
-def test_detect_drift_dirty_worktree_relabels(tmp_path: Path) -> None:
-    """Issue #252: dead session with dirty worktree still relabels to ready."""
+def test_detect_drift_dirty_worktree_with_commits_salvaged(tmp_path: Path) -> None:
+    """Issue #1130: dead session with a dirty worktree that has commits ahead
+    of base emits salvage drift, not relabel-to-ready. The committed work is
+    salvageable regardless of working-tree dirt (shim/scaffolding artifacts)."""
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     worktree_path, branch = _setup_completed_worktree(repo_root, 253, dirty=True)
 
@@ -3391,10 +3269,10 @@ def test_detect_drift_dirty_worktree_relabels(tmp_path: Path) -> None:
     drift = detect_drift(gh, state, config, repo_root=repo_root)
 
     salvage = [d for d in drift if d.kind == "session_unpublished_work_salvaged"]
-    assert not salvage
+    assert len(salvage) == 1
+    assert salvage[0].issue_number == 253
     relabel = [d for d in drift if d.kind == "session_failed_relabeled"]
-    assert len(relabel) == 1
-    assert relabel[0].issue_number == 253
+    assert not relabel
 
 
 def test_detect_drift_no_commits_relabels(tmp_path: Path) -> None:

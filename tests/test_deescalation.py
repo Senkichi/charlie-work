@@ -60,8 +60,8 @@ from charlie_work.state import (
 from charlie_work.worktree import worktree_path_for_branch
 from charlie_work.workflow import OrchestratorApp
 
-from test_charlie_work import _second_mergequeue_pr
-from test_fix_unescalate import _app, _events
+from _helpers import _second_mergequeue_pr
+from _unescalate_fixtures import _app, _events
 
 
 def test_deescalation_sweep_clears_mechanical_and_leaves_judgment_untouched(
@@ -208,6 +208,12 @@ def test_deescalation_cap_exhausted_stops_clearing_and_notifies_once(tmp_path: P
     green PR -- and must emit ``deescalation_cap_exhausted`` exactly once,
     not on every subsequent pass, via the ``deescalation_cap_notified_at``
     dedup marker.
+
+    Issue #1266: cap exhaustion also applies a real "escalated" label
+    transition (human_needed added, operator_queue and every other
+    workflow label stripped) so a human actually sees the issue -- a
+    capped-out mechanical escalation must not sit silently in
+    operator_queue forever.
     """
     app = _app(tmp_path)
     assert app.config.deescalation.max_auto_deescalations == 2
@@ -238,8 +244,8 @@ def test_deescalation_cap_exhausted_stops_clearing_and_notifies_once(tmp_path: P
     assert issue_123["status"] == "escalated"
     assert issue_123["reason_class"] == "mechanical"
     assert issue_123["deescalation_cap_notified_at"]
-    assert app.gh.labels_added == []
-    assert app.gh.labels_removed == []
+    assert (123, app.config.labels.human_needed) in app.gh.labels_added
+    assert (123, app.config.labels.operator_queue) in app.gh.labels_removed
 
     exhausted = _events(state, "deescalation_cap_exhausted")
     assert len(exhausted) == 1
@@ -614,7 +620,14 @@ def _is_event_call(func: ast.expr) -> bool:
     if isinstance(func, ast.Name):
         return func.id in ("append_event", "_record_event")
     if isinstance(func, ast.Attribute):
-        return func.attr == "_record_event"
+        # Issue #1264/#1329 (W6 PR4): WriteGate-routed sites call
+        # self.write_gate.append_event(...)/self.write_gate.record_event(...)
+        # instead of the bare functions above -- same event-kind vocabulary,
+        # different call shape. Without this, a migrated escalation-kind
+        # emit site becomes invisible to this scanner, and the mapping
+        # completeness check silently stops covering it (exactly the
+        # fail-closed-forever failure mode this test exists to prevent).
+        return func.attr in ("_record_event", "append_event", "record_event")
     return False
 
 
@@ -636,10 +649,12 @@ def _dict_literal_keys(node: ast.expr) -> set[str]:
 def _escalation_event_kinds_from_workflow() -> set[str]:
     """Discover escalation-transition event kinds by inspecting workflow.py.
 
-    An escalation event is an ``append_event`` / ``_record_event`` call whose
-    ``kind`` ends with ``_escalated``, or a ``_record_event`` call in a function
-    that also assigns a ``reason_class`` and whose payload carries an
-    ``escalated`` key.
+    An escalation event is an ``append_event`` / ``_record_event`` call --
+    bare, or WriteGate-routed as ``self.write_gate.append_event(...)`` /
+    ``self.write_gate.record_event(...)`` (issue #1264/#1329, W6 PR4) --
+    whose ``kind`` ends with ``_escalated``, or a ``_record_event``-shaped
+    call in a function that also assigns a ``reason_class`` and whose
+    payload carries an ``escalated`` key.
 
     The test is deliberately conservative: only kinds that unambiguously mark
     an ``escalated``/``blocked`` status transition with a ``reason_class`` are

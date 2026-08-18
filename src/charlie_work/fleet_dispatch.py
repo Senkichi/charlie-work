@@ -64,6 +64,7 @@ from .supervisor_lifecycle import (
     supervisor_heartbeat_path,
     update_supervisor_heartbeat,
 )
+from .wedge_watchdog import WedgeWatchdog
 from .workflow import DEFERRED_BY_CONCURRENCY_REASON_PREFIX, CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -1118,7 +1119,12 @@ def _collect_escalated_label_repair_events(repo_key: str, data: Any) -> list[dic
                 "issue_number": (errored or failures)[0],
                 "type": "escalated_label_repair_error",
                 "error": (
-                    "agent:human-needed edge still owed -- "
+                    # Issue #1266: the owed label is human_needed for a
+                    # judgment escalation but operator_queue for a
+                    # mechanical one -- this aggregates possibly-mixed
+                    # subjects into one message, so name the edge (shared by
+                    # both) rather than hardcoding one specific label.
+                    "escalated-label repair edge still owed -- "
                     f"{len(errored)} unreachable {errored}, "
                     f"{len(failures)} not applied {failures}"
                 ),
@@ -2949,7 +2955,11 @@ def _record_supervise_loop_cap_event(result: SuperviseLoopResult) -> None:
         logger.exception("Failed to record supervise relaunch cap event")
 
 
-def _spawn_supervise_child(supervise_args: Sequence[str]) -> int:
+def _spawn_supervise_child(
+    supervise_args: Sequence[str],
+    *,
+    wedge_watchdog_factory: Callable[[subprocess.Popen[Any]], WedgeWatchdog | None] | None = None,
+) -> int:
     """Run one ``fleet supervise`` child to completion; return its exit code.
 
     ``Popen`` + ``wait`` with *inherited* stdio, deliberately not
@@ -2971,6 +2981,13 @@ def _spawn_supervise_child(supervise_args: Sequence[str]) -> int:
     would silently redirect the supervisor's entire log away from the launcher's
     ``>> $log`` and into a hidden console nobody can read. ``CREATE_NO_WINDOW``
     suppresses the window while leaving inherited handles intact.
+
+    ``wedge_watchdog_factory``: when not ``None``, called with the child
+    ``Popen`` to obtain a :class:`~charlie_work.wedge_watchdog.WedgeWatchdog`
+    (or ``None`` to skip). The watchdog runs as a daemon thread alongside
+    ``process.wait()`` and kills the child if its heartbeat goes stale (issue
+    #728). The factory is injectable so tests can disable it or supply a
+    watchdog pointed at a test-controlled heartbeat path.
     """
     command = [sys.executable, "-m", "charlie_work", "fleet", "supervise", *supervise_args]
     process = subprocess.Popen(
@@ -2978,7 +2995,45 @@ def _spawn_supervise_child(supervise_args: Sequence[str]) -> int:
         cwd=str(orchestrator_root()),
         **no_console_window_kwargs(),
     )
-    return process.wait()
+    watchdog = None
+    watchdog_thread = None
+    if wedge_watchdog_factory is not None:
+        watchdog = wedge_watchdog_factory(process)
+        if watchdog is not None:
+            watchdog_thread = watchdog.start()
+    exit_code = process.wait()
+    if watchdog is not None and watchdog_thread is not None and watchdog.killed:
+        # The watchdog records its supervisor_wedged_killed event *after*
+        # process.kill() succeeds — which is also the moment wait() returns
+        # here. Without this bounded join the wrapper exits and tears down
+        # the daemon thread mid-write, silently losing the forensic event
+        # (144 kills / 0 recorded rows during the #1333 incident). The
+        # timeout bounds a wedged event write so it cannot wedge the
+        # wrapper. ``killed`` is set between kill() and the event write, so
+        # a lost GIL-switch race here degrades to the old lost-event
+        # behavior at worst — it never blocks a healthy exit.
+        watchdog_thread.join(timeout=10.0)
+    return exit_code
+
+
+def _default_wedge_watchdog(process: subprocess.Popen[Any]) -> WedgeWatchdog:
+    """Construct the production wedge watchdog for a spawned supervisor child.
+
+    The heartbeat path resolves through ``supervisor_heartbeat_path(None)``,
+    which follows the same ``fleet_dir()`` resolution (env override then
+    platform default) the child uses when no ``--fleet-dir`` override is
+    passed. In production the scheduled task launches ``supervise-loop`` with
+    no ``--fleet-dir``, so wrapper and child resolve the same fleet directory.
+    """
+    return WedgeWatchdog(process, supervisor_heartbeat_path(None))
+
+
+# Sentinel distinguishing "use the default watchdog factory" from
+# "watchdog explicitly disabled (factory is None)". Without it, a ``None``
+# default for ``wedge_watchdog_factory`` would be ambiguous between "on" and
+# "off" — and the whole point is that the watchdog is ON by default in
+# production.
+_USE_DEFAULT_WATCHDOG: Any = object()
 
 
 def run_fleet_supervise_loop(
@@ -2987,6 +3042,8 @@ def run_fleet_supervise_loop(
     max_relaunches: int = DEFAULT_MAX_RELAUNCHES,
     spawn: Callable[[int], int] | None = None,
     on_cap_reached: Callable[[SuperviseLoopResult], None] | None = None,
+    wedge_watchdog_factory: Callable[[subprocess.Popen[Any]], WedgeWatchdog | None]
+    | object = _USE_DEFAULT_WATCHDOG,
 ) -> CommandResult:
     """Run ``fleet supervise``, relaunching immediately on a restart request.
 
@@ -3000,11 +3057,24 @@ def run_fleet_supervise_loop(
     writes into the **live** ``events.db`` that the running supervisor owns --
     both polluting production data and contending for its state lock. Tests
     pass their own recorder and assert on it.
+
+    ``wedge_watchdog_factory``: controls the wedge-detection watchdog (issue
+    #728). Defaults to :func:`_default_wedge_watchdog` (ON). Pass a callable
+    that returns ``None`` to disable, or a callable that returns a
+    :class:`~charlie_work.wedge_watchdog.WedgeWatchdog` pointed at a
+    test-controlled heartbeat path. Only consulted when ``spawn`` is also left
+    at its default — an injected ``spawn`` owns its own process lifecycle and
+    is responsible for its own watchdog (if any).
     """
     args = tuple(supervise_args)
+    watchdog_factory: Callable[[subprocess.Popen[Any]], WedgeWatchdog | None] | None
+    if wedge_watchdog_factory is _USE_DEFAULT_WATCHDOG:
+        watchdog_factory = _default_wedge_watchdog
+    else:
+        watchdog_factory = wedge_watchdog_factory  # type: ignore[assignment]
 
     def _default_spawn(_launch_number: int) -> int:
-        return _spawn_supervise_child(args)
+        return _spawn_supervise_child(args, wedge_watchdog_factory=watchdog_factory)
 
     result = run_supervise_relaunch_loop(
         spawn if spawn is not None else _default_spawn,

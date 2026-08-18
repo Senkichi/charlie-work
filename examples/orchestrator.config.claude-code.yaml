@@ -88,6 +88,12 @@ runtime:
   # retried on provable pre-connection errors to preserve at-most-once semantics.
   # gh_max_retries: 3
   # gh_retry_base_seconds: 1.0
+  # Bounded outer retry for `gh pr create` specifically (cw#1273), layered on
+  # top of the inner retry above. The inner retry only covers pre-connection
+  # failures for mutations; this one spans longer TLS blips (~45s observed)
+  # and includes a duplicate-PR guard before each retry.
+  # pr_create_retry_max_attempts: 3
+  # pr_create_retry_base_seconds: 10.0
   # Pre-emptive GraphQL rate-limit guard for quota-heavy phases (mop-up sweeps,
   # merged-PR listings). Quota-heavy phases are deferred when remaining points
   # fall below this threshold. Set to 0 to disable the guard.

@@ -6,50 +6,16 @@ that call it (``_attempt_salvage`` and ``_open_pr_for_orphaned_branch``).
 
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
+from _salvage_fixtures import _SalvageTestGitHub, _salvage_labels
 from charlie_work.config import OrchestratorConfig
+from charlie_work.write_gate import WriteGate
 
 
-class _SalvageTestGitHub:
-    """Minimal fake for the ``GitHubLike`` surface used by the salvage helpers."""
-
-    def __init__(
-        self,
-        *,
-        repo_root: Path | None = None,
-        pr_create_return: int | None = 101,
-        remove_ok: bool = True,
-        add_ok: bool = True,
-    ) -> None:
-        self.repo_root = repo_root
-        self.dry_run = False
-        self.pr_create_return = pr_create_return
-        self._remove_ok = remove_ok
-        self._add_ok = add_ok
-        self.prs_created: list[dict[str, Any]] = []
-        self.labels_removed: list[tuple[int, str]] = []
-        self.labels_added: list[tuple[int, str]] = []
-
-    def pr_create(self, head: str, base: str, title: str, body: str) -> int | None:
-        self.prs_created.append({"head": head, "base": base, "title": title, "body": body})
-        return self.pr_create_return
-
-    def remove_issue_label(self, number: int, label: str) -> bool:
-        self.labels_removed.append((number, label))
-        return self._remove_ok
-
-    def add_issue_label(self, number: int, label: str) -> bool:
-        self.labels_added.append((number, label))
-        return self._add_ok
-
-
-def _salvage_labels(config: OrchestratorConfig) -> tuple[set[str], set[str]]:
-    active = {config.labels.in_progress}
-    issue = {config.labels.in_progress}
-    return active, issue
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_open_salvage_pr_creates_pr_and_moves_labels(tmp_path: Path) -> None:
@@ -60,7 +26,7 @@ def test_open_salvage_pr_creates_pr_and_moves_labels(tmp_path: Path) -> None:
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path)
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=tmp_path,
@@ -116,7 +82,7 @@ def test_open_salvage_pr_returns_none_on_pr_create_failure(tmp_path: Path) -> No
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path, pr_create_return=None)
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=tmp_path,
@@ -141,7 +107,7 @@ def test_open_salvage_pr_returns_pr_and_error_on_label_write_failure(tmp_path: P
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path, remove_ok=False)
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=tmp_path,
@@ -166,7 +132,7 @@ def test_open_salvage_pr_refuses_missing_repo_root() -> None:
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub()
 
-    pr_number, error = _open_salvage_pr(
+    pr_number, error, _closing_ref = _open_salvage_pr(
         gh=gh,
         config=config,
         repo_root=None,
@@ -190,7 +156,7 @@ def test_open_pr_for_orphaned_branch_refuses_missing_repo_root() -> None:
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub()
 
-    pr_number, error = _open_pr_for_orphaned_branch(
+    pr_number, error, _closing_ref = _open_pr_for_orphaned_branch(
         gh=gh,
         config=config,
         repo_root=None,
@@ -214,7 +180,7 @@ def test_open_pr_for_orphaned_branch_uses_issue_title(tmp_path: Path) -> None:
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path)
 
-    pr_number, error = _open_pr_for_orphaned_branch(
+    pr_number, error, _closing_ref = _open_pr_for_orphaned_branch(
         gh=gh,
         config=config,
         repo_root=tmp_path,
@@ -259,6 +225,7 @@ def test_attempt_salvage_records_salvaged_event(
         state_file=state_file,
         failure_kind="unpublished_work",
         issue_title="Completed but unpublished",
+        write_gate=_wg(state_file),
     )
 
     assert salvaged is True
@@ -298,6 +265,7 @@ def test_attempt_salvage_records_label_write_failure(
         state_file=state_file,
         failure_kind="unpublished_work",
         issue_title="Completed but labels fail",
+        write_gate=_wg(state_file),
     )
 
     assert salvaged is True

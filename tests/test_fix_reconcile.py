@@ -35,8 +35,16 @@ from charlie_work.state import (
     save_state,
 )
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
+from charlie_work.write_gate import WriteGate
 
-from test_reconcile import FakeGitHub, _issue, _pr
+from _reconcile_fixtures import FakeGitHub, _issue, _pr
+
+
+# Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
+# as state_path -- WriteGate.save_state() writes to self.state_path, not to
+# whatever path the converted function was also given.
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_orphan_no_active_label_with_open_pr_is_drift() -> None:
@@ -327,7 +335,13 @@ def test_pr_status_normalization_does_not_trip_stalled_review_sweep(
     assert new_state["prs"]["100"]["status"] == PASSIVE_OPEN_STATUS
     save_state(paths.state_file, new_state)
 
-    _detect_and_handle_stalled_reviews(reviews_dir, paths.state_file, config, tmp_path / "repo")
+    _detect_and_handle_stalled_reviews(
+        reviews_dir,
+        paths.state_file,
+        config,
+        tmp_path / "repo",
+        write_gate=_wg(paths.state_file),
+    )
 
     final_state = load_state(paths.state_file)
     assert final_state["prs"]["100"]["status"] == PASSIVE_OPEN_STATUS
@@ -422,6 +436,69 @@ def test_escalated_status_zero_labels_converges_instead_of_self_heal() -> None:
     assert (40, config.labels.human_needed) in gh.labels_added
     # Status stays escalated -- convergence repairs labels, never status.
     assert new_state["issues"]["40"]["status"] == "escalated"
+
+
+def test_mechanical_escalated_status_zero_labels_converges_to_operator_queue() -> None:
+    """Issue #1266 counterpart of the judgment case above: a mechanically
+    escalated issue (``reason_class == "mechanical"``) whose label write
+    failed must converge to ``agent:operator-queue``, not
+    ``agent:human-needed``."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(50, "OPEN", head_ref="agent/issue-40-x")],
+        issues=[_issue(40, [config.labels.ready])],
+    )
+    state = empty_state()
+    state["issues"]["40"] = {"number": 40, "status": "escalated", "reason_class": "mechanical"}
+
+    full_drift = detect_drift(gh, state, config)
+    issue_40_items = [item for item in full_drift if item.issue_number == 40]
+
+    assert len(issue_40_items) == 1
+    item = issue_40_items[0]
+    assert item.kind == "escalated_labels_converged"
+    assert item.add_labels == (config.labels.operator_queue,)
+    assert item.remove_labels == ()
+
+    new_state = apply_fixes(gh, state, issue_40_items, config)
+    assert (40, config.labels.operator_queue) in gh.labels_added
+    assert (40, config.labels.human_needed) not in gh.labels_added
+    assert new_state["issues"]["40"]["status"] == "escalated"
+
+
+def test_mechanical_escalated_status_with_correct_label_does_not_clobber() -> None:
+    """Issue #1266: a mechanically escalated issue that already carries
+    ``agent:operator-queue`` on GitHub must produce NO *convergence* drift --
+    proving the reason_class-aware expected-label derivation, not just a
+    hardcoded ``human_needed`` membership check, decides "already correct".
+    Before #1266 this exact shape (operator_queue present, human_needed
+    absent) would have been misread as missing its terminal label and
+    converged to human_needed, clobbering a correctly routed mechanical
+    escalation on every reconcile pass.
+
+    The orthogonal issue #947 ``terminal_state_stale`` alert still fires
+    (age never observed, no timestamp seeded here) -- extended by #1266 to
+    watch ``operator_queue`` the same way it already watched
+    ``human_needed`` (see ``test_escalated_status_with_correct_labels_is_no_drift``
+    for the pre-existing human_needed case this mirrors), so a mechanical
+    escalation parked here forever is no longer invisible either.
+    """
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[_pr(50, "OPEN", head_ref="agent/issue-40-x")],
+        issues=[_issue(40, [config.labels.ready, config.labels.operator_queue])],
+    )
+    state = empty_state()
+    state["issues"]["40"] = {"number": 40, "status": "escalated", "reason_class": "mechanical"}
+
+    full_drift = detect_drift(gh, state, config)
+    issue_40_items = [item for item in full_drift if item.issue_number == 40]
+
+    convergence_items = [
+        item for item in issue_40_items if item.kind == "escalated_labels_converged"
+    ]
+    assert convergence_items == []
+    assert {item.kind for item in issue_40_items} == {"terminal_state_stale"}
 
 
 def test_escalated_status_with_stale_active_label_strips_it() -> None:
