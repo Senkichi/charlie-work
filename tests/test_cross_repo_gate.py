@@ -255,3 +255,104 @@ def test_domain_token_adjacent_to_real_path_does_not_swallow_it(
     assert result.referenced_paths == ("src/charlie_work/real.py",)
     assert not result.passed
     assert "cross_repo_target" in result.reason
+
+
+# --- issue #1343: templated runtime-state example paths ---------------------
+
+
+def test_issue_1343_placeholder_numbered_segment_dropped_at_extraction() -> None:
+    """A candidate with a ``pr-N`` placeholder segment is dropped during
+    extraction — a literal ``N`` standing in for an unknown number can never
+    name a real file, so it cannot be a genuine cross-repo reference."""
+    paths = extract_referenced_paths(
+        "The decision file is at `.var/charlie-work/prs/pr-N/review-decision.json`."
+    )
+    assert paths == []
+
+
+def test_issue_1343_angle_bracket_placeholder_dropped_at_extraction() -> None:
+    """A candidate with an angle-bracket placeholder segment (``<state-dir>``)
+    is dropped during extraction — template text, not a file reference."""
+    paths = extract_referenced_paths(
+        "The decision file is at `<state-dir>/prs/pr-N/review-decision.json`."
+    )
+    assert paths == []
+
+
+def test_issue_1343_issue_n_placeholder_dropped_at_extraction() -> None:
+    """An ``issue-N`` placeholder segment is also dropped (same rule as
+    ``pr-N``)."""
+    paths = extract_referenced_paths(
+        "See `.var/charlie-work/issues/issue-N/dispatch.json` for the shape."
+    )
+    assert paths == []
+
+
+def test_issue_1340_templated_state_dir_path_does_not_escalate(tmp_path: Path) -> None:
+    """The exact #1340 shape: the sole candidate is a templated runtime-state
+    example path (``.var/charlie-work/prs/pr-N/review-decision.json``) whose
+    first segment names the real, gitignored runtime state dir.
+
+    The placeholder segment ``pr-N`` drops the candidate at extraction, so
+    the gate sees no file paths and passes — no ``dispatch_cross_repo_escalated``.
+    """
+    (tmp_path / ".var" / "charlie-work" / "prs").mkdir(parents=True)
+    (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
+
+    body = (
+        "The decision-file divergence is documented at "
+        "`.var/charlie-work/prs/pr-N/review-decision.json`."
+    )
+    result = cross_repo_gate(body, tmp_path)
+    assert result.passed
+    assert result.referenced_paths == ()
+    assert result.missing_paths == ()
+
+
+def test_issue_1343_gitignored_top_level_dir_not_repo_shaped(tmp_path: Path) -> None:
+    """Isolates fix 1 (gitignore-derived exclusion) from fix 2 (placeholder
+    rejection): the sole candidate keys on a real, gitignored top-level
+    directory but has NO placeholder segment. It is missing, yet the gate
+    abstains — a path whose first segment names an *ignored* directory is
+    not a reference to this repo's tracked code."""
+    (tmp_path / ".var" / "charlie-work").mkdir(parents=True)
+    (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
+
+    body = "State is mirrored in `.var/charlie-work/state.json`."
+    paths = extract_referenced_paths(body)
+    assert paths == [".var/charlie-work/state.json"]
+
+    result = cross_repo_gate(body, tmp_path)
+    assert result.passed
+    assert result.referenced_paths == (".var/charlie-work/state.json",)
+    assert result.missing_paths == (".var/charlie-work/state.json",)
+
+
+def test_issue_1343_tracked_top_level_dir_still_repo_shaped_with_gitignore(
+    tmp_path: Path,
+) -> None:
+    """A gitignore that ignores ``.var/`` must not weaken escalation on a
+    genuine tracked-dir reference: ``src/charlie_work/nonexistent.py`` (``src``
+    is a real, non-ignored top-level dir) still escalates."""
+    (tmp_path / "src" / "charlie_work").mkdir(parents=True)
+    (tmp_path / ".gitignore").write_text(".var/\n.venv/\n", encoding="utf-8")
+
+    body = "The bug is in `src/charlie_work/nonexistent.py`."
+    result = cross_repo_gate(body, tmp_path)
+    assert not result.passed
+    assert result.referenced_paths == ("src/charlie_work/nonexistent.py",)
+    assert "cross_repo_target" in result.reason
+
+
+def test_issue_1343_no_gitignore_keeps_existing_repo_shape_behavior(
+    tmp_path: Path,
+) -> None:
+    """Without a ``.gitignore`` the gitignore-derived exclusion is a no-op:
+    a single repo-shaped missing candidate still escalates, preserving the
+    pre-#1343 positive behavior."""
+    (tmp_path / "src" / "charlie_work").mkdir(parents=True)
+
+    body = "The bug is in `src/charlie_work/nonexistent.py`."
+    result = cross_repo_gate(body, tmp_path)
+    assert not result.passed
+    assert "cross_repo_target" in result.reason
