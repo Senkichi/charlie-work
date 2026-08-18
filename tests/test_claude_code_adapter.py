@@ -4298,3 +4298,85 @@ def test_detect_provider_suspended_detects_signature_outside_tail_2kb(
     # necessary for in-flight detection.
     failure_kind, _ = _classify_session_failure(log_path, adapter_kind="api")
     assert failure_kind != "provider_suspended"
+
+
+def test_detect_provider_suspended_benign_transcript_quoting_phrases_no_false_positive(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342 round-3 review finding: a benign session whose own
+    transcript legitimately quotes the billing phrases (the #651/#652
+    false-positive class) must NOT be killed by ``detect_provider_suspended``'s
+    full-log scan.
+
+    The full-log scan sees every line of a live agentic transcript. A session
+    that is reading/editing ``claude_code.py`` (whose comments document these
+    exact phrases) or this issue's own body would contain "insufficient
+    balance" / "recharge your account" in Python comments, docstrings, and
+    prose — without any structured error shape on the same line. The
+    error-line gate (``_PROVIDER_ERROR_LINE_PATTERN``) rejects these because
+    the phrases appear in prose, not in a JSON ``{"error":...}`` object or a
+    CLI ``Error:`` line. Without the gate, the in-flight kill would fire on a
+    live, healthy session that is merely working on this codebase.
+    """
+    from charlie_work.claude_code import detect_provider_suspended
+
+    log_path = tmp_path / "session.claude.log"
+    # A transcript that quotes the billing phrases in the exact contexts a
+    # session working on this issue would produce: Python comments from
+    # claude_code.py, a docstring, and issue-body prose. None of these lines
+    # carry a JSON "error" key or start with "Error:".
+    log_path.write_text(
+        "# Pattern for provider account-suspension / insufficient-balance responses\n"
+        "# * ``insufficient balance`` / ``recharge your account`` -- billing-depleted\n"
+        "#   semantics shared across providers' insufficient-funds responses.\n"
+        '    The billing phrases ("insufficient balance", "recharge your account")\n'
+        "    are natural-language and appear in benign transcripts.\n"
+        "Reading issue #1342: the scan matches 'insufficient balance' and\n"
+        "'recharge your account' against the full log. The fix adds a gate.\n"
+        "Editing src/charlie_work/claude_code.py to add _PROVIDER_ERROR_LINE_PATTERN.\n"
+        "Working... the insufficient balance pattern is documented in the comments.\n"
+        "Remember to recharge your account is one of the matched phrases.\n",
+        encoding="utf-8",
+    )
+
+    assert detect_provider_suspended(log_path) is False
+
+
+def test_detect_provider_suspended_gated_phrase_matches_cli_error_line(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342 round-3: a billing phrase on a CLI ``Error:`` line (without
+    the structured ``exceeded_current_quota_error`` type) IS detected — the
+    error-line gate accepts ``Error:`` prefixed lines. This verifies the gate
+    does not over-restrict: a real provider error that arrives as a CLI error
+    line (not JSON) is still caught."""
+    from charlie_work.claude_code import detect_provider_suspended
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        "Working...\n"
+        "Error: Your account is suspended due to insufficient balance, "
+        "please recharge your account\n",
+        encoding="utf-8",
+    )
+
+    assert detect_provider_suspended(log_path) is True
+
+
+def test_detect_provider_suspended_gated_phrase_matches_json_error(
+    tmp_path: Path,
+) -> None:
+    """Issue #1342 round-3: a billing phrase inside a JSON ``{"error":...}``
+    object (without the structured ``exceeded_current_quota_error`` type) IS
+    detected — the error-line gate accepts lines with a JSON ``"error"`` key.
+    This verifies the gate catches a real provider JSON response even when the
+    type field is absent or different."""
+    from charlie_work.claude_code import detect_provider_suspended
+
+    log_path = tmp_path / "session.claude.log"
+    log_path.write_text(
+        'Working...\n{"error":{"message":"insufficient balance, please recharge"}}\n',
+        encoding="utf-8",
+    )
+
+    assert detect_provider_suspended(log_path) is True

@@ -43682,6 +43682,146 @@ def test_classify_dead_sessions_api_provider_suspended_escalates(
     assert escalated_events[0]["payload"]["failure_kind"] == "provider_suspended"
 
 
+# ---------------------------------------------------------------------------
+# Issue #1342 round-3: AC3 helper unit tests + integration tests for the
+# previously-untested redispatch_at/dispatch_failed_at skip sites.
+# ---------------------------------------------------------------------------
+
+
+def test_redispatch_at_for_escalation_skips_increment_for_provider_suspended() -> None:
+    """Issue #1342 AC3: ``_redispatch_at_for_escalation`` skips the
+    redispatch_at increment for a provider_suspended failure (returns the
+    windowed list without the new timestamp). For every other failure kind,
+    the already-computed incremented list is returned unchanged."""
+    from charlie_work.workflow import _redispatch_at_for_escalation
+
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    entry: dict[str, Any] = {"redispatch_at": [now_iso]}
+    incremented = [now_iso, now_iso]
+
+    # provider_suspended: windowed list only (no increment).
+    result = _redispatch_at_for_escalation(
+        entry, "provider_suspended", incremented, window_minutes=60
+    )
+    assert result == [now_iso]
+    assert len(result) == 1  # not 2 (the increment was skipped)
+
+    # Other failure kinds: incremented list unchanged.
+    result = _redispatch_at_for_escalation(entry, "rate_limited", incremented, window_minutes=60)
+    assert result == incremented
+
+    # None failure_kind: incremented list unchanged.
+    result = _redispatch_at_for_escalation(entry, None, incremented, window_minutes=60)
+    assert result == incremented
+
+
+def test_dispatch_failed_at_for_escalation_skips_now_for_provider_suspended() -> None:
+    """Issue #1342 AC3: ``_dispatch_failed_at_for_escalation`` removes the
+    ``now`` timestamp from ``all_attempts`` for a provider_suspended failure.
+    For every other failure kind, the full list (including ``now``) is
+    returned unchanged."""
+    from charlie_work.workflow import _dispatch_failed_at_for_escalation
+
+    now_iso = datetime.now(UTC).isoformat()
+    prior_iso = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    all_attempts = [prior_iso, now_iso]
+
+    # provider_suspended: now is removed.
+    result = _dispatch_failed_at_for_escalation("provider_suspended", all_attempts, now_iso)
+    assert now_iso not in result
+    assert prior_iso in result
+
+    # Other failure kinds: full list unchanged.
+    result = _dispatch_failed_at_for_escalation("rate_limited", all_attempts, now_iso)
+    assert result == all_attempts
+
+    # None failure_kind: full list unchanged.
+    result = _dispatch_failed_at_for_escalation(None, all_attempts, now_iso)
+    assert result == all_attempts
+
+
+def test_dispatch_rework_impl_provider_suspended_skips_redispatch_increment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1342 AC3: ``_dispatch_rework_impl`` (the rework-dispatch path)
+    skips the redispatch_at increment for a provider_suspended failure. A
+    rework dispatch whose launch fails with provider_suspended escalates
+    immediately (terminal) and the issue's redispatch_at is NOT polluted by
+    the provider outage. This is one of the 4 previously-untested AC3 sites
+    (round-3 review); the shared ``_redispatch_at_for_escalation`` helper is
+    the single point of enforcement."""
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=3, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    # Seed a prior redispatch_at so the skip is observable: without the skip,
+    # the list would grow by 1 on this escalation.
+    prior_redispatch = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [prior_redispatch],
+        }
+        save_state(paths.state_file, state)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="provider account suspended",
+                failure_kind="provider_suspended",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    result = app.dispatch_rework()
+    assert result.ok is False
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "provider_suspended"
+
+    # AC3: redispatch_at was NOT incremented — the prior entry is preserved
+    # but no new timestamp was added for the provider outage.
+    redispatch_at = state["issues"]["123"].get("redispatch_at", [])
+    assert prior_redispatch in redispatch_at
+    assert len(redispatch_at) <= 1, (
+        f"redispatch_at should not have grown for provider_suspended, got {redispatch_at}"
+    )
+
+
 def test_classify_dead_sessions_launch_failed_api_provider_auth(
     tmp_path: Path,
 ) -> None:

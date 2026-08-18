@@ -141,12 +141,61 @@ _PROVIDER_AUTH_PATTERN = re.compile(
 #   keep the existing ``rate_limited`` backoff behavior (acceptance criterion
 #   4). The suspension/billing semantics above are disjoint from the
 #   transient-overload semantics.
+#
+# The combined pattern below is used by ``_classify_session_failure``'s 2KB
+# tail scan (post-mortem, narrow window — the false-positive risk is
+# negligible there). The full-log scan (``detect_provider_suspended``) splits
+# this into a structured-type pattern (safe anywhere) and a free-text phrase
+# pattern (gated on an error-line shape) — see the split patterns and the
+# ``detect_provider_suspended`` docstring for the #651/#652 false-positive
+# safeguard rationale.
 _PROVIDER_SUSPENDED_PATTERN = re.compile(
     r"exceeded_current_quota_error"
     r"|suspended due to insufficient balance"
     r"|insufficient balance"
     r"|recharge your account",
     re.IGNORECASE,
+)
+
+# Structured provider error-type string (issue #1342). Safe to match anywhere
+# in the FULL log: it is a specific provider-documented error type, not
+# natural-language prose, so it cannot false-positive on a benign transcript
+# that merely quotes the billing phrases in comments or issue-body text.
+_PROVIDER_SUSPENDED_TYPE_PATTERN = re.compile(
+    r"exceeded_current_quota_error",
+    re.IGNORECASE,
+)
+
+# Free-text billing-phrase alternatives (issue #1342). NOT safe to match
+# anywhere in the full log: a session reading/editing ``claude_code.py`` or
+# this issue's own body legitimately quotes "insufficient balance" /
+# "recharge your account" in comments, docstrings, and prose — the #651/#652
+# false-positive class this codebase has already hit in production. In the
+# full-log scan (``detect_provider_suspended``) these are gated on
+# ``_PROVIDER_ERROR_LINE_PATTERN`` (a structured error shape on the same line)
+# so prose that merely quotes the phrase does not trigger the in-flight kill.
+# In the 2KB tail scan (``_classify_session_failure``) the narrow window
+# makes the false-positive negligible, so the combined
+# ``_PROVIDER_SUSPENDED_PATTERN`` is used directly there.
+_PROVIDER_SUSPENDED_PHRASE_PATTERN = re.compile(
+    r"suspended due to insufficient balance"
+    r"|insufficient balance"
+    r"|recharge your account",
+    re.IGNORECASE,
+)
+
+# A line that carries a structured provider error shape, not benign prose.
+# Real provider errors arrive as a JSON error object (``{"error":...}``) or a
+# CLI error-prefixed line (``Error: ...``). A benign transcript that merely
+# QUOTES the billing phrases (Python comments like
+# ``# * ``insufficient balance`` / ``recharge your account``,
+# docstrings, issue-body prose) does not carry either shape on the same line
+# as the phrase, so the gate rejects it. This is the #651/#652
+# false-positive safeguard for the full-log in-flight kill scan.
+_PROVIDER_ERROR_LINE_PATTERN = re.compile(
+    r'"error"'
+    r"|^\s*Error\b\s*:",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Default cooldown durations when we can't parse a specific reset time
@@ -681,9 +730,28 @@ def detect_provider_suspended(log_path: Path) -> bool:
     caller kills the process immediately instead of letting the CLI burn its
     retry budget against a permanently-failing endpoint.
 
-    The pattern (``_PROVIDER_SUSPENDED_PATTERN``) is api-provider-specific and
-    disjoint from genuine transient 429 rate-limit signatures, so a transient
-    rate-limit log returns False here and keeps the existing backoff behavior.
+    The patterns are api-provider-specific and disjoint from genuine transient
+    429 rate-limit signatures, so a transient rate-limit log returns False
+    here and keeps the existing backoff behavior.
+
+    **#651/#652 false-positive safeguard:** the full-log scan sees every line
+    of a live agentic transcript, including the session's own prose. The
+    billing phrases ("insufficient balance", "recharge your account") are
+    natural-language and appear in benign transcripts — a session
+    reading/editing ``claude_code.py`` (whose comments document these exact
+    phrases) or this issue's own body would be killed on a false positive
+    without a gate. The scan therefore splits the pattern:
+
+    * ``_PROVIDER_SUSPENDED_TYPE_PATTERN`` (``exceeded_current_quota_error``)
+      is a structured provider error-type string — safe to match anywhere in
+      the full log (it does not appear in benign prose).
+    * ``_PROVIDER_SUSPENDED_PHRASE_PATTERN`` (the free-text billing phrases)
+      is gated on ``_PROVIDER_ERROR_LINE_PATTERN`` — the phrase must appear on
+      a line that also carries a structured error shape (a JSON ``"error"``
+      key or a CLI ``Error:`` prefix). Prose that merely quotes the phrase
+      (Python comments, docstrings, issue-body text) does not carry either
+      shape on the same line, so it is not killed. A real provider response
+      (JSON ``{"error":...}`` or a CLI ``Error: ...`` line) is.
     """
     if not log_path.exists():
         return False
@@ -691,7 +759,23 @@ def detect_provider_suspended(log_path: Path) -> bool:
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    return bool(_PROVIDER_SUSPENDED_PATTERN.search(log_text))
+    # Structured error type: safe to match anywhere in the full log (a
+    # specific provider error-type string, not natural-language prose).
+    if _PROVIDER_SUSPENDED_TYPE_PATTERN.search(log_text):
+        return True
+    # Free-text billing phrases: gate on a structured error shape on the
+    # same line. A benign transcript that quotes these phrases in comments
+    # or prose (the #651/#652 false-positive class — e.g. a session
+    # reading/editing claude_code.py or this issue's body) does not carry
+    # a JSON error object or CLI error prefix on the same line, so it is
+    # not killed. A real provider response (JSON ``{"error":...}`` or a
+    # CLI ``Error: ...`` line) is.
+    for line in log_text.splitlines():
+        if _PROVIDER_SUSPENDED_PHRASE_PATTERN.search(line) and _PROVIDER_ERROR_LINE_PATTERN.search(
+            line
+        ):
+            return True
+    return False
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
