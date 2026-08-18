@@ -1044,7 +1044,7 @@ def test_jsonl_migration_malformed_tolerance_preserved(tmp_path: Path) -> None:
 # becomes resolvable (or is rewritten) can't leave stale cover behind.
 # ---------------------------------------------------------------------------
 
-_EMIT_FUNCS = {"log_event", "append_event", "_record_event"}
+_EMIT_FUNCS = {"log_event", "append_event", "_record_event", "record_event"}
 _WRAPPER_FUNCS = {"_route_to_rework"}
 _VALID_LEVELS = {"info", "warning", "error"}
 
@@ -1507,6 +1507,42 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
             "_self_deploy_event_kind(result) returns one of "
             "self_deploy_{failed,succeeded,skipped}; every branch is "
             "verified by test_self_deploy_event_kind_only_returns_registered_kinds."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="write_gate.py",
+        scope="append_event",
+        source="kind",
+        reason=(
+            "WriteGate.append_event forwards its own `kind` parameter to "
+            "state.append_event. Same pass-through as the existing "
+            "state.py/append_event entry above; the literal is chosen at "
+            "each call site, and every self.write_gate.append_event(...) "
+            "call site is scanned there."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="write_gate.py",
+        scope="record_event",
+        source="kind",
+        reason=(
+            "WriteGate.record_event forwards its own `kind` parameter to "
+            "state.append_event, mirroring OrchestratorApp._record_event's "
+            "own forwarding shape (see the workflow.py/_record_event entry "
+            "above). Every self.write_gate.record_event(...) call site is "
+            "scanned there; `record_event` is itself in _EMIT_FUNCS so no "
+            "coverage gap opens once a call site migrates onto it."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="write_gate.py",
+        scope="log_event",
+        source="kind",
+        reason=(
+            "WriteGate.log_event forwards its own `kind` parameter to "
+            "instrumentation.log_event. The literal is chosen at each call "
+            "site, and every self.write_gate.log_event(...) call site is "
+            "scanned there."
         ),
     ),
 )
