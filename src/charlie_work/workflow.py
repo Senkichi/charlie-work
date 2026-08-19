@@ -9669,6 +9669,29 @@ class OrchestratorApp:
         dispatch_disabled = not self.config.review_dispatch.enabled
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            # Issue #1351: the dispatch attempt counter is reset only for a
+            # genuinely new head, not on every packet write. ``review()`` is
+            # called every loop pass for a PR stuck on a stale
+            # ``decision``/``reviewed_head_sha`` pair (the ``already_approved``
+            # branch with ``head_matches=False``), so an unconditional reset
+            # raced with ``dispatch_reviews()``'s claim-time increment and the
+            # counter oscillated 1->0->1->0... never reaching
+            # ``max_review_dispatch_attempts`` -- the cap was silently inert and
+            # reviewers re-dispatched indefinitely with no escalation.
+            # ``review_dispatch_attempt_last_head`` baselines the head the
+            # current attempt count is counting against, mirroring the
+            # ``no_op_rework_attempts_last_head`` /
+            # ``conflict_rework_attempts_last_head`` pattern: the counter resets
+            # only when the packetized head advances past it.
+            _existing_pr_state = state["prs"].get(str(pr_number), {})
+            _packet_head = pr.get("headRefOid")
+            _prior_attempt_last_head = _existing_pr_state.get("review_dispatch_attempt_last_head")
+            _fresh_dispatch_cycle = (
+                _prior_attempt_last_head is None or _prior_attempt_last_head != _packet_head
+            )
+            _preserved_attempt_count = int(
+                _existing_pr_state.get("review_dispatch_attempt_count", 0)
+            )
             # Issue #1340: the pending-reset decision-file write is inside the
             # state lock, and when a stale-head terminal verdict is voided the
             # state.json ``decision`` field is cleared in the same locked
@@ -9739,9 +9762,20 @@ class OrchestratorApp:
                 "cross_family_ok": cf_result.ok if cf_result else None,
                 "consecutive_failed_merge_attempts": 0,
                 "check_rerun_attempts": verdict.check_rerun_attempts,
-                # New packet for a (possibly) new head: reset the dispatch
-                # attempt counter so the fresh review cycle starts clean.
-                "review_dispatch_attempt_count": 0,
+                # Issue #1351: reset the dispatch attempt counter only when
+                # the packet is for a genuinely new head. Rebuilding the
+                # packet for the same head (e.g. a stale already_approved /
+                # head_matches=False loop that calls review() every pass) must
+                # NOT zero the counter -- otherwise review()'s reset races
+                # with dispatch_reviews()'s claim-time increment and
+                # max_review_dispatch_attempts never fires. The companion
+                # ``review_dispatch_attempt_last_head`` baselines the head the
+                # count is against (mirroring no_op/conflict_rework_attempts_
+                # last_head); the counter resets only when the head advances.
+                "review_dispatch_attempt_count": (
+                    0 if _fresh_dispatch_cycle else _preserved_attempt_count
+                ),
+                "review_dispatch_attempt_last_head": _packet_head,
                 # Reset the unreadable-log streak: a new packet is a new
                 # review cycle, so a prior persistent-unreadable condition
                 # must not carry forward and immediately count against the
@@ -12970,6 +13004,11 @@ class OrchestratorApp:
     # checks passed).
     _UNESCALATE_PR_RESET_FIELDS = (
         "review_dispatch_attempt_count",
+        # Issue #1351: companion baseline to review_dispatch_attempt_count.
+        # Cleared on re-arm alongside the counter so the next review() for the
+        # same head starts a fresh dispatch cycle (counter is 0 either way, but
+        # this keeps the pair consistent with the other _last_head baselines).
+        "review_dispatch_attempt_last_head",
         "review_log_unreadable_streak",
         "request_changes_count",
         "conflict_rework_attempts",
