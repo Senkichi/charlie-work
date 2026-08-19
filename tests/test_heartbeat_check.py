@@ -376,6 +376,142 @@ def test_check_review_liveness_falls_back_to_packet_mtime_when_state_timestamp_m
     assert "pr-200" in report.lines[0]
 
 
+def _write_state_multi(state_dir: Path, prs: dict[int, dict[str, Any]]) -> None:
+    """Write a state.json with multiple PR entries (``_write_state`` covers one)."""
+    state = {"version": 1, "prs": {str(n): pr_state for n, pr_state in prs.items()}}
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_check_review_liveness_escalated_pr_not_anomaly(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Regression for issue #1357.
+
+    An escalated PR (``status == "escalated"`` in state.json) keeps its
+    placeholder ``decision="pending"`` packet file forever -- the escalation
+    gate stops further dispatch, so no review ever completes to overwrite it.
+    The liveness check must NOT count it as an open claim or trip ANOMALY; it
+    should be surfaced in the facts string as ``escalated=N`` instead.
+    """
+    frozen_now = datetime(2026, 8, 19, 5, 13, 0, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    # Live-case shape: pr-1736 escalated, packet dir untouched, pending
+    # decision file from packet-build time ~14h before the beat.
+    _patch_gh(monkeypatch, hb, [1736])
+    _make_pr_dirs(
+        repo.state_dir,
+        1736,
+        pr_mtime=(frozen_now - timedelta(hours=14)).timestamp(),
+    )
+    _write_state(
+        repo.state_dir,
+        1736,
+        {
+            "status": "escalated",
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": _iso(871, base=frozen_now),
+            "reviewer_pid": None,
+        },
+    )
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert not report.anomaly
+    assert report.lines and "review-liveness" in report.lines[0]
+    assert "open_claims=0" in report.lines[0]
+    assert "escalated=1" in report.lines[0]
+    # The escalated PR's stale dir must not appear in an ANOMALY detail line.
+    assert "pr-1736" not in report.lines[0]
+
+
+def test_check_review_liveness_escalated_mixed_with_still_stale_open_claim(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1357 AC2: a non-escalated stale open claim still fires ANOMALY.
+
+    With one escalated PR (skipped) and one genuinely in-flight open claim
+    past the stale threshold, the check must still ANOMALY on the in-flight
+    one only -- escalated accounting must not silently swallow real liveness
+    failures. The escalated PR is surfaced as ``escalated=1`` in the facts.
+    """
+    frozen_now = datetime(2026, 8, 19, 5, 13, 0, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    _patch_gh(monkeypatch, hb, [1736, 2000])
+    _make_pr_dirs(
+        repo.state_dir,
+        1736,
+        pr_mtime=(frozen_now - timedelta(hours=14)).timestamp(),
+    )
+    _make_pr_dirs(repo.state_dir, 2000)
+    _write_state_multi(
+        repo.state_dir,
+        {
+            1736: {
+                "status": "escalated",
+                "review_dispatch_status": "review_dispatch_dispatched",
+                "review_dispatched_at": _iso(871, base=frozen_now),
+                "reviewer_pid": None,
+            },
+            2000: {
+                "review_dispatch_status": "review_dispatch_dispatched",
+                "review_dispatched_at": _iso(60, base=frozen_now),
+                "reviewer_pid": 24616,
+                "reviewer_process_start_time": 1000.0,
+            },
+        },
+    )
+    monkeypatch.setattr(hb, "psutil", FakePsutil({24616: (False, None)}))
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert report.anomaly
+    assert "pr-2000" in report.lines[0]
+    assert "threshold=45m" in report.lines[0]
+    # The escalated PR is not in the ANOMALY detail but is in the facts.
+    assert "escalated=1" in report.lines[0]
+    assert "open_claims=1" in report.lines[0]
+    # The escalated PR's dir must not be listed as a stale claim dir.
+    assert "pr-1736" not in report.lines[0]
+
+
+def test_check_review_liveness_non_escalated_pending_status_still_counts(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1357 AC2 guard: only ``status == "escalated"`` is skipped.
+
+    A PR whose state entry lacks ``status: "escalated"`` (here, no ``status``
+    key at all, just a stale pending dispatch) must still be counted as an open
+    claim and trip ANOMALY past the threshold -- the escalation carve-out is
+    exact, not a fuzzy "pending-looking" match.
+    """
+    frozen_now = datetime(2026, 8, 19, 5, 13, 0, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    _patch_gh(monkeypatch, hb, [3000])
+    _make_pr_dirs(repo.state_dir, 3000)
+    _write_state(
+        repo.state_dir,
+        3000,
+        {
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": _iso(60, base=frozen_now),
+            "reviewer_pid": 24616,
+            "reviewer_process_start_time": 1000.0,
+        },
+    )
+    monkeypatch.setattr(hb, "psutil", FakePsutil({24616: (False, None)}))
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert report.anomaly
+    assert "pr-3000" in report.lines[0]
+    assert "open_claims=1" in report.lines[0]
+    assert "escalated=" not in report.lines[0]
+
+
 # ---------------------------------------------------------------------------
 # Smoke tests for the remaining checks (review-liveness is covered above).
 # Each test exercises one check's OK and/or anomaly path with stubbed I/O.
