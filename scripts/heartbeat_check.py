@@ -899,6 +899,7 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
 
     resolved_now = now if now is not None else datetime.now(timezone.utc)
     open_claims = 0
+    escalated_claims = 0
     stale: list[str] = []
     claims: list[tuple[int, int, str]] = []
     for entry in sorted(prs_dir.iterdir()):
@@ -918,11 +919,29 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
         if not _claim_is_open(entry / "review-decision.json"):
             continue
 
-        open_claims += 1
-
         pr_state = prs_state.get(str(pr_number), {}) if isinstance(prs_state, dict) else {}
         if not isinstance(pr_state, dict):
             pr_state = {}
+
+        # Issue #1357: an escalated PR (``status == "escalated"`` in state.json,
+        # ``agent:human-needed`` on the issue) never completes a review -- the
+        # escalation gate stops further dispatch, so the placeholder
+        # ``decision="pending"`` file written at packet-build time is accurate
+        # history, not a liveness signal. Counting it as an open claim trips
+        # ANOMALY on every heartbeat indefinitely. Skip the open-claim/stale
+        # accounting for escalated entries and surface them separately in the
+        # facts string instead. The packet and its pending decision file are
+        # reused on unescalate (same-head packet semantics, #1351/#1352), so
+        # the scoping belongs in this liveness check -- forging a terminal
+        # decision or deleting the packet would corrupt review state to quiet
+        # a monitor. The ``status`` field read here is the same one
+        # ``charlie_work.escalation._escalation_flags`` keys on, so the
+        # definition of "escalated" stays single-sourced.
+        if pr_state.get("status") == "escalated":
+            escalated_claims += 1
+            continue
+
+        open_claims += 1
 
         timestamp = _review_claim_timestamp(pr_state)
         claim_time = parse_iso(timestamp)
@@ -951,6 +970,8 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
             stale.append(f"{entry.name}: {age_rounded}m {pid_label}")
 
     facts = f"open_claims={open_claims}"
+    if escalated_claims:
+        facts += f" escalated={escalated_claims}"
     if open_claims:
         oldest = max(claims, key=lambda c: c[1])
         facts += f" oldest_min={oldest[1]} oldest={oldest[2]}"
