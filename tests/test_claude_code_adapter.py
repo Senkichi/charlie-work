@@ -3706,6 +3706,67 @@ def test_launch_claude_worker_review_prompt_write_failure_tears_down_checkout(
     assert str(checkout_path) not in result.stdout
 
 
+def test_launch_claude_worker_review_writes_terminal_status_record(
+    tmp_path: Path,
+) -> None:
+    """A review=True launch must start the terminal-status watcher so a
+    ``terminal.json`` appears at
+    ``worker_terminal_status_path(reviews_dir, pr_number, 'claude')`` once the
+    reviewer process exits (issue #1354, PR #1356 round-2 review).
+
+    Before the fix, ``launch_claude_worker`` guarded the
+    ``start_terminal_status_watcher`` call with ``if not review:``, so review
+    launches never wrote a terminal-status record and the review-verdict
+    reaper's exit-code fallback had nothing to read. This test exercises the
+    real launch path end-to-end (real ``create_review_checkout``, real
+    ``subprocess.Popen`` of the fake claude script, real watcher thread) and
+    asserts the durable record materializes at the path the reaper reads from.
+    """
+    from charlie_work.process_utils import (
+        find_worker_terminal_status,
+        worker_terminal_status_path,
+    )
+
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    record = launch_claude_worker(
+        1354,
+        "agent/issue-1354-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert record.ok, record.error
+    assert record.pid is not None
+
+    expected_path = worker_terminal_status_path(sessions_dir, 1354, "claude")
+    # The watcher polls every _TERMINAL_STATUS_POLL_INTERVAL_SECONDS (2s); the
+    # fake script exits near-instantly, so the record should appear within a
+    # few poll intervals. Poll rather than sleep a fixed duration so the test
+    # is fast on a healthy path and only waits as long as needed.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not expected_path.exists():
+        time.sleep(0.1)
+    assert expected_path.exists(), (
+        f"review=True launch did not write a terminal-status record at "
+        f"{expected_path} -- the start_terminal_status_watcher guard "
+        f"(`if not review:`) may have been reintroduced"
+    )
+
+    payload = find_worker_terminal_status(sessions_dir, 1354)
+    assert payload is not None, "terminal-status record vanished after appearing"
+    assert payload["pid"] == record.pid
+    # The fake claude script exits 0.
+    assert payload["exit_code"] == 0
+
+
 def test_launch_claude_worker_api_kind_sidecar_naming(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
