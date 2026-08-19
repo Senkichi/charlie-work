@@ -21033,6 +21033,156 @@ def test_bootstrap_labels_fails_when_label_list_raises(tmp_path: Path) -> None:
     assert "verification failed" in result.message
 
 
+# ---------------------------------------------------------------------------
+# Issue #1339: automatic startup label ensure (OrchestratorApp.ensure_labels)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_labels_creates_every_configured_label(tmp_path: Path) -> None:
+    """ensure_labels is the automatic startup counterpart of bootstrap_labels.
+
+    It must create every LabelConfig-derived label and record an ``ok`` event
+    so convergence is observable in events.db without an operator running
+    ``charlie bootstrap-labels``.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.ensure_labels()
+
+    created = {name for name, _color, _desc in fake_gh.labels_created}
+    assert created == set(config.labels.all)
+    assert result.ok is True
+    assert result.data["missing"] == []
+    ok_events = query_events(paths.state_file, kind="label_ensure_ok")
+    assert len(ok_events) == 1, ok_events
+    assert ok_events[0]["level"] == "info"
+
+
+def test_ensure_labels_extra_labelconfig_field_is_ensured(tmp_path: Path) -> None:
+    """AC #3: a LabelConfig with an extra field results in that label being ensured.
+
+    The ensure set must derive from LabelConfig fields, so a new field ships its
+    label with no extra wiring. Verified by subclassing LabelConfig with an
+    extra field included in ``all``.
+    """
+
+    @dataclasses.dataclass(frozen=True)
+    class _ExtraLabelConfig(LabelConfig):
+        extra_label: str = "agent:extra-test-field"
+
+        @property
+        def all(self) -> list[str]:
+            return [*LabelConfig.all.fget(self), self.extra_label]  # type: ignore[misc]
+
+    config = OrchestratorConfig(labels=_ExtraLabelConfig())
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.ensure_labels()
+
+    created = {name for name, _color, _desc in fake_gh.labels_created}
+    assert "agent:extra-test-field" in created
+    assert created == set(config.labels.all)
+    assert result.ok is True
+
+
+def test_ensure_labels_removal_of_field_does_not_delete(tmp_path: Path) -> None:
+    """AC #3: removing a field from LabelConfig must not delete the label.
+
+    ensure_labels only creates/updates; it never deletes. A label that exists
+    on the repo but is no longer in ``LabelConfig.all`` must survive the ensure.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Pre-create a label that is NOT in the default LabelConfig.all, simulating
+    # a label left behind after a field was removed from LabelConfig.
+    orphan = "agent:removed-from-config"
+    fake_gh.labels_created.append((orphan, "5319E7", "orphaned label"))
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.ensure_labels()
+
+    assert result.ok is True
+    live = {str(item.get("name") or "") for item in fake_gh.label_list()}
+    # The orphan label survives — ensure never deletes.
+    assert orphan in live
+
+
+def test_ensure_labels_records_incomplete_event_on_missing(tmp_path: Path) -> None:
+    """AC #2: ensure failures surface as events, not exceptions.
+
+    When label_create silently fails (e.g. no auth), the ensure must record a
+    ``label_ensure_incomplete`` warning event and return ok=False rather than
+    raise.
+    """
+
+    class _FailingCreateGitHub(FakeGitHub):
+        def label_create(self, label: str, color: str, description: str) -> None:
+            pass  # silently drop all creates
+
+        def label_list(self) -> list[dict[str, object]]:
+            return []  # nothing was created
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, _FailingCreateGitHub())
+
+    result = app.ensure_labels()
+
+    assert result.ok is False
+    assert result.data["missing"] == config.labels.all
+    incomplete = query_events(paths.state_file, kind="label_ensure_incomplete")
+    assert len(incomplete) == 1, incomplete
+    assert incomplete[0]["level"] == "warning"
+
+
+def test_ensure_labels_records_failed_event_on_list_error(tmp_path: Path) -> None:
+    """AC #2: a verification (label_list) error surfaces as an error event."""
+    from charlie_work.github import GitHubError
+
+    class _ErrorListGitHub(FakeGitHub):
+        def label_list(self) -> list[dict[str, object]]:
+            raise GitHubError("could not list labels: HTTP 401")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, _ErrorListGitHub())
+
+    result = app.ensure_labels()
+
+    assert result.ok is False
+    assert "verification failed" in result.message
+    failed = query_events(paths.state_file, kind="label_ensure_failed")
+    assert len(failed) == 1, failed
+    assert failed[0]["level"] == "error"
+
+
+def test_ensure_labels_never_raises_on_unexpected_exception(tmp_path: Path) -> None:
+    """AC #2: an unexpected exception from the gh impl is recorded, not raised."""
+
+    class _RaisingCreateGitHub(FakeGitHub):
+        def label_create(self, label: str, color: str, description: str) -> None:
+            raise RuntimeError("boom")
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, _RaisingCreateGitHub())
+
+    # Must not raise.
+    result = app.ensure_labels()
+
+    assert result.ok is False
+    failed = query_events(paths.state_file, kind="label_ensure_failed")
+    assert len(failed) == 1, failed
+    assert failed[0]["level"] == "error"
+    assert "RuntimeError" in failed[0]["payload"]["error"]
+
+
 def test_status_aggregates_counts(tmp_path: Path) -> None:
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -36276,6 +36426,118 @@ def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path
     workers = [w for w in result.data["workers"] if w["issue"] == issue_number]
     assert len(workers) == 1
     assert workers[0]["health"] == "healthy"
+
+
+@pytest.mark.real_activity_probe_live
+def test_status_workers_surfaces_corroboration_alive_but_polling(tmp_path: Path) -> None:
+    """Issue #1346: an alive-but-polling worker (stale sidecar log mtime, fresh
+    events.jsonl corroboration) must be visibly distinguishable from a genuinely
+    stalled one (stale log AND stale corroboration) in the status()/roll-call
+    workers section.
+
+    Both workers share the same stale sidecar log mtime -- the only signal a
+    log-mtime monitor sees -- so pre-#1346 they printed identically. After
+    #1346 the workers section carries the watchdog's corroboration probe
+    verdict (``last_corroborated_activity_at`` / ``last_corroborated_activity_source``
+    / ``corroboration_fresh``) alongside ``health``, all derived from the same
+    ``real_activity_probe_for`` + ``classify_worker_health`` code path the
+    watchdog uses. The alive-but-polling worker reports ``health="healthy"`` +
+    ``corroboration_fresh=True``; the stalled worker reports
+    ``health="stalled"`` + ``corroboration_fresh=False``.
+
+    Marked ``real_activity_probe_live`` so the autouse stale-probe stub fixture
+    leaves ``real_activity_probe_for`` unstubbed and the real events.jsonl
+    source is exercised.
+    """
+    from datetime import timedelta
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    fresh_time = datetime.now(UTC) - timedelta(minutes=1)
+
+    def _plant_claude_worker(issue_number: int, *, fresh_corroboration: bool) -> None:
+        log_path = sessions_dir / f"issue-{issue_number}.claude.log"
+        log_path.write_text("Working on task...\nLast line", encoding="utf-8")
+        # Stale sidecar log mtime for BOTH workers -- this is the signal that
+        # log-mtime monitors cannot disambiguate.
+        os.utime(log_path, (time.time(), old_time.timestamp()))
+
+        events_path = sessions_dir / f"issue-{issue_number}.events.jsonl"
+        ts = fresh_time if fresh_corroboration else old_time
+        events_path.write_text(
+            f'{{"type": "tool_call", "timestamp": "{ts.isoformat()}"}}\n',
+            encoding="utf-8",
+        )
+        os.utime(events_path, (time.time(), ts.timestamp()))
+
+        sidecar_path = sessions_dir / f"issue-{issue_number}.claude.json"
+        sidecar_path.write_text(
+            json.dumps(
+                {
+                    "issue_number": issue_number,
+                    "branch": f"agent/issue-{issue_number}",
+                    "worktree_path": str(tmp_path / f"worktree-{issue_number}"),
+                    "prompt_path": str(tmp_path / "prompt.md"),
+                    "command": ["claude", "prompt.md"],
+                    "pid": 70000 + issue_number,
+                    "started_at": (datetime.now(UTC) - timedelta(minutes=10)).isoformat(),
+                    "log_path": str(log_path),
+                    "error": None,
+                    "failure_kind": None,
+                    "process_start_time": 1710000000.0,
+                    "reclaimed": None,
+                    # last_activity_at is the sidecar's stored log mtime -- the
+                    # stale signal a log-mtime monitor reads. Both workers
+                    # carry the same stale value so the only disambiguator is
+                    # the corroboration probe.
+                    "last_activity_at": old_time.isoformat(),
+                    "log_bytes": len("Working on task...\nLast line"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # Worker 1346: alive-but-polling (stale log, fresh corroboration).
+    _plant_claude_worker(1346, fresh_corroboration=True)
+    # Worker 1347: genuinely stalled (stale log, stale corroboration).
+    _plant_claude_worker(1347, fresh_corroboration=False)
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        result = app.status()
+
+    by_issue = {w["issue"]: w for w in result.data["workers"]}
+    assert set(by_issue) == {1346, 1347}
+
+    alive_polling = by_issue[1346]
+    # Acceptance criterion 1: visibly distinguishable. The stale log mtime is
+    # identical to the stalled worker's, but the corroboration fields differ.
+    assert alive_polling["health"] == "healthy"
+    assert alive_polling["corroboration_fresh"] is True
+    assert alive_polling["last_corroborated_activity_at"] is not None
+    assert alive_polling["last_corroborated_activity_source"] is not None
+
+    stalled = by_issue[1347]
+    # Acceptance criterion 3: stale-both classifies stalled.
+    assert stalled["health"] == "stalled"
+    assert stalled["corroboration_fresh"] is False
+
+    # The distinguishing signal: same stale last_activity_at (log mtime), but
+    # the corroboration fields diverge -- exactly the gap #1346 closes.
+    assert alive_polling["last_activity_at"] is not None
+    assert stalled["last_activity_at"] is not None
+    assert alive_polling["corroboration_fresh"] is not stalled["corroboration_fresh"]
 
 
 def test_status_workers_empty_when_no_live_sessions(tmp_path: Path) -> None:

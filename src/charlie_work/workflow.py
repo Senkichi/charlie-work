@@ -5995,7 +5995,11 @@ class OrchestratorApp:
                 continue
             probe = real_activity_probe_for(view, self.config, now)
             workers.append(
-                self._summarize_worker(view, classify_worker_health(view, self.config, now, probe))
+                self._summarize_worker(
+                    view,
+                    classify_worker_health(view, self.config, now, probe),
+                    probe=probe,
+                )
             )
 
         # Observe runner pool if feature is enabled
@@ -6149,35 +6153,70 @@ class OrchestratorApp:
             },
         )
 
-    def bootstrap_labels(self) -> CommandResult:
-        descriptions = {
-            self.config.labels.ready: "Issue is ready for deterministic agentic automation.",
-            self.config.labels.queued: "Issue is queued by the orchestrator.",
-            self.config.labels.in_progress: "A worker is implementing this issue.",
-            self.config.labels.pr_open: "A worker PR exists for this issue.",
-            self.config.labels.reviewing: "The orchestrator is adversarially reviewing the worker PR.",
-            self.config.labels.needs_rework: "The worker PR needs another implementation cycle.",
-            self.config.labels.blocked: "Automation is blocked and needs intervention.",
-            self.config.labels.done: "Automation completed and the issue was merged or resolved.",
-            self.config.labels.human_needed: "A human product or security decision is needed.",
-            self.config.labels.operator_queue: "A mechanical failure exhausted its automated retries; needs operator triage.",
-            self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
-            self.config.labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
-            self.config.labels.complexity_high: (
+    def _label_descriptions(self) -> dict[str, str]:
+        """Human-readable description for every LabelConfig-derived label.
+
+        Single source for the descriptions used by both the explicit
+        ``charlie bootstrap-labels`` command and the automatic startup
+        ensure (issue #1339). Keyed by the resolved label string from
+        ``self.config.labels``, never a hard-coded literal.
+        """
+        labels = self.config.labels
+        return {
+            labels.ready: "Issue is ready for deterministic agentic automation.",
+            labels.queued: "Issue is queued by the orchestrator.",
+            labels.in_progress: "A worker is implementing this issue.",
+            labels.pr_open: "A worker PR exists for this issue.",
+            labels.reviewing: "The orchestrator is adversarially reviewing the worker PR.",
+            labels.needs_rework: "The worker PR needs another implementation cycle.",
+            labels.blocked: "Automation is blocked and needs intervention.",
+            labels.done: "Automation completed and the issue was merged or resolved.",
+            labels.human_needed: "A human product or security decision is needed.",
+            labels.operator_queue: "A mechanical failure exhausted its automated retries; needs operator triage.",
+            labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
+            labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
+            labels.complexity_high: (
                 "Routing hint: route to the api worker (multi-module, "
                 "cross-cutting invariant, or prior escalation)."
             ),
         }
-        for label in self.config.labels.all:
-            # The ready marker is green; the complexity routing hint gets a
-            # distinct amber so it is visually separable from workflow state.
-            if label == self.config.labels.ready:
-                color = "0E8A16"
-            elif label == self.config.labels.complexity_high:
-                color = "BFD4F2"
-            else:
-                color = "5319E7"
-            self.gh.label_create(label, color, descriptions[label])
+
+    def _label_color(self, label: str) -> str:
+        """Color for a label, derived from LabelConfig fields (no hard-coded names)."""
+        labels = self.config.labels
+        # The ready marker is green; the complexity routing hint gets a
+        # distinct amber so it is visually separable from workflow state.
+        if label == labels.ready:
+            return "0E8A16"
+        if label == labels.complexity_high:
+            return "BFD4F2"
+        return "5319E7"
+
+    def _ensure_labels_core(self) -> CommandResult:
+        """Idempotent ensure of every LabelConfig-derived label on the repo.
+
+        Creates/updates each label in ``self.config.labels.all`` via
+        ``gh.label_create`` (``--force`` → update-or-create, so colour and
+        description drift is repaired on existing labels too), then verifies
+        via ``gh.label_list``. The ensure set is derived entirely from
+        ``LabelConfig`` fields — never a hard-coded list — so a new field
+        ships its label with no extra wiring (issue #1339).
+
+        Returns a ``CommandResult`` and never raises: a ``GitHubError`` from
+        verification is reported in the result, not propagated. The CLI
+        ``bootstrap-labels`` command and the automatic startup ensure both
+        route through here.
+        """
+        labels = self.config.labels
+        desired = list(labels.all)
+        descriptions = self._label_descriptions()
+        for label in desired:
+            # A brand-new LabelConfig field may ship before its entry in
+            # ``_label_descriptions`` is added; fall back to a generic
+            # description so the label is still created (issue #1339 AC #3).
+            # Never block the ensure on a missing description.
+            description = descriptions.get(label, "Orchestrator-managed label.")
+            self.gh.label_create(label, self._label_color(label), description)
         # Verify: check which labels actually exist after creation attempts.
         # label_create uses allow_failure=True, so silent failures are possible
         # (e.g. no auth, wrong repo). Don't report success we can't vouch for.
@@ -6187,22 +6226,82 @@ class OrchestratorApp:
                 for item in self.gh.label_list()
                 if isinstance(item, dict)
             }
-            missing = [name for name in self.config.labels.all if name not in live]
+            missing = [name for name in desired if name not in live]
         except GitHubError as exc:
             return CommandResult(
                 False,
                 f"labels created but verification failed: {exc}",
-                {"labels": self.config.labels.all, "missing": None},
+                {"labels": desired, "missing": None},
             )
         if missing:
             return CommandResult(
                 False,
                 f"bootstrap incomplete — {len(missing)} label(s) still missing: {missing}",
-                {"labels": self.config.labels.all, "missing": missing},
+                {"labels": desired, "missing": missing},
             )
-        return CommandResult(
-            True, "labels ensured", {"labels": self.config.labels.all, "missing": []}
-        )
+        return CommandResult(True, "labels ensured", {"labels": desired, "missing": []})
+
+    def bootstrap_labels(self) -> CommandResult:
+        return self._ensure_labels_core()
+
+    def ensure_labels(self) -> CommandResult:
+        """Automatic startup label ensure (issue #1339).
+
+        Runs the same idempotent LabelConfig-derived ensure as
+        ``bootstrap_labels``, but records the outcome as an event so a
+        missing-label drift surfaces in ``events.db`` without an operator
+        having to run ``charlie bootstrap-labels`` by hand. Never raises:
+        any unexpected exception is recorded as an event and swallowed, so a
+        label-ensure failure can never block the supervisor/loop startup it
+        runs from.
+        """
+        try:
+            result = self._ensure_labels_core()
+        except Exception as exc:  # noqa: BLE001 — ensure must never block startup
+            # _ensure_labels_core itself does not raise, but a GitHub
+            # implementation that raises from label_create/label_list would
+            # otherwise crash the caller. Record and degrade to a failure
+            # result instead of propagating.
+            log_event(
+                self.paths.state_file,
+                "label_ensure_failed",
+                {"error": f"{type(exc).__name__}: {exc}", "labels": list(self.config.labels.all)},
+                repo=self.repo_root.name,
+                level="error",
+            )
+            return CommandResult(
+                False,
+                f"label ensure error: {exc}",
+                {"labels": list(self.config.labels.all), "missing": None},
+            )
+        missing = result.data.get("missing")
+        if result.ok:
+            log_event(
+                self.paths.state_file,
+                "label_ensure_ok",
+                {"labels": result.data.get("labels", []), "missing": []},
+                repo=self.repo_root.name,
+                level="info",
+            )
+        elif missing is None:
+            # Verification itself failed (e.g. label_list raised); the ensure
+            # could not be confirmed. Surface as an error event.
+            log_event(
+                self.paths.state_file,
+                "label_ensure_failed",
+                {"message": result.message, "labels": result.data.get("labels", [])},
+                repo=self.repo_root.name,
+                level="error",
+            )
+        else:
+            log_event(
+                self.paths.state_file,
+                "label_ensure_incomplete",
+                {"missing": missing, "message": result.message},
+                repo=self.repo_root.name,
+                level="warning",
+            )
+        return result
 
     @_guard_state_lock
     def intake(self) -> CommandResult:
@@ -23493,18 +23592,28 @@ class OrchestratorApp:
             "reviewDecision": pr.get("reviewDecision"),
         }
 
-    def _summarize_worker(self, view, health) -> dict[str, Any]:
+    def _summarize_worker(self, view, health, probe=None) -> dict[str, Any]:
         """Summarize a worker's state for the status() workers list.
 
         Args:
             view: WorkerView with worker state
             health: WorkerHealth enum value from classify_worker_health
+            probe: Optional ``RealActivityProbe`` from
+                ``real_activity_probe_for`` (the same corroboration probe the
+                watchdog consults). When supplied, the summary surfaces the
+                freshest corroborated activity timestamp/source and whether
+                that signal is fresh within ``watchdog.stall_minutes`` -- so an
+                alive-but-polling worker (stale sidecar log, fresh sessions.db
+                / per-PID log) is visibly distinguishable from a genuinely
+                stalled one (issue #1346). ``None`` keeps the legacy shape
+                (no corroboration fields) for callers that did not compute a
+                probe.
 
         Returns:
             Dict with worker summary fields for status() JSON output
         """
         from .claude_code import parse_claude_events
-        from .post_mortem import _events_path_from_log
+        from .post_mortem import RealActivityProbe, _events_path_from_log
 
         # Resolve repo_key: use view.repo_key if present, otherwise fall back to gh.name_with_owner()
         # This handles both fleet mode (repo_key populated by iter_workers) and single-repo mode
@@ -23540,6 +23649,23 @@ class OrchestratorApp:
         elif cost_usd is not None and self.config.watchdog.cost_budget_usd is not None:
             budget_remaining = max(0, self.config.watchdog.cost_budget_usd - cost_usd)
 
+        # Issue #1346: surface the watchdog's corroboration probe so an
+        # alive-but-polling worker (stale sidecar log mtime, fresh
+        # sessions.db / per-PID log / events.jsonl) is visibly distinguishable
+        # from a genuinely stalled one. The probe is the same object
+        # ``classify_worker_health`` consulted for ``health`` -- reusing it
+        # here means the displayed classification and the displayed
+        # corroboration come from one code path, never two. ``probe is None``
+        # keeps the legacy shape for callers that did not compute one.
+        corroboration_latest_at: str | None = None
+        corroboration_latest_source: str | None = None
+        corroboration_fresh: bool | None = None
+        if isinstance(probe, RealActivityProbe):
+            latest_ts = probe.latest_timestamp
+            corroboration_latest_at = latest_ts.isoformat() if latest_ts is not None else None
+            corroboration_latest_source = probe.latest_source
+            corroboration_fresh = probe.is_fresh(self.config.watchdog.stall_minutes)
+
         return {
             "repo": repo,
             "issue": view.issue_number,
@@ -23547,6 +23673,9 @@ class OrchestratorApp:
             "health": health.value,
             "runtime_seconds": view.runtime_seconds(),
             "last_activity_at": view.last_activity_at,
+            "last_corroborated_activity_at": corroboration_latest_at,
+            "last_corroborated_activity_source": corroboration_latest_source,
+            "corroboration_fresh": corroboration_fresh,
             "tool_calls": tool_calls,
             "tokens": tokens,
             "cost_usd": cost_usd,
