@@ -16367,6 +16367,39 @@ class OrchestratorApp:
             or str(pr.get("mergeStateStatus") or "").upper() == "DIRTY"
         )
 
+    def _rework_candidate_conflict_blocked(self, pr_data: dict[str, Any], pr_number: int) -> bool:
+        """Issue #1349: a patch-id-advanced head on a CONFLICTING/DIRTY PR is
+        still a legitimate launch candidate — the head advance did not resolve
+        the conflict the rework was requested for. Routing such a PR to
+        review() just bounces off the janitor gate's conflict check back to
+        rework_requested, deadlocking the issue between dispatch_rework and
+        review() forever (the only exit being the #765 stall escalation to a
+        human, not a dispatch).
+
+        Returns True when the candidate must be kept as a launch candidate
+        (conflict-bypass applies). Shared by the dry-run and live paths so the
+        two cannot drift.
+
+        ``pr_list``'s ``mergeable`` can be UNKNOWN (GitHub computes it
+        asynchronously); ``mergeStateStatus == "DIRTY"`` is reliable from
+        ``pr_list``, but a CONFLICTING reading may only appear on a fresh
+        ``pr_view``. When ``pr_list``'s signal is indeterminate (not a definite
+        MERGEABLE and not a definite CONFLICTING), re-check with a fresh
+        ``pr_view`` before routing to review so a persistently-conflicting PR
+        is not misrouted back into the deadlock. A failed ``pr_view`` returns
+        ``{}`` (production) which ``_is_merge_conflict`` reads as
+        not-conflicting, falling through to the review lane — the same
+        fail-closed behavior review() itself uses (issue #1349).
+        """
+        if self._is_merge_conflict(pr_data):
+            return True
+        live_mergeable = str(pr_data.get("mergeable") or "").upper()
+        if live_mergeable not in ("MERGEABLE", "CONFLICTING"):
+            fresh_pr = self.gh.pr_view(pr_number)
+            if fresh_pr and self._is_merge_conflict(fresh_pr):
+                return True
+        return False
+
     def _route_to_rework(
         self,
         pr: dict[str, Any],
@@ -20355,6 +20388,15 @@ class OrchestratorApp:
                 if live_patch_id == reviewed_patch_id:
                     dry_filtered_candidates.append(issue)
                     continue
+                # Issue #1349: a patch-id-advanced head on a CONFLICTING/DIRTY
+                # PR is still a legitimate launch candidate -- the head advance
+                # did not resolve the conflict the rework was requested for.
+                # Mirror the live path's conflict check (read-only here) via
+                # the shared helper so the dry-run report does not misreport
+                # these as routed_to_review.
+                if self._rework_candidate_conflict_blocked(pr_data, pr_number):
+                    dry_filtered_candidates.append(issue)
+                    continue
                 dry_routed_to_review.append(issue_number)
 
             dry_candidates = dry_filtered_candidates
@@ -20555,6 +20597,25 @@ class OrchestratorApp:
             if live_patch_id == reviewed_patch_id:
                 # Sync-merge only: the patch itself is unchanged, so the
                 # rework is still genuinely outstanding.
+                filtered_candidates.append(issue)
+                continue
+
+            # Issue #1349: a patch-id-advanced head does NOT mean the
+            # rework was already pushed when the PR is still
+            # CONFLICTING/DIRTY. The head advance was sync-merges (or
+            # conflict-laden merges) that changed the patch-id without
+            # resolving the conflict the rework was requested for --
+            # whatever was pushed since the last verdict did NOT resolve
+            # the conflict, so the rework is still outstanding. Routing
+            # such a PR to review() just bounces off the janitor gate's
+            # conflict check back to rework_requested, deadlocking the
+            # issue between dispatch_rework and review() forever (the
+            # only exit being the #765 stall escalation to a human, not a
+            # dispatch). Keep it as a legitimate launch candidate so a
+            # conflict-rework worker actually dispatches, subject to
+            # max_conflict_rework_attempts via the janitor gate on the
+            # next settled head change.
+            if self._rework_candidate_conflict_blocked(pr_data, pr_number):
                 filtered_candidates.append(issue)
                 continue
 
