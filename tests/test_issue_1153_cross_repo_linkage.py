@@ -61,7 +61,7 @@ from charlie_work.reconcile import apply_fixes, detect_drift
 from charlie_work.state import load_state, save_state
 from charlie_work.write_gate import WriteGate
 
-from test_reconcile import FakeGitHub, _issue, _pr
+from _reconcile_fixtures import FakeGitHub, _issue, _pr
 
 
 def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
@@ -464,7 +464,7 @@ def test_orphan_sweep_escalates_zero_artifact_loop(tmp_path: Path) -> None:
     ``dead_worker_no_open_pr_orphan_sweep``, relabeled, redispatched.
     """
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
-    from test_charlie_work import FakeGitHub as CWFakeGitHub
+    from _fakes_github import FakeGitHub as CWFakeGitHub
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
@@ -542,7 +542,7 @@ def test_orphan_sweep_relabels_when_not_zero_artifact_loop(tmp_path: Path) -> No
     orphan sweep must still relabel to ``automated-ready`` as before.
     """
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
-    from test_charlie_work import FakeGitHub as CWFakeGitHub
+    from _fakes_github import FakeGitHub as CWFakeGitHub
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),
