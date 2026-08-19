@@ -36278,6 +36278,118 @@ def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path
     assert workers[0]["health"] == "healthy"
 
 
+@pytest.mark.real_activity_probe_live
+def test_status_workers_surfaces_corroboration_alive_but_polling(tmp_path: Path) -> None:
+    """Issue #1346: an alive-but-polling worker (stale sidecar log mtime, fresh
+    events.jsonl corroboration) must be visibly distinguishable from a genuinely
+    stalled one (stale log AND stale corroboration) in the status()/roll-call
+    workers section.
+
+    Both workers share the same stale sidecar log mtime -- the only signal a
+    log-mtime monitor sees -- so pre-#1346 they printed identically. After
+    #1346 the workers section carries the watchdog's corroboration probe
+    verdict (``last_corroborated_activity_at`` / ``last_corroborated_activity_source``
+    / ``corroboration_fresh``) alongside ``health``, all derived from the same
+    ``real_activity_probe_for`` + ``classify_worker_health`` code path the
+    watchdog uses. The alive-but-polling worker reports ``health="healthy"`` +
+    ``corroboration_fresh=True``; the stalled worker reports
+    ``health="stalled"`` + ``corroboration_fresh=False``.
+
+    Marked ``real_activity_probe_live`` so the autouse stale-probe stub fixture
+    leaves ``real_activity_probe_for`` unstubbed and the real events.jsonl
+    source is exercised.
+    """
+    from datetime import timedelta
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="manual"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    old_time = datetime.now(UTC) - timedelta(minutes=30)
+    fresh_time = datetime.now(UTC) - timedelta(minutes=1)
+
+    def _plant_claude_worker(issue_number: int, *, fresh_corroboration: bool) -> None:
+        log_path = sessions_dir / f"issue-{issue_number}.claude.log"
+        log_path.write_text("Working on task...\nLast line", encoding="utf-8")
+        # Stale sidecar log mtime for BOTH workers -- this is the signal that
+        # log-mtime monitors cannot disambiguate.
+        os.utime(log_path, (time.time(), old_time.timestamp()))
+
+        events_path = sessions_dir / f"issue-{issue_number}.events.jsonl"
+        ts = fresh_time if fresh_corroboration else old_time
+        events_path.write_text(
+            f'{{"type": "tool_call", "timestamp": "{ts.isoformat()}"}}\n',
+            encoding="utf-8",
+        )
+        os.utime(events_path, (time.time(), ts.timestamp()))
+
+        sidecar_path = sessions_dir / f"issue-{issue_number}.claude.json"
+        sidecar_path.write_text(
+            json.dumps(
+                {
+                    "issue_number": issue_number,
+                    "branch": f"agent/issue-{issue_number}",
+                    "worktree_path": str(tmp_path / f"worktree-{issue_number}"),
+                    "prompt_path": str(tmp_path / "prompt.md"),
+                    "command": ["claude", "prompt.md"],
+                    "pid": 70000 + issue_number,
+                    "started_at": (datetime.now(UTC) - timedelta(minutes=10)).isoformat(),
+                    "log_path": str(log_path),
+                    "error": None,
+                    "failure_kind": None,
+                    "process_start_time": 1710000000.0,
+                    "reclaimed": None,
+                    # last_activity_at is the sidecar's stored log mtime -- the
+                    # stale signal a log-mtime monitor reads. Both workers
+                    # carry the same stale value so the only disambiguator is
+                    # the corroboration probe.
+                    "last_activity_at": old_time.isoformat(),
+                    "log_bytes": len("Working on task...\nLast line"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    # Worker 1346: alive-but-polling (stale log, fresh corroboration).
+    _plant_claude_worker(1346, fresh_corroboration=True)
+    # Worker 1347: genuinely stalled (stale log, stale corroboration).
+    _plant_claude_worker(1347, fresh_corroboration=False)
+
+    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+        result = app.status()
+
+    by_issue = {w["issue"]: w for w in result.data["workers"]}
+    assert set(by_issue) == {1346, 1347}
+
+    alive_polling = by_issue[1346]
+    # Acceptance criterion 1: visibly distinguishable. The stale log mtime is
+    # identical to the stalled worker's, but the corroboration fields differ.
+    assert alive_polling["health"] == "healthy"
+    assert alive_polling["corroboration_fresh"] is True
+    assert alive_polling["last_corroborated_activity_at"] is not None
+    assert alive_polling["last_corroborated_activity_source"] is not None
+
+    stalled = by_issue[1347]
+    # Acceptance criterion 3: stale-both classifies stalled.
+    assert stalled["health"] == "stalled"
+    assert stalled["corroboration_fresh"] is False
+
+    # The distinguishing signal: same stale last_activity_at (log mtime), but
+    # the corroboration fields diverge -- exactly the gap #1346 closes.
+    assert alive_polling["last_activity_at"] is not None
+    assert stalled["last_activity_at"] is not None
+    assert alive_polling["corroboration_fresh"] is not stalled["corroboration_fresh"]
+
+
 def test_status_workers_empty_when_no_live_sessions(tmp_path: Path) -> None:
     """Issue #167: workers section should be empty list when no live sessions exist."""
     config = OrchestratorConfig(
