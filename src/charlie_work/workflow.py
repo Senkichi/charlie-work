@@ -6839,6 +6839,23 @@ class OrchestratorApp:
                         ):
                             live_dispatched.add(issue_number)
                 issues_with_open_tracked_prs = set(pr_by_issue.keys())
+                # Issue #1336: lift the mention-only exclusion for re-armed
+                # issues (read-only detection for dry-run parity with the
+                # real dispatch path -- never stamps state).
+                _already_flagged_dry = {
+                    int(num)
+                    for num, entry in state.get("issues", {}).items()
+                    if isinstance(entry, dict) and entry.get("merged_pr_mention_flagged_at")
+                }
+                rearmed_mention_issues, _ = self._mention_rearmed_issue_numbers(
+                    merged_pr_mention_only_issue_numbers,
+                    issues,
+                    state,
+                    _already_flagged_dry,
+                )
+                merged_pr_issue_numbers = merged_pr_bound_issue_numbers | (
+                    merged_pr_mention_only_issue_numbers - rearmed_mention_issues
+                )
             candidates = [
                 issue
                 for issue in issues
@@ -6954,6 +6971,7 @@ class OrchestratorApp:
                 "merged_pr_mention_only_issue_numbers": sorted(
                     merged_pr_mention_only_issue_numbers
                 ),
+                "merged_pr_mention_rearmed_issue_numbers": sorted(rearmed_mention_issues),
                 "label_errors": [],
                 "cross_repo_escalated_issue_numbers": sorted(dry_run_cross_repo_escalated),
                 "sessions": [asdict(request) for request in session_requests],
@@ -7072,15 +7090,22 @@ class OrchestratorApp:
         # The simplest acceptable semantics per issue #564; pinned by
         # test_dispatch_merged_pr_mention_flag_is_one_shot.
         #
-        # Known limitation (issue #564 point 2, documented as out of scope):
-        # the mention-only *dispatch exclusion* still keys off the raw mention
-        # scan (merged_pr_issue_numbers below), not the label. So an operator
-        # who removes agent:human-needed to re-arm automation does NOT re-enter
-        # dispatch — the scan-based exclusion keeps blocking the issue until it
-        # closes or the mentioning PRs are no longer merged/referenced. Keying
-        # the exclusion off the label instead would let a deliberate operator
-        # requeue take effect, but it widens the blast radius (label-read
-        # dependency in the candidate filter) and is left for a follow-up.
+        # Issue #1336 follow-up to #564 point 2: the mention-only *dispatch
+        # exclusion* previously keyed off the raw mention scan
+        # (merged_pr_issue_numbers below) alone, so an operator who removed
+        # agent:human-needed to re-arm automation could NOT re-enter dispatch
+        # -- the scan-based exclusion kept blocking the issue until it closed
+        # or the mentioning PRs were no longer merged/referenced. The
+        # exclusion now lifts for an issue once it was flagged in a prior pass
+        # and the operator has removed agent:human-needed: the re-arm is
+        # detected from the already-loaded issue labels (no new per-pass API
+        # call) and recorded durably in state.json as ``mention_rearmed_at``,
+        # so the candidate filter keys the lift off the state signal rather
+        # than a per-pass label read -- the blast-radius concern the original
+        # comment raised. ``bound`` exclusions stay scan-based; the safe
+        # default (never-flagged or still-carries-human-needed stays
+        # excluded) is preserved. See ``_mention_rearmed_issue_numbers`` and
+        # the re-arm block inside the state lock below.
         # load_state_locked (not raw load_state) so the read holds the
         # advisory state lock — required by the invariant enforced in
         # test_no_unlocked_load_state_in_production_code. The authoritative
@@ -7202,6 +7227,44 @@ class OrchestratorApp:
                     state_path=self.paths.state_file,
                 )
                 save_state(self.paths.state_file, state)
+            # Issue #1336: lift the mention-only dispatch exclusion once the
+            # operator has re-armed a previously-flagged issue (removed
+            # agent:human-needed). The re-arm is recorded durably as
+            # ``mention_rearmed_at`` so the exclusion keys off a state.json
+            # signal rather than a per-pass GitHub label read in the
+            # candidate filter -- the blast-radius concern the #564 point-2
+            # comment raised when it documented this as out of scope.
+            #
+            # Safe default preserved: an issue never flagged, flagged this
+            # pass, or flagged and still carrying agent:human-needed stays
+            # excluded. ``bound`` exclusions are never lifted -- those PRs
+            # genuinely bound to the issue by a hijack-safe signal.
+            #
+            # The durable stamp + event emission is routed through
+            # ``_stamp_mention_rearm`` (Convention A: ``self.write_gate.*``)
+            # rather than raw ``append_event``/``save_state`` so the R9
+            # shrink-only ratchet on workflow.py's raw-primitive count
+            # (issue #1264 W6 PR4) is not increased -- the re-arm writes are
+            # new territory this wave does not convert, and a raw
+            # ``append_event``+``save_state`` pair would trip the ratchet
+            # (baseline 266). The existing flag block above stays raw (it is
+            # part of the ratchet's baseline); only the NEW re-arm writes go
+            # through the gate.
+            rearmed_mention_issues, newly_rearmed_mention_issues = (
+                self._mention_rearmed_issue_numbers(
+                    merged_pr_mention_only_issue_numbers,
+                    issues,
+                    state,
+                    already_flagged_mention_issues,
+                )
+            )
+            state = self._stamp_mention_rearm(state, newly_rearmed_mention_issues)
+            # Recompute the exclusion set so the candidate filter below and
+            # the result payload reflect the lifted mention-only exclusions.
+            # ``bound`` exclusions are never lifted.
+            merged_pr_issue_numbers = merged_pr_bound_issue_numbers | (
+                merged_pr_mention_only_issue_numbers - rearmed_mention_issues
+            )
             # Defence-in-depth against double-dispatch: an issue whose state records
             # a live launched worker (status "dispatched") or a fresh pending claim
             # (status "dispatch_pending" not yet stale) is not re-dispatchable even
@@ -7962,6 +8025,9 @@ class OrchestratorApp:
                     "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
                     "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
                     "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
+                    "merged_pr_mention_rearmed_issue_numbers": sorted(
+                        newly_rearmed_mention_issues
+                    ),
                     "failures": dispatch_failure_map,
                     # Issue #944: why zero, when it is zero. Every other field
                     # here describes issues the ready-filtered query returned;
@@ -8029,6 +8095,7 @@ class OrchestratorApp:
             "merged_pr_referenced_issue_numbers": sorted(merged_pr_issue_numbers),
             "merged_pr_closed_issue_numbers": sorted(closed_merged_pr_issues),
             "merged_pr_flagged_issue_numbers": sorted(newly_flagged_mention_issues),
+            "merged_pr_mention_rearmed_issue_numbers": sorted(newly_rearmed_mention_issues),
             "label_errors": sorted(label_errors),
             "session_manifest": str(manifest_path),
             "session_results": str(results_path),
@@ -9424,12 +9491,15 @@ class OrchestratorApp:
                 },
             )
 
-        # Single read of review-decision.json, BEFORE rendering: reused both to
-        # build the round-2 $prior_review_section below and, after rendering,
-        # by the stale-verdict reset a few lines down. Previously that reset
-        # was the only reader, and it ran after the prompt was already
-        # rendered — so a prior round's verdict/summary/required_changes were
-        # on disk at render time but never surfaced to the reviewer.
+        # Single read of review-decision.json, BEFORE rendering: used to build
+        # the round-2 $prior_review_section below. The stale-verdict reset a
+        # few lines down re-reads the file inside the state lock (issue #1340:
+        # the outside-lock read here may be stale w.r.t. a concurrent
+        # record_review, and the reset write must be atomic with the state
+        # write). Previously that reset was the only reader, and it ran after
+        # the prompt was already rendered — so a prior round's
+        # verdict/summary/required_changes were on disk at render time but
+        # never surfaced to the reviewer.
         existing_decision = self._review_decision(pr_number)
         prior_reviewed_head_sha = existing_decision.get("reviewed_head_sha")
         # Issue #632 defect 3: a terminal verdict on disk must reach the
@@ -9486,20 +9556,6 @@ class OrchestratorApp:
             # entirely looks identical to one that never considered it).
             "verdict_provenance": None,
         }
-        if not decision_path.exists():
-            self._write_json(decision_path, decision_template)
-        else:
-            # A verdict is pinned to a specific head. If the PR has moved on,
-            # the old verdict is void and must not survive into the new packet.
-            # This applies to all terminal decisions (approved, request_changes,
-            # blocked), not just approvals: a request_changes on an old head is
-            # equally stale when the head has advanced, and carrying forward its
-            # summary/required_changes misleads the reviewer into re-issuing the
-            # same verdict without examining the new diff.
-            if existing_decision.get("decision") not in ("pending", None) and (
-                prior_reviewed_head_sha is None or prior_reviewed_head_sha != pr.get("headRefOid")
-            ):
-                self._write_json(decision_path, decision_template)
         # Issue #868: review_dispatch.enabled gates whether landing this PR in
         # "reviewing" is safe. Disabled means dispatch_reviews()'s launch+reap
         # machinery never services this state (its own internal gate skips
@@ -9510,6 +9566,45 @@ class OrchestratorApp:
         dispatch_disabled = not self.config.review_dispatch.enabled
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
+            # Issue #1340: the pending-reset decision-file write is inside the
+            # state lock, and when a stale-head terminal verdict is voided the
+            # state.json ``decision`` field is cleared in the same locked
+            # section, so the file and state can never diverge (file "pending"
+            # while state carries the stale decision).
+            # The ``existing_decision`` read at line ~9429 was outside any lock
+            # and may be stale w.r.t. a concurrent record_review; re-read the
+            # on-disk decision here, inside the lock. The #1036 compare-and-swap
+            # above already proved the PR head is stable, so the only concurrent
+            # writer of this file is record_review, which holds this same lock.
+            live_decision = self._review_decision(pr_number)
+            live_decision_value = live_decision.get("decision")
+            live_reviewed_head_sha = live_decision.get("reviewed_head_sha")
+            # A verdict is pinned to a specific head. If the PR has moved on,
+            # the old verdict is void and must not survive into the new packet.
+            # This applies to all terminal decisions (approved, request_changes,
+            # blocked), not just approvals: a request_changes on an old head is
+            # equally stale when the head has advanced, and carrying forward its
+            # summary/required_changes misleads the reviewer into re-issuing the
+            # same verdict without examining the new diff.
+            #
+            # Only a real terminal decision (approved/request_changes/blocked)
+            # on disk can be voided. ``_review_decision`` returns
+            # ``{"decision": "missing"}`` when the file does not exist and
+            # ``{"decision": "invalid"}`` on a corrupt read; neither is a
+            # terminal verdict, so neither triggers the void path -- the
+            # fresh-template write below handles the missing-file case, and
+            # an invalid file is left for a human rather than silently
+            # overwritten (mirroring the original code's ``else`` branch,
+            # which only reset on a real terminal decision).
+            voided_stale_verdict = live_decision_value in (
+                "approved",
+                "request_changes",
+                "blocked",
+            ) and (
+                live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            if not decision_path.exists() or voided_stale_verdict:
+                self._write_json(decision_path, decision_template)
             # Merge-update, never replace: wholesale assignment here used to erase
             # recorded review decisions on repeated review()/loop() passes
             # (production-confirmed, pr-497).
@@ -9520,6 +9615,18 @@ class OrchestratorApp:
                 "issue_number": issue_number,
                 "prompt_path": str(prompt_path),
                 "decision_path": str(decision_path),
+                # Issue #1340: when the decision file was just voided back to
+                # "pending" (stale head), mirror that into state.json so the two
+                # stores agree on the decision. Without this, state.json
+                # retained the stale ``decision`` while the file said
+                # "pending" -- a file-trusting consumer (the packet-current skip
+                # in loop()) saw "pending" while state-trusting paths acted on
+                # the stale verdict. ``reviewed_head_sha`` is intentionally
+                # NOT cleared: ``_route_rework_candidate_to_review`` uses it
+                # to detect whether ``review()`` recorded a new decision vs.
+                # just wrote a fresh pending packet, and clearing it would
+                # break that detection (issue #339).
+                **({"decision": "pending"} if voided_stale_verdict else {}),
                 **({} if dispatch_disabled else {"status": "reviewing"}),
                 "janitor_ok": True,
                 "janitor_failures": [],
@@ -10161,6 +10268,12 @@ class OrchestratorApp:
                 required_changes=verdict["required_changes"],
                 session_metrics=session_metrics,
                 verdict_provenance="fresh_llm_review",
+                # Issue #1340: thread the parser-level provenance into the
+                # decision file so a later reader can distinguish a
+                # log-extracted verdict (dead reviewer) from a clean
+                # structured completion. ``verdict_source`` is the same value
+                # already threaded into ``session_metrics`` above.
+                verdict_source=verdict_source,
             )
             if result.ok:
                 recorded.append(
@@ -11932,6 +12045,7 @@ class OrchestratorApp:
         *,
         verdict_provenance: str,
         allow_stale_head: bool = False,
+        verdict_source: str | None = None,
     ) -> CommandResult:
         if decision not in {"approved", "request_changes", "blocked"}:
             return CommandResult(
@@ -12274,6 +12388,18 @@ class OrchestratorApp:
         # ``since`` to recover -- it falls back to ``reviewed_at``).
         if ingestion_before is not None:
             decision_payload["before"] = ingestion_before
+        # Issue #1340: persist the parser-level provenance (which extractor
+        # found the verdict block: "log", "events", "file:<source>") into the
+        # decision file so a later reader can distinguish a log-extracted
+        # verdict (the reviewer process died before emitting a structured
+        # result) from a clean structured completion. Distinct from
+        # ``verdict_provenance`` (the mechanism that produced the verdict --
+        # "fresh_llm_review", "ci_gate_auto_reject", ...). Only present when a
+        # caller supplied it; the reap path threads ``session_metrics``'s
+        # ``verdict_source`` here, while direct operator/CI-gate callers leave
+        # it absent (no parser was involved).
+        if verdict_source is not None:
+            decision_payload["verdict_source"] = verdict_source
         decision_path = pr_dir / "review-decision.json"
         # Issue #1268 (W11): per-round archive directory. ``round_number`` is
         # declared here (rather than inside the lock below) so it survives
@@ -21154,6 +21280,108 @@ class OrchestratorApp:
                         mention_only.add(mentioned)
         mention_only -= bound
         return bound, mention_only, bound_pr_numbers
+
+    def _mention_rearmed_issue_numbers(
+        self,
+        mention_only: set[int],
+        issues: list[dict[str, Any]],
+        state: dict[str, Any],
+        already_flagged: set[int],
+    ) -> tuple[set[int], list[int]]:
+        """Issue #1336: which mention-only issues have been re-armed by the
+        operator and so must NOT be excluded from dispatch.
+
+        Returns ``(rearmed, newly_detected)``:
+
+        * ``rearmed`` -- the full set whose mention-only exclusion lifts
+          (issues carrying the durable ``mention_rearmed_at`` marker plus
+          issues whose re-arm is detected this pass).
+        * ``newly_detected`` -- the subset of ``rearmed`` the caller should
+          persist by stamping ``mention_rearmed_at``. Empty for the dry-run
+          path, which never writes state.
+
+        An issue lifts its mention-only exclusion only when it was flagged
+        in a PRIOR pass (``already_flagged``) AND either the durable
+        ``mention_rearmed_at`` marker is already set, or the operator has
+        since removed ``agent:human-needed``. The label is read from the
+        already-loaded ``issues`` objects (no new per-pass GitHub API call
+        in the candidate filter -- the blast-radius concern the #564
+        point-2 comment raised when it documented this as out of scope);
+        the durable marker written by the caller means subsequent passes
+        key the lift off the state signal alone.
+
+        Safe default preserved (#564 / acceptance criterion 2): an issue
+        never flagged, flagged this pass, or flagged and still carrying
+        ``agent:human-needed`` stays excluded. ``bound`` exclusions are
+        never lifted here -- those PRs genuinely bound to the issue by a
+        hijack-safe signal.
+        """
+        issue_labels_by_number = {int(issue["number"]): label_names(issue) for issue in issues}
+        rearmed: set[int] = set()
+        newly_detected: list[int] = []
+        for issue_number in mention_only:
+            # Only issues flagged in a PRIOR pass can be re-armed. Issues
+            # flagged this pass just had agent:human-needed applied and
+            # must stay excluded; never-flagged issues have no flag to
+            # re-arm through.
+            if issue_number not in already_flagged:
+                continue
+            entry = state.get("issues", {}).get(str(issue_number), {})
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("mention_rearmed_at"):
+                # Durable re-arm marker from a prior pass -- the lift stays.
+                rearmed.add(issue_number)
+                continue
+            # Flagged before, not yet recorded as re-armed: detect the
+            # operator's agent:human-needed removal from the already-loaded
+            # issue labels. The caller stamps mention_rearmed_at so future
+            # passes key off state, not the label snapshot.
+            if self.config.labels.human_needed not in issue_labels_by_number.get(
+                issue_number, set()
+            ):
+                rearmed.add(issue_number)
+                newly_detected.append(issue_number)
+        return rearmed, newly_detected
+
+    def _stamp_mention_rearm(
+        self,
+        state: dict[str, Any],
+        newly_rearmed: list[int],
+    ) -> dict[str, Any]:
+        """Issue #1336: durably stamp ``mention_rearmed_at`` and emit the
+        ``dispatch_merged_pr_mention_rearmed`` event for issues the operator
+        re-armed this pass.
+
+        Routed through WriteGate (Convention A: ``self.write_gate.*``) so the
+        R9 shrink-only ratchet on workflow.py's raw-primitive count (issue
+        #1264 W6 PR4) is not increased -- the re-arm writes are new territory
+        this wave does not convert, and a raw ``append_event``/``save_state``
+        pair would trip the ratchet (baseline 266). The existing flag block in
+        ``_dispatch_impl`` stays raw (it is part of the ratchet's baseline);
+        only the NEW re-arm writes go through the gate.
+
+        Returns ``state`` (possibly updated by ``append_event``). In dry-run
+        mode the gate no-ops and ``state`` is returned unchanged -- but this
+        method is only called from the non-dry-run dispatch path (the dry-run
+        early return precedes it), so the dry-run no-op is defence-in-depth.
+        """
+        for issue_number in newly_rearmed:
+            _ra_key = str(issue_number)
+            _ra_entry = state["issues"].get(_ra_key, {})
+            state["issues"][_ra_key] = {
+                **_ra_entry,
+                "number": issue_number,
+                "mention_rearmed_at": utc_now(),
+            }
+        if newly_rearmed:
+            state = self.write_gate.append_event(
+                state,
+                "dispatch_merged_pr_mention_rearmed",
+                {"issue_numbers": sorted(newly_rearmed)},
+            )
+            self.write_gate.save_state(state)
+        return state
 
     def _is_dispatchable(
         self,
