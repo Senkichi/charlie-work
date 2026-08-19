@@ -1054,6 +1054,69 @@ def detect_drift(
                     )
                 )
 
+            # Issue #1153: a same-repo PR whose closing-keyword reference
+            # resolves to an issue number that does not exist in this repo
+            # (e.g. ``Closes #1497`` where 1497 is a sibling repo's issue)
+            # is invisible to every issue-driven sweep: ``linked_issue_number``
+            # returned a number, so the PR was added to
+            # ``open_prs_by_issue[issue_number]``, but ``issues_by_number``
+            # has no entry for it -- no issue-side normalization, no review
+            # routing, no merge lane ever sees it. The PR silently becomes
+            # ``open_passive`` (if tracked) or is simply never tracked at
+            # all. A resolution failure is a signal, not an absence: surface
+            # it as a distinct drift item so the ``reconcile`` event makes
+            # the cross-repo linkage failure visible to operators and the
+            # janitor, instead of silently demoting the PR to passive.
+            #
+            # Self-healing (mirrors every sibling drift kind in this loop):
+            # once ``apply_fixes`` has tracked this PR in state with the
+            # cross-repo ``issue_number`` (from a prior reconcile pass), the
+            # linkage failure is already surfaced -- the ``reconcile`` event
+            # was emitted and the PR is visible to future sweeps. Skip
+            # re-emitting so this drift kind does not re-fire on every pass
+            # for as long as the PR stays open, which would unboundedly
+            # duplicate ``reconcile`` events in the capped events ring and
+            # ``events.db``. ``pr_status_normalized`` below self-heals the
+            # same way (skips once ``state_entry["status"]`` is no longer
+            # None); ``closed_unmerged_pr_state_converged`` above self-heals
+            # by skipping once status is ``"closed"``.
+            #
+            # The self-heal checks ``issue_number`` only, not ``status``:
+            # ``apply_fixes`` deliberately does NOT escalate (see the
+            # ``apply_fixes`` branch for this kind), because escalating
+            # would pre-empt the existing ``foreign_issue_ref`` parking
+            # mechanism in the per-PR review loop (``review()`` treats
+            # ``status="escalated"`` as terminal and returns early, so
+            # ``issue_view`` is never called and the one-shot foreign-PR
+            # digest is never emitted). Tracking the PR with the cross-repo
+            # ``issue_number`` alone is sufficient for self-healing and
+            # preserves the existing parking and alerting path.
+            if (
+                issue_number is not None
+                and issues_by_number.get(issue_number) is None
+                and not (
+                    isinstance(state_entry, dict)
+                    and state_entry.get("issue_number") == issue_number
+                )
+            ):
+                drift.append(
+                    DriftItem(
+                        kind="pr_linked_issue_not_in_repo",
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        detail=(
+                            f"PR #{pr_number} has closing reference to issue "
+                            f"#{issue_number}, but no such issue exists in this "
+                            f"repo; the reference likely targets a sibling repo "
+                            f"(cross-repo linkage failure, issue #1153)"
+                        ),
+                        fix_actions=(
+                            f"surface cross-repo linkage failure for PR #{pr_number} "
+                            f"(closing ref issue #{issue_number} not in this repo)",
+                        ),
+                    )
+                )
+
     pr_numbers_on_github = {int(pr["number"]) for pr in prs if pr.get("number") is not None}
     for pr_number_str in state_prs:
         try:
@@ -2395,6 +2458,37 @@ def apply_fixes(
                 pr_key = str(item.pr_number)
                 existing_pr = new_prs.get(pr_key, {})
                 new_prs[pr_key] = {**existing_pr, "status": item.new_status}
+
+        elif item.kind == "pr_linked_issue_not_in_repo":
+            # Issue #1153: a PR whose closing reference targets an issue that
+            # does not exist in this repo (cross-repo linkage failure). Track
+            # the PR in state with the cross-repo ``issue_number`` so it is
+            # visible to future reconcile sweeps and the drift self-heals
+            # (does not re-fire once the PR is tracked with the matching
+            # ``issue_number``). The ``reconcile`` event emitted below (every
+            # drift item gets one) is the visible signal -- it surfaces the
+            # cross-repo linkage failure to operators and the janitor.
+            #
+            # This does NOT set ``status="escalated"`` because the existing
+            # ``foreign_issue_ref`` parking mechanism in the per-PR review
+            # loop (``_mark_foreign_issue_ref``) already handles parking and
+            # one-shot digest alerting when ``issue_view`` raises
+            # ``GitHubNotFoundError``. Escalating here would pre-empt that
+            # mechanism: ``review()`` treats ``status="escalated"`` as
+            # terminal and returns early, so ``issue_view`` is never called,
+            # the ``GitHubNotFoundError`` handler never fires, and the
+            # foreign-PR digest is never emitted. It would also break the
+            # ``dispatch_reviews`` lane, which skips escalated PRs. Tracking
+            # the PR with ``issue_number`` alone preserves both the existing
+            # parking/alerting path and the review-dispatch path while adding
+            # reconcile visibility -- the blind spot issue #1153 describes.
+            if item.pr_number is not None:
+                pr_key = str(item.pr_number)
+                existing_pr = new_prs.get(pr_key, {})
+                pr_entry = {**existing_pr, "number": item.pr_number}
+                if item.issue_number is not None:
+                    pr_entry["issue_number"] = item.issue_number
+                new_prs[pr_key] = pr_entry
 
         elif item.kind == "state_active_status_issue_closed":
             # Issue #259: finalize the state entry and strip any active labels that

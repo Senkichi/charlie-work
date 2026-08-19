@@ -93,10 +93,17 @@ class FakeApp:
         )
         self._results = list(results)
         self._call_count = 0
+        # Issue #1339: records ensure_labels() invocations so a test can assert
+        # the supervisor runs the startup label ensure exactly once.
+        self.ensure_labels_calls = 0
 
     def _resolve(self, path_str: str) -> Path:
         """Resolve a config path string — returns sessions_dir for any input."""
         return self._sessions_dir
+
+    def ensure_labels(self) -> CommandResult:
+        self.ensure_labels_calls += 1
+        return CommandResult(True, "labels ensured", {"labels": [], "missing": []})
 
     def loop(self, limit: Any = None, *, merge: Any = None) -> CommandResult:
         if self._call_count < len(self._results):
@@ -560,6 +567,37 @@ def test_pass_summary_reports_warnings_count(tmp_path: Path, capsys: Any) -> Non
 # ---------------------------------------------------------------------------
 # run_supervised tests
 # ---------------------------------------------------------------------------
+
+
+def test_run_supervised_ensures_labels_once_at_startup(tmp_path: Path) -> None:
+    """Issue #1339: run_supervised runs the LabelConfig-derived label ensure
+    exactly once at startup (not per pass), so a new LabelConfig field
+    converges to its label with no operator action.
+    """
+    app = FakeApp(tmp_path, [_drained_result(), _drained_result()])
+    fc = FakeClock()
+    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=2)
+
+    assert app.ensure_labels_calls == 1
+
+
+def test_run_supervised_ensure_labels_failure_does_not_block(tmp_path: Path) -> None:
+    """Issue #1339 AC #2: a label-ensure failure must not block the supervisor."""
+    app = FakeApp(tmp_path, [_drained_result()])
+    ensure_calls: list[int] = []
+
+    def _raising_ensure() -> CommandResult:
+        ensure_calls.append(1)
+        raise RuntimeError("boom")
+
+    app.ensure_labels = _raising_ensure  # type: ignore[assignment]
+    fc = FakeClock()
+
+    # Must not raise; the supervisor proceeds to its loop.
+    result = run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    assert result.ok is True
+    # The ensure was actually invoked (not skipped), and its failure was caught.
+    assert ensure_calls == [1], ensure_calls
 
 
 def test_run_supervised_exits_when_drained_first_pass(tmp_path: Path) -> None:

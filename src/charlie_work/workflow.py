@@ -1902,6 +1902,46 @@ def sink_census(state: dict[str, Any]) -> set[int]:
     return parked
 
 
+# Issue #1153: minimum number of zero-artifact attempts (all ``ahead_of_main
+# == 0``) in a post-mortem sidecar before the orphan sweep escalates instead
+# of relabeling to ``automated-ready`` for another redispatch. The first
+# zero-artifact attempt is the initial dispatch; the second is the first
+# redispatch. Escalating before the *second* redispatch (the third attempt
+# overall) means the threshold is 2: two attempts have already produced zero
+# artifacts, so a third would almost certainly do the same.
+_ZERO_ARTIFACT_ESCALATION_THRESHOLD = 2
+
+
+def _is_zero_artifact_dispatch_loop(sessions_dir: Path, issue_number: int) -> bool:
+    """Return True when prior dispatch attempts all produced zero artifacts.
+
+    Issue #1153: an issue whose post-mortem sidecar records ``>= 2`` attempts
+    where *every* attempt's ``ahead_of_main`` is ``0`` is in a zero-artifact
+    dispatch loop -- each worker session ran, produced no commits ahead of
+    the base ref, and was swept as a dead worker with no open PR. The
+    post-mortem file already contains exactly the signal needed
+    (``attempts[].ahead_of_main == 0`` repeated); this helper reads it so the
+    orphan sweep can escalate to ``agent:human-needed`` instead of relabeling
+    to ``automated-ready`` for yet another fruitless redispatch.
+
+    Returns ``False`` when there is no sidecar, fewer than the threshold
+    number of attempts, any attempt has a non-zero ``ahead_of_main``, or any
+    attempt's ``ahead_of_main`` is ``None`` (unknown -- cannot confirm
+    zero-artifact, so do not escalate on ambiguous evidence).
+    """
+    from .post_mortem import read_post_mortem
+
+    record = read_post_mortem(sessions_dir, issue_number)
+    if record is None:
+        return False
+    if len(record.attempts) < _ZERO_ARTIFACT_ESCALATION_THRESHOLD:
+        return False
+    # Every attempt must have a confirmed ahead_of_main == 0. An attempt
+    # with ahead_of_main == None is ambiguous (the count could not be
+    # computed) -- do not escalate on ambiguous evidence.
+    return all(attempt.ahead_of_main == 0 for attempt in record.attempts)
+
+
 def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
@@ -1997,6 +2037,12 @@ def _detect_and_handle_orphaned_workers(
     # have accumulated in state.json over time.
     no_pr_orphans = [n for n in orphaned_issues if n not in pr_by_issue]
     reclaim_results: dict[int, dict[str, Any]] = {}
+    # Issue #1153: issues escalated to ``agent:human-needed`` by the
+    # zero-artifact dispatch loop guard, instead of being relabeled to
+    # ``automated-ready`` for another fruitless redispatch. Keyed by issue
+    # number; each value carries the label-write outcome and the attempt
+    # count that triggered the escalation.
+    zero_artifact_escalations: dict[int, dict[str, Any]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
@@ -2025,6 +2071,30 @@ def _detect_and_handle_orphaned_workers(
             # fall through here without any GitHub call).
             if not active_labels:
                 continue
+
+            # Issue #1153: before relabeling to ``automated-ready`` for
+            # another redispatch, check whether prior attempts all produced
+            # zero artifacts (``ahead_of_main == 0``). A repeated
+            # zero-artifact dispatch loop means each worker session ran,
+            # determined the fix belongs in a sibling repo, hopped to its
+            # worktree, did the work there, and exited with ``ahead_of_main:
+            # 0`` in *this* repo's tree -- swept as a dead worker with no
+            # open PR, relabeled, redispatched, forever. Escalate to
+            # ``agent:human-needed`` instead of burning another dispatch.
+            if _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
+                label_write_ok = True
+                for label in sorted(active_labels):
+                    if not gh.remove_issue_label(issue_number, label):
+                        label_write_ok = False
+                if config.labels.human_needed not in issue_labels:
+                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
+                        label_write_ok = False
+                zero_artifact_escalations[issue_number] = {
+                    "removed_labels": sorted(active_labels),
+                    "label_write_ok": label_write_ok,
+                }
+                continue
+
             needs_ready = config.labels.ready not in issue_labels
             label_write_ok = True
             for label in sorted(active_labels):
@@ -2796,6 +2866,43 @@ def _detect_and_handle_orphaned_workers(
                         )
                     )
                     state["issues"][str(issue_number)] = entry
+                    continue
+
+                # Issue #1153: check whether this issue was escalated to
+                # ``agent:human-needed`` by the zero-artifact dispatch loop
+                # guard (computed above, outside the state lock). If so,
+                # record the escalation in state and emit a visible event --
+                # do NOT fall through to the reclaim path (which would
+                # re-add ``automated-ready`` and trigger another fruitless
+                # redispatch).
+                escalation = zero_artifact_escalations.get(issue_number)
+                if escalation is not None:
+                    # Route through ``_escalate_issue`` so the paired
+                    # ``escalation_reason`` / ``reason_class`` /
+                    # ``terminal_since`` fields are written atomically and
+                    # the #750 structural guard (status="escalated" only
+                    # inside the helper) continues to hold.
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="zero_artifact_dispatch_loop",
+                        reason_class="mechanical",
+                    )
+                    escalated_entry = state["issues"][str(issue_number)]
+                    escalated_entry["orphan_flagged_at"] = utc_now()
+                    state["issues"][str(issue_number)] = escalated_entry
+                    sweep_events.append(
+                        (
+                            "session_failed_escalated",
+                            _session_failed_relabeled_payload(
+                                issue_number=issue_number,
+                                reason="zero_artifact_dispatch_loop",
+                                removed_labels=escalation["removed_labels"],
+                                added_ready=False,
+                                label_write_ok=escalation["label_write_ok"],
+                            ),
+                        )
+                    )
                     continue
 
                 # Issue #1243: per-issue redispatch cap with stall detection.
@@ -5888,7 +5995,11 @@ class OrchestratorApp:
                 continue
             probe = real_activity_probe_for(view, self.config, now)
             workers.append(
-                self._summarize_worker(view, classify_worker_health(view, self.config, now, probe))
+                self._summarize_worker(
+                    view,
+                    classify_worker_health(view, self.config, now, probe),
+                    probe=probe,
+                )
             )
 
         # Observe runner pool if feature is enabled
@@ -6042,35 +6153,70 @@ class OrchestratorApp:
             },
         )
 
-    def bootstrap_labels(self) -> CommandResult:
-        descriptions = {
-            self.config.labels.ready: "Issue is ready for deterministic agentic automation.",
-            self.config.labels.queued: "Issue is queued by the orchestrator.",
-            self.config.labels.in_progress: "A worker is implementing this issue.",
-            self.config.labels.pr_open: "A worker PR exists for this issue.",
-            self.config.labels.reviewing: "The orchestrator is adversarially reviewing the worker PR.",
-            self.config.labels.needs_rework: "The worker PR needs another implementation cycle.",
-            self.config.labels.blocked: "Automation is blocked and needs intervention.",
-            self.config.labels.done: "Automation completed and the issue was merged or resolved.",
-            self.config.labels.human_needed: "A human product or security decision is needed.",
-            self.config.labels.operator_queue: "A mechanical failure exhausted its automated retries; needs operator triage.",
-            self.config.labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
-            self.config.labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
-            self.config.labels.complexity_high: (
+    def _label_descriptions(self) -> dict[str, str]:
+        """Human-readable description for every LabelConfig-derived label.
+
+        Single source for the descriptions used by both the explicit
+        ``charlie bootstrap-labels`` command and the automatic startup
+        ensure (issue #1339). Keyed by the resolved label string from
+        ``self.config.labels``, never a hard-coded literal.
+        """
+        labels = self.config.labels
+        return {
+            labels.ready: "Issue is ready for deterministic agentic automation.",
+            labels.queued: "Issue is queued by the orchestrator.",
+            labels.in_progress: "A worker is implementing this issue.",
+            labels.pr_open: "A worker PR exists for this issue.",
+            labels.reviewing: "The orchestrator is adversarially reviewing the worker PR.",
+            labels.needs_rework: "The worker PR needs another implementation cycle.",
+            labels.blocked: "Automation is blocked and needs intervention.",
+            labels.done: "Automation completed and the issue was merged or resolved.",
+            labels.human_needed: "A human product or security decision is needed.",
+            labels.operator_queue: "A mechanical failure exhausted its automated retries; needs operator triage.",
+            labels.prose_only_deps: "Issue has prose-only dependencies that need structured blocker declarations.",
+            labels.merge_hold: "Approved PR is held out of the merge queue by operator request.",
+            labels.complexity_high: (
                 "Routing hint: route to the api worker (multi-module, "
                 "cross-cutting invariant, or prior escalation)."
             ),
         }
-        for label in self.config.labels.all:
-            # The ready marker is green; the complexity routing hint gets a
-            # distinct amber so it is visually separable from workflow state.
-            if label == self.config.labels.ready:
-                color = "0E8A16"
-            elif label == self.config.labels.complexity_high:
-                color = "BFD4F2"
-            else:
-                color = "5319E7"
-            self.gh.label_create(label, color, descriptions[label])
+
+    def _label_color(self, label: str) -> str:
+        """Color for a label, derived from LabelConfig fields (no hard-coded names)."""
+        labels = self.config.labels
+        # The ready marker is green; the complexity routing hint gets a
+        # distinct amber so it is visually separable from workflow state.
+        if label == labels.ready:
+            return "0E8A16"
+        if label == labels.complexity_high:
+            return "BFD4F2"
+        return "5319E7"
+
+    def _ensure_labels_core(self) -> CommandResult:
+        """Idempotent ensure of every LabelConfig-derived label on the repo.
+
+        Creates/updates each label in ``self.config.labels.all`` via
+        ``gh.label_create`` (``--force`` → update-or-create, so colour and
+        description drift is repaired on existing labels too), then verifies
+        via ``gh.label_list``. The ensure set is derived entirely from
+        ``LabelConfig`` fields — never a hard-coded list — so a new field
+        ships its label with no extra wiring (issue #1339).
+
+        Returns a ``CommandResult`` and never raises: a ``GitHubError`` from
+        verification is reported in the result, not propagated. The CLI
+        ``bootstrap-labels`` command and the automatic startup ensure both
+        route through here.
+        """
+        labels = self.config.labels
+        desired = list(labels.all)
+        descriptions = self._label_descriptions()
+        for label in desired:
+            # A brand-new LabelConfig field may ship before its entry in
+            # ``_label_descriptions`` is added; fall back to a generic
+            # description so the label is still created (issue #1339 AC #3).
+            # Never block the ensure on a missing description.
+            description = descriptions.get(label, "Orchestrator-managed label.")
+            self.gh.label_create(label, self._label_color(label), description)
         # Verify: check which labels actually exist after creation attempts.
         # label_create uses allow_failure=True, so silent failures are possible
         # (e.g. no auth, wrong repo). Don't report success we can't vouch for.
@@ -6080,22 +6226,82 @@ class OrchestratorApp:
                 for item in self.gh.label_list()
                 if isinstance(item, dict)
             }
-            missing = [name for name in self.config.labels.all if name not in live]
+            missing = [name for name in desired if name not in live]
         except GitHubError as exc:
             return CommandResult(
                 False,
                 f"labels created but verification failed: {exc}",
-                {"labels": self.config.labels.all, "missing": None},
+                {"labels": desired, "missing": None},
             )
         if missing:
             return CommandResult(
                 False,
                 f"bootstrap incomplete — {len(missing)} label(s) still missing: {missing}",
-                {"labels": self.config.labels.all, "missing": missing},
+                {"labels": desired, "missing": missing},
             )
-        return CommandResult(
-            True, "labels ensured", {"labels": self.config.labels.all, "missing": []}
-        )
+        return CommandResult(True, "labels ensured", {"labels": desired, "missing": []})
+
+    def bootstrap_labels(self) -> CommandResult:
+        return self._ensure_labels_core()
+
+    def ensure_labels(self) -> CommandResult:
+        """Automatic startup label ensure (issue #1339).
+
+        Runs the same idempotent LabelConfig-derived ensure as
+        ``bootstrap_labels``, but records the outcome as an event so a
+        missing-label drift surfaces in ``events.db`` without an operator
+        having to run ``charlie bootstrap-labels`` by hand. Never raises:
+        any unexpected exception is recorded as an event and swallowed, so a
+        label-ensure failure can never block the supervisor/loop startup it
+        runs from.
+        """
+        try:
+            result = self._ensure_labels_core()
+        except Exception as exc:  # noqa: BLE001 — ensure must never block startup
+            # _ensure_labels_core itself does not raise, but a GitHub
+            # implementation that raises from label_create/label_list would
+            # otherwise crash the caller. Record and degrade to a failure
+            # result instead of propagating.
+            log_event(
+                self.paths.state_file,
+                "label_ensure_failed",
+                {"error": f"{type(exc).__name__}: {exc}", "labels": list(self.config.labels.all)},
+                repo=self.repo_root.name,
+                level="error",
+            )
+            return CommandResult(
+                False,
+                f"label ensure error: {exc}",
+                {"labels": list(self.config.labels.all), "missing": None},
+            )
+        missing = result.data.get("missing")
+        if result.ok:
+            log_event(
+                self.paths.state_file,
+                "label_ensure_ok",
+                {"labels": result.data.get("labels", []), "missing": []},
+                repo=self.repo_root.name,
+                level="info",
+            )
+        elif missing is None:
+            # Verification itself failed (e.g. label_list raised); the ensure
+            # could not be confirmed. Surface as an error event.
+            log_event(
+                self.paths.state_file,
+                "label_ensure_failed",
+                {"message": result.message, "labels": result.data.get("labels", [])},
+                repo=self.repo_root.name,
+                level="error",
+            )
+        else:
+            log_event(
+                self.paths.state_file,
+                "label_ensure_incomplete",
+                {"missing": missing, "message": result.message},
+                repo=self.repo_root.name,
+                level="warning",
+            )
+        return result
 
     @_guard_state_lock
     def intake(self) -> CommandResult:
@@ -23447,18 +23653,28 @@ class OrchestratorApp:
             "reviewDecision": pr.get("reviewDecision"),
         }
 
-    def _summarize_worker(self, view, health) -> dict[str, Any]:
+    def _summarize_worker(self, view, health, probe=None) -> dict[str, Any]:
         """Summarize a worker's state for the status() workers list.
 
         Args:
             view: WorkerView with worker state
             health: WorkerHealth enum value from classify_worker_health
+            probe: Optional ``RealActivityProbe`` from
+                ``real_activity_probe_for`` (the same corroboration probe the
+                watchdog consults). When supplied, the summary surfaces the
+                freshest corroborated activity timestamp/source and whether
+                that signal is fresh within ``watchdog.stall_minutes`` -- so an
+                alive-but-polling worker (stale sidecar log, fresh sessions.db
+                / per-PID log) is visibly distinguishable from a genuinely
+                stalled one (issue #1346). ``None`` keeps the legacy shape
+                (no corroboration fields) for callers that did not compute a
+                probe.
 
         Returns:
             Dict with worker summary fields for status() JSON output
         """
         from .claude_code import parse_claude_events
-        from .post_mortem import _events_path_from_log
+        from .post_mortem import RealActivityProbe, _events_path_from_log
 
         # Resolve repo_key: use view.repo_key if present, otherwise fall back to gh.name_with_owner()
         # This handles both fleet mode (repo_key populated by iter_workers) and single-repo mode
@@ -23494,6 +23710,23 @@ class OrchestratorApp:
         elif cost_usd is not None and self.config.watchdog.cost_budget_usd is not None:
             budget_remaining = max(0, self.config.watchdog.cost_budget_usd - cost_usd)
 
+        # Issue #1346: surface the watchdog's corroboration probe so an
+        # alive-but-polling worker (stale sidecar log mtime, fresh
+        # sessions.db / per-PID log / events.jsonl) is visibly distinguishable
+        # from a genuinely stalled one. The probe is the same object
+        # ``classify_worker_health`` consulted for ``health`` -- reusing it
+        # here means the displayed classification and the displayed
+        # corroboration come from one code path, never two. ``probe is None``
+        # keeps the legacy shape for callers that did not compute one.
+        corroboration_latest_at: str | None = None
+        corroboration_latest_source: str | None = None
+        corroboration_fresh: bool | None = None
+        if isinstance(probe, RealActivityProbe):
+            latest_ts = probe.latest_timestamp
+            corroboration_latest_at = latest_ts.isoformat() if latest_ts is not None else None
+            corroboration_latest_source = probe.latest_source
+            corroboration_fresh = probe.is_fresh(self.config.watchdog.stall_minutes)
+
         return {
             "repo": repo,
             "issue": view.issue_number,
@@ -23501,6 +23734,9 @@ class OrchestratorApp:
             "health": health.value,
             "runtime_seconds": view.runtime_seconds(),
             "last_activity_at": view.last_activity_at,
+            "last_corroborated_activity_at": corroboration_latest_at,
+            "last_corroborated_activity_source": corroboration_latest_source,
+            "corroboration_fresh": corroboration_fresh,
             "tool_calls": tool_calls,
             "tokens": tokens,
             "cost_usd": cost_usd,
