@@ -1355,17 +1355,24 @@ def launch_claude_worker(
     # Issue #773: persist this worker's terminal status (exit code + duration)
     # once it exits, so a later orphan-detection pass can tell a clean exit-0
     # no-op apart from a genuine crash instead of inferring it from PID
-    # liveness alone. Scoped to non-review launches -- orphan detection
-    # (workflow._detect_and_handle_orphaned_workers) only concerns dispatched
-    # worker/rework sessions, never reviewer sessions, which have their own,
-    # separate stall-detection path. Does not block this function's return;
-    # see start_terminal_status_watcher's docstring.
-    if not review:
-        start_terminal_status_watcher(
-            process,
-            worker_terminal_status_path(sessions_dir, issue_number, _sidecar_suffix(adapter_kind)),
-            worktree_path=worktree.path,
-        )
+    # liveness alone. Does not block this function's return; see
+    # start_terminal_status_watcher's docstring.
+    #
+    # Issue #1354: extended to review launches too. A reviewer that dies
+    # mid-session leaves no terminal signal in its events.jsonl (the stream
+    # is cut before the ``result`` event), so the exit code captured here is
+    # the only durable record of HOW the process ended. The review-verdict
+    # reaper (``_reap_review_verdicts``) reads it back via
+    # ``find_worker_terminal_status`` and folds it into the
+    # ``review_verdict_missed`` payload's ``cause`` field. Review sessions
+    # pass ``worktree_path=None`` because they use an isolated review
+    # checkout (not a worker worktree) whose outcome file is not relevant
+    # here -- only the exit code is.
+    start_terminal_status_watcher(
+        process,
+        worker_terminal_status_path(sessions_dir, issue_number, _sidecar_suffix(adapter_kind)),
+        worktree_path=worktree.path if not review else None,
+    )
 
     try:
         write_worktree_marker(worktree.path, process.pid, session_id)

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
@@ -23,6 +23,12 @@ from typing import Any, Sequence
 from .claude_code import extract_event_text, iter_stream_json_events, parse_claude_events
 from .config import OrchestratorConfig
 from .throttle_signatures import match_throttle_tail
+
+# Sentinel value for the terminating-cause dict when no signal could be
+# captured at all (issue #1354). The ``cause`` key inside the dict is the
+# single field the acceptance criterion requires; the rest of the dict
+# carries whatever diagnostic detail WAS recoverable.
+CAUSE_UNKNOWN: dict[str, Any] = {"cause": "unknown"}
 
 # Language-tag group accepts any tag (not just ``json``), mirroring the fix in
 # ``cross_family._VERDICT_FENCE_RE``: a fence opened with an unrecognized tag
@@ -418,12 +424,24 @@ class ReviewSessionOutcome:
     session that completed turns and then died is a PR-level outcome (the
     review didn't fit its budget), while one that never reached its first turn
     is an environmental failure that says nothing about the PR.
+
+    ``terminating_cause`` (issue #1354) captures whatever signal exists for
+    HOW the session ended: the ``result`` event's ``is_error`` /
+    ``api_error_status`` / ``terminal_reason`` / ``stop_reason`` / ``subtype``
+    fields when the stream-json terminal event is present, plus the process
+    exit code from the durable terminal-status record when available. When the
+    stream was cut before the ``result`` event (the observed death mode for
+    ``died_mid_session``), ``result_event`` is ``"absent"`` and the last
+    event type is recorded so a reader can distinguish a mid-turn cut from a
+    post-turn crash. When nothing could be captured at all, the dict is
+    ``{"cause": "unknown"}``.
     """
 
     text: str
     reason: str
     turn_count: int
     tool_call_count: int
+    terminating_cause: dict[str, Any] = field(default_factory=lambda: dict(CAUSE_UNKNOWN))
 
     @property
     def did_substantial_work(self) -> bool:
@@ -481,12 +499,136 @@ def body_has_crash_signature(text: str) -> bool:
     )
 
 
+# Fields extracted from the stream-json ``result`` event's terminal payload
+# (issue #1354). These are the fields that diagnose WHY the session ended:
+# ``is_error`` / ``subtype`` / ``api_error_status`` / ``terminal_reason`` /
+# ``stop_reason``. Verified against a live Claude Code stream-json result
+# event captured from job-cannon issue-1736's review events.jsonl (see
+# ``tests/fixtures/claude_code_result_event_success.json``).
+_RESULT_EVENT_CAUSE_FIELDS: tuple[str, ...] = (
+    "is_error",
+    "subtype",
+    "api_error_status",
+    "terminal_reason",
+    "stop_reason",
+)
+
+
+def _extract_terminating_cause(
+    events_path: Path,
+    log_path: Path,
+    *,
+    exit_code: int | None = None,
+) -> dict[str, Any]:
+    """Extract whatever signal exists for HOW a reviewer session ended.
+
+    Issue #1354: ``died_mid_session`` deaths left no diagnosable cause in the
+    ``review_verdict_missed`` payload. This function reconstructs the
+    terminating condition from two sources:
+
+    1. The stream-json ``result`` event (the terminal event Claude Code
+       emits on a clean exit). When present, its ``is_error`` /
+       ``api_error_status`` / ``terminal_reason`` / ``stop_reason`` /
+       ``subtype`` fields are the authoritative cause. When absent, the
+       stream was cut before the CLI could emit its terminal event -- the
+       observed death mode for mid-session deaths -- and ``result_event``
+       is set to ``"absent"`` with the last event type recorded so a reader
+       can distinguish a mid-turn cut from a post-turn crash.
+
+    2. The process exit code (from the durable terminal-status record written
+       by ``start_terminal_status_watcher``, passed in by the caller as
+       ``exit_code``). This is the only signal when the events file is
+       missing or empty (e.g. a reviewer that crashed before its first
+       flush).
+
+    Returns ``{"cause": "unknown"}`` only when neither source yields any
+    signal. Never raises: a missing/unreadable events file or a malformed
+    result event is treated as "no signal", not an error.
+
+    The ``events_path`` is the structured ``.events.jsonl`` sidecar; the
+    ``log_path`` is the raw process log (byte-identical to ``events_path``
+    when ``tee_stream_json=True``, which reviewer launches force). Both are
+    tried so the function works whether the caller has the events sidecar,
+    the raw log, or both.
+    """
+    cause: dict[str, Any] = {}
+
+    # Source 1: the stream-json result event.
+    result_event: dict[str, Any] | None = None
+    last_event_type: str | None = None
+    scanned = False
+    for source_path in (events_path, log_path):
+        if result_event is not None:
+            break
+        if not source_path.exists():
+            continue
+        try:
+            raw_text = source_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        scanned = True
+        for event in iter_stream_json_events(raw_text):
+            if not isinstance(event, dict):
+                continue
+            etype = event.get("type")
+            if etype is not None:
+                last_event_type = str(etype)
+            if etype == "result":
+                result_event = event
+                # Don't break here -- keep scanning so last_event_type
+                # reflects the true last event (the result event IS the
+                # last event in a clean exit, but if there are post-result
+                # system events we want to know).
+
+    if result_event is not None:
+        cause["result_event"] = "present"
+        for field_name in _RESULT_EVENT_CAUSE_FIELDS:
+            if field_name in result_event:
+                cause[field_name] = result_event[field_name]
+    elif scanned:
+        # Only record "absent" when we actually scanned an events file --
+        # a missing events file is not a stream cut, it's "no signal".
+        cause["result_event"] = "absent"
+        if last_event_type is not None:
+            cause["last_event_type"] = last_event_type
+
+    # Source 2: the process exit code from the terminal-status watcher.
+    if exit_code is not None:
+        cause["exit_code"] = exit_code
+
+    # If we captured nothing at all, return the explicit unknown sentinel.
+    if not cause:
+        return dict(CAUSE_UNKNOWN)
+
+    # Always include the ``cause`` summary key the acceptance criterion
+    # requires. When a result event is present, the cause is the result
+    # event's subtype/terminal_reason; when absent, the cause is the
+    # stream-cut signal; when only an exit code is available, the cause
+    # is the exit code.
+    if "cause" not in cause:
+        if result_event is not None:
+            terminal_reason = result_event.get("terminal_reason")
+            subtype = result_event.get("subtype")
+            is_error = result_event.get("is_error")
+            if is_error:
+                cause["cause"] = f"result_error:{subtype or terminal_reason or 'unknown'}"
+            else:
+                cause["cause"] = f"result_ok:{terminal_reason or subtype or 'completed'}"
+        elif exit_code is not None:
+            cause["cause"] = f"exit_code:{exit_code}"
+        else:
+            cause["cause"] = "stream_cut_no_result_event"
+
+    return cause
+
+
 def _extract_review_session_summary(
     events_path: Path,
     log_path: Path,
     max_turns: int,
     *,
     session_limit_markers: Sequence[str] | None = None,
+    exit_code: int | None = None,
 ) -> ReviewSessionOutcome | None:
     """Summarize and classify a reviewer session that produced no verdict.
 
@@ -680,4 +822,5 @@ def _extract_review_session_summary(
         reason=reason,
         turn_count=turn_count,
         tool_call_count=tool_call_count,
+        terminating_cause=_extract_terminating_cause(events_path, log_path, exit_code=exit_code),
     )

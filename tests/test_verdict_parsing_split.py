@@ -332,14 +332,17 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
     #1269 (W12) is exactly that PR, adding ``REVIEW_SESSION_FAILED_HEADING``,
     ``REVIEW_SESSION_SUMMARY_HEADING`` (2 constants: 10 -> 12) and
     ``body_has_crash_signature`` (1 function: 9 -> 10), for 20 -> 23 overall.
+    Issue #1354 adds ``CAUSE_UNKNOWN``, ``_RESULT_EVENT_CAUSE_FIELDS`` (2
+    constants: 12 -> 14) and ``_extract_terminating_cause`` (1 function:
+    10 -> 11), for 23 -> 26 overall.
     """
     import charlie_work.verdict_parsing as verdict_parsing
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_VERDICT_PARSING_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 23, (
-        f"expected 23 moved units (10 functions + ReviewSessionOutcome + 12 constants), "
+    assert len(names) == 26, (
+        f"expected 26 moved units (11 functions + ReviewSessionOutcome + 14 constants), "
         f"found {len(names)}: {sorted(names)}"
     )
 
@@ -488,13 +491,13 @@ def test_facade_reexports_every_name_consumers_reach_through_workflow() -> None:
     from a list restated by hand in this test (which is exactly the kind of
     copy that drifts the moment a consumer changes).
 
-    Only 6 of verdict_parsing.py's 23 module-level names have any consumer
+    Only 6 of verdict_parsing.py's 26 module-level names have any consumer
     reference outside workflow.py at all -- the core-chain functions
     ``_validate_review_verdict``, ``_extract_verdict_from_text``,
     ``_parse_review_verdict_from_log``, ``_parse_review_verdict_from_events``,
     ``_parse_review_verdict_from_files``, ``_extract_review_session_summary``.
     ``ReviewSessionOutcome``, ``_log_tail_throttled``,
-    ``_reviewer_session_metrics``, and all 12 module constants are reached
+    ``_reviewer_session_metrics``, and all 14 module constants are reached
     only by bare-name call sites inside workflow.py (OrchestratorApp methods,
     and -- since issue #1269, W12 -- the module-level
     ``_collect_external_findings``), so this scan imposes no obligation for
@@ -506,7 +509,9 @@ def test_facade_reexports_every_name_consumers_reach_through_workflow() -> None:
     (``rework_prompts.py``, ``scripts/backfill_stale_rework_briefs.py``, and
     this issue's new tests) import directly from ``charlie_work.verdict_parsing``,
     never through ``charlie_work.workflow``, so they add no new obligation
-    here either.
+    here either. Issue #1354's ``CAUSE_UNKNOWN``,
+    ``_RESULT_EVENT_CAUSE_FIELDS``, and ``_extract_terminating_cause`` join
+    the same set for the same reason.
     """
     candidates = set(_module_level_defined_names(_VERDICT_PARSING_PATH))
     referenced = _consumer_referenced_names(
