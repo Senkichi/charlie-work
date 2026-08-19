@@ -1561,6 +1561,18 @@ def run_supervised(
             {},
         )
 
+    # Issue #1339: ensure every LabelConfig-derived label exists on the repo
+    # once at supervisor startup, so a new LabelConfig field converges to its
+    # label with no operator action. ``ensure_labels`` is idempotent, records
+    # failures as events (not exceptions), and never blocks the loop. Guarded
+    # so a stand-in app without the method (tests) is tolerated.
+    ensure = getattr(app, "ensure_labels", None)
+    if callable(ensure):
+        try:
+            ensure()
+        except Exception as exc:  # noqa: BLE001 — never block supervisor startup
+            logger.warning("startup label ensure failed: %s", exc)
+
     # Apply CLI overrides on top of the configured supervisor section as a
     # single ``dataclasses.replace`` — one config object instead of parallel
     # locals that can drift out of sync with each other or with future fields.

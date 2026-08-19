@@ -1685,6 +1685,7 @@ def fleet_loop(
     merge: bool | None = None,
     dry_run: bool = False,
     work_only: bool = False,
+    ensure_labels: bool = False,
 ) -> CommandResult:
     """Run a fleet pass across all (or selected) registered repos.
 
@@ -1702,6 +1703,12 @@ def fleet_loop(
         dry_run: If True, pass dry_run to every per-repo GitHub/OrchestratorApp.
         work_only: If True, run dispatch-only path (no review/merge), analogous
             to single-repo 'work' vs 'bash-rats'.
+        ensure_labels: If True, run the idempotent LabelConfig-derived label
+            ensure (issue #1339) for each repo before its lane. The supervisor
+            passes this on its first pass only, so a new ``LabelConfig`` field
+            converges to its label within one startup/pass with no operator
+            action. Failures are recorded as events per repo, never raised,
+            and never block the lane.
 
     Returns:
         A CommandResult with per-repo results and the consolidated digest.
@@ -1819,6 +1826,20 @@ def fleet_loop(
                     dry_run=dry_run,
                     fleet_dir_override=fleet_dir_override,
                 )
+
+                # Issue #1339: ensure every LabelConfig-derived label exists
+                # on the repo before the lane runs. Idempotent and
+                # best-effort: ``ensure_labels`` records failures as events
+                # and never raises, so a missing-label drift self-heals on
+                # the supervisor's first pass without blocking the lane. The
+                # supervisor passes ``ensure_labels=True`` on its first pass
+                # only (see run_fleet_supervise), so this is once per startup
+                # per repo, not once per pass.
+                if ensure_labels:
+                    try:
+                        app.ensure_labels()
+                    except Exception as exc:  # noqa: BLE001 — never block a lane
+                        logger.warning("fleet label ensure failed for %s: %s", repo_key, exc)
 
                 # Call the appropriate per-repo method
                 if work_only:
@@ -2426,6 +2447,13 @@ def run_fleet_supervise(
     total_repo_passes = 0
     total_attention_events = 0
     total_failed_repos = 0
+    # Issue #1339: the LabelConfig-derived label ensure runs once per supervisor
+    # startup per repo (on the first fleet_loop pass only), so a new
+    # LabelConfig field converges to its label with no operator action. Cleared
+    # to False after the first pass reaches fleet_loop regardless of outcome,
+    # so a self-deploy / head-drift restart on pass 1 still re-ensures on the
+    # next supervisor startup (a new process resets this local).
+    labels_ensure_pending = True
     # Issue #738: split the aggregate "failed" count into genuine lane crashes
     # (errored) vs non-fatal ok=False conditions (with conditions) so the
     # final supervisor summary does not paint the majority of passes red the
@@ -2696,7 +2724,11 @@ def run_fleet_supervise(
                 merge=merge,
                 dry_run=dry_run,
                 work_only=False,
+                # Issue #1339: ensure LabelConfig-derived labels exist on each
+                # repo on the first pass only (once per supervisor startup).
+                ensure_labels=labels_ensure_pending,
             )
+            labels_ensure_pending = False
 
             data = pass_result.data
             repos_data = data.get("repos", {}) if isinstance(data, dict) else {}

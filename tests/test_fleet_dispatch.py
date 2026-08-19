@@ -546,6 +546,120 @@ def test_fleet_loop_calls_loop_per_repo(
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_ensure_labels_calls_ensure_per_repo(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #1339: fleet_loop(ensure_labels=True) calls app.ensure_labels()
+    once per repo before its lane, so a new LabelConfig field converges to its
+    label on the supervisor's first pass.
+    """
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            },
+            "owner/repo2": {
+                "repo_root": str(tmp_path / "repo2"),
+                "config_path": "orchestrator.config.yaml",
+            },
+        }
+    }
+    mock_load_registry.return_value = registry
+    (tmp_path / "repo1").mkdir()
+    (tmp_path / "repo2").mkdir()
+
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app1 = MagicMock()
+    mock_app2 = MagicMock()
+    mock_app1.loop.return_value = CommandResult(True, "repo1 loop complete", {})
+    mock_app2.loop.return_value = CommandResult(True, "repo2 loop complete", {})
+    mock_app_class.side_effect = [mock_app1, mock_app2]
+    mock_gh_class.return_value = MagicMock()
+
+    fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+        ensure_labels=True,
+    )
+
+    mock_app1.ensure_labels.assert_called_once()
+    mock_app2.ensure_labels.assert_called_once()
+    # The lane still ran after the ensure.
+    mock_app1.loop.assert_called_once_with(3, merge=True)
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
+def test_fleet_loop_ensure_labels_failure_does_not_block_lane(
+    mock_app_class: MagicMock,
+    mock_gh_class: MagicMock,
+    mock_runtime_paths: MagicMock,
+    mock_load_layered_config: MagicMock,
+    mock_load_registry: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #1339 AC #2: an ensure_labels exception must not block the lane."""
+    registry = {
+        "repos": {
+            "owner/repo1": {
+                "repo_root": str(tmp_path / "repo1"),
+                "config_path": "orchestrator.config.yaml",
+            }
+        }
+    }
+    mock_load_registry.return_value = registry
+    (tmp_path / "repo1").mkdir()
+
+    mock_load_layered_config.return_value = OrchestratorConfig()
+    mock_paths = MagicMock()
+    mock_paths.root = tmp_path / ".var" / "charlie-work"
+    mock_runtime_paths.return_value = mock_paths
+
+    mock_app = MagicMock()
+    mock_app.loop.return_value = CommandResult(True, "repo1 loop complete", {})
+    mock_app.ensure_labels.side_effect = RuntimeError("boom")
+    mock_app_class.side_effect = [mock_app]
+    mock_gh_class.return_value = MagicMock()
+
+    result = fleet_loop(
+        fleet_dir_override=str(tmp_path / "fleet"),
+        global_config=None,
+        repos=None,
+        limit=3,
+        merge=True,
+        dry_run=False,
+        work_only=False,
+        ensure_labels=True,
+    )
+
+    # The lane still ran despite the ensure raising.
+    mock_app.loop.assert_called_once_with(3, merge=True)
+    assert "owner/repo1" in result.data["repos"]
+
+
+@patch("charlie_work.fleet_dispatch._load_registry")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.runtime_paths")
+@patch("charlie_work.fleet_dispatch.GitHub")
+@patch("charlie_work.fleet_dispatch.OrchestratorApp")
 def test_fleet_loop_work_only_calls_dispatch(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
@@ -1795,6 +1909,37 @@ def test_run_fleet_supervise_loops_until_max_passes(
     # them on this field alone -- a regression here would relaunch forever.
     assert result.data["exit_reason"] == "max_passes"
     assert result.data["restart_requested"] is False
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_ensures_labels_on_first_pass_only(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+) -> None:
+    """Issue #1339: run_fleet_supervise passes ensure_labels=True on the first
+    fleet_loop pass only, so the LabelConfig-derived label ensure runs once per
+    supervisor startup per repo (not once per pass).
+    """
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(
+            poll_interval_seconds=5,
+            full_pass_interval_seconds=1,
+            active_cooldown_seconds=7,
+        )
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    fc = _FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+
+    assert mock_fleet_loop.call_count == 3
+    ensure_flags = [call.kwargs.get("ensure_labels") for call in mock_fleet_loop.call_args_list]
+    # First pass ensures; subsequent passes do not.
+    assert ensure_flags == [True, False, False], ensure_flags
 
 
 def _failed_fleet_result(
