@@ -1,0 +1,31 @@
+fix(labels): ensure LabelConfig-derived labels exist on startup (#1339)
+
+Adding a field to LabelConfig did not guarantee the label existed on the
+repo. #1315 added operator_queue but the label was never created on either
+fleet repo, causing partial label-transition failures until an operator ran
+`charlie bootstrap-labels` by hand.
+
+Fix: run the idempotent LabelConfig-derived label ensure once per
+orchestrator startup per repo, with failures reported as events (not
+exceptions):
+
+- OrchestratorApp.ensure_labels(): wraps the existing bootstrap_labels
+  logic (refactored into _ensure_labels_core) and records the outcome as
+  label_ensure_ok / label_ensure_incomplete / label_ensure_failed events.
+  Never raises — a label-ensure failure cannot block startup.
+- run_supervised (single-repo): calls app.ensure_labels() once at startup.
+- run_fleet_supervise: passes ensure_labels=True to fleet_loop on the first
+  pass only (once per supervisor startup per repo).
+- fleet_loop: gained an ensure_labels keyword-only param; when True, calls
+  app.ensure_labels() per repo before its lane, guarded so an exception
+  never blocks the lane.
+
+The ensure set derives entirely from LabelConfig fields — never a
+hard-coded list — so a new field ships its label with no extra wiring.
+Removal of a field does not delete anything (ensure only creates/updates).
+
+Closes #1339.
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
