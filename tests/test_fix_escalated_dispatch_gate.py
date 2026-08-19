@@ -296,13 +296,18 @@ def test_reap_review_verdicts_launch_failure_is_not_reported_as_turn_limit(
     state = load_state(app.paths.state_file)
     missed_events = _events(state, "review_verdict_missed")
     assert len(missed_events) == 1
-    assert missed_events[0]["payload"] == {
-        "pr_number": 100,
-        "issue_number": 10,
-        "reason": "launch_failed",
-        "turn_count": 0,
-        "tool_call_count": 0,
-    }
+    # Issue #1354: the payload now carries a ``cause`` dict. The exact cause
+    # depends on the events fixture; assert the required fields and that
+    # ``cause`` is present with a ``cause`` summary key, without coupling to
+    # the exact last_event_type.
+    payload = missed_events[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["issue_number"] == 10
+    assert payload["reason"] == "launch_failed"
+    assert payload["turn_count"] == 0
+    assert payload["tool_call_count"] == 0
+    assert "cause" in payload
+    assert "cause" in payload["cause"]
 
     # The turn-limit marker gates two downstream behaviours: #584 counts it as
     # a turn-limit death, and the provider-throttle sweep reads it to deny a
@@ -343,13 +348,15 @@ def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path:
     state = load_state(app.paths.state_file)
     missed_events = _events(state, "review_verdict_missed")
     assert len(missed_events) == 1
-    assert missed_events[0]["payload"] == {
-        "pr_number": 100,
-        "issue_number": 10,
-        "reason": "turn_limit_summary_posted",
-        "turn_count": max_turns,
-        "tool_call_count": 3,
-    }
+    # Issue #1354: the payload now carries a ``cause`` dict.
+    payload = missed_events[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["issue_number"] == 10
+    assert payload["reason"] == "turn_limit_summary_posted"
+    assert payload["turn_count"] == max_turns
+    assert payload["tool_call_count"] == 3
+    assert "cause" in payload
+    assert "cause" in payload["cause"]
     assert state["prs"]["100"].get("review_turn_limit_summary_posted") is True
 
 
@@ -464,13 +471,15 @@ def test_reap_review_verdicts_session_limit_notice_is_launch_failure(
     state = load_state(app.paths.state_file)
     missed_events = _events(state, "review_verdict_missed")
     assert len(missed_events) == 1
-    assert missed_events[0]["payload"] == {
-        "pr_number": 100,
-        "issue_number": 10,
-        "reason": "launch_failed",
-        "turn_count": 1,
-        "tool_call_count": 0,
-    }
+    # Issue #1354: the payload now carries a ``cause`` dict.
+    payload = missed_events[0]["payload"]
+    assert payload["pr_number"] == 100
+    assert payload["issue_number"] == 10
+    assert payload["reason"] == "launch_failed"
+    assert payload["turn_count"] == 1
+    assert payload["tool_call_count"] == 0
+    assert "cause" in payload
+    assert "cause" in payload["cause"]
 
     # did_substantial_work is False, so the #583 rollback guard actually fires:
     # the turn-limit marker must NOT be set, otherwise the throttle sweep takes

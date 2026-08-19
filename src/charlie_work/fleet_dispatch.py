@@ -1172,15 +1172,22 @@ def _add_review_verdict_events(
     for verdict in data.get("missed_verdicts", []):
         if not isinstance(verdict, dict):
             continue
-        events.append(
-            {
-                "repo_key": repo_key,
-                "type": "review_verdict_missed",
-                "issue_number": verdict.get("issue") or verdict.get("pr"),
-                "pr": verdict.get("pr"),
-                "reason": verdict.get("reason", "verdict not recorded"),
-            }
-        )
+        event: dict[str, Any] = {
+            "repo_key": repo_key,
+            "type": "review_verdict_missed",
+            "issue_number": verdict.get("issue") or verdict.get("pr"),
+            "pr": verdict.get("pr"),
+            "reason": verdict.get("reason", "verdict not recorded"),
+        }
+        # Issue #1354: preserve the terminating-cause dict so fleet-level
+        # attention events carry the same diagnosable cause as the
+        # state.json ``review_verdict_missed`` event. Absent on misses from
+        # the record_review-failure path (a different failure class) and on
+        # older records predating the cause-capture instrumentation.
+        cause = verdict.get("cause")
+        if cause is not None:
+            event["cause"] = cause
+        events.append(event)
 
 
 def _collect_launch_failures(repo_key: str, data: Any) -> list[dict[str, Any]]:

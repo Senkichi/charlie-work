@@ -140,6 +140,7 @@ from .worktree import (
     read_worker_outcome,
     remote_branch_ahead_count,
     remote_branch_head_sha,
+    remove_review_checkout,
     remove_worktree_marker,
     resolve_base_branch_name,
     salvage_branch_empty_diff,
@@ -273,6 +274,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     REVIEW_MISS_TURN_LIMIT,
     REVIEW_MISS_LAUNCH_FAILED,
     REVIEW_MISS_DIED_MID_SESSION,
+    CAUSE_UNKNOWN,
     _VERDICT_FENCE_RE,
     _REVIEW_MD_PATH_RE,
     _REVIEW_FALLBACK_FILE_MAX_BYTES,
@@ -280,6 +282,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _REVIEW_FALLBACK_MAX_CANDIDATES,
     _DEFAULT_REVIEW_SESSION_LIMIT_MARKERS,
     _REVIEW_THROTTLE_TAIL_CHARS,
+    _RESULT_EVENT_CAUSE_FIELDS,
     _validate_review_verdict,
     _extract_verdict_from_text,
     _extract_verdict_from_stream_json,
@@ -288,6 +291,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _parse_review_verdict_from_files,
     _reviewer_session_metrics,
     _log_tail_throttled,
+    _extract_terminating_cause,
     _extract_review_session_summary,
     REVIEW_SESSION_FAILED_HEADING,
     REVIEW_SESSION_SUMMARY_HEADING,
@@ -10432,11 +10436,39 @@ class OrchestratorApp:
                 if not already_posted:
                     events_path = _events_path(reviews_dir, pr_number, review=True)
                     max_turns = self.config.review_dispatch.review_max_turns
+                    # Issue #1354: read the reviewer's exit code from the
+                    # durable terminal-status record (written by
+                    # ``start_terminal_status_watcher`` in
+                    # ``launch_claude_worker``) so the terminating-cause
+                    # extractor can fold it into the ``cause`` field of the
+                    # ``review_verdict_missed`` payload. The terminal-status
+                    # watcher is now started for review launches too (see
+                    # ``claude_code.launch_claude_worker``); for sessions
+                    # that died before that change landed, the record is
+                    # absent and ``exit_code`` stays ``None``, in which case
+                    # ``_extract_terminating_cause`` falls back to the
+                    # stream-json result event or the explicit
+                    # ``{"cause": "unknown"}`` sentinel.
+                    #
+                    # The reviewer's terminal-status file is written under
+                    # ``reviews_dir`` keyed by ``pr_number`` -- the review
+                    # launch site (``dispatch_reviews``) calls
+                    # ``launch_claude_worker(sessions_dir=reviews_dir,
+                    # issue_number=pr_number, review=True)``, and
+                    # ``start_terminal_status_watcher`` writes to
+                    # ``worker_terminal_status_path(sessions_dir,
+                    # issue_number, ...)``. Reading from the layout's default
+                    # sessions dir keyed by the linked issue number would
+                    # return the original coding worker's stale exit code,
+                    # not the reviewer's.
+                    terminal = find_worker_terminal_status(reviews_dir, pr_number)
+                    exit_code = terminal.get("exit_code") if terminal else None
                     outcome = _extract_review_session_summary(
                         events_path,
                         Path(w.log_path),
                         max_turns,
                         session_limit_markers=self.config.runtime.session_limit_markers,
+                        exit_code=exit_code,
                     )
                     if outcome is not None:
                         try:
@@ -10467,6 +10499,14 @@ class OrchestratorApp:
                                     "reason": outcome.reason,
                                     "turn_count": outcome.turn_count,
                                     "tool_call_count": outcome.tool_call_count,
+                                    # Issue #1354: the terminating-cause
+                                    # dict (exit code, stream-json result
+                                    # event fields, or ``{"cause": "unknown"}``
+                                    # when nothing could be captured). Always
+                                    # present so a downstream query can
+                                    # distinguish "no cause captured" from
+                                    # "cause field absent".
+                                    "cause": outcome.terminating_cause,
                                 },
                                 state_path=self.paths.state_file,
                             )
@@ -10476,8 +10516,33 @@ class OrchestratorApp:
                                 "pr": pr_number,
                                 "issue": issue_number,
                                 "reason": outcome.reason,
+                                "cause": outcome.terminating_cause,
                             }
                         )
+                        # Issue #1354: release this dead reviewer's isolated
+                        # review checkout in the SAME pass that detected the
+                        # death, rather than waiting for
+                        # ``_detect_and_handle_stalled_reviews``'s 5-minute
+                        # stale-claim timeout. The reviewer is already dead
+                        # (``w.is_alive()`` returned False at the top of this
+                        # loop) and no verdict was found, so the checkout is
+                        # pure overhead -- a detached-HEAD git worktree that
+                        # holds no recoverable work. Releasing it here means
+                        # the claim directory does not linger for a full
+                        # stale-claim interval.
+                        #
+                        # The sidecar is deliberately NOT reaped here: the
+                        # stalled-review sweep (which runs immediately after
+                        # this function in ``dispatch_reviews``) reads the
+                        # sidecar's log tail to classify provider-throttle
+                        # signatures and arm fleet-wide backoff. Reaping the
+                        # sidecar here would prevent that classification,
+                        # silently disarming the quota-exhaustion backoff for
+                        # a death that may have been caused by exactly that
+                        # condition. The stalled sweep reaps the sidecar
+                        # itself after classification (or on its next pass
+                        # once the stale timeout elapses).
+                        remove_review_checkout(self.repo_root, pr_number, reviews_dir=reviews_dir)
                 continue
 
             packet_head_sha = self._read_packet_head_oid(pr_number)
