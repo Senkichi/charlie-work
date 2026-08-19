@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -120,6 +121,24 @@ CHARLIE_STATUS_TIMEOUT_SECONDS = 60
 SUPERVISOR_HEARTBEAT_FILENAME = "supervisor-heartbeat.json"
 SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = 2
 SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
+
+# Disk-free thresholds (issue #1359): the 2026-08-19 outage drained C: to 0
+# bytes free over ~3.5 days at ~4 MB/s while every fleet pass failed with
+# `OSError: [Errno 28] No space left on device` and state.json went stale in
+# both lanes -- with zero early warning, because this script had no disk-space
+# check. A coarse threshold would have surfaced this days before ENOSPC.
+#
+# Defaults: WARN below 100 GB or 5% free; ANOMALY below 20 GB or 1% free. The
+# ANOMALY flips the exit code exactly like other anomalies; the WARN goes
+# through `report.warn` (routine-operational, never flips the exit code) so a
+# low-but-not-critical volume surfaces without making the check permanently
+# red. This script has no per-check config file -- thresholds are constants
+# here, matching every other threshold in this block (LOOP_PASS_STALE_MINUTES,
+# SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER, ...); override by editing this file.
+DISK_FREE_WARN_BYTES = 100 * 1024**3  # 100 GB
+DISK_FREE_WARN_RATIO = 0.05  # 5%
+DISK_FREE_ANOMALY_BYTES = 20 * 1024**3  # 20 GB
+DISK_FREE_ANOMALY_RATIO = 0.01  # 1%
 
 # check_stale_open_issue_mentions (issue #902): two bulk API sources plus one
 # free local one, per the issue's "API economy matters" constraint -- never a
@@ -1600,6 +1619,98 @@ def check_github_rate(report: Report, any_repo_root: Path) -> None:
         report.ok(check, facts)
 
 
+def _volume_label(anchor: str) -> str:
+    """Compact display label for a volume anchor (e.g. ``C:\\`` -> ``C:``).
+
+    Strips trailing path separators so the per-volume line reads
+    ``OK disk-space C: free=...`` rather than ``... C:\\ ...``. A root-only
+    anchor (POSIX ``/``) is returned unchanged so it does not collapse to an
+    empty label.
+    """
+    stripped = anchor.rstrip("\\/")
+    return stripped if stripped else anchor
+
+
+def check_disk_space(report: Report, repos: list[RepoInfo]) -> None:
+    """Flag low free disk space on any volume hosting a monitored state root.
+
+    Issue #1359: the 2026-08-19 disk-full outage drained the host volume to 0
+    bytes free while every fleet pass failed with
+    ``OSError: [Errno 28] No space left on device`` and state.json went stale
+    in both lanes. The first heartbeat signal was error-events firing AFTER
+    writes were already failing fleet-wide; free space had been draining for
+    ~3.5 days with zero early warning. This check surfaces the drain at a
+    coarse threshold days before impact.
+
+    The volume set is DERIVED from configuration the script already knows --
+    each registered repo's ``state_dir`` (which holds ``state.json`` and
+    ``events.db`` -- the same paths the rest of this script monitors) plus the
+    fleet dir (which holds ``heartbeat-state.json`` and
+    ``supervisor-heartbeat.json``) -- never a hardcoded drive letter. Volumes
+    are deduplicated by drive anchor (``Path.anchor``: ``C:\\`` on Windows,
+    the mount-root ``/`` on POSIX), so a single volume hosting several repos'
+    state dirs -- the common one-drive-host case -- reports once, not N times.
+    ``events.db`` lives at ``state_dir / "events.db"`` and therefore shares
+    ``state_dir``'s volume, so it needs no separate entry.
+
+    Uses ``shutil.disk_usage`` (stdlib, no new deps, consistent with this
+    script's stdlib-only invariant in ``scripts/README.md``). Below the hard
+    threshold (``DISK_FREE_ANOMALY_BYTES`` or ``DISK_FREE_ANOMALY_RATIO``) ->
+    ``report.anom`` (flips the exit code, exactly like other anomalies);
+    between soft and hard -> ``report.warn`` (routine-operational, never flips
+    the exit code, matching ``check_warning_events``'s treatment of
+    normal-operation warnings); otherwise ``report.ok``.
+    """
+    # Collect candidate paths whose hosting volumes matter, then deduplicate
+    # by drive anchor so each volume reports exactly once.
+    candidates: list[Path] = [repo.state_dir for repo in repos]
+    candidates.append(fleet_dir())
+    volumes: dict[str, Path] = {}
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            # An unresolvable path (e.g. a registered state_dir on a drive
+            # that no longer exists) still has an anchor worth probing; fall
+            # back to the literal path so disk_usage can surface the failure
+            # rather than silently dropping the volume from the report.
+            resolved = path
+        anchor = resolved.anchor or str(resolved)
+        volumes.setdefault(anchor, resolved)
+
+    for anchor, sample_path in volumes.items():
+        check = f"disk-space {_volume_label(anchor)}"
+        try:
+            usage = shutil.disk_usage(str(sample_path))
+        except OSError as exc:
+            report.anom(check, f"cannot stat volume {anchor}: {exc}")
+            continue
+        free = usage.free
+        total = usage.total
+        ratio = free / total if total > 0 else 0.0
+        free_gb = free / 1024**3
+        total_gb = total / 1024**3
+        facts = f"free={free_gb:.1f}GB ({ratio * 100:.1f}%) total={total_gb:.1f}GB"
+        if free < DISK_FREE_ANOMALY_BYTES or ratio < DISK_FREE_ANOMALY_RATIO:
+            report.anom(
+                check,
+                f"free space below hard threshold (free={free_gb:.1f}GB/"
+                f"{ratio * 100:.1f}%, anomaly below "
+                f"{DISK_FREE_ANOMALY_BYTES / 1024**3:.0f}GB or "
+                f"{DISK_FREE_ANOMALY_RATIO * 100:.0f}%) ({facts})",
+            )
+        elif free < DISK_FREE_WARN_BYTES or ratio < DISK_FREE_WARN_RATIO:
+            report.warn(
+                check,
+                f"free space below soft threshold (free={free_gb:.1f}GB/"
+                f"{ratio * 100:.1f}%, warn below "
+                f"{DISK_FREE_WARN_BYTES / 1024**3:.0f}GB or "
+                f"{DISK_FREE_WARN_RATIO * 100:.0f}%) ({facts})",
+            )
+        else:
+            report.ok(check, facts)
+
+
 def check_runners(report: Report) -> None:
     check = "runners"
     if sys.platform != "win32":
@@ -1804,6 +1915,7 @@ def main() -> int:
     else:
         report.anom("github-rate", "no repos registered, cannot resolve a cwd for gh")
 
+    check_disk_space(report, repos)
     check_runners(report)
     check_supervisor_heartbeat(report)
 
