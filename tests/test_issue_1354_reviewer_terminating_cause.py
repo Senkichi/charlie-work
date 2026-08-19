@@ -411,3 +411,96 @@ def test_reap_review_verdicts_does_not_reap_sidecar_same_pass(monkeypatch, tmp_p
         "Sidecar was reaped in _reap_review_verdicts -- the stalled-review "
         "sweep needs it for throttle classification"
     )
+
+
+# --- AC1 regression: exit-code fallback reads the reviewer's terminal-status
+# record, not the original coding worker's stale one (PR #1356 round-2 review) ---
+
+
+def test_reap_review_verdicts_exit_code_from_reviewer_terminal_record(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """``_reap_review_verdicts`` reads the reviewer's exit code from the
+    terminal-status record written under ``reviews_dir`` keyed by ``pr_number``
+    -- not from the layout's default sessions dir keyed by the linked issue
+    number (PR #1356 round-2 review).
+
+    The review launch site (``dispatch_reviews``) calls
+    ``launch_claude_worker(sessions_dir=reviews_dir, issue_number=pr_number,
+    review=True)``, and ``start_terminal_status_watcher`` writes the
+    terminal-status file to ``worker_terminal_status_path(sessions_dir,
+    issue_number, ...)`` = ``reviews_dir/issue-<pr_number>.claude.terminal.json``.
+
+    Before the fix, ``_reap_review_verdicts`` called
+    ``find_worker_terminal_status(self._layout.sessions_dir, issue_number)``,
+    which looked under the default sessions dir keyed by the linked issue
+    number -- silently returning the original coding worker's stale exit code
+    instead of the reviewer's. This test plants both records with distinct
+    exit codes and asserts the reviewer's wins.
+    """
+    from charlie_work.process_utils import (
+        worker_terminal_status_path,
+        write_worker_terminal_status,
+    )
+
+    app = _dispatch_reviews_app(tmp_path, prs=[_PR])
+    _write_review_packet(tmp_path, 100, "sha-100")
+    # PR #100 is linked to issue #10.
+    _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
+
+    reviews_dir = app._layout.reviews_dir
+    # A dead reviewer that did substantial work but had no result event
+    # (stream cut = died_mid_session), so the exit code is the only
+    # terminal signal.
+    _write_review_events(reviews_dir, 100, turns=3, tool_calls=2)
+    _make_dead_review_sidecar(reviews_dir, 100, "log text")
+
+    # The reviewer's real terminal-status record, written under reviews_dir
+    # keyed by pr_number (the actual production write path).
+    write_worker_terminal_status(
+        worker_terminal_status_path(reviews_dir, 100, "claude"),
+        pid=99999,
+        exit_code=137,
+        started_at="2026-07-06T12:00:00Z",
+        ended_at="2026-07-06T12:05:00Z",
+        duration_seconds=300.0,
+    )
+
+    # A STALE terminal-status record for the original coding worker, written
+    # under the layout's default sessions dir keyed by the linked issue
+    # number. Before the fix, _reap_review_verdicts read THIS record and
+    # silently returned exit_code=0 (the coding worker's clean exit) instead
+    # of the reviewer's crash (137).
+    sessions_dir = app._layout.sessions_dir
+    write_worker_terminal_status(
+        worker_terminal_status_path(sessions_dir, 10, "claude"),
+        pid=88888,
+        exit_code=0,
+        started_at="2026-07-06T11:00:00Z",
+        ended_at="2026-07-06T11:30:00Z",
+        duration_seconds=1800.0,
+    )
+
+    monkeypatch.setattr(app, "_comment_pr", lambda *a, **kw: None)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    missed = result.get("missed", [])
+    assert len(missed) == 1
+    assert missed[0]["reason"] == "died_mid_session"
+    cause = missed[0]["cause"]
+    # The reviewer's crash exit code (137), not the coding worker's clean
+    # exit (0).
+    assert cause["exit_code"] == 137, (
+        f"expected reviewer's exit_code=137 from reviews_dir terminal record, "
+        f"got {cause.get('exit_code')!r} -- _reap_review_verdicts is reading "
+        f"from the wrong directory/key"
+    )
+
+    # Verify the event payload carries the reviewer's exit code too.
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+    events = _events(state, "review_verdict_missed")
+    assert len(events) == 1
+    payload = events[0].get("payload", {})
+    assert payload["cause"]["exit_code"] == 137

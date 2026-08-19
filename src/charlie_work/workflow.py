@@ -10379,12 +10379,6 @@ class OrchestratorApp:
         Returns a dict with ``recorded`` and ``missed`` verdict info lists for
         the dispatch result and the fleet attention digest.
         """
-        # Issue #1354: the reviewer's exit code lives in the sessions dir's
-        # terminal-status record (``find_worker_terminal_status``), not under
-        # ``reviews_dir``. Read from the layout's sessions dir so the
-        # terminating-cause extractor can fold the exit code into the
-        # ``review_verdict_missed`` payload's ``cause`` field.
-        sessions_dir = self._layout.sessions_dir
         recorded: list[dict[str, Any]] = []
         missed: list[dict[str, Any]] = []
 
@@ -10455,7 +10449,19 @@ class OrchestratorApp:
                     # ``_extract_terminating_cause`` falls back to the
                     # stream-json result event or the explicit
                     # ``{"cause": "unknown"}`` sentinel.
-                    terminal = find_worker_terminal_status(sessions_dir, issue_number)
+                    #
+                    # The reviewer's terminal-status file is written under
+                    # ``reviews_dir`` keyed by ``pr_number`` -- the review
+                    # launch site (``dispatch_reviews``) calls
+                    # ``launch_claude_worker(sessions_dir=reviews_dir,
+                    # issue_number=pr_number, review=True)``, and
+                    # ``start_terminal_status_watcher`` writes to
+                    # ``worker_terminal_status_path(sessions_dir,
+                    # issue_number, ...)``. Reading from the layout's default
+                    # sessions dir keyed by the linked issue number would
+                    # return the original coding worker's stale exit code,
+                    # not the reviewer's.
+                    terminal = find_worker_terminal_status(reviews_dir, pr_number)
                     exit_code = terminal.get("exit_code") if terminal else None
                     outcome = _extract_review_session_summary(
                         events_path,
