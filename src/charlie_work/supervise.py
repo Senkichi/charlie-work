@@ -1531,7 +1531,7 @@ def run_supervised(
         logger.error("VENV EDITABLE ANCHOR VIOLATION: %s", anchor.detail)
         log_event(
             app.paths.state_file,
-            # event-consumer: pending #1364 -- hard supervisor-refusal safety gate (issue
+            # event-consumer: pending #1366 -- hard supervisor-refusal safety gate (issue
             # #974) with no confirmed alerting path beyond this log line + the refusal itself
             "venv_editable_anchor_violation",
             {"detail": anchor.detail},

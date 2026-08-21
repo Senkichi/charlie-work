@@ -5,17 +5,16 @@ either genuinely consumed downstream, or carry a `# event-consumer:` marker
 explaining why not. Two kinds in the current baseline are action-implying
 (they represent an unresolved condition that reads as "something should have
 happened next") but have no confirmed downstream consumer yet. Per the issue's
-baseline-handling rule, these get `# event-consumer: pending #1364` markers as
-an interim pointer rather than a blanket `audit-only` marking.
+baseline-handling rule, these carry `# event-consumer: pending #1366` markers
+pointing at the grouped tracking issue
+(https://github.com/Senkichi/charlie-work/issues/1366) rather than a blanket
+`audit-only` marking.
 
-**This file is the input for the finalize stage**, which is expected to:
-1. File one grouped tracking issue (or two individual issues) covering the
-   kinds below.
-2. Replace the literal `#1364` in the two marker comments listed here with the
-   real issue number(s), in:
-   - `src/charlie_work/workflow.py` (the `draft_pr_blocked` kind, ~line 9454)
-   - `src/charlie_work/supervise.py` (the `venv_editable_anchor_violation`
-     kind, ~line 1534)
+Both markers already point at #1366 (retargeted from the provisional #1364
+self-reference an adversarial review caught -- see that issue's own body for
+why a `pending` marker cannot point at the issue introducing the marker
+itself). Resolving #1366 means adding a real consumer for each kind and then
+deleting the corresponding `pending` marker, not just closing the issue.
 
 ## Pending kinds
 
@@ -23,7 +22,7 @@ an interim pointer rather than a blanket `audit-only` marking.
 
 - **Emission site:** `src/charlie_work/workflow.py:9454` (inside an `if`/`else`
   ternary alongside the sibling kind `janitor_gate`, which IS consumed).
-- **Marker:** `# event-consumer: pending #1364 -- draft_pr_blocked has no
+- **Marker:** `# event-consumer: pending #1366 -- draft_pr_blocked has no
   automated consumer yet, only the query_events(kind=...) grep the comment
   above names; janitor_gate (the other branch) is separately consumed`
 - **Why pending, not audit-only:** the surrounding code's own comment
@@ -43,7 +42,7 @@ an interim pointer rather than a blanket `audit-only` marking.
 - **Emission site:** `src/charlie_work/supervise.py:1534`, inside the hard
   supervisor-refusal safety gate added for issue #974 (protects against a
   worktree's editable install silently repointing the main checkout's venv).
-- **Marker:** `# event-consumer: pending #1364 -- hard supervisor-refusal
+- **Marker:** `# event-consumer: pending #1366 -- hard supervisor-refusal
   safety gate (issue #974) with no confirmed alerting path beyond this log
   line + the refusal itself`
 - **Why pending, not audit-only:** the refusal itself is the immediate
@@ -70,8 +69,8 @@ current tree. 196 emission call sites, ~136 distinct literal kinds.
 | Consumed (category 1: `src/charlie_work/**` read positions) | see `_collect_src_consumer_sites` | `query_events`/`event_counts_by_kind`/`events_by_correlation_id` filters, classification tables, equality comparisons against a `kind` field |
 | Consumed (category 2: `scripts/heartbeat_check.py`) | included above | kind-classification sets/queries in the heartbeat script |
 | Consumed (category 3: tests-only, weak consumer) | reported separately by the test (`test_only_consumed`) | asserted on in `tests/**` but not read by production code |
-| Marked `audit-only` (15 sites) | 15 | one-clause justification per marker, see grep below |
-| Marked `pending #1364` (2 kinds) | 2 | this file |
+| Marked `audit-only` (13 sites) | 13 | one-clause justification per marker, see grep below |
+| Marked `pending #1366` (2 kinds) | 2 | this file |
 | Marked `pointer` (2 sites, same underlying dynamic kind pattern) | 2 | `stalled_review_reap.py`'s `sweep_events` batching flush |
 
 To reproduce the full per-kind table, run:
@@ -89,7 +88,7 @@ for p in report.pending:
 PY
 ```
 
-All 15 `audit-only` markers and their justifications can be listed with:
+All 13 `audit-only` markers and their justifications can be listed with:
 
 ```bash
 grep -rn "event-consumer: audit-only" src/charlie_work/

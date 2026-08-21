@@ -44,10 +44,9 @@ kind is the actionable one). The two kinds that looked like they should have
 a real consumer -- ``draft_pr_blocked`` (the code's own comment names the
 consumer it doesn't have yet) and ``venv_editable_anchor_violation`` (a hard
 supervisor-refusal safety gate with no confirmed alerting path) -- carry
-``pending #1364`` markers; the grouped tracking issue this points at is filed
-alongside this PR and the inventory is recorded in
-``pending-kinds-inventory.md`` at the repo root for the finalize step to
-retarget at the real issue number.
+``pending #1366`` markers, pointing at the grouped tracking issue filed
+alongside this PR (see ``pending-kinds-inventory.md`` at the repo root for
+the derived inventory and the two kinds' detail).
 """
 
 from __future__ import annotations

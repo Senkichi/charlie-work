@@ -9451,7 +9451,7 @@ class OrchestratorApp:
                     event_kind = "draft_pr_blocked" if verdict.is_draft else "janitor_gate"
                     state = self._record_event(
                         state,
-                        # event-consumer: pending #1364 -- draft_pr_blocked has no automated
+                        # event-consumer: pending #1366 -- draft_pr_blocked has no automated
                         # consumer yet, only the query_events(kind=...) grep the comment above
                         # names; janitor_gate (the other branch) is separately consumed
                         event_kind,
