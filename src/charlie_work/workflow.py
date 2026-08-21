@@ -128,6 +128,10 @@ from .reconcile import (
     detect_drift,
     detect_mergequeue_not_approved,
 )
+from .review_decision import (
+    resolve_decision_payload,
+    review_decision,
+)
 from .safe_ref import require_valid_sha
 from .worktree import (
     OPERATOR_MARKER_KIND,
@@ -2282,16 +2286,14 @@ def _detect_and_handle_orphaned_workers(
         if not pr_data:
             continue
         pr_number = int(pr_data["number"])
-        pr_state = state_snapshot.get("prs", {}).get(str(pr_number), {})
-        last_decision = pr_state.get("decision")
-        reviewed_head_sha = pr_state.get("reviewed_head_sha")
-        live_head_sha = pr_data.get("headRefOid")
-        if (
-            last_decision == "request_changes"
-            and reviewed_head_sha
-            and live_head_sha
-            and reviewed_head_sha == live_head_sha
-        ):
+        # Issue #1362 Stage 1: read through the single review-decision
+        # reader (flat file, falling back to the highest archived round)
+        # rather than state.json's ``decision``/``reviewed_head_sha``
+        # fields, which can lag a concurrent record_review/void.
+        resolved_decision = review_decision(
+            state_file.parent / "prs" / f"pr-{pr_number}", None, pr_data.get("headRefOid")
+        )
+        if resolved_decision.decision == "request_changes" and not resolved_decision.stale:
             # Let the second-lock request_changes restoration path handle this;
             # do not overwrite an existing review feedback prompt.
             continue
@@ -2327,13 +2329,28 @@ def _detect_and_handle_orphaned_workers(
     # dead. ``pr_by_issue`` only contains OPEN PRs (``gh pr list --state
     # open``), so presence there is the "PR is OPEN" precondition.
     pr_orphan_unreviewed_details: dict[int, dict[str, Any]] = {}
+
+    def _has_no_review_verdict_yet(issue_number: int) -> bool:
+        """True when the PR carries no terminal review verdict yet.
+
+        Issue #1362 Stage 1 fix: the old state-based predicate
+        (``not pr_state.get("decision")``) was true for both "no decision
+        file at all" and "a pending placeholder decision" -- both count as
+        "no verdict yet" per this lane's #1128 intent (see the comment
+        above). Checking only ``.missing`` narrowed that: a dead-worker
+        orphan PR that reached a pending packet would be silently excluded
+        from the ``agent:in-progress`` -> ``agent:pr-open`` advance,
+        re-stranding the issue exactly like the original #1128 bug.
+        """
+        resolved = review_decision(
+            state_file.parent / "prs" / f"pr-{int(pr_by_issue[issue_number]['number'])}",
+            None,
+            pr_by_issue[issue_number].get("headRefOid"),
+        )
+        return resolved.missing or resolved.decision == "pending"
+
     pr_orphans_unreviewed = [
-        n
-        for n in orphaned_issues
-        if n in pr_by_issue
-        and not state_snapshot.get("prs", {})
-        .get(str(int(pr_by_issue[n]["number"])), {})
-        .get("decision")
+        n for n in orphaned_issues if n in pr_by_issue and _has_no_review_verdict_yet(n)
     ]
     if pr_orphans_unreviewed:
         # ``issues_by_number`` is only populated above when there were
@@ -2458,11 +2475,19 @@ def _detect_and_handle_orphaned_workers(
 
             if pr_data:
                 pr_number = int(pr_data["number"])
-                # Check the last review decision from state
                 pr_state = state.get("prs", {}).get(str(pr_number), {})
-                last_decision = pr_state.get("decision")
-                reviewed_head_sha = pr_state.get("reviewed_head_sha")
                 live_head_sha = pr_data.get("headRefOid")
+                # Issue #1362 Stage 1: read the last review decision through
+                # the single file-first reader (flat file, falling back to
+                # the highest archived round) instead of state.json's
+                # decision/reviewed_head_sha fields, which can lag a
+                # concurrent record_review/void -- the #1340 divergence
+                # class AC1 exists to eliminate.
+                resolved_decision = review_decision(
+                    state_file.parent / "prs" / f"pr-{pr_number}", None, live_head_sha
+                )
+                last_decision = resolved_decision.decision
+                reviewed_head_sha = resolved_decision.reviewed_head_sha
 
                 # Issue #773: measurement-first payload enrichment. A dead PID
                 # alone cannot distinguish a worker that crashed from one that
@@ -2718,13 +2743,20 @@ def _detect_and_handle_orphaned_workers(
                         # Not the #1109 approved+rework_requested classified
                         # case. This branch covers two populations that share
                         # one fingerprinted drift fallback below:
-                        #   (a) #1128: ``last_decision`` is None (open PR, no
-                        #       review verdict yet) -- try advancing to
-                        #       ``pr-open``; on label-write failure or missing
-                        #       details, fall through to the shared drift.
+                        #   (a) #1128: ``last_decision`` is None or "pending"
+                        #       (open PR, no terminal review verdict yet) --
+                        #       try advancing to ``pr-open``; on label-write
+                        #       failure or missing details, fall through to
+                        #       the shared drift. Issue #1362 Stage 1: this
+                        #       must match ``_has_no_review_verdict_yet``'s
+                        #       predicate above (``.missing or .decision ==
+                        #       "pending"``) or a pending-packet PR would be
+                        #       precomputed into ``pr_orphan_unreviewed_details``
+                        #       but never consulted here, re-stranding the
+                        #       issue on ``agent:in-progress``.
                         #   (b) genuinely unclassifiable decisions -- fall
                         #       through to the shared drift directly.
-                        if last_decision is None:
+                        if last_decision is None or last_decision == "pending":
                             details = pr_orphan_unreviewed_details.get(issue_number)
                             if details is not None:
                                 active_labels = details["active_labels"]
@@ -3469,15 +3501,11 @@ def _reap_restore_rework_requested(
         if not isinstance(entry, dict) or entry.get("status") != "dispatched":
             return
 
-        pr_state = state.get("prs", {}).get(str(pr_number), {})
-        last_decision = pr_state.get("decision")
-        reviewed_head_sha = pr_state.get("reviewed_head_sha")
-
+        # Issue #1362 Stage 1: read through the single review-decision
+        # reader instead of state.json's ``decision``/``reviewed_head_sha``.
+        resolved_decision = review_decision(prs_dir / f"pr-{pr_number}", None, live_head_sha)
         has_request_changes = (
-            last_decision == "request_changes"
-            and reviewed_head_sha is not None
-            and live_head_sha is not None
-            and reviewed_head_sha == live_head_sha
+            resolved_decision.decision == "request_changes" and not resolved_decision.stale
         )
         # Diagnostic only (issue #315 finding 1) — never gates the restore by
         # itself; see the docstring above.
@@ -9750,7 +9778,6 @@ class OrchestratorApp:
             "pending",
             None,
             "missing",
-            "invalid",
         ) and bool(prior_reviewed_head_sha)
         prior_review_section = (
             self._build_prior_review_section(pr_dir, existing_decision, pr.get("headRefOid"))
@@ -9849,11 +9876,12 @@ class OrchestratorApp:
             #
             # Only a real terminal decision (approved/request_changes/blocked)
             # on disk can be voided. ``_review_decision`` returns
-            # ``{"decision": "missing"}`` when the file does not exist and
-            # ``{"decision": "invalid"}`` on a corrupt read; neither is a
-            # terminal verdict, so neither triggers the void path -- the
-            # fresh-template write below handles the missing-file case, and
-            # an invalid file is left for a human rather than silently
+            # ``{"decision": "missing"}`` for both a missing file and a
+            # corrupt/unreadable one (issue #1362's ``review_decision``
+            # collapses both into one sentinel) -- that is not a terminal
+            # verdict, so it never triggers the void path -- the fresh-
+            # template write below handles the missing-file case, and a
+            # corrupt file is left for a human rather than silently
             # overwritten (mirroring the original code's ``else`` branch,
             # which only reset on a real terminal decision).
             voided_stale_verdict = live_decision_value in (
@@ -9968,15 +9996,10 @@ class OrchestratorApp:
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
                 pr_state = state["prs"].get(str(pr_number), {})
-                existing_decision = pr_state.get("decision")
-                reviewed_head_sha = pr_state.get("reviewed_head_sha")
-                live_head_sha = pr.get("headRefOid")
-                if (
-                    existing_decision == "request_changes"
-                    and reviewed_head_sha is not None
-                    and live_head_sha is not None
-                    and live_head_sha == reviewed_head_sha
-                ):
+                # Issue #1362 Stage 1: single review-decision reader instead
+                # of state.json's decision/reviewed_head_sha fields.
+                resolved_decision = review_decision(pr_dir, None, pr.get("headRefOid"))
+                if resolved_decision.decision == "request_changes" and not resolved_decision.stale:
                     should_skip_transition = True
                 # Issue #384, re-checked here and not only at the top of
                 # review(): the `review_started` edge removes every workflow
@@ -10364,7 +10387,7 @@ class OrchestratorApp:
                         "mergeStateStatus": pr.get("mergeStateStatus"),
                     }
                 )
-            elif decision_value in ("pending", "missing", "invalid"):
+            elif decision_value in ("pending", "missing"):
                 if packet_head_sha is None or packet_head_sha != live_head_sha:
                     continue
                 # Issue #592: a template-stale packet must be regenerated by
@@ -13770,16 +13793,16 @@ class OrchestratorApp:
                 },
             )
         if decision_value == "missing":
+            # Issue #1362 Stage 1: resolve_decision_payload collapses both
+            # "no decision file at all" and "flat file corrupt, no round
+            # fallback" into this same "missing" sentinel (the old distinct
+            # "invalid" sentinel no longer exists) -- both are equally
+            # non-terminal for authorization purposes, so this one reason
+            # covers what used to be two.
             return CommandResult(
                 False,
-                f"PR #{pr_number}: no review-decision.json — not authorized",
+                f"PR #{pr_number}: no readable review-decision.json — not authorized",
                 {**base, "authorized": False, "reason": "no_decision"},
-            )
-        if decision_value == "invalid":
-            return CommandResult(
-                False,
-                f"PR #{pr_number}: review-decision.json unreadable — not authorized",
-                {**base, "authorized": False, "reason": "invalid_decision"},
             )
         if decision_value != "approved":
             return CommandResult(
@@ -19858,17 +19881,24 @@ class OrchestratorApp:
                 # that's simply waiting on pending checks.
                 state = load_state_locked(self.paths.state_file)
                 pr_state = state["prs"].get(str(pr_number), {})
-                already_approved = pr_state.get("decision") == "approved" and pr_state.get(
+                pr_dir_for_decision = self.paths.prs / f"pr-{pr_number}"
+                live_head_sha = pr.get("headRefOid")
+                # Issue #1362 Stage 1 (#1340 regression): the FILE is
+                # authoritative for the decision itself -- state.json's
+                # ``decision`` can lag a concurrent void/record_review (the
+                # #1340 shape: state still says "approved" at an old head
+                # while the file has already been reset to "pending").
+                # ``status`` is a distinct workflow-state field, not one of
+                # the three decision stores, so it still reads pr_state.
+                resolved_decision = review_decision(pr_dir_for_decision, None, live_head_sha)
+                already_approved = resolved_decision.decision == "approved" and pr_state.get(
                     "status"
                 ) not in ("request_changes", "escalated", "blocked")
                 if already_approved:
-                    reviewed_head_sha = pr_state.get("reviewed_head_sha")
-                    live_head_sha = pr.get("headRefOid")
-                    head_matches = (
-                        reviewed_head_sha is not None
-                        and live_head_sha is not None
-                        and live_head_sha == reviewed_head_sha
-                    )
+                    # ``resolved_decision.stale`` already encodes exactly the
+                    # reviewed-head-vs-live-head comparison ``head_matches``
+                    # used to hand-roll.
+                    head_matches = not resolved_decision.stale
                     if head_matches and is_merge_head:
                         merge_result = self.merge_ready(
                             pr_number, merge=merge, merge_train_head=merge_train_head
@@ -19885,8 +19915,14 @@ class OrchestratorApp:
                         # PR and let a later pass reap the review and rebuild.
                         if review.data.get("cross_family_pending"):
                             continue
-                        decision = self._review_decision(pr_number)
-                        if decision.get("decision") == "approved" and is_merge_head:
+                        post_review_decision = review_decision(
+                            pr_dir_for_decision, None, pr.get("headRefOid")
+                        )
+                        if (
+                            post_review_decision.decision == "approved"
+                            and not post_review_decision.stale
+                            and is_merge_head
+                        ):
                             merge_result = self.merge_ready(
                                 pr_number, merge=merge, merge_train_head=merge_train_head
                             )
@@ -19936,17 +19972,22 @@ class OrchestratorApp:
                         pr=pr, pr_number=pr_number
                     )
                     if head_current and template_current and cross_family_current:
-                        # Packet is current — skip regenerating it. But an
-                        # operator may have written review-decision.json
-                        # directly without state.json reflecting it yet (the
-                        # already_approved branch above only fires once
-                        # state.json has the decision), so the verdict would
-                        # otherwise stay invisible until the head moves. Check
-                        # the decision file directly and proceed to merge on
-                        # approval, same as the decided path.
+                        # Packet is current — skip regenerating it. The
+                        # already_approved branch above is evaluated earlier
+                        # in this same pass and may not see a decision file an
+                        # operator wrote after that check ran, so the verdict
+                        # would otherwise stay invisible until the head moves.
+                        # Re-check the decision file here and proceed to merge
+                        # on approval, same as the decided path.
                         skipped_reviews += 1
-                        decision = self._review_decision(pr_number)
-                        if decision.get("decision") == "approved" and is_merge_head:
+                        packet_skip_decision = review_decision(
+                            pr_dir_for_decision, None, pr.get("headRefOid")
+                        )
+                        if (
+                            packet_skip_decision.decision == "approved"
+                            and not packet_skip_decision.stale
+                            and is_merge_head
+                        ):
                             merge_result = self.merge_ready(
                                 pr_number, merge=merge, merge_train_head=merge_train_head
                             )
@@ -23123,15 +23164,38 @@ class OrchestratorApp:
         )
 
     def _review_decision(self, pr_number: int) -> dict[str, Any]:
-        decision_path = self.paths.prs / f"pr-{pr_number}" / "review-decision.json"
-        if not decision_path.exists():
-            return {"decision": "missing"}
-        try:
-            with decision_path.open("r", encoding="utf-8") as handle:
-                value = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            return {"decision": "invalid"}
-        return value if isinstance(value, dict) else {"decision": "invalid"}
+        """Read the resolved review decision for ``pr_number`` as a Mapping.
+
+        Issue #1362 Stage 1: resolution order (the flat
+        ``review-decision.json`` file first, falling back to the
+        highest-numbered ``rounds/round-K/review-decision.json`` when the
+        flat file is missing or unparseable) is delegated to
+        ``review_decision``'s helpers -- the same ones
+        ``rework_prompts._round_history_entries`` now imports rather than
+        defining -- so the fallback logic lives in exactly one place
+        instead of being re-derived here, fixing all of this method's
+        call sites at once (previously this method had no round fallback
+        at all; only ``rework_prompts.py`` did).
+
+        Many callers need the FULL recorded payload (``required_changes``,
+        ``summary``, ``escalated``, ``authorized_override``, ...) --
+        fields ``review_decision.ReviewDecision`` deliberately does not
+        carry, since that dataclass is scoped to control-flow
+        approved/stale/missing questions only -- so this method keeps
+        returning a plain dict rather than the dataclass. A caller that
+        only needs "is this approved and fresh" should call
+        ``review_decision.review_decision()`` directly instead (see
+        ``already_approved`` in ``loop()``).
+
+        A corrupt flat file with no usable round fallback now resolves to
+        ``{"decision": "missing"}`` rather than the old ``"invalid"``
+        sentinel -- both are already treated as "not a terminal verdict"
+        by every caller that branches on decision value, so this collapses
+        two fail-safe outcomes into one without changing whether a caller
+        treats the PR as reviewed.
+        """
+        pr_dir = self.paths.prs / f"pr-{pr_number}"
+        return resolve_decision_payload(pr_dir)
 
     def _read_packet_head_oid(self, pr_number: int) -> str | None:
         """Return the ``headRefOid`` stored in the existing review packet for

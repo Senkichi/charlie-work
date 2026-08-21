@@ -271,40 +271,53 @@ def test_all_rework_prompts_names_are_reexported_by_identity() -> None:
     function would compare unequal-but-structurally-similar in ways that are
     easy to miss.
 
-    The ``len(names) == 17`` assertion below is a second, independent
+    The ``len(names) == 16`` assertion below is a second, independent
     anti-vacuity guard: it is the only thing in this file that proves
     ``_module_level_defined_names`` is still walking the ``Assign`` branch
     (the 4 module constants: ``_EXTERNAL_FINDINGS_POINTER``,
     ``_EXTERNAL_FINDINGS_SECTION_INTRO``, ``_REQUIRED_CHANGES_TIER1_INTRO``,
     ``_ROUND_COMPARE_KEYS``), not just ``FunctionDef``. A regression that
-    silently dropped that branch would shrink ``names`` to the 13 functions,
+    silently dropped that branch would shrink ``names`` to the 12 functions,
     and every remaining assertion in this test -- and in the AC5
     completeness test below, which draws its own candidate set from this
-    same helper -- would keep passing while quietly stopping to cover 13 of
-    the 17 moved/added units.
+    same helper -- would keep passing while quietly stopping to cover 12 of
+    the 16 moved/added units.
 
     Issue #1270 (W13) added two more free functions here --
     ``_round_history_entries`` and ``_render_round_findings`` -- bringing the
     count from 14 to 16 (12 core-chain functions + _write_text_atomic + 3
     constants). Neither is reached by this file's own consumer-reference
-    scan (AC5 below): both are called only by bare-name call sites inside
+    scan (AC5 below): both were called only by bare-name call sites inside
     ``OrchestratorApp._build_prior_review_section``, which stays in
-    workflow.py, so they join the "reached only by bare-name call sites"
+    workflow.py, so they joined the "reached only by bare-name call sites"
     bucket AC5's docstring already describes for 8 of the original 14 names.
     A #1270 review-round-1 fix then hoisted a fifth constant,
     ``_REQUIRED_CHANGES_TIER1_INTRO`` (previously a literal restated in two
-    places), bringing the count to 17; it joins the same bare-name-only
+    places), bringing the count to 17; it joined the same bare-name-only
     bucket, referenced only inside ``_render_required_changes_section`` and
     ``_render_round_findings``, both of which stay in rework_prompts.py.
+
+    Issue #1362 Stage 1 then hoisted ``_round_history_entries`` itself OUT
+    of this module into ``charlie_work.review_decision`` (the new
+    single-reader module) -- this file now imports it rather than defining
+    it, so it drops out of ``_module_level_defined_names``'s AST walk
+    entirely (that helper only sees ``FunctionDef``/``Assign``/
+    ``AnnAssign``, never ``ImportFrom``), bringing the count back down to
+    16. ``workflow.py``'s facade import of ``_round_history_entries`` at
+    line 334 keeps resolving through the new import chain (``workflow`` ->
+    ``rework_prompts`` -> ``review_decision``), so the identity check below
+    still holds for it even though it is no longer in ``names``.
     """
     import charlie_work.rework_prompts as rework_prompts
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_REWORK_PROMPTS_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 17, (
-        f"expected 17 moved/added units (12 core-chain functions + "
-        f"_write_text_atomic + 4 constants), found {len(names)}: {sorted(names)}"
+    assert len(names) == 16, (
+        f"expected 16 moved/added units (11 core-chain functions + "
+        f"_write_text_atomic + 4 constants, after issue #1362 Stage 1 hoisted "
+        f"_round_history_entries out to review_decision.py), found {len(names)}: "
+        f"{sorted(names)}"
     )
 
     missing_from_facade = [n for n in names if not hasattr(workflow, n)]
