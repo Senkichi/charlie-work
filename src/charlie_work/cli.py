@@ -23,7 +23,11 @@ from .fleet_dispatch import (
     run_fleet_supervise,
     run_fleet_supervise_loop,
 )
-from .supervise_loop import DEFAULT_MAX_RELAUNCHES, EXIT_RESTART_REQUESTED
+from .supervise_loop import (
+    DEFAULT_MAX_RELAUNCHES,
+    EXIT_RESTART_REQUESTED,
+    PREFLIGHT_REFUSAL_EXIT_CODE,
+)
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .global_config import load_layered_config
@@ -2661,6 +2665,16 @@ def main(argv: list[str] | None = None) -> int:
     # out the interval exactly as in #862.
     if isinstance(result.data, dict) and result.data.get("restart_requested"):
         return EXIT_RESTART_REQUESTED
+
+    # Issue #1363: a fatal preflight failure at supervisor startup (disk
+    # floor, wrong venv/checkout) exits PREFLIGHT_REFUSAL_EXIT_CODE (4), not
+    # the generic 1 -- so the fleet pass log and the supervise-loop wrapper
+    # can both distinguish "refused to start, named reason" from an ordinary
+    # crash. Read out of result.data the same way restart_requested is,
+    # above: main() is generic across every command, and this keeps the
+    # signal out of the command-name dispatch.
+    if isinstance(result.data, dict) and result.data.get("preflight_refused"):
+        return PREFLIGHT_REFUSAL_EXIT_CODE
 
     return 0 if result.ok else 1
 

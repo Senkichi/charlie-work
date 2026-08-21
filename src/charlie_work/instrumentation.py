@@ -174,6 +174,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "intake_failed": "error",
         "janitor_rework_cycle_failed": "error",
         "janitor_rework_escalated": "error",
+        # Issue #1363: a fatal preflight check (disk_floor, venv_identity)
+        # failed at the top of a loop pass, so `_loop_body` never ran this
+        # pass -- no partial work was created. Error, not warning: this is
+        # the pass's terminal outcome, the replacement for what used to be a
+        # generic mid-pass crash (e.g. `fleet_pass_config_error`).
+        "loop_refused_preflight": "error",
         "merge_blocked": "error",
         "merge_deferred_stale_base_alarm": "error",
         "merge_failed": "error",
@@ -298,6 +304,16 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # (workflow.py), never from pr_create_retry.py itself -- that module
         # has no state_file/fingerprint state to dedup against.
         "pr_create_failed_branch_stranded": "warning",
+        # Issue #1363: a non-fatal preflight check (clock_sanity) failed at
+        # the top of a loop pass. Warning, not error: the pass still ran
+        # (_loop_body was not skipped) -- this is a tripwire for an operator
+        # to notice, not a terminal outcome for the pass.
+        "preflight_warning": "warning",
+        # Issue #1363: config_freshness detected a config file mtime change
+        # since the supervisor loaded it (or since the last pass that
+        # observed it) -- the silent-inert-edit trap made loud. Warning, not
+        # error: this does not hot-reload or block the pass.
+        "preflight_config_stale": "warning",
         "quota_probe_failed": "warning",
         "required_changes_vacuous": "warning",
         "review_dispatch_lifecycle_reaped": "warning",

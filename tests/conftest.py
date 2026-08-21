@@ -10,6 +10,7 @@ from unittest.mock import create_autospec
 
 import pytest
 
+from charlie_work.preflight import PreflightResult
 
 _UNSET = object()
 
@@ -164,3 +165,43 @@ def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     import charlie_work.pr_create_retry as pr_create_retry_module
 
     monkeypatch.setattr(pr_create_retry_module, "_default_sleep", lambda seconds: None)
+
+
+def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:
+    return PreflightResult(checks=())
+
+
+@pytest.fixture(autouse=True)
+def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #1363: default every test to a healthy ``run_preflight`` result.
+
+    The preflight gate wired into ``OrchestratorApp._loop_impl`` and
+    ``fleet_dispatch.run_fleet_supervise`` (``charlie_work.workflow.run_preflight``
+    and ``charlie_work.fleet_dispatch.run_preflight`` respectively -- each module
+    imported its own reference, so both must be patched independently) inspects
+    the REAL host: free disk space, ``sys.executable``'s location relative to a
+    conventional ``.venv``, ``charlie_work.__file__``'s location, and
+    ``state.json``'s mtime versus wall clock. That is exactly the point of the
+    check in production, but it means every pre-existing test that drives
+    ``OrchestratorApp(...).loop()`` or ``run_fleet_supervise(...)`` -- none of
+    which exist to test host preconditions -- would otherwise pass or fail
+    depending on incidental facts about whichever machine/venv/checkout layout
+    pytest happens to run under. Worktree-based local test runs in particular
+    put ``sys.executable`` under a DIFFERENT checkout's venv than
+    ``charlie_work.__file__`` resolves to, by deliberate project convention
+    (see CLAUDE.md's Worktree Discipline section) -- which is indistinguishable,
+    to this check, from the real wrong-venv bug class it exists to catch.
+    Confirmed by measurement: leaving ``fleet_dispatch``'s reference unpatched
+    made every ``test_run_fleet_supervise_*``/``test_supervisor_lifecycle_*``
+    test fail, and that failure's early return without the normal lock
+    teardown cascaded into unrelated ``test_cli.py`` fleet-registry pollution.
+
+    Tests that target the preflight gate's OWN wiring re-monkeypatch
+    ``run_preflight`` inside their own test body via the same ``monkeypatch``
+    fixture instance, which cleanly overrides this default for the duration of
+    that one test (`test_charlie_work.py`'s two dedicated wiring tests;
+    `test_supervise_loop.py`'s tests script the subprocess boundary directly
+    and never import either module).
+    """
+    monkeypatch.setattr("charlie_work.workflow.run_preflight", _healthy_preflight)
+    monkeypatch.setattr("charlie_work.fleet_dispatch.run_preflight", _healthy_preflight)

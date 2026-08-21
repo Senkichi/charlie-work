@@ -775,8 +775,35 @@ class AutoMergeConfig:
 
 
 @dataclass(frozen=True)
+class PreflightConfig:
+    """Thresholds and fatal/non-fatal classification for ``preflight.py``'s
+    four host-precondition checks (issue #1363). Defaults match the issue's
+    explicit design: disk_floor and venv_identity are fatal (refuse the
+    pass); clock_sanity and config_freshness are non-fatal tripwires (emit
+    an event, pass proceeds). Never hardcode these values at a call site --
+    read them from here so an operator can retune per host without a code
+    change.
+    """
+
+    #: Minimum free disk space, in GB, on each volume hosting state_dir/repo
+    #: root. Below this, disk_floor fails. 2026-08-19 outage: C: hit 0 bytes
+    #: free; a refusal here replaces 8 noisy aborted passes with one.
+    disk_floor_gb: int = 10
+    disk_floor_fatal: bool = True
+    #: Bound (hours) on state.json's age before clock_sanity flags it as
+    #: stale/skewed. A negative age (state.json mtime in the future) always
+    #: flags regardless of this bound.
+    clock_max_skew_hours: float = 48.0
+    clock_sanity_fatal: bool = False
+    venv_identity_fatal: bool = True
+    config_freshness_fatal: bool = False
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     state_dir: str = layout.DEFAULT_STATE_DIR
+    # Preflight gate thresholds (issue #1363) -- see PreflightConfig.
+    preflight: PreflightConfig = field(default_factory=PreflightConfig)
     # Repo-local template dir searched before the package defaults. Relative
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None
@@ -2346,6 +2373,61 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
                 f"must be >= 0, got {repair_cap}"
             )
+    # Parse preflight sub-section (issue #1363).
+    preflight_data = runtime_data.get("preflight")
+    if preflight_data is not None:
+        if not isinstance(preflight_data, dict):
+            raise ConfigError(
+                "config section 'runtime' key 'preflight' must be a mapping, "
+                f"got {type(preflight_data).__name__}"
+            )
+        preflight_fields = {f.name for f in fields(PreflightConfig)}
+        unknown_preflight_keys = sorted(set(preflight_data) - preflight_fields)
+        if unknown_preflight_keys:
+            raise ConfigError(
+                "config section 'runtime' key 'preflight' has unknown key(s): "
+                f"{', '.join(unknown_preflight_keys)} "
+                f"(valid: {', '.join(sorted(preflight_fields))})"
+            )
+        disk_floor_gb = preflight_data.get("disk_floor_gb")
+        if disk_floor_gb is not None:
+            if not isinstance(disk_floor_gb, int) or isinstance(disk_floor_gb, bool):
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.disk_floor_gb' must be an int, "
+                    f"got {type(disk_floor_gb).__name__}"
+                )
+            if disk_floor_gb < 0:
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.disk_floor_gb' must be >= 0, "
+                    f"got {disk_floor_gb}"
+                )
+        clock_max_skew_hours = preflight_data.get("clock_max_skew_hours")
+        if clock_max_skew_hours is not None:
+            if not isinstance(clock_max_skew_hours, (int, float)) or isinstance(
+                clock_max_skew_hours, bool
+            ):
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be a "
+                    f"number, got {type(clock_max_skew_hours).__name__}"
+                )
+            if clock_max_skew_hours < 0:
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be >= 0, "
+                    f"got {clock_max_skew_hours}"
+                )
+        for bool_key in (
+            "disk_floor_fatal",
+            "clock_sanity_fatal",
+            "venv_identity_fatal",
+            "config_freshness_fatal",
+        ):
+            bool_value = preflight_data.get(bool_key)
+            if bool_value is not None and not isinstance(bool_value, bool):
+                raise ConfigError(
+                    f"config section 'runtime' key 'preflight.{bool_key}' must be a bool, "
+                    f"got {type(bool_value).__name__}"
+                )
+        runtime_data["preflight"] = PreflightConfig(**preflight_data)
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")
     for command_key in ("dispatch_command", "shell_command"):
