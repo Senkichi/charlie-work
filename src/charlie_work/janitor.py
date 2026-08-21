@@ -414,7 +414,9 @@ def run_janitor(
             "stale-CI (all findings cite required checks that are green now)"
         )
     elif repo_root is not None:
-        is_no_op_rework = _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
+        is_no_op_rework = _check_no_op_rework(
+            pr, pr_state, failures, warnings, repo_root, pr_diff, review_decision=review_decision
+        )
 
     is_check_failure_block = bool(failed_required_checks) and not failures
 
@@ -715,12 +717,14 @@ def _check_no_op_rework(
     warnings: list[str],
     repo_root: Path,
     pr_diff: str | None = None,
+    *,
+    review_decision: Mapping[str, Any] | None = None,
 ) -> bool:
     """Check if the PR has actual content changes since a request_changes verdict.
 
-    When a PR has a request_changes verdict in its state, compare the current
-    patch-id against the reviewed_patch_id from that verdict. If they match,
-    the rework produced no actual content changes (no-op rework).
+    When a PR has a request_changes verdict, compare the current patch-id
+    against the reviewed_patch_id from that verdict. If they match, the
+    rework produced no actual content changes (no-op rework).
 
     This is superior to head SHA comparison because base-update merges can
     advance the head SHA without changing the actual diff content (issue #222).
@@ -736,8 +740,13 @@ def _check_no_op_rework(
     if not pr_state:
         return False
 
-    # Check if the most recent verdict was request_changes
-    decision = pr_state.get("decision")
+    # Issue #1362 Stage 1: the "was the last verdict request_changes" gate must
+    # read the file-first review_decision mapping (run_janitor's own
+    # ``review_decision`` param, already resolved by callers via
+    # ``self._review_decision(pr_number)``), never ``pr_state["decision"]``
+    # directly -- otherwise a crash between the file write and the state write
+    # leaves this check acting on stale state.json (the #1340 divergence class).
+    decision = (review_decision or {}).get("decision")
     if decision != "request_changes":
         return False
 

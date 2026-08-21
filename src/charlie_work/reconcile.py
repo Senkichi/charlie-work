@@ -45,6 +45,7 @@ from .labels import TransitionOutcome, transition
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
+from .review_decision import review_decision as _resolve_review_decision
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
@@ -426,46 +427,23 @@ AVIATOR_CHECK_NAME = "aviator/checks"
 AVIATOR_BLOCKED_MESSAGE = "PR has a blocked label, remove to re-queue"
 
 
-def _read_review_decision(
-    config: OrchestratorConfig, repo_root: Path, pr_number: int
-) -> dict[str, Any] | None:
-    """Best-effort read of ``review-decision.json`` for *pr_number*.
-
-    Returns ``None`` on any absence/read/parse failure (missing file, OS
-    error, malformed JSON, or a JSON value that isn't an object) -- never
-    raises. Callers that need fail-closed behavior treat ``None`` the same
-    as "not approved"; callers building a human-readable explanation (e.g.
-    ``detect_mergequeue_not_approved``) use it to distinguish *why*.
-    """
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
-    decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
-    if not decision_path.exists():
-        return None
-    try:
-        with decision_path.open("r", encoding="utf-8") as handle:
-            decision = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(decision, dict):
-        return None
-    return decision
-
-
 def _pr_review_approved_at_head(
     config: OrchestratorConfig, repo_root: Path | None, pr_number: int, head_sha: str
 ) -> bool:
-    """Mirror ``OrchestratorApp._review_decision``'s approval gate.
+    """Mirror the single review-decision reader's approval gate (issue #1362).
 
     Re-adding the Aviator ``mergequeue`` label must never be safer than the
-    normal ship_it path, which only queues a PR when its review-decision.json
-    records ``decision == "approved"`` at the PR's *current* head. Without
-    this check, ``detect_aviator_stale_blocked`` re-queued job-cannon PR
-    #1408 (issue #1404) and PR #1392 (issue #1268) for Aviator merge while
+    normal ship_it path, which only queues a PR when its review decision
+    resolves to ``decision == "approved"`` at the PR's *current* head.
+    Without this check, ``detect_aviator_stale_blocked`` re-queued job-cannon
+    PR #1408 (issue #1404) and PR #1392 (issue #1268) for Aviator merge while
     their recorded decisions were ``request_changes``/never-reviewed --
     Aviator then merged both unreviewed once CI was green, since Aviator's
     own admission check knows nothing about ``review-decision.json``.
-    Returns ``False`` (fail closed) when *repo_root* is unavailable or no
-    matching approved-at-head decision can be read.
+    Returns ``False`` (fail closed) when *repo_root* is unavailable, no
+    decision can be resolved at all, or the resolved decision is stale
+    (``reviewed_head_sha`` does not match *head_sha* -- ``review_decision``'s
+    own staleness check, not a re-derived comparison here).
 
     ``detect_mergequeue_not_approved`` (issue #819) reuses this exact
     predicate as its revocation gate: the label is removed whenever this
@@ -473,10 +451,9 @@ def _pr_review_approved_at_head(
     """
     if repo_root is None:
         return False
-    decision = _read_review_decision(config, repo_root, pr_number)
-    if decision is None or decision.get("decision") != "approved":
-        return False
-    return decision.get("reviewed_head_sha") == head_sha
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    resolved = _resolve_review_decision(paths.prs / f"pr-{pr_number}", None, head_sha)
+    return resolved.decision == "approved" and not resolved.stale
 
 
 def detect_aviator_stale_blocked(
@@ -613,13 +590,14 @@ def _mergequeue_revocation_detail(
     payload makes the distinction explicit rather than collapsing both into
     one indistinguishable string.
     """
-    decision = _read_review_decision(config, repo_root, pr_number)
-    if decision is None:
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    resolved = _resolve_review_decision(paths.prs / f"pr-{pr_number}", None, head_sha)
+    if resolved.missing:
         return f"no readable review-decision.json for PR #{pr_number}"
-    verdict = decision.get("decision")
+    verdict = resolved.decision
     if verdict != "approved":
         return f"recorded decision is {verdict!r}, not 'approved'"
-    reviewed_head = decision.get("reviewed_head_sha")
+    reviewed_head = resolved.reviewed_head_sha
     reviewed_head_display = str(reviewed_head)[:12] if reviewed_head else repr(reviewed_head)
     return (
         f"approved at stale head {reviewed_head_display} but current head is "
