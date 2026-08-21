@@ -192,7 +192,24 @@ def touch_repo(
         # registry-pollution issue: both are "operator/test context leaks
         # into the live fleet registry surface" defects).
         existing_root_str = entry.get("repo_root") if entry else None
-        if existing_root_str:
+        # Cheap string-equality short-circuit (issue #1376 round-2 review):
+        # the steady-state case -- the canonical repo touching its own
+        # already-registered entry with the same ``repo_root`` string --
+        # is by far the most common path (nearly every CLI invocation).
+        # Skip the git-subprocess resolution in that case so the
+        # fleet-wide ``state_lock`` is not held across 2-3 ``git`` calls
+        # for a repoint that cannot be happening.  Only when the incoming
+        # ``repo_root`` string actually differs from the registered one do
+        # we pay for ``_resolved_canonical_root`` to distinguish a sibling
+        # clone (old root still live) from a moved repo (old root gone).
+        # The short-circuit is safe as a *filter*: a false "differ"
+        # (strings differ but paths are canonically the same) falls
+        # through to the expensive but correct resolution, which is the
+        # original behavior -- never a regression.  A false "equal" is
+        # impossible because the stored value is itself ``str(repo_root)``
+        # from a prior write (line above), so equal strings mean the same
+        # path was registered.
+        if existing_root_str and existing_root_str != str(repo_root):
             normalized_existing = _resolved_canonical_root(Path(existing_root_str))
             if normalized_existing is not None and normalized_existing != repo_root:
                 logger.warning(

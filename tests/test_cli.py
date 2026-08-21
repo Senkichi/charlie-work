@@ -2738,6 +2738,70 @@ def test_touch_repo_allows_repoint_when_old_root_no_longer_a_git_repo(
     assert entry["state_dir"] == str(new_paths.root)
 
 
+def test_touch_repo_steady_state_skips_canonical_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1376 round-2 review: the sibling-clone repoint guard must NOT
+    spawn git subprocesses (via ``_resolved_canonical_root``) on the
+    steady-state path -- the canonical repo touching its own
+    already-registered entry with the same ``repo_root`` string.  That path
+    runs on nearly every CLI invocation while the fleet-wide ``state_lock``
+    is held, so unconditionally resolving the canonical root there is a
+    real lock-hold-time regression.
+
+    The cheap string-equality short-circuit (``existing_root_str !=
+    str(repo_root)``) skips the resolution when the strings match.  This
+    test monkeypatches ``_resolved_canonical_root`` to fail the test if
+    called on a steady-state touch, then confirms a second touch from the
+    same canonical root (a) does not call it and (b) still bumps
+    ``last_seen``.
+    """
+    import charlie_work.fleet_registry as fr
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    class _NWOGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "test/canonical"
+
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    canonical_paths = runtime_paths(canonical, ".var/charlie-work")
+
+    # First touch registers the entry (no existing entry -> short-circuit
+    # branch is skipped because existing_root_str is None).
+    touch_repo(str(fleet_dir), canonical, canonical_paths, _NWOGitHub(repo_root=canonical))
+    fleet_json = fleet_dir / "fleet.json"
+    registry = json.loads(fleet_json.read_text(encoding="utf-8"))
+    first_seen = registry["repos"]["test/canonical"]["first_seen"]
+    first_last_seen = registry["repos"]["test/canonical"]["last_seen"]
+
+    # Sentinel: _resolved_canonical_root must NOT be called on a steady-state
+    # touch (same repo_root string as the registered entry).
+    def _no_resolution_call(path: Path) -> Path | None:  # noqa: ANN001
+        raise AssertionError(
+            "_resolved_canonical_root must not be called on a steady-state "
+            "touch (same repo_root string); the short-circuit should skip it "
+            f"(called with {path!r})"
+        )
+
+    monkeypatch.setattr(fr, "_resolved_canonical_root", _no_resolution_call)
+
+    # Second touch from the SAME canonical root with the SAME string --
+    # the steady-state path.  Must not raise (short-circuit took effect)
+    # and must still bump last_seen.
+    touch_repo(str(fleet_dir), canonical, canonical_paths, _NWOGitHub(repo_root=canonical))
+
+    registry = json.loads(fleet_json.read_text(encoding="utf-8"))
+    entry = registry["repos"]["test/canonical"]
+    assert entry["repo_root"] == str(canonical)
+    assert entry["first_seen"] == first_seen
+    assert entry["last_seen"] >= first_last_seen
+
+
 # --------------------------------------------------------------------------
 # runners shadow-status (issue #909)
 # --------------------------------------------------------------------------
