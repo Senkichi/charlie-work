@@ -279,6 +279,92 @@ def _primitive_name(node: ast.Call) -> str | None:
     return None
 
 
+def _bare_primitive_name(expr: ast.expr) -> str | None:
+    """If `expr` is a bare `Name` or `Attribute` whose id/attr is one of the
+    six gated primitives, return that primitive name. Otherwise None.
+
+    This is the alias-source detector for issue #1374: a parameter DEFAULT
+    or an Assign VALUE that is a bare primitive reference (e.g.
+    `log_event_fn=log_event` or `_LOG = instrumentation.log_event`) makes
+    the parameter/variable name an alias for that primitive. Receiver-
+    agnostic, same shape as `_primitive_name` but applied to default/value
+    expressions rather than call func expressions."""
+    if isinstance(expr, ast.Name) and expr.id in _GATED_PRIMITIVE_NAMES:
+        return expr.id
+    if isinstance(expr, ast.Attribute) and expr.attr in _GATED_PRIMITIVE_NAMES:
+        return expr.attr
+    return None
+
+
+def _collect_function_param_aliases(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> dict[str, str]:
+    """Issue #1374: return a mapping of parameter name -> underlying
+    primitive name for parameters whose DEFAULT is a bare Name/Attribute
+    matching a gated primitive.
+
+    The injectable-default-for-testability pattern
+    (`def f(emit=log_event): emit(...)`) is GOOD style this repo actively
+    uses, but it is also the pattern that silently exits the R9 ratchet:
+    the scanner's `_primitive_name` matches by literal name only, so a call
+    through the parameter name is invisible. This mapping lets the walk
+    resolve such calls to the underlying primitive and classify them into
+    the same four buckets.
+
+    Convention B `write_gate` parameters are NOT aliases (they have their
+    own lane) and are excluded by construction: 'write_gate' is not in
+    `_GATED_PRIMITIVE_NAMES`, so `_bare_primitive_name` returns None for it
+    regardless of its default.
+
+    Alias resolution stays local and static -- one function scope, default
+    expression only, no dataflow analysis. A parameter reassigned inside
+    the body to something else is still treated as an alias (fail-closed:
+    a false positive is caught by the ratchet and dispositioned, a false
+    negative is the silent hole this scanner exists to prevent)."""
+    aliases: dict[str, str] = {}
+    args = func_node.args
+    # Positional defaults align with the TAIL of posonlyargs+args.
+    posargs = [*args.posonlyargs, *args.args]
+    paired = zip(posargs[-len(args.defaults) :], args.defaults)
+    for arg, default in paired:
+        prim = _bare_primitive_name(default)
+        if prim is not None:
+            aliases[arg.arg] = prim
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is None:
+            continue
+        prim = _bare_primitive_name(default)
+        if prim is not None:
+            aliases[arg.arg] = prim
+    return aliases
+
+
+def _collect_module_aliases(tree: ast.Module) -> dict[str, str]:
+    """Issue #1374: return a mapping of variable name -> underlying
+    primitive name for module-level `Assign` statements whose value is a
+    bare Name/Attribute matching a gated primitive.
+
+    The module-level alias pattern (`_LOG = log_event` followed by
+    `_LOG(...)`) is the other obvious spelling of the injectable-default
+    escape, and gets the same treatment. Only simple `Name` targets are
+    considered (no tuple unpacking, no attribute targets) -- a complex
+    target is not the "obvious spelling" the issue names, and adding it
+    would be speculative scope. Only top-level statements are scanned: an
+    alias assigned inside a function body is a local variable, not a
+    module alias, and is invisible to this pass by design (no dataflow
+    analysis)."""
+    aliases: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            prim = _bare_primitive_name(stmt.value)
+            if prim is None:
+                continue
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    aliases[target.id] = prim
+    return aliases
+
+
 def _is_write_gate_receiver(value: ast.expr) -> bool:
     """True if `value` statically looks like a WriteGate instance.
 
@@ -454,6 +540,19 @@ def _scan_module_for_raw_primitive_calls(
     `_function_own_body_uses_write_gate`); a site directly at module level
     (`scope == "<module>"`) is never in-predicate -- there is no enclosing
     function to carry a `write_gate` parameter or reference.
+
+    Issue #1374 alias resolution: a call through a parameter name whose
+    DEFAULT is a bare primitive (`def f(emit=log_event): emit(...)`) or
+    through a module-level alias (`_LOG = log_event; _LOG(...)`) is resolved
+    to the underlying primitive and classified into the same four buckets.
+    Alias resolution is local and static -- one function scope for param
+    aliases (a nested closure does NOT inherit the parent's param aliases,
+    mirroring the closure-scoping rule for `in_predicate`), default
+    expression only, no dataflow analysis. Module-level aliases apply in
+    every scope (a local param alias shadows a module alias of the same
+    name, matching Python's own scoping). Fail-closed: an alias call that
+    cannot be dispositioned lands in the unaccounted bucket and trips the
+    ratchet, same as a directly-named raw call.
     """
     sites: list[_RawPrimitiveSite] = []
     occurrence_counts: dict[tuple[str, str, str], int] = {}
@@ -464,10 +563,39 @@ def _scan_module_for_raw_primitive_calls(
     # scanner inherits from test_instrumentation.py's own idiom -- not
     # something R9 asked PR4 to solve.
     scope_uses_write_gate: dict[str, bool] = {}
+    # Issue #1374: per-scope param-alias map (param name -> primitive name).
+    # Keyed by the same unqualified scope name as scope_uses_write_gate and
+    # subject to the same collision limit.
+    scope_param_aliases: dict[str, dict[str, str]] = {}
+    # Issue #1374: module-level alias map (var name -> primitive name),
+    # computed once from top-level Assign statements. Applies in every
+    # scope; a local param alias of the same name takes precedence.
+    module_aliases: dict[str, str] = (
+        _collect_module_aliases(tree) if isinstance(tree, ast.Module) else {}
+    )
+
+    def _resolve_call_primitive(node: ast.Call, scope_name: str) -> str | None:
+        """Direct name match first (the existing scanner path); if that
+        misses, alias resolution for issue #1374 -- a bare-Name call whose
+        id is a param alias for this scope or a module-level alias."""
+        prim = _primitive_name(node)
+        if prim is not None:
+            return prim
+        func = node.func
+        if not isinstance(func, ast.Name):
+            return None
+        # Scope param aliases take precedence (a local param shadows a
+        # module-level alias of the same name, matching Python scoping).
+        param_aliases = scope_param_aliases.get(scope_name)
+        if param_aliases is not None and func.id in param_aliases:
+            return param_aliases[func.id]
+        if func.id in module_aliases:
+            return module_aliases[func.id]
+        return None
 
     def walk(node: ast.AST, scope_name: str) -> None:
         if isinstance(node, ast.Call):
-            primitive = _primitive_name(node)
+            primitive = _resolve_call_primitive(node, scope_name)
             if primitive is not None and not _is_gate_covered_call(node):
                 exempt = (
                     apply_legacy_exemption
@@ -499,6 +627,7 @@ def _scan_module_for_raw_primitive_calls(
             # different classes sharing a name produce the same scope
             # string -- documented limit, see above).
             scope_uses_write_gate[node.name] = _function_own_body_uses_write_gate(node)
+            scope_param_aliases[node.name] = _collect_function_param_aliases(node)
             for child in ast.iter_child_nodes(node):
                 walk(child, node.name)
             return
@@ -950,6 +1079,300 @@ def test_scanner_recognizes_a_write_gate_referencing_closure_as_its_own_in_predi
     assert site.in_predicate, (
         "a closure that itself references write_gate is in-predicate on its own terms"
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1374: injectable-default-alias and module-level-alias resolution.
+#
+# The scanner's `_primitive_name` matches by literal name only, so a call
+# through a parameter whose DEFAULT is a bare primitive
+# (`def f(emit=log_event): emit(...)`) or through a module-level alias
+# (`_LOG = log_event; _LOG(...)`) is invisible -- silently exiting the R9
+# ratchet. These tests prove the alias-resolution extension actually fires.
+# ---------------------------------------------------------------------------
+
+
+def test_scanner_detects_injectable_default_alias_call() -> None:
+    """Issue #1374 acceptance criterion 1: a function with a parameter
+    whose DEFAULT is a bare primitive name, and a call through that
+    parameter name, is counted as a raw call to the underlying primitive.
+    This is the exact pattern `preflight.py`'s `emit_preflight_refusal`
+    uses (`log_event_fn: Callable = log_event`), which the pre-fix scanner
+    reported 0 sites for in the same pass it reported 271 for workflow.py.
+    """
+    source = textwrap.dedent(
+        """
+        def emit_preflight_refusal(state_path, check, *, log_event_fn=log_event):
+            log_event_fn(state_path, "loop_refused_preflight", {"check": check.name})
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 1, f"expected the alias call to be visible, found: {sites}"
+    (site,) = sites
+    assert site.primitive == "log_event", (
+        "the alias call must be classified as the underlying primitive, not the alias name"
+    )
+    assert site.scope == "emit_preflight_refusal"
+    assert site.call_source.startswith("log_event_fn("), (
+        "call_source must be the actual call text (alias name), not the resolved primitive"
+    )
+    assert not site.in_predicate, (
+        "a function whose only WriteGate-shaped reference is a primitive alias "
+        "(not a write_gate param or self.write_gate call) is NOT in-predicate -- "
+        "the alias is a raw primitive reference, not WriteGate usage"
+    )
+
+
+def test_scanner_detects_injectable_default_alias_keyword_only_param() -> None:
+    """The alias pattern with a keyword-only parameter (the real
+    `emit_preflight_refusal` shape uses `*, log_event_fn=log_event`)."""
+    source = textwrap.dedent(
+        """
+        def f(state, *, emit=append_event):
+            state = emit(state, "k", {})
+            return state
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 1, f"kw-only alias not detected: {sites}"
+    assert sites[0].primitive == "append_event"
+
+
+def test_scanner_detects_injectable_default_alias_attribute_default() -> None:
+    """A parameter whose default is a bare Attribute matching a primitive
+    (e.g. `fn=instrumentation.log_event`) is also resolved -- the issue
+    names 'Name/Attribute' for parameter defaults."""
+    source = textwrap.dedent(
+        """
+        def f(state, fn=instrumentation.log_event):
+            fn(state, "k", {})
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 1, f"Attribute-default alias not detected: {sites}"
+    assert sites[0].primitive == "log_event"
+
+
+def test_scanner_detects_module_level_alias_call() -> None:
+    """Issue #1374 acceptance criterion 2: a module-level
+    `_ALIAS = log_event` followed by `_ALIAS(...)` is counted as a raw
+    call to the underlying primitive. This is the other obvious spelling
+    of the injectable-default escape."""
+    source = textwrap.dedent(
+        """
+        _LOG = log_event
+
+        def f(state_path):
+            _LOG(state_path, "kind", {"x": 1})
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 1, f"module-level alias call not detected: {sites}"
+    (site,) = sites
+    assert site.primitive == "log_event"
+    assert site.scope == "f", "the call inside f() is attributed to f, not <module>"
+    assert site.call_source.startswith("_LOG(")
+
+
+def test_scanner_detects_module_level_alias_at_module_scope() -> None:
+    """A module-level alias called at module scope (not inside a function)
+    is attributed to `<module>` and is never in-predicate."""
+    source = textwrap.dedent(
+        """
+        _SAVE = save_state
+        _SAVE(path, {"init": True})
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 1, f"module-scope alias call not detected: {sites}"
+    (site,) = sites
+    assert site.primitive == "save_state"
+    assert site.scope == "<module>"
+    assert not site.in_predicate
+
+
+def test_scanner_detects_module_level_alias_with_attribute_value() -> None:
+    """A module-level alias whose value is a bare Attribute matching a
+    primitive (`_LOG = instrumentation.log_event`) is also resolved."""
+    source = textwrap.dedent(
+        """
+        _LOG = instrumentation.log_event
+
+        def f(state_path):
+            _LOG(state_path, "kind", {})
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 1, f"Attribute-value module alias not detected: {sites}"
+    assert sites[0].primitive == "log_event"
+
+
+def test_scanner_does_not_flag_a_non_primitive_default_alias() -> None:
+    """Negative control: a parameter whose default is NOT a gated
+    primitive (e.g. `emit=print`) must not be resolved -- the scanner
+    should report zero sites for a call through it."""
+    source = textwrap.dedent(
+        """
+        def f(msg, emit=print):
+            emit(msg)
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+    assert sites == [], f"non-primitive default alias incorrectly flagged: {sites}"
+
+
+def test_scanner_does_not_flag_a_module_level_alias_to_non_primitive() -> None:
+    """Negative control: a module-level alias whose value is not a gated
+    primitive must not be resolved."""
+    source = textwrap.dedent(
+        """
+        _PRINT = print
+
+        def f(msg):
+            _PRINT(msg)
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+    assert sites == [], f"non-primitive module alias incorrectly flagged: {sites}"
+
+
+def test_scanner_param_alias_does_not_leak_into_nested_closure() -> None:
+    """Closure scoping for aliases mirrors the closure-scoping rule for
+    `in_predicate`: a nested closure does NOT inherit the parent's param
+    aliases. If the closure's own params don't alias a primitive, a call
+    through the parent's alias name inside the closure is NOT resolved --
+    it is a free variable capture, which is outside the static, one-scope
+    alias resolution the issue specifies (no dataflow analysis). This
+    prevents a parent's `emit=log_event` from silently making a closure's
+    `emit(...)` visible when the closure captured a differently-typed
+    variable of the same name."""
+    source = textwrap.dedent(
+        """
+        def outer(state, emit=log_event):
+            def inner(emit=print):
+                emit(state, "k", {})
+            return inner
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+    # inner's own `emit=print` default shadows outer's `emit=log_event`;
+    # the call inside inner is through inner's `emit` (print), not a
+    # primitive alias -- zero sites.
+    assert sites == [], (
+        f"parent param alias leaked into closure whose own param shadows it: {sites}"
+    )
+
+
+def test_scanner_module_alias_applies_inside_nested_closure() -> None:
+    """Unlike param aliases (which are scope-local), a module-level alias
+    applies in every scope, including nested closures -- the closure
+    captures the module global, and the alias is a module-level fact, not
+    a scope-local one."""
+    source = textwrap.dedent(
+        """
+        _LOG = log_event
+
+        def outer():
+            def inner(state_path):
+                _LOG(state_path, "k", {})
+            return inner
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 1, f"module alias not detected inside nested closure: {sites}"
+    (site,) = sites
+    assert site.scope == "inner"
+    assert site.primitive == "log_event"
+
+
+def test_scanner_param_alias_shadows_module_alias() -> None:
+    """A local param alias of the same name as a module alias takes
+    precedence (matching Python's own scoping: a local variable shadows a
+    module global). If the param aliases a DIFFERENT primitive than the
+    module alias, the call is resolved to the param's primitive."""
+    source = textwrap.dedent(
+        """
+        _FN = save_state
+
+        def f(state, fn=append_event):
+            state = fn(state, "k", {})
+            return state
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 1, f"param-alias-shadow not resolved: {sites}"
+    assert sites[0].primitive == "append_event", (
+        "the local param alias (append_event) must shadow the module alias (save_state)"
+    )
+
+
+def test_scanner_alias_call_in_predicate_function_is_in_predicate() -> None:
+    """If a function that uses WriteGate (has a `write_gate` param) ALSO
+    has a primitive-alias param and calls through it, the alias call is
+    in-predicate -- it is a raw call inside a WriteGate-using function,
+    subject to the exclusive-use rule, not merely ratcheted. This is the
+    'mixed usage' defect class applied to aliases."""
+    source = textwrap.dedent(
+        """
+        def f(state, write_gate, emit=log_event):
+            write_gate = require_write_gate(write_gate)
+            write_gate.append_event(state, "k", {})
+            emit(state, "other", {})
+            return state
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    alias_sites = [s for s in sites if s.primitive == "log_event"]
+    assert len(alias_sites) == 1, f"alias call not detected in predicate function: {sites}"
+    assert alias_sites[0].in_predicate, (
+        "an alias call inside a WriteGate-using function is in-predicate -- "
+        "it is subject to the exclusive-use rule, not merely ratcheted"
+    )
+
+
+def test_scanner_assigns_distinct_occurrences_to_identical_alias_calls() -> None:
+    """The occurrence-index discipline (issue #619 / the existing
+    `test_scanner_assigns_distinct_occurrence_indices_to_identical_call_shapes`)
+    applies to alias-resolved calls too: two byte-identical `emit(...)`
+    calls in the same scope get distinct occurrence indices so an allow-
+    list entry covers exactly one, not both."""
+    source = textwrap.dedent(
+        """
+        def f(state, emit=append_event):
+            state = emit(state, "k", {})
+            state["a"] = 1
+            state = emit(state, "k", {})
+            return state
+        """
+    )
+    tree = ast.parse(source)
+    sites = _scan_module_for_raw_primitive_calls(tree, "synthetic_fixture.py")
+
+    assert len(sites) == 2, f"expected two distinct alias call sites, found: {sites}"
+    assert sites[0].call_source == sites[1].call_source
+    assert {s.occurrence for s in sites} == {0, 1}
+    assert len({s.key for s in sites}) == 2
 
 
 def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
