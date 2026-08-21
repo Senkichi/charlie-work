@@ -14034,6 +14034,14 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
     # live worker slot. This also makes _worker_pid_alive return False so the
     # issue is selectable despite state.json recording a worker_pid.
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # The sidecar-driven live-worker census (_issues_with_live_workers ->
+    # worker.iter_workers().is_alive() -> claude_code.is_worker_alive) reads a
+    # SEPARATE claude_code.is_pid_alive reference. Patch it too: whether the
+    # fixture's PID reads as alive there depends on the host's current PID
+    # table (process_utils.is_pid_alive treats OpenProcess/ERROR_ACCESS_DENIED
+    # as indeterminate-so-alive by design), so leaving it unpatched makes the
+    # test's outcome depend on host state, not the code under test.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -14150,6 +14158,14 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # The sidecar-driven live-worker census (_issues_with_live_workers ->
+    # worker.iter_workers().is_alive() -> claude_code.is_worker_alive) reads a
+    # SEPARATE claude_code.is_pid_alive reference. Patch it too: whether the
+    # fixture's PID reads as alive there depends on the host's current PID
+    # table (process_utils.is_pid_alive treats OpenProcess/ERROR_ACCESS_DENIED
+    # as indeterminate-so-alive by design), so leaving it unpatched makes the
+    # test's outcome depend on host state, not the code under test.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -14254,6 +14270,13 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     worktree_path, branch = _setup_completed_worktree(repo_root, 1122)
 
+    # Derived, not hardcoded: this removes a latent stale-date hazard in the
+    # fixture. It is NOT what fixes this test -- the phantom-live routing
+    # under test does not gate on started_at at all. The actual gate that
+    # made this test flip green/red across days is PID-liveness, not a time
+    # window (see the claude_code.is_pid_alive patch below).
+    recent_started_at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
             issue_number=issue_number,
@@ -14262,7 +14285,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
             prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
             command=("claude", "-p"),
             pid=6262,
-            started_at="2026-08-10T11:15:39Z",
+            started_at=recent_started_at,
             log_path=str(tmp_path / "log"),
             error="probe_error",
             failure_kind="live_worker_redispatch_averted",
@@ -14271,6 +14294,23 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # Issue #1122 fixture note: the sidecar's PID must also read as dead via
+    # ``_issues_with_live_workers`` -> ``worker.iter_workers().is_alive()`` ->
+    # ``claude_code.is_worker_alive`` -> ``claude_code.is_pid_alive`` -- a
+    # SEPARATE module-level reference from ``charlie_work.workflow.is_pid_alive``
+    # patched above. Without this, this fixture's specific PID (6262) can
+    # spuriously read as "alive": ``process_utils.is_pid_alive`` treats
+    # ``OpenProcess`` failing with ``ERROR_ACCESS_DENIED`` as indeterminate-so-
+    # alive by design (process_utils.py:293-301), and on this host PID 6262
+    # currently returns that error while sibling fixture PIDs (4242, 5353,
+    # 7373) return ``ERROR_INVALID_PARAMETER`` (correctly read as dead) --
+    # confirmed by direct ``OpenProcess`` probe, not assumed. That makes the
+    # unpatched read host-PID-table-state dependent rather than deterministic,
+    # which is what made this test pass on 2026-08-19 and fail on 2026-08-21
+    # with no code change: it marks the issue live-dispatched and drops it out
+    # of the dispatch candidate set before the phantom-live-worker routing
+    # under test ever runs.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -14303,7 +14343,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
                 "prompt_path": "",
                 "command": ["claude", "-p"],
                 "pid": 6262,
-                "started_at": "2026-08-10T11:15:39Z",
+                "started_at": recent_started_at,
                 "log_path": str(tmp_path / "log"),
                 "error": "probe_error",
                 "failure_kind": "live_worker_redispatch_averted",
@@ -14330,7 +14370,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     result = app.dispatch(limit=1)
 
     # The phantom live worker is detected but the sidecar is PRESERVED.
-    assert result.data["phantom_live_worker_count"] == 1
+    assert result.data["phantom_live_worker_count"] == 1, repr(result.data)
     assert sidecar_path.exists(), "Sidecar must not be reaped so the reaper lane can salvage"
 
     # Labels are NOT stripped: the issue stays in-progress until salvage moves
@@ -14391,6 +14431,13 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # See the sibling completed-worktree test above: the sidecar's PID must
+    # also read as dead through claude_code.is_worker_alive's own
+    # claude_code.is_pid_alive reference, not just workflow's, or the test's
+    # outcome depends on the host's current PID table (ERROR_ACCESS_DENIED
+    # from OpenProcess is treated as indeterminate-so-alive by design) instead
+    # of the code under test.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -14448,7 +14495,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch(limit=1)
 
-    assert result.data["phantom_live_worker_count"] == 1
+    assert result.data["phantom_live_worker_count"] == 1, repr(result.data)
     assert sidecar_path.exists(), "Sidecar must not be reaped so the reaper lane can salvage"
 
     # Labels are NOT stripped.
