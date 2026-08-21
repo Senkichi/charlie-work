@@ -13540,7 +13540,11 @@ def test_corrupt_review_decision_treated_as_not_approved(tmp_path: Path) -> None
 
     result = app.merge_ready(456)
 
-    assert result.data["review_decision"] == {"decision": "invalid"}
+    # Issue #1362 Stage 1: a corrupt flat file with no round-archive fallback
+    # now resolves to {"decision": "missing"} rather than the old "invalid"
+    # sentinel (review_decision.resolve_decision_payload) -- both are
+    # equally non-terminal, so the fail-safe outcome below is unchanged.
+    assert result.data["review_decision"] == {"decision": "missing"}
     assert result.data["can_merge"] is False
     assert fake_gh.merged == []
 
@@ -25231,9 +25235,18 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     # Create the rework prompt on disk (the rework brief).
     pr_dir = paths.prs / "pr-456"
-    pr_dir.mkdir(parents=True)
+    pr_dir.mkdir(parents=True, exist_ok=True)
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
@@ -25471,6 +25484,15 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     # Launch-failure sidecar with a non-deterministic failure signature (rate
     # limit) -- isolates the cap check from finding 2b's deterministic-kind
     # guard (covered by the worktree_unsafe test below).
@@ -25576,6 +25598,15 @@ def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -25663,6 +25694,15 @@ def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
             "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -25756,6 +25796,15 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -25836,6 +25885,15 @@ def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediate
             "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -29683,6 +29741,15 @@ def test_reap_restore_sets_startup_death_flag(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -29784,6 +29851,15 @@ def test_reap_restore_startup_death_stalled_real_pid_under_classification_delay(
             "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
 
     # Write the log file with the calibration incident's refusal message and
     # freeze its mtime at the death moment (5s after start).
@@ -29894,6 +29970,15 @@ def test_reap_restore_stalled_long_runtime_not_startup_death(
             "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -40406,6 +40491,15 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     }
     save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the decision
+    # must exist on disk (not just in state.json) for `.missing` to be False.
+    pr_decision_dir = paths.prs / "pr-100"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
+
     class FakeGitHubForOrphan(FakeGitHub):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
@@ -42199,12 +42293,20 @@ def test_loop_undecided_head_moved_invokes_review(tmp_path: Path) -> None:
 def test_loop_undecided_same_head_skip_still_merges_on_approved_decision_file(
     tmp_path: Path,
 ) -> None:
-    """Regression for review finding #7: a same-head packet skip must still
-    check review-decision.json directly. An operator can write the decision
-    file without state.json reflecting it yet (the already_approved branch
-    only fires once state.json has caught up), so the approval must not stay
-    invisible until the head moves -- it should proceed straight to
-    merge_ready(), same as the decided path.
+    """Regression for review finding #7: an operator-written decision file
+    must not stay invisible until the head moves, even when state.json
+    hasn't caught up -- it should proceed straight to merge_ready(), same as
+    the decided path.
+
+    Pre-#1362 this was reached via the same-head packet-skip branch (which
+    re-checked the decision file directly as a fallback, incrementing
+    ``skipped_reviews``). Issue #1362 Stage 1 made ``already_approved``
+    itself file-first, so the file-only approval is now caught one branch
+    earlier -- ``already_approved`` is True immediately and routes straight
+    to ``merge_ready()`` without ever reaching the packet-skip branch, so
+    ``skipped_reviews`` stays 0. The observable guarantee this test protects
+    (the approval is not invisible; the PR merges) is unchanged; only which
+    internal branch reaches it is.
     """
     pr = {
         "number": 456,
@@ -42248,8 +42350,11 @@ def test_loop_undecided_same_head_skip_still_merges_on_approved_decision_file(
     result = app.loop(limit=0)
 
     # Packet regeneration is still skipped (review() never called)...
-    assert result.data["skipped_reviews"] == 1
     assert 456 not in review_calls
+    # Issue #1362 Stage 1: already_approved is file-first, so this approval
+    # is caught before the packet-skip branch runs at all -- skipped_reviews
+    # stays 0 rather than incrementing (see docstring above).
+    assert result.data["skipped_reviews"] == 0
     # ...but the approval is not left invisible: merge_ready() fires.
     assert len(result.data["merges"]) == 1
     assert result.data["merges"][0]["merged"] is True

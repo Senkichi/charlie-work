@@ -13765,16 +13765,16 @@ class OrchestratorApp:
                 },
             )
         if decision_value == "missing":
+            # Issue #1362 Stage 1: resolve_decision_payload collapses both
+            # "no decision file at all" and "flat file corrupt, no round
+            # fallback" into this same "missing" sentinel (the old distinct
+            # "invalid" sentinel no longer exists) -- both are equally
+            # non-terminal for authorization purposes, so this one reason
+            # covers what used to be two.
             return CommandResult(
                 False,
-                f"PR #{pr_number}: no review-decision.json — not authorized",
+                f"PR #{pr_number}: no readable review-decision.json — not authorized",
                 {**base, "authorized": False, "reason": "no_decision"},
-            )
-        if decision_value == "invalid":
-            return CommandResult(
-                False,
-                f"PR #{pr_number}: review-decision.json unreadable — not authorized",
-                {**base, "authorized": False, "reason": "invalid_decision"},
             )
         if decision_value != "approved":
             return CommandResult(
