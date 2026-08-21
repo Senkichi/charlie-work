@@ -1350,7 +1350,12 @@ def _append_sweep_events(
     # its own level is exempt from kind verification. See #1029.
     for kind, payloads in grouped.items():
         if len(payloads) == 1:
-            state = write_gate.append_event(state, kind, payloads[0], max_size=max_size)
+            # kind is the loop variable over sweep_events, a list built from
+            # `sweep_events.append((literal_kind, payload))` call sites elsewhere in this
+            # file -- those literals are the ones actually checked for consumers.
+            state = write_gate.append_event(
+                state, kind, payloads[0], max_size=max_size
+            )  # event-consumer: pointer -- literal chosen at each sweep_events.append(...) site
         else:
             numbers: list[int] = []
             numbers_key = "numbers"
@@ -1366,6 +1371,9 @@ def _append_sweep_events(
                     numbers.append(payload["number"])
             state = write_gate.append_event(
                 state,
+                # event-consumer: pointer -- same kind loop variable as the single-payload
+                # branch above, with the `_sweep` suffix; literals are scanned at their
+                # sweep_events.append(...) build sites elsewhere in this file
                 f"{kind}_sweep",
                 {
                     "count": len(payloads),
