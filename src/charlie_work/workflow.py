@@ -129,6 +129,7 @@ from .reconcile import (
     detect_mergequeue_not_approved,
 )
 from .review_decision import (
+    record_decision,
     resolve_decision_payload,
     review_decision,
 )
@@ -9892,7 +9893,14 @@ class OrchestratorApp:
                 live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
             )
             if not decision_path.exists() or voided_stale_verdict:
-                self._write_json(decision_path, decision_template)
+                # Issue #1362 Stage 2: routed through the single writer so the
+                # placeholder is head-stamped like every other verdict --
+                # ``reviewed_head_sha`` lets a "pending" that is actually
+                # pinned to a dead head be told apart from a genuinely
+                # unreviewed current head (the mechanism the issue exists
+                # for). ``pr`` is the head snapshot already validated
+                # unchanged by the compare-and-swap guard above this block.
+                record_decision(pr_dir, decision_template, pr.get("headRefOid"))
             # Merge-update, never replace: wholesale assignment here used to erase
             # recorded review decisions on repeated review()/loop() passes
             # (production-confirmed, pr-497).
@@ -12873,17 +12881,25 @@ class OrchestratorApp:
                         ]
                 except (OSError, json.JSONDecodeError):
                     pass
-            self._write_json(decision_path, decision_payload)
             # Issue #1268 (W11): archive this round's artifacts before a
             # later round's call can overwrite the live files above in
             # place. round_number is derived from the archive already on
             # disk -- never from pr_state or request_changes_count (see
             # _next_round_number's docstring) -- so a crash between this
             # write and save_state() below cannot desync the round this call
-            # recorded from what is actually on disk.
+            # recorded from what is actually on disk. Computed here (not just
+            # inside record_decision) because round_dir is also the archive
+            # target for the rework-prompt/dispatch-note siblings below;
+            # record_decision (issue #1362 Stage 2) derives the identical
+            # number from the same rounds_dir/decision_payload pair, so the
+            # two never disagree.
             round_number = _next_round_number(rounds_dir, decision_payload)
             round_dir = rounds_dir / f"round-{round_number}"
-            self._write_json(round_dir / "review-decision.json", decision_payload)
+            # Single writer (issue #1362 Stage 2): round-file-then-flat, so a
+            # crash between the two writes still leaves a durable, readable
+            # verdict via review_decision()'s round-fallback. head_sha=None:
+            # decision_payload["reviewed_head_sha"] is already resolved above.
+            record_decision(pr_dir, decision_payload, None)
             if decision == "request_changes" and not escalated:
                 rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
                 # Archived alongside the decision above, same round_dir: this
@@ -13930,9 +13946,13 @@ class OrchestratorApp:
             else:
                 existing = {}
             updated = {**existing, "authorized_override": override_payload}
-            # Write the decision file atomically (CLAUDE.md invariant: all JSON
-            # state writes use temp-file + replace).
-            self._write_json(decision_path, updated)
+            # Single writer (issue #1362 Stage 2): this patch only adds
+            # ``authorized_override``, not one of ``_ROUND_COMPARE_KEYS``, so
+            # it dedupes as a retry onto the existing highest round (see
+            # record_decision's ``archive_round`` docstring) -- no phantom
+            # round is minted. head_sha=None: any ``reviewed_head_sha``
+            # already on ``existing`` passes through unchanged.
+            record_decision(decision_path.parent, updated, None)
             state = load_state(self.paths.state_file)
             state = self._record_event(
                 state,
@@ -18089,7 +18109,14 @@ class OrchestratorApp:
             if old_head is not None and old_head != new_head and old_head not in carried_forward:
                 carried_forward.append(old_head)
             updated_decision["carried_forward_from"] = carried_forward
-            self._write_json(decision_path, updated_decision)
+            # Single writer (issue #1362 Stage 2): archive_round=False -- a
+            # carry-forward is a mechanical head-rebind, not a new reviewer
+            # verdict, even though it changes reviewed_head_sha (one of
+            # _ROUND_COMPARE_KEYS). Routing it through the default round-mint
+            # logic would archive a content-free duplicate "round" (see
+            # record_decision's archive_round docstring). head_sha=None:
+            # reviewed_head_sha is already set to new_head above.
+            record_decision(decision_path.parent, updated_decision, None, archive_round=False)
 
             if tier == "patch-id":
                 event_kind = "verdict_carried_forward_clean_rebase"

@@ -215,6 +215,8 @@ def record_decision(
     pr_dir: Path,
     verdict_payload: Mapping[str, Any],
     head_sha: str | None,
+    *,
+    archive_round: bool = True,
 ) -> ReviewDecision:
     """Single writer for a PR's review decision (issue #1362 Stage 2).
 
@@ -223,7 +225,27 @@ def record_decision(
     1. The per-round archive, ``rounds/round-K/review-decision.json`` -- K
        derived from :func:`_next_round_number` against whatever is already
        archived on disk, exactly as ``record_review`` derives it today.
+       Skipped entirely when ``archive_round=False`` (see below).
     2. The flat ``review-decision.json``, atomically.
+
+    ``archive_round`` (default ``True``) exists for callers whose write is a
+    mechanical patch onto an existing verdict rather than a new reviewer
+    round -- currently only the carry-forward path in
+    ``_update_approval_head``. That write changes ``reviewed_head_sha`` (one
+    of :data:`_ROUND_COMPARE_KEYS`) while leaving ``decision``/``summary``/
+    ``required_changes`` untouched, so routing it through the default
+    round-mint logic would archive a content-free "round" whose only
+    difference from the prior one is the head it is pinned to --
+    ``_round_history_entries``/``prior_review_section`` would then render an
+    extra, duplicate-looking entry in the rendered prior-review history for
+    every carry-forward, even though no reviewer produced a new verdict.
+    ``archive_round=False`` skips :func:`_next_round_number` and the round
+    write entirely, performing only the flat-file write -- the carry-forward
+    still updates the single durable record, it just never masquerades as a
+    new round. ``merge_authorize``'s override patch does not need this flag:
+    it only adds ``authorized_override``, which is not one of
+    ``_ROUND_COMPARE_KEYS``, so it already dedupes as a retry onto the
+    existing highest round (see :func:`_next_round_number`) with the default.
 
     This is round-file-*then*-flat -- the inverse of the historical
     ``record_review`` ordering, which wrote flat first and archived the
@@ -267,10 +289,11 @@ def record_decision(
     if head_sha is not None:
         payload["reviewed_head_sha"] = head_sha
 
-    rounds_dir = pr_dir / "rounds"
-    round_number = _next_round_number(rounds_dir, payload)
-    round_path = rounds_dir / f"round-{round_number}" / "review-decision.json"
-    _write_json_atomic(round_path, payload)
+    if archive_round:
+        rounds_dir = pr_dir / "rounds"
+        round_number = _next_round_number(rounds_dir, payload)
+        round_path = rounds_dir / f"round-{round_number}" / "review-decision.json"
+        _write_json_atomic(round_path, payload)
 
     flat_path = pr_dir / "review-decision.json"
     _write_json_atomic(flat_path, payload)
