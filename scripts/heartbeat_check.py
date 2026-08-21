@@ -12,7 +12,11 @@ Run via:
 Output contract (stdout): one line per check, either
     OK <check>: <compact facts>
     ANOMALY <check>: <what tripped, with numbers and the threshold>
-Exit code 0 if no anomalies, 1 if any.
+    SUPPRESSED <check>: [#<issue> until <date>] <what tripped> (issue #1361 --
+        a registry-matched, non-expired anomaly: visible but does not flip
+        the exit code)
+Exit code 0 if no anomalies (including suppressed ones), 1 if any anomaly is
+unsuppressed or a suppression itself has expired.
 """
 
 from __future__ import annotations
@@ -177,15 +181,167 @@ class RepoInfo:
     config_path: Path
 
 
+@dataclass(frozen=True)
+class SuppressionEntry:
+    """One entry from `scripts/heartbeat-suppressions.yaml` (issue #1361).
+
+    `check` is the *base* check name as emitted, with no repo suffix (e.g.
+    ``"stale-open-issue-mentions"``, never ``"stale-open-issue-mentions
+    Senkichi/charlie-work"``). Per-repo checks build their emitted check
+    string as ``f"{base} {repo.slug}"`` (the convention already used by every
+    per-repo check in this file); `Report._match` reconstructs that same
+    convention to test a candidate entry against an emitted check string, so
+    this dataclass itself never needs to know which checks are per-repo.
+    """
+
+    check: str
+    issue: int
+    expires: str  # ISO date (YYYY-MM-DD), UTC
+    repo: str | None = None
+    match: str = ""
+    note: str = ""
+
+    def is_expired(self, now: datetime) -> bool:
+        """An entry expiring today counts as expired (issue #1361 AC7)."""
+        try:
+            expires_date = datetime.strptime(self.expires, "%Y-%m-%d").date()
+        except ValueError:
+            return True  # malformed dates are caught at load time; fail closed regardless
+        return now.date() >= expires_date
+
+
+SUPPRESSION_REGISTRY_FILENAME = "heartbeat-suppressions.yaml"
+
+
+def suppression_registry_path() -> Path:
+    """Resolve the suppression registry path, next to this script by default.
+
+    ``CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS`` overrides it -- tests must always
+    set this (or pass an explicit path to `load_suppression_registry`
+    directly) rather than relying on the default, since after this file ships
+    the default path resolves to the real seeded registry.
+    """
+    override = os.environ.get("CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent / SUPPRESSION_REGISTRY_FILENAME
+
+
+def _is_iso_date(value: str) -> bool:
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def load_suppression_registry(path: Path) -> tuple[list[SuppressionEntry], str | None]:
+    """Load and validate the suppression registry.
+
+    Returns ``(entries, error)``. A missing file is not an error: it means
+    zero suppressions, exactly today's (pre-#1361) behavior. A malformed
+    file or entry returns ``([], error)`` -- fail closed: the entries list
+    comes back empty so a bad edit can never silently suppress anything
+    (only ever ADD an anomaly, this error, plus every previously-suppressed
+    condition resurfacing as a raw, unsuppressed ANOMALY -- the safe
+    direction to fail in).
+    """
+    if not path.exists():
+        return [], None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [], f"{path}: unreadable: {exc}"
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        return [], f"{path}: YAML parse error: {exc}"
+    if data is None:
+        return [], None
+    if not isinstance(data, list):
+        return [], f"{path}: expected a YAML list at the top level, got {type(data).__name__}"
+
+    entries: list[SuppressionEntry] = []
+    for idx, raw_entry in enumerate(data):
+        if not isinstance(raw_entry, dict):
+            return [], f"{path}: entry {idx} is not a mapping"
+        check = raw_entry.get("check")
+        if not isinstance(check, str) or not check:
+            return [], f"{path}: entry {idx} missing required string field 'check'"
+        issue = raw_entry.get("issue")
+        if not isinstance(issue, int) or isinstance(issue, bool):
+            return [], f"{path}: entry {idx} missing required integer field 'issue'"
+        expires = raw_entry.get("expires")
+        if not isinstance(expires, str) or not _is_iso_date(expires):
+            return [], f"{path}: entry {idx} missing/invalid required ISO date field 'expires'"
+        repo = raw_entry.get("repo")
+        if repo is not None and not isinstance(repo, str):
+            return [], f"{path}: entry {idx} field 'repo' must be a string"
+        match = raw_entry.get("match", "")
+        if not isinstance(match, str):
+            return [], f"{path}: entry {idx} field 'match' must be a string"
+        note = raw_entry.get("note", "")
+        if not isinstance(note, str):
+            return [], f"{path}: entry {idx} field 'note' must be a string"
+        entries.append(
+            SuppressionEntry(
+                check=check, issue=issue, expires=expires, repo=repo, match=match, note=note
+            )
+        )
+    return entries, None
+
+
 @dataclass
 class Report:
     lines: list[str] = field(default_factory=list)
     anomaly: bool = False
+    suppressions: list[SuppressionEntry] = field(default_factory=list)
+    now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    _matched_indices: set[int] = field(default_factory=set, repr=False, compare=False)
 
     def ok(self, check: str, facts: str) -> None:
         self.lines.append(f"OK {check}: {facts}")
 
+    def _find_suppression(self, check: str, detail: str) -> tuple[int, SuppressionEntry] | None:
+        """Match an emitted check string against the registry.
+
+        A registry entry's `check` is the base name; per-repo checks emit
+        ``f"{base} {repo}"`` (see `SuppressionEntry`'s docstring), so an
+        entry with a `repo` matches only that exact combined string, and an
+        entry with no `repo` matches the base name as a whole leading
+        component (never a bare substring -- ``"dispatch"`` must not match
+        ``"dispatch-coverage ..."``). `match`, when set, must additionally
+        appear as a substring of `detail` -- never of the whole line and
+        never a hash of it, since detail contains counts that change every
+        beat (issue #1361 constraint).
+        """
+        for idx, entry in enumerate(self.suppressions):
+            if entry.repo is not None:
+                if check != f"{entry.check} {entry.repo}":
+                    continue
+            else:
+                if check != entry.check and not check.startswith(f"{entry.check} "):
+                    continue
+            if entry.match and entry.match not in detail:
+                continue
+            return idx, entry
+        return None
+
     def anom(self, check: str, detail: str) -> None:
+        found = self._find_suppression(check, detail)
+        if found is not None:
+            idx, entry = found
+            self._matched_indices.add(idx)
+            if entry.is_expired(self.now):
+                self.lines.append(
+                    f"ANOMALY {check}: [suppression #{entry.issue} EXPIRED {entry.expires}] {detail}"
+                )
+                self.anomaly = True
+            else:
+                self.lines.append(
+                    f"SUPPRESSED {check}: [#{entry.issue} until {entry.expires}] {detail}"
+                )
+            return
         self.lines.append(f"ANOMALY {check}: {detail}")
         self.anomaly = True
 
@@ -198,8 +354,35 @@ class Report:
         normal-operation events, not faults (see `EXPECTED_OPERATIONAL_KINDS`,
         issue #1271, for exactly which ones) -- alarming on them would make
         this check permanently red and get ignored within a day.
+
+        Never suppressed: issue #1361 deliberately scopes the suppression
+        registry to ANOMALY lines only -- WARN already does not affect the
+        exit code, so suppressing it would add complexity for no behavior
+        change.
         """
         self.lines.append(f"WARN {check}: {detail}")
+
+    def suppression_summary(self) -> str | None:
+        """`OK suppressions: active=N expired=M unmatched=K`, or None.
+
+        Returns None when the registry is empty (missing file or a malformed
+        one, which loads as zero entries) -- AC5 says the summary appears
+        "whenever the registry is non-empty", and with zero entries there is
+        nothing to summarize. `active`/`expired` classify registry entries by
+        their own expiry date, independent of whether anything matched this
+        run; `unmatched` is the orthogonal count of entries that matched zero
+        `anom()` calls this run -- issue #1361's signal that a condition has
+        cleared and the entry is a candidate for deletion (surfaced, never
+        auto-deleted).
+        """
+        if not self.suppressions:
+            return None
+        active = sum(1 for e in self.suppressions if not e.is_expired(self.now))
+        expired = len(self.suppressions) - active
+        unmatched = sum(
+            1 for idx in range(len(self.suppressions)) if idx not in self._matched_indices
+        )
+        return f"active={active} expired={expired} unmatched={unmatched}"
 
 
 # --------------------------------------------------------------------------
@@ -1856,7 +2039,22 @@ def check_supervisor_heartbeat(report: Report) -> None:
 
 
 def main() -> int:
-    report = Report()
+    # Sampled once for this entire beat (issue #828) and threaded into every
+    # sub-check below instead of each one independently racing the wall
+    # clock -- keeps all checks in one run reporting against a single
+    # consistent instant, and makes the run's own last_beat_at exact. Issue
+    # #1361 reuses this same instant for suppression-registry expiry checks
+    # rather than sampling the clock a second time.
+    now = datetime.now(timezone.utc)
+
+    suppressions, suppression_err = load_suppression_registry(suppression_registry_path())
+    report = Report(suppressions=suppressions, now=now)
+    if suppression_err:
+        # Fail closed (issue #1361): the registry loaded as empty, so no
+        # suppression applies this run -- this ANOMALY is additive, not a
+        # replacement for whatever previously-suppressed conditions now
+        # resurface as raw ANOMALY lines below.
+        report.anom("suppression-registry", suppression_err)
 
     repos, load_err = load_repos()
     if load_err:
@@ -1866,11 +2064,6 @@ def main() -> int:
 
     prev_state = load_state()
     prev_last_beat_at = parse_iso(prev_state.get("last_beat_at"))
-    # Sampled once for this entire beat (issue #828) and threaded into every
-    # sub-check below instead of each one independently racing the wall
-    # clock -- keeps all checks in one run reporting against a single
-    # consistent instant, and makes the run's own last_beat_at exact.
-    now = datetime.now(timezone.utc)
     baseline = prev_last_beat_at or (now - timedelta(minutes=LOG_FRESHNESS_STALE_MINUTES))
     skip_delta = prev_last_beat_at is not None and (now - prev_last_beat_at) < timedelta(
         minutes=MIN_BEAT_INTERVAL_MINUTES
@@ -1920,6 +2113,10 @@ def main() -> int:
     check_supervisor_heartbeat(report)
 
     save_state(new_state)
+
+    summary = report.suppression_summary()
+    if summary is not None:
+        report.ok("suppressions", summary)
 
     print("\n".join(report.lines))
     return 1 if report.anomaly else 0
