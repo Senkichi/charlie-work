@@ -4296,6 +4296,8 @@ def _route_dead_worker_to_pre_review_rework(
         }
         state = write_gate.append_event(
             state,
+            # event-consumer: audit-only -- records a rework routing decision already
+            # applied inline above (status set to rework_requested); no downstream consumer needed
             "pre_review_rework_routed",
             {
                 "issue_number": issue_number,
@@ -6558,6 +6560,8 @@ class OrchestratorApp:
                 if issue_pr_map:
                     state = self._record_event(
                         state,
+                        # event-consumer: audit-only -- records the PR-status "merged"
+                        # finalization already applied inline above; no separate consumer needed
                         "finalize_externally_merged",
                         {
                             "issue_numbers": sorted(issue_pr_map.keys()),
@@ -7387,6 +7391,8 @@ class OrchestratorApp:
             if closed_merged_pr_issues:
                 state = append_event(
                     state,
+                    # event-consumer: audit-only -- records the issue-status "closed" mutation
+                    # already applied inline above; no downstream consumer needed
                     "dispatch_merged_pr_references_closed",
                     {"issue_numbers": sorted(closed_merged_pr_issues)},
                     state_path=self.paths.state_file,
@@ -7549,6 +7555,8 @@ class OrchestratorApp:
             if operator_claimed_ready:
                 state = append_event(
                     state,
+                    # event-consumer: audit-only -- records a skip already enforced by the
+                    # `candidates` filter above; the skip itself already happened
                     "dispatch_skip_operator_claimed",
                     {"issue_numbers": operator_claimed_ready},
                     state_path=self.paths.state_file,
@@ -8968,6 +8976,9 @@ class OrchestratorApp:
                         }
                         state = append_event(
                             state,
+                            # event-consumer: audit-only -- records a successfully-triggered
+                            # rerun (the action already happened); flake_rerun_failed/escalated
+                            # are the actionable siblings and are separately consumed
                             "flake_rerun_triggered",
                             {
                                 "pr_number": pr_number,
@@ -9453,6 +9464,9 @@ class OrchestratorApp:
                     event_kind = "draft_pr_blocked" if verdict.is_draft else "janitor_gate"
                     state = self._record_event(
                         state,
+                        # event-consumer: pending #1366 -- draft_pr_blocked has no automated
+                        # consumer yet, only the query_events(kind=...) grep the comment above
+                        # names; janitor_gate (the other branch) is separately consumed
                         event_kind,
                         {"pr_number": pr_number, "failures": list(verdict.failures)},
                     )
@@ -9571,6 +9585,8 @@ class OrchestratorApp:
                     if static_probe_verdict.branch_findings:
                         state = self._record_event(
                             state,
+                            # event-consumer: audit-only -- measurement-window telemetry for the
+                            # false-positive rate (see comment above), not consumed downstream by design
                             "coverage_probe_flagged",
                             {
                                 "pr_number": pr_number,
@@ -9584,6 +9600,8 @@ class OrchestratorApp:
                     if static_probe_verdict.unwired_findings:
                         state = self._record_event(
                             state,
+                            # event-consumer: audit-only -- measurement-window telemetry for the
+                            # false-positive rate (see comment above), not consumed downstream by design
                             "unwired_symbol",
                             {
                                 "pr_number": pr_number,
@@ -10949,6 +10967,9 @@ class OrchestratorApp:
                 state,
                 "cross_family_verdict_abandoned"
                 if abandon
+                # event-consumer: audit-only -- intermediate attempt-counter bump before the
+                # abandon threshold; only the terminal cross_family_verdict_abandoned (consumed)
+                # is actionable
                 else "cross_family_verdict_unparseable",
                 {
                     "pr_number": pr_number,
@@ -14407,7 +14428,7 @@ class OrchestratorApp:
                 state = load_state(self.paths.state_file)
                 state = self._record_event(
                     state,
-                    "containment_check",
+                    "containment_check",  # event-consumer: audit-only -- report-only per issue directive, not a blocking gate
                     {
                         "pr_number": pr_number,
                         "warnings": list(containment_warnings),
@@ -16591,6 +16612,8 @@ class OrchestratorApp:
             issue_number,
             decision,
             summary,
+            # event-consumer: audit-only -- records a rework repair request already
+            # routed to a worker via _route_to_rework (the dispatch IS the action)
             "no_op_rework_repair_requested",
             extra_state=extra_state,
         )
@@ -20044,6 +20067,8 @@ class OrchestratorApp:
                 # forever — retrying can never succeed.
                 log_event(
                     self.paths.state_file,
+                    # event-consumer: audit-only -- handled inline via _mark_foreign_issue_ref
+                    # below (parked durably, alerted once); no separate downstream consumer needed
                     "github_not_found_error",
                     {"pr_number": pr_number, "issue_number": issue_number, "error": str(exc)},
                     repo=self.repo_root.name,
