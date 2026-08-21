@@ -30,6 +30,8 @@ from .prompts import (
     assert_no_merge_contract,
     render_prompt,
 )
+from .review_decision import _round_history_entries  # noqa: F401  (re-exported)
+from .review_decision import resolve_decision_payload
 from .verdict_parsing import body_has_crash_signature
 
 
@@ -578,59 +580,10 @@ def _next_round_number(rounds_dir: Path, decision_payload: Mapping[str, Any]) ->
     return highest if is_retry else highest + 1
 
 
-def _round_history_entries(
-    rounds_dir: Path,
-    fallback_decision: Mapping[str, Any] | None = None,
-) -> list[tuple[int, dict[str, Any]]]:
-    """Return every archived review round under ``rounds_dir``, oldest first.
-
-    Issue #1270 (W13): reads exclusively from the ``rounds/round-K`` layout
-    W11 built (issue #1268) -- never events.db, never
-    ``request_changes_count``, per the binding decision on #1270. Each
-    element is ``(round_number, decision_payload)``; the payload is read
-    fresh from ``rounds/round-K/review-decision.json`` via
-    ``_read_review_decision``, not derived from ``fallback_decision``, so a
-    hand-edited round archive (an operator correction) is reflected exactly.
-
-    ``fallback_decision`` exists for two cases, both gated on ``not entries``
-    (i.e. checked AFTER attempting to read every archived round, not merely
-    on ``rounds_dir`` having no subdirectories -- issue #1270 review round 1
-    found the original ``not numbers`` gate left a PR's prior review
-    silently invisible whenever a round directory existed but its decision
-    file did not parse):
-
-    * The transition window around the W11 deploy: a PR whose only recorded
-      verdict predates W11 has a flat ``review-decision.json`` but no
-      ``rounds/`` directory at all (``numbers`` is empty).
-    * A round directory exists (``numbers`` is non-empty) but every
-      ``round-K/review-decision.json`` under it is missing or fails to
-      parse -- e.g. ``OrchestratorApp._write_json`` (workflow.py), the method
-      ``record_review`` uses to archive each round, creates the round
-      directory via ``mkdir`` strictly before its atomic ``tmp_path.replace()``,
-      so a crash in that window leaves an empty, decision-file-less
-      ``round-K/`` that ``_existing_round_numbers`` still counts.
-
-    Without a fallback in either case, such a PR would silently lose its
-    prior-round findings even though the caller's own round-2 gate
-    (``is_round2_review`` in ``workflow.py``, unchanged by this issue)
-    already says a prior verdict exists. The fallback is surfaced as a
-    synthetic round 1 -- ``fallback_decision`` itself, not a disk read --
-    and is consulted ONLY when every attempted read came back empty; once at
-    least one round is actually read successfully, the archive is
-    authoritative and the fallback is never consulted, matching "exclusively
-    from that layout" for every PR reviewed since W11 shipped.
-    """
-    numbers = sorted(_existing_round_numbers(rounds_dir))
-    entries: list[tuple[int, dict[str, Any]]] = []
-    for number in numbers:
-        payload = _read_review_decision(rounds_dir / f"round-{number}" / "review-decision.json")
-        if payload is not None:
-            entries.append((number, payload))
-    if not entries:
-        if fallback_decision is not None:
-            return [(1, dict(fallback_decision))]
-        return []
-    return entries
+# _round_history_entries hoisted to review_decision.py (issue #1362 Stage 1):
+# imported above from .review_decision. Behavior is unchanged; this module
+# no longer defines it, only re-exports it via that import (and, in turn,
+# via workflow.py's existing facade import block).
 
 
 def _render_round_findings(decision: dict[str, Any]) -> str:
@@ -757,7 +710,7 @@ def _render_rework_prompt(
     """
     pr_number = int(pr["number"])
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
-    decision = _read_review_decision(pr_dir / "review-decision.json")
+    decision = resolve_decision_payload(pr_dir)
     required_changes_section = _render_required_changes_section(decision)
     return render_prompt(
         config.dispatch.rework_template,
