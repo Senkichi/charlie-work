@@ -193,6 +193,12 @@ from .state import (
     without_review_dispatch_claim,
 )
 from .instrumentation import correlation_context, log_event, query_events, record_loop_pass
+from .preflight import (
+    PreflightPaths,
+    emit_preflight_refusal,
+    run_preflight,
+)
+from .supervise import orchestrator_root
 from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
 from .process_utils import (
     find_worker_terminal_status,
@@ -5535,6 +5541,13 @@ class OrchestratorApp:
             dry_run=self.dry_run, state_path=self.paths.state_file, repo=self.repo_root.name
         )
         self.fleet_dir_override = fleet_dir_override
+        # Issue #1363: config_freshness's "exactly once per change" semantics
+        # need a mtime cache that outlives a single pass but not the process
+        # -- an in-memory dict on the (per-process, per-repo) app instance is
+        # exactly that. Fresh at supervisor startup by design: an edit that
+        # landed before this instance's first pass is not "stale since load"
+        # for THIS instance, only an edit after.
+        self._preflight_config_mtimes: dict[str, float] = {}
         # Issue #1001: same-instance once-only escalation flag for the
         # worker-github-token gate. A missing token is a standing condition;
         # the gate must not emit an event every loop pass. The cross-instance
@@ -18372,6 +18385,59 @@ class OrchestratorApp:
     def _loop_impl(
         self, limit: int | None, *, merge: bool | None, now: datetime | None = None
     ) -> CommandResult:
+        # Issue #1363: preflight gate. Runs BEFORE `loop_started` is recorded
+        # -- a fatal host-precondition failure (disk_floor, venv_identity)
+        # must refuse the pass with zero partial work, not half-run it and
+        # fail midway with a generic error. Non-fatal failures (clock_sanity,
+        # config_freshness) emit a warning event and the pass proceeds
+        # unmodified -- on a healthy host this adds no event at all (AC3).
+        preflight_result = run_preflight(
+            PreflightPaths(
+                repo_root=self.repo_root,
+                state_dir=self.paths.root,
+                # venv_identity must anchor on the orchestrator's OWN
+                # checkout (the code/venv this process is actually running),
+                # never on `self.repo_root` -- that is the *target* repo this
+                # particular pass processes, which varies per registered
+                # repo even though every one of them runs from the same
+                # single orchestrator install. See PreflightPaths.
+                # orchestrator_root's docstring for why conflating the two
+                # would make venv_identity fatally misfire on every repo
+                # other than the orchestrator's own.
+                orchestrator_root=orchestrator_root(),
+            ),
+            self.config.runtime.preflight,
+            now=now,
+            config_sources=self.config.sources,
+            known_config_mtimes=self._preflight_config_mtimes,
+        )
+        for check in preflight_result.non_fatal_failures:
+            kind = (
+                "preflight_config_stale"
+                if check.name == "config_freshness"
+                else "preflight_warning"
+            )
+            log_event(
+                self.paths.state_file,
+                kind,
+                {"check": check.name, "detail": check.detail},
+                repo=self.repo_root.name,
+                level="warning",
+            )
+        if not preflight_result.ok:
+            fatal_check = preflight_result.fatal_failures[0]
+            emit_preflight_refusal(self.paths.state_file, fatal_check, repo=self.repo_root.name)
+            return CommandResult(
+                False,
+                f"preflight refused pass: {fatal_check.name}: {fatal_check.detail}",
+                {
+                    "pass_skipped": True,
+                    "reason": "preflight_refused",
+                    "check": fatal_check.name,
+                    "detail": fatal_check.detail,
+                },
+            )
+
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
         # evaluation + labels) but skips the actual `gh pr merge` — for
         # operators sequencing same-surface PR cascades by hand, where the
