@@ -129,7 +129,7 @@ from .reconcile import (
     detect_mergequeue_not_approved,
 )
 from .review_decision import (
-    _read_review_decision_payload,
+    resolve_decision_payload,
     review_decision,
 )
 from .safe_ref import require_valid_sha
@@ -23168,14 +23168,7 @@ class OrchestratorApp:
         treats the PR as reviewed.
         """
         pr_dir = self.paths.prs / f"pr-{pr_number}"
-        payload = _read_review_decision_payload(pr_dir / "review-decision.json")
-        if payload is None:
-            entries = _round_history_entries(pr_dir / "rounds")
-            if entries:
-                payload = entries[-1][1]
-        if payload is None:
-            return {"decision": "missing"}
-        return payload
+        return resolve_decision_payload(pr_dir)
 
     def _read_packet_head_oid(self, pr_number: int) -> str | None:
         """Return the ``headRefOid`` stored in the existing review packet for

@@ -31,6 +31,7 @@ from .prompts import (
     render_prompt,
 )
 from .review_decision import _round_history_entries  # noqa: F401  (re-exported)
+from .review_decision import resolve_decision_payload
 from .verdict_parsing import body_has_crash_signature
 
 
@@ -709,7 +710,7 @@ def _render_rework_prompt(
     """
     pr_number = int(pr["number"])
     pr_dir = state_file.parent / "prs" / f"pr-{pr_number}"
-    decision = _read_review_decision(pr_dir / "review-decision.json")
+    decision = resolve_decision_payload(pr_dir)
     required_changes_section = _render_required_changes_section(decision)
     return render_prompt(
         config.dispatch.rework_template,

@@ -152,6 +152,33 @@ def _round_history_entries(
     return entries
 
 
+def resolve_decision_payload(pr_dir: Path) -> dict[str, Any]:
+    """Return the full recorded decision payload for ``pr_dir``, or ``{"decision": "missing"}``.
+
+    Same read order as :func:`review_decision` (flat file first, falling
+    back to the highest-numbered round archive) but returns the raw dict
+    instead of the narrow :class:`ReviewDecision` -- for callers that need
+    fields the dataclass deliberately does not carry (``required_changes``,
+    ``summary``, ``escalated``, ``reviewed_patch_id``, ...), such as
+    rendering a rework prompt's required-changes section.
+
+    Hoisted out of ``OrchestratorApp._review_decision`` (issue #1362 Stage
+    1) so both that method and any standalone caller (e.g.
+    ``rework_prompts._render_rework_prompt``) share one resolution instead
+    of ``rework_prompts.py`` re-deriving a flat-file-only read that silently
+    dropped the round fallback ``review_decision()``/``_review_decision``
+    both apply.
+    """
+    payload = _read_review_decision_payload(pr_dir / "review-decision.json")
+    if payload is None:
+        entries = _round_history_entries(pr_dir / "rounds")
+        if entries:
+            payload = entries[-1][1]
+    if payload is None:
+        return {"decision": "missing"}
+    return payload
+
+
 def review_decision(
     pr_dir: Path,
     pr_state: Mapping[str, Any] | None,
