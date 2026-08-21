@@ -34,15 +34,11 @@
   match: "referenced by merged work"
   issue: 1361
   expires: "2026-09-30"
-  note: >
-    Deliberately-open residuals, re-listed every beat (18 issues as of
-    2026-08-19). See issue #1361.
+  note: "Deliberately-open residuals, re-listed every beat (18 issues as of 2026-08-19). See issue #1361."
 
 - check: stale-open-issue-mentions
   repo: "Senkichi/job-cannon"
   match: "referenced by merged work"
   issue: 1361
   expires: "2026-09-30"
-  note: >
-    Deliberately-open residuals, re-listed every beat (16 issues as of
-    2026-08-19). See issue #1361.
+  note: "Deliberately-open residuals, re-listed every beat (16 issues as of 2026-08-19). See issue #1361."

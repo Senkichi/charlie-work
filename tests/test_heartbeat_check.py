@@ -2665,3 +2665,31 @@ def test_seeded_registry_loads_and_matches_both_fleet_repos(hb: ModuleType) -> N
         assert e.check == "stale-open-issue-mentions"
         assert e.issue == 1361
         assert e.expires == "2026-09-30"
+
+
+def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
+    hb: ModuleType,
+) -> None:
+    """Closes the gap the two tests above leave open individually: parsing
+    the checked-in registry and matching *some* check name each prove half
+    the path. This proves the file on disk suppresses the exact string
+    `check_stale_open_issue_mentions` emits for each real fleet repo
+    (f"stale-open-issue-mentions {repo.slug}") -- not a stand-in owner/repo
+    slug, and not a hypothetical shape. If a future edit bakes the repo
+    suffix into the seeded `check:` field instead of using the separate
+    `repo:` field, this test fails loudly; the two tests above would not."""
+    registry_path = Path(__file__).parent.parent / "scripts" / "heartbeat-suppressions.yaml"
+    entries, err = hb.load_suppression_registry(registry_path)
+    assert err is None
+
+    for real_slug in ("Senkichi/charlie-work", "Senkichi/job-cannon"):
+        report = hb.Report(suppressions=entries)
+        check = f"stale-open-issue-mentions {real_slug}"
+        detail = (
+            "18 open issue(s) referenced by merged work with no closure path: "
+            "#817 (PR #824 fix/817-fleet-health-latch) (open=18)"
+        )
+        report.anom(check, detail)
+
+        assert not report.anomaly, f"registry failed to suppress real slug {real_slug}"
+        assert report.lines[-1].startswith(f"SUPPRESSED {check}: [#1361 until 2026-09-30]")
