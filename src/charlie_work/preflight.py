@@ -101,15 +101,37 @@ class PreflightPaths:
     repo_root: Path
     state_dir: Path
     #: Directory the venv is expected to live in. Defaults to
-    #: ``repo_root / ".venv"`` (the standard layout) when not given
+    #: ``package_root / ".venv"`` (the standard layout) when not given
     #: explicitly.
     expected_venv_dir: Path | None = None
+    #: The orchestrator's OWN source-tree root -- i.e. ``supervise.
+    #: orchestrator_root()``, the checkout ``charlie_work`` is installed
+    #: from and the target of self-deploy's ``git pull``/``uv sync``.
+    #:
+    #: Deliberately distinct from ``repo_root``: ``repo_root`` is the
+    #: *target* repo a given pass is processing (jc, charlie-work, whatever
+    #: is registered in the fleet), which varies per ``OrchestratorApp``
+    #: instance even though every one of those instances runs from the same
+    #: single orchestrator install. venv_identity's whole job is asking "is
+    #: THIS PROCESS running the correct orchestrator code and venv" -- a
+    #: question about the process, not about whichever repo it happens to
+    #: be processing this pass -- so it must anchor on the orchestrator's
+    #: own checkout, never the target repo's.
+    #:
+    #: Defaults to ``repo_root`` when not given, which keeps single-repo
+    #: callers (every existing test, and any caller where the orchestrator
+    #: manages only itself) working unchanged.
+    orchestrator_root: Path | None = None
+
+    @property
+    def package_root(self) -> Path:
+        return self.orchestrator_root if self.orchestrator_root is not None else self.repo_root
 
     @property
     def venv_dir(self) -> Path:
         if self.expected_venv_dir is not None:
             return self.expected_venv_dir
-        return self.repo_root / ".venv"
+        return self.package_root / ".venv"
 
 
 def _drive_anchor(path: Path) -> str:
@@ -226,7 +248,7 @@ def _check_venv_identity(
 ) -> PreflightCheck:
     name = "venv_identity"
     expected_venv = paths.venv_dir.resolve()
-    expected_repo_root = paths.repo_root.resolve()
+    expected_repo_root = paths.package_root.resolve()
     exec_path = Path(sys_executable).resolve()
     pkg_path = Path(package_file).resolve()
 

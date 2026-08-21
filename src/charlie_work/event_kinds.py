@@ -47,5 +47,11 @@ EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset(
         "dispatch_stale",
         "runner_capacity_starved",
         "draft_pr_ready_held",
+        # Issue #1363: non-fatal preflight tripwires. The pass still ran
+        # (clock_sanity) or the pass proceeds without hot-reloading
+        # (config_freshness) -- both are expected-operational per AC7, not
+        # a fault worth interleaving with the flat warning listing.
+        "preflight_warning",
+        "preflight_config_stale",
     }
 )
