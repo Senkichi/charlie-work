@@ -14,7 +14,7 @@ from .global_config import load_layered_config
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError, GitHubLike
-from .paths import RuntimePaths
+from .paths import RepoNotFoundError, RuntimePaths, find_repo_root
 from .state import save_state, state_lock
 from .worker import iter_workers
 
@@ -71,6 +71,21 @@ def _load_registry(fleet_json_path: Path) -> dict[str, Any]:
     data.setdefault("version", FLEET_REGISTRY_VERSION)
     data.setdefault("repos", {})
     return data
+
+
+def _resolved_canonical_root(path: Path) -> Path | None:
+    """Return the shared main worktree root for *path*, or ``None`` if not a git repo.
+
+    Wraps :func:`find_repo_root` so callers can distinguish "this path is a
+    live git worktree (here is its canonical root)" from "this path is no
+    longer a git repo" without handling :class:`RepoNotFoundError` at every
+    call site.  Used by :func:`touch_repo`'s sibling-clone repoint guard
+    (issue #1376).
+    """
+    try:
+        return find_repo_root(path, explicit=True)
+    except RepoNotFoundError:
+        return None
 
 
 def touch_repo(
@@ -156,6 +171,49 @@ def touch_repo(
             "first_seen": entry.get("first_seen", now) if entry else now,
             "last_seen": now,
         }
+
+        # Issue #1376: do not let a sibling clone repoint the canonical
+        # registry entry.  An unguarded command (merge-check, status,
+        # tripwire ack, ship-it, why-charlie-hate, ...) run from a sibling
+        # clone reaches touch_repo with the clone's own repo_root; blindly
+        # overwriting repo_root would point the fleet registry at the clone,
+        # and a subsequent verdict / merge-authorize / unescalate run from
+        # the TRUE canonical repo would then be *refused* by
+        # ``_assert_not_sibling_clone`` (the guard compares against a
+        # registry that now names the clone as canonical -- the refusal
+        # inverts and blocks the legitimate canonical repo instead of the
+        # sibling clone).  When the existing entry's repo_root is still a
+        # live git worktree whose canonical root differs from the incoming
+        # one, this is a sibling clone, not a moved repo -- the moved-repo
+        # case has the old root gone or no longer a git repo, so
+        # ``_resolved_canonical_root`` returns ``None`` and the repoint is
+        # allowed.  Keep the canonical repo_root / state_dir / config_path
+        # and bump ``last_seen`` only.  Cross-references #1372 (same week's
+        # registry-pollution issue: both are "operator/test context leaks
+        # into the live fleet registry surface" defects).
+        existing_root_str = entry.get("repo_root") if entry else None
+        if existing_root_str:
+            normalized_existing = _resolved_canonical_root(Path(existing_root_str))
+            if normalized_existing is not None and normalized_existing != repo_root:
+                logger.warning(
+                    "touch_repo: refusing to repoint %s registry entry from "
+                    "%s to %s -- the existing root is still a live git repo, "
+                    "so this looks like a sibling clone, not a move "
+                    "(issue #1376). Keeping the canonical root; only bumping "
+                    "last_seen.",
+                    name_with_owner,
+                    existing_root_str,
+                    repo_root,
+                )
+                updated_entry = {
+                    "repo_root": existing_root_str,
+                    "name_with_owner": name_with_owner,
+                    "config_path": entry.get("config_path")
+                    or str(Path(existing_root_str) / DEFAULT_CONFIG_FILENAME),
+                    "state_dir": entry.get("state_dir") or str(paths.root),
+                    "first_seen": entry.get("first_seen", now),
+                    "last_seen": now,
+                }
 
         repos[name_with_owner] = updated_entry
         data["repos"] = repos

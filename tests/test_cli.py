@@ -2541,6 +2541,203 @@ def test_read_only_command_skips_guard(monkeypatch: pytest.MonkeyPatch, tmp_path
     cli.build_app(args)
 
 
+def test_verdict_round_trip_linked_worktree_to_canonical_merge_check(
+    tmp_path: Path,
+) -> None:
+    """Issue #1376 acceptance criterion #3: a verdict recorded via the
+    canonical-resolution (linked-worktree) path must land in the canonical
+    state root and be visible to a subsequent merge-check run from the
+    canonical root.
+
+    This is the round-trip the issue explicitly mandates: the worktree-resolved
+    app and the canonical-root app share one ``state_file`` / ``prs`` tree
+    (because ``find_repo_root`` resolves the linked worktree to the shared
+    main checkout, issue #648), so a verdict written through the former is read
+    by the latter — never silently stranded in a phantom worktree ``.var``.
+    """
+    import subprocess
+
+    from charlie_work.paths import find_repo_root
+    from charlie_work.state import load_state
+    from charlie_work.workflow import OrchestratorApp
+
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+
+    # Linked worktree of the canonical repo (the AC#1 shape).
+    linked_wt = tmp_path / "linked-wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/round-trip", str(linked_wt), "HEAD"],
+        cwd=canonical,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        # Canonical-resolution path: find_repo_root from the linked worktree
+        # resolves to the shared main checkout, identical to resolving from
+        # the canonical root itself.
+        resolved_from_wt = find_repo_root(linked_wt)
+        resolved_from_canonical = find_repo_root(canonical)
+        assert resolved_from_wt == resolved_from_canonical == canonical.resolve()
+
+        config = OrchestratorConfig()
+        paths_wt = runtime_paths(resolved_from_wt, config.runtime.state_dir)
+        paths_canonical = runtime_paths(resolved_from_canonical, config.runtime.state_dir)
+        # The core round-trip invariant: one canonical state root for both.
+        assert paths_wt.root == paths_canonical.root
+        assert paths_wt.state_file == paths_canonical.state_file
+        assert paths_wt.prs == paths_canonical.prs
+
+        # Record a verdict through the worktree-resolved (canonical-targeting)
+        # app — the "canonical-resolution path" the issue names.
+        app_wt = OrchestratorApp(resolved_from_wt, paths_wt, config, _FakeGitHub())
+        result = app_wt.record_review(
+            1,
+            "approved",
+            verdict_provenance="operator_manual",
+            allow_stale_head=True,
+        )
+        assert result.ok, f"verdict recording failed: {result.message}"
+
+        # The decision file landed in the canonical prs tree, not a phantom.
+        decision_path = paths_canonical.prs / "pr-1" / "review-decision.json"
+        assert decision_path.exists(), "verdict must land in the canonical prs tree"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        assert decision["decision"] == "approved"
+        assert decision["reviewed_head_sha"] == "sha-abc"
+
+        # The canonical state.json carries the verdict's durable PR record.
+        state = load_state(paths_canonical.state_file)
+        assert state["prs"]["1"]["decision"] == "approved"
+
+        # A subsequent merge-check run FROM THE CANONICAL ROOT sees it.
+        app_canonical = OrchestratorApp(
+            resolved_from_canonical, paths_canonical, config, _FakeGitHub()
+        )
+        mc = app_canonical.merge_check(1)
+        assert mc.ok is True
+        assert mc.data["authorized"] is True
+        assert mc.data["reason"] == "approved_at_head"
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=canonical,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_touch_repo_refuses_sibling_clone_repoint_keeps_canonical(
+    tmp_path: Path,
+) -> None:
+    """Issue #1376 / #1372: an unguarded command (merge-check, status,
+    tripwire ack, ship-it, why-charlie-hate, ...) run from a sibling clone
+    reaches ``touch_repo`` with the clone's own ``repo_root``.  Without the
+    repoint guard, ``touch_repo`` would overwrite the canonical registry
+    entry, and a subsequent verdict / merge-authorize / unescalate run from
+    the TRUE canonical repo would then be *refused* by
+    ``_assert_not_sibling_clone`` -- the guard compares against a registry
+    that now names the clone as canonical, so the refusal inverts and blocks
+    the legitimate canonical repo instead of the sibling clone.
+
+    ``touch_repo`` must keep the canonical ``repo_root`` / ``state_dir`` and
+    bump ``last_seen`` only when the existing root is still a live git repo
+    of a different canonical root.  The moved-repo case (old root gone or no
+    longer a git repo) stays unaffected.
+    """
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    class _NWOGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "test/canonical"
+
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+    sibling = _init_git_repo_with_origin(tmp_path / "sibling", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    canonical_paths = runtime_paths(canonical, ".var/charlie-work")
+
+    # Register the canonical repo first (as a real touch_repo would).
+    touch_repo(str(fleet_dir), canonical, canonical_paths, _NWOGitHub(repo_root=canonical))
+    fleet_json = fleet_dir / "fleet.json"
+    registry = json.loads(fleet_json.read_text(encoding="utf-8"))
+    assert registry["repos"]["test/canonical"]["repo_root"] == str(canonical)
+
+    # An unguarded command run from the sibling clone reaches touch_repo with
+    # the sibling's repo_root (same nameWithOwner, different git repo).
+    sibling_paths = runtime_paths(sibling, ".var/charlie-work")
+    touch_repo(str(fleet_dir), sibling, sibling_paths, _NWOGitHub(repo_root=sibling))
+
+    # The registry must STILL point at the canonical root -- the sibling clone
+    # did not repoint it.  state_dir stays canonical too; only last_seen moved.
+    registry = json.loads(fleet_json.read_text(encoding="utf-8"))
+    entry = registry["repos"]["test/canonical"]
+    assert entry["repo_root"] == str(canonical)
+    assert entry["state_dir"] == str(canonical_paths.root)
+    assert entry["config_path"] == str(canonical / "orchestrator.config.yaml")
+
+    # Consequently, a subsequent verdict from the TRUE canonical repo is NOT
+    # refused by _assert_not_sibling_clone: the registry still names the
+    # canonical root, so the guard's comparison succeeds.  This is the exact
+    # inversion the finding names -- without the touch_repo mitigation the
+    # guard would fire here against the canonical repo.
+    config = OrchestratorConfig()
+    ctx = _make_sibling_clone_ctx(canonical, config)
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(fleet_dir), "verdict", "--pr", "1", "--decision", "approved"]
+    )
+    cli._assert_not_sibling_clone(ctx, args)  # must not raise
+
+
+def test_touch_repo_allows_repoint_when_old_root_no_longer_a_git_repo(
+    tmp_path: Path,
+) -> None:
+    """Issue #1376: the sibling-clone repoint guard must NOT block a
+    legitimate moved-repo repoint.  When the existing registered root is no
+    longer a git repo (the moved-repo shape: old checkout deleted or stripped
+    of ``.git``), ``touch_repo`` must update ``repo_root`` to the new path.
+    This is the discriminator from the sibling-clone case: a moved repo's old
+    root is gone or not a git repo, a sibling clone's old root is still live."""
+    from charlie_work.fleet_registry import touch_repo
+    from charlie_work.github import GitHub
+
+    class _NWOGitHub(GitHub):
+        def name_with_owner(self) -> str:
+            return "test/canonical"
+
+    remote_url = "https://github.com/test/canonical.git"
+    old_root = _init_git_repo_with_origin(tmp_path / "old", remote_url)
+    new_root = _init_git_repo_with_origin(tmp_path / "new", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    old_paths = runtime_paths(old_root, ".var/charlie-work")
+    touch_repo(str(fleet_dir), old_root, old_paths, _NWOGitHub(repo_root=old_root))
+
+    # The repo was moved: the old checkout's .git is taken out of the way (it
+    # is no longer a git repo), and the operator re-registers from the new
+    # location.  Renaming rather than rmtree-ing .git avoids Windows
+    # read-only-packfile PermissionError; find_repo_root only looks for a
+    # directory named exactly ``.git``, so the rename is enough to make the
+    # old root resolve as "not a git repo".
+    import os
+
+    os.rename(old_root / ".git", old_root / ".git-disabled")
+
+    new_paths = runtime_paths(new_root, ".var/charlie-work")
+    touch_repo(str(fleet_dir), new_root, new_paths, _NWOGitHub(repo_root=new_root))
+
+    fleet_json = fleet_dir / "fleet.json"
+    registry = json.loads(fleet_json.read_text(encoding="utf-8"))
+    entry = registry["repos"]["test/canonical"]
+    # The repoint is allowed because the old root is no longer a git repo.
+    assert entry["repo_root"] == str(new_root)
+    assert entry["state_dir"] == str(new_paths.root)
+
+
 # --------------------------------------------------------------------------
 # runners shadow-status (issue #909)
 # --------------------------------------------------------------------------
