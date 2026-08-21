@@ -47,11 +47,21 @@ EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset(
         "dispatch_stale",
         "runner_capacity_starved",
         "draft_pr_ready_held",
-        # Issue #1363: non-fatal preflight tripwires. The pass still ran
-        # (clock_sanity) or the pass proceeds without hot-reloading
-        # (config_freshness) -- both are expected-operational per AC7, not
-        # a fault worth interleaving with the flat warning listing.
-        "preflight_warning",
-        "preflight_config_stale",
     }
 )
+
+# Issue #1363: `preflight_warning` (clock_sanity) and `preflight_config_stale`
+# (config_freshness) are deliberately NOT added to EXPECTED_OPERATIONAL_KINDS
+# above, even though both are non-fatal tripwires. That bucket exists for
+# kinds that "routinely dominate warning volume" (see its own docstring) --
+# summarizing them into a count is what keeps genuinely rare warnings from
+# being drowned out. Both preflight tripwires are the opposite: clock_sanity
+# should almost never fire on a healthy host, and config_freshness's own spec
+# (AC5) requires it to fire exactly once per config-file edit, not
+# routinely. AC7's rationale for requiring them classified at all is "they
+# are exactly the kinds an operator must see" -- bucketing them WITH the
+# high-volume kinds would misfile them under the wrong reason. They still
+# get their required `warning`-level classification via
+# `instrumentation._LEVEL_BY_KIND`, which is what makes them visible to
+# `check_warning_events` at all; they simply keep the flat, unsummarized
+# `kind@ts` presentation like every other rare warning kind.
