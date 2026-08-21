@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -881,6 +882,112 @@ def test_in_progress_stale_excludes_git_dir(hb: ModuleType, tmp_path: Path) -> N
     )
     assert report.anomaly
     assert "worktree idle" in report.lines[0]
+
+
+def _make_junction(junction: Path, target: Path) -> None:
+    """Create a real Windows directory junction ``junction`` -> ``target``.
+
+    ``os.symlink`` creates a symlink, not a junction -- and ``os.path.islink``
+    returns ``False`` for a junction, which is exactly the gap issue #1379's
+    review found. A real junction (via ``mklink /J``) reproduces the
+    production ``.venv`` junction shape this fleet uses, so the test exercises
+    the actual failure path rather than a symlink stand-in that ``islink``
+    would already catch.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target.resolve())],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+_windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="junctions are a Windows reparse-point type"
+)
+
+
+@_windows_only
+def test_in_progress_stale_excludes_junction_mtime(hb: ModuleType, tmp_path: Path) -> None:
+    """A ``.venv`` junction's fresh file must NOT exonerate a dead worker.
+
+    Issue #1379 review: ``os.path.islink`` does not detect Windows junctions
+    and ``os.walk(followlinks=False)`` recurses straight through one, so a
+    shared ``.venv`` junction's unrelated mtimes could mask a genuinely dead
+    worker. This plants a real junction (``mklink /J``, not ``os.symlink``)
+    with a fresh file inside it and asserts the dead worktree still flags.
+    """
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Worktree itself is dead: only a 60m-old file (outside the 30m window).
+    wt = _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=60, now=now)
+    # Plant a .venv junction pointing at a shared target with a FRESH file
+    # (1m old -- well inside the window). Without the reparse-point fix this
+    # fresh file would be walked and exonerate the dead worker (false OK).
+    shared_venv = tmp_path / "shared-venv"
+    shared_venv.mkdir()
+    fresh_venv_file = shared_venv / "pyvenv.cfg"
+    fresh_venv_file.write_text("home = shared\n", encoding="utf-8")
+    _set_file_mtime(fresh_venv_file, now - timedelta(minutes=1))
+    _make_junction(wt / ".venv", shared_venv)
+    # Sanity: the junction really is a junction (islink returns False), so
+    # this test genuinely exercises the islink-blind path, not a symlink.
+    assert not os.path.islink(wt / ".venv")
+    assert os.path.isdir(wt / ".venv")
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    assert "worktree idle" in report.lines[0]
+
+
+def test_in_progress_stale_honors_worktrees_dir_override(hb: ModuleType, tmp_path: Path) -> None:
+    """``claude_code.worktrees_dir`` override must be honored (issue #1379 review).
+
+    The worktrees root defaults to ``<state_dir>/worktrees``; a repo that sets
+    ``claude_code.worktrees_dir`` places worktrees elsewhere. The check must
+    look at the configured location, not the default -- otherwise it
+    under-reports (a fresh worktree at the override location reads as missing
+    -> false ANOMALY). Mirrors ``charlie_work.paths.resolved_layout``.
+    """
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Configure an explicit (relative) worktrees_dir override.
+    override_root = tmp_path / "custom-worktrees"
+    repo.config_path.write_text(
+        "claude_code:\n  worktrees_dir: custom-worktrees\n", encoding="utf-8"
+    )
+    # Build the worktree at the OVERRIDE location (not the default
+    # state_dir/worktrees), with a fresh file inside the 30m window.
+    wt = hb._worktree_path_for_branch(repo, _BRANCH_99, worktrees_dir=override_root)
+    wt.mkdir(parents=True, exist_ok=True)
+    src = wt / "src"
+    src.mkdir(exist_ok=True)
+    f = src / "main.py"
+    f.write_text("# worker activity\n", encoding="utf-8")
+    _set_file_mtime(f, now - timedelta(minutes=5))
+    # The default location must NOT exist, so a check that ignores the
+    # override would read "no worktree found" (false ANOMALY).
+    default_wt = repo.state_dir / "worktrees" / hb._slugify_branch(_BRANCH_99)
+    assert not default_wt.exists()
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert line.startswith("OK ")
+    assert "worktree-fresh=1" in line
 
 
 def test_check_dispatch_failures_ok_when_no_dir(hb: ModuleType, tmp_path: Path) -> None:

@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -590,15 +591,44 @@ def _slugify_branch(branch: str) -> str:
     return slug[:80].rstrip("-") or "worktree"
 
 
-def _worktree_path_for_branch(repo: RepoInfo, branch: str) -> Path:
-    """Return the worktree dir for ``branch`` under ``repo``'s state root.
+def _resolved_worktrees_dir(repo: RepoInfo) -> Path:
+    """Resolve the worktrees root for ``repo``, honouring ``claude_code.worktrees_dir``.
 
-    Mirrors ``charlie_work.worktree.worktree_path_for_branch`` with the default
-    worktrees dir (``<state_root>/worktrees``). ``repo.state_dir`` is the state
-    root (the directory holding ``state.json``, as registered in fleet.json),
-    so the worktrees root is ``repo.state_dir / "worktrees"``.
+    Mirrors ``charlie_work.paths.resolved_layout``'s worktrees resolution
+    (issue #1379 review): ``claude_code.worktrees_dir`` is a sentinel-style
+    override -- ``None``/empty means "derive from ``runtime.state_dir``"
+    (``<state_dir>/worktrees``), a non-empty value is an explicit path
+    (absolute returned as-is, relative joined to ``repo_root``). This script
+    cannot import ``charlie_work.config``/``paths`` (stdlib-only invariant,
+    scripts/README), so the resolution is reimplemented locally against the
+    config dict ``load_orchestrator_config`` already returns -- the same
+    reimplement-locally treatment ``fleet_dir`` and the stale-open-issue-mention
+    primitives use. A broken/unreadable config degrades to the default
+    (fail-toward-flagging: a missing worktree dir reads as ANOMALY, not OK).
     """
-    return repo.state_dir / "worktrees" / _slugify_branch(branch)
+    default = repo.state_dir / "worktrees"
+    config, _error = load_orchestrator_config(repo.config_path)
+    raw = config.get("claude_code", {}).get("worktrees_dir")
+    if not raw or not isinstance(raw, str):
+        return default
+    candidate = Path(raw)
+    return candidate if candidate.is_absolute() else repo.repo_root / candidate
+
+
+def _worktree_path_for_branch(
+    repo: RepoInfo, branch: str, worktrees_dir: Path | None = None
+) -> Path:
+    """Return the worktree dir for ``branch`` under ``repo``'s worktrees root.
+
+    Mirrors ``charlie_work.worktree.worktree_path_for_branch``. The worktrees
+    root defaults to ``_resolved_worktrees_dir(repo)`` (which honours
+    ``claude_code.worktrees_dir``); pass ``worktrees_dir`` to override it
+    once (e.g. a caller that resolves it once for many branches). ``repo.state_dir``
+    is the state root (the directory holding ``state.json``, as registered in
+    fleet.json).
+    """
+    root = worktrees_dir if worktrees_dir is not None else _resolved_worktrees_dir(repo)
+    return root / _slugify_branch(branch)
 
 
 def _load_state_issues(repo: RepoInfo) -> dict[str, Any]:
@@ -624,6 +654,32 @@ def _load_state_issues(repo: RepoInfo) -> dict[str, Any]:
     return issues
 
 
+def _is_reparse_point(path: str) -> bool:
+    """True if ``path`` is a reparse point (Windows junction or any symlink).
+
+    ``os.path.islink`` does NOT detect Windows directory junctions (verified
+    empirically on this host: ``islink`` returns ``False`` for a junction
+    while the reparse-point file attribute is set), and ``os.walk`` with
+    ``followlinks=False`` recurses straight through a junction regardless --
+    so a ``dirs[:]`` filter built on ``islink`` alone lets the scan walk a
+    ``.venv`` junction into a shared venv whose mtimes reflect *other*
+    worktrees' test runs, not this worker's activity. That can mask a
+    genuinely dead worker (issue #1379 review). This check is what keeps the
+    scan out of such a junction: ``islink`` catches POSIX symlinks (and
+    Windows symlinks), and the reparse-point attribute catches Windows
+    junctions that ``islink`` misses.
+    """
+    if os.path.islink(path):
+        return True
+    if sys.platform == "win32":
+        try:
+            attrs = os.lstat(path).st_file_attributes
+        except (OSError, AttributeError):
+            return False
+        return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return False
+
+
 def _newest_worktree_mtime(
     worktree: Path,
     *,
@@ -642,8 +698,10 @@ def _newest_worktree_mtime(
     Windows notes (issue #1379): uses the newest *file* mtime, not directory
     mtimes (dir mtimes do not propagate on Windows). Excludes ``.git/``
     (background git ops are not worker activity). Does not recurse into
-    junctions/symlinks (a ``.venv`` junction can point at a shared venv whose
-    mtimes reflect other worktrees' test runs, not this worker's activity).
+    junctions/symlinks via ``_is_reparse_point`` (a ``.venv`` junction can
+    point at a shared venv whose mtimes reflect other worktrees' test runs,
+    not this worker's activity); ``os.path.islink`` alone is insufficient
+    because it does not detect Windows junctions.
     """
     if not worktree.is_dir():
         return None
@@ -651,8 +709,9 @@ def _newest_worktree_mtime(
     scanned = 0
     for root, dirs, files in os.walk(worktree, followlinks=False):
         # Exclude .git (background git ops) and do not recurse into
-        # junctions/symlinks (os.path.islink detects both on Windows).
-        dirs[:] = [d for d in dirs if d != ".git" and not os.path.islink(os.path.join(root, d))]
+        # junctions/symlinks. _is_reparse_point catches Windows junctions
+        # that os.path.islink misses (issue #1379 review).
+        dirs[:] = [d for d in dirs if d != ".git" and not _is_reparse_point(os.path.join(root, d))]
         for fname in files:
             scanned += 1
             if scanned > file_cap:
@@ -1127,6 +1186,9 @@ def check_in_progress_staleness(
     # worktree for recent file activity as a second liveness signal.
     state_issues = _load_state_issues(repo)
     threshold = resolved_now - timedelta(minutes=IN_PROGRESS_STALE_WORKTREE_MINUTES)
+    # Resolve the worktrees root once (honours claude_code.worktrees_dir, issue
+    # #1379 review) instead of re-reading the config per stale issue.
+    worktrees_root = _resolved_worktrees_dir(repo)
     truly_stale_details: list[str] = []
     worktree_fresh: list[str] = []
 
@@ -1138,7 +1200,7 @@ def check_in_progress_staleness(
             # events-only behavior (fail toward flagging, not toward green).
             truly_stale_details.append(f"#{number}: no events across 2 beats; no worktree found")
             continue
-        worktree = _worktree_path_for_branch(repo, branch)
+        worktree = _worktree_path_for_branch(repo, branch, worktrees_dir=worktrees_root)
         if not worktree.is_dir():
             # Worktree missing entirely: absence must not read as activity.
             truly_stale_details.append(f"#{number}: no events across 2 beats; no worktree found")
