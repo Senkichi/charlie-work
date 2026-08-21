@@ -207,6 +207,9 @@ def record_supervisor_started(
     try:
         log_event(
             path,
+            # event-consumer: audit-only -- companion audit record to the heartbeat file
+            # written just above (_write_heartbeat), which is the actual liveness signal
+            # consumers read; this event is only the durable history trail
             SUPERVISOR_STARTED,
             {
                 "pid": pid,
@@ -348,7 +351,10 @@ def record_supervisor_exit(
         "passes": passes,
         "reason": reason,
     }
-    log_event(path, SUPERVISOR_EXITED, payload, repo=_FLEET_REPO)
+    log_event(
+        path, SUPERVISOR_EXITED, payload, repo=_FLEET_REPO
+    )  # event-consumer: audit-only -- companion audit record to the heartbeat's own
+    # exited_at stamp below, which is the actual liveness signal consumers read
     existing = _read_heartbeat_for_merge(path)
     if existing is None:
         logger.warning(

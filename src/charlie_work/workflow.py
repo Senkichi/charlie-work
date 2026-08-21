@@ -193,6 +193,12 @@ from .state import (
     without_review_dispatch_claim,
 )
 from .instrumentation import correlation_context, log_event, query_events, record_loop_pass
+from .preflight import (
+    PreflightPaths,
+    emit_preflight_refusal,
+    run_preflight,
+)
+from .supervise import orchestrator_root
 from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
 from .process_utils import (
     find_worker_terminal_status,
@@ -4290,6 +4296,8 @@ def _route_dead_worker_to_pre_review_rework(
         }
         state = write_gate.append_event(
             state,
+            # event-consumer: audit-only -- records a rework routing decision already
+            # applied inline above (status set to rework_requested); no downstream consumer needed
             "pre_review_rework_routed",
             {
                 "issue_number": issue_number,
@@ -5535,6 +5543,13 @@ class OrchestratorApp:
             dry_run=self.dry_run, state_path=self.paths.state_file, repo=self.repo_root.name
         )
         self.fleet_dir_override = fleet_dir_override
+        # Issue #1363: config_freshness's "exactly once per change" semantics
+        # need a mtime cache that outlives a single pass but not the process
+        # -- an in-memory dict on the (per-process, per-repo) app instance is
+        # exactly that. Fresh at supervisor startup by design: an edit that
+        # landed before this instance's first pass is not "stale since load"
+        # for THIS instance, only an edit after.
+        self._preflight_config_mtimes: dict[str, float] = {}
         # Issue #1001: same-instance once-only escalation flag for the
         # worker-github-token gate. A missing token is a standing condition;
         # the gate must not emit an event every loop pass. The cross-instance
@@ -6545,6 +6560,8 @@ class OrchestratorApp:
                 if issue_pr_map:
                     state = self._record_event(
                         state,
+                        # event-consumer: audit-only -- records the PR-status "merged"
+                        # finalization already applied inline above; no separate consumer needed
                         "finalize_externally_merged",
                         {
                             "issue_numbers": sorted(issue_pr_map.keys()),
@@ -7374,6 +7391,8 @@ class OrchestratorApp:
             if closed_merged_pr_issues:
                 state = append_event(
                     state,
+                    # event-consumer: audit-only -- records the issue-status "closed" mutation
+                    # already applied inline above; no downstream consumer needed
                     "dispatch_merged_pr_references_closed",
                     {"issue_numbers": sorted(closed_merged_pr_issues)},
                     state_path=self.paths.state_file,
@@ -7536,6 +7555,8 @@ class OrchestratorApp:
             if operator_claimed_ready:
                 state = append_event(
                     state,
+                    # event-consumer: audit-only -- records a skip already enforced by the
+                    # `candidates` filter above; the skip itself already happened
                     "dispatch_skip_operator_claimed",
                     {"issue_numbers": operator_claimed_ready},
                     state_path=self.paths.state_file,
@@ -8955,6 +8976,9 @@ class OrchestratorApp:
                         }
                         state = append_event(
                             state,
+                            # event-consumer: audit-only -- records a successfully-triggered
+                            # rerun (the action already happened); flake_rerun_failed/escalated
+                            # are the actionable siblings and are separately consumed
                             "flake_rerun_triggered",
                             {
                                 "pr_number": pr_number,
@@ -9440,6 +9464,9 @@ class OrchestratorApp:
                     event_kind = "draft_pr_blocked" if verdict.is_draft else "janitor_gate"
                     state = self._record_event(
                         state,
+                        # event-consumer: pending #1366 -- draft_pr_blocked has no automated
+                        # consumer yet, only the query_events(kind=...) grep the comment above
+                        # names; janitor_gate (the other branch) is separately consumed
                         event_kind,
                         {"pr_number": pr_number, "failures": list(verdict.failures)},
                     )
@@ -9558,6 +9585,8 @@ class OrchestratorApp:
                     if static_probe_verdict.branch_findings:
                         state = self._record_event(
                             state,
+                            # event-consumer: audit-only -- measurement-window telemetry for the
+                            # false-positive rate (see comment above), not consumed downstream by design
                             "coverage_probe_flagged",
                             {
                                 "pr_number": pr_number,
@@ -9571,6 +9600,8 @@ class OrchestratorApp:
                     if static_probe_verdict.unwired_findings:
                         state = self._record_event(
                             state,
+                            # event-consumer: audit-only -- measurement-window telemetry for the
+                            # false-positive rate (see comment above), not consumed downstream by design
                             "unwired_symbol",
                             {
                                 "pr_number": pr_number,
@@ -10936,6 +10967,9 @@ class OrchestratorApp:
                 state,
                 "cross_family_verdict_abandoned"
                 if abandon
+                # event-consumer: audit-only -- intermediate attempt-counter bump before the
+                # abandon threshold; only the terminal cross_family_verdict_abandoned (consumed)
+                # is actionable
                 else "cross_family_verdict_unparseable",
                 {
                     "pr_number": pr_number,
@@ -14394,7 +14428,7 @@ class OrchestratorApp:
                 state = load_state(self.paths.state_file)
                 state = self._record_event(
                     state,
-                    "containment_check",
+                    "containment_check",  # event-consumer: audit-only -- report-only per issue directive, not a blocking gate
                     {
                         "pr_number": pr_number,
                         "warnings": list(containment_warnings),
@@ -16578,6 +16612,8 @@ class OrchestratorApp:
             issue_number,
             decision,
             summary,
+            # event-consumer: audit-only -- records a rework repair request already
+            # routed to a worker via _route_to_rework (the dispatch IS the action)
             "no_op_rework_repair_requested",
             extra_state=extra_state,
         )
@@ -18372,6 +18408,59 @@ class OrchestratorApp:
     def _loop_impl(
         self, limit: int | None, *, merge: bool | None, now: datetime | None = None
     ) -> CommandResult:
+        # Issue #1363: preflight gate. Runs BEFORE `loop_started` is recorded
+        # -- a fatal host-precondition failure (disk_floor, venv_identity)
+        # must refuse the pass with zero partial work, not half-run it and
+        # fail midway with a generic error. Non-fatal failures (clock_sanity,
+        # config_freshness) emit a warning event and the pass proceeds
+        # unmodified -- on a healthy host this adds no event at all (AC3).
+        preflight_result = run_preflight(
+            PreflightPaths(
+                repo_root=self.repo_root,
+                state_dir=self.paths.root,
+                # venv_identity must anchor on the orchestrator's OWN
+                # checkout (the code/venv this process is actually running),
+                # never on `self.repo_root` -- that is the *target* repo this
+                # particular pass processes, which varies per registered
+                # repo even though every one of them runs from the same
+                # single orchestrator install. See PreflightPaths.
+                # orchestrator_root's docstring for why conflating the two
+                # would make venv_identity fatally misfire on every repo
+                # other than the orchestrator's own.
+                orchestrator_root=orchestrator_root(),
+            ),
+            self.config.runtime.preflight,
+            now=now,
+            config_sources=self.config.sources,
+            known_config_mtimes=self._preflight_config_mtimes,
+        )
+        for check in preflight_result.non_fatal_failures:
+            kind = (
+                "preflight_config_stale"
+                if check.name == "config_freshness"
+                else "preflight_warning"
+            )
+            log_event(
+                self.paths.state_file,
+                kind,
+                {"check": check.name, "detail": check.detail},
+                repo=self.repo_root.name,
+                level="warning",
+            )
+        if not preflight_result.ok:
+            fatal_check = preflight_result.fatal_failures[0]
+            emit_preflight_refusal(self.paths.state_file, fatal_check, repo=self.repo_root.name)
+            return CommandResult(
+                False,
+                f"preflight refused pass: {fatal_check.name}: {fatal_check.detail}",
+                {
+                    "pass_skipped": True,
+                    "reason": "preflight_refused",
+                    "check": fatal_check.name,
+                    "detail": fatal_check.detail,
+                },
+            )
+
         # merge=False runs the full pass (intake, dispatch, reviews, readiness
         # evaluation + labels) but skips the actual `gh pr merge` — for
         # operators sequencing same-surface PR cascades by hand, where the
@@ -19978,6 +20067,8 @@ class OrchestratorApp:
                 # forever — retrying can never succeed.
                 log_event(
                     self.paths.state_file,
+                    # event-consumer: audit-only -- handled inline via _mark_foreign_issue_ref
+                    # below (parked durably, alerted once); no separate downstream consumer needed
                     "github_not_found_error",
                     {"pr_number": pr_number, "issue_number": issue_number, "error": str(exc)},
                     repo=self.repo_root.name,

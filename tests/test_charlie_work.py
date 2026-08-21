@@ -49992,6 +49992,112 @@ def test_loop_records_sink_metric_in_completed_event_and_pass_row(
 
 
 # ---------------------------------------------------------------------------
+# Issue #1363 PART 2: preflight gate wiring into OrchestratorApp.loop()
+#
+# Both tests below monkeypatch ``charlie_work.workflow.run_preflight``
+# directly with a canned ``PreflightResult`` rather than driving the real
+# disk/clock/venv/config probes through ``tmp_path``. That is the correct
+# abstraction layer for a *wiring* test: run_preflight's own check logic
+# (disk_floor math, venv_identity path matching, config_freshness
+# once-per-change semantics, ...) is already exhaustively covered at the
+# unit level in test_preflight.py. What is untested until now is whether
+# OrchestratorApp._loop_impl reacts to a PreflightResult correctly -- and
+# canning the result also makes these tests immune to the ambient
+# sys.executable/orchestrator_root() of whatever environment happens to run
+# them (a real venv-synced checkout under CI, a PYTHONPATH-overridden
+# worktree locally, ...), which the real venv_identity check is otherwise
+# sensitive to.
+# ---------------------------------------------------------------------------
+
+
+def test_loop_fatal_preflight_refusal_skips_loop_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC2: a fatal preflight failure must refuse the pass -- _loop_body must
+    never run, a loop_refused_preflight event must be recorded, and loop()
+    must return a non-ok CommandResult naming the failing check -- without
+    a loop_completed event ever appearing."""
+    from charlie_work.preflight import PreflightCheck, PreflightResult
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    fatal_check = PreflightCheck(
+        name="disk_floor", ok=False, detail="0.10 GB free (floor 5 GB)", fatal=True
+    )
+    fake_result = PreflightResult(checks=(fatal_check,))
+    monkeypatch.setattr("charlie_work.workflow.run_preflight", lambda *args, **kwargs: fake_result)
+
+    body_invoked = False
+
+    def stub_body(limit: int | None, *, merge: bool | None, now=None) -> CommandResult:
+        nonlocal body_invoked
+        body_invoked = True
+        return CommandResult(ok=True, message="stub", data={})
+
+    app._loop_body = stub_body  # type: ignore[assignment]
+    result = app.loop(limit=0)
+
+    assert body_invoked is False, "_loop_body ran despite a fatal preflight refusal"
+    assert result.ok is False
+    assert result.data.get("pass_skipped") is True
+    assert result.data.get("reason") == "preflight_refused"
+    assert result.data.get("check") == "disk_floor"
+
+    refused = query_events(paths.state_file, kind="loop_refused_preflight")
+    assert refused, "loop_refused_preflight event was not emitted"
+    assert refused[-1]["payload"]["check"] == "disk_floor"
+
+    completed = query_events(paths.state_file, kind="loop_completed")
+    assert not completed, "loop_completed must not fire when preflight refuses the pass"
+
+
+def test_loop_healthy_preflight_proceeds_with_no_extra_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC3: a fully-passing preflight run must add nothing beyond the
+    ordinary loop event sequence -- no loop_refused_preflight, no
+    preflight_warning/preflight_config_stale noise -- and loop_completed
+    must still fire normally. This is the "healthy host" regression control
+    for AC2: proof that the gate's presence is invisible on a clean pass."""
+    from charlie_work.preflight import PreflightCheck, PreflightResult
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    all_ok_result = PreflightResult(
+        checks=(
+            PreflightCheck(name="disk_floor", ok=True, detail="ok", fatal=True),
+            PreflightCheck(name="clock_sanity", ok=True, detail="ok", fatal=False),
+            PreflightCheck(name="venv_identity", ok=True, detail="ok", fatal=True),
+            PreflightCheck(name="config_freshness", ok=True, detail="ok", fatal=False),
+        )
+    )
+    monkeypatch.setattr(
+        "charlie_work.workflow.run_preflight", lambda *args, **kwargs: all_ok_result
+    )
+
+    def stub_body(limit: int | None, *, merge: bool | None, now=None) -> CommandResult:
+        return CommandResult(
+            ok=True, message="stub", data={"errors": [], "merges": [], "reviews": []}
+        )
+
+    app._loop_body = stub_body  # type: ignore[assignment]
+    result = app.loop(limit=0)
+
+    assert result.ok is True
+    assert not query_events(paths.state_file, kind="loop_refused_preflight")
+    assert not query_events(paths.state_file, kind="preflight_warning")
+    assert not query_events(paths.state_file, kind="preflight_config_stale")
+    completed = query_events(paths.state_file, kind="loop_completed")
+    assert completed, "loop_completed event was not emitted on a healthy preflight pass"
+
+
+# ---------------------------------------------------------------------------
 # Issue #1248: orphan-sweep integration with salvage_push_stranded_commits
 # ---------------------------------------------------------------------------
 #

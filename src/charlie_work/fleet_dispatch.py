@@ -49,9 +49,11 @@ from ci_fleet.charlie_work_adapter import (
 )
 from .state import save_state, state_lock, utc_now
 from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
+from .preflight import PreflightPaths, run_preflight
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
     EXIT_RESTART_REQUESTED,
+    PREFLIGHT_REFUSAL_EXIT_CODE,
     SuperviseLoopResult,
     run_supervise_relaunch_loop,
 )
@@ -2573,7 +2575,44 @@ def run_fleet_supervise(
     if max_runtime_override is not None:
         overrides["max_runtime_minutes"] = max_runtime_override
     cfg = replace(global_config.supervisor, **overrides)
-    state_root = runtime_paths(orchestrator_root(), global_config.runtime.state_dir).root
+    supervisor_runtime_paths = runtime_paths(orchestrator_root(), global_config.runtime.state_dir)
+    state_root = supervisor_runtime_paths.root
+
+    # Issue #1363: supervisor-startup preflight. Runs once, before the lock is
+    # even acquired -- a fatal host precondition (disk_floor, venv_identity)
+    # means this process should never become the supervisor of record, not
+    # loop and fail midway. Unlike the per-pass gate in
+    # `OrchestratorApp._loop_impl` (which returns a refusal CommandResult for
+    # the caller to interpret), a fatal failure HERE must end the process with
+    # a distinct nonzero exit code the wrapper can recognize: PR #862's
+    # EXIT_RESTART_REQUESTED (3) means "replace me, new code is on disk" --
+    # reusing it for a refusal would tell a fresh wrapper to relaunch the very
+    # process that just refused to start, in a tight loop. Reusing plain exit
+    # 1 would fold this into "ordinary crash", losing the named condition an
+    # operator should see at a glance in the fleet pass log. So this is its
+    # own value, PREFLIGHT_REFUSAL_EXIT_CODE (4); the wrapper's relaunch logic
+    # needs no special case for it because anything other than
+    # EXIT_RESTART_REQUESTED already means "do not relaunch" (see
+    # `supervise_loop.run_supervise_relaunch_loop` and its dedicated test).
+    startup_preflight = run_preflight(
+        PreflightPaths(repo_root=orchestrator_root(), state_dir=state_root),
+        global_config.runtime.preflight,
+    )
+    if not startup_preflight.ok:
+        fatal_check = startup_preflight.fatal_failures[0]
+        detail = f"{fatal_check.name}: {fatal_check.detail}"
+        print(f"PREFLIGHT REFUSAL (supervisor startup): {detail}", file=sys.stderr, flush=True)
+        logger.error("Fleet supervisor refused to start: %s", detail)
+        return CommandResult(
+            False,
+            f"fleet supervisor refused to start: preflight failed ({detail})",
+            {
+                "exit_code": PREFLIGHT_REFUSAL_EXIT_CODE,
+                "preflight_refused": True,
+                "check": fatal_check.name,
+                "detail": fatal_check.detail,
+            },
+        )
 
     lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     lock = try_acquire_supervisor_lock(lock_path)
