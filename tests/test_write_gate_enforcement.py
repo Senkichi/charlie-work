@@ -630,7 +630,11 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
 # out-of-wave raw sites with no #1264 sub-issue yet).
 # ---------------------------------------------------------------------------
 _RATCHET_BASELINE: dict[str, int] = {
-    "fleet_dispatch.py": 8,
+    # Issue #1372: +3 log_event calls in fleet_loop's stale-entry handling
+    # (stale detection warning, prune warning, and the existing lane-completed
+    # events). These are out-of-wave raw sites in unconverted territory, same
+    # class as the pre-existing 8 — the ratchet holds at the new count.
+    "fleet_dispatch.py": 11,
     "fleet_registry.py": 1,
     "reconcile.py": 5,
     "state_migration.py": 1,

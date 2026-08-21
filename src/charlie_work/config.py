@@ -877,6 +877,14 @@ class RuntimeConfig:
     # ``label_error`` is None, which costs a dict lookup and no API call). Set
     # to 0 for unlimited.
     escalated_label_repair_max_per_pass: int = 10
+    # Issue #1372: grace period (in days) after which a stale fleet registry
+    # entry (repo_root no longer exists) is pruned from fleet.json. A stale
+    # entry is skipped every pass and reported separately so one corpse cannot
+    # degrade fleet-wide tooling; after this many days without a successful
+    # touch_repo (last_seen older than the grace period), it is pruned under
+    # state_lock. Set to 0 to disable pruning (stale entries are skipped but
+    # never removed).
+    fleet_registry_stale_grace_days: int = 7
 
 
 @dataclass(frozen=True)
@@ -2345,6 +2353,18 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             raise ConfigError(
                 "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
                 f"must be >= 0, got {repair_cap}"
+            )
+    stale_grace_days = runtime_data.get("fleet_registry_stale_grace_days")
+    if stale_grace_days is not None:
+        if not isinstance(stale_grace_days, int) or isinstance(stale_grace_days, bool):
+            raise ConfigError(
+                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
+                f"must be an int, got {type(stale_grace_days).__name__}"
+            )
+        if stale_grace_days < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
+                f"must be >= 0, got {stale_grace_days}"
             )
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")

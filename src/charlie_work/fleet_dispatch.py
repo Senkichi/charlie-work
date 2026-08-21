@@ -47,7 +47,7 @@ from ci_fleet.charlie_work_adapter import (
     save_allocation_skip,
     scale_down_idle_runners,
 )
-from .state import state_lock, utc_now
+from .state import save_state, state_lock, utc_now
 from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
@@ -1683,6 +1683,76 @@ def _record_lane_failure_event(
     )
 
 
+def _parse_registry_timestamp(ts: str | None) -> datetime.datetime | None:
+    """Parse a fleet registry ISO-8601 timestamp into a timezone-aware datetime.
+
+    Registry timestamps are written by ``touch_repo`` as
+    ``datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")``
+    — e.g. ``"2026-08-21T12:00:00Z"``. Returns ``None`` for a missing or
+    unparseable value so the caller can treat it as "not old enough to prune"
+    rather than crashing the pass.
+    """
+    if not ts:
+        return None
+    try:
+        # fromisoformat handles the "Z" suffix from Python 3.11+; for older
+        # versions the +00:00 form is used. Both produce a tz-aware datetime.
+        normalized = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+        return datetime.datetime.fromisoformat(normalized)
+    except (ValueError, TypeError):
+        return None
+
+
+def _prune_stale_registry_entries(
+    fleet_json_path: Path,
+    stale_keys: list[str],
+    grace_days: int,
+    now: datetime.datetime,
+) -> list[str]:
+    """Prune stale registry entries past their grace period from fleet.json.
+
+    Issue #1372: a stale entry (repo_root no longer exists) is skipped every
+    pass and reported separately, but it should not live in the registry
+    forever. After ``grace_days`` without a successful ``touch_repo`` (i.e.
+    ``last_seen`` older than ``now - grace_days``), the entry is removed from
+    fleet.json under ``state_lock``. The write is atomic (``save_state`` uses
+    temp-file + ``replace()``).
+
+    ``grace_days == 0`` disables pruning: stale entries are skipped but never
+    removed. Returns the list of repo keys actually pruned (for event logging).
+    Never raises — a prune failure is logged and the pass continues.
+    """
+    if not stale_keys or grace_days <= 0:
+        return []
+
+    cutoff = now - datetime.timedelta(days=grace_days)
+    pruned: list[str] = []
+
+    try:
+        with state_lock(fleet_json_path):
+            data = _load_registry(fleet_json_path)
+            repos = data.get("repos", {})
+            for key in stale_keys:
+                entry = repos.get(key)
+                if entry is None:
+                    continue
+                last_seen = _parse_registry_timestamp(entry.get("last_seen"))
+                # No last_seen or unparseable -> treat as not old enough to
+                # prune (conservative: never prune what we cannot date).
+                if last_seen is None or last_seen > cutoff:
+                    continue
+                del repos[key]
+                pruned.append(key)
+            if pruned:
+                data["repos"] = repos
+                save_state(fleet_json_path, data)
+    except Exception:
+        logger.exception("Failed to prune stale fleet registry entries")
+        return []
+
+    return pruned
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -1693,6 +1763,7 @@ def fleet_loop(
     dry_run: bool = False,
     work_only: bool = False,
     ensure_labels: bool = False,
+    now: datetime.datetime | None = None,
 ) -> CommandResult:
     """Run a fleet pass across all (or selected) registered repos.
 
@@ -1716,10 +1787,18 @@ def fleet_loop(
             converges to its label within one startup/pass with no operator
             action. Failures are recorded as events per repo, never raised,
             and never block the lane.
+        now: Injectable clock (issue #822/#828) used for stale-entry grace
+            period computation (issue #1372). Defaults to
+            ``datetime.now(UTC)`` when not supplied, so production behavior is
+            byte-identical. Without it, the prune-after-grace test cannot
+            control the cutoff deterministically.
 
     Returns:
         A CommandResult with per-repo results and the consolidated digest.
     """
+    if now is None:
+        now = datetime.datetime.now(datetime.UTC)
+
     # Load fleet registry with state_lock guard
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     registry = _load_registry(fleet_json_path)
@@ -1753,6 +1832,12 @@ def fleet_loop(
     resolved_fleet_dir = fleet_dir(override=fleet_dir_override)
     fleet_state_path = layout.state_file_path(resolved_fleet_dir)
 
+    # Issue #1372: stale registry entries (repo_root no longer exists) are
+    # collected during the pass for prune-after-grace processing. They are
+    # skipped (not counted as failures) and reported via a warning-level event
+    # into the daemon's own events.db — never into the dead entry's state_dir.
+    stale_keys: list[str] = []
+
     # Run runner prologues if enabled (only for full loop, not work-only).
     # Allocation first: moving an idle slot to a starved repo is free, so it
     # runs before autoscale decides the host needs more runners registered.
@@ -1771,16 +1856,34 @@ def fleet_loop(
         # already has the right answer for a bad path.
         repo_root = Path(entry.get("repo_root") or "")
         if not repo_root.is_dir():
-            # Tolerate vanished/moved repo (#169 precedent)
-            error_message = f"repo_root missing, skipped: {repo_root}"
-            per_repo_results[repo_key] = CommandResult(False, error_message, {})
-            attention_events.append(
-                {"repo_key": repo_key, "type": "error", "error": error_message}
+            # Issue #1372: a registry entry whose repo_root no longer exists is
+            # STALE, not a live failing lane. Emit ONE warning-level
+            # fleet_registry_stale_entry event into the DAEMON's own events.db
+            # (fleet_state_path), never into the dead entry's recorded
+            # state_dir — _record_lane_failure_event resolves the event state
+            # path from the registry's recorded state_dir, and log_event
+            # auto-mkdirs (#746), which resurrects a zombie directory under
+            # %TEMP% on every pass. Skip the lane without making the pass fail
+            # (ok=True, pass_skipped=True) so one corpse cannot degrade
+            # fleet-wide tooling. The entry is collected for prune-after-grace.
+            stale_message = f"repo_root missing, stale entry skipped: {repo_root}"
+            per_repo_results[repo_key] = CommandResult(
+                True, stale_message, {"stale": True, "pass_skipped": True}
             )
+            stale_keys.append(repo_key)
             try:
-                _record_lane_failure_event(repo_root, repo_key, entry, error_message)
+                log_event(
+                    fleet_state_path,
+                    "fleet_registry_stale_entry",
+                    {
+                        "repo_key": repo_key,
+                        "repo_root": str(repo_root),
+                        "reason": "repo_root_missing",
+                    },
+                    repo=repo_key,
+                )
             except Exception:
-                logger.exception("Failed to record repo_root missing event for %s", repo_key)
+                logger.debug("Failed to record fleet_registry_stale_entry for %s", repo_key)
             continue
 
         try:
@@ -1915,6 +2018,38 @@ def fleet_loop(
             )
             _record_lane_failure_event(repo_root, repo_key, entry, error_message)
 
+    # Issue #1372: prune stale registry entries past their grace period. The
+    # grace_days knob is read from the global config's runtime section (the
+    # fleet-wide layer); 0 disables pruning. The prune happens under
+    # state_lock and is atomic (save_state uses temp-file + replace()).
+    grace_days = 0
+    if global_config is not None:
+        grace_days = getattr(
+            getattr(global_config, "runtime", None),
+            "fleet_registry_stale_grace_days",
+            0,
+        )
+    pruned_keys: list[str] = []
+    if stale_keys and grace_days > 0:
+        pruned_keys = _prune_stale_registry_entries(fleet_json_path, stale_keys, grace_days, now)
+        for pruned_key in pruned_keys:
+            try:
+                log_event(
+                    fleet_state_path,
+                    "fleet_registry_stale_entry",
+                    {
+                        "repo_key": pruned_key,
+                        "reason": "pruned_after_grace",
+                        "grace_days": grace_days,
+                    },
+                    repo=pruned_key,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to record fleet_registry_stale_entry prune for %s",
+                    pruned_key,
+                )
+
     # Issue #1078: record per-repo lane liveness to the fleet-level events.db
     # so an operator can observe every repo's last lane completion from one
     # query, without hand-querying each repo's individual events.db. This
@@ -2000,6 +2135,8 @@ def fleet_loop(
         {
             "repos": repos_data,
             "digest": digest,
+            "stale": stale_keys,
+            "pruned": pruned_keys,
             "api_worker_report": api_worker_report.to_dict()
             if api_worker_report is not None
             else None,
