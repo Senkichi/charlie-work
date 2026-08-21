@@ -610,6 +610,39 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         ),
         in_predicate=True,
     ),
+    # Issue #1363: preflight non-fatal-failure warning emission, added
+    # inside `_loop_impl` (workflow.py) alongside that same function's two
+    # long-standing raw `log_event` calls for `loop_started`/`loop_completed`.
+    # `tests/test_write_gate_dry_run_loop.py`'s module docstring documents
+    # those two as deliberate, orthogonal pass-level telemetry that fires
+    # "on every pass, dry-run or not" and states plainly that "none of the
+    # wave's clusters ever targeted this wrapper -- it is not a 'caller
+    # migrated onto WriteGate' in C1.2's sense." This third `log_event` call
+    # is the same kind of telemetry for the same function, by the same
+    # design: a preflight warning (config gone stale, clock skew) must
+    # survive `dry_run=True` exactly like the sibling calls it sits next to,
+    # so routing it through `self.write_gate.log_event(...)` would be wrong
+    # twice over -- it would newly suppress the warning under dry-run
+    # (contradicting the documented invariant), and it would flip
+    # `_loop_impl` into R9's in-predicate exclusive-use bucket, which would
+    # then flag its two untouched sibling `log_event` calls as violations
+    # too, forcing an out-of-scope conversion of telemetry this wave never
+    # targeted. `in_predicate=False` here matches the real scan (the
+    # function makes no direct `self.write_gate.*`/`write_gate.*` call), so
+    # this entry is not an R9-exclusivity exemption -- it keeps this
+    # genuinely-new, by-design raw site off the per-module shrink-only
+    # ratchet the same way the ratchet's own ~1160-1162 sentence intends for
+    # sites that are correct as designed rather than an unconverted debt.
+    _RawPrimitiveSite(
+        path="workflow.py",
+        scope="_loop_impl",
+        primitive="log_event",
+        call_source=(
+            "log_event(self.paths.state_file, kind, {'check': check.name, "
+            "'detail': check.detail}, repo=self.repo_root.name, level='warning')"
+        ),
+        in_predicate=False,
+    ),
 )
 
 
