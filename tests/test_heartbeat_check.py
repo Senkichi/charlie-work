@@ -729,6 +729,160 @@ def test_check_in_progress_staleness_anomaly_when_unchanged_across_beats(
     assert "99" in report.lines[0]
 
 
+# --------------------------------------------------------------------------
+# Issue #1379: worktree mtime as a second liveness signal for in-progress-stale
+# --------------------------------------------------------------------------
+
+_BRANCH_99 = "agent/issue-99-some-fix-title-here"
+
+
+def _set_file_mtime(path: Path, dt: datetime) -> None:
+    """Set a file's mtime to ``dt`` (derived-relative, never hardcoded)."""
+    ts = dt.timestamp()
+    os.utime(path, (ts, ts))
+
+
+def _write_state_issues(repo: Any, issues: dict[str, Any]) -> None:
+    """Write a state.json with the given ``issues`` map under repo.state_dir."""
+    state_json = repo.state_dir / "state.json"
+    state_json.parent.mkdir(parents=True, exist_ok=True)
+    state_json.write_text(json.dumps({"issues": issues}), encoding="utf-8")
+
+
+def _make_worktree_with_file(
+    hb: ModuleType, repo: Any, branch: str, file_age_min: float, now: datetime
+) -> Path:
+    """Create the worktree dir for ``branch`` with one file aged ``file_age_min``.
+
+    The worktree path is derived via ``hb._worktree_path_for_branch`` (the same
+    slugify the production check uses), so a slug mismatch between the check
+    and the orchestrator's worktree creation surfaces here as a missing-dir
+    failure rather than a silent false ANOMALY.
+    """
+    wt = hb._worktree_path_for_branch(repo, branch)
+    wt.mkdir(parents=True, exist_ok=True)
+    src = wt / "src"
+    src.mkdir(exist_ok=True)
+    f = src / "main.py"
+    f.write_text("# worker activity\n", encoding="utf-8")
+    _set_file_mtime(f, now - timedelta(minutes=file_age_min))
+    return wt
+
+
+def test_in_progress_stale_ok_when_worktree_fresh(hb: ModuleType, tmp_path: Path) -> None:
+    """AC1: zero recent events but worktree file modified inside the window -> OK."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Worktree file 5 minutes old -- well inside the 30-minute window.
+    _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=5, now=now)
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert not report.anomaly
+    line = report.lines[0]
+    assert line.startswith("OK ")
+    assert "worktree-fresh=1" in line
+    assert "worktree mtime" in line
+    assert "99" in line
+
+
+def test_in_progress_stale_anomaly_when_worktree_stale(hb: ModuleType, tmp_path: Path) -> None:
+    """AC2: zero recent events AND no worktree file newer than window -> ANOMALY with both ages."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Worktree file 60 minutes old -- outside the 30-minute window (dead worker).
+    _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=60, now=now)
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    line = report.lines[0]
+    assert line.startswith("ANOMALY ")
+    assert "no events across 2 beats" in line
+    assert "worktree idle" in line
+    assert "99" in line
+
+
+def test_in_progress_stale_anomaly_when_worktree_missing(hb: ModuleType, tmp_path: Path) -> None:
+    """AC3: worktree dir does not exist -> events-only ANOMALY with 'no worktree found'."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    # Deliberately do NOT create the worktree dir.
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    line = report.lines[0]
+    assert line.startswith("ANOMALY ")
+    assert "no worktree found" in line
+    assert "99" in line
+
+
+def test_in_progress_stale_ok_mixed_fresh_and_stale(hb: ModuleType, tmp_path: Path) -> None:
+    """Mixed: one worktree-fresh (OK) and one worktree-stale (ANOMALY) -> ANOMALY wins."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated, "100": updated}}
+    new: dict[str, Any] = {}
+    branch_100 = "agent/issue-100-another-fix-title"
+    _write_state_issues(
+        repo,
+        {"99": {"branch_name": _BRANCH_99}, "100": {"branch_name": branch_100}},
+    )
+    # #99 is alive (5m), #100 is dead (60m).
+    _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=5, now=now)
+    _make_worktree_with_file(hb, repo, branch_100, file_age_min=60, now=now)
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated), (100, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    line = report.lines[0]
+    assert "#100" in line
+    assert "worktree idle" in line
+    # #99 must NOT appear in the ANOMALY detail (it was exonerated by worktree mtime).
+    assert "#99" not in line
+
+
+def test_in_progress_stale_excludes_git_dir(hb: ModuleType, tmp_path: Path) -> None:
+    """``.git/`` file activity must not count as worker activity (issue #1379)."""
+    repo = _make_repo(hb, tmp_path)
+    now = datetime.now(timezone.utc)
+    updated = _iso(5, base=now)
+    prev = {"in_progress": {"99": updated}}
+    new: dict[str, Any] = {}
+    _write_state_issues(repo, {"99": {"branch_name": _BRANCH_99}})
+    wt = _make_worktree_with_file(hb, repo, _BRANCH_99, file_age_min=60, now=now)
+    # Plant a fresh file under .git/ (background git op) -- must NOT exonerate.
+    git_dir = wt / ".git"
+    git_dir.mkdir(exist_ok=True)
+    fresh_git_file = git_dir / "HEAD"
+    fresh_git_file.write_text("ref: refs/heads/main\n", encoding="utf-8")
+    _set_file_mtime(fresh_git_file, now - timedelta(minutes=1))
+    report = hb.Report()
+    hb.check_in_progress_staleness(
+        report, repo, [(99, updated)], prev, new, skip_delta=False, now=now
+    )
+    assert report.anomaly
+    assert "worktree idle" in report.lines[0]
+
+
 def test_check_dispatch_failures_ok_when_no_dir(hb: ModuleType, tmp_path: Path) -> None:
     repo = _make_repo(hb, tmp_path)
     report = hb.Report()
