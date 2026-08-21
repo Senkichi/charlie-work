@@ -1,0 +1,44 @@
+# Heartbeat anomaly suppression registry (issue #1361).
+#
+# Loaded once per run by scripts/heartbeat_check.py's main(). Each entry
+# suppresses a matching ANOMALY line's effect on the exit code -- the line
+# itself always stays visible, retagged SUPPRESSED, never hidden. An entry
+# that has passed its `expires` date stops suppressing automatically and the
+# line resurfaces as ANOMALY, annotated with the expired suppression's issue
+# and date. Renewing an entry is a reviewed diff to this file, not a silent
+# extension -- that friction is the point.
+#
+# A missing file means zero suppressions (today's pre-#1361 behavior). A
+# malformed file, or a malformed entry anywhere in this list, is itself
+# reported as `ANOMALY suppression-registry: ...` and the WHOLE list is
+# treated as empty for this run (fail closed) -- a bad edit here can only
+# ever ADD anomalies, never silently suppress one.
+#
+# Schema, one entry per suppression:
+#   check:   REQUIRED. Exact check name as emitted, WITHOUT any repo suffix
+#            (e.g. "stale-open-issue-mentions", never
+#            "stale-open-issue-mentions Senkichi/charlie-work" -- the repo
+#            suffix that per-repo checks append is matched via the `repo`
+#            field below instead).
+#   repo:    optional; omitted = matches this check name in every repo.
+#   match:   optional substring the detail text must contain; omitted/empty
+#            = matches any detail for this check. Never a hash of the whole
+#            (changing) detail line -- match on stable substrings only.
+#   issue:   REQUIRED. Tracking issue number for the suppressed condition.
+#   expires: REQUIRED. ISO date (YYYY-MM-DD), UTC. Inclusive: an entry
+#            expiring today is already treated as expired.
+#   note:    free text, for humans reading this file.
+
+- check: stale-open-issue-mentions
+  repo: "Senkichi/charlie-work"
+  match: "referenced by merged work"
+  issue: 1361
+  expires: "2026-09-30"
+  note: "Deliberately-open residuals, re-listed every beat (18 issues as of 2026-08-19). See issue #1361."
+
+- check: stale-open-issue-mentions
+  repo: "Senkichi/job-cannon"
+  match: "referenced by merged work"
+  issue: 1361
+  expires: "2026-09-30"
+  note: "Deliberately-open residuals, re-listed every beat (16 issues as of 2026-08-19). See issue #1361."

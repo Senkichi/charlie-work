@@ -56,6 +56,31 @@ from dataclasses import dataclass
 # handshake. Same discipline CLAUDE.md applies to label strings.
 EXIT_RESTART_REQUESTED = 3
 
+# The supervisor's exit code meaning "a fatal preflight check failed at
+# startup; I never entered the pass loop" (issue #1363). Distinct from 0
+# (deliberate clean stop), 1 (aborted/uncaught exception), and 3
+# (EXIT_RESTART_REQUESTED, above). Deliberately a NEW value rather than
+# reusing 1: exit 1 is folded into "an ordinary crash" by every consumer of
+# this wrapper's result, while a preflight refusal is a distinct, actionable,
+# named condition (see `preflight.py`) an operator should be able to tell
+# apart from a stack trace at a glance -- `supervise_loop.py`'s log line and
+# the fleet pass log both print the check name and detail already.
+#
+# This wrapper's own relaunch logic needs no special case for this value: any
+# exit code other than EXIT_RESTART_REQUESTED already falls through to "do
+# not relaunch" (see the `if exit_code != EXIT_RESTART_REQUESTED` branch
+# below), so a preflight refusal at startup correctly does not spin the
+# wrapper -- it surfaces once, exactly like exit 1 does today, and the
+# 5-minute scheduled-task tick retries on its own cadence. A test proves this
+# explicitly (`test_preflight_refusal_exit_code_does_not_relaunch`) rather
+# than relying on the fallthrough being self-evident.
+#
+# NEVER reuse or renumber this to collide with EXIT_RESTART_REQUESTED -- same
+# cross-version wire-contract discipline as that constant, since a stale
+# wrapper and a freshly-deployed child could disagree on its meaning across a
+# self-deploy boundary exactly as documented above.
+PREFLIGHT_REFUSAL_EXIT_CODE = 4
+
 # Chosen to be generous relative to the real event (a self-deploy chain is
 # normally one restart) while still bounding a pathological loop to well under
 # the 5-minute tick it must not starve.
