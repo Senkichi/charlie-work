@@ -38650,6 +38650,21 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
     }
     save_state(app.paths.state_file, state)
 
+    # Issue #1362 Stage 1: _check_no_op_rework now reads the last verdict
+    # from the file-first review_decision reader, not pr_state["decision"],
+    # so the live request_changes decision must exist on disk too.
+    pr_decision_dir = app.paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "reviewed_head_sha": "abc123abcdefabcdefabcdefabcdefabcdefabcd",
+            }
+        ),
+        encoding="utf-8",
+    )
+
     # Second review on same head: janitor gate blocks (no-op rework check)
     # check_test_adequacy should NOT be called again
     result2 = app.review(456)
@@ -40345,6 +40360,18 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the last-review-decision read in
+    # _detect_and_handle_orphaned_workers is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json,
+    # or it resolves to "missing" and misses the clean-exit-no-op fingerprint
+    # short-circuit this test is exercising.
+    pr_decision_dir = paths.prs / "pr-100"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
