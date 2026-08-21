@@ -786,6 +786,122 @@ def test_is_pid_alive_treats_start_time_none_as_indeterminate(tmp_path: Path) ->
         proc.wait(timeout=5)
 
 
+# --- issue #1371: ACCESS_DENIED fail-closed ---------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_is_pid_alive_false_for_protected_system_process() -> None:
+    """Issue #1371 acceptance criterion #1.
+
+    ``is_pid_alive`` must return ``False`` for a real protected/system PID
+    discovered at test runtime -- not a hardcoded guess.  PID 4 (the Windows
+    ``System`` process) is always present and always returns
+    ``ERROR_ACCESS_DENIED`` for ``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)``
+    from a non-administrator token.  If no protected PID is discoverable, the
+    test skips cleanly.
+    """
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    # Discover a protected PID at runtime.  PID 4 (System) is the canonical
+    # always-present protected process on Windows NT; OpenProcess with limited
+    # rights returns 0 + ERROR_ACCESS_DENIED for it from a non-elevated token.
+    candidate_pids = [4]
+    protected_pid: int | None = None
+    for candidate in candidate_pids:
+        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, candidate)
+        if not handle:
+            if kernel32.GetLastError() == 5:  # ERROR_ACCESS_DENIED
+                protected_pid = candidate
+                break
+        else:
+            kernel32.CloseHandle(handle)
+
+    if protected_pid is None:
+        pytest.skip("no protected PID discoverable on this host")
+
+    # Any start time -- the identity check is never reached because the handle
+    # open fails with ACCESS_DENIED.
+    assert is_pid_alive(protected_pid, 123.456) is False
+    assert is_pid_alive(protected_pid) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_is_pid_alive_access_denied_returns_false_with_monkeypatched_openprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1371 acceptance criterion #3.
+
+    Simulate the ACCESS_DENIED path with an injected ``OpenProcess`` and assert
+    ``False`` -- without any snapshot fallback being able to verify identity.
+    The monkeypatched ``OpenProcess`` returns 0 (failure) and
+    ``GetLastError`` returns 5 (``ERROR_ACCESS_DENIED``), which is exactly the
+    recycled-pid-onto-protected-process scenario.
+    """
+
+    class _FakeKernel32:
+        """Minimal kernel32 stub that makes OpenProcess fail with ACCESS_DENIED."""
+
+        def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
+            return 0  # failure -> caller checks GetLastError
+
+        def GetLastError(self) -> int:
+            return 5  # ERROR_ACCESS_DENIED
+
+        def CloseHandle(self, handle: int) -> int:
+            return 1
+
+        def GetExitCodeProcess(self, handle: int, exit_code: Any) -> int:
+            return 0  # not reached
+
+    fake = _FakeKernel32()
+    # ``is_pid_alive`` resolves ``ctypes.windll.kernel32`` at call time, so
+    # patch the attribute on the ctypes.windll proxy.
+    import ctypes
+
+    monkeypatch.setattr(ctypes.windll, "kernel32", fake, raising=False)
+
+    # No snapshot fallback is present in the implementation, so identity cannot
+    # be verified -- the assertion must hold purely from the ACCESS_DENIED path.
+    assert is_pid_alive(6262, 123.456) is False
+    assert is_pid_alive(6262) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_is_pid_alive_invalid_parameter_dead_pid_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1371 acceptance criterion #4: no behavior change for the dead-pid path.
+
+    ``ERROR_INVALID_PARAMETER`` (87) from ``OpenProcess`` means the PID does not
+    exist.  This path must still return ``False`` -- the fix only changed the
+    ``ERROR_ACCESS_DENIED`` branch.
+    """
+
+    class _FakeKernel32:
+        def OpenProcess(self, access: int, inherit: bool, pid: int) -> int:
+            return 0  # failure
+
+        def GetLastError(self) -> int:
+            return 87  # ERROR_INVALID_PARAMETER
+
+        def CloseHandle(self, handle: int) -> int:
+            return 1
+
+        def GetExitCodeProcess(self, handle: int, exit_code: Any) -> int:
+            return 0  # not reached
+
+    fake = _FakeKernel32()
+    import ctypes
+
+    monkeypatch.setattr(ctypes.windll, "kernel32", fake, raising=False)
+
+    assert is_pid_alive(999999, 123.456) is False
+    assert is_pid_alive(999999) is False
+
+
 def _capture_popen_call(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     """Replace subprocess.Popen with a MagicMock and return the mock."""
     mock = MagicMock()
