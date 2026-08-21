@@ -10108,7 +10108,16 @@ def test_stale_claim_recovery_skipped_logs_when_packet_not_stale(
         save_state(state_file, state)
 
     _detect_and_handle_stalled_reviews(
-        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+        reviews_dir,
+        state_file,
+        config,
+        repo_root,
+        write_gate=_wg(state_file),
+        # Pass now= aligned with the packet's mtime so the stale-claim timeout
+        # is not met (the packet is fresh).  Under CHARLIE_TEST_CLOCK_SKEW_DAYS
+        # datetime.now is shifted but filesystem mtimes are not, so without
+        # this the packet would appear stale under skew — issue #1369.
+        now=datetime.fromtimestamp(prompt_path.stat().st_mtime, UTC),
     )
 
     state = load_state(state_file)
@@ -14254,6 +14263,11 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     worktree_path, branch = _setup_completed_worktree(repo_root, 1122)
 
+    # Relative to now so the fixture does not age into a different watchdog
+    # window as wall-clock advances (issue #1369).  30 minutes ago is within
+    # the bounded-runtime classification window but clearly in the past.
+    _started_at = (datetime.now(UTC) - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
             issue_number=issue_number,
@@ -14262,7 +14276,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
             prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
             command=("claude", "-p"),
             pid=6262,
-            started_at="2026-08-10T11:15:39Z",
+            started_at=_started_at,
             log_path=str(tmp_path / "log"),
             error="probe_error",
             failure_kind="live_worker_redispatch_averted",
@@ -14270,6 +14284,9 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    # Patch the binding that is_worker_alive actually calls (claude_code imports
+    # is_pid_alive at module level), not just the workflow-level re-import.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
@@ -14303,7 +14320,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
                 "prompt_path": "",
                 "command": ["claude", "-p"],
                 "pid": 6262,
-                "started_at": "2026-08-10T11:15:39Z",
+                "started_at": _started_at,
                 "log_path": str(tmp_path / "log"),
                 "error": "probe_error",
                 "failure_kind": "live_worker_redispatch_averted",
@@ -14374,6 +14391,9 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
         encoding="utf-8",
     )
 
+    # Relative to now — issue #1369 (see sibling test above for rationale).
+    _started_at = (datetime.now(UTC) - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
             issue_number=issue_number,
@@ -14382,7 +14402,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
             prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
             command=("claude", "-p"),
             pid=7373,
-            started_at="2026-08-10T11:15:39Z",
+            started_at=_started_at,
             log_path=str(tmp_path / "log"),
             error="probe_error",
             failure_kind="live_worker_redispatch_averted",
@@ -14390,6 +14410,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
@@ -14422,7 +14443,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
                 "prompt_path": "",
                 "command": ["claude", "-p"],
                 "pid": 7373,
-                "started_at": "2026-08-10T11:15:39Z",
+                "started_at": _started_at,
                 "log_path": str(tmp_path / "log"),
                 "error": "probe_error",
                 "failure_kind": "live_worker_redispatch_averted",
@@ -42629,6 +42650,9 @@ def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     worktree_path, branch = _setup_completed_worktree(repo_root, 1130, dirty=True)
 
+    # Relative to now — issue #1369 (see sibling test above for rationale).
+    _started_at = (datetime.now(UTC) - timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
             issue_number=issue_number,
@@ -42637,7 +42661,7 @@ def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
             prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
             command=("claude", "-p"),
             pid=8282,
-            started_at="2026-08-10T11:15:39Z",
+            started_at=_started_at,
             log_path=str(tmp_path / "log"),
             error="probe_error",
             failure_kind="live_worker_redispatch_averted",
@@ -42645,6 +42669,7 @@ def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
 
     config = OrchestratorConfig(devin=DevinConfig(adapter="claude-code"))
@@ -42677,7 +42702,7 @@ def test_phantom_live_worker_preserves_sidecar_for_dirty_worktree_with_commits(
                 "prompt_path": "",
                 "command": ["claude", "-p"],
                 "pid": 8282,
-                "started_at": "2026-08-10T11:15:39Z",
+                "started_at": _started_at,
                 "log_path": str(tmp_path / "log"),
                 "error": "probe_error",
                 "failure_kind": "live_worker_redispatch_averted",

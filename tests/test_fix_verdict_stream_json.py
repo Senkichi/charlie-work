@@ -234,6 +234,8 @@ def test_file_fallback_recovers_verdict_from_referenced_md(tmp_path: Path) -> No
     recovered when the file is fresher than the session start."""
     md = tmp_path / "adversarial-review-packet.md"
     md.write_text("# Review\n\nDetails...\n\n" + VERDICT_TEXT, encoding="utf-8")
+    # Align mtime with the active clock (issue #1369).
+    os.utime(md, (datetime.now(UTC).timestamp(),) * 2)
 
     log = tmp_path / "review.claude.log"
     log.write_text(
@@ -307,6 +309,8 @@ def test_file_fallback_bogus_mentions_do_not_starve_a_real_file(tmp_path: Path) 
     packet_dir.mkdir()
     real = tmp_path / "reviewer-notes.md"
     real.write_text(VERDICT_TEXT, encoding="utf-8")
+    # Align mtime with the active clock (issue #1369).
+    os.utime(real, (datetime.now(UTC).timestamp(),) * 2)
 
     bogus = " ".join(f"`C:\\reviewed\\file-{i}.md`" for i in range(10))
     log = tmp_path / "review.claude.log"
@@ -406,6 +410,8 @@ def test_reap_records_verdict_via_file_fallback(monkeypatch, tmp_path: Path) -> 
     md = tmp_path / "plans" / "adversarial-review-notes.md"
     md.parent.mkdir(parents=True)
     md.write_text("# Full review\n\n...analysis...\n\n" + VERDICT_TEXT, encoding="utf-8")
+    # Align mtime with the active clock (issue #1369).
+    os.utime(md, (datetime.now(UTC).timestamp(),) * 2)
 
     log_text = _stream_json_log(
         _result_event(f"Full review written to `{md}` with the verdict JSON block at the end.")

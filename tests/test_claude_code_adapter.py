@@ -2827,7 +2827,13 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     assert "line 3" in events_content
 
     # Verify is_session_stalled works correctly on the tee'd log
-    # The log should not be stalled (it was just written)
+    # The log should not be stalled (it was just written).  Touch the log to
+    # align its mtime with whatever clock is active (datetime.now under
+    # CHARLIE_TEST_CLOCK_SKEW_DAYS is shifted, but filesystem mtimes are not,
+    # so a just-written file can appear stale under skew — issue #1369).
+    from datetime import UTC, datetime
+
+    os.utime(log_path, (datetime.now(UTC).timestamp(),) * 2)
     is_stalled, last_line = is_session_stalled(log_path, stall_threshold_minutes=20)
     assert is_stalled is False, "Freshly written log should not be stalled"
     assert last_line is not None, "Should be able to read last line from log"

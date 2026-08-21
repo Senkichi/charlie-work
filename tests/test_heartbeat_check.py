@@ -742,6 +742,8 @@ def test_check_dispatch_failures_anomaly_for_new_failure(hb: ModuleType, tmp_pat
     dispatches = repo.state_dir / "dispatches"
     dispatches.mkdir(parents=True, exist_ok=True)
     (dispatches / "bad.json").write_text(json.dumps({"error": "boom"}), encoding="utf-8")
+    # Align mtime with the active clock (issue #1369).
+    os.utime(dispatches / "bad.json", (datetime.now(timezone.utc).timestamp(),) * 2)
     baseline = datetime.now(timezone.utc) - timedelta(hours=1)
     report = hb.Report()
     hb.check_dispatch_failures(report, repo, baseline)
@@ -769,6 +771,8 @@ def test_check_log_freshness_ok_when_fresh(hb: ModuleType, tmp_path: Path) -> No
     repo = _make_repo(hb, tmp_path)
     repo.state_dir.mkdir(parents=True, exist_ok=True)
     (repo.state_dir / "run.log").write_text("hi", encoding="utf-8")
+    # Align mtime with the active clock (issue #1369).
+    os.utime(repo.state_dir / "run.log", (datetime.now(timezone.utc).timestamp(),) * 2)
     report = hb.Report()
     hb.check_log_freshness(report, repo)
     assert not report.anomaly
@@ -1217,6 +1221,9 @@ def test_check_loop_pass_freshness_anomaly_when_stale_but_log_fresh(
     repo = _make_repo(hb, tmp_path)
     repo.state_dir.mkdir(parents=True, exist_ok=True)
     (repo.state_dir / "state.json").write_text("{}", encoding="utf-8")
+    # Align mtime with the active clock so check_log_freshness reads healthy
+    # (issue #1369).
+    os.utime(repo.state_dir / "state.json", (datetime.now(timezone.utc).timestamp(),) * 2)
     _write_events_db(repo.state_dir, [(_iso(120), "loop_started")])
 
     log_report = hb.Report()

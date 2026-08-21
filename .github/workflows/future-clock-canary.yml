@@ -1,0 +1,147 @@
+name: Future-clock canary
+
+# Issue #1369: scheduled canary that runs the full test suite with the test
+# clock shifted forward by 45 days.  This detonates age-sensitive fixtures --
+# tests that compare hardcoded absolute timestamps against datetime.now() --
+# before they age into a different watchdog/throttle window and turn every
+# PR red on a random Tuesday.
+#
+# Runs ONLY on schedule and manual dispatch -- never on pull_request or push,
+# so a canary failure does not block merges directly.  Instead, a failure
+# creates or updates a single tracking issue (keyed by a fixed title) so the
+# team gets one actionable signal rather than paging-style noise.
+on:
+  schedule:
+    # 09:00 UTC every Monday -- start of the dev week, low CI contention.
+    - cron: "0 9 * * 1"
+  workflow_dispatch: {}
+
+# Cancel superseded in-progress canary runs (e.g. a manual dispatch while the
+# scheduled run is still going).  There is no PR or branch ref to key on, so
+# the workflow name alone is the concurrency group.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8:surrogateescape"
+
+jobs:
+  future-clock-tests:
+    name: Tests (+45 day clock skew)
+    runs-on: self-hosted
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Add uv to PATH (self-hosted, no setup-uv)
+        shell: bash
+        run: |
+          set -e
+          cache="$RUNNER_TOOL_CACHE/uv"
+          dir=""
+          if [ -d "$cache" ]; then
+            ver=$(ls "$cache" | grep -E '^[0-9]+[.][0-9]+[.][0-9]+$' | sort -V | tail -1)
+            [ -n "$ver" ] && dir="$cache/$ver/x64"
+          fi
+          if [ -n "$dir" ] && [ -x "$dir/uv.exe" ]; then
+            echo "$dir" >> "$GITHUB_PATH"
+            "$dir/uv.exe" --version
+          elif command -v uv >/dev/null; then
+            uv --version
+          else
+            echo "::error::uv not found in tool cache ($cache) or host PATH; install uv on the host"
+            exit 1
+          fi
+      - name: Check out ci_runners as a sibling
+        shell: powershell
+        env:
+          CI_RUNNERS_PAT: ${{ secrets.CI_RUNNERS_PAT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dest = Join-Path (Split-Path $env:GITHUB_WORKSPACE -Parent) 'ci_runners'
+          $pair = "x-access-token:$env:CI_RUNNERS_PAT"
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+          $auth = "AUTHORIZATION: basic $b64"
+          Write-Host "::add-mask::$b64"
+          if (Test-Path (Join-Path $dest '.git')) {
+            git -C $dest -c http.extraheader="$auth" fetch --depth 1 origin main
+            if ($LASTEXITCODE -ne 0) { throw "fetch of ci_runners failed" }
+            git -C $dest reset --hard FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { throw "reset of ci_runners failed" }
+          } elseif (Test-Path $dest) {
+            throw "$dest exists but is not a git checkout -- refusing to touch it"
+          } else {
+            git -c http.extraheader="$auth" clone --depth 1 --branch main `
+              https://github.com/Senkichi/ci_runners.git $dest
+            if ($LASTEXITCODE -ne 0) { throw "clone of ci_runners failed" }
+          }
+          if (-not (Test-Path (Join-Path $dest 'pyproject.toml'))) {
+            throw "ci_runners checkout at $dest has no pyproject.toml"
+          }
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+      - name: Run tests with +45 day clock skew
+        id: tests
+        # CHARLIE_TEST_CLOCK_SKEW_DAYS is read by tests/conftest.py, which
+        # patches datetime.datetime.now() to return a clock shifted forward
+        # by this many days.  This makes every age-sensitive fixture see a
+        # wall-clock that is 45 days in the future relative to the fixtures'
+        # hardcoded absolute timestamps.
+        env:
+          CHARLIE_TEST_CLOCK_SKEW_DAYS: "45"
+        run: uv run pytest --tb=short -n 2 --dist=load
+      - name: Create or update tracking issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TITLE="canary: future-clock test failures (issue #1369)"
+          BODY=$(cat <<EOF
+          ## Future-clock canary failure
+
+          The weekly future-clock canary detected test failures when running
+          the full suite with the clock shifted forward by 45 days.
+
+          This means one or more tests compare hardcoded absolute timestamps
+          against \`datetime.now()\` and have aged into a different
+          watchdog/throttle/staleness window.  Left unfixed, these will
+          eventually turn the normal CI job red on every PR.
+
+          **Action required:** convert the failing test's hardcoded timestamps
+          to relative-to-now values or inject a frozen \`now=\` parameter, per
+          the issue #1369 classification methodology.
+
+          ---
+
+          - **Canary run:** ${RUN_URL}
+          - **Run ID:** ${RUN_ID}
+          - **Clock skew:** 45 days forward
+          - **Tracking issue:** re-opened automatically on each canary failure
+
+          _This issue is created/updated by the future-clock-canary workflow.
+          It is not a paging alert -- it tracks the need to fix age-sensitive
+          fixtures before they block merges._
+          EOF
+          )
+
+          # Search for an existing open issue with the fixed title.
+          EXISTING=$(gh issue list --state open --search "in:title $TITLE" --json number,title --limit 5 2>/dev/null || echo "[]")
+          ISSUE_NUMBER=$(echo "$EXISTING" | jq -r '.[] | select(.title == "'"$TITLE"'") | .number' | head -1)
+
+          if [ -n "$ISSUE_NUMBER" ] && [ "$ISSUE_NUMBER" != "null" ]; then
+            # Update the existing issue with a comment linking this run.
+            gh issue comment "$ISSUE_NUMBER" --body "$BODY"
+            echo "Updated tracking issue #$ISSUE_NUMBER with latest canary failure."
+          else
+            # Create a new tracking issue.
+            gh issue create --title "$TITLE" --body "$BODY" --label "ci-canary"
+            echo "Created new tracking issue for canary failure."
+          fi

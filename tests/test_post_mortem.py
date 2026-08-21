@@ -1924,6 +1924,11 @@ def test_reclaim_stale_temp_copies_removes_old_keeps_fresh(tmp_path: Path, monke
     fresh_dir = tmp_path / "charlie-work-postmortem-fresh"
     fresh_dir.mkdir()
     (fresh_dir / "sessions.db").write_bytes(b"x")
+    # Align the fresh dir's mtime with whatever clock is active (datetime.now
+    # under CHARLIE_TEST_CLOCK_SKEW_DAYS is shifted, but filesystem mtimes are
+    # not, so a just-created dir can appear stale under skew — issue #1369).
+    fresh_time = datetime.now(UTC).timestamp()
+    os.utime(fresh_dir, (fresh_time, fresh_time))
 
     # A non-matching dir must be ignored.
     other_dir = tmp_path / "something-else"

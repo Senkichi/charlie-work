@@ -40,6 +40,8 @@ def test_classify_worker_health_healthy(tmp_path: Path) -> None:
     """classify_worker_health returns HEALTHY for a live worker with recent log activity."""
     log_file = tmp_path / "test.log"
     log_file.write_text("Working on task...\nStill working...", encoding="utf-8")
+    # Align mtime with the active clock (issue #1369).
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Use a recent started_at to avoid triggering the wall-clock tripwire
     recent_start = datetime.now(UTC) - timedelta(minutes=10)
@@ -387,6 +389,7 @@ def test_classify_worker_health_legacy_none_start_time(tmp_path: Path) -> None:
     """A WorkerView with process_start_time=None and a live PID never classifies as DEAD on liveness grounds alone."""
     log_file = tmp_path / "test.log"
     log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Use a recent started_at to avoid triggering the wall-clock tripwire
     recent_start = datetime.now(UTC) - timedelta(minutes=10)
@@ -513,6 +516,7 @@ def test_classify_worker_health_no_io_performed(tmp_path: Path) -> None:
     """classify_worker_health performs no I/O beyond what WorkerView.log_stat() already captured."""
     log_file = tmp_path / "test.log"
     log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Use a recent started_at to avoid triggering the wall-clock tripwire
     recent_start = datetime.now(UTC) - timedelta(minutes=10)
@@ -610,6 +614,7 @@ def test_classify_worker_health_cost_budget_warn_mode(tmp_path: Path) -> None:
     log_file = tmp_path / "sessions" / "issue-1.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     events_file = tmp_path / "sessions" / "issue-1.events.jsonl"
     events_file.write_text(
@@ -648,6 +653,7 @@ def test_classify_worker_health_cost_budget_kill_mode(tmp_path: Path) -> None:
     log_file = tmp_path / "sessions" / "issue-1.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     events_file = tmp_path / "sessions" / "issue-1.events.jsonl"
     events_file.write_text(
@@ -686,6 +692,7 @@ def test_classify_worker_health_token_budget_warn_mode(tmp_path: Path) -> None:
     log_file = tmp_path / "sessions" / "issue-1.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     events_file = tmp_path / "sessions" / "issue-1.events.jsonl"
     events_file.write_text(
@@ -724,6 +731,7 @@ def test_classify_worker_health_token_budget_kill_mode(tmp_path: Path) -> None:
     log_file = tmp_path / "sessions" / "issue-1.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     events_file = tmp_path / "sessions" / "issue-1.events.jsonl"
     events_file.write_text(
@@ -762,6 +770,7 @@ def test_classify_worker_health_usage_below_budgets(tmp_path: Path) -> None:
     log_file = tmp_path / "sessions" / "issue-1.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     events_file = tmp_path / "sessions" / "issue-1.events.jsonl"
     events_file.write_text(
@@ -800,6 +809,7 @@ def test_classify_worker_health_no_events_file_devin(tmp_path: Path) -> None:
     log_file = tmp_path / "sessions" / "issue-1.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # No events.jsonl file exists
 
@@ -833,6 +843,7 @@ def test_classify_worker_health_no_events_file_claude(tmp_path: Path) -> None:
     log_file = tmp_path / "sessions" / "issue-1.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # No events.jsonl file exists
 
@@ -866,6 +877,7 @@ def test_classify_worker_health_budgets_disabled_by_default(tmp_path: Path) -> N
     log_file = tmp_path / "sessions" / "issue-1.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     events_file = tmp_path / "sessions" / "issue-1.events.jsonl"
     events_file.write_text(
@@ -902,6 +914,7 @@ def test_classify_worker_health_wall_clock_slow_default(tmp_path: Path) -> None:
     """Wall-clock tripwire returns SLOW at default config (wall_clock_kill=False)."""
     log_file = tmp_path / "test.log"
     log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Set started_at to 241 minutes ago (past the 240-minute default)
     old_start = datetime.now(UTC) - timedelta(minutes=241)
@@ -931,6 +944,7 @@ def test_classify_worker_health_wall_clock_runaway_with_kill(tmp_path: Path) -> 
     """Wall-clock tripwire returns RUNAWAY when wall_clock_kill=True."""
     log_file = tmp_path / "test.log"
     log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Set started_at to 241 minutes ago (past the 240-minute default)
     old_start = datetime.now(UTC) - timedelta(minutes=241)
@@ -960,6 +974,7 @@ def test_classify_worker_health_wall_clock_within_threshold(tmp_path: Path) -> N
     """Wall-clock tripwire does not fire when started_at is within threshold."""
     log_file = tmp_path / "test.log"
     log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Set started_at to 60 minutes ago (well within the 240-minute default)
     recent_start = datetime.now(UTC) - timedelta(minutes=60)
@@ -1149,6 +1164,7 @@ def test_classify_worker_health_loop_no_events_file(tmp_path: Path) -> None:
     """Loop tripwire is skipped when events.jsonl does not exist (no error raised)."""
     log_file = tmp_path / "test.log"
     log_file.write_text("Working on task...\nLast line", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # No events.jsonl file created
 
@@ -1560,6 +1576,7 @@ def test_classify_worker_health_budget_tripwire_rework_layout(tmp_path: Path) ->
     issue_number = 42
     log_file = sessions_dir / f"issue-{issue_number}-rework.claude.log"
     log_file.write_text("Working on rework attempt...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Stale events.jsonl from a prior (non-rework) attempt: under budget.
     stale_events_file = sessions_dir / f"issue-{issue_number}.events.jsonl"
@@ -1730,6 +1747,7 @@ def _api_worker_view(tmp_path: Path, *, provider: str = "example") -> WorkerView
     log_file = tmp_path / "sessions" / "issue-1.claude.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("Working on task...", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
     recent_start = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     return WorkerView(
         adapter_kind="api",

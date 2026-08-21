@@ -4906,6 +4906,8 @@ def test_recovery_aborts_on_fresh_per_pid_log_despite_sessions_db_error(tmp_path
     logs_dir.mkdir(parents=True, exist_ok=True)
     fresh_log = logs_dir / "devin_test_999999.log"
     fresh_log.write_text("fresh activity\n", encoding="utf-8")
+    # Align mtime with the active clock (issue #1369).
+    os.utime(fresh_log, (datetime.now(UTC).timestamp(),) * 2)
 
     now = datetime.now(UTC).isoformat()
     config = OrchestratorConfig(
@@ -4965,10 +4967,12 @@ def test_recovery_aborts_on_fresh_per_pid_log_when_sessions_db_confirmed_stale(
     )
 
     # Fresh per-PID Devin log (mtime defaults to "now" via write_text).
+    # Align mtime with the active clock (issue #1369).
     logs_dir = db_path.parent / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     fresh_log = logs_dir / "devin_test_999999.log"
     fresh_log.write_text("fresh activity\n", encoding="utf-8")
+    os.utime(fresh_log, (datetime.now(UTC).timestamp(),) * 2)
 
     config = OrchestratorConfig(
         devin=DevinConfig(adapter="devin-shell"),

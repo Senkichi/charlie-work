@@ -1,14 +1,45 @@
 from __future__ import annotations
 
-import os
-import shutil
-import sys
-from collections.abc import Callable
-from pathlib import Path
-from typing import Any
-from unittest.mock import create_autospec
+# --- Clock-skew shim (issue #1369) -------------------------------------------
+# Must run BEFORE any other import that could bind ``datetime.datetime`` at
+# module level.  When ``CHARLIE_TEST_CLOCK_SKEW_DAYS`` is set, every
+# ``datetime.now()`` call in production code (imported after this conftest) sees
+# a clock shifted forward by that many days.  This lets the weekly canary
+# workflow (and local runs) detonate age-sensitive fixtures that compare
+# hardcoded absolute timestamps against wall-clock now — before they block
+# merges on a random Tuesday.
+#
+# The shim replaces ``datetime.datetime`` in the ``datetime`` module with a
+# subclass whose ``now()`` adds the skew.  Modules that do
+# ``from datetime import datetime`` *after* this conftest loads (i.e. all
+# production code imported during test collection) get the skewed class.
+# ``fromisoformat`` and other parsers are inherited unchanged and return
+# original ``datetime`` instances, so only ``now()`` is affected.
+import datetime as _datetime_module
+import os as _os
 
-import pytest
+_SKEW_DAYS_ENV = _os.environ.get("CHARLIE_TEST_CLOCK_SKEW_DAYS", "")
+if _SKEW_DAYS_ENV:
+    _skew = _datetime_module.timedelta(days=int(_SKEW_DAYS_ENV))
+    _RealDateTime = _datetime_module.datetime
+
+    class _SkewedDateTime(_RealDateTime):
+        @classmethod
+        def now(cls, tz=None):
+            return _RealDateTime.now(tz) + _skew
+
+    _datetime_module.datetime = _SkewedDateTime
+# --- End clock-skew shim -----------------------------------------------------
+
+import os  # noqa: E402
+import shutil  # noqa: E402
+import sys  # noqa: E402
+from collections.abc import Callable  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
+from unittest.mock import create_autospec  # noqa: E402
+
+import pytest  # noqa: E402
 
 
 _UNSET = object()

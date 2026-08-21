@@ -82,6 +82,8 @@ def test_is_session_stalled_healthy_session(tmp_path: Path) -> None:
     """Test that a healthy session (recent log, no terminal marker) is not stalled."""
     log_file = tmp_path / "test.log"
     log_file.write_text("working on issue\nmaking progress\n", encoding="utf-8")
+    # Align mtime with the active clock (issue #1369).
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Fresh mtime, no terminal error
     is_stalled, last_line = is_session_stalled(log_file, stall_threshold_minutes=20)
@@ -93,6 +95,7 @@ def test_is_session_stalled_retry_message_not_stalled(tmp_path: Path) -> None:
     """Test that a retry-style error message with fresh mtime does NOT trigger stall."""
     log_file = tmp_path / "test.log"
     log_file.write_text("Retrying after Error: connection reset\n", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Fresh mtime, retry message should not trigger stall (not a terminal error)
     is_stalled, last_line = is_session_stalled(log_file, stall_threshold_minutes=20)
@@ -113,6 +116,7 @@ def test_is_session_stalled_empty_log(tmp_path: Path) -> None:
     """Test that an empty log file is handled correctly."""
     log_file = tmp_path / "empty.log"
     log_file.write_text("", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     is_stalled, last_line = is_session_stalled(log_file, stall_threshold_minutes=20)
     # Empty log with fresh mtime should not be stalled
@@ -596,6 +600,7 @@ def test_is_session_stalled_custom_terminal_markers(tmp_path: Path) -> None:
     """Test that is_session_stalled uses custom terminal_error_markers when provided."""
     log_file = tmp_path / "test.log"
     log_file.write_text("some log content\nCustom fatal error\n", encoding="utf-8")
+    os.utime(log_file, (datetime.now(UTC).timestamp(),) * 2)
 
     # Default markers should not trigger stall
     is_stalled, last_line = is_session_stalled(
@@ -1008,8 +1013,13 @@ def test_find_worker_terminal_status_picks_most_recent_by_mtime(tmp_path: Path) 
     )
     # Force an unambiguous mtime ordering regardless of filesystem timestamp
     # resolution (some Windows filesystems only resolve mtime to ~2 seconds).
+    # Both mtimes are set relative to whatever clock is active (datetime.now
+    # under CHARLIE_TEST_CLOCK_SKEW_DAYS is shifted, but filesystem mtimes are
+    # not — issue #1369).
     old_time = (datetime.now(UTC) - timedelta(minutes=10)).timestamp()
     os.utime(older, (old_time, old_time))
+    new_time = datetime.now(UTC).timestamp()
+    os.utime(newer, (new_time, new_time))
 
     record = find_worker_terminal_status(tmp_path, 7)
     assert record is not None
