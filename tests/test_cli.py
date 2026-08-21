@@ -2214,6 +2214,334 @@ def test_bootstrap_command_includes_config_repo_misroute_guard(
 
 
 # --------------------------------------------------------------------------
+# sibling-clone state-root misroute guard (issue #1376)
+# --------------------------------------------------------------------------
+
+
+def _init_git_repo_with_origin(root: Path, remote_url: str) -> Path:
+    """Create a real git repo with one commit and an ``origin`` remote."""
+    import subprocess
+
+    root.mkdir(parents=True, exist_ok=True)
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=root, check=True, capture_output=True, text=True
+    )
+    run(["git", "init", "--initial-branch=main"])
+    run(["git", "config", "user.email", "test@example.test"])
+    run(["git", "config", "user.name", "Test User"])
+    (root / "README.md").write_text("hello\n", encoding="utf-8")
+    run(["git", "add", "README.md"])
+    run(["git", "commit", "-m", "initial commit"])
+    run(["git", "remote", "add", "origin", remote_url])
+    return root
+
+
+def _write_fleet_registry(
+    fleet_dir: Path, name_with_owner: str, repo_root: Path, state_dir: Path
+) -> None:
+    """Write a minimal fleet.json with one registered repo."""
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "repo_root": str(repo_root),
+        "name_with_owner": name_with_owner,
+        "config_path": str(repo_root / "orchestrator.config.yaml"),
+        "state_dir": str(state_dir),
+        "first_seen": "2026-01-01T00:00:00Z",
+        "last_seen": "2026-01-01T00:00:00Z",
+    }
+    registry = {"version": 1, "repos": {name_with_owner: entry}}
+    (fleet_dir / "fleet.json").write_text(json.dumps(registry), encoding="utf-8")
+
+
+def _make_sibling_clone_ctx(sibling_root: Path, config: OrchestratorConfig) -> cli.CommandContext:
+    """Build a CommandContext whose repo_root is the sibling clone."""
+    from charlie_work.github import GitHub
+    from charlie_work.paths import runtime_paths
+
+    paths = runtime_paths(sibling_root, config.runtime.state_dir)
+    gh = GitHub(repo_root=sibling_root, runtime=config.runtime, dry_run=True)
+    return cli.CommandContext(repo_root=sibling_root, config=config, paths=paths, gh=gh)
+
+
+def test_sibling_clone_verdict_refused(tmp_path: Path) -> None:
+    """Issue #1376 acceptance criterion #5: a state-affecting command run
+    from a sibling clone (separate git repo, same GitHub remote) must refuse
+    with a three-path error, never silently write to the clone's phantom
+    ``.var`` tree."""
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+    sibling = _init_git_repo_with_origin(tmp_path / "sibling", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    canonical_state = canonical / ".var" / "charlie-work"
+    _write_fleet_registry(fleet_dir, "test/canonical", canonical, canonical_state)
+
+    config = OrchestratorConfig()
+    ctx = _make_sibling_clone_ctx(sibling, config)
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(fleet_dir), "verdict", "--pr", "1", "--decision", "approved"]
+    )
+
+    with pytest.raises(ConfigError) as excinfo:
+        cli._assert_not_sibling_clone(ctx, args)
+
+    message = str(excinfo.value)
+    # The three required paths: cwd, would-be state root, canonical root.
+    assert str(ctx.paths.root) in message
+    assert str(canonical.resolve()) in message
+    # The corrective invocation.
+    assert "--repo" in message
+
+
+def test_sibling_clone_merge_authorize_refused(tmp_path: Path) -> None:
+    """Issue #1376 acceptance criterion #2: merge-authorize is also guarded."""
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+    sibling = _init_git_repo_with_origin(tmp_path / "sibling", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    _write_fleet_registry(
+        fleet_dir, "test/canonical", canonical, canonical / ".var" / "charlie-work"
+    )
+
+    config = OrchestratorConfig()
+    ctx = _make_sibling_clone_ctx(sibling, config)
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(fleet_dir), "merge-authorize", "1", "--reason", "ok"]
+    )
+
+    with pytest.raises(ConfigError):
+        cli._assert_not_sibling_clone(ctx, args)
+
+
+def test_sibling_clone_unescalate_refused(tmp_path: Path) -> None:
+    """Issue #1376 acceptance criterion #2: unescalate is also guarded."""
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+    sibling = _init_git_repo_with_origin(tmp_path / "sibling", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    _write_fleet_registry(
+        fleet_dir, "test/canonical", canonical, canonical / ".var" / "charlie-work"
+    )
+
+    config = OrchestratorConfig()
+    ctx = _make_sibling_clone_ctx(sibling, config)
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(fleet_dir), "unescalate", "--pr", "1"]
+    )
+
+    with pytest.raises(ConfigError):
+        cli._assert_not_sibling_clone(ctx, args)
+
+
+def test_canonical_repo_verdict_allowed(tmp_path: Path) -> None:
+    """Issue #1376: the guard must NOT fire when cwd is the canonical repo
+    itself — the registered root matches the resolved root."""
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    _write_fleet_registry(
+        fleet_dir, "test/canonical", canonical, canonical / ".var" / "charlie-work"
+    )
+
+    config = OrchestratorConfig()
+    ctx = _make_sibling_clone_ctx(canonical, config)
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(fleet_dir), "verdict", "--pr", "1", "--decision", "approved"]
+    )
+
+    cli._assert_not_sibling_clone(ctx, args)  # must not raise
+
+
+def test_linked_worktree_verdict_allowed_via_canonical_resolution(
+    tmp_path: Path,
+) -> None:
+    """Issue #1376 acceptance criterion #1: a verdict run from a linked
+    worktree of the canonical repo must NOT be refused — ``find_repo_root``
+    resolves the linked worktree to the shared main checkout, so the
+    resolved root matches the registered root."""
+    import subprocess
+
+    from charlie_work.paths import find_repo_root
+
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+
+    # Create a linked worktree.
+    linked_wt = tmp_path / "linked-wt"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/test", str(linked_wt), "HEAD"],
+        cwd=canonical,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        fleet_dir = tmp_path / "fleet"
+        _write_fleet_registry(
+            fleet_dir, "test/canonical", canonical, canonical / ".var" / "charlie-work"
+        )
+
+        # find_repo_root from the linked worktree resolves to the main checkout.
+        resolved = find_repo_root(linked_wt)
+        assert resolved == canonical.resolve()
+
+        config = OrchestratorConfig()
+        ctx = _make_sibling_clone_ctx(resolved, config)
+        args = cli.build_parser().parse_args(
+            ["--fleet-dir", str(fleet_dir), "verdict", "--pr", "1", "--decision", "approved"]
+        )
+
+        cli._assert_not_sibling_clone(ctx, args)  # must not raise
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(linked_wt)],
+            cwd=canonical,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+
+def test_explicit_repo_skips_sibling_clone_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1376 acceptance criterion #4: explicit ``--repo`` overrides
+    the guard — the operator named the repo, so the resolution is
+    intentional and the guard is not called."""
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+    sibling = _init_git_repo_with_origin(tmp_path / "sibling", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    _write_fleet_registry(
+        fleet_dir, "test/canonical", canonical, canonical / ".var" / "charlie-work"
+    )
+
+    # build_app with --repo pointing at the sibling clone must NOT call the
+    # guard.  We verify by monkeypatching the guard to raise if called.
+    config = OrchestratorConfig()
+
+    def _guard_should_not_fire(ctx, args):  # noqa: ANN001
+        raise AssertionError("guard should not fire when --repo is explicit")
+
+    monkeypatch.setattr(cli, "_assert_not_sibling_clone", _guard_should_not_fire)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: sibling)
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    monkeypatch.setattr(cli, "touch_repo", lambda *a, **k: {})
+
+    args = cli.build_parser().parse_args(
+        [
+            "--repo",
+            str(sibling),
+            "--fleet-dir",
+            str(fleet_dir),
+            "verdict",
+            "--pr",
+            "1",
+            "--decision",
+            "approved",
+        ]
+    )
+    # Must not raise — the guard was skipped because args.repo is not None.
+    cli.build_app(args)
+
+
+def test_guard_fails_open_for_unregistered_repo(tmp_path: Path) -> None:
+    """Issue #1376: when the repo is not in the fleet registry (fresh
+    install), the guard must allow the command — there is no canonical root
+    to compare against."""
+    remote_url = "https://github.com/test/fresh.git"
+    repo = _init_git_repo_with_origin(tmp_path / "fresh", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    # No fleet.json written — registry is empty.
+
+    config = OrchestratorConfig()
+    ctx = _make_sibling_clone_ctx(repo, config)
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(fleet_dir), "verdict", "--pr", "1", "--decision", "approved"]
+    )
+
+    cli._assert_not_sibling_clone(ctx, args)  # must not raise
+
+
+def test_guard_fails_open_for_no_origin_remote(tmp_path: Path) -> None:
+    """Issue #1376: when the repo has no ``origin`` remote (or a non-GitHub
+    URL), ``nameWithOwner`` cannot be resolved and the guard must allow the
+    command — the guard is for GitHub-fleet repos, not arbitrary checkouts."""
+    from _helpers import _init_git_repo
+
+    repo = tmp_path / "no-remote"
+    _init_git_repo(repo)
+
+    fleet_dir = tmp_path / "fleet"
+    _write_fleet_registry(
+        fleet_dir, "test/canonical", tmp_path / "canonical", tmp_path / "canonical" / ".var"
+    )
+
+    config = OrchestratorConfig()
+    ctx = _make_sibling_clone_ctx(repo, config)
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(fleet_dir), "verdict", "--pr", "1", "--decision", "approved"]
+    )
+
+    cli._assert_not_sibling_clone(ctx, args)  # must not raise
+
+
+def test_guard_fails_open_for_stale_registered_root(tmp_path: Path) -> None:
+    """Issue #1376: when the registered ``repo_root`` no longer exists, the
+    guard must allow — a stale entry is not evidence of a sibling clone."""
+    remote_url = "https://github.com/test/canonical.git"
+    sibling = _init_git_repo_with_origin(tmp_path / "sibling", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    # Register a root that doesn't exist.
+    _write_fleet_registry(
+        fleet_dir, "test/canonical", tmp_path / "deleted", tmp_path / "deleted" / ".var"
+    )
+
+    config = OrchestratorConfig()
+    ctx = _make_sibling_clone_ctx(sibling, config)
+    args = cli.build_parser().parse_args(
+        ["--fleet-dir", str(fleet_dir), "verdict", "--pr", "1", "--decision", "approved"]
+    )
+
+    cli._assert_not_sibling_clone(ctx, args)  # must not raise
+
+
+def test_read_only_command_skips_guard(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Issue #1376 acceptance criterion #2: read-only commands (e.g.
+    ``roll-call``/status) must NOT trigger the sibling-clone guard."""
+    remote_url = "https://github.com/test/canonical.git"
+    canonical = _init_git_repo_with_origin(tmp_path / "canonical", remote_url)
+    sibling = _init_git_repo_with_origin(tmp_path / "sibling", remote_url)
+
+    fleet_dir = tmp_path / "fleet"
+    _write_fleet_registry(
+        fleet_dir, "test/canonical", canonical, canonical / ".var" / "charlie-work"
+    )
+
+    config = OrchestratorConfig()
+
+    def _guard_should_not_fire(ctx, args):  # noqa: ANN001
+        raise AssertionError("guard should not fire for read-only commands")
+
+    monkeypatch.setattr(cli, "_assert_not_sibling_clone", _guard_should_not_fire)
+    monkeypatch.setattr(cli, "find_repo_root", lambda repo, explicit=False: sibling)
+    monkeypatch.setattr(cli, "load_layered_config", lambda *a, **k: config)
+    monkeypatch.setattr(cli, "GitHub", _FakeGitHub)
+    monkeypatch.setattr(cli, "touch_repo", lambda *a, **k: {})
+
+    args = cli.build_parser().parse_args(["--fleet-dir", str(fleet_dir), "roll-call"])
+    # roll-call is not in _STATE_AFFECTING_COMMANDS, so the guard is skipped.
+    cli.build_app(args)
+
+
+# --------------------------------------------------------------------------
 # runners shadow-status (issue #909)
 # --------------------------------------------------------------------------
 
