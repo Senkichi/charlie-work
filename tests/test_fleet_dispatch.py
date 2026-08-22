@@ -723,7 +723,11 @@ def test_fleet_loop_missing_repo_root_skipped(
     mock_load_registry: MagicMock,
     tmp_path: Path,
 ) -> None:
-    """fleet_loop skips repos with missing repo_root and records failure."""
+    """fleet_loop skips repos with missing repo_root as stale (issue #1372).
+
+    A stale entry is not a failing lane: ok=True, pass_skipped=True, and the
+    repo is listed under the result's ``stale`` key for prune-after-grace.
+    """
     # Setup registry with one missing repo
     registry = {
         "repos": {
@@ -746,11 +750,15 @@ def test_fleet_loop_missing_repo_root_skipped(
         work_only=False,
     )
 
-    # Verify result includes the failed repo
+    # Verify result includes the stale repo (ok=True, not a failure)
     assert "repos" in result.data
     assert "owner/repo1" in result.data["repos"]
-    assert result.data["repos"]["owner/repo1"]["ok"] is False
-    assert "missing, skipped" in result.data["repos"]["owner/repo1"]["message"]
+    assert result.data["repos"]["owner/repo1"]["ok"] is True
+    assert result.data["repos"]["owner/repo1"].get("stale") is True
+    assert result.data["repos"]["owner/repo1"].get("pass_skipped") is True
+    assert "stale entry skipped" in result.data["repos"]["owner/repo1"]["message"]
+    # The stale key is collected for prune-after-grace
+    assert "owner/repo1" in result.data.get("stale", [])
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
@@ -758,7 +766,7 @@ def test_fleet_loop_missing_repo_root_skipped(
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
-def test_fleet_loop_missing_repo_root_records_lane_failure(
+def test_fleet_loop_missing_repo_root_records_stale_event_to_daemon(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
     mock_runtime_paths: MagicMock,
@@ -766,8 +774,11 @@ def test_fleet_loop_missing_repo_root_records_lane_failure(
     mock_load_registry: MagicMock,
     tmp_path: Path,
 ) -> None:
-    """#749: a repo whose repo_root no longer exists is recorded to events.db
-    and the fleet digest, not only per_repo_results."""
+    """#1372: a repo whose repo_root no longer exists is STALE, not a failing
+    lane. The ``fleet_registry_stale_entry`` warning is emitted into the
+    DAEMON's own events.db (fleet_state_path), never into the dead entry's
+    recorded state_dir — which would resurrect a zombie directory under %TEMP%
+    via log_event's auto-mkdir (#746). The pass completes with ok=True."""
     repo1_state_dir = tmp_path / "repo1-state"
     repo1_state_dir.mkdir(parents=True)
     repo2 = tmp_path / "repo2"
@@ -806,33 +817,33 @@ def test_fleet_loop_missing_repo_root_records_lane_failure(
         work_only=False,
     )
 
-    # repo1 is reported as a failed repo, repo2 still runs.
-    assert result.data["repos"]["owner/repo1"]["ok"] is False
-    assert "repo_root missing, skipped" in result.data["repos"]["owner/repo1"]["message"]
+    # repo1 is stale (ok=True), repo2 still runs.
+    assert result.data["repos"]["owner/repo1"]["ok"] is True
+    assert result.data["repos"]["owner/repo1"].get("stale") is True
+    assert "stale entry skipped" in result.data["repos"]["owner/repo1"]["message"]
     assert result.data["repos"]["owner/repo2"]["ok"] is True
     assert mock_app_class.call_count == 1
     assert mock_app2.loop.call_count == 1
     assert mock_load_layered_config.call_count == 1
 
-    # The failure is durably recorded to repo1's own events.db.
-    state_path = layout.state_file_path(repo1_state_dir)
-    recorded = query_events(state_path, kind="fleet_pass_config_error")
-    assert len(recorded) == 1
-    assert recorded[0]["level"] == "error"
-    assert recorded[0]["payload"]["repo_key"] == "owner/repo1"
-    assert "repo_root missing, skipped" in recorded[0]["payload"]["error"]
+    # The stale warning is recorded to the DAEMON's events.db, not repo1's.
+    fleet_state_path = layout.state_file_path(tmp_path / "fleet")
+    daemon_recorded = query_events(fleet_state_path, kind="fleet_registry_stale_entry")
+    assert len(daemon_recorded) == 1
+    assert daemon_recorded[0]["level"] == "warning"
+    assert daemon_recorded[0]["payload"]["repo_key"] == "owner/repo1"
+    assert daemon_recorded[0]["payload"]["reason"] == "repo_root_missing"
 
-    # The fleet digest carries a matching ERROR entry.
+    # NOTHING is written to the dead entry's state_dir — no zombie directory
+    # is resurrected under the recorded state_dir path.
+    repo1_state_path = layout.state_file_path(repo1_state_dir)
+    repo1_recorded = query_events(repo1_state_path, kind="fleet_pass_config_error")
+    assert len(repo1_recorded) == 0
+
+    # The fleet digest does NOT carry an ERROR entry for the stale repo.
     digest_events = result.data["digest"]["events"]
-    error_events = [e for e in digest_events if e.get("repo_key") == "owner/repo1"]
-    assert len(error_events) == 1
-    assert error_events[0]["type"] == "error"
-    assert "repo_root missing, skipped" in error_events[0]["error"]
-
-    attention_digest = _build_fleet_attention_digest(digest_events)
-    matching = [e for e in attention_digest.transitions if e.adapter_kind == "owner/repo1"]
-    assert len(matching) == 1
-    assert matching[0].health == "ERROR"
+    stale_digest_events = [e for e in digest_events if e.get("repo_key") == "owner/repo1"]
+    assert len(stale_digest_events) == 0
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")

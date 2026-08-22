@@ -742,7 +742,15 @@ def build_app(args: argparse.Namespace) -> OrchestratorApp:
     # mutates the fleet registry — a sibling-clone cwd would otherwise
     # overwrite the canonical entry and the guard would never fire.  Explicit
     # --repo skips the guard (the operator named the repo intentionally).
-    if args.command in _STATE_AFFECTING_COMMANDS and args.repo is None:
+    # `args.repo is None` is checked first, and `command` is read defensively
+    # via getattr: build_app is also called directly (outside the full
+    # argparse pipeline) by tests and other callers that hand-build a
+    # Namespace without a `command` attribute. Ordering the cheap, always-
+    # present `repo` check first avoids an AttributeError on `args.command`
+    # for those callers when --repo is explicit (AC#4 already skips the
+    # guard in that case), and getattr keeps the check inert rather than
+    # crashing if `command` is absent entirely.
+    if args.repo is None and getattr(args, "command", None) in _STATE_AFFECTING_COMMANDS:
         _assert_not_sibling_clone(ctx, args)
     touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh, dry_run=args.dry_run)
     return OrchestratorApp(
@@ -1384,12 +1392,20 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
+    # Issue #1372: stale entries (repo_root no longer exists) are reported in a
+    # separate "stale" list that does NOT flip ok/exit-code, so one corpse
+    # cannot degrade fleet-wide tooling (e.g. the heartbeat's blocked-issue
+    # enrichment that treats any nonzero exit as degraded).
+    stale: list[dict[str, str]] = []
 
     for repo_key, entry in sorted(registry.get("repos", {}).items()):
         try:
-            repo_root = Path(entry.get("repo_root"))
+            repo_root = Path(entry.get("repo_root") or "")
             if not repo_root.exists():
-                raise RepoNotFoundError(f"Repo root does not exist: {repo_root}")
+                # Issue #1372: a stale entry is not a live failing lane —
+                # report it separately so it does not affect the exit code.
+                stale.append({"repo_key": repo_key, "repo_root": str(repo_root)})
+                continue
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
@@ -1405,10 +1421,11 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
 
     return CommandResult(
         ok=not errors,
-        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s)",
+        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), {len(stale)} stale(s)",
         data={
             "repos": per_repo,
             "errors": errors,
+            "stale": stale,
             "api_worker_report": api_worker_report.to_dict()
             if api_worker_report is not None
             else None,
@@ -2602,6 +2619,14 @@ def main(argv: list[str] | None = None) -> int:
                 print("Errors:")
                 for error in errors:
                     print(f"  {error['repo_key']}: {error['error']}")
+            # Issue #1372: stale entries are reported separately and do not
+            # affect the exit code; surface them so an operator can see and
+            # clean up corpses without mistaking them for live failing lanes.
+            stale = result.data.get("stale", [])
+            if stale:
+                print("Stale:")
+                for entry in stale:
+                    print(f"  {entry['repo_key']}: {entry['repo_root']}")
             _render_api_worker_report(result.data)
         elif args.fleet_command in ("work", "bash-rats"):
             repos = result.data.get("repos", {})
