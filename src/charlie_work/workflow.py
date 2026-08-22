@@ -23287,7 +23287,16 @@ class OrchestratorApp:
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             pr_key = str(pr_number)
-            pr_state = state["prs"].get(pr_key, {})
+            if pr_key not in state["prs"]:
+                # No PR-state entry exists yet for this PR (it has not been
+                # dispatched/tracked this pass) -- refreshing here would
+                # materialize a decision-only partial entry with no
+                # status/counters, a state shape the four writer-adjacent
+                # mirrors never produce. Let the PR's normal dispatch path
+                # create the full entry; the boundary refresh will cover it
+                # on a later pass once that entry exists.
+                return
+            pr_state = state["prs"][pr_key]
             if (
                 pr_state.get("decision") == decision.decision
                 and pr_state.get("reviewed_head_sha") == decision.reviewed_head_sha
