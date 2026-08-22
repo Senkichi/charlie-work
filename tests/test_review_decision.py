@@ -320,6 +320,64 @@ def test_record_decision_second_call_distinct_verdict_mints_new_round(tmp_path: 
     assert sorted(p.name for p in rounds_dir.iterdir()) == ["round-1", "round-2"]
 
 
+def test_pending_placeholder_with_archive_round_false_does_not_shift_real_verdict_round(
+    tmp_path: Path,
+) -> None:
+    """Regression for the F1 review finding: workflow.py's packet-build
+    placeholder must pass ``archive_round=False`` so a content-free
+    "pending" head-stamp never occupies round-1 ahead of the first real
+    reviewer verdict. This mirrors the actual call sequence -- placeholder
+    write, then record_review's live verdict write -- at the record_decision
+    level, without needing the full workflow.py app fixture."""
+    pr_dir = tmp_path / "pr-1"
+
+    # The packet-build placeholder (workflow.py ~:9903), correctly not
+    # archiving a round.
+    record_decision(pr_dir, {"decision": "pending"}, "sha-1", archive_round=False)
+
+    # The first real reviewer verdict (record_review's write).
+    record_decision(
+        pr_dir,
+        {
+            "decision": "request_changes",
+            "summary": "first pass",
+            "required_changes": ["do X"],
+            "verdict_provenance": "fresh_llm_review",
+        },
+        "sha-1",
+    )
+
+    rounds_dir = pr_dir / "rounds"
+    # The real verdict must land in round-1, not round-2 -- no phantom
+    # "pending" round was minted by the placeholder.
+    assert sorted(p.name for p in rounds_dir.iterdir()) == ["round-1"]
+    round_payload = json.loads((rounds_dir / "round-1" / "review-decision.json").read_text())
+    assert round_payload["decision"] == "request_changes"
+
+
+def test_merge_authorize_override_before_any_verdict_does_not_mint_a_round(
+    tmp_path: Path,
+) -> None:
+    """Regression for the F2 review finding: merge_authorize's override
+    patch (workflow.py ~:13955) must also pass ``archive_round=False``.
+    Once the placeholder no longer archives (F1's fix), a PR can reach
+    merge_authorize with zero archived rounds; without this flag the
+    override patch would become the round-1 minter -- a phantom "reviewer
+    round" that contains only an operator override, never a verdict."""
+    pr_dir = tmp_path / "pr-1"
+
+    # No prior reviewer verdict and no placeholder round -- decision_path
+    # does not even exist yet, matching the F1-fixed placeholder's
+    # behavior (or a PR that skipped review entirely).
+    updated = {"authorized_override": {"by": "senkichi", "reason": "CI green"}}
+    record_decision(pr_dir, updated, None, archive_round=False)
+
+    rounds_dir = pr_dir / "rounds"
+    assert not rounds_dir.exists() or list(rounds_dir.iterdir()) == []
+    flat_payload = json.loads((pr_dir / "review-decision.json").read_text())
+    assert flat_payload["authorized_override"]["by"] == "senkichi"
+
+
 def test_record_decision_crash_between_round_and_flat_write_recovers_from_round(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
