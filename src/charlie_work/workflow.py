@@ -9900,7 +9900,20 @@ class OrchestratorApp:
                 # unreviewed current head (the mechanism the issue exists
                 # for). ``pr`` is the head snapshot already validated
                 # unchanged by the compare-and-swap guard above this block.
-                record_decision(pr_dir, decision_template, pr.get("headRefOid"))
+                # ``archive_round=False``: a pending placeholder is not a
+                # reviewer round -- it carries no decision/summary content,
+                # so archiving it would mint a content-free round ahead of
+                # the first real verdict (and, on the rework path, before
+                # every subsequent verdict whenever the head moves and the
+                # packet is rebuilt), shifting round numbers and polluting
+                # ``_build_prior_review_section``'s rendered history with
+                # phantom "Round N (decision: pending)" entries that never
+                # came from a reviewer. This is the flat-file head-stamp
+                # only; the reader still resolves it correctly since it
+                # reads the flat file first.
+                record_decision(
+                    pr_dir, decision_template, pr.get("headRefOid"), archive_round=False
+                )
             # Merge-update, never replace: wholesale assignment here used to erase
             # recorded review decisions on repeated review()/loop() passes
             # (production-confirmed, pr-497).
@@ -13946,13 +13959,19 @@ class OrchestratorApp:
             else:
                 existing = {}
             updated = {**existing, "authorized_override": override_payload}
-            # Single writer (issue #1362 Stage 2): this patch only adds
-            # ``authorized_override``, not one of ``_ROUND_COMPARE_KEYS``, so
-            # it dedupes as a retry onto the existing highest round (see
-            # record_decision's ``archive_round`` docstring) -- no phantom
-            # round is minted. head_sha=None: any ``reviewed_head_sha``
-            # already on ``existing`` passes through unchanged.
-            record_decision(decision_path.parent, updated, None)
+            # Single writer (issue #1362 Stage 2): ``archive_round=False`` --
+            # this patch only adds ``authorized_override``, not a new
+            # reviewer verdict, so it must never mint a round itself. Before
+            # the F1 fix above, the packet-build placeholder guaranteed a
+            # round-1 always existed by the time an override could land, so
+            # this patch merely deduped onto that round; now that the
+            # placeholder no longer archives, a PR with no reviewer verdict
+            # yet has zero archived rounds, and without this flag the
+            # override patch would become the round-1 minter -- a phantom
+            # "reviewer round" containing only an operator override.
+            # head_sha=None: any ``reviewed_head_sha`` already on ``existing``
+            # passes through unchanged.
+            record_decision(decision_path.parent, updated, None, archive_round=False)
             state = load_state(self.paths.state_file)
             state = self._record_event(
                 state,
