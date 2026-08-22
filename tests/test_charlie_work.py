@@ -23406,8 +23406,32 @@ def test_refresh_pr_decision_cache_no_op_when_cache_already_agrees(tmp_path: Pat
         stale=False,
         missing=False,
     )
-    app._refresh_pr_decision_cache(456, decision, decision_path)
 
+    # Positive signal, not just an absence: wrap the gated writer so a call
+    # that happens but happens to leave the mtime unchanged (e.g. a
+    # sub-resolution clock or a write of byte-identical content) cannot
+    # read as "no write occurred". An mtime check alone would pass even if
+    # the short-circuit above it were deleted, as long as the resulting
+    # write raced under the OS's mtime granularity.
+    #
+    # ``write_gate`` is a frozen dataclass (its instances reject attribute
+    # assignment), so the wrap patches the *class* method rather than the
+    # instance attribute.
+    save_state_calls: list[dict] = []
+    write_gate_cls = type(app.write_gate)
+    original_save_state = write_gate_cls.save_state
+
+    def _tracking_save_state(self: object, state: dict) -> None:
+        save_state_calls.append(state)
+        original_save_state(self, state)
+
+    write_gate_cls.save_state = _tracking_save_state  # type: ignore[method-assign]
+    try:
+        app._refresh_pr_decision_cache(456, decision, decision_path)
+    finally:
+        write_gate_cls.save_state = original_save_state  # type: ignore[method-assign]
+
+    assert save_state_calls == []
     assert paths.state_file.stat().st_mtime_ns == mtime_before
 
 

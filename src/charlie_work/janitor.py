@@ -803,9 +803,11 @@ def _check_no_op_rework(
     # *cache*: ``reviewed_head_sha`` is refreshed from the file at the start
     # of every already-tracked PR's ``loop()`` evaluation
     # (``_refresh_pr_decision_cache`` -- skipped only for a PR not yet present
-    # in ``state["prs"]``, which cannot reach this no-op-rework check either,
-    # since it has no prior review to be a no-op against) and by each of the
-    # four writer-adjacent mirrors, so it can no longer lag the file the way
+    # in ``state["prs"]``, and a PR in that state is passed to this function
+    # as ``pr_state={}``/``None``, which the ``if not pr_state: return False``
+    # guard at the top of this function already rejects before execution
+    # ever reaches this fallback) and by each of the four writer-adjacent
+    # mirrors, so it can no longer lag the file the way
     # it could before Stage 3 introduced that invariant. Reading
     # ``pr_state`` here directly (rather than threading a second
     # ``review_decision``-shaped parameter through every ``_check_no_op_rework``
