@@ -801,9 +801,12 @@ def _check_no_op_rework(
     # directly rather than through ``review_decision``/``resolve_decision_payload``
     # (unlike the ``decision`` gate just above). That is now safe to read as
     # *cache*: ``reviewed_head_sha`` is refreshed from the file at the start
-    # of every PR's ``loop()`` evaluation (``_refresh_pr_decision_cache``) and
-    # by each of the four writer-adjacent mirrors, so it can no longer lag the
-    # file the way it could before Stage 3 introduced that invariant. Reading
+    # of every already-tracked PR's ``loop()`` evaluation
+    # (``_refresh_pr_decision_cache`` -- skipped only for a PR not yet present
+    # in ``state["prs"]``, which cannot reach this no-op-rework check either,
+    # since it has no prior review to be a no-op against) and by each of the
+    # four writer-adjacent mirrors, so it can no longer lag the file the way
+    # it could before Stage 3 introduced that invariant. Reading
     # ``pr_state`` here directly (rather than threading a second
     # ``review_decision``-shaped parameter through every ``_check_no_op_rework``
     # caller) is deliberate, not an oversight left over from Stage 1.

@@ -23272,9 +23272,14 @@ class OrchestratorApp:
         ``merge_ready``'s carry-forward branch, and ``review``'s new-dispatch
         placeholder write) -- those keep a PR whose verdict changed THIS pass
         current without waiting for the NEXT pass's boundary refresh; this
-        method covers every OTHER PR, so the cache never goes stale between
-        verdict-producing passes. See ``tests/test_state_decision_cache_enforcement.py``
-        for the enforcement that no other production site may set these keys.
+        method covers every OTHER *already-tracked* PR (one already present
+        in ``state["prs"]``), so the cache never goes stale between
+        verdict-producing passes for a PR this method is willing to touch at
+        all -- see the ``pr_key not in state["prs"]`` early-return below for
+        the one case (a PR not yet dispatched this pass) that instead waits
+        for its normal dispatch path to create the full entry first. See
+        ``tests/test_state_decision_cache_enforcement.py`` for the enforcement
+        that no other production site may set these keys.
 
         Skips the write entirely when the cache already agrees with the file
         (the common case: no verdict activity since the last pass), so a

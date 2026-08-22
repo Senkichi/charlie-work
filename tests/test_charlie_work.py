@@ -92,6 +92,7 @@ from charlie_work.instrumentation import log_event, query_events
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
+from charlie_work.review_decision import ReviewDecision
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
     append_event,
@@ -23338,6 +23339,99 @@ def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> No
     # _review_decision is the reader used by merge_ready and merge-train
     # eligibility; it must see the persisted escalated value.
     assert app._review_decision(456)["escalated"] is True
+
+
+def test_refresh_pr_decision_cache_updates_disagreeing_tracked_pr(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3: a tracked PR whose cache disagrees with the
+    file-first decision gets its three cache fields overwritten."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {
+        "status": "reviewing",
+        "issue_number": 123,
+        "decision": "pending",
+        "reviewed_head_sha": "stale-sha",
+        "decision_path": "stale-path",
+    }
+    save_state(paths.state_file, seed)
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+    app._refresh_pr_decision_cache(456, decision, decision_path)
+
+    refreshed = load_state(paths.state_file)["prs"]["456"]
+    assert refreshed["decision"] == "approved"
+    assert refreshed["reviewed_head_sha"] == "fresh-sha"
+    assert refreshed["decision_path"] == str(decision_path)
+    # Non-decision fields (status, issue_number) must survive the mirror
+    # write untouched -- the refresh must never clobber the rest of the entry.
+    assert refreshed["status"] == "reviewing"
+    assert refreshed["issue_number"] == 123
+
+
+def test_refresh_pr_decision_cache_no_op_when_cache_already_agrees(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3: when the cache already agrees with the file, the
+    refresh must not write state.json at all -- the docstring's promised
+    short-circuit for the common (no verdict activity) case."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {
+        "status": "reviewing",
+        "decision": "approved",
+        "reviewed_head_sha": "fresh-sha",
+        "decision_path": str(decision_path),
+    }
+    save_state(paths.state_file, seed)
+    mtime_before = paths.state_file.stat().st_mtime_ns
+
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+    app._refresh_pr_decision_cache(456, decision, decision_path)
+
+    assert paths.state_file.stat().st_mtime_ns == mtime_before
+
+
+def test_refresh_pr_decision_cache_skips_pr_not_yet_in_state(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3 (review finding F3): a PR not yet tracked in
+    state["prs"] must be left untouched by the refresh rather than
+    materializing a decision-only partial entry with no status/counters."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    decision_path = paths.prs / "pr-999" / "review-decision.json"
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+    app._refresh_pr_decision_cache(999, decision, decision_path)
+
+    state = load_state(paths.state_file)
+    assert "999" not in state["prs"]
 
 
 def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> None:
