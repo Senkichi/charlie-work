@@ -2954,6 +2954,16 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
     In a criss-cross graph, the two best common ancestors are both minimal.
     A correct BFS distance and a deterministic tie-break must produce the same
     merge base regardless of hash randomization.
+
+    Issue #1292: the harness was previously flaky because (a) it imported
+    ``FakeGitHub`` via ``test_charlie_work`` -- dragging the entire 50k-line
+    test module (pytest, yaml, every helper fixture) into a subprocess whose
+    import can fail transiently under full-suite parallel-run contention --
+    and (b) it collected results into a ``set``, discarding the seed-to-result
+    mapping so a failure was unactionable. The harness now imports
+    ``FakeGitHub`` directly from ``_fakes_github`` (the lightweight module that
+    defines it) and records the seed that produced each result so any future
+    non-determinism is immediately attributable.
     """
     tests_dir = Path(__file__).parent
     repo_root = tests_dir.parent
@@ -2961,7 +2971,7 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
         [
             "import os, sys",
             "sys.path.insert(0, sys.argv[1])",
-            "from test_charlie_work import FakeGitHub",
+            "from _fakes_github import FakeGitHub",
             "gh = FakeGitHub()",
             "gh.commits = {",
             '    "R": {"parents": []},',
@@ -2974,7 +2984,8 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
             'print(gh._merge_base("A2", "B2"))',
         ]
     )
-    results: set[str] = set()
+    # Record the seed that produced each result so a failure is actionable.
+    results: dict[str, str] = {}
     for seed in range(5):
         env = os.environ.copy()
         env["PYTHONHASHSEED"] = str(seed)
@@ -2984,10 +2995,15 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
             cwd=str(repo_root),
             capture_output=True,
             text=True,
-            check=True,
         )
-        results.add(proc.stdout.strip())
-    assert len(results) == 1, f"merge_base varied across hash seeds: {results}"
+        if proc.returncode != 0:
+            raise AssertionError(
+                f"subprocess for PYTHONHASHSEED={seed} exited {proc.returncode}.\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+        results[str(seed)] = proc.stdout.strip()
+    distinct = set(results.values())
+    assert len(distinct) == 1, f"merge_base varied across hash seeds (seed -> result): {results}"
 
 
 def test_base_fake_github_merged_prs_for_issue_returns_typed_result() -> None:
