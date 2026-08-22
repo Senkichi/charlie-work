@@ -1521,6 +1521,50 @@ def operator_queue_depth(state: dict[str, Any]) -> set[int]:
     return queued
 
 
+def _build_branch_issue_validator(
+    gh: GitHubLike,
+) -> Callable[[int], bool] | None:
+    """Build a validator for branch-name-derived issue numbers (issue #1229).
+
+    This is the single-point-of-enforcement constructor for the
+    ``branch_issue_validator`` callable consumed by ``linked_issue_number``.
+    Both the ``OrchestratorApp._make_branch_issue_validator`` method (used by
+    the rework-routing call sites) and the module-level sweeps
+    (``_detect_and_handle_orphaned_workers``,
+    ``_classify_dead_sessions_and_update_throttle_state``) route through here
+    so the open-issue fetch, failure handling, and ``_LIST_LIMIT`` tradeoff
+    cannot diverge between the two call surfaces.
+
+    Returns a callable that returns True iff the given number corresponds to
+    a real *open* issue in this repo, or None when the open-issue list cannot
+    be fetched (API outage). Callers that receive None should pass None to
+    ``linked_issue_number``'s ``branch_issue_validator`` — the function then
+    trusts the branch-name binding unconditionally, preserving the pre-#1229
+    behavior rather than blocking the sweep during a transient GitHub
+    failure.
+
+    ``issue_list(state="open")`` is cached within a pass on the real
+    ``GitHub`` client, so repeated calls to this helper in the same pass
+    share a single GitHub API call. The list is capped at ``_LIST_LIMIT``
+    (500); a repo with more open issues than the cap could see a false
+    negative (a genuinely open issue treated as absent), which is the safe
+    direction — refusing a branch-name binding never corrupts state, it only
+    defers an issue-adjacent operation until the issue is confirmed by a
+    closing keyword.
+    """
+    try:
+        open_issues = gh.issue_list(state="open")
+    except Exception:
+        # GitHubError (API outage), AttributeError (test fakes without
+        # issue_list), or any other transient failure — the safe direction
+        # is to skip validation (return None) so callers preserve the
+        # pre-#1229 branch-name trust behavior rather than crashing or
+        # blocking the sweep.
+        return None
+    open_numbers = frozenset(int(i["number"]) for i in open_issues if i.get("number") is not None)
+    return lambda n: n in open_numbers
+
+
 def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
@@ -1601,11 +1645,20 @@ def _detect_and_handle_orphaned_workers(
     # Fetch PRs once before acquiring the lock (avoid network I/O under lock)
     prs = gh.pr_list()
     pr_by_issue: dict[int, dict[str, Any]] = {}
+    # Issue #1229: validate branch-name-derived issue numbers against the
+    # open-issue set so a stale branch name (e.g. agent/issue-709-… left over
+    # from a merged PR #709, reused by an unrelated issue-less PR) cannot bind
+    # the PR to a non-existent or closed issue here. Without this, a stale
+    # binding would populate pr_by_issue[<wrong n>] and either mask a real
+    # orphan's no-open-PR reclaim (the orphan is wrongly seen as "has a PR")
+    # or route the #417 ground-truth label reclaim at the wrong issue subject.
+    branch_validator = _build_branch_issue_validator(gh)
     for pr in prs:
         linked = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
+            branch_issue_validator=branch_validator,
         )
         if linked is not None:
             pr_by_issue[linked] = pr
@@ -3527,6 +3580,1159 @@ def _is_readiness_no_ci_stall(
     if any(name in seen for name in required):
         return False
     return _is_pr_updated_at_older_than(pr, now, no_ci_minutes)
+
+
+def _route_dead_worker_to_pre_review_rework(
+    state_file: Path,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    pr: dict[str, Any],
+    issue_number: int,
+    reason: str,
+    *,
+    failure_kind: str | None = None,
+    write_gate: WriteGate,
+) -> dict[str, Any] | None:
+    """Route a dead worker's stuck pre-review PR to the rework pipeline.
+
+    Writes a rebase-onto-main brief, transitions the issue to ``needs_rework``,
+    and updates state.json to ``rework_requested``. Idempotent: if the issue is
+    already ``rework_requested`` or ``escalated``, this is a no-op.
+
+    Enforces ``watchdog.max_auto_redispatch`` and escalates deterministic
+    failures immediately, mirroring the existing redispatch-escalation logic.
+    """
+    write_gate = require_write_gate(write_gate)
+    pr_number = int(pr["number"])
+    if reason == "merge_conflict":
+        summary = (
+            "The PR branch has a merge conflict with the base branch. "
+            "Rebase the branch onto the current base branch, resolve the conflicts, "
+            "and push. The code changes are already approved; do not re-litigate the review."
+        )
+    elif reason == "rework_branch_conflict":
+        summary = (
+            "The rework branch conflicts with the current base branch; GitHub cannot "
+            "build the merge ref, so no pull_request CI will run. Resolve the conflicts "
+            "manually and push."
+        )
+        if failure_kind is None:
+            failure_kind = "rework_branch_conflict"
+    else:
+        summary = (
+            "The PR was opened but no CI checks have been created after the stale threshold. "
+            "Rebase the branch onto the current base branch and push to trigger a fresh CI run. "
+            "The existing changes are pre-approved; do not re-litigate the review."
+        )
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state.setdefault("issues", {})
+        state.setdefault("prs", {})
+        entry = state["issues"].get(str(issue_number), {})
+        if not isinstance(entry, dict):
+            entry = {}
+        current_status = entry.get("status")
+        if current_status in ("rework_requested", "escalated"):
+            return None
+
+        redispatch_at = _windowed_redispatch_at(
+            entry, window_minutes=config.watchdog.redispatch_window_minutes
+        ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+
+        terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+        if terminal_failure or len(redispatch_at) > config.watchdog.max_auto_redispatch:
+            # Issue #783: merge conflict / rework-branch conflict / stale-CI
+            # redispatch cap are all process failures, not judgment calls.
+            state = _escalate_issue(
+                state,
+                issue_number,
+                reason=(failure_kind if terminal_failure else "redispatch_cap_exceeded"),
+                reason_class="mechanical",
+                issue_extra={
+                    "redispatch_at": redispatch_at,
+                    "pre_review_rework_reason": reason,
+                },
+            )
+            write_gate.save_state(state)
+            edge = _escalation_edge("redispatch_escalated", "mechanical")
+            result = write_gate.transition(gh, config.labels, issue_number, edge)
+            if result.outcome != TransitionOutcome.APPLIED:
+                entry = state["issues"].get(str(issue_number), {})
+                if isinstance(entry, dict):
+                    entry = {
+                        **entry,
+                        "label_error": {
+                            "edge": edge,
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        },
+                    }
+                    state["issues"][str(issue_number)] = entry
+                    write_gate.save_state(state)
+            return {
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "reason": reason,
+                "escalated": True,
+                "escalation_reason": state["issues"][str(issue_number)]["escalation_reason"],
+            }
+
+        repo_root = getattr(gh, "repo_root", None)
+        _write_rework_prompt(state_file, pr, issue_number, summary, config, repo_root=repo_root)
+        entry = {
+            **entry,
+            "number": issue_number,
+            "status": "rework_requested",
+            "dispatched_at": None,
+            "pre_review_rework_reason": reason,
+        }
+        state["issues"][str(issue_number)] = entry
+        state["prs"][str(pr_number)] = {
+            **state["prs"].get(str(pr_number), {}),
+            "number": pr_number,
+            "issue_number": issue_number,
+            "status": "rework_requested",
+        }
+        state = write_gate.append_event(
+            state,
+            # event-consumer: audit-only -- records a rework routing decision already
+            # applied inline above (status set to rework_requested); no downstream consumer needed
+            "pre_review_rework_routed",
+            {
+                "issue_number": issue_number,
+                "pr_number": pr_number,
+                "reason": reason,
+                "failure_kind": failure_kind,
+            },
+        )
+        write_gate.save_state(state)
+
+    result = write_gate.transition(gh, config.labels, issue_number, "rework_requested")
+    label_error = None
+    if result.outcome != TransitionOutcome.APPLIED:
+        label_error = {
+            "edge": "rework_requested",
+            "outcome": result.outcome.value,
+            "add_failures": result.add_failures,
+            "remove_failures": result.remove_failures,
+        }
+        with state_lock(state_file):
+            state = load_state(state_file)
+            entry = state["issues"].get(str(issue_number), {})
+            if isinstance(entry, dict):
+                entry = {**entry, "label_error": label_error}
+                state["issues"][str(issue_number)] = entry
+                write_gate.save_state(state)
+
+    return {
+        "issue_number": issue_number,
+        "pr_number": pr_number,
+        "reason": reason,
+        "label_error": label_error,
+    }
+
+
+def _classify_dead_sessions_and_update_throttle_state(
+    sessions_dir: Path,
+    state_file: Path,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    *,
+    write_gate: WriteGate,
+    persist_inconclusive_probe_counter: bool = True,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Check for dead sessions, classify their failures, and update throttle state.
+
+    This is called from the production loop to detect provider throttling
+    from worker deaths and set the cooldown window in state.json.
+
+    Also reconciles labels for dead sessions with no open PR (issue #118):
+    a dead worker with no open PR is recoverable and should be relabeled
+    as dispatchable (remove active labels, ensure ready label present).
+
+    Issue #252: if a dead worker has a clean worktree with unpushed commits
+    (completed-but-unpublished), push the branch, create a PR, and move the
+    issue to ``pr_open`` instead of re-dispatching.
+
+    Issue #266: launch-failure sidecars (pid=None, error set) are terminal by
+    construction and are reaped immediately, reported in the returned list.
+
+    Issue #295: dead/launch-failed rework sessions with an open PR and a
+    request_changes verdict (or a rework prompt on disk) are restored to
+    ``rework_requested`` so ``dispatch_rework`` can re-select them.
+
+    ``persist_inconclusive_probe_counter`` (issue #343 Finding 2): controls
+    whether this lane persists Signal-1's inconclusive-probe deferral counter
+    for a not-alive, pid-bearing worker. Defaults to True so this function
+    remains fully self-sufficient when called on its own (as every existing
+    unit test does, and as any future standalone caller would expect).
+    ``loop()`` is the one caller that always runs the sibling stall lane
+    (``_detect_and_handle_stalled_sessions``, the sole writer of this counter
+    for an ALIVE-but-stalled worker, and -- unconditionally, regardless of
+    liveness -- the first lane to see every worker each pass) immediately
+    before this one, in the same pass; it passes False there so this lane
+    does not ALSO increment the same counter on top of what the stall lane
+    just wrote a moment earlier -- that double counting (0->1 in the stall
+    lane, then re-read and ->2 here) halved the effective deferral grace
+    period and was the very mechanism that opened Finding 1's pass-2
+    phantom-sidecar window. classify_worker_health's own cap-check always
+    reads whatever value is currently on the sidecar, regardless of which
+    lane -- or how many passes ago -- last wrote it, so suppressing the
+    write here never affects the DEAD-vs-deferred decision made below,
+    only which lane's write ends up on disk for a given pass.
+
+    ``now`` (issue #822) is the injectable clock for this entire pass: it
+    seeds ``now_for_health`` (worker-health/probe timing) and is forwarded
+    to every throttle classification call below, so a single instant is used
+    consistently for the whole pass instead of each call independently
+    racing the wall clock. Defaults to ``datetime.now(UTC)`` when omitted,
+    so production behavior is byte-identical; tests can freeze it and assert
+    exact equality on the resulting ``throttled_until`` instead of a
+    wall-clock-tolerance proximity check.
+    """
+    write_gate = require_write_gate(write_gate)
+    from .claude_code import update_worker_record_with_failure_classification
+    from .devin_shell import update_session_record_with_failure_classification
+    from .post_mortem import classify_and_record
+    from .state import load_state, set_throttled_until, state_lock
+    from .worker import (
+        is_worker_confirmed_dead,
+        iter_workers,
+    )
+    from .worktree import WorktreeState
+
+    now_for_health = now if now is not None else datetime.now(UTC)
+
+    # Fetch open PRs for the "no open PR" guard
+    prs = gh.pr_list()
+    open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
+    # Issue #1229: validate branch-name-derived issue numbers against the
+    # open-issue set so a stale branch name (e.g. agent/issue-709-… left over
+    # from a merged PR #709, reused by an unrelated issue-less PR) cannot
+    # populate open_prs_by_issue[<wrong n>]. That map feeds the
+    # escalation/salvage-skip guard below (``w.issue_number not in
+    # open_prs_by_issue``): a stale binding to a dead worker's issue number
+    # would make the guard see a phantom open PR for that issue and skip
+    # escalation/salvage for a session that has no real open PR — the same
+    # "act on the wrong subject" failure class as the rework-episode
+    # collision the issue was filed for.
+    branch_validator = _build_branch_issue_validator(gh)
+    for pr in prs:
+        pr_state = str(pr.get("state") or "").upper()
+        if pr_state != "OPEN":
+            continue
+        issue_number = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+            branch_issue_validator=branch_validator,
+        )
+        if issue_number is not None:
+            open_prs_by_issue.setdefault(issue_number, []).append(pr)
+
+    repo_root = getattr(gh, "repo_root", None)
+
+    reaped: list[dict[str, Any]] = []
+
+    for w in iter_workers(sessions_dir):
+        if w.pid is None and w.error is not None:
+            # Launch-failure sidecar: terminal by construction (issue #266).
+            # The process never launched, so it can never transition to live.
+            failure_kind = "launch_failed"
+            throttled_until = None
+            if w.adapter_kind == "devin":
+                failure_kind, throttled_until = update_session_record_with_failure_classification(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind=failure_kind,
+                    config=config,
+                    now=now_for_health,
+                )
+            elif w.adapter_kind == "claude-code":
+                failure_kind, throttled_until = update_worker_record_with_failure_classification(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind=failure_kind,
+                    config=config,
+                    now=now_for_health,
+                )
+            elif w.adapter_kind == "api":
+                failure_kind, throttled_until = update_worker_record_with_failure_classification(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind=failure_kind,
+                    config=config,
+                    adapter_kind="api",
+                    now=now_for_health,
+                )
+            if failure_kind and throttled_until:
+                # A throttle-caused launch failure must persist its window just
+                # like the dead-session branch below — otherwise the governor
+                # relaunches straight into the same throttled provider.
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
+                    write_gate.save_state(state)
+
+            if (
+                failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                and w.issue_number not in open_prs_by_issue
+            ):
+                try:
+                    issue = gh.issue_view(w.issue_number)
+                except Exception:
+                    issue = None
+                issue_labels = label_names(issue) if issue else set()
+                active_labels = issue_labels & config.labels.active
+
+                # Issue #1130: before escalating a ``worktree_unsafe`` launch
+                # failure, attempt salvage. A ``worktree_unsafe`` failure means
+                # redispatch found the worktree holding unpushed commits — that
+                # is exactly the work salvage exists to recover. Escalating to
+                # a human without attempting the cheap safe action (push the
+                # branch + open a PR) inverts the priority: salvage-the-commit
+                # first, human adjudication only when salvage fails.
+                salvaged_from_unsafe = False
+                if (
+                    failure_kind == "worktree_unsafe"
+                    and repo_root is not None
+                    and w.branch
+                    and active_labels
+                ):
+                    worktrees_dir = resolved_layout(config, repo_root).worktrees
+                    wt_path = worktree_path_for_branch(repo_root, w.branch, worktrees_dir)
+                    unsafe_inspection = inspect_worktree_state(
+                        wt_path,
+                        config.dispatch.base_ref,
+                        config.dispatch.injected_paths,
+                        config.dispatch.materialize_dirs,
+                    )
+                    if unsafe_inspection.ahead_count > 0:
+                        salvaged_from_unsafe, _ = _attempt_salvage(
+                            gh=gh,
+                            config=config,
+                            repo_root=repo_root,
+                            worktree_path=wt_path if wt_path.is_dir() else repo_root,
+                            branch=w.branch,
+                            base_ref=unsafe_inspection.resolved_base_ref
+                            or config.dispatch.base_ref,
+                            issue_number=w.issue_number,
+                            active_labels=active_labels,
+                            issue_labels=issue_labels,
+                            state_file=state_file,
+                            failure_kind=failure_kind,
+                            issue_title=issue.get("title") if issue else None,
+                            write_gate=write_gate,
+                        )
+
+                if not salvaged_from_unsafe:
+                    with state_lock(state_file):
+                        state = load_state(state_file)
+                        entry = state["issues"].get(str(w.issue_number), {})
+                        now = datetime.now(UTC)
+                        redispatch_at = _windowed_redispatch_at(
+                            entry, window_minutes=config.watchdog.redispatch_window_minutes
+                        ) + [now.isoformat().replace("+00:00", "Z")]
+                        # Issue #783: a deterministic launch failure kind is a
+                        # process failure, not a judgment call -- mechanical.
+                        state = _escalate_issue(
+                            state,
+                            w.issue_number,
+                            reason=failure_kind,
+                            reason_class="mechanical",
+                            issue_extra={"redispatch_at": redispatch_at},
+                        )
+                        state["issues"][str(w.issue_number)].pop("worker_pid", None)
+                        state["issues"][str(w.issue_number)].pop("worker_process_start_time", None)
+                        write_gate.save_state(state)
+                        write_gate.transition(
+                            gh,
+                            config.labels,
+                            w.issue_number,
+                            _escalation_edge("redispatch_escalated", "mechanical"),
+                        )
+                        state = write_gate.append_event(
+                            state,
+                            "session_failed_escalated",
+                            {
+                                "issue_number": w.issue_number,
+                                "failure_kind": failure_kind,
+                                "removed_labels": sorted(active_labels),
+                                "redispatch_count": len(redispatch_at),
+                            },
+                        )
+                        write_gate.save_state(state)
+
+            w.reap_sidecar(
+                sessions_dir,
+                api_config=config.api_worker,
+                state_dir=state_file.parent,
+            )
+            reaped.append(
+                {
+                    "issue_number": w.issue_number,
+                    "adapter_kind": w.adapter_kind,
+                    "failure_kind": failure_kind,
+                    "error": w.error,
+                    "pid": w.pid,
+                }
+            )
+            # Issue #295: a launch-failed rework session must still be returned to
+            # rework_requested so its owning lane can re-dispatch it.
+            _reap_restore_rework_requested(
+                state_file,
+                gh,
+                config,
+                open_prs_by_issue,
+                w,
+                failure_kind=failure_kind,
+                write_gate=write_gate,
+            )
+            continue
+        if not w.is_alive():
+            # Issue #755: the confirmed-dead decision (including the
+            # max_inconclusive_probe_deferrals grace period and counter) is now
+            # owned by a single helper shared with reconcile.detect_drift.
+            if not is_worker_confirmed_dead(
+                w,
+                config,
+                now_for_health,
+                sessions_dir,
+                persist_inconclusive_probe_counter=persist_inconclusive_probe_counter,
+            ):
+                continue
+
+            # Inspect the worktree before deciding how to classify and relabel.
+            # This is the single enforcement point for issue #252.
+            worktree_path = Path(w.worktree_path)
+            inspection = inspect_worktree_state(
+                worktree_path,
+                config.dispatch.base_ref,
+                config.dispatch.injected_paths,
+                config.dispatch.materialize_dirs,
+            )
+            is_completed = inspection.state == WorktreeState.COMPLETED
+
+            # Post-mortem extraction (issue #261) is intertwined with log-tail
+            # classification. For a completed-but-unpublished worktree, we want
+            # failure_kind to be "unpublished_work" even if the terminal log
+            # tail would otherwise look like a tool-rejection (worker_blocked).
+            # Call update_* first when completed, then run classify_and_record
+            # for diagnostics (it will no-op on the sidecar because failure_kind
+            # is already set). For non-completed sessions, preserve the original
+            # ordering so worker_blocked still escalates.
+            if is_completed:
+                # session_completed=True (issue #656): the worktree inspection
+                # just above is ground truth that this session produced real,
+                # committable work -- it cannot also have died to a provider
+                # quota/rate-limit/auth failure, so log-tail marker matching
+                # (which would otherwise treat the session's own completion
+                # summary prose as fair game) is skipped entirely.
+                if w.adapter_kind == "devin":
+                    failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="unpublished_work",
+                            config=config,
+                            session_completed=True,
+                            now=now_for_health,
+                        )
+                    )
+                elif w.adapter_kind == "claude-code":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="unpublished_work",
+                            config=config,
+                            session_completed=True,
+                            now=now_for_health,
+                        )
+                    )
+                elif w.adapter_kind == "api":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind="unpublished_work",
+                            config=config,
+                            adapter_kind="api",
+                            session_completed=True,
+                            now=now_for_health,
+                        )
+                    )
+                else:
+                    failure_kind, throttled_until = None, None
+                # Diagnostic post-mortem; its worker_blocked verdict is ignored
+                # because the worktree itself proves the work was completed.
+                classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
+            else:
+                classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
+                fallback_kind = "stalled" if inspection.state != WorktreeState.UNKNOWN else None
+                if w.adapter_kind == "devin":
+                    failure_kind, throttled_until = (
+                        update_session_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind=fallback_kind,
+                            config=config,
+                            now=now_for_health,
+                        )
+                    )
+                elif w.adapter_kind == "claude-code":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind=fallback_kind,
+                            config=config,
+                            now=now_for_health,
+                        )
+                    )
+                elif w.adapter_kind == "api":
+                    failure_kind, throttled_until = (
+                        update_worker_record_with_failure_classification(
+                            sessions_dir,
+                            w.issue_number,
+                            fallback_kind=fallback_kind,
+                            config=config,
+                            adapter_kind="api",
+                            now=now_for_health,
+                        )
+                    )
+                else:
+                    failure_kind, throttled_until = None, None
+
+            if failure_kind and throttled_until:
+                # Update state with throttle window
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = set_throttled_until(
+                        state,
+                        throttled_until,
+                        reason=failure_kind,
+                        adapter_kind=w.adapter_kind,
+                    )
+                    write_gate.save_state(state)
+
+            # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
+            # Delete the sidecar file after the session is detected as dead and classified
+            w.reap_sidecar(
+                sessions_dir,
+                api_config=config.api_worker,
+                state_dir=state_file.parent,
+            )
+            reaped.append(
+                {
+                    "issue_number": w.issue_number,
+                    "adapter_kind": w.adapter_kind,
+                    "failure_kind": failure_kind,
+                    "error": w.error,
+                    "pid": w.pid,
+                }
+            )
+
+            # Issue #118: reconcile labels for dead sessions with no open PR
+            if w.issue_number not in open_prs_by_issue:
+                try:
+                    issue = gh.issue_view(w.issue_number)
+                except Exception:
+                    # Issue may have been deleted or we lack access; skip relabel
+                    continue
+                issue_labels = label_names(issue)
+                active_labels = issue_labels & config.labels.active
+                # Gate the WHOLE reclaim on an active label actually being
+                # present, matching reconcile.py's issue_active_label_no_open_pr
+                # pattern (~536-580) so all three sites agree. An issue with
+                # no active label -- e.g. one carrying only a terminal label
+                # like agent:human-needed/agent:done/agent:blocked -- has
+                # nothing here to reclaim; it must never get `ready` added
+                # back just because it also has a stale
+                # dispatched/dead-worker/no-PR state.json entry. (A prior
+                # revision gated on "not active_labels and not needs_ready" to
+                # also repair a remove-succeeded-but-add-failed partial
+                # failure once the active label was already gone -- but that
+                # made this lane indistinguishable from "issue is legitimately
+                # terminal-only", which is the regression this gate now
+                # avoids. `needs_ready` is still honored below whenever an
+                # active label IS present, so the common
+                # remove-and-add-together case is unaffected.)
+                if not active_labels:
+                    continue
+                needs_ready = config.labels.ready not in issue_labels
+
+                # Issue #252: completed-but-unpublished work takes the salvage
+                # path (push + PR) instead of re-dispatching.
+                # Issue #1130: relax the salvage trigger from ``is_completed``
+                # (clean + ahead) to ``ahead_count > 0`` (ahead, regardless of
+                # working-tree dirt). A worker that dies mid-push leaves a
+                # committed-but-unpushed branch; the worktree may also carry
+                # shim/scaffolding dirt (e.g. ``.devin/`` artifacts) that is
+                # not in ``injected_paths`` and so reads as worker-authored
+                # dirty, classifying the worktree PARTIAL instead of COMPLETED.
+                # Salvage pushes the branch ref (the committed work), not the
+                # working tree — the dirt is irrelevant to the push and survives
+                # in the worktree for later inspection. Without this relaxation
+                # the dead-session lane relabels to ready, the next redispatch
+                # hits the unpushed commits, raises ``worktree_unsafe``, and
+                # escalates to a human without ever attempting the cheap safe
+                # action (salvage-the-commit).
+                salvage_error: str | None = None
+                has_salvageable_commits = inspection.ahead_count > 0
+                if has_salvageable_commits and repo_root is not None:
+                    salvaged, salvage_error = _attempt_salvage(
+                        gh=gh,
+                        config=config,
+                        repo_root=repo_root,
+                        worktree_path=worktree_path,
+                        branch=w.branch,
+                        base_ref=inspection.resolved_base_ref or "",
+                        issue_number=w.issue_number,
+                        active_labels=active_labels,
+                        issue_labels=issue_labels,
+                        state_file=state_file,
+                        failure_kind=failure_kind,
+                        issue_title=issue.get("title") if issue else None,
+                        issue=issue,
+                        write_gate=write_gate,
+                    )
+                    if salvaged:
+                        continue
+                    # Salvage failed: fall through to the normal relabel path below.
+
+                # Track redispatch count for escalation cap (issue #165)
+                # This relabel-to-ready path is a redispatch event
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    entry = state["issues"].get(str(w.issue_number), {})
+                    now = datetime.now(UTC)
+                    redispatch_at = _windowed_redispatch_at(
+                        entry, window_minutes=config.watchdog.redispatch_window_minutes
+                    ) + [now.isoformat().replace("+00:00", "Z")]
+                    # issue #261: a worker_blocked verdict (extracted from the
+                    # Devin CLI's session store — see post_mortem.classify_and_record)
+                    # means the worker was killed by a push-gate hook, not a
+                    # generic stall/crash. Hot-redispatching it just repeats the
+                    # same block, so it bypasses the redispatch-count cap entirely
+                    # and escalates on the very first occurrence.
+                    terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    if (
+                        terminal_failure
+                        or len(redispatch_at) > config.watchdog.max_auto_redispatch
+                    ):
+                        # Escalate to human review instead of relabeling to ready
+                        reason = (
+                            failure_kind
+                            if terminal_failure and failure_kind is not None
+                            else "redispatch_cap_exceeded"
+                        )
+                        # Issue #783: dead worker session / redispatch cap is a
+                        # process failure, not a judgment call -- mechanical.
+                        state = _escalate_issue(
+                            state,
+                            w.issue_number,
+                            reason=reason,
+                            reason_class="mechanical",
+                            issue_extra={"redispatch_at": redispatch_at},
+                        )
+                        # Issue #282: preserve the liveness fingerprint for the
+                        # recovery path. The PID is already verified dead by the
+                        # time we reach this branch, but clearing it removes the
+                        # only signal the recovery probe can cross-check.
+                        write_gate.save_state(state)
+                        write_gate.transition(
+                            gh,
+                            config.labels,
+                            w.issue_number,
+                            _escalation_edge("redispatch_escalated", "mechanical"),
+                        )
+                        state = write_gate.append_event(
+                            state,
+                            "session_failed_escalated",
+                            {
+                                "issue_number": w.issue_number,
+                                "failure_kind": failure_kind,
+                                "removed_labels": sorted(active_labels),
+                                "redispatch_count": len(redispatch_at),
+                            },
+                        )
+                        write_gate.save_state(state)
+                        continue
+                    else:
+                        entry["redispatch_at"] = redispatch_at
+                        state["issues"][str(w.issue_number)] = entry
+                        write_gate.save_state(state)
+                # Remove all active labels and ensure ready label is present.
+                # Issue #417: check (and record) the bool return values instead
+                # of silently discarding them. A False here means this pass's
+                # label swap did not fully land -- the issue remains eligible
+                # for _detect_and_handle_orphaned_workers' no-open-PR sweep to
+                # finish the reclaim on a later pass, since that lane
+                # re-derives "does this still need fixing" from GitHub's live
+                # label state every pass rather than from any flag written
+                # here (and never touches redispatch_at, so a retry there
+                # cannot double-count this as a second redispatch event).
+                label_write_ok = True
+                for label in sorted(active_labels):
+                    if not gh.remove_issue_label(w.issue_number, label):
+                        label_write_ok = False
+                if needs_ready:
+                    if not gh.add_issue_label(w.issue_number, config.labels.ready):
+                        label_write_ok = False
+                # Record the relabel event
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    # Issue #282: preserve the liveness fingerprint so the
+                    # recovery path can verify the worker is dead before removing
+                    # the worktree, even after the session is classified as dead.
+                    state = _emit_session_failed_relabeled(
+                        state,
+                        issue_number=w.issue_number,
+                        reason="dead_worker_no_open_pr",
+                        failure_kind=failure_kind,
+                        removed_labels=sorted(active_labels),
+                        added_ready=needs_ready,
+                        label_write_ok=label_write_ok,
+                        salvage_failed=has_salvageable_commits,
+                        salvage_error=salvage_error,
+                        state_path=state_file,
+                        write_gate=write_gate,
+                    )
+                    write_gate.save_state(state)
+            else:
+                # Issue #295: open PR with request_changes or rework prompt =>
+                # restore to rework_requested for its owning lane.
+                #
+                # Issue #315 finding 1: a completed worktree (ahead of base and
+                # clean) proves the worker finished its work — even if this
+                # reap pass's PR-list snapshot (fetched once, at line ~889)
+                # hasn't caught up to a fresh push yet. Never roll a worker
+                # that finished (and, per the open-PR guard above, already has
+                # a PR reflecting or about to reflect that work) back to
+                # rework_requested just because a launch-failure classifier
+                # ran on its now-dead sidecar.
+                if not is_completed:
+                    pr_data = _rework_pr_for_worker(open_prs_by_issue, w)
+                    if pr_data is not None:
+                        pr_number = int(pr_data["number"])
+                        try:
+                            pr_view = gh.pr_view(pr_number)
+                        except Exception:
+                            pr_view = None
+                        enriched = pr_view if pr_view else pr_data
+                        is_candidate, reason = _is_pre_review_rework_candidate(
+                            enriched, config, now_for_health
+                        )
+                        if is_candidate:
+                            _route_dead_worker_to_pre_review_rework(
+                                state_file,
+                                gh,
+                                config,
+                                enriched,
+                                w.issue_number,
+                                reason,
+                                failure_kind=failure_kind,
+                                write_gate=write_gate,
+                            )
+                        else:
+                            _reap_restore_rework_requested(
+                                state_file,
+                                gh,
+                                config,
+                                open_prs_by_issue,
+                                w,
+                                failure_kind=failure_kind,
+                                write_gate=write_gate,
+                            )
+                    else:
+                        _reap_restore_rework_requested(
+                            state_file,
+                            gh,
+                            config,
+                            open_prs_by_issue,
+                            w,
+                            failure_kind=failure_kind,
+                            write_gate=write_gate,
+                        )
+
+    return reaped
+
+
+def _safe_repo_slug(gh: GitHubLike) -> str:
+    """Return the ``owner/repo`` slug, or ``"?"`` if the lookup fails.
+
+    ``name_with_owner()`` raises ``GitHubError`` on failure (offline, gh
+    missing, etc.); this is used only to qualify a closing-reference line, so
+    a lookup failure must not stop salvage-PR creation. Mirrors
+    ``reconcile._repo_slug``.
+    """
+    try:
+        return gh.name_with_owner()
+    except Exception:
+        return "?"
+
+
+def _open_salvage_pr(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path | None,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    active_labels: set[str],
+    issue_labels: set[str],
+    issue_title: str | None = None,
+    source_description: str = "worker branch",
+    state_file: Path | None = None,
+) -> tuple[int | None, str | None, ValidationResult | None]:
+    """Open a PR for a salvaged worker branch and move issue labels toward ``pr_open``.
+
+    Returns ``(pr_number, error, closing_ref)``. ``pr_number`` is the created
+    PR number, or ``None`` when the PR could not be created. ``error`` is
+    ``None`` when both the PR and the label swap succeeded; otherwise it
+    describes the first failure encountered (a missing ``repo_root``, a
+    failed PR create, or a label write failure after the PR was created).
+    ``closing_ref`` is the `~charlie_work.closing_reference.ValidationResult`
+    from canonicalizing the closing-reference line before the PR was
+    created, or ``None`` when PR creation never reached that far (missing
+    ``repo_root``).
+
+    cw#1263: the body's ``Closes #N`` line is validated/canonicalized via
+    `closing_reference.validate_closing_reference` before ``gh.pr_create``
+    ever sees it -- this is the sole point where both salvage/orphan-recovery
+    callers (`_attempt_salvage`, `_open_pr_for_orphaned_branch`) create a PR,
+    so routing the fixed-up body through here covers both without a second
+    call site to keep in sync. After a successful create, GitHub's own
+    ``closingIssuesReferences`` resolution is queried and compared against
+    ``issue_number``; a mismatch is logged (``pr_closing_ref_unlinked``) but
+    never blocks the return -- this is the only verification surface that
+    would catch it, since GitHub's own auto-close resolution can diverge from
+    the text charlie-work wrote even when that text looks correct.
+    """
+    if repo_root is None:
+        return None, "repo_root is required to open a salvage PR", None
+
+    base_branch = resolve_base_branch_name(repo_root, base_ref)
+
+    title = (
+        f"Salvaged work for #{issue_number}: {issue_title}"
+        if issue_title
+        else f"Salvaged work for issue #{issue_number}"
+    )
+    # The body must satisfy the same janitor gate as a worker-authored one
+    # (`review.require_tests_or_rationale`). A fixed boilerplate string cannot:
+    # it carries no rationale token, so every salvage PR failed a gate on text
+    # the orchestrator itself wrote. Derive the rationale from the worker's own
+    # commit log instead of injecting the gate's keywords -- a branch with no
+    # commits still yields no summary, and still correctly fails.
+    body = f"Closes #{issue_number}\n\nSalvaged by the orchestrator from a {source_description}."
+    # Pass the RESOLVED base branch, not the raw ``base_ref``. The orphaned-branch
+    # lane (``_open_pr_for_orphaned_branch``) sources ``base_ref`` straight from
+    # ``config.dispatch.base_ref``, whose default is ``""`` and which the live
+    # config leaves unset -- so production reaches here with the empty sentinel.
+    # ``require_valid_rev("")`` raises, ``summarize_branch_work`` returns "", and
+    # the body falls back to boilerplate that cannot pass the janitor gate: the
+    # exact defect this code exists to fix, on the lane that hits it most.
+    summary = summarize_branch_work(
+        repo_root,
+        branch,
+        base_branch,
+        test_path_globs=config.test_adequacy.test_path_globs,
+    )
+    if summary:
+        body = f"{body}\n\n{summary}"
+
+    closing_ref = validate_closing_reference(body, issue_number, repo=_safe_repo_slug(gh), gh=gh)
+    body = closing_ref.body
+    if closing_ref.changed and state_file is not None:
+        log_event(
+            state_file,
+            "pr_closing_ref_rewritten",
+            {
+                "issue_number": issue_number,
+                "findings": list(closing_ref.findings),
+                "source": source_description,
+            },
+        )
+
+    # cw#1273: every gh.pr_create call site routes through the bounded outer
+    # retry + duplicate-PR guard instead of calling gh.pr_create directly.
+    retry_result = create_pr_with_retry(
+        gh,
+        head=branch,
+        base=base_branch,
+        title=title,
+        body=body,
+        max_retries=config.runtime.pr_create_retry_max_attempts,
+        base_seconds=config.runtime.pr_create_retry_base_seconds,
+    )
+    pr_number = retry_result.pr_number
+    if pr_number is None:
+        return (
+            None,
+            retry_result.error or "gh pr create failed or returned no PR number",
+            closing_ref,
+        )
+
+    # `pr_number` is falsy (0) under `dry_run`, where no real PR was opened and
+    # a `gh pr view 0` call would be both wasted and nonsensical -- only probe
+    # a real, truthy PR number.
+    if pr_number and state_file is not None:
+        query_ok = True
+        try:
+            pr_view = gh.pr_view(pr_number, fields=PR_CLOSING_ISSUES_FIELDS)
+        except Exception:
+            pr_view = {}
+            query_ok = False
+        linked_numbers = closing_issues_referenced_numbers(pr_view)
+        # Only log when the query itself succeeded: a transient `gh` failure
+        # collapses to the same empty result as "GitHub really didn't link
+        # the issue", and this event exists to be acted on -- conflating a
+        # failed probe with a genuine miss would make it noisy and untrustworthy.
+        if query_ok and issue_number not in linked_numbers:
+            log_event(
+                state_file,
+                "pr_closing_ref_unlinked",
+                {
+                    "issue_number": issue_number,
+                    "pr_number": pr_number,
+                    "linked_issue_numbers": sorted(linked_numbers),
+                },
+            )
+
+    label_write_ok = True
+    for label in sorted(active_labels):
+        if not gh.remove_issue_label(issue_number, label):
+            label_write_ok = False
+    if config.labels.pr_open not in issue_labels:
+        if not gh.add_issue_label(issue_number, config.labels.pr_open):
+            label_write_ok = False
+
+    if not label_write_ok:
+        return pr_number, "PR created but label write failed", closing_ref
+
+    return pr_number, None, closing_ref
+
+
+def _salvage_already_landed(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    issue: dict[str, Any] | None,
+) -> tuple[bool, str | None]:
+    """Return ``(already_landed, reason)`` if salvage should be skipped.
+
+    Issue #1221: a dead session's snapshot (issue, pr_number, branch) can be
+    stale by the time staleness trips and salvage fires -- the linked issue may
+    have been closed and/or its PR merged by an operator or sibling worker
+    inside the staleness threshold window. Re-check LIVE terminal state at fire
+    time instead of trusting the snapshot. Any one of these means a salvage PR
+    would be vestigial (a duplicate of already-landed work):
+
+    1. the linked issue is CLOSED (``issue`` carries ``state`` from the
+       caller's ``gh.issue_view`` -- one call, already made).
+    2. a PR binding to this issue is MERGED (``gh.merged_prs_for_issue`` -- one
+       call). A failed search (``ok=False``) is treated as "unknown", which
+       falls through to opening the PR; a human reviews salvage PRs anyway.
+    3. the salvage branch's tree contributes an empty diff against current main
+       (``salvage_branch_empty_diff`` -- a fetch + two rev-parse calls). This
+       is the belt-and-suspenders for the case where (1)/(2) miss (e.g. a
+       squash-merge that closed the issue but whose PR search lags, or work
+       landed via a sibling branch). Fails safe (returns False) on git error.
+
+    ``reason`` is a short string identifying which check fired, recorded in the
+    ``salvage_skipped_already_landed`` event for diagnosis.
+    """
+    # (1) Issue closed.
+    if issue is not None and str(issue.get("state") or "").upper() == "CLOSED":
+        return True, "issue_closed"
+
+    # (2) A merged PR binds to this issue.
+    merged = gh.merged_prs_for_issue(issue_number, config.dispatch.branch_prefix)
+    if getattr(merged, "ok", True) and len(merged) > 0:
+        return True, "pr_merged"
+
+    # (3) The branch's tree is identical to current main's tree.
+    if salvage_branch_empty_diff(repo_root, branch, base_ref):
+        return True, "empty_diff"
+
+    return False, None
+
+
+def _attempt_salvage(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path,
+    worktree_path: Path,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    active_labels: set[str],
+    issue_labels: set[str],
+    state_file: Path,
+    failure_kind: str | None,
+    issue_title: str | None = None,
+    issue: dict[str, Any] | None = None,
+    write_gate: WriteGate,
+) -> tuple[bool, str | None]:
+    """Push a completed branch and open a PR, then move labels to ``pr_open``.
+
+    Returns ``(ok, error)``. Errors are recorded as values and never raised.
+    ``ok`` is ``True`` once the PR is created, even if the label swap failed;
+    in that case ``error`` describes the label failure and the
+    ``session_salvaged`` event records ``label_write_ok=False``.
+
+    ``ok`` is also ``True`` (with ``error=None``) when salvage is *skipped*
+    because the work already landed (issue #1221): the dead session's snapshot
+    can be stale, so before opening a PR we re-check live terminal state. A
+    skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
+    duplicate PR, and the caller treats it as "handled" (no redispatch).
+
+    NOTE (issue #1264, W6 PR3 disclosure): the ``push_branch`` call below is
+    an unconditional, unguarded real ``git push`` -- outside WriteGate's
+    declared 6-primitive surface (state.json/events.db/label-transition/
+    process-kill) and therefore NOT gated by ``write_gate`` here. This is a
+    real dry-run leak (filed separately; see the PR3 handoff) that this PR
+    does not fix -- gating an external git push was never in R6's scope
+    (kill_process was the one sanctioned new primitive) and freelancing a
+    7th WriteGate primitive without design review would repeat exactly the
+    mistake R6b's STOP-and-report exists to prevent.
+    """
+    write_gate = require_write_gate(write_gate)
+    already_landed, skip_reason = _salvage_already_landed(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+        issue=issue,
+    )
+    if already_landed:
+        with state_lock(state_file):
+            state = load_state(state_file)
+            # Issue #282: preserve the liveness fingerprint so the recovery
+            # path can verify the worker is dead before the worktree is
+            # reclaimed.
+            state = write_gate.append_event(
+                state,
+                "salvage_skipped_already_landed",
+                {
+                    "issue_number": issue_number,
+                    "failure_kind": failure_kind,
+                    "reason": skip_reason,
+                    # The skip path does NOT remove labels -- label cleanup is the
+                    # reconcile lane's job. Record the active labels at skip time
+                    # for diagnosis (what state the issue was in), not as removed.
+                    "active_labels": sorted(active_labels),
+                },
+            )
+            write_gate.save_state(state)
+        return True, None
+
+    push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
+    if not push_ok:
+        return False, push_error
+
+    pr_number, pr_error, _closing_ref = _open_salvage_pr(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        issue_title=issue_title,
+        source_description="completed-but-unpublished worker worktree",
+        state_file=state_file,
+    )
+    if pr_number is None:
+        return False, pr_error or "gh pr create failed or returned no PR number"
+
+    with state_lock(state_file):
+        state = load_state(state_file)
+        # Issue #282: preserve the liveness fingerprint so the recovery path
+        # can verify the worker is dead before the worktree is reclaimed.
+        state = write_gate.append_event(
+            state,
+            "session_salvaged",
+            {
+                "issue_number": issue_number,
+                "failure_kind": failure_kind,
+                "removed_labels": sorted(active_labels),
+                "pr_number": pr_number,
+                "label_write_ok": pr_error is None,
+                "label_error": pr_error,
+            },
+        )
+        write_gate.save_state(state)
+    return True, pr_error
+
+
+def _open_pr_for_orphaned_branch(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path | None,
+    branch: str,
+    base_ref: str,
+    issue_number: int,
+    active_labels: set[str],
+    issue_labels: set[str],
+    issue_title: str | None = None,
+    state_file: Path | None = None,
+) -> tuple[int | None, str | None, ValidationResult | None]:
+    """Open a PR for a branch that the worker pushed but could not create a PR for.
+
+    Returns ``(pr_number, error, closing_ref)``. Errors are recorded as
+    values and never raised. This is the orchestrator-side recovery for
+    issue #935: workers are unauthenticated in their environment, so after
+    pushing a completed branch they cannot run ``gh pr create``. The
+    orchestrator, which is authenticated, creates the PR and moves the issue
+    labels toward ``pr_open``. See `_open_salvage_pr` for the closing-
+    reference validation and post-create verification this delegates to.
+    """
+    return _open_salvage_pr(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch=branch,
+        base_ref=base_ref,
+        issue_number=issue_number,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        issue_title=issue_title,
+        source_description="worker branch that could not open a PR",
+        state_file=state_file,
+    )
+
+
+def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
+    """Return the set of issue numbers that have currently alive worker sessions.
+
+    Reads session sidecar files from both devin-shell and claude-code adapters,
+    then checks each record's PID liveness using the adapter-specific liveness
+    probe. Returns the set of issue numbers with alive PIDs.
+    """
+    from .worker import iter_workers
+
+    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
 
 
 def _build_attention_digest(
@@ -22171,36 +23377,14 @@ class OrchestratorApp:
     def _make_branch_issue_validator(self) -> Callable[[int], bool] | None:
         """Build a validator for branch-name-derived issue numbers (issue #1229).
 
-        Returns a callable that returns True iff the given number corresponds
-        to a real *open* issue in this repo, or None when the open-issue list
-        cannot be fetched (API outage). Callers that receive None should pass
-        None to ``linked_issue_number``'s ``branch_issue_validator`` — the
-        function then trusts the branch-name binding unconditionally,
-        preserving the pre-#1229 behavior rather than blocking all rework
-        routing during a transient GitHub failure.
-
-        ``issue_list(state="open")`` is cached within a pass, so repeated
-        calls to this helper (e.g. from both ``merge_ready`` and
-        ``dispatch_rework`` in the same loop pass) share a single GitHub API
-        call. The list is capped at ``_LIST_LIMIT`` (500); a repo with more
-        open issues than the cap could see a false negative (a genuinely open
-        issue treated as absent), which is the safe direction — refusing a
-        branch-name binding never corrupts state, it only defers a rework
-        dispatch until the issue is confirmed by a closing keyword.
+        Thin delegate to the module-level ``_build_branch_issue_validator`` so
+        the rework-routing call sites and the module-level sweeps
+        (``_detect_and_handle_orphaned_workers``,
+        ``_classify_dead_sessions_and_update_throttle_state``) share one
+        construction path — see that function for the open-issue fetch,
+        failure handling, and ``_LIST_LIMIT`` tradeoff.
         """
-        try:
-            open_issues = self.gh.issue_list(state="open")
-        except Exception:
-            # GitHubError (API outage), AttributeError (test fakes without
-            # issue_list), or any other transient failure — the safe
-            # direction is to skip validation (return None) so callers
-            # preserve the pre-#1229 branch-name trust behavior rather
-            # than crashing or blocking all rework routing.
-            return None
-        open_numbers = frozenset(
-            int(i["number"]) for i in open_issues if i.get("number") is not None
-        )
-        return lambda n: n in open_numbers
+        return _build_branch_issue_validator(self.gh)
 
     def _render_issue_comments(self, issue: dict[str, Any]) -> str:
         """Render the ``$issue_comments`` slot for a worker prompt (issue #872).
