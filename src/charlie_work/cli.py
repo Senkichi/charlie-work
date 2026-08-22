@@ -1287,12 +1287,20 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
+    # Issue #1372: stale entries (repo_root no longer exists) are reported in a
+    # separate "stale" list that does NOT flip ok/exit-code, so one corpse
+    # cannot degrade fleet-wide tooling (e.g. the heartbeat's blocked-issue
+    # enrichment that treats any nonzero exit as degraded).
+    stale: list[dict[str, str]] = []
 
     for repo_key, entry in sorted(registry.get("repos", {}).items()):
         try:
-            repo_root = Path(entry.get("repo_root"))
+            repo_root = Path(entry.get("repo_root") or "")
             if not repo_root.exists():
-                raise RepoNotFoundError(f"Repo root does not exist: {repo_root}")
+                # Issue #1372: a stale entry is not a live failing lane —
+                # report it separately so it does not affect the exit code.
+                stale.append({"repo_key": repo_key, "repo_root": str(repo_root)})
+                continue
 
             config = load_layered_config(repo_root, None, fleet_dir_override=args.fleet_dir)
             paths = runtime_paths(repo_root, config.runtime.state_dir)
@@ -1308,10 +1316,11 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
 
     return CommandResult(
         ok=not errors,
-        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s)",
+        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), {len(stale)} stale(s)",
         data={
             "repos": per_repo,
             "errors": errors,
+            "stale": stale,
             "api_worker_report": api_worker_report.to_dict()
             if api_worker_report is not None
             else None,
@@ -2505,6 +2514,14 @@ def main(argv: list[str] | None = None) -> int:
                 print("Errors:")
                 for error in errors:
                     print(f"  {error['repo_key']}: {error['error']}")
+            # Issue #1372: stale entries are reported separately and do not
+            # affect the exit code; surface them so an operator can see and
+            # clean up corpses without mistaking them for live failing lanes.
+            stale = result.data.get("stale", [])
+            if stale:
+                print("Stale:")
+                for entry in stale:
+                    print(f"  {entry['repo_key']}: {entry['repo_root']}")
             _render_api_worker_report(result.data)
         elif args.fleet_command in ("work", "bash-rats"):
             repos = result.data.get("repos", {})
