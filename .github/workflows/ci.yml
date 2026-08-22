@@ -56,17 +56,54 @@ jobs:
   Tests:
     name: Tests
     runs-on: self-hosted
-    # 30 min: derived from 28 successful runs (2026-07-28/29). Per-job
-    # execution time (startedAt->completedAt, excluding runner-queue wait):
-    # median 11.5 min, range 3.85-23.72 min. The prior 60 min budget was
-    # generous enough that the 2026-08-08 cross-repo contention incident let
-    # wedged legs hold both runners for ~10h before anything timed out --
-    # the same shared-box pressure documented in job-cannon's own ci.yml
-    # (5 registered runners on one 8-core box; #1451). 30 clears the 23.72
-    # max by ~26% while applying the same fail-loud bar now used on
-    # job-cannon: a required check should time out fast enough to free the
-    # runner, not sit wedged for hours. Sibling: job-cannon PR #1443.
-    timeout-minutes: 30
+    # Job-level concurrency: serialize all Tests jobs across every branch so
+    # at most one Tests job runs on the shared self-hosted box at a time.
+    # Without this, two runners pick up two Tests jobs concurrently, each
+    # spawning -n 2 pytest workers (4 total), and when the worker-dispatch
+    # tree or sibling repos' CI add more pytest sessions to the same 8-core
+    # box the CPU saturates and every Tests job stretches past its timeout
+    # -- the #1254 false-red incident (four PRs killed at the 30m finish
+    # line, suites actually passing) and the mid-run xdist-worker death
+    # documented in the issue's second symptom.
+    #
+    # cancel-in-progress: false is deliberate: a queued Tests job must NOT
+    # be cancelled by a newer one (that would silently drop PR check
+    # coverage). Excess jobs queue and run when the current one finishes --
+    # GitHub's runner assignment is independent of concurrency groups, so a
+    # queued Tests job does not block the second runner from picking up a
+    # Lint job or a reclaim job.
+    #
+    # The group key is a constant string (not per-branch) so ALL branches
+    # share one slot. The workflow-level concurrency block above
+    # (${workflow}-${ref}) already serializes per-branch; this job-level
+    # group additionally serializes cross-branch, which is the dimension
+    # that causes the oversubscription.
+    #
+    # Throughput cost: one runner is idle while Tests jobs queue. This is
+    # the structural bound the issue asks for instead of operator
+    # discipline -- and the alternative (thrash, false reds, operator
+    # diagnosis time, staggered reruns) is strictly more expensive.
+    concurrency:
+      group: cw-tests-self-hosted
+      cancel-in-progress: false
+    # 45 min: raised from 30 (#1254). 30 was derived from 28 successful
+    # runs (2026-07-28/29) with per-job execution time median 11.5 min,
+    # range 3.85-23.72 min, and cleared the 23.72 max by ~26%. But on
+    # 2026-08-15 four PRs' Tests jobs ran concurrently on the shared
+    # self-hosted box alongside other repos' CI and the dispatch tree's
+    # pytest sessions; CPU contention stretched a suite that normally
+    # finishes in ~8m (-n 2) to 29:43, and the 30m job timeout killed each
+    # at the finish line -- the suites PASSED ("4140 passed, 4 skipped in
+    # 1783.10s") but the job was cancelled during cleanup, producing false
+    # reds. The job-level concurrency group above eliminates the primary
+    # contention source (concurrent Tests jobs), but residual contention
+    # from sibling repos' CI and the dispatch tree persists, so the timeout
+    # must still survive it. 45 min is ~1.9x the uncontended max (23.72m)
+    # and ~1.5x the observed contended runtime (30m) -- enough headroom for
+    # residual contention without returning to the 60m budget that let the
+    # 2026-08-08 cross-repo incident wedge runners for ~10h. Sibling:
+    # job-cannon PR #1443.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       # setup-uv@v7 replaced with a PATH-append (#1115): the action's runner
