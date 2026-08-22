@@ -5,8 +5,14 @@
 # something actionable changed or full_pass_interval_seconds (300 s) expires.
 # This replaces the former one-shot `charlie fleet bash-rats` that the scheduled
 # task re-invoked every 5 minutes. The scheduled task's 5-minute trigger now
-# acts as a watchdog: if the daemon crashes, the next tick restarts it
-# (MultipleInstancesPolicy=IgnoreNew prevents double-launch while it's alive).
+# acts as a crash-recovery watchdog: if the daemon process dies, the next
+# tick restarts it (MultipleInstancesPolicy=IgnoreNew prevents double-launch
+# while it's alive). This covers a CRASHED supervisor only — a WEDGED
+# supervisor (alive but not making progress) is still suppressed by
+# IgnoreNew, so the trigger never fires. Wedge detection is handled in-
+# process by the supervise-loop wrapper's WedgeWatchdog (issue #728), which
+# monitors the supervisor heartbeat and terminates a wedged child so the
+# next tick relaunches it.
 #
 # cwd MUST be a registered repo so the fleet command resolves the global config
 # layer (%LOCALAPPDATA%\charlie-work\config.yaml) for the notify digest.

@@ -18,6 +18,7 @@ from typing import Any
 import yaml
 
 from .config import ApiWorkerConfig, OrchestratorConfig
+from .env_sanitize import worker_github_token_findings
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
 from . import layout
@@ -144,21 +145,21 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
         )
 
 
-#  Issue #873 Part 2: the token variable names sanitize_env() strips from
-#  every worker subprocess's environment (issue #502). Mirrored here, not
-#  imported from env_sanitize, so this preflight check touches only its own
-#  module — see _check_worker_github_token's docstring for why.
-_STRIPPED_GH_TOKEN_VARS = (
-    "GH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_ENTERPRISE_TOKEN",
-    "GITHUB_ENTERPRISE_TOKEN",
-)
+#  Issue #873 Part 2 / #1001: the token variable names and the adapter-path
+#  predicate live in env_sanitize.py now — shared by this preflight check and
+#  the dispatch gate in workflow.py so they cannot drift (issue #1001). The
+#  pre-#1001 private _STRIPPED_GH_TOKEN_VARS copy was deleted when
+#  worker_github_token_findings became the single predicate.
 
 
 def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
     """Flag a dispatch-enabled adapter with no scoped GitHub token configured
     for its workers (issue #873 Part 2).
+
+    Delegates to :func:`env_sanitize.worker_github_token_findings` — the single
+    predicate shared with the dispatch gate in ``workflow.py:_dispatch_impl``
+    (issue #1001) — so the doctor preflight and the dispatch gate cannot
+    disagree about whether the fleet is healthy.
 
     Background: ``env_sanitize.sanitize_env`` (issue #502) is a deliberate
     security control — it strips ``GH_TOKEN``/``GITHUB_TOKEN`` (and the GHES
@@ -228,59 +229,11 @@ def _check_worker_github_token(add: Any, config: OrchestratorConfig) -> None:
     severity-independent ``failed`` list — the finding is exactly as visible
     at ``warning``, it just doesn't block).
     """
-    adapter = config.devin.adapter
-    checks: list[tuple[str, str, str, dict[str, str]]] = []
-    if adapter == "devin-shell":
-        checks.append(
-            ("worker GitHub token", adapter, "devin.worker_env", config.devin.worker_env)
-        )
-    elif adapter in ("claude-code", "api"):
-        checks.append(
-            (
-                "worker GitHub token",
-                adapter,
-                "claude_code.worker_env",
-                config.claude_code.worker_env,
-            )
-        )
-
-    claude_code_reachable_via_routing = config.api_worker.enabled or config.rescue.enabled
-    if claude_code_reachable_via_routing and adapter not in ("claude-code", "api"):
-        checks.append(
-            (
-                "worker GitHub token (claude-code-routed)",
-                "api/rescue",
-                "claude_code.worker_env",
-                config.claude_code.worker_env,
-            )
-        )
-
-    for name, context, config_key, worker_env in checks:
-        configured_var = next(
-            (var for var in _STRIPPED_GH_TOKEN_VARS if worker_env.get(var)), None
-        )
-        if configured_var is not None:
-            add(
-                name,
-                True,
-                f"{config_key} configures {configured_var} — restores a scoped "
-                "token for worker `gh` calls after sanitize_env strips the "
-                "orchestrator's own token (issue #502/#873)",
-                severity="warning",
-            )
-            continue
-
+    for finding in worker_github_token_findings(config):
         add(
-            name,
-            False,
-            f"{config_key} has no GH_TOKEN/GITHUB_TOKEN (or GHES equivalent) — "
-            "sanitize_env (issue #502) strips the orchestrator's token from "
-            "every worker and points GH_CONFIG_DIR at an empty directory, so "
-            f"workers dispatched via the `{context}` adapter right now have no "
-            "sanctioned credential for `gh` and will stall or silently fall "
-            "back to an ambient Git Credential Manager entry (issue #873). Set "
-            f"{config_key}={{'GH_TOKEN': '<scoped-PAT>'}} to fix — never widen "
-            "sanitize_env itself to pass the orchestrator's token through.",
+            finding.name,
+            finding.ok,
+            finding.detail,
             severity="warning",
         )
 
@@ -514,6 +467,99 @@ def _surface_post_mortems(
             "; ".join(lines),
             severity="warning",
         )
+
+
+def _surface_in_progress_corroboration(
+    add: Any, repo_root: Path, config: OrchestratorConfig, *, now: datetime.datetime | None
+) -> None:
+    """Issue #1346: surface the watchdog's corroboration probe for in-progress
+    workers so an alive-but-polling worker (stale sidecar log mtime, fresh
+    sessions.db / per-PID log / events.jsonl) is visibly distinguishable from a
+    genuinely stalled one in doctor output.
+
+    Read-only and cheap: reuses ``iter_workers`` +
+    ``real_activity_probe_for`` + ``classify_worker_health`` -- the exact same
+    code path the stall watchdog consults -- so the displayed classification
+    and the displayed corroboration can never diverge. Never raises: a missing
+    sessions directory or a probe I/O failure is reported as "no in-progress
+    workers" rather than crashing doctor.
+
+    The check is informational (``ok=True``, ``severity="warning"``) unless a
+    genuinely stalled worker is found, in which case ``ok=False`` so the
+    operator sees it surfaced alongside the existing ``launched sessions``
+    check rather than having to infer staleness from a silent log mtime.
+    """
+    from datetime import UTC
+
+    from .worker import classify_worker_health, iter_workers, real_activity_probe_for
+
+    sessions_dir = resolved_layout(config, repo_root).sessions_dir
+    if not sessions_dir.is_dir():
+        return
+
+    resolved_now = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    dt_now = resolved_now if resolved_now.tzinfo is not None else resolved_now.replace(tzinfo=UTC)
+
+    alive_polling: list[str] = []
+    stalled: list[str] = []
+    healthy_fresh_log: list[str] = []
+    for view in iter_workers(sessions_dir):
+        if not view.is_alive():
+            continue
+        probe = real_activity_probe_for(view, config, dt_now)
+        health = classify_worker_health(view, config, dt_now, probe)
+        latest_ts = probe.latest_timestamp
+        latest_iso = latest_ts.isoformat() if latest_ts is not None else "none"
+        latest_src = probe.latest_source or "no source"
+        fresh = probe.is_fresh(config.watchdog.stall_minutes)
+        # Sidecar log staleness: view.last_activity_at is the log mtime ISO.
+        log_stale = _log_mtime_is_stale(view, config.watchdog.stall_minutes, dt_now)
+        tag = f"issue #{view.issue_number} (pid={view.pid}, health={health.value}, "
+        tag += f"corroboration={latest_iso} via {latest_src}, fresh={fresh})"
+        if health.value in ("stalled", "dead"):
+            stalled.append(tag)
+        elif log_stale and fresh:
+            # The exact #1346 shape: sidecar log frozen, real session still
+            # moving. Healthy per the watchdog, but indistinguishable from
+            # stalled on log mtime alone -- surface it explicitly.
+            alive_polling.append(tag)
+        else:
+            healthy_fresh_log.append(tag)
+
+    parts: list[str] = []
+    if alive_polling:
+        parts.append(f"alive-but-polling ({len(alive_polling)}): " + "; ".join(alive_polling))
+    if stalled:
+        parts.append(f"stalled/dead ({len(stalled)}): " + "; ".join(stalled))
+    if healthy_fresh_log:
+        parts.append(f"healthy ({len(healthy_fresh_log)})")
+    detail = "; ".join(parts) if parts else f"no in-progress workers in {sessions_dir}"
+
+    # ok=True unless a genuinely stalled/dead worker is present -- those are
+    # real problems. Alive-but-polling is informational (the watchdog already
+    # defers them), surfaced so an operator does not chase them as stalls.
+    add(
+        "in-progress worker corroboration",
+        not stalled,
+        detail,
+        severity="warning",
+    )
+
+
+def _log_mtime_is_stale(view: Any, stall_minutes: int, now: datetime.datetime) -> bool:
+    """Return True when the worker's sidecar log mtime is older than
+    ``stall_minutes``. Stats the log file directly (via ``view.log_stat()``)
+    rather than reading the sidecar's stored ``last_activity_at`` field, so
+    the verdict reflects the *current* log mtime -- the same signal a
+    log-mtime monitor reads. Best-effort: a missing/unreadable log is treated
+    as not-stale (the corroboration probe is the authoritative signal there)."""
+    from datetime import timedelta
+
+    stat_result = view.log_stat()
+    if stat_result is None:
+        return False
+    log_mtime = datetime.datetime.fromtimestamp(stat_result.st_mtime, tz=datetime.timezone.utc)
+    return (now - log_mtime) > timedelta(minutes=stall_minutes)
 
 
 def _allocation_writer_label(source: str | None) -> str:
@@ -1258,6 +1304,11 @@ def run_doctor(
     if adapter_probe:
         _probe_adapter(add, repo_root, config)
         _surface_sessions(add, repo_root, config)
+        # Issue #1346: surface the watchdog's corroboration probe for
+        # in-progress workers so alive-but-polling (stale sidecar log, fresh
+        # sessions.db / per-PID log) is visibly distinguishable from genuinely
+        # stalled. Read-only, same code path as the watchdog.
+        _surface_in_progress_corroboration(add, repo_root, config, now=resolved_now)
 
     if live:
         _validate_gh_field_lists(add, gh)

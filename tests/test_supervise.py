@@ -27,9 +27,12 @@ from charlie_work.supervise import (
     _BLOCKER_NAMES_IN_MESSAGE,
     _check_venv,
     _command_failure_message,
+    _match_pth_to_root,
     _pending_sync_marker_path,
+    _pull_ci_fleet_sibling,
     _record_self_deploy_failure_streak,
     _repair_lossless_pull_blockers,
+    _repair_venv_pth,
     _repairable_blocker_path,
     _self_deploy_failure_counter_path,
     _self_deploy_state_path,
@@ -55,6 +58,7 @@ class _FakePaths:
     def __init__(self, root: Path) -> None:
         self.root = root
         self.prs = root / "prs"
+        self.state_file = root / "state.json"
 
 
 class FakeApp:
@@ -89,10 +93,17 @@ class FakeApp:
         )
         self._results = list(results)
         self._call_count = 0
+        # Issue #1339: records ensure_labels() invocations so a test can assert
+        # the supervisor runs the startup label ensure exactly once.
+        self.ensure_labels_calls = 0
 
     def _resolve(self, path_str: str) -> Path:
         """Resolve a config path string — returns sessions_dir for any input."""
         return self._sessions_dir
+
+    def ensure_labels(self) -> CommandResult:
+        self.ensure_labels_calls += 1
+        return CommandResult(True, "labels ensured", {"labels": [], "missing": []})
 
     def loop(self, limit: Any = None, *, merge: Any = None) -> CommandResult:
         if self._call_count < len(self._results):
@@ -558,6 +569,37 @@ def test_pass_summary_reports_warnings_count(tmp_path: Path, capsys: Any) -> Non
 # ---------------------------------------------------------------------------
 
 
+def test_run_supervised_ensures_labels_once_at_startup(tmp_path: Path) -> None:
+    """Issue #1339: run_supervised runs the LabelConfig-derived label ensure
+    exactly once at startup (not per pass), so a new LabelConfig field
+    converges to its label with no operator action.
+    """
+    app = FakeApp(tmp_path, [_drained_result(), _drained_result()])
+    fc = FakeClock()
+    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=2)
+
+    assert app.ensure_labels_calls == 1
+
+
+def test_run_supervised_ensure_labels_failure_does_not_block(tmp_path: Path) -> None:
+    """Issue #1339 AC #2: a label-ensure failure must not block the supervisor."""
+    app = FakeApp(tmp_path, [_drained_result()])
+    ensure_calls: list[int] = []
+
+    def _raising_ensure() -> CommandResult:
+        ensure_calls.append(1)
+        raise RuntimeError("boom")
+
+    app.ensure_labels = _raising_ensure  # type: ignore[assignment]
+    fc = FakeClock()
+
+    # Must not raise; the supervisor proceeds to its loop.
+    result = run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    assert result.ok is True
+    # The ensure was actually invoked (not skipped), and its failure was caught.
+    assert ensure_calls == [1], ensure_calls
+
+
 def test_run_supervised_exits_when_drained_first_pass(tmp_path: Path) -> None:
     """First pass drains everything → loop exits immediately."""
     app = FakeApp(tmp_path, [_drained_result()])
@@ -570,6 +612,46 @@ def test_run_supervised_exits_when_drained_first_pass(tmp_path: Path) -> None:
     )
     assert result.ok is True
     assert app._call_count == 1
+
+
+def test_run_supervised_records_ci_fleet_provenance(tmp_path: Path) -> None:
+    """Issue #954: run_supervised records ci_fleet provenance to events.db.
+
+    Mirrors ``test_run_fleet_supervise_records_ci_fleet_provenance``: the
+    per-repo supervisor stamps ``ci_fleet.__file__`` plus the sibling repo's
+    HEAD/branch/dirty-state into its ``events.db`` at every start, so the
+    editable-working-tree coupling is attributable rather than silent. The
+    event is recorded before the supervisor lock and loop, so it lands even
+    on a drained single-pass run.
+
+    Review finding for #954: this event-write had no regression test -- only
+    a fixture attribute (``_FakePaths.state_file``) was patched to stop
+    existing tests from breaking. This test asserts the event is actually
+    written with the expected payload via ``query_events``.
+    """
+    app = FakeApp(tmp_path, [_drained_result()])
+    fc = FakeClock()
+    result = run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    assert result.ok is True
+
+    rows = query_events(app.paths.state_file, kind="ci_fleet_provenance")
+    assert rows is not None, "no events.db reader -- the event was not recorded"
+    assert len(rows) == 1, f"expected exactly one ci_fleet_provenance event, got {len(rows)}"
+    payload = rows[0]["payload"]
+    # ci_fleet is importable in this venv, so __file__ is always set.
+    assert payload["ci_fleet_file"] is not None
+    # All six fields from the shared payload helper must be present (None is a
+    # valid value for the sibling fields when declared_ci_fleet_root abstains
+    # from a worktree).
+    for key in (
+        "ci_fleet_file",
+        "sibling_root",
+        "sibling_head",
+        "sibling_branch",
+        "sibling_dirty",
+        "error",
+    ):
+        assert key in payload, f"missing field {key!r} in ci_fleet_provenance payload"
 
 
 def test_run_supervised_infill_freed_slot_triggers_prompt_pass(tmp_path: Path) -> None:
@@ -2009,7 +2091,7 @@ def test_self_deploy_venv_repair_failure_is_non_fatal(
     _setup_fake_venv(tmp_path, wrong_target=wrong_target)
     monkeypatch.setattr(
         "charlie_work.supervise._repair_venv_pth",
-        lambda _repo_root, _venv_path: (False, "Access is denied"),
+        lambda _repo_root, _venv_path: (False, "Access is denied", []),
     )
 
     runner, calls = _make_fake_runner([RunResult(0, "abc123\n", "")])
@@ -2024,6 +2106,292 @@ def test_self_deploy_venv_repair_failure_is_non_fatal(
     assert result.error is not None
     assert "Access is denied" in result.error
     assert not calls
+
+
+# ---------------------------------------------------------------------------
+# _repair_venv_pth per-package root targeting (issue #969 gap 1)
+# ---------------------------------------------------------------------------
+
+
+def _setup_repo_with_peer_dep_venv(
+    tmp_path: Path,
+    *,
+    charlie_work_target: Path | None = None,
+    ci_fleet_target: Path | None = None,
+) -> tuple[Path, Path, Path, Path]:
+    """Create a repo with a relative editable dep and a venv with two .pth files.
+
+    Returns ``(repo_root, peer_src, charlie_pth, ci_fleet_pth)``.  Each .pth
+    is written to the given target (or the correct root when ``None``).
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    (repo_root / "pyproject.toml").write_text(
+        '[project]\nname = "charlie-work"\nversion = "0.1.0"\n'
+        '[tool.uv.sources]\nci-fleet = { path = "../ci_runners", editable = true }\n',
+        encoding="utf-8",
+    )
+    peer_src = tmp_path / "ci_runners" / "src"
+    (peer_src / "ci_fleet").mkdir(parents=True)
+    (peer_src / "ci_fleet" / "__init__.py").write_text("", encoding="utf-8")
+
+    site_packages = repo_root / ".venv" / "lib" / "python3.13" / "site-packages"
+    site_packages.mkdir(parents=True)
+    charlie_pth = site_packages / "_editable_impl_charlie_work.pth"
+    ci_fleet_pth = site_packages / "_editable_impl_ci_fleet.pth"
+    charlie_pth.write_text(
+        str((charlie_work_target or (repo_root / "src")).resolve()) + "\n",
+        encoding="utf-8",
+    )
+    ci_fleet_pth.write_text(str((ci_fleet_target or peer_src).resolve()) + "\n", encoding="utf-8")
+    return repo_root, peer_src, charlie_pth, ci_fleet_pth
+
+
+def test_repair_venv_pth_rewrites_foreign_editable_to_peer_root(
+    tmp_path: Path,
+) -> None:
+    """A poisoned foreign .pth is rewritten to its peer repo src, not repo_root/src (gap 1).
+
+    The old repair used a single ``main_src`` constant and would have rewritten
+    ``_editable_impl_ci_fleet.pth`` to ``charlie-work/src`` -- a hard
+    ``ImportError`` because no ``ci_fleet`` package lives there.
+    """
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    repo_root, peer_src, _charlie_pth, ci_fleet_pth = _setup_repo_with_peer_dep_venv(
+        tmp_path, ci_fleet_target=scratch
+    )
+
+    ok, message, repaired = _repair_venv_pth(repo_root, repo_root / ".venv")
+
+    assert ok
+    assert ci_fleet_pth.read_text(encoding="utf-8").strip() == str(peer_src.resolve())
+    assert "configured checkouts" in message
+    assert "_editable_impl_ci_fleet.pth" in repaired
+
+
+def test_repair_venv_pth_refuses_unknown_foreign_editable(tmp_path: Path) -> None:
+    """A poisoned .pth whose correct root is unknown is left untouched (gap 1).
+
+    Refusing to write a wrong root is strictly safer than guessing: a missed
+    repair surfaces as a verification mismatch on re-check, while a wrong
+    repair surfaces as a silent ``ImportError`` that verifies clean.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    # No pyproject.toml -> no peer dep -> ci_fleet root is not derivable.
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    site_packages = repo_root / ".venv" / "lib" / "python3.13" / "site-packages"
+    site_packages.mkdir(parents=True)
+    unknown_pth = site_packages / "_editable_impl_ci_fleet.pth"
+    unknown_pth.write_text(str(scratch.resolve()) + "\n", encoding="utf-8")
+    original_content = unknown_pth.read_text(encoding="utf-8")
+
+    ok, message, repaired = _repair_venv_pth(repo_root, repo_root / ".venv")
+
+    assert not ok
+    assert "could not determine correct root" in message
+    assert "_editable_impl_ci_fleet.pth" in message
+    # No files were repaired -- the unknown .pth was left untouched.
+    assert repaired == []
+    # The file is left untouched -- no ImportError written.
+    assert unknown_pth.read_text(encoding="utf-8") == original_content
+
+
+def test_repair_venv_pth_partial_repair_observable_despite_overall_failure(
+    tmp_path: Path,
+) -> None:
+    """A mixed matchable/unmatchable scenario records the partial repair (PR #1176 review).
+
+    When some poisoned .pth files are successfully rewritten but others are
+    unrepairable, the overall call returns ``False`` -- but the successfully
+    repaired files must not be invisible.  The return value's ``repaired_files``
+    list makes the partial repair observable so it is indistinguishable neither
+    from a no-op failure nor from a full success.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    # No pyproject.toml peer dep for ci_fleet -> its root is not derivable.
+    correct_charlie_src = (repo_root / "src").resolve()
+    wrong_charlie_target = (tmp_path / "wrong_charlie" / "src").resolve()
+    wrong_charlie_target.mkdir(parents=True)
+    wrong_ci_fleet_target = (tmp_path / "wrong_fleet" / "src").resolve()
+    wrong_ci_fleet_target.mkdir(parents=True)
+
+    site_packages = repo_root / ".venv" / "lib" / "python3.13" / "site-packages"
+    site_packages.mkdir(parents=True)
+    charlie_pth = site_packages / "_editable_impl_charlie_work.pth"
+    charlie_pth.write_text(str(wrong_charlie_target) + "\n", encoding="utf-8")
+    unknown_fleet_pth = site_packages / "_editable_impl_ci_fleet.pth"
+    unknown_fleet_pth.write_text(str(wrong_ci_fleet_target) + "\n", encoding="utf-8")
+    original_fleet_content = unknown_fleet_pth.read_text(encoding="utf-8")
+
+    ok, message, repaired = _repair_venv_pth(repo_root, repo_root / ".venv")
+
+    # Overall failure: the unmatchable ci_fleet .pth could not be repaired.
+    assert not ok
+    assert "could not determine correct root" in message
+    assert "_editable_impl_ci_fleet.pth" in message
+    # The matchable charlie_work .pth WAS successfully rewritten.
+    assert charlie_pth.read_text(encoding="utf-8").strip() == str(correct_charlie_src)
+    # The partial repair is observable in the return value.
+    assert "_editable_impl_charlie_work.pth" in repaired
+    assert "_editable_impl_ci_fleet.pth" not in repaired
+    # The unmatchable file is left untouched.
+    assert unknown_fleet_pth.read_text(encoding="utf-8") == original_fleet_content
+
+
+def test_check_venv_partial_repair_event_records_repaired_files(
+    tmp_path: Path,
+) -> None:
+    """A partial repair's venv_pth_repair_failed event includes repaired_files (PR #1176 review).
+
+    Goes through ``_check_venv`` so the event path is exercised end-to-end.
+    The matchable charlie_work .pth is rewritten; the unmatchable ci_fleet .pth
+    is left untouched.  The overall result is failure, but the
+    ``venv_pth_repair_failed`` event's payload carries ``repaired_files`` so the
+    partial repair is not indistinguishable from a no-op failure in events.db.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True)
+    (repo_root / "src" / "charlie_work").mkdir(parents=True)
+    (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
+    # No pyproject.toml -> no peer dep -> ci_fleet root is not derivable.
+    correct_charlie_src = (repo_root / "src").resolve()
+    wrong_charlie_target = (tmp_path / "wrong_charlie" / "src").resolve()
+    wrong_charlie_target.mkdir(parents=True)
+    wrong_ci_fleet_target = (tmp_path / "wrong_fleet" / "src").resolve()
+    wrong_ci_fleet_target.mkdir(parents=True)
+
+    site_packages = repo_root / ".venv" / "lib" / "python3.13" / "site-packages"
+    site_packages.mkdir(parents=True)
+    charlie_pth = site_packages / "_editable_impl_charlie_work.pth"
+    charlie_pth.write_text(str(wrong_charlie_target) + "\n", encoding="utf-8")
+    unknown_fleet_pth = site_packages / "_editable_impl_ci_fleet.pth"
+    unknown_fleet_pth.write_text(str(wrong_ci_fleet_target) + "\n", encoding="utf-8")
+
+    state_path = _self_deploy_state_path(repo_root)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}", encoding="utf-8")
+
+    result = _check_venv(repo_root)
+
+    # Overall failure: the unmatchable ci_fleet .pth could not be repaired.
+    assert result.ok is False
+    assert result.venv_repaired is False
+    assert "could not determine correct root" in (result.error or "")
+    # The matchable charlie_work .pth WAS successfully rewritten.
+    assert charlie_pth.read_text(encoding="utf-8").strip() == str(correct_charlie_src)
+    # The partial repair is observable in the venv_pth_repair_failed event.
+    failed_events = query_events(state_path, kind="venv_pth_repair_failed")
+    assert len(failed_events) == 1
+    payload = failed_events[0]["payload"]
+    assert "repaired_files" in payload
+    assert "_editable_impl_charlie_work.pth" in payload["repaired_files"]
+    assert "_editable_impl_ci_fleet.pth" not in payload["repaired_files"]
+
+
+def test_match_pth_to_root_returns_correct_root() -> None:
+    """_match_pth_to_root maps a .pth filename to its configured src root."""
+    repo_src = Path("C:/repo/src")
+    peer_src = Path("C:/ci_runners/src")
+    package_to_root = {"charlie_work": repo_src, "ci_fleet": peer_src}
+
+    assert _match_pth_to_root(Path("_editable_impl_charlie_work.pth"), package_to_root) == repo_src
+    assert _match_pth_to_root(Path("_editable_impl_ci_fleet.pth"), package_to_root) == peer_src
+
+
+def test_match_pth_to_root_returns_none_for_unknown() -> None:
+    """An unrecognized .pth filename yields None so the caller refuses to repair."""
+    package_to_root = {"charlie_work": Path("C:/repo/src")}
+    assert _match_pth_to_root(Path("_editable_impl_ci_fleet.pth"), package_to_root) is None
+
+
+# ---------------------------------------------------------------------------
+# _check_venv observability (issue #969 gap 3)
+# ---------------------------------------------------------------------------
+
+
+def test_check_venv_emits_mismatch_and_repaired_events(tmp_path: Path) -> None:
+    """A detected mismatch emits venv_pth_mismatch; a successful repair emits venv_pth_repaired."""
+    wrong_target = tmp_path / "wrong" / "src"
+    pth_path = _setup_fake_venv(tmp_path, wrong_target=wrong_target)
+    state_path = _self_deploy_state_path(tmp_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}", encoding="utf-8")
+
+    result = _check_venv(tmp_path)
+
+    assert result.ok is True
+    assert result.venv_repaired is True
+    assert pth_path.read_text(encoding="utf-8").strip() == str((tmp_path / "src").resolve())
+
+    mismatch_events = query_events(state_path, kind="venv_pth_mismatch")
+    repaired_events = query_events(state_path, kind="venv_pth_repaired")
+    assert len(mismatch_events) == 1
+    assert len(repaired_events) == 1
+    assert mismatch_events[0]["payload"]["detail"]
+
+
+def test_check_venv_emits_repair_failed_event(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """A failed repair emits venv_pth_repair_failed and returns a non-fatal error."""
+    wrong_target = tmp_path / "wrong" / "src"
+    _setup_fake_venv(tmp_path, wrong_target=wrong_target)
+    state_path = _self_deploy_state_path(tmp_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "charlie_work.supervise._repair_venv_pth",
+        lambda _repo_root, _venv_path: (False, "Access is denied", []),
+    )
+
+    result = _check_venv(tmp_path)
+
+    assert result.ok is False
+    assert result.venv_repaired is False
+    assert "Access is denied" in result.error
+    failed_events = query_events(state_path, kind="venv_pth_repair_failed")
+    assert len(failed_events) == 1
+    assert "Access is denied" in failed_events[0]["payload"]["detail"]
+
+
+def test_check_venv_emits_mismatch_event_for_foreign_editable(
+    tmp_path: Path,
+) -> None:
+    """A foreign editable mismatch emits venv_pth_mismatch even when the main .pth is healthy.
+
+    This is the false-green scenario: the old filter would have repaired only
+    the main .pth and reported success.  The resolved-target test catches the
+    foreign mismatch, and the event makes it observable.
+    """
+    scratch = tmp_path / "scratch" / "src"
+    scratch.mkdir(parents=True)
+    repo_root, peer_src, _charlie_pth, _ci_fleet_pth = _setup_repo_with_peer_dep_venv(
+        tmp_path, ci_fleet_target=scratch
+    )
+    state_path = _self_deploy_state_path(repo_root)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}", encoding="utf-8")
+
+    result = _check_venv(repo_root)
+
+    assert result.ok is True
+    assert result.venv_repaired is True
+    mismatch_events = query_events(state_path, kind="venv_pth_mismatch")
+    assert len(mismatch_events) == 1
+    assert "_editable_impl_ci_fleet.pth" in mismatch_events[0]["payload"]["detail"]
+    repaired_events = query_events(state_path, kind="venv_pth_repaired")
+    assert len(repaired_events) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2455,3 +2823,260 @@ def test_self_deploy_records_nothing_cleared_when_no_repair_was_needed(
         query_events(_self_deploy_state_path(clone_root), kind="self_deploy_blockers_cleared")
         == []
     )
+
+
+# ---------------------------------------------------------------------------
+# _pull_ci_fleet_sibling unit tests (issue #552 deploy-clone half)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def captured_log_events(monkeypatch: Any) -> list[tuple[Path, str, dict[str, Any]]]:
+    """Capture (state_path, kind, payload) tuples instead of writing to events.db."""
+    calls: list[tuple[Path, str, dict[str, Any]]] = []
+
+    def _fake_log_event(
+        state_path: Path, kind: str, payload: dict[str, Any], **_kwargs: Any
+    ) -> None:
+        calls.append((state_path, kind, payload))
+
+    monkeypatch.setattr("charlie_work.supervise.log_event", _fake_log_event)
+    return calls
+
+
+def _fake_declared_root(monkeypatch: Any, sibling_src: Path | None) -> None:
+    """Patch declared_ci_fleet_root at its source module.
+
+    ``_pull_ci_fleet_sibling`` imports it lazily inside its body
+    (``from .ci_fleet_anchor import declared_ci_fleet_root``), so it must be
+    patched at ``charlie_work.ci_fleet_anchor``, not at ``charlie_work.supervise``.
+    """
+    monkeypatch.setattr("charlie_work.ci_fleet_anchor.declared_ci_fleet_root", lambda: sibling_src)
+
+
+def test_pull_ci_fleet_sibling_happy_path(
+    tmp_path: Path,
+    monkeypatch: Any,
+    captured_log_events: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    """Clean main sibling, sha moves -> one ok/changed events.db entry."""
+    sibling = tmp_path / "ci-fleet"
+    _fake_declared_root(monkeypatch, sibling / "src")
+
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "main\n", ""),  # branch
+            RunResult(0, "", ""),  # status --porcelain (clean)
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "", ""),  # pull ok
+            RunResult(0, "def456\n", ""),  # after HEAD
+        ]
+    )
+
+    outcome = _pull_ci_fleet_sibling(tmp_path, run_command=runner, timeout=60)
+
+    assert outcome is None
+    assert len(captured_log_events) == 1
+    _, kind, payload = captured_log_events[0]
+    assert kind == "self_deploy_ci_fleet_pull"
+    assert payload["ok"] is True
+    assert payload["changed"] is True
+    assert payload["from_sha"] == "abc123"
+    assert payload["to_sha"] == "def456"
+    assert payload["from_sha"] != payload["to_sha"]
+    assert len(calls) == 5
+    assert all(c[1] == sibling for c in calls)
+
+
+def test_pull_ci_fleet_sibling_unchanged_pull(
+    tmp_path: Path,
+    monkeypatch: Any,
+    captured_log_events: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    """Pull succeeds but the sha does not move -> ok True, changed False."""
+    sibling = tmp_path / "ci-fleet"
+    _fake_declared_root(monkeypatch, sibling / "src")
+
+    runner, _ = _make_fake_runner(
+        [
+            RunResult(0, "main\n", ""),
+            RunResult(0, "", ""),
+            RunResult(0, "abc123\n", ""),
+            RunResult(0, "Already up to date.\n", ""),
+            RunResult(0, "abc123\n", ""),
+        ]
+    )
+
+    _pull_ci_fleet_sibling(tmp_path, run_command=runner, timeout=60)
+
+    _, kind, payload = captured_log_events[0]
+    assert kind == "self_deploy_ci_fleet_pull"
+    assert payload["ok"] is True
+    assert payload["changed"] is False
+    assert payload["from_sha"] == payload["to_sha"] == "abc123"
+
+
+def test_pull_ci_fleet_sibling_skips_non_main_branch(
+    tmp_path: Path,
+    monkeypatch: Any,
+    captured_log_events: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    """A sibling not on main is skipped -- pull is never issued.
+
+    This pins the fail-safe precondition: only two canned responses (branch,
+    status) are supplied, so if the branch check were deleted the function
+    would try to consume a third response and the fake runner's ``pop(0)``
+    would raise ``IndexError``, failing the test.
+    """
+    sibling = tmp_path / "ci-fleet"
+    _fake_declared_root(monkeypatch, sibling / "src")
+
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "feature-branch\n", ""),  # branch
+            RunResult(0, "", ""),  # status --porcelain
+        ]
+    )
+
+    _pull_ci_fleet_sibling(tmp_path, run_command=runner, timeout=60)
+
+    _, kind, payload = captured_log_events[0]
+    assert kind == "self_deploy_ci_fleet_pull"
+    assert payload["ok"] is False
+    assert "feature-branch" in payload["skipped_reason"]
+    assert all(c[0] != ["git", "pull", "--ff-only", "origin", "main"] for c in calls)
+    assert len(calls) == 2
+
+
+def test_pull_ci_fleet_sibling_skips_dirty_tree(
+    tmp_path: Path,
+    monkeypatch: Any,
+    captured_log_events: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    """A dirty sibling tree is skipped -- pull is never issued.
+
+    Only two canned responses are supplied, pinning the precondition the same
+    way as the non-main-branch case above.
+    """
+    sibling = tmp_path / "ci-fleet"
+    _fake_declared_root(monkeypatch, sibling / "src")
+
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "main\n", ""),
+            RunResult(0, " M some_file.py\n", ""),  # dirty
+        ]
+    )
+
+    _pull_ci_fleet_sibling(tmp_path, run_command=runner, timeout=60)
+
+    _, kind, payload = captured_log_events[0]
+    assert kind == "self_deploy_ci_fleet_pull"
+    assert payload["ok"] is False
+    assert payload["skipped_reason"] == "sibling tree is dirty"
+    assert all(c[0] != ["git", "pull", "--ff-only", "origin", "main"] for c in calls)
+    assert len(calls) == 2
+
+
+def test_pull_ci_fleet_sibling_skips_when_no_declared_root(
+    tmp_path: Path,
+    monkeypatch: Any,
+    captured_log_events: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    """No declared ci-fleet source -- skipped, no git commands issued at all."""
+    _fake_declared_root(monkeypatch, None)
+
+    runner, calls = _make_fake_runner([])
+
+    _pull_ci_fleet_sibling(tmp_path, run_command=runner, timeout=60)
+
+    _, kind, payload = captured_log_events[0]
+    assert kind == "self_deploy_ci_fleet_pull"
+    assert payload["ok"] is False
+    assert "no declared" in payload["skipped_reason"]
+    assert calls == []
+
+
+def test_pull_ci_fleet_sibling_pull_failure_is_non_fatal(
+    tmp_path: Path,
+    monkeypatch: Any,
+    captured_log_events: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    """A failed pull is recorded with an error, event still emitted, no raise."""
+    sibling = tmp_path / "ci-fleet"
+    _fake_declared_root(monkeypatch, sibling / "src")
+
+    runner, _ = _make_fake_runner(
+        [
+            RunResult(0, "main\n", ""),
+            RunResult(0, "", ""),
+            RunResult(0, "abc123\n", ""),
+            RunResult(1, "", "fatal: could not read from remote repository."),
+            RunResult(0, "abc123\n", ""),
+        ]
+    )
+
+    outcome = _pull_ci_fleet_sibling(tmp_path, run_command=runner, timeout=60)
+
+    assert outcome is None
+    assert len(captured_log_events) == 1
+    _, kind, payload = captured_log_events[0]
+    assert kind == "self_deploy_ci_fleet_pull"
+    assert payload["ok"] is False
+    assert payload.get("error")
+
+
+def test_pull_ci_fleet_sibling_declared_root_raises_is_caught(
+    tmp_path: Path,
+    monkeypatch: Any,
+    captured_log_events: list[tuple[Path, str, dict[str, Any]]],
+) -> None:
+    """An exception from declared_ci_fleet_root is caught, logged, never propagates."""
+
+    def _boom() -> Path | None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("charlie_work.ci_fleet_anchor.declared_ci_fleet_root", _boom)
+
+    runner, calls = _make_fake_runner([])
+
+    outcome = _pull_ci_fleet_sibling(tmp_path, run_command=runner, timeout=60)
+
+    assert outcome is None
+    _, kind, payload = captured_log_events[0]
+    assert kind == "self_deploy_ci_fleet_pull"
+    assert payload["ok"] is False
+    assert "RuntimeError" in payload["error"]
+    assert calls == []
+
+
+def test_self_deploy_does_not_pull_ci_fleet_sibling_by_default(
+    tmp_path: Path, monkeypatch: Any, no_fleet_live_sessions: None
+) -> None:
+    """self_deploy's default pull_ci_fleet=False never touches the sibling machinery.
+
+    Patches ``_pull_ci_fleet_sibling`` with a fail-if-called stub and drives
+    ``self_deploy`` (no ``pull_ci_fleet`` kwarg -> default False) with a
+    successful, code-only pull -- confirming the sibling path is gated even
+    when the orchestrator's own pull succeeds.
+    """
+
+    def _fail_if_called(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("_pull_ci_fleet_sibling must not be called when pull_ci_fleet=False")
+
+    monkeypatch.setattr("charlie_work.supervise._pull_ci_fleet_sibling", _fail_if_called)
+
+    runner, _ = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "", ""),  # pull ok
+            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
+        ]
+    )
+
+    result = self_deploy(tmp_path, run_command=runner)
+
+    assert result.ok is True
+    assert result.pulled is True
+    assert result.changed is True

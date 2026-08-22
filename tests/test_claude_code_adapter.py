@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _claude_adapter_fixtures import _fake_worktree, _install_fake_create_worktree
 from _worker_marker_wait import read_worker_marker
 
 from charlie_work import claude_code
@@ -39,70 +40,7 @@ from charlie_work.claude_code import (
 )
 from charlie_work.env_sanitize import sanitize_env
 from charlie_work.subprocess_runner import RunResult
-from charlie_work.worktree import WorktreeInfo
-
-
-def _fake_worktree(tmp_path: Path, branch: str) -> WorktreeInfo:
-    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
-
-
-def _fake_worktree_with_venv(tmp_path: Path, branch: str) -> WorktreeInfo:
-    """Create a fake worktree with a .venv directory.
-
-    This makes sanitize_env actively SET VIRTUAL_ENV (instead of POP-ing it),
-    which makes the merge order testable: if worker_env is merged first,
-    sanitize_env will clobber the override.
-    """
-    worktree_path = tmp_path / "worktrees" / branch.replace("/", "-")
-    worktree_path.mkdir(parents=True, exist_ok=True)
-    (worktree_path / ".venv").mkdir()
-    return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
-
-
-def _install_fake_create_worktree(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    calls: list[dict] | None = None,
-    with_venv: bool = False,
-) -> None:
-    def fake_create_worktree(
-        repo_root,
-        branch,
-        *,
-        base_ref="HEAD",
-        worktrees_dir=None,
-        venv_source=None,
-        materialize_dirs=(),
-        rework=False,
-        recovery=None,
-        issue_number=None,
-        config=None,
-        sessions_dir=None,
-    ):
-        if calls is not None:
-            calls.append(
-                {
-                    "repo_root": repo_root,
-                    "branch": branch,
-                    "base_ref": base_ref,
-                    "worktrees_dir": worktrees_dir,
-                    "venv_source": venv_source,
-                    "materialize_dirs": materialize_dirs,
-                    "rework": rework,
-                    "recovery": recovery,
-                    "issue_number": issue_number,
-                    "config": config,
-                    "sessions_dir": sessions_dir,
-                }
-            )
-        if with_venv:
-            return _fake_worktree_with_venv(tmp_path, branch)
-        return _fake_worktree(tmp_path, branch)
-
-    monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
+from charlie_work.worktree import WorktreeForeignWriterError, WorktreeInfo
 
 
 def _fake_claude_script(tmp_path: Path) -> tuple[str, ...]:
@@ -584,6 +522,74 @@ def test_launch_claude_worker_create_worktree_failure_does_not_raise(
 
     sidecar_path = sessions_dir / "issue-13.claude.json"
     assert sidecar_path.exists()
+
+
+def test_launch_claude_worker_foreign_writer_error_serializes_path_and_writes_clean_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression test for issue #1184.
+
+    ``WorktreeForeignWriterError.worktree_path`` is a ``pathlib.Path``. If
+    ``launch_claude_worker`` inserts it into the failure ``ClaudeWorkerRecord``
+    without ``str()`` coercion, ``_write_json_atomic`` raises ``TypeError``
+    mid-write, stranding a ``.tmp`` file and never producing a readable
+    sidecar or a returned record.
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    foreign_path = tmp_path / "foreign-wt"
+
+    def foreign_writer_create_worktree(
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        materialize_dirs=(),
+        rework=False,
+        recovery=None,
+        issue_number=None,
+        config=None,
+        sessions_dir=None,
+    ):
+        raise WorktreeForeignWriterError(
+            worktree_path=foreign_path,
+            pid=1234,
+            session_id="abc",
+        )
+
+    monkeypatch.setattr(claude_code, "create_worktree", foreign_writer_create_worktree)
+
+    # Must not raise: the shim converts this exception into a durable
+    # error record.
+    record = launch_claude_worker(
+        14,
+        "agent/issue-14-foreign",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+    )
+
+    assert not record.ok
+    assert record.failure_kind == "worktree_foreign_writer"
+    assert isinstance(record.worktree_path, str)
+    assert record.worktree_path == str(foreign_path)
+
+    sidecar_path = sessions_dir / "issue-14.claude.json"
+    tmp_sidecar_path = sidecar_path.with_suffix(sidecar_path.suffix + ".tmp")
+
+    assert sidecar_path.exists()
+    assert not tmp_sidecar_path.exists()
+
+    # json.loads must succeed cleanly — this is the assertion that would
+    # fail (TypeError during json.dump, no file or a stranded .tmp instead)
+    # if the str() coercion were reverted.
+    payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert payload["failure_kind"] == "worktree_foreign_writer"
+    assert payload["worktree_path"] == str(foreign_path)
 
 
 def test_launch_claude_worker_fetch_failure_yields_error_record_not_exception(
@@ -3099,6 +3105,35 @@ def test_launch_claude_worker_honors_configured_model_override(
     assert record.command[idx + 1] == "claude-opus-4-8"
 
 
+def test_launch_claude_worker_model_override_wins_over_claude_code_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #1245: an explicit ``model_override`` is pinned as the ``--model``
+    value instead of ``claude_code.model``. This is the seam the api adapter
+    uses to pin the provider's model. The two values deliberately differ so a
+    regression that ignores the override is caught."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(model="claude-sonnet-5"))
+
+    record = launch_claude_worker(
+        42,
+        "agent/issue-42-fix",
+        "Do the thing.",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        config=config,
+        model_override="kimi-k3",
+    )
+
+    assert record.command.count("--model") == 1
+    idx = record.command.index("--model")
+    assert record.command[idx + 1] == "kimi-k3"
+    assert record.command[idx + 1] != "claude-sonnet-5"
+
+
 def test_launch_claude_worker_review_pins_configured_model_by_default(
     tmp_path: Path,
 ) -> None:
@@ -3669,6 +3704,67 @@ def test_launch_claude_worker_review_prompt_write_failure_tears_down_checkout(
         text=True,
     )
     assert str(checkout_path) not in result.stdout
+
+
+def test_launch_claude_worker_review_writes_terminal_status_record(
+    tmp_path: Path,
+) -> None:
+    """A review=True launch must start the terminal-status watcher so a
+    ``terminal.json`` appears at
+    ``worker_terminal_status_path(reviews_dir, pr_number, 'claude')`` once the
+    reviewer process exits (issue #1354, PR #1356 round-2 review).
+
+    Before the fix, ``launch_claude_worker`` guarded the
+    ``start_terminal_status_watcher`` call with ``if not review:``, so review
+    launches never wrote a terminal-status record and the review-verdict
+    reaper's exit-code fallback had nothing to read. This test exercises the
+    real launch path end-to-end (real ``create_review_checkout``, real
+    ``subprocess.Popen`` of the fake claude script, real watcher thread) and
+    asserts the durable record materializes at the path the reaper reads from.
+    """
+    from charlie_work.process_utils import (
+        find_worker_terminal_status,
+        worker_terminal_status_path,
+    )
+
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    record = launch_claude_worker(
+        1354,
+        "agent/issue-1354-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+    )
+
+    assert record.ok, record.error
+    assert record.pid is not None
+
+    expected_path = worker_terminal_status_path(sessions_dir, 1354, "claude")
+    # The watcher polls every _TERMINAL_STATUS_POLL_INTERVAL_SECONDS (2s); the
+    # fake script exits near-instantly, so the record should appear within a
+    # few poll intervals. Poll rather than sleep a fixed duration so the test
+    # is fast on a healthy path and only waits as long as needed.
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not expected_path.exists():
+        time.sleep(0.1)
+    assert expected_path.exists(), (
+        f"review=True launch did not write a terminal-status record at "
+        f"{expected_path} -- the start_terminal_status_watcher guard "
+        f"(`if not review:`) may have been reintroduced"
+    )
+
+    payload = find_worker_terminal_status(sessions_dir, 1354)
+    assert payload is not None, "terminal-status record vanished after appearing"
+    assert payload["pid"] == record.pid
+    # The fake claude script exits 0.
+    assert payload["exit_code"] == 0
 
 
 def test_launch_claude_worker_api_kind_sidecar_naming(

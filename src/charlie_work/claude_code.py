@@ -921,6 +921,7 @@ def launch_claude_worker(
     adapter_kind: str = "claude-code",
     provider: str = "",
     resolved_review_effort: str | None = None,
+    model_override: str | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -973,6 +974,15 @@ def launch_claude_worker(
     production path, rather than two calls to the same pure function that
     merely agree by convention. When omitted (direct callers, unit tests),
     the effort is resolved internally as a fallback.
+
+    ``model_override``, when provided, is pinned as the ``--model`` value
+    instead of ``resolved_config.claude_code.model``. The api adapter
+    (``api_worker.launch_api_worker``) passes the resolved provider's model
+    here so the ``--model`` flag — which the Claude Code CLI gives precedence
+    over ``ANTHROPIC_MODEL`` — selects the provider's model rather than the
+    claude_code section's. When omitted (the default), the claude_code
+    section's model is pinned exactly as before — the single enforcement
+    point stays ``_apply_model_pin``, never an ``adapter_kind`` branch.
     """
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework, review=review)
@@ -1004,7 +1014,16 @@ def launch_claude_worker(
     elif command_template is None:
         command_template = _WORKER_COMMAND_TEMPLATE
     resolved_config = config or OrchestratorConfig()
-    command_template = _apply_model_pin(command_template, resolved_config.claude_code.model)
+    # Issue #1245: the api adapter passes its provider's model so the
+    # ``--model`` flag (which the Claude Code CLI prefers over
+    # ``ANTHROPIC_MODEL``) selects the provider's model, not the
+    # claude_code section's. Default to claude_code.model for every other
+    # caller — single enforcement point stays _apply_model_pin, never an
+    # adapter_kind branch.
+    pinned_model = (
+        model_override if model_override is not None else resolved_config.claude_code.model
+    )
+    command_template = _apply_model_pin(command_template, pinned_model)
     # Reviewer sessions may pin their own effort independently of worker
     # effort (empty string means fall back to claude_code.effort), optionally
     # split into a per-PR randomized treatment/control experiment — see
@@ -1080,7 +1099,11 @@ def launch_claude_worker(
         record = _error_record(
             issue_number=issue_number,
             branch=branch,
-            worktree_path=getattr(exc, "worktree_path", "")
+            # str() is load-bearing: the exception stores a Path, and an
+            # unserializable field here destroys this whole failure record
+            # mid-json.dump, downgrading the diagnosis to a generic launch
+            # failure that burns the rework cap (issue #1184).
+            worktree_path=str(getattr(exc, "worktree_path", ""))
             if isinstance(exc, WorktreeForeignWriterError)
             else "",
             prompt_path="",
@@ -1336,17 +1359,24 @@ def launch_claude_worker(
     # Issue #773: persist this worker's terminal status (exit code + duration)
     # once it exits, so a later orphan-detection pass can tell a clean exit-0
     # no-op apart from a genuine crash instead of inferring it from PID
-    # liveness alone. Scoped to non-review launches -- orphan detection
-    # (workflow._detect_and_handle_orphaned_workers) only concerns dispatched
-    # worker/rework sessions, never reviewer sessions, which have their own,
-    # separate stall-detection path. Does not block this function's return;
-    # see start_terminal_status_watcher's docstring.
-    if not review:
-        start_terminal_status_watcher(
-            process,
-            worker_terminal_status_path(sessions_dir, issue_number, _sidecar_suffix(adapter_kind)),
-            worktree_path=worktree.path,
-        )
+    # liveness alone. Does not block this function's return; see
+    # start_terminal_status_watcher's docstring.
+    #
+    # Issue #1354: extended to review launches too. A reviewer that dies
+    # mid-session leaves no terminal signal in its events.jsonl (the stream
+    # is cut before the ``result`` event), so the exit code captured here is
+    # the only durable record of HOW the process ended. The review-verdict
+    # reaper (``_reap_review_verdicts``) reads it back via
+    # ``find_worker_terminal_status`` and folds it into the
+    # ``review_verdict_missed`` payload's ``cause`` field. Review sessions
+    # pass ``worktree_path=None`` because they use an isolated review
+    # checkout (not a worker worktree) whose outcome file is not relevant
+    # here -- only the exit code is.
+    start_terminal_status_watcher(
+        process,
+        worker_terminal_status_path(sessions_dir, issue_number, _sidecar_suffix(adapter_kind)),
+        worktree_path=worktree.path if not review else None,
+    )
 
     try:
         write_worktree_marker(worktree.path, process.pid, session_id)

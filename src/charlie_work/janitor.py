@@ -197,6 +197,17 @@ class JanitorVerdict:
     # run for pushed heads; detection added so the janitor gate distinguishes
     # "CI never started" from "CI failed".
     missing_required_checks: tuple[str, ...] = ()
+    # Issue #1133: True only when "Required check(s) missing" is the SOLE
+    # janitor failure -- every other gate (state, mergeable, failed checks,
+    # linked issue, body, draft, no-op-rework, ...) already passed. This is
+    # the transient population: a brand-new PR whose required checks simply
+    # haven't reported yet, which self-heals within one CI cycle. Distinct
+    # from the durable "CI never started" case, which is detected separately
+    # by _detect_ci_run_never_created and recorded as
+    # ``ci_run_never_created_head`` on the PR state. Consumers must branch on
+    # this structured flag, never on the failure-message text -- same rule as
+    # is_draft_only_block/is_check_failure_block above.
+    is_missing_checks_only_block: bool = False
 
 
 def _calculate_patch_id(diff: str) -> str:
@@ -403,9 +414,24 @@ def run_janitor(
             "stale-CI (all findings cite required checks that are green now)"
         )
     elif repo_root is not None:
-        is_no_op_rework = _check_no_op_rework(pr, pr_state, failures, warnings, repo_root, pr_diff)
+        is_no_op_rework = _check_no_op_rework(
+            pr, pr_state, failures, warnings, repo_root, pr_diff, review_decision=review_decision
+        )
 
     is_check_failure_block = bool(failed_required_checks) and not failures
+
+    # Issue #1133: mirror the "*_only_block" pattern for the transient
+    # "Required check(s) missing" case. ``failures`` here still excludes the
+    # "Required check(s) failed" message (appended below) but DOES include the
+    # "Required check(s) missing" message (appended in _check_required_checks
+    # above) -- so ``len(failures) == 1`` with non-empty ``missing_required_checks``
+    # means the missing-checks failure is the sole blocker. Co-occurring
+    # unavailable/infra-failed checks, draft, merge conflict, body, etc. all
+    # lengthen ``failures`` and disqualify this flag, correctly leaving them
+    # in the durable (dead) population.
+    is_missing_checks_only_block = (
+        bool(missing_required_checks) and not failed_required_checks and len(failures) == 1
+    )
 
     # issue #841: mirror is_check_failure_block for infra-failed required
     # checks. `failures` at this point still excludes the "Required check(s)
@@ -488,6 +514,7 @@ def run_janitor(
         is_draft=is_draft,
         is_draft_only_block=is_draft_only_block,
         missing_required_checks=missing_required_checks,
+        is_missing_checks_only_block=is_missing_checks_only_block,
     )
 
 
@@ -690,12 +717,14 @@ def _check_no_op_rework(
     warnings: list[str],
     repo_root: Path,
     pr_diff: str | None = None,
+    *,
+    review_decision: Mapping[str, Any] | None = None,
 ) -> bool:
     """Check if the PR has actual content changes since a request_changes verdict.
 
-    When a PR has a request_changes verdict in its state, compare the current
-    patch-id against the reviewed_patch_id from that verdict. If they match,
-    the rework produced no actual content changes (no-op rework).
+    When a PR has a request_changes verdict, compare the current patch-id
+    against the reviewed_patch_id from that verdict. If they match, the
+    rework produced no actual content changes (no-op rework).
 
     This is superior to head SHA comparison because base-update merges can
     advance the head SHA without changing the actual diff content (issue #222).
@@ -711,8 +740,13 @@ def _check_no_op_rework(
     if not pr_state:
         return False
 
-    # Check if the most recent verdict was request_changes
-    decision = pr_state.get("decision")
+    # Issue #1362 Stage 1: the "was the last verdict request_changes" gate must
+    # read the file-first review_decision mapping (run_janitor's own
+    # ``review_decision`` param, already resolved by callers via
+    # ``self._review_decision(pr_number)``), never ``pr_state["decision"]``
+    # directly -- otherwise a crash between the file write and the state write
+    # leaves this check acting on stale state.json (the #1340 divergence class).
+    decision = (review_decision or {}).get("decision")
     if decision != "request_changes":
         return False
 
@@ -763,6 +797,21 @@ def _check_no_op_rework(
 
     # Fallback: head SHA comparison (only when patch-id check could not run)
 
+    # Issue #1362 Stage 3: this reads ``pr_state["reviewed_head_sha"]``
+    # directly rather than through ``review_decision``/``resolve_decision_payload``
+    # (unlike the ``decision`` gate just above). That is now safe to read as
+    # *cache*: ``reviewed_head_sha`` is refreshed from the file at the start
+    # of every already-tracked PR's ``loop()`` evaluation
+    # (``_refresh_pr_decision_cache`` -- skipped only for a PR not yet present
+    # in ``state["prs"]``, and a PR in that state is passed to this function
+    # as ``pr_state={}``/``None``, which the ``if not pr_state: return False``
+    # guard at the top of this function already rejects before execution
+    # ever reaches this fallback) and by each of the four writer-adjacent
+    # mirrors, so it can no longer lag the file the way it could before
+    # Stage 3 introduced that invariant. Reading
+    # ``pr_state`` here directly (rather than threading a second
+    # ``review_decision``-shaped parameter through every ``_check_no_op_rework``
+    # caller) is deliberate, not an oversight left over from Stage 1.
     reviewed_head_sha = pr_state.get("reviewed_head_sha")
     if not reviewed_head_sha:
         return False

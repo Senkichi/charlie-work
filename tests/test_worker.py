@@ -26,6 +26,11 @@ from charlie_work.devin_shell import (
 )
 from charlie_work.post_mortem import ActivitySource, RealActivityProbe, real_activity_for_worker
 from charlie_work.worker import WorkerHealth, WorkerView, _log_is_stalled_at_shim, iter_workers
+from charlie_work.write_gate import WriteGate
+
+
+def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
 def test_iter_workers_empty_dir(tmp_path: Path) -> None:
@@ -904,7 +909,9 @@ def test_workflow_classify_dead_sessions_reaps_sidecar(tmp_path: Path) -> None:
     state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
 
     # Run the production function that should reap the sidecar
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, fake_gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, fake_gh, config, write_gate=_wg(state_file)
+    )
 
     # Verify the sidecar was deleted as a side effect
     assert not sidecar_path.exists(), "Sidecar should be reaped after dead session classification"
@@ -1019,7 +1026,9 @@ def test_workflow_classify_dead_sessions_reaps_probe_error_sidecar(
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: False)
 
     # First pass: defer and advance the counter.
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, fake_gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, fake_gh, config, write_gate=_wg(state_file)
+    )
     assert sidecar_path.exists()
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert sidecar.get("inconclusive_probe_deferred_count") == 1
@@ -1027,7 +1036,9 @@ def test_workflow_classify_dead_sessions_reaps_probe_error_sidecar(
     assert fake_gh.labels_added == []
 
     # Second pass: deferral cap reached, sidecar reaped and issue relabeled.
-    _classify_dead_sessions_and_update_throttle_state(sessions_dir, state_file, fake_gh, config)
+    _classify_dead_sessions_and_update_throttle_state(
+        sessions_dir, state_file, fake_gh, config, write_gate=_wg(state_file)
+    )
     assert not sidecar_path.exists()
     assert (123, config.labels.in_progress) in fake_gh.labels_removed
     assert (123, config.labels.ready) in fake_gh.labels_added
@@ -1229,7 +1240,7 @@ def test_workflow_classify_dead_sessions_completed_skips_log_tail_throttle(
     state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
 
     reaped = _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, state_file, gh, config
+        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
     )
 
     # The dead lane ran and reaped the sidecar.

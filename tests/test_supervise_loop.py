@@ -8,6 +8,7 @@ from charlie_work.supervise_loop import (
     CAP_CAUSE_NON_CONVERGENCE,
     CAP_CAUSE_RETIREMENT,
     EXIT_RESTART_REQUESTED,
+    PREFLIGHT_REFUSAL_EXIT_CODE,
     SuperviseLoopResult,
     run_supervise_relaunch_loop,
 )
@@ -79,6 +80,29 @@ def test_failure_exit_does_not_relaunch() -> None:
     assert result.relaunches == 0
     assert result.last_exit_code == 1
     assert result.cap_reached is False
+
+
+def test_preflight_refusal_exit_code_does_not_relaunch() -> None:
+    """Issue #1363 AC6: a fatal preflight failure at supervisor startup exits
+    PREFLIGHT_REFUSAL_EXIT_CODE (4), not EXIT_RESTART_REQUESTED (3) -- the
+    wrapper must not mistake a refusal-to-start for a self-deploy restart
+    request and relaunch it.
+
+    Also asserts the two constants are distinct values, so a future edit that
+    accidentally aliased them would fail this test even if the relaunch logic
+    itself still happened to behave.
+    """
+    assert PREFLIGHT_REFUSAL_EXIT_CODE != EXIT_RESTART_REQUESTED
+
+    spawn = _ScriptedSpawn([PREFLIGHT_REFUSAL_EXIT_CODE])
+
+    result = run_supervise_relaunch_loop(spawn, max_relaunches=5, log=lambda _: None)
+
+    assert result.launches == 1
+    assert result.relaunches == 0
+    assert result.last_exit_code == PREFLIGHT_REFUSAL_EXIT_CODE
+    assert result.cap_reached is False
+    assert spawn.launch_numbers == [1]
 
 
 def test_restart_request_relaunches_until_a_normal_exit() -> None:

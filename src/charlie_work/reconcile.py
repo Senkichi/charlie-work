@@ -28,23 +28,28 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
 from .config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
 )
+from .escalation import _escalation_edge, _escalation_label, _repair_reason_class
 from .github import (
     GitHubError,
     GitHubLike,
     GraphQLBudgetError,
+    PR_CLOSING_ISSUES_FIELDS,
     _LIST_LIMIT,
     label_names,
     linked_issue_number,
 )
-from .instrumentation import query_events
+from .instrumentation import log_event, query_events
 from .labels import TransitionOutcome, transition
 from .paths import resolved_layout, runtime_paths
+from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
+from .review_decision import review_decision as _resolve_review_decision
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
@@ -53,6 +58,7 @@ from .state import (
     append_event,
     is_claim_stale,
     set_throttled_until,
+    utc_now,
     without_review_dispatch_claim,
 )
 from .worktree import (
@@ -425,46 +431,23 @@ AVIATOR_CHECK_NAME = "aviator/checks"
 AVIATOR_BLOCKED_MESSAGE = "PR has a blocked label, remove to re-queue"
 
 
-def _read_review_decision(
-    config: OrchestratorConfig, repo_root: Path, pr_number: int
-) -> dict[str, Any] | None:
-    """Best-effort read of ``review-decision.json`` for *pr_number*.
-
-    Returns ``None`` on any absence/read/parse failure (missing file, OS
-    error, malformed JSON, or a JSON value that isn't an object) -- never
-    raises. Callers that need fail-closed behavior treat ``None`` the same
-    as "not approved"; callers building a human-readable explanation (e.g.
-    ``detect_mergequeue_not_approved``) use it to distinguish *why*.
-    """
-    paths = runtime_paths(repo_root, config.runtime.state_dir)
-    decision_path = paths.prs / f"pr-{pr_number}" / "review-decision.json"
-    if not decision_path.exists():
-        return None
-    try:
-        with decision_path.open("r", encoding="utf-8") as handle:
-            decision = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(decision, dict):
-        return None
-    return decision
-
-
 def _pr_review_approved_at_head(
     config: OrchestratorConfig, repo_root: Path | None, pr_number: int, head_sha: str
 ) -> bool:
-    """Mirror ``OrchestratorApp._review_decision``'s approval gate.
+    """Mirror the single review-decision reader's approval gate (issue #1362).
 
     Re-adding the Aviator ``mergequeue`` label must never be safer than the
-    normal ship_it path, which only queues a PR when its review-decision.json
-    records ``decision == "approved"`` at the PR's *current* head. Without
-    this check, ``detect_aviator_stale_blocked`` re-queued job-cannon PR
-    #1408 (issue #1404) and PR #1392 (issue #1268) for Aviator merge while
+    normal ship_it path, which only queues a PR when its review decision
+    resolves to ``decision == "approved"`` at the PR's *current* head.
+    Without this check, ``detect_aviator_stale_blocked`` re-queued job-cannon
+    PR #1408 (issue #1404) and PR #1392 (issue #1268) for Aviator merge while
     their recorded decisions were ``request_changes``/never-reviewed --
     Aviator then merged both unreviewed once CI was green, since Aviator's
     own admission check knows nothing about ``review-decision.json``.
-    Returns ``False`` (fail closed) when *repo_root* is unavailable or no
-    matching approved-at-head decision can be read.
+    Returns ``False`` (fail closed) when *repo_root* is unavailable, no
+    decision can be resolved at all, or the resolved decision is stale
+    (``reviewed_head_sha`` does not match *head_sha* -- ``review_decision``'s
+    own staleness check, not a re-derived comparison here).
 
     ``detect_mergequeue_not_approved`` (issue #819) reuses this exact
     predicate as its revocation gate: the label is removed whenever this
@@ -472,10 +455,9 @@ def _pr_review_approved_at_head(
     """
     if repo_root is None:
         return False
-    decision = _read_review_decision(config, repo_root, pr_number)
-    if decision is None or decision.get("decision") != "approved":
-        return False
-    return decision.get("reviewed_head_sha") == head_sha
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    resolved = _resolve_review_decision(paths.prs / f"pr-{pr_number}", None, head_sha)
+    return resolved.decision == "approved" and not resolved.stale
 
 
 def detect_aviator_stale_blocked(
@@ -612,13 +594,14 @@ def _mergequeue_revocation_detail(
     payload makes the distinction explicit rather than collapsing both into
     one indistinguishable string.
     """
-    decision = _read_review_decision(config, repo_root, pr_number)
-    if decision is None:
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    resolved = _resolve_review_decision(paths.prs / f"pr-{pr_number}", None, head_sha)
+    if resolved.missing:
         return f"no readable review-decision.json for PR #{pr_number}"
-    verdict = decision.get("decision")
+    verdict = resolved.decision
     if verdict != "approved":
         return f"recorded decision is {verdict!r}, not 'approved'"
-    reviewed_head = decision.get("reviewed_head_sha")
+    reviewed_head = resolved.reviewed_head_sha
     reviewed_head_display = str(reviewed_head)[:12] if reviewed_head else repr(reviewed_head)
     return (
         f"approved at stale head {reviewed_head_display} but current head is "
@@ -820,6 +803,16 @@ def detect_drift(
     now = now if now is not None else datetime.now(UTC)
 
     labels_cfg = config.labels
+    # Issue #1266: a mechanical escalation parks on operator_queue instead of
+    # human_needed, so "terminal escalation label present" must watch both --
+    # derived from _escalation_edge's own mechanical-edge table (via
+    # _escalation_label) rather than a second hardcoded label pair, so the
+    # label-repair consumers below and the staleness alert further down can
+    # never drift out of sync about what "escalated and parked" looks like.
+    escalation_parked_labels = {
+        _escalation_label(labels_cfg, "escalated"),
+        _escalation_label(labels_cfg, _escalation_edge("escalated", "mechanical")),
+    }
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
@@ -1040,6 +1033,69 @@ def detect_drift(
                             f"set state prs[{pr_number}].status = {PASSIVE_OPEN_STATUS!r}",
                         ),
                         new_status=PASSIVE_OPEN_STATUS,
+                    )
+                )
+
+            # Issue #1153: a same-repo PR whose closing-keyword reference
+            # resolves to an issue number that does not exist in this repo
+            # (e.g. ``Closes #1497`` where 1497 is a sibling repo's issue)
+            # is invisible to every issue-driven sweep: ``linked_issue_number``
+            # returned a number, so the PR was added to
+            # ``open_prs_by_issue[issue_number]``, but ``issues_by_number``
+            # has no entry for it -- no issue-side normalization, no review
+            # routing, no merge lane ever sees it. The PR silently becomes
+            # ``open_passive`` (if tracked) or is simply never tracked at
+            # all. A resolution failure is a signal, not an absence: surface
+            # it as a distinct drift item so the ``reconcile`` event makes
+            # the cross-repo linkage failure visible to operators and the
+            # janitor, instead of silently demoting the PR to passive.
+            #
+            # Self-healing (mirrors every sibling drift kind in this loop):
+            # once ``apply_fixes`` has tracked this PR in state with the
+            # cross-repo ``issue_number`` (from a prior reconcile pass), the
+            # linkage failure is already surfaced -- the ``reconcile`` event
+            # was emitted and the PR is visible to future sweeps. Skip
+            # re-emitting so this drift kind does not re-fire on every pass
+            # for as long as the PR stays open, which would unboundedly
+            # duplicate ``reconcile`` events in the capped events ring and
+            # ``events.db``. ``pr_status_normalized`` below self-heals the
+            # same way (skips once ``state_entry["status"]`` is no longer
+            # None); ``closed_unmerged_pr_state_converged`` above self-heals
+            # by skipping once status is ``"closed"``.
+            #
+            # The self-heal checks ``issue_number`` only, not ``status``:
+            # ``apply_fixes`` deliberately does NOT escalate (see the
+            # ``apply_fixes`` branch for this kind), because escalating
+            # would pre-empt the existing ``foreign_issue_ref`` parking
+            # mechanism in the per-PR review loop (``review()`` treats
+            # ``status="escalated"`` as terminal and returns early, so
+            # ``issue_view`` is never called and the one-shot foreign-PR
+            # digest is never emitted). Tracking the PR with the cross-repo
+            # ``issue_number`` alone is sufficient for self-healing and
+            # preserves the existing parking and alerting path.
+            if (
+                issue_number is not None
+                and issues_by_number.get(issue_number) is None
+                and not (
+                    isinstance(state_entry, dict)
+                    and state_entry.get("issue_number") == issue_number
+                )
+            ):
+                drift.append(
+                    DriftItem(
+                        kind="pr_linked_issue_not_in_repo",
+                        issue_number=issue_number,
+                        pr_number=pr_number,
+                        detail=(
+                            f"PR #{pr_number} has closing reference to issue "
+                            f"#{issue_number}, but no such issue exists in this "
+                            f"repo; the reference likely targets a sibling repo "
+                            f"(cross-repo linkage failure, issue #1153)"
+                        ),
+                        fix_actions=(
+                            f"surface cross-repo linkage failure for PR #{pr_number} "
+                            f"(closing ref issue #{issue_number} not in this repo)",
+                        ),
                     )
                 )
 
@@ -1345,9 +1401,16 @@ def detect_drift(
                                 # Mark this issue as handled to avoid double-emission with
                                 # issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
                                 issues_handled_by_session_relabel.add(w.issue_number)
-                            elif active_labels and is_completed:
+                            elif active_labels and inspection.ahead_count > 0:
                                 # Issue #252: completed-but-unpublished work takes the salvage
                                 # path (push + PR) instead of re-dispatching.
+                                # Issue #1130: relax from ``is_completed`` to
+                                # ``ahead_count > 0`` — a worktree with
+                                # committed-but-unpushed work plus shim/scaffolding
+                                # dirt (not in ``injected_paths``) classifies as
+                                # PARTIAL, not COMPLETED, but the committed work
+                                # is still salvageable. Salvage pushes the branch
+                                # ref (the committed work), not the working tree.
                                 base_branch = None
                                 if inspection.resolved_base_ref:
                                     base_branch = resolve_base_branch_name(
@@ -1371,7 +1434,7 @@ def detect_drift(
                                         issue_number=w.issue_number,
                                         pr_number=None,
                                         detail=(
-                                            f"issue #{w.issue_number} session has a clean worktree "
+                                            f"issue #{w.issue_number} session has a worktree "
                                             f"with {inspection.ahead_count} unpushed commit(s); "
                                             f"salvaging by pushing branch '{w.branch}' and opening a PR"
                                         ),
@@ -1448,6 +1511,12 @@ def detect_drift(
         # unconditionally ``continue``s -- inserting after it would silently
         # skip the common case.
         #
+        # Issue #1266: ``escalation_parked_labels`` extends this same alert
+        # to ``operator_queue`` -- a mechanical escalation that never clears
+        # (e.g. the de-escalation sweep itself stops running) must not sit
+        # silently forever just because it parked on the *other* terminal
+        # label instead of ``human_needed``.
+        #
         # Age is resolved with a 3-tier fallback so a legacy escalation
         # (predating this check) still gets a real age instead of
         # masquerading as fresh:
@@ -1467,7 +1536,8 @@ def detect_drift(
         # unknown age as healthy is exactly the failure mode
         # ``classify_backlog_reachability``'s ``observed: False`` return
         # exists to avoid.
-        if labels_cfg.human_needed in issue_labels and _issue_state(issue) == "OPEN":
+        stale_terminal_labels = issue_labels & escalation_parked_labels
+        if stale_terminal_labels and _issue_state(issue) == "OPEN":
             since_raw: str | None = None
             if isinstance(tracked_entry, dict):
                 since_raw = tracked_entry.get("terminal_since") or tracked_entry.get(
@@ -1496,12 +1566,26 @@ def detect_drift(
 
             threshold_days = config.reconcile_pass.terminal_state_alert_days
             if age_days is None or age_days >= threshold_days:
+                # Issue #1266: name whichever parked label is actually
+                # present -- human_needed for a judgment escalation,
+                # operator_queue for a mechanical one -- instead of
+                # hardcoding human_needed into the message regardless of
+                # which label is really there. Both are never present
+                # together (labels.py's edges remove each other), but pick
+                # deterministically (prefer human_needed) for the
+                # pathological case where a manual label add put both on
+                # the issue at once.
+                stale_label = (
+                    labels_cfg.human_needed
+                    if labels_cfg.human_needed in stale_terminal_labels
+                    else labels_cfg.operator_queue
+                )
                 detail = (
                     f"issue #{issue_number} has been parked in "
-                    f"'{labels_cfg.human_needed}' for {age_days:.1f} day(s)"
+                    f"'{stale_label}' for {age_days:.1f} day(s)"
                     if age_days is not None
                     else (
-                        f"issue #{issue_number} carries '{labels_cfg.human_needed}' with no "
+                        f"issue #{issue_number} carries '{stale_label}' with no "
                         "recorded escalation timestamp (age never observed)"
                     )
                 )
@@ -1516,15 +1600,27 @@ def detect_drift(
                 )
 
         if tracked_status == "escalated" and _issue_state(issue) == "OPEN":
-            needs_human_needed = labels_cfg.human_needed not in issue_labels
-            if needs_human_needed or active_present:
+            # Issue #1266: a mechanical escalation's correct label is
+            # operator_queue, not human_needed -- deriving the target from
+            # the issue's reason_class (via the same helpers the label-repair
+            # self-heal sweep uses) is what stops this convergence check from
+            # clobbering a correctly operator-queued issue back to
+            # human_needed on every reconcile pass.
+            repair_reason_class = _repair_reason_class(
+                tracked_entry if isinstance(tracked_entry, dict) else None
+            )
+            expected_label = _escalation_label(
+                labels_cfg, _escalation_edge("escalated", repair_reason_class)
+            )
+            needs_expected_label = (
+                expected_label is not None and expected_label not in issue_labels
+            )
+            if needs_expected_label or active_present:
                 fix_actions = []
                 add_labels: tuple[str, ...] = ()
-                if needs_human_needed:
-                    fix_actions.append(
-                        f"add label '{labels_cfg.human_needed}' to issue #{issue_number}"
-                    )
-                    add_labels = (labels_cfg.human_needed,)
+                if needs_expected_label:
+                    fix_actions.append(f"add label '{expected_label}' to issue #{issue_number}")
+                    add_labels = (expected_label,)
                 for label in sorted(active_present):
                     fix_actions.append(f"remove label '{label}' from issue #{issue_number}")
                 drift.append(
@@ -2063,6 +2159,14 @@ def apply_fixes(
                 }
                 if item.issue_number is not None:
                     new_pr_state["issue_number"] = item.issue_number
+                # Issue #747: ``merged_outside_orchestrator`` drift only fires
+                # when ``state_status != "merged"`` (detect_drift, above), so
+                # this is always a genuine non-merged -> merged transition.
+                # Stamp ``merged_at`` so externally-merged entries get the
+                # same timestamp field as fleet-merged ones; existing merged
+                # entries are never back-dated because they never reach here.
+                if existing_pr.get("status") != "merged":
+                    new_pr_state["merged_at"] = utc_now()
                 new_prs[pr_key] = new_pr_state
 
                 if repo_root is not None:
@@ -2214,10 +2318,11 @@ def apply_fixes(
                         label_ok = False
                 # Issue #417: issue_active_label_no_open_pr now carries
                 # add_labels=(ready,) when the ready label is missing;
-                # escalated_labels_converged carries add_labels=(human_needed,)
-                # when the escalation label never landed --
-                # done_label_with_active_labels never sets add_labels, so this
-                # loop is a no-op for that sibling kind.
+                # escalated_labels_converged carries add_labels=(<expected
+                # terminal label>,) when it never landed -- human_needed for
+                # a judgment escalation, operator_queue for a mechanical one
+                # (issue #1266) -- done_label_with_active_labels never sets
+                # add_labels, so this loop is a no-op for that sibling kind.
                 for label in item.add_labels:
                     if not gh.add_issue_label(item.issue_number, label):
                         label_ok = False
@@ -2336,6 +2441,37 @@ def apply_fixes(
                 existing_pr = new_prs.get(pr_key, {})
                 new_prs[pr_key] = {**existing_pr, "status": item.new_status}
 
+        elif item.kind == "pr_linked_issue_not_in_repo":
+            # Issue #1153: a PR whose closing reference targets an issue that
+            # does not exist in this repo (cross-repo linkage failure). Track
+            # the PR in state with the cross-repo ``issue_number`` so it is
+            # visible to future reconcile sweeps and the drift self-heals
+            # (does not re-fire once the PR is tracked with the matching
+            # ``issue_number``). The ``reconcile`` event emitted below (every
+            # drift item gets one) is the visible signal -- it surfaces the
+            # cross-repo linkage failure to operators and the janitor.
+            #
+            # This does NOT set ``status="escalated"`` because the existing
+            # ``foreign_issue_ref`` parking mechanism in the per-PR review
+            # loop (``_mark_foreign_issue_ref``) already handles parking and
+            # one-shot digest alerting when ``issue_view`` raises
+            # ``GitHubNotFoundError``. Escalating here would pre-empt that
+            # mechanism: ``review()`` treats ``status="escalated"`` as
+            # terminal and returns early, so ``issue_view`` is never called,
+            # the ``GitHubNotFoundError`` handler never fires, and the
+            # foreign-PR digest is never emitted. It would also break the
+            # ``dispatch_reviews`` lane, which skips escalated PRs. Tracking
+            # the PR with ``issue_number`` alone preserves both the existing
+            # parking/alerting path and the review-dispatch path while adding
+            # reconcile visibility -- the blind spot issue #1153 describes.
+            if item.pr_number is not None:
+                pr_key = str(item.pr_number)
+                existing_pr = new_prs.get(pr_key, {})
+                pr_entry = {**existing_pr, "number": item.pr_number}
+                if item.issue_number is not None:
+                    pr_entry["issue_number"] = item.issue_number
+                new_prs[pr_key] = pr_entry
+
         elif item.kind == "state_active_status_issue_closed":
             # Issue #259: finalize the state entry and strip any active labels that
             # still remain on the closed issue.
@@ -2378,8 +2514,19 @@ def apply_fixes(
             # Issue #261: worker was killed by a push-gate hook — escalate
             # via the same "redispatch_escalated" label edge workflow.py's
             # reaper uses, instead of relabeling to ready.
+            # Issue #1266: this DriftItem is only ever raised when
+            # failure_kind is in DETERMINISTIC_ESCALATION_FAILURE_KINDS (see
+            # detect_drift) -- the exact gate workflow.py's own dead-session
+            # reapers use to set reason_class="mechanical" unconditionally.
+            # This is a first-escalation path (reconcile.py detected a dead
+            # worker before any workflow.py sweep did), not a label-repair
+            # path, so it must independently resolve the mechanical edge
+            # rather than hardcoding "redispatch_escalated" -- otherwise the
+            # same dead-worker condition lands on a different label purely
+            # because reconcile.py's drift pass caught it first.
             if item.issue_number is not None:
-                result = transition(gh, config.labels, item.issue_number, "redispatch_escalated")
+                edge = _escalation_edge("redispatch_escalated", "mechanical")
+                result = transition(gh, config.labels, item.issue_number, edge)
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
                     fix_actions.append(
@@ -2408,8 +2555,8 @@ def apply_fixes(
                 if repo_root is not None:
                     push_ok, push_error = push_branch(repo_root, item.branch)
                     if push_ok:
-                        pr_create = getattr(gh, "pr_create", None)
-                        if pr_create is not None:
+                        has_pr_create = getattr(gh, "pr_create", None) is not None
+                        if has_pr_create:
                             # Same janitor body gate as a worker-authored PR --
                             # boilerplate alone can never satisfy it. Derive the
                             # rationale from the worker's own commit log rather
@@ -2427,14 +2574,72 @@ def apply_fixes(
                             )
                             if branch_summary:
                                 salvage_body = f"{salvage_body}\n\n{branch_summary}"
-                            pr_number = pr_create(
+                            # cw#1263: canonicalize/validate the closing-reference
+                            # line the same way workflow.py's `_open_salvage_pr`
+                            # does, via the shared `closing_reference` module.
+                            # `workflow.py` imports `reconcile.py` (for
+                            # `apply_fixes`/`detect_drift`), so importing
+                            # `workflow._open_salvage_pr` back into this module
+                            # would cycle -- the standalone third module is what
+                            # lets both salvage-body builders share one
+                            # implementation without either importing the other.
+                            closing_ref = validate_closing_reference(
+                                salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
+                            )
+                            salvage_body = closing_ref.body
+                            if closing_ref.changed and state_path is not None:
+                                log_event(
+                                    state_path,
+                                    "pr_closing_ref_rewritten",
+                                    {
+                                        "issue_number": item.issue_number,
+                                        "findings": list(closing_ref.findings),
+                                        "source": "session_unpublished_work_salvaged",
+                                    },
+                                )
+                            # cw#1273: route through the bounded outer retry
+                            # + duplicate-PR guard instead of calling
+                            # gh.pr_create directly, matching workflow.py's
+                            # _open_salvage_pr (the other pr_create call site).
+                            retry_result = create_pr_with_retry(
+                                gh,
                                 head=item.branch,
                                 base=item.base_branch,
                                 title=f"Salvaged work for issue #{item.issue_number}",
                                 body=salvage_body,
+                                max_retries=config.runtime.pr_create_retry_max_attempts,
+                                base_seconds=config.runtime.pr_create_retry_base_seconds,
                             )
+                            pr_number = retry_result.pr_number
                         if pr_number is not None:
                             salvage_ok = True
+                            # `pr_number` is falsy (0) under `dry_run`, where no
+                            # real PR was opened -- only probe a real, truthy PR
+                            # number (mirrors workflow.py::_open_salvage_pr).
+                            if pr_number and state_path is not None:
+                                query_ok = True
+                                try:
+                                    pr_view = gh.pr_view(
+                                        pr_number, fields=PR_CLOSING_ISSUES_FIELDS
+                                    )
+                                except Exception:
+                                    pr_view = {}
+                                    query_ok = False
+                                linked_numbers = closing_issues_referenced_numbers(pr_view)
+                                # Only log when the query itself succeeded --
+                                # a transient `gh` failure must not be conflated
+                                # with a genuine unlinked-PR miss (see
+                                # workflow.py::_open_salvage_pr for rationale).
+                                if query_ok and item.issue_number not in linked_numbers:
+                                    log_event(
+                                        state_path,
+                                        "pr_closing_ref_unlinked",
+                                        {
+                                            "issue_number": item.issue_number,
+                                            "pr_number": pr_number,
+                                            "linked_issue_numbers": sorted(linked_numbers),
+                                        },
+                                    )
                         else:
                             salvage_error = "gh pr create failed or returned no PR number"
                     else:

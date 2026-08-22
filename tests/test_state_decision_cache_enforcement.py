@@ -1,0 +1,445 @@
+"""Lint-style enforcement for issue #1362 Stage 3 (state as declared cache).
+
+``state.json``'s ``prs[N].decision`` / ``reviewed_head_sha`` / ``decision_path``
+fields are a *cache* of the file-first ``review_decision``/
+``resolve_decision_payload`` resolution -- never a second source of truth.
+Exactly six production sites are permitted to set new values for these keys
+on a PR's ``state["prs"][pr_number]`` entry:
+
+* ``review`` -- the new-dispatch placeholder write, immediately after (and
+  sourced from) its own ``record_decision(..., archive_round=False)`` call.
+* ``record_review`` -- the reviewer-verdict writer, immediately after its own
+  ``record_decision(...)`` call.
+* ``merge_ready`` -- the carry-forward branch, immediately after calling
+  ``_update_approval_head`` (which itself calls ``record_decision``).
+* ``_route_to_rework`` -- deliberately *preserves* prior values via
+  ``pr_entry.get(...)``; the verdict file is untouched by design.
+* ``_update_approval_head`` -- the carry-forward writer, immediately after
+  its own ``record_decision(..., archive_round=False)`` call.
+* ``_refresh_pr_decision_cache`` -- the Stage 3 loop-boundary refresh, the
+  5th/6th sanctioned site: it mirrors ``review_decision()``'s file-first
+  read into state for every PR that had no verdict activity this pass.
+
+This mirrors ``test_no_unlocked_load_state_in_production_code``
+(``tests/test_load_state_locked.py``): an AST scan over ``src/charlie_work``,
+not a value-form grep -- rephrasing the write as ``.update()``,
+``setdefault()``, ``|=``, a bare three-level subscript, a conditional
+``**``-spread, an ``.update()``/``**``-spread/``|=`` payload bound to a
+named variable rather than written inline, indirection through a local
+alias variable, or indirection through a helper call that takes the
+pr-state dict and a decision key as arguments must still be caught, so a
+new writer growing back (the failure mode issue #1362 exists to close off)
+fails the test until explicitly added, with justification, to
+``_SANCTIONED_FUNCTIONS`` above.
+
+Deliberately scoped to targets shaped ``<expr>["prs"][<expr>]`` (the PR-state
+dict itself), not any local dict that happens to reuse the key name
+"decision" for an unrelated purpose (e.g. the unauthorized-merge audit
+sidecar's ``record[...]  = {"decision": ...}``, or a tripwire-status report's
+local ``entry.update(...)``) -- those are not part of the state.json cache
+this issue governs.
+"""
+
+from __future__ import annotations
+
+import ast
+import textwrap
+from pathlib import Path
+
+_DECISION_KEYS = {"decision", "reviewed_head_sha", "decision_path"}
+
+# The exact, exhaustive set of functions permitted to introduce a NEW value
+# for one of _DECISION_KEYS onto a state["prs"][pr_number] entry. Adding a
+# name here must come with the same "sourced from a fresh record_decision
+# call, never a stale re-read" justification the existing six sites document
+# in their own docstrings/comments -- see this module's docstring.
+_SANCTIONED_FUNCTIONS = frozenset(
+    {
+        "review",
+        "record_review",
+        "merge_ready",
+        "_route_to_rework",
+        "_update_approval_head",
+        "_refresh_pr_decision_cache",
+    }
+)
+
+
+def _is_prs_subscript(node: ast.AST) -> bool:
+    """True for a target/receiver shaped ``<expr>["prs"][<expr>]``."""
+    if not isinstance(node, ast.Subscript):
+        return False
+    outer = node.value
+    if not isinstance(outer, ast.Subscript):
+        return False
+    key = outer.slice
+    return isinstance(key, ast.Constant) and key.value == "prs"
+
+
+def _resolve_dict_node(node: ast.AST, dict_aliases: dict[str, ast.Dict]) -> ast.Dict | None:
+    """Resolve ``node`` to the ``Dict`` literal it denotes, if any.
+
+    Either ``node`` is itself a ``Dict`` literal, or it is a ``Name`` bound
+    earlier in the same function to one (``updates = {"decision": ...}``;
+    see ``_PrStateWriteVisitor.visit_Assign``'s dict-alias tracking) --
+    without this, ``x["prs"][y].update(updates)`` or
+    ``x["prs"][y] = {**pr_state, **updates}`` would sail through a scanner
+    that only recognizes an inline ``Dict`` literal.
+    """
+    if isinstance(node, ast.Dict):
+        return node
+    if isinstance(node, ast.Name) and node.id in dict_aliases:
+        return dict_aliases[node.id]
+    return None
+
+
+def _dict_literal_decision_keys(
+    node: ast.AST, dict_aliases: dict[str, ast.Dict] | None = None
+) -> list[str]:
+    """Decision-key hits inside a ``Dict`` literal, including ``**`` spreads.
+
+    Recurses into ``**{...}``, ``**({...} if cond else {})``, and
+    ``**a_dict_variable`` spread entries (the first shape is ``review``'s
+    new-dispatch site: ``**({"decision": "pending"} if voided_stale_verdict
+    else {})``; the third is a variable bound to a dict literal earlier in
+    the function -- see :func:`_resolve_dict_node`) so a key hidden behind a
+    conditional unpack or a named intermediate is not invisible to the
+    scanner -- a value-form grep would miss exactly these rephrasings.
+    """
+    dict_aliases = dict_aliases or {}
+    resolved = _resolve_dict_node(node, dict_aliases)
+    hits: list[str] = []
+    if resolved is None:
+        return hits
+    for key, value in zip(resolved.keys, resolved.values):
+        if key is not None:
+            if isinstance(key, ast.Constant) and key.value in _DECISION_KEYS:
+                hits.append(key.value)
+            continue
+        # A `**value` spread entry: recurse if the spread itself is (or
+        # branches to, or names) a dict literal.
+        candidates: list[ast.AST] = []
+        direct = _resolve_dict_node(value, dict_aliases)
+        if direct is not None:
+            candidates.append(direct)
+        elif isinstance(value, ast.IfExp):
+            for branch in (value.body, value.orelse):
+                branch_resolved = _resolve_dict_node(branch, dict_aliases)
+                if branch_resolved is not None:
+                    candidates.append(branch_resolved)
+        for candidate in candidates:
+            hits.extend(_dict_literal_decision_keys(candidate, dict_aliases))
+    return hits
+
+
+class _PrStateWriteVisitor(ast.NodeVisitor):
+    """Find every new-value assignment to _DECISION_KEYS on a PR-state dict.
+
+    Beyond the literal ``x["prs"][y]`` shape, this tracks simple intra-function
+    aliasing (``entry = state["prs"][pr_key]``) so a write routed through a
+    local variable is still attributed to the pr-state dict -- the most
+    idiomatic way a writer #2 would actually be written, and the one a
+    target-shape-only matcher (matching only the literal subscript chain)
+    misses. Six write shapes are covered so a rephrased write (subscript vs
+    ``.update()`` vs ``setdefault()`` vs ``|=`` vs a conditional ``**``-merge
+    vs indirection through a helper call) must still be caught rather than
+    passing by accident:
+
+    1. ``x["prs"][y] = {...}`` -- a whole-dict-literal replace (every real
+       site in this codebase today uses this shape) containing a decision
+       key, direct or via a ``**`` spread (see :func:`_dict_literal_decision_keys`).
+    2. ``x["prs"][y]["decision"] = ...`` (or the same through a tracked
+       alias, e.g. ``entry["decision"] = ...`` after ``entry = x["prs"][y]``)
+       -- a bare subscript assignment straight onto one of the keys.
+    3. ``x["prs"][y].update({...})`` / ``x["prs"][y].setdefault("decision", ...)``
+       (direct or aliased) -- the two remaining standard-library ways to
+       introduce a new key.
+    4. ``x["prs"][y] |= {...}`` / ``x["prs"][y]["decision"] |= ...`` (direct
+       or aliased) -- the augmented-assignment form of #1/#2; semantically a
+       merge/replace but syntactically invisible to a plain ``visit_Assign``.
+    5. A call whose first positional argument is the pr-state dict (or a
+       tracked alias of it) and which also passes one of the decision keys
+       as a string literal elsewhere in its arguments -- the
+       ``_set(state["prs"][k], "decision", "approved")`` helper-indirection
+       shape. This is deliberately a coarse heuristic (a false positive just
+       means a legitimate new call needs a one-line sanction, which is the
+       intended failure mode of a fail-closed lint), not a full call-graph
+       analysis.
+    6. Any of #1/#3/#4 above where the dict payload itself is a *named*
+       local variable bound to a dict literal earlier in the function
+       (``updates = {"decision": "approved"}; x["prs"][y].update(updates)``,
+       or the same value spread with ``**updates``) rather than written
+       inline -- see :func:`_resolve_dict_node`.
+
+    Both kinds of alias tracking are intentionally simple (straight-line,
+    function-scoped, never revoked): a ``Name = <prs-subscript-or-tracked-
+    alias>`` assignment adds ``Name`` to the current function's pr-state
+    alias set, and a ``Name = <dict-literal-or-tracked-dict-alias>``
+    assignment adds ``Name`` to the current function's dict-payload alias
+    map, each for the rest of that function's body. Neither attempts real
+    data-flow (branches, loops, and reassignment-to-something-else are all
+    over-approximated as "still an alias"), which is the correct direction
+    for a lint that must fail closed: it can flag a local variable that no
+    longer aliases its original binding, but it must never fail to flag one
+    that still does.
+    """
+
+    def __init__(self) -> None:
+        self._func_stack: list[str] = []
+        self._alias_stack: list[set[str]] = []
+        self._dict_alias_stack: list[dict[str, ast.Dict]] = []
+        self.hits: list[tuple[int, str, str]] = []  # (lineno, func_name, key)
+
+    def _enter_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self._func_stack.append(node.name)
+        self._alias_stack.append(set())
+        self._dict_alias_stack.append({})
+        self.generic_visit(node)
+        self._dict_alias_stack.pop()
+        self._alias_stack.pop()
+        self._func_stack.pop()
+
+    visit_FunctionDef = _enter_function
+    visit_AsyncFunctionDef = _enter_function
+
+    def _current_function(self) -> str:
+        return self._func_stack[-1] if self._func_stack else "<module>"
+
+    def _current_aliases(self) -> set[str]:
+        return self._alias_stack[-1] if self._alias_stack else set()
+
+    def _current_dict_aliases(self) -> dict[str, ast.Dict]:
+        return self._dict_alias_stack[-1] if self._dict_alias_stack else {}
+
+    def _is_pr_state_like(self, node: ast.AST) -> bool:
+        """True for a prs-subscript expr OR a Name currently tracked as an alias of one."""
+        if _is_prs_subscript(node):
+            return True
+        return isinstance(node, ast.Name) and node.id in self._current_aliases()
+
+    def _decision_keys(self, node: ast.AST) -> list[str]:
+        return _dict_literal_decision_keys(node, self._current_dict_aliases())
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for target in node.targets:
+            if _is_prs_subscript(target):
+                for key in self._decision_keys(node.value):
+                    self.hits.append((node.lineno, self._current_function(), key))
+            elif (
+                isinstance(target, ast.Subscript)
+                and self._is_pr_state_like(target.value)
+                and isinstance(target.slice, ast.Constant)
+                and target.slice.value in _DECISION_KEYS
+            ):
+                self.hits.append((node.lineno, self._current_function(), target.slice.value))
+            elif isinstance(target, ast.Name) and self._is_pr_state_like(node.value):
+                # `entry = state["prs"][k]` (or `entry2 = entry`, chained) --
+                # track the new alias; this line itself is a read, not a write.
+                self._current_aliases().add(target.id)
+            elif isinstance(target, ast.Name):
+                # `updates = {"decision": ...}` (or `updates2 = updates`,
+                # chained) -- track the dict-literal binding so a later
+                # `.update(updates)` / `**updates` spread still resolves.
+                resolved = _resolve_dict_node(node.value, self._current_dict_aliases())
+                if resolved is not None:
+                    self._current_dict_aliases()[target.id] = resolved
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        target = node.target
+        if self._is_pr_state_like(target):
+            # `x["prs"][y] |= {...}` (or through an alias): a merge is a
+            # write of every key in the RHS dict literal, same as `.update()`.
+            for key in self._decision_keys(node.value):
+                self.hits.append((node.lineno, self._current_function(), key))
+        elif (
+            isinstance(target, ast.Subscript)
+            and self._is_pr_state_like(target.value)
+            and isinstance(target.slice, ast.Constant)
+            and target.slice.value in _DECISION_KEYS
+        ):
+            self.hits.append((node.lineno, self._current_function(), target.slice.value))
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Attribute) and self._is_pr_state_like(node.func.value):
+            if node.func.attr == "update" and node.args:
+                for key in self._decision_keys(node.args[0]):
+                    self.hits.append((node.lineno, self._current_function(), key))
+            elif (
+                node.func.attr == "setdefault"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in _DECISION_KEYS
+            ):
+                self.hits.append((node.lineno, self._current_function(), node.args[0].value))
+        elif node.args and self._is_pr_state_like(node.args[0]):
+            # Helper-indirection: `_set(state["prs"][k], "decision", value)`
+            # -- the pr-state dict (or its alias) is passed as the first
+            # positional argument, alongside a decision-key string literal
+            # anywhere else in the call. Coarse by design; see class docstring.
+            for arg in list(node.args[1:]) + [kw.value for kw in node.keywords]:
+                if isinstance(arg, ast.Constant) and arg.value in _DECISION_KEYS:
+                    self.hits.append((node.lineno, self._current_function(), arg.value))
+        self.generic_visit(node)
+
+
+def _scan(tree: ast.Module) -> list[tuple[int, str, str]]:
+    visitor = _PrStateWriteVisitor()
+    visitor.visit(tree)
+    return visitor.hits
+
+
+def test_pr_state_decision_writes_are_all_sanctioned() -> None:
+    """Every real write site in src/charlie_work must be a sanctioned function."""
+    src_root = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
+
+    violations: list[str] = []
+    functions_seen: set[str] = set()
+    for source_file in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        for lineno, func_name, key in _scan(tree):
+            functions_seen.add(func_name)
+            if func_name not in _SANCTIONED_FUNCTIONS:
+                violations.append(
+                    f"{source_file.relative_to(src_root)}:{lineno} in {func_name}() "
+                    f"sets {key!r} on a PR-state dict but is not a sanctioned site"
+                )
+
+    assert not violations, (
+        "New/unsanctioned production write(s) to a PR-state decision field:\n"
+        + "\n".join(violations)
+        + "\nIf this is a deliberate new writer, add it to _SANCTIONED_FUNCTIONS "
+        "above with the same 'sourced from a fresh record_decision call, never "
+        "a stale re-read' justification the existing six sites document."
+    )
+
+    # Every sanctioned name must still correspond to a real write in the
+    # tree -- an entry that stops being used (the function was renamed,
+    # inlined, or its write deleted) must not sit here silently allow-listing
+    # nothing, mirroring the staleness check on
+    # test_legacy_forwarding_wrapper_scopes_are_not_stale in
+    # test_write_gate_enforcement.py.
+    stale = _SANCTIONED_FUNCTIONS - functions_seen
+    assert not stale, (
+        f"_SANCTIONED_FUNCTIONS lists {sorted(stale)} but no production write to a "
+        "PR-state decision field was found in that function anymore -- remove the "
+        "stale entry (or the write it guarded was deleted/renamed and this list is "
+        "now over-permissive)."
+    )
+
+
+def test_scanner_fails_closed_on_a_rephrased_write() -> None:
+    """The scanner must catch the write regardless of its syntactic shape.
+
+    An AST guard that only matches the CURRENT spelling of a forbidden write
+    fails open the moment someone rephrases it (subscript -> .update() ->
+    setdefault() -> a conditional **-merge). This pins all four shapes
+    against a synthetic module so a future edit to the scanner itself that
+    narrows it back to one shape is caught here, not in production.
+    """
+    samples = {
+        "whole_dict_replace": """
+            def _rogue_writer(state, pr_number):
+                state["prs"][str(pr_number)] = {"decision": "approved"}
+        """,
+        "bare_subscript": """
+            def _rogue_writer(state, pr_number):
+                state["prs"][str(pr_number)]["reviewed_head_sha"] = "deadbeef"
+        """,
+        "dot_update": """
+            def _rogue_writer(state, pr_number):
+                state["prs"][str(pr_number)].update({"decision_path": "x"})
+        """,
+        "setdefault": """
+            def _rogue_writer(state, pr_number):
+                state["prs"][str(pr_number)].setdefault("decision", "pending")
+        """,
+        "conditional_spread": """
+            def _rogue_writer(state, pr_number, cond):
+                state["prs"][str(pr_number)] = {
+                    **state["prs"].get(str(pr_number), {}),
+                    **({"decision": "pending"} if cond else {}),
+                }
+        """,
+        "augassign_merge": """
+            def _rogue_writer(state, pr_number):
+                state["prs"][str(pr_number)] |= {"decision": "approved"}
+        """,
+        "augassign_bare_subscript": """
+            def _rogue_writer(state, pr_number):
+                state["prs"][str(pr_number)]["decision"] += ""
+        """,
+        "intermediate_alias": """
+            def _rogue_writer(state, pr_number):
+                entry = state["prs"][str(pr_number)]
+                entry["decision"] = "approved"
+        """,
+        "chained_alias": """
+            def _rogue_writer(state, pr_number):
+                entry = state["prs"][str(pr_number)]
+                entry2 = entry
+                entry2.update({"decision": "approved"})
+        """,
+        "alias_augassign": """
+            def _rogue_writer(state, pr_number):
+                entry = state["prs"][str(pr_number)]
+                entry |= {"decision": "approved"}
+        """,
+        "helper_indirection": """
+            def _rogue_writer(state, pr_number):
+                _set(state["prs"][str(pr_number)], "decision", "approved")
+        """,
+        "helper_indirection_aliased": """
+            def _rogue_writer(state, pr_number):
+                entry = state["prs"][str(pr_number)]
+                _set(entry, "decision", "approved")
+        """,
+        "helper_indirection_keyword": """
+            def _rogue_writer(state, pr_number):
+                _set(state["prs"][str(pr_number)], key="reviewed_head_sha", value="deadbeef")
+        """,
+        "named_dict_update_arg": """
+            def _rogue_writer(state, pr_number, sha):
+                updates = {"decision": "approved", "reviewed_head_sha": sha}
+                state["prs"][str(pr_number)].update(updates)
+        """,
+        "named_dict_spread": """
+            def _rogue_writer(state, pr_number, existing, sha):
+                updates = {"decision": "approved", "reviewed_head_sha": sha}
+                state["prs"][str(pr_number)] = {**existing, **updates}
+        """,
+        "named_dict_augassign": """
+            def _rogue_writer(state, pr_number, sha):
+                updates = {"decision": "approved", "reviewed_head_sha": sha}
+                state["prs"][str(pr_number)] |= updates
+        """,
+    }
+    for name, source in samples.items():
+        tree = ast.parse(textwrap.dedent(source))
+        hits = _scan(tree)
+        assert hits, f"scanner failed to catch the {name!r} rephrasing: {ast.dump(tree)}"
+        assert all(func_name == "_rogue_writer" for _, func_name, _ in hits), (
+            f"{name!r}: hit attributed to the wrong enclosing function: {hits}"
+        )
+
+
+def test_scanner_ignores_unrelated_local_dicts() -> None:
+    """A local dict that reuses the key name 'decision' for something else
+    (not the state["prs"] PR-state cache) must not be flagged -- this is the
+    real shape of ``_announce_unauthorized_merges``'s audit-sidecar record
+    and ``tripwire_status``'s report entry, both of which use "decision" as a
+    key on a dict that is NOT ``state["prs"][...]``.
+    """
+    source = """
+        def _unrelated(state, key, candidate):
+            record = state.get(key)
+            record[str(candidate["pr"])] = {
+                "decision": candidate.get("decision"),
+                "reviewed_head_sha": candidate.get("reviewed_head_sha"),
+            }
+            entry = {"pr": candidate.get("pr")}
+            entry.update({"decision": candidate.get("decision")})
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    assert _scan(tree) == []

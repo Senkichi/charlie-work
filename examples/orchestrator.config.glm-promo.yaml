@@ -47,6 +47,8 @@ runtime:
   # prompts_dir: orchestrator-prompts
   # gh_max_retries: 3
   # gh_retry_base_seconds: 1.0
+  # pr_create_retry_max_attempts: 3
+  # pr_create_retry_base_seconds: 10.0
   # graphql_rate_limit_threshold: 1500
 
 devin:
