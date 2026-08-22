@@ -274,6 +274,13 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "draft_pr_blocked": "warning",
         "draft_pr_ready_failed": "warning",
         "draft_pr_ready_held": "warning",
+        # Issue #1372: a fleet registry entry whose repo_root no longer exists
+        # is stale, not a live failing lane. Warning, not error: the lane is
+        # skipped (not crashed), the daemon's pass completes, and the entry is
+        # reported separately so one corpse cannot degrade fleet-wide tooling.
+        # Emitted into the daemon's own events.db, never into the dead entry's
+        # recorded state_dir (which would resurrect a zombie directory).
+        "fleet_registry_stale_entry": "warning",
         "flake_rerun_failed": "warning",
         "graphql_rate_limit_deferred": "warning",
         "infra_rerun_failed": "warning",

@@ -92,6 +92,7 @@ from charlie_work.instrumentation import log_event, query_events
 from charlie_work.markdown_fence import fenced_block
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.prompts import render_prompt
+from charlie_work.review_decision import ReviewDecision
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
     append_event,
@@ -131,6 +132,27 @@ from charlie_work.write_gate import WriteGate
 # whatever path the converted function was also given.
 def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
     return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
+
+
+def _write_flat_review_decision(
+    paths: Any, pr_number: int, decision: str, reviewed_head_sha: str | None
+) -> None:
+    """Write a flat ``prs/pr-N/review-decision.json`` matching a test's
+    ``state["prs"][...]`` fixture.
+
+    Issue #1362 Stage 1: control-flow reads of a PR's review decision go
+    through the file-first ``review_decision`` reader now, not
+    ``state.json``'s ``decision``/``reviewed_head_sha`` fields. A fixture
+    that only writes those fields into ``state.json`` no longer drives the
+    behavior it used to -- the flat file must exist and agree, or the
+    reader reports ``missing``.
+    """
+    pr_dir = paths.prs / f"pr-{pr_number}"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"decision": decision}
+    if reviewed_head_sha is not None:
+        payload["reviewed_head_sha"] = reviewed_head_sha
+    (pr_dir / "review-decision.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _load_external_fixture(name: str) -> list[dict[str, Any]]:
@@ -13549,7 +13571,11 @@ def test_corrupt_review_decision_treated_as_not_approved(tmp_path: Path) -> None
 
     result = app.merge_ready(456)
 
-    assert result.data["review_decision"] == {"decision": "invalid"}
+    # Issue #1362 Stage 1: a corrupt flat file with no round-archive fallback
+    # now resolves to {"decision": "missing"} rather than the old "invalid"
+    # sentinel (review_decision.resolve_decision_payload) -- both are
+    # equally non-terminal, so the fail-safe outcome below is unchanged.
+    assert result.data["review_decision"] == {"decision": "missing"}
     assert result.data["can_merge"] is False
     assert fake_gh.merged == []
 
@@ -23329,6 +23355,123 @@ def test_record_review_persists_escalated_in_decision_file(tmp_path: Path) -> No
     assert app._review_decision(456)["escalated"] is True
 
 
+def test_refresh_pr_decision_cache_updates_disagreeing_tracked_pr(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3: a tracked PR whose cache disagrees with the
+    file-first decision gets its three cache fields overwritten."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {
+        "status": "reviewing",
+        "issue_number": 123,
+        "decision": "pending",
+        "reviewed_head_sha": "stale-sha",
+        "decision_path": "stale-path",
+    }
+    save_state(paths.state_file, seed)
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+    app._refresh_pr_decision_cache(456, decision, decision_path)
+
+    refreshed = load_state(paths.state_file)["prs"]["456"]
+    assert refreshed["decision"] == "approved"
+    assert refreshed["reviewed_head_sha"] == "fresh-sha"
+    assert refreshed["decision_path"] == str(decision_path)
+    # Non-decision fields (status, issue_number) must survive the mirror
+    # write untouched -- the refresh must never clobber the rest of the entry.
+    assert refreshed["status"] == "reviewing"
+    assert refreshed["issue_number"] == 123
+
+
+def test_refresh_pr_decision_cache_no_op_when_cache_already_agrees(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3: when the cache already agrees with the file, the
+    refresh must not write state.json at all -- the docstring's promised
+    short-circuit for the common (no verdict activity) case."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    decision_path = paths.prs / "pr-456" / "review-decision.json"
+    seed = load_state(paths.state_file)
+    seed["prs"]["456"] = {
+        "status": "reviewing",
+        "decision": "approved",
+        "reviewed_head_sha": "fresh-sha",
+        "decision_path": str(decision_path),
+    }
+    save_state(paths.state_file, seed)
+    mtime_before = paths.state_file.stat().st_mtime_ns
+
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+
+    # Positive signal, not just an absence: wrap the gated writer so a call
+    # that happens but happens to leave the mtime unchanged (e.g. a
+    # sub-resolution clock or a write of byte-identical content) cannot
+    # read as "no write occurred". An mtime check alone would pass even if
+    # the short-circuit above it were deleted, as long as the resulting
+    # write raced under the OS's mtime granularity.
+    #
+    # ``write_gate`` is a frozen dataclass (its instances reject attribute
+    # assignment), so the wrap patches the *class* method rather than the
+    # instance attribute.
+    save_state_calls: list[dict] = []
+    write_gate_cls = type(app.write_gate)
+    original_save_state = write_gate_cls.save_state
+
+    def _tracking_save_state(self: object, state: dict) -> None:
+        save_state_calls.append(state)
+        original_save_state(self, state)
+
+    write_gate_cls.save_state = _tracking_save_state  # type: ignore[method-assign]
+    try:
+        app._refresh_pr_decision_cache(456, decision, decision_path)
+    finally:
+        write_gate_cls.save_state = original_save_state  # type: ignore[method-assign]
+
+    assert save_state_calls == []
+    assert paths.state_file.stat().st_mtime_ns == mtime_before
+
+
+def test_refresh_pr_decision_cache_skips_pr_not_yet_in_state(tmp_path: Path) -> None:
+    """Issue #1362 Stage 3 (review finding F3): a PR not yet tracked in
+    state["prs"] must be left untouched by the refresh rather than
+    materializing a decision-only partial entry with no status/counters."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    app = OrchestratorApp(tmp_path, paths, config, FakeGitHub())
+
+    decision_path = paths.prs / "pr-999" / "review-decision.json"
+    decision = ReviewDecision(
+        decision="approved",
+        reviewed_head_sha="fresh-sha",
+        recorded_at="2026-08-21T00:00:00Z",
+        source_round=None,
+        stale=False,
+        missing=False,
+    )
+    app._refresh_pr_decision_cache(999, decision, decision_path)
+
+    state = load_state(paths.state_file)
+    assert "999" not in state["prs"]
+
+
 def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> None:
     """Issue #407: merge_ready (via _review_decision and merge-train
     eligibility) must see the escalated flag from the persisted decision file.
@@ -25245,9 +25388,18 @@ def test_classify_dead_rework_session_returns_to_rework_requested(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     # Create the rework prompt on disk (the rework brief).
     pr_dir = paths.prs / "pr-456"
-    pr_dir.mkdir(parents=True)
+    pr_dir.mkdir(parents=True, exist_ok=True)
     rework_prompt = pr_dir / "rework-prompt.md"
     rework_prompt.write_text("Fix the issues", encoding="utf-8")
 
@@ -25485,6 +25637,15 @@ def test_classify_dead_rework_session_escalates_at_death_cap(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     # Launch-failure sidecar with a non-deterministic failure signature (rate
     # limit) -- isolates the cap check from finding 2b's deterministic-kind
     # guard (covered by the worktree_unsafe test below).
@@ -25590,6 +25751,15 @@ def test_classify_dead_rework_session_no_op_cap_with_prior_no_ops(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -25677,6 +25847,15 @@ def test_classify_dead_rework_session_deaths_below_cap_not_escalated(
             "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -25770,6 +25949,15 @@ def test_classify_dead_rework_session_deterministic_failure_kind_escalates_immed
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -25850,6 +26038,15 @@ def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediate
             "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -29697,6 +29894,15 @@ def test_reap_restore_sets_startup_death_flag(
         }
         save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = sessions_dir / "issue-123.log"
@@ -29798,6 +30004,15 @@ def test_reap_restore_startup_death_stalled_real_pid_under_classification_delay(
             "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
 
     # Write the log file with the calibration incident's refusal message and
     # freeze its mtime at the death moment (5s after start).
@@ -29908,6 +30123,15 @@ def test_reap_restore_stalled_long_runtime_not_startup_death(
             "reviewed_head_sha": "sha-abc123",
         }
         save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -38558,6 +38782,21 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
     }
     save_state(app.paths.state_file, state)
 
+    # Issue #1362 Stage 1: _check_no_op_rework now reads the last verdict
+    # from the file-first review_decision reader, not pr_state["decision"],
+    # so the live request_changes decision must exist on disk too.
+    pr_decision_dir = app.paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps(
+            {
+                "decision": "request_changes",
+                "reviewed_head_sha": "abc123abcdefabcdefabcdefabcdefabcdefabcd",
+            }
+        ),
+        encoding="utf-8",
+    )
+
     # Second review on same head: janitor gate blocks (no-op rework check)
     # check_test_adequacy should NOT be called again
     result2 = app.review(456)
@@ -38827,14 +39066,18 @@ def test_fleet_status_isolates_broken_repo(
     args = cli.build_parser().parse_args(["fleet", "status"])
     result = cli.run_fleet_status(args)
 
-    # Verify error isolation
-    assert result.ok is False  # Errors present
-    assert "1 repo(s), 1 error(s)" in result.message
+    # Issue #1372: a repo whose repo_root does not exist is STALE, not a live
+    # failing lane. It is reported in a separate "stale" list that does NOT
+    # flip ok/exit-code, so one corpse cannot degrade fleet-wide tooling.
+    assert result.ok is True  # Stale entries do not flip the exit code
+    assert "1 repo(s)" in result.message
+    assert "1 stale(s)" in result.message
     assert len(result.data["repos"]) == 1
     assert "owner/repo_valid" in result.data["repos"]
-    assert len(result.data["errors"]) == 1
-    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
-    assert "does not exist" in result.data["errors"][0]["error"]
+    # The broken repo is in stale, not errors.
+    assert len(result.data["errors"]) == 0
+    assert len(result.data["stale"]) == 1
+    assert result.data["stale"][0]["repo_key"] == "owner/repo_broken"
 
 
 def test_fleet_status_never_mutates(
@@ -39640,6 +39883,7 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     # Mock GitHub to return an open PR for the issue
     class FakeGitHubForOrphan(FakeGitHub):
@@ -39736,6 +39980,7 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -39801,6 +40046,7 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -40251,6 +40497,18 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     }
     save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the last-review-decision read in
+    # _detect_and_handle_orphaned_workers is now file-first, so the live
+    # request_changes decision must exist on disk, not only in state.json,
+    # or it resolves to "missing" and misses the clean-exit-no-op fingerprint
+    # short-circuit this test is exercising.
+    pr_decision_dir = paths.prs / "pr-100"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
+
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
             return [
@@ -40420,6 +40678,15 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     }
     save_state(paths.state_file, state)
 
+    # Issue #1362 Stage 1: the reader is now file-first, so the decision
+    # must exist on disk (not just in state.json) for `.missing` to be False.
+    pr_decision_dir = paths.prs / "pr-100"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
+
     class FakeGitHubForOrphan(FakeGitHub):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
@@ -40483,6 +40750,7 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -40571,6 +40839,7 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -40655,6 +40924,7 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
         "reviewed_head_sha": "abc123",  # Old head
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     # Mock GitHub to return an open PR with changed head
     class FakeGitHubForOrphan(FakeGitHub):
@@ -40791,6 +41061,7 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     # Mock GitHub to return an open PR
     class FakeGitHubForOrphan(FakeGitHub):
@@ -40975,6 +41246,7 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -42213,12 +42485,20 @@ def test_loop_undecided_head_moved_invokes_review(tmp_path: Path) -> None:
 def test_loop_undecided_same_head_skip_still_merges_on_approved_decision_file(
     tmp_path: Path,
 ) -> None:
-    """Regression for review finding #7: a same-head packet skip must still
-    check review-decision.json directly. An operator can write the decision
-    file without state.json reflecting it yet (the already_approved branch
-    only fires once state.json has caught up), so the approval must not stay
-    invisible until the head moves -- it should proceed straight to
-    merge_ready(), same as the decided path.
+    """Regression for review finding #7: an operator-written decision file
+    must not stay invisible until the head moves, even when state.json
+    hasn't caught up -- it should proceed straight to merge_ready(), same as
+    the decided path.
+
+    Pre-#1362 this was reached via the same-head packet-skip branch (which
+    re-checked the decision file directly as a fallback, incrementing
+    ``skipped_reviews``). Issue #1362 Stage 1 made ``already_approved``
+    itself file-first, so the file-only approval is now caught one branch
+    earlier -- ``already_approved`` is True immediately and routes straight
+    to ``merge_ready()`` without ever reaching the packet-skip branch, so
+    ``skipped_reviews`` stays 0. The observable guarantee this test protects
+    (the approval is not invisible; the PR merges) is unchanged; only which
+    internal branch reaches it is.
     """
     pr = {
         "number": 456,
@@ -42262,8 +42542,11 @@ def test_loop_undecided_same_head_skip_still_merges_on_approved_decision_file(
     result = app.loop(limit=0)
 
     # Packet regeneration is still skipped (review() never called)...
-    assert result.data["skipped_reviews"] == 1
     assert 456 not in review_calls
+    # Issue #1362 Stage 1: already_approved is file-first, so this approval
+    # is caught before the packet-skip branch runs at all -- skipped_reviews
+    # stays 0 rather than incrementing (see docstring above).
+    assert result.data["skipped_reviews"] == 0
     # ...but the approval is not left invisible: merge_ready() fires.
     assert len(result.data["merges"]) == 1
     assert result.data["merges"][0]["merged"] is True
@@ -45345,6 +45628,7 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -45419,6 +45703,7 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -45578,6 +45863,7 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -45664,6 +45950,7 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):
@@ -45921,6 +46208,109 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
         f"Expected two orphaned_worker_drift events across dispatch generations, "
         f"got {len(drift_events)}"
     )
+
+
+def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
+    tmp_path: Path,
+) -> None:
+    """Issue #1362 Stage 1 regression: a dead worker with an OPEN PR that has
+    a *pending* placeholder ``review-decision.json`` (not a missing file, and
+    no ``decision`` recorded in state.json either) must still be advanced
+    from ``agent:in-progress`` to ``agent:pr-open`` -- a pending packet is
+    "no verdict yet" exactly like a wholly-absent decision file, per the
+    #1128 intent this lane implements. The single-reader predicate must check
+    both ``.missing`` and a ``pending`` decision, not ``.missing`` alone --
+    narrowing to ``.missing`` only would silently exclude this PR and
+    re-strand the issue on ``agent:in-progress``, the precise #1128 failure
+    this lane exists to fix.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(adapter="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    in_progress = config.labels.in_progress
+    pr_open = config.labels.pr_open
+
+    state = load_state(paths.state_file)
+    state["issues"]["1578"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # No ``decision`` key in state -- but the flat file records a pending
+    # placeholder, not a missing file.
+    state["prs"]["1585"] = {}
+    save_state(paths.state_file, state)
+
+    pr_dir = paths.prs / "pr-1585"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "pending"}), encoding="utf-8"
+    )
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 1578,
+                    "title": "Salvage wedge",
+                    "url": "https://example.test/issues/1578",
+                    "body": "Dead worker with open unreviewed PR",
+                    "labels": [{"name": in_progress}],
+                    "state": "OPEN",
+                }
+            ]
+            self.prs = [
+                {
+                    "number": 1585,
+                    "title": "Salvaged work for #1578",
+                    "url": "https://example.test/pull/1585",
+                    "headRefName": "agent/issue-1578-salvage-wedge",
+                    "baseRefName": "main",
+                    "headRefOid": "sha-deadbeef",
+                    "mergeStateStatus": "CLEAN",
+                    "body": "Closes #1578\n\nTests: regression coverage added.",
+                    "labels": [],
+                    "isCrossRepository": False,
+                    "state": "OPEN",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1578"]
+    assert entry["status"] == PASSIVE_OPEN_STATUS, (
+        f"expected open_passive, got {entry['status']!r}"
+    )
+    assert entry.get("dispatched_at") is None
+
+    events = state.get("events", [])
+    advance_events = [e for e in events if e.get("kind") == "orphaned_worker_advanced_to_pr_open"]
+    assert len(advance_events) == 1
+    payload = advance_events[0]["payload"]
+    assert payload["pr_number"] == 1585
+    assert payload["reason"] == "dead_worker_unsafe_to_auto_reset_open_unreviewed_pr"
+
+    # The label swap mirrors the orphaned_worker_opened_pr lane.
+    assert (1578, in_progress) in fake_gh.labels_removed
+    assert (1578, pr_open) in fake_gh.labels_added
 
 
 def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) -> None:
@@ -50151,6 +50541,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 500, "request_changes", "abc123")
 
     class FakeGitHubForSalvage(FakeGitHub):
         def pr_list(self):
@@ -50259,6 +50650,7 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 500, "request_changes", "abc123")
 
     class FakeGitHubForSalvage(FakeGitHub):
         def pr_list(self):
@@ -50343,6 +50735,7 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 500, "request_changes", "abc123")
 
     class FakeGitHubForSalvage(FakeGitHub):
         def pr_list(self):

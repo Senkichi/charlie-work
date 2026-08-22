@@ -270,6 +270,18 @@ def test_ac8_mutation_ii_head_only_compare_breaks_distinct_verdict_isolation(
 _AC6_TARGET_FILENAMES = ("review-decision.json", "rework-prompt.md", "rework-dispatch-note.txt")
 _AC6_APPROVED_WRITERS = {"_write_json", "_write_text_atomic"}
 _AC6_RAW_WRITE_ATTRS = {"write_text", "write_bytes"}
+# Issue #1362 Stage 2: review-decision.json's single writer is now
+# record_decision (charlie_work/review_decision.py) -- every call site in
+# workflow.py/rework_prompts.py that used to build a path from this literal
+# and hand it to _write_json/_write_text_atomic directly (the packet
+# placeholder, record_review's live+round writes, merge_authorize,
+# _update_approval_head's carry-forward) was converted to call
+# record_decision instead, so the violations loop below correctly finds zero
+# raw writes AND the positive-existence check below correctly finds zero
+# _write_json/_write_text_atomic calls targeting it in these two modules --
+# neither is a regression. record_decision's own atomicity is covered by
+# test_review_decision.py, not this module-wide guard.
+_AC6_FILENAMES_WITHOUT_LOCAL_APPROVED_WRITER = frozenset({"review-decision.json"})
 
 
 def _ac6_call_func_name(node: ast.Call) -> str | None:
@@ -366,6 +378,13 @@ def test_ac6_module_wide_write_sites_for_archived_filenames_are_atomic() -> None
     # archive/live writes entirely would otherwise make the assertion above
     # trivially pass with zero violations for the wrong reason.
     for filename in _AC6_TARGET_FILENAMES:
+        if filename in _AC6_FILENAMES_WITHOUT_LOCAL_APPROVED_WRITER:
+            # See the comment on _AC6_FILENAMES_WITHOUT_LOCAL_APPROVED_WRITER:
+            # this filename's writer moved to review_decision.record_decision
+            # (issue #1362 Stage 2), so zero hits here is the expected,
+            # non-vacuous state -- not a candidate for the "did the guard
+            # silently stop protecting anything" check below.
+            continue
         assert any(filename in text for text in approved_targets), (
             f"expected at least one _write_json/_write_text_atomic call "
             f"targeting {filename!r}; none found -- the violations check "

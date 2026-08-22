@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -109,6 +110,34 @@ GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
 MIN_BEAT_INTERVAL_MINUTES = 10
 CHARLIE_STATUS_TIMEOUT_SECONDS = 60
+
+# in-progress-stale worktree mtime threshold (issue #1379). The events-based
+# check flags an issue when its GitHub updatedAt hasn't moved across 2 beats,
+# but long-running workers routinely emit no events for 40-60+ minutes while
+# actively working (events fire at dispatch/PR/exit boundaries, not during
+# implementation). Before flagging, the check also looks at the newest file
+# mtime under the issue's worker worktree: a healthy worker's worktree shows
+# file activity (edits, pytest cache, compiled bytecode) far more frequently
+# than events fire.
+#
+# The threshold separates the two cases observed on 2026-08-21: the false
+# positives (#1372) had worktree mtimes 4 seconds to 17 minutes old (alive),
+# while the true positive (#1744) had a worktree mtime ~48 minutes old (dead).
+# 30 minutes sits between them with margin on both sides (~13m below the dead
+# case, ~13m above the oldest alive case). Do not lower this without revisiting
+# those data points -- too-low reintroduces the alert fatigue the issue was
+# filed to fix; too-high lets a genuinely dead worker run longer before
+# surfacing.
+IN_PROGRESS_STALE_WORKTREE_MINUTES = 30
+
+# Bound on files scanned per worktree in _newest_worktree_mtime (issue #1379
+# acceptance: "scan cost bounded"). The scan short-circuits as soon as a file
+# newer than the stale window is found, so this cap only bounds the worst case
+# (a genuinely dead worktree with many stale files). 5000 comfortably covers a
+# typical worktree's non-.git file count; a worktree with >5000 files all older
+# than the window is overwhelmingly likely to be dead, and the cap fails toward
+# flagging (conservative), never toward green.
+_WORKTREE_MTIME_SCAN_FILE_CAP = 5000
 
 # Supervisor heartbeat freshness (issue #627). The supervisor writes
 # supervisor-heartbeat.json at the top of every loop iteration. On a live
@@ -532,6 +561,174 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+# --------------------------------------------------------------------------
+# Worker worktree mtime signal (issue #1379)
+# --------------------------------------------------------------------------
+#
+# These helpers are stdlib-only reimplementations of layout/worktree helpers
+# this script cannot import (see scripts/README.md's "stdlib-only" invariant).
+# They mirror:
+#   - charlie_work.layout.worktrees_dir(state_root) -> state_root / "worktrees"
+#   - charlie_work.worktree._slugify(branch)
+#   - charlie_work.worktree.worktree_path_for_branch(root, branch, worktrees_dir)
+# If those ever diverge, tests/test_heartbeat_check.py's worktree-mtime tests
+# will catch it (they build the worktree dir the same way the orchestrator
+# does, via the same slugify, so a slug mismatch surfaces as a missing dir).
+
+
+def _slugify_branch(branch: str) -> str:
+    """Mirror ``charlie_work.worktree._slugify`` (stdlib-only reimplementation).
+
+    The production function lives in ``charlie_work.worktree``; this script
+    cannot import it (stdlib-only invariant, scripts/README.md). The two must
+    agree so the worktree path derived here matches the one the orchestrator
+    created. ``tests/test_heartbeat_check.py`` exercises the same derivation
+    against real branch names, so a drift surfaces as a missing-dir test
+    failure rather than a silent false ANOMALY.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", branch).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    return slug[:80].rstrip("-") or "worktree"
+
+
+def _resolved_worktrees_dir(repo: RepoInfo) -> Path:
+    """Resolve the worktrees root for ``repo``, honouring ``claude_code.worktrees_dir``.
+
+    Mirrors ``charlie_work.paths.resolved_layout``'s worktrees resolution
+    (issue #1379 review): ``claude_code.worktrees_dir`` is a sentinel-style
+    override -- ``None``/empty means "derive from ``runtime.state_dir``"
+    (``<state_dir>/worktrees``), a non-empty value is an explicit path
+    (absolute returned as-is, relative joined to ``repo_root``). This script
+    cannot import ``charlie_work.config``/``paths`` (stdlib-only invariant,
+    scripts/README), so the resolution is reimplemented locally against the
+    config dict ``load_orchestrator_config`` already returns -- the same
+    reimplement-locally treatment ``fleet_dir`` and the stale-open-issue-mention
+    primitives use. A broken/unreadable config degrades to the default
+    (fail-toward-flagging: a missing worktree dir reads as ANOMALY, not OK).
+    """
+    default = repo.state_dir / "worktrees"
+    config, _error = load_orchestrator_config(repo.config_path)
+    raw = config.get("claude_code", {}).get("worktrees_dir")
+    if not raw or not isinstance(raw, str):
+        return default
+    candidate = Path(raw)
+    return candidate if candidate.is_absolute() else repo.repo_root / candidate
+
+
+def _worktree_path_for_branch(
+    repo: RepoInfo, branch: str, worktrees_dir: Path | None = None
+) -> Path:
+    """Return the worktree dir for ``branch`` under ``repo``'s worktrees root.
+
+    Mirrors ``charlie_work.worktree.worktree_path_for_branch``. The worktrees
+    root defaults to ``_resolved_worktrees_dir(repo)`` (which honours
+    ``claude_code.worktrees_dir``); pass ``worktrees_dir`` to override it
+    once (e.g. a caller that resolves it once for many branches). ``repo.state_dir``
+    is the state root (the directory holding ``state.json``, as registered in
+    fleet.json).
+    """
+    root = worktrees_dir if worktrees_dir is not None else _resolved_worktrees_dir(repo)
+    return root / _slugify_branch(branch)
+
+
+def _load_state_issues(repo: RepoInfo) -> dict[str, Any]:
+    """Load the ``issues`` map from ``repo``'s ``state.json``.
+
+    Returns ``{}`` on any read/parse failure or missing file -- the caller
+    (``check_in_progress_staleness``) degrades to events-only behavior when no
+    ``branch_name`` is found, which is the correct (fail-toward-flagging)
+    direction for a corrupt state file.
+    """
+    state_json = repo.state_dir / "state.json"
+    if not state_json.exists():
+        return {}
+    try:
+        data = json.loads(state_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    issues = data.get("issues")
+    if not isinstance(issues, dict):
+        return {}
+    return issues
+
+
+def _is_reparse_point(path: str) -> bool:
+    """True if ``path`` is a reparse point (Windows junction or any symlink).
+
+    ``os.path.islink`` does NOT detect Windows directory junctions (verified
+    empirically on this host: ``islink`` returns ``False`` for a junction
+    while the reparse-point file attribute is set), and ``os.walk`` with
+    ``followlinks=False`` recurses straight through a junction regardless --
+    so a ``dirs[:]`` filter built on ``islink`` alone lets the scan walk a
+    ``.venv`` junction into a shared venv whose mtimes reflect *other*
+    worktrees' test runs, not this worker's activity. That can mask a
+    genuinely dead worker (issue #1379 review). This check is what keeps the
+    scan out of such a junction: ``islink`` catches POSIX symlinks (and
+    Windows symlinks), and the reparse-point attribute catches Windows
+    junctions that ``islink`` misses.
+    """
+    if os.path.islink(path):
+        return True
+    if sys.platform == "win32":
+        try:
+            attrs = os.lstat(path).st_file_attributes
+        except (OSError, AttributeError):
+            return False
+        return bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return False
+
+
+def _newest_worktree_mtime(
+    worktree: Path,
+    *,
+    threshold: datetime,
+    file_cap: int = _WORKTREE_MTIME_SCAN_FILE_CAP,
+) -> datetime | None:
+    """Newest file mtime under ``worktree``, excluding ``.git/``. Bounded scan.
+
+    Returns ``None`` when the directory does not exist or contains no scannable
+    files. Short-circuits as soon as a file at or after ``threshold`` is found
+    (the caller only needs to know whether ANY file is fresher than the stale
+    window), so the ``file_cap`` only bounds the worst case -- a dead worktree
+    whose every file is older than the window. The cap fails toward flagging
+    (returns the newest-so-far, which is stale), never toward green.
+
+    Windows notes (issue #1379): uses the newest *file* mtime, not directory
+    mtimes (dir mtimes do not propagate on Windows). Excludes ``.git/``
+    (background git ops are not worker activity). Does not recurse into
+    junctions/symlinks via ``_is_reparse_point`` (a ``.venv`` junction can
+    point at a shared venv whose mtimes reflect other worktrees' test runs,
+    not this worker's activity); ``os.path.islink`` alone is insufficient
+    because it does not detect Windows junctions.
+    """
+    if not worktree.is_dir():
+        return None
+    newest: datetime | None = None
+    scanned = 0
+    for root, dirs, files in os.walk(worktree, followlinks=False):
+        # Exclude .git (background git ops) and do not recurse into
+        # junctions/symlinks. _is_reparse_point catches Windows junctions
+        # that os.path.islink misses (issue #1379 review).
+        dirs[:] = [d for d in dirs if d != ".git" and not _is_reparse_point(os.path.join(root, d))]
+        for fname in files:
+            scanned += 1
+            if scanned > file_cap:
+                return newest
+            fpath = os.path.join(root, fname)
+            try:
+                mtime = os.path.getmtime(fpath)
+            except OSError:
+                continue
+            mt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            if newest is None or mt > newest:
+                newest = mt
+                if mt >= threshold:
+                    return newest
+    return newest
+
+
 def load_orchestrator_config(config_path: Path) -> tuple[dict[str, Any], str | None]:
     """Load an orchestrator.config.yaml.
 
@@ -919,7 +1116,7 @@ def check_dispatch_coverage(
 
     check_dispatch_throttle(report, repo, now=resolved_now)
     check_in_progress_staleness(
-        report, repo, in_progress, prev_repo_state, new_repo_state, skip_delta
+        report, repo, in_progress, prev_repo_state, new_repo_state, skip_delta, now=now
     )
 
 
@@ -930,12 +1127,33 @@ def check_in_progress_staleness(
     prev_repo_state: dict[str, Any],
     new_repo_state: dict[str, Any],
     skip_delta: bool,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Flag agent:in-progress issues whose updatedAt hasn't moved across 2 beats.
 
     Persists {issue_number: updatedAt} per repo in the state file so the next
     beat can compare. Entries for issues no longer in-progress are pruned
     automatically since cur_map is rebuilt fresh from this beat's data.
+
+    Issue #1379: events-stale does not mean the worker is dead. Long-running
+    workers emit events only at dispatch/PR/exit boundaries, not during
+    implementation, so a healthy worker routinely shows zero new events across
+    2 beats. Before flagging, the check also looks at the newest file mtime
+    under the issue's worker worktree (the state record carries ``branch_name``;
+    the worktree dir is derived from it). Worktree mtime cleanly separates a
+    healthy worker (files modified seconds-to-minutes ago) from a dead one (no
+    file activity for tens of minutes).
+
+    Decision matrix:
+    - events fresh (updatedAt moved) -> OK (not in the stale set at all).
+    - events stale AND worktree mtime fresh -> OK, naming the mtime signal.
+    - events stale AND worktree mtime stale -> ANOMALY, with BOTH ages in the
+      line ("no events across 2 beats; worktree idle Nm") so the true-dead case
+      reads unambiguously.
+    - events stale AND worktree dir missing -> ANOMALY (events-only, today's
+      behavior), with "no worktree found" in the line. Absence of the directory
+      must not read as activity (fail toward flagging, not toward green).
     """
     check = f"in-progress-stale {repo.slug}"
     prev_map: dict[str, str] = prev_repo_state.get("in_progress", {})
@@ -946,6 +1164,8 @@ def check_in_progress_staleness(
         new_repo_state["in_progress"] = prev_map
         report.ok(check, f"tracked={len(prev_map)} stale=0{DELTA_SKIP_SUFFIX}")
         return
+
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
 
     cur_map: dict[str, str] = {}
     stale: list[int] = []
@@ -958,10 +1178,56 @@ def check_in_progress_staleness(
 
     new_repo_state["in_progress"] = cur_map
 
-    if stale:
-        report.anom(check, f"issue(s) {sorted(stale)} no activity across 2 beats (threshold: 2)")
-    else:
+    if not stale:
         report.ok(check, f"tracked={len(cur_map)} stale=0")
+        return
+
+    # Issue #1379: before flagging events-stale issues, check the worker's
+    # worktree for recent file activity as a second liveness signal.
+    state_issues = _load_state_issues(repo)
+    threshold = resolved_now - timedelta(minutes=IN_PROGRESS_STALE_WORKTREE_MINUTES)
+    # Resolve the worktrees root once (honours claude_code.worktrees_dir, issue
+    # #1379 review) instead of re-reading the config per stale issue.
+    worktrees_root = _resolved_worktrees_dir(repo)
+    truly_stale_details: list[str] = []
+    worktree_fresh: list[str] = []
+
+    for number in sorted(stale):
+        entry = state_issues.get(str(number))
+        branch = entry.get("branch_name") if isinstance(entry, dict) else None
+        if not branch:
+            # No branch recorded in state: cannot locate a worktree. Keep
+            # events-only behavior (fail toward flagging, not toward green).
+            truly_stale_details.append(f"#{number}: no events across 2 beats; no worktree found")
+            continue
+        worktree = _worktree_path_for_branch(repo, branch, worktrees_dir=worktrees_root)
+        if not worktree.is_dir():
+            # Worktree missing entirely: absence must not read as activity.
+            truly_stale_details.append(f"#{number}: no events across 2 beats; no worktree found")
+            continue
+        newest = _newest_worktree_mtime(worktree, threshold=threshold)
+        if newest is not None and newest >= threshold:
+            age_min = (resolved_now - newest).total_seconds() / 60
+            worktree_fresh.append(f"#{number} worktree mtime {round(age_min)}m")
+        else:
+            wt_age = (
+                round((resolved_now - newest).total_seconds() / 60) if newest is not None else 0
+            )
+            truly_stale_details.append(
+                f"#{number}: no events across 2 beats; worktree idle {wt_age}m"
+            )
+
+    if truly_stale_details:
+        detail = "; ".join(truly_stale_details) + " (threshold: 2 beats)"
+        report.anom(check, detail)
+    else:
+        facts = (
+            f"tracked={len(cur_map)} events-stale={len(stale)} "
+            f"worktree-fresh={len(worktree_fresh)}"
+        )
+        if worktree_fresh:
+            facts += "; " + ", ".join(worktree_fresh)
+        report.ok(check, facts)
 
 
 def _claim_is_open(decision_path: Path) -> bool:
