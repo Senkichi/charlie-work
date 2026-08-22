@@ -129,6 +129,7 @@ from .reconcile import (
     detect_mergequeue_not_approved,
 )
 from .review_decision import (
+    ReviewDecision,
     record_decision,
     resolve_decision_payload,
     review_decision,
@@ -19937,6 +19938,19 @@ class OrchestratorApp:
                 # ``status`` is a distinct workflow-state field, not one of
                 # the three decision stores, so it still reads pr_state.
                 resolved_decision = review_decision(pr_dir_for_decision, None, live_head_sha)
+                # Issue #1362 Stage 3: state.json's decision fields are a
+                # declared cache of the file, refreshed here at the start of
+                # this PR's evaluation so any OTHER reader of ``state["prs"]``
+                # later in this same pass (merge_ready, janitor, the reap
+                # sweep, ...) sees a current decision/reviewed_head_sha/
+                # decision_path without waiting for one of the four writer-
+                # adjacent mirrors. Never touches ``status`` (checked just
+                # below), so the already-loaded ``pr_state`` stays valid.
+                self._refresh_pr_decision_cache(
+                    pr_number,
+                    resolved_decision,
+                    pr_dir_for_decision / "review-decision.json",
+                )
                 already_approved = resolved_decision.decision == "approved" and pr_state.get(
                     "status"
                 ) not in ("request_changes", "escalated", "blocked")
@@ -23242,6 +23256,51 @@ class OrchestratorApp:
         """
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         return resolve_decision_payload(pr_dir)
+
+    def _refresh_pr_decision_cache(
+        self, pr_number: int, decision: ReviewDecision, decision_path: Path
+    ) -> None:
+        """Mirror the file-first decision into ``state["prs"][pr_number]`` (issue #1362 Stage 3).
+
+        ``state.json``'s ``decision``/``reviewed_head_sha``/``decision_path``
+        fields are a declared *cache* of the file, refreshed from
+        ``review_decision()`` at exactly one boundary: the start of each PR's
+        evaluation in ``loop()``'s per-PR dispatch block (this method's only
+        call site), plus the four writer-adjacent mirrors that already run
+        immediately after a ``record_decision()`` call in the same pass
+        (``record_review``, ``_route_to_rework``, ``_update_approval_head``,
+        ``merge_ready``'s carry-forward branch, and ``review``'s new-dispatch
+        placeholder write) -- those keep a PR whose verdict changed THIS pass
+        current without waiting for the NEXT pass's boundary refresh; this
+        method covers every OTHER PR, so the cache never goes stale between
+        verdict-producing passes. See ``tests/test_pr_decision_cache_sites.py``
+        for the enforcement that no other production site may set these keys.
+
+        Skips the write entirely when the cache already agrees with the file
+        (the common case: no verdict activity since the last pass), so a
+        healthy fleet does not pay a state.json write per tracked PR per pass.
+        Uses ``self.write_gate.save_state`` (never the raw ``save_state``
+        primitive) so this method is itself WriteGate-exclusive under issue
+        #1264's R9 predicate -- it must never gain a second, ungated write.
+        """
+        decision_path_str = str(decision_path)
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            pr_key = str(pr_number)
+            pr_state = state["prs"].get(pr_key, {})
+            if (
+                pr_state.get("decision") == decision.decision
+                and pr_state.get("reviewed_head_sha") == decision.reviewed_head_sha
+                and pr_state.get("decision_path") == decision_path_str
+            ):
+                return
+            state["prs"][pr_key] = {
+                **pr_state,
+                "decision": decision.decision,
+                "reviewed_head_sha": decision.reviewed_head_sha,
+                "decision_path": decision_path_str,
+            }
+            self.write_gate.save_state(state)
 
     def _read_packet_head_oid(self, pr_number: int) -> str | None:
         """Return the ``headRefOid`` stored in the existing review packet for

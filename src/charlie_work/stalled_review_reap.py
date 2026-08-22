@@ -38,16 +38,17 @@ monkeypatch targets keep working unchanged.
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from . import layout
 from .config import OrchestratorConfig
 from .github import GitHubLike
 from .instrumentation import log_event
 from .process_utils import is_pid_alive
+from .review_decision import resolve_decision_payload
 from .state import (
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     is_claim_stale,
@@ -947,18 +948,16 @@ def _detect_and_handle_stalled_reviews(
                 )
                 continue
 
+            # Issue #1362 Stage 3: read the file-first resolver, never a
+            # hand-rolled open() against a state-sourced ``decision_path`` --
+            # that was exactly the third read path the issue collapses (the
+            # state field can lag a concurrent writer; the file is
+            # authoritative). ``pr_key`` is this loop's own dict key, already
+            # guarded above as the digit-or-skip PR number.
             decision_value: str | None = "missing"
-            decision_path_str = pr_state.get("decision_path")
-            if decision_path_str:
-                decision_path = Path(decision_path_str)
-                if decision_path.exists():
-                    try:
-                        with decision_path.open("r", encoding="utf-8") as handle:
-                            decision_data = json.load(handle)
-                        if isinstance(decision_data, dict):
-                            decision_value = decision_data.get("decision")
-                    except (OSError, json.JSONDecodeError):
-                        decision_value = "invalid"
+            if pr_key.isdigit():
+                pr_dir = state_file.parent / layout.PRS_DIRNAME / f"pr-{pr_key}"
+                decision_value = resolve_decision_payload(pr_dir).get("decision")
             if decision_value not in ("pending", "missing", "invalid", None):
                 # Issue #734: the decision_path gate is the second of three
                 # silent skip paths in stale-claim recovery. A PR whose review
