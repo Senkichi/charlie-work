@@ -23273,7 +23273,7 @@ class OrchestratorApp:
         placeholder write) -- those keep a PR whose verdict changed THIS pass
         current without waiting for the NEXT pass's boundary refresh; this
         method covers every OTHER PR, so the cache never goes stale between
-        verdict-producing passes. See ``tests/test_pr_decision_cache_sites.py``
+        verdict-producing passes. See ``tests/test_state_decision_cache_enforcement.py``
         for the enforcement that no other production site may set these keys.
 
         Skips the write entirely when the cache already agrees with the file
