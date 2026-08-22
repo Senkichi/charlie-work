@@ -603,6 +603,97 @@ def _assert_config_repo_matches(config_arg: Path | None, repo_root: Path) -> Non
     )
 
 
+#: Commands that mutate orchestrator state and are rare, operator-driven, and
+#: high-cost-of-misroute.  ``_assert_not_sibling_clone`` is called for these
+#: only (issue #1376): a wrong-cwd invocation silently writes a valid record
+#: into a sibling clone's phantom ``.var`` tree, invisible to the canonical
+#: repo — and if the target is a transient dispatch/agent worktree, the reap
+#: lanes later delete the whole checkout, destroying the record permanently.
+#: Read-only commands are deliberately exempt: their cwd-defaulted resolution
+#: is harmless and changing it would break operator workflows that routinely
+#: run ``charlie status`` from worktree cwds.
+_STATE_AFFECTING_COMMANDS = frozenset({"verdict", "merge-authorize", "unescalate"})
+
+
+def _assert_not_sibling_clone(ctx: CommandContext, args: argparse.Namespace) -> None:
+    """Refuse to write state from a sibling clone of the canonical fleet repo.
+
+    The DEFAULT-case sibling of the documented ``--config`` trap
+    (``_assert_config_repo_matches``, issue #895): there, an explicit flag
+    misleads; here, no flag at all plus an unexpected cwd silently selects a
+    different state root.  ``find_repo_root`` already resolves linked
+    worktrees to the shared main checkout (issue #648), so a verdict run from
+    a ``.claude/worktrees/*`` or agent worktree correctly targets the
+    canonical ``.var/charlie-work``.  The remaining hazard is a **sibling
+    clone** — a separate git repo (e.g. ``repos/cw-*``) that shares the same
+    GitHub remote but has its own ``.git`` and therefore its own phantom
+    ``.var/charlie-work``.  ``find_repo_root`` returns the clone's own root
+    (it is the main worktree of its own repo), and state silently lands there.
+
+    Detection uses the fleet registry: the canonical repo is registered under
+    its ``nameWithOwner`` with a ``repo_root`` pointing at the main checkout.
+    If the current ``repo_root`` differs from the registered one (after
+    normalizing both through ``find_repo_root`` so an old entry pointing at a
+    linked worktree resolves to the same shared root), the current cwd is a
+    sibling clone and the command is refused.
+
+    Fails open (allows the command) when:
+    - ``nameWithOwner`` cannot be resolved from ``git remote get-url origin``
+      (non-GitHub repo, no origin remote) — the guard is for GitHub-fleet
+      repos, not arbitrary git checkouts.
+    - The repo is not yet in the fleet registry (fresh install) — there is no
+      canonical root to compare against.
+    - The registered ``repo_root`` no longer exists or is not a git worktree
+      — a stale entry is not evidence of a sibling clone.
+
+    Explicit ``--repo`` skips this guard entirely (acceptance criterion #4):
+    the operator named the repo, so the resolution is intentional.
+    """
+    # Resolve the repo's GitHub identity from the local git remote — no
+    # network round-trip, works under --dry-run and in tests with real repos.
+    try:
+        owner, name = ctx.gh._repo_owner_name()
+    except GitHubError:
+        return
+    name_with_owner = f"{owner}/{name}"
+
+    fleet_json_path = layout.fleet_registry_path(override=args.fleet_dir)
+    registry = _load_registry(fleet_json_path)
+    entry = registry.get("repos", {}).get(name_with_owner)
+    if not entry:
+        return
+
+    registered_root_str = entry.get("repo_root")
+    if not registered_root_str:
+        return
+    registered_root = Path(registered_root_str)
+    if not registered_root.exists():
+        return
+
+    # Normalize the registered root through find_repo_root so an old entry
+    # pointing at a linked worktree resolves to the shared main checkout —
+    # the same normalization find_repo_root applies to cwd.  Without this,
+    # a pre-#692 registry entry would false-positive as a sibling clone.
+    try:
+        normalized_registered = find_repo_root(registered_root, explicit=True)
+    except RepoNotFoundError:
+        return
+
+    if ctx.repo_root == normalized_registered:
+        return
+
+    cwd = Path.cwd()
+    raise ConfigError(
+        f"cwd {cwd} resolves to repo root {ctx.repo_root}, whose state root "
+        f"is {ctx.paths.root}. The fleet registry has {name_with_owner} "
+        f"registered at {normalized_registered} — the canonical root. "
+        f"State would silently land in the sibling clone's tree, invisible "
+        f"to the canonical repo. "
+        f"Pass --repo {normalized_registered} to operate on the canonical repo, "
+        f"or cd to {normalized_registered}."
+    )
+
+
 @dataclass(frozen=True)
 class CommandContext:
     """The four bootstrap artifacts every command handler needs (issue #705).
@@ -647,6 +738,20 @@ def bootstrap_command(args: argparse.Namespace) -> CommandContext:
 
 def build_app(args: argparse.Namespace) -> OrchestratorApp:
     ctx = bootstrap_command(args)
+    # Issue #1376: for state-affecting commands, refuse before touch_repo
+    # mutates the fleet registry — a sibling-clone cwd would otherwise
+    # overwrite the canonical entry and the guard would never fire.  Explicit
+    # --repo skips the guard (the operator named the repo intentionally).
+    # `args.repo is None` is checked first, and `command` is read defensively
+    # via getattr: build_app is also called directly (outside the full
+    # argparse pipeline) by tests and other callers that hand-build a
+    # Namespace without a `command` attribute. Ordering the cheap, always-
+    # present `repo` check first avoids an AttributeError on `args.command`
+    # for those callers when --repo is explicit (AC#4 already skips the
+    # guard in that case), and getattr keeps the check inert rather than
+    # crashing if `command` is absent entirely.
+    if args.repo is None and getattr(args, "command", None) in _STATE_AFFECTING_COMMANDS:
+        _assert_not_sibling_clone(ctx, args)
     touch_repo(args.fleet_dir, ctx.repo_root, ctx.paths, ctx.gh, dry_run=args.dry_run)
     return OrchestratorApp(
         ctx.repo_root,
