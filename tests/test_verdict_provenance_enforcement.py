@@ -402,19 +402,30 @@ def test_derived_from_prose_absent_from_verdict_provenance_surface() -> None:
 # Covers two categories:
 #   1. Every record_review() call site (any file, any receiver) must supply
 #      a non-None verdict_provenance keyword.
-#   2. Every self._write_json(...) call whose first argument resolves to a
-#      path ending in "review-decision.json" -- derived from the filename
-#      literal, not an assumed variable name, so a future bypass writer
-#      spelled differently is still caught -- must write a dict containing a
-#      "verdict_provenance" key. record_review's own write and
-#      merge_authorize's write are excluded by function name: the former is
-#      already covered by category 1 (a caller can't omit the value that
-#      flows into record_review's own write) and the latter is a deliberate
-#      exclusion (AC7), the same way test_closing_reference.py excludes
-#      pr_create's own definition from the scan of pr_create's callers.
+#   2. Every record_decision(...) call (issue #1362 Stage 2: the single
+#      writer of review-decision.json, replacing the old direct
+#      self._write_json(decision_path, ...) call sites this scan used to
+#      match) must pass a payload dict that carries a "verdict_provenance"
+#      key -- as a literal in an inline dict, via a named dict variable's
+#      literal assignment, or via a subscript assignment onto that variable
+#      (the read-modify-write shape _update_approval_head's carry-forward
+#      uses). record_decision's identity alone scopes every match to a
+#      review-decision.json write -- it is the sole writer, so no separate
+#      path-literal check is needed the way the old self._write_json scan
+#      required one (that helper writes many unrelated files). Only
+#      merge_authorize's call is excluded by function name: it passes through
+#      whatever provenance the existing file already has (AC7) rather than
+#      ever writing the key itself, the same way test_closing_reference.py
+#      excludes pr_create's own definition from the scan of pr_create's
+#      callers. record_review no longer needs an exemption here: since Stage
+#      2 collapsed its two direct writes (live + round-archive copy) into one
+#      record_decision(...) call, and its decision_payload dict already
+#      contains the "verdict_provenance" key literally (required by category
+#      1's own kwarg check upstream of this call), the write-site check below
+#      passes it on the merits rather than via a name-based carve-out.
 # ---------------------------------------------------------------------------
 
-_PROVENANCE_WRITER_EXEMPT_FUNCTIONS = frozenset({"record_review", "merge_authorize"})
+_PROVENANCE_WRITER_EXEMPT_FUNCTIONS = frozenset({"merge_authorize"})
 
 
 def _nodes_outside_function_definition(tree: ast.AST, function_name: str) -> list[ast.AST]:
@@ -469,34 +480,6 @@ def _enclosing_function(node: ast.AST, parents: dict[int, ast.AST]) -> ast.AST |
     return None
 
 
-def _last_name_assignment(func_node: ast.AST, name: str) -> ast.expr | None:
-    result: ast.expr | None = None
-    for node in ast.walk(func_node):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == name:
-                    result = node.value
-    return result
-
-
-def _contains_review_decision_literal(expr: ast.expr) -> bool:
-    return any(
-        isinstance(n, ast.Constant) and n.value == "review-decision.json" for n in ast.walk(expr)
-    )
-
-
-def _resolves_to_review_decision_path(
-    expr: ast.expr, func_node: ast.AST, _seen: frozenset[str] = frozenset()
-) -> bool:
-    if _contains_review_decision_literal(expr):
-        return True
-    if isinstance(expr, ast.Name) and expr.id not in _seen:
-        value = _last_name_assignment(func_node, expr.id)
-        if value is not None:
-            return _resolves_to_review_decision_path(value, func_node, _seen | {expr.id})
-    return False
-
-
 def _dict_var_has_key(func_node: ast.AST, var_name: str, key: str) -> bool:
     """True if ``var_name`` is ever assigned a Dict literal containing
     ``key``, OR ever subscript-assigned that key directly (the
@@ -543,15 +526,26 @@ def _review_decision_write_sites(
 ) -> tuple[list[tuple[str, ast.Call, ast.AST]], list[tuple[str, ast.Call, ast.AST]]]:
     """Returns ``(checked_sites, exempted_sites)``.
 
+    Issue #1362 Stage 2: matches calls to ``record_decision`` -- the single
+    writer of review-decision.json -- rather than the old direct
+    ``self._write_json(decision_path, ...)`` call sites (all four of which
+    were converted to call ``record_decision`` instead). ``record_decision``
+    is imported and called as a bare name (``from .review_decision import
+    record_decision``), not a method, so this matches ``ast.Name`` rather
+    than ``ast.Attribute`` as the old ``_write_json`` scan did. No separate
+    "does this resolve to a review-decision.json path" check is needed the
+    way the old scan required one: ``record_decision`` writes nothing else,
+    so the function name alone scopes every match correctly.
+
     Exempted sites are *collected*, not silently skipped, because the
     exemption in ``_PROVENANCE_WRITER_EXEMPT_FUNCTIONS`` matches by function
     *name*, not identity. Matching by name alone fails open: a future
     function anywhere under ``_SRC_ROOT`` that happens to be named
-    ``record_review`` or ``merge_authorize`` would silently inherit the
-    exemption and could write review-decision.json with no provenance while
-    this scanner stays green. Returning the exempted sites lets the caller
-    assert the exemption still resolves to exactly the two known, deliberate
-    exclusions instead of trusting the name match blindly.
+    ``merge_authorize`` would silently inherit the exemption and could write
+    review-decision.json with no provenance while this scanner stays green.
+    Returning the exempted sites lets the caller assert the exemption still
+    resolves to exactly the one known, deliberate exclusion instead of
+    trusting the name match blindly.
     """
     parents = _build_parent_map(tree)
     checked: list[tuple[str, ast.Call, ast.AST]] = []
@@ -559,15 +553,13 @@ def _review_decision_write_sites(
     for node in ast.walk(tree):
         if not (
             isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_write_json"
-            and len(node.args) >= 1
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "record_decision"
+            and len(node.args) >= 2
         ):
             continue
         func_node = _enclosing_function(node, parents)
         if func_node is None:
-            continue
-        if not _resolves_to_review_decision_path(node.args[0], func_node):
             continue
         if func_node.name in _PROVENANCE_WRITER_EXEMPT_FUNCTIONS:
             exempted.append((func_node.name, node, func_node))
@@ -619,26 +611,26 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     assert any(site.endswith("(review)") for site in scanned_write_sites), scanned_write_sites
 
     # _PROVENANCE_WRITER_EXEMPT_FUNCTIONS matches by function *name*, which
-    # fails open: any future function elsewhere in src/ named record_review
-    # or merge_authorize would silently inherit the exemption and this scan
-    # would stay green while it wrote review-decision.json with no
-    # provenance. Asserting the exemption resolves to exactly the three
-    # known, deliberate sites (all in workflow.py) turns that into a hard
-    # failure instead of a silent widening. Three, not two, since issue
-    # #1268 (W11) added a second review-decision.json write inside
-    # record_review itself: the per-round archive copy under
-    # rounds/round-K/, written from the exact same already-validated
-    # decision_payload dict as the live write immediately above it (not a
-    # second, independently-constructed payload) -- so it is exempt for the
-    # identical reason the live write is, and the function-name-based
-    # exemption already covers it correctly. merge_authorize still
-    # contributes exactly one.
-    assert len(exempted_write_sites) == 3, exempted_write_sites
+    # fails open: any future function elsewhere in src/ named merge_authorize
+    # would silently inherit the exemption and this scan would stay green
+    # while it wrote review-decision.json with no provenance. Asserting the
+    # exemption resolves to exactly the one known, deliberate site (in
+    # workflow.py) turns that into a hard failure instead of a silent
+    # widening. Issue #1362 Stage 2 collapsed record_review's two direct
+    # writes (the live write plus the per-round archive copy under
+    # rounds/round-K/, both previously exempt here) into a single
+    # record_decision(...) call -- record_decision now performs both writes
+    # internally from the one already-validated decision_payload dict, so
+    # there is exactly one call site in record_review, and it is CHECKED
+    # (not exempted) because decision_payload carries the
+    # "verdict_provenance" key literally. merge_authorize still contributes
+    # exactly one exempted site.
+    assert len(exempted_write_sites) == 1, exempted_write_sites
     assert all(site.startswith("workflow.py:") for site in exempted_write_sites), (
         exempted_write_sites
     )
     exempted_func_names = {site.rsplit(" (", 1)[1].rstrip(")") for site in exempted_write_sites}
-    assert exempted_func_names == {"record_review", "merge_authorize"}, exempted_write_sites
+    assert exempted_func_names == {"merge_authorize"}, exempted_write_sites
 
     assert offenders == [], (
         "record_review call site(s) or review-decision.json writer(s) bypass "

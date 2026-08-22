@@ -9,9 +9,15 @@ must go through :func:`review_decision` so staleness/missing/fail-safe
 semantics are enforced in exactly one place instead of re-derived at each
 call site.
 
-Stage 1 (this module) introduces the reader only. ``state.json``'s decision
-fields are still WRITTEN everywhere they are today -- writer unification is
-a later stage and is out of scope here. Nothing in ``src/`` should read
+Stage 1 (this module) introduced the reader only. Stage 2 adds
+:func:`record_decision`, the single writer: every direct
+``review-decision.json`` writer in ``workflow.py`` (``record_review``, the
+packet-build placeholder, ``merge_authorize``, and the carry-forward path in
+``_update_approval_head``) is converted to call it instead of writing the
+file itself. ``state.json``'s decision fields are still WRITTEN everywhere
+they are today by those same call sites -- ``record_decision`` does not
+touch ``state.json``; folding the two stores together is Stage 3
+(state-as-cache) and is out of scope here. Nothing in ``src/`` should read
 those fields for control flow after Stage 1 lands; this module is the
 replacement.
 
@@ -150,6 +156,149 @@ def _round_history_entries(
             return [(1, dict(fallback_decision))]
         return []
     return entries
+
+
+def _write_json_atomic(path: Path, value: Any) -> None:
+    """Atomic temp-file + ``replace()`` write, matching the repo's canonical
+    pattern (``OrchestratorApp._write_json`` in ``workflow.py``,
+    ``adapters._write_json``, ``devin_shell._write_json`` -- see CLAUDE.md's
+    "All JSON state writes are atomic" invariant).
+
+    Hoisted here (issue #1362 Stage 2) as the one atomic-write primitive
+    :func:`record_decision` uses for both the round-file and flat-file
+    writes, rather than inventing a second shape or requiring an
+    ``OrchestratorApp`` instance just to reach the static method.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    tmp_path.replace(path)
+
+
+# Issue #1268 (W11): the field set that identifies a review round. Two writes
+# that agree on all four are the same round (a retry); any difference --
+# including on an unchanged head -- is a distinct verdict and must never
+# overwrite a prior round's archived text. Verbatim copy of
+# ``rework_prompts._ROUND_COMPARE_KEYS`` -- see :func:`_next_round_number`
+# below for why this is a private mirror rather than an import.
+_ROUND_COMPARE_KEYS = ("decision", "summary", "required_changes", "reviewed_head_sha")
+
+
+def _next_round_number(rounds_dir: Path, decision_payload: Mapping[str, Any]) -> int:
+    """Return the round-K under which ``decision_payload`` should be archived.
+
+    Private mirror of ``rework_prompts._next_round_number`` (same retry/
+    distinct-verdict reasoning documented there in full) -- not an import,
+    for the same reason ``_read_review_decision_payload`` and
+    ``_existing_round_numbers`` above are private copies rather than
+    imports: ``rework_prompts.py`` already imports ``_round_history_entries``
+    FROM this module, so importing ``_next_round_number`` the other way
+    would be circular. :func:`record_decision` must reuse this exact
+    dedup logic (never fork a second numbering scheme), so any future change
+    to ``rework_prompts._next_round_number`` must be mirrored here too.
+    """
+    highest = max(_existing_round_numbers(rounds_dir), default=0)
+    if highest == 0:
+        return 1
+    prior_decision = _read_review_decision_payload(
+        rounds_dir / f"round-{highest}" / "review-decision.json"
+    )
+    is_retry = prior_decision is not None and all(
+        prior_decision.get(key) == decision_payload.get(key) for key in _ROUND_COMPARE_KEYS
+    )
+    return highest if is_retry else highest + 1
+
+
+def record_decision(
+    pr_dir: Path,
+    verdict_payload: Mapping[str, Any],
+    head_sha: str | None,
+    *,
+    archive_round: bool = True,
+) -> ReviewDecision:
+    """Single writer for a PR's review decision (issue #1362 Stage 2).
+
+    Writes, in this order:
+
+    1. The per-round archive, ``rounds/round-K/review-decision.json`` -- K
+       derived from :func:`_next_round_number` against whatever is already
+       archived on disk, exactly as ``record_review`` derives it today.
+       Skipped entirely when ``archive_round=False`` (see below).
+    2. The flat ``review-decision.json``, atomically.
+
+    ``archive_round`` (default ``True``) exists for callers whose write is a
+    mechanical patch onto an existing verdict rather than a new reviewer
+    round -- currently only the carry-forward path in
+    ``_update_approval_head``. That write changes ``reviewed_head_sha`` (one
+    of :data:`_ROUND_COMPARE_KEYS`) while leaving ``decision``/``summary``/
+    ``required_changes`` untouched, so routing it through the default
+    round-mint logic would archive a content-free "round" whose only
+    difference from the prior one is the head it is pinned to --
+    ``_round_history_entries``/``prior_review_section`` would then render an
+    extra, duplicate-looking entry in the rendered prior-review history for
+    every carry-forward, even though no reviewer produced a new verdict.
+    ``archive_round=False`` skips :func:`_next_round_number` and the round
+    write entirely, performing only the flat-file write -- the carry-forward
+    still updates the single durable record, it just never masquerades as a
+    new round. ``merge_authorize``'s override patch does not need this flag:
+    it only adds ``authorized_override``, which is not one of
+    ``_ROUND_COMPARE_KEYS``, so it already dedupes as a retry onto the
+    existing highest round (see :func:`_next_round_number`) with the default.
+
+    This is round-file-*then*-flat -- the inverse of the historical
+    ``record_review`` ordering, which wrote flat first and archived the
+    round second. Round-first means a crash (or any exception) between the
+    two writes leaves the round archive as the durable record and the flat
+    file either absent (a PR's first-ever verdict) or still holding the
+    prior round's content; either way, :func:`review_decision`'s
+    flat-then-round-fallback read order still resolves to a real verdict --
+    the crash never silently loses the verdict this call was recording. See
+    ``tests/test_review_decision.py`` for the regression test (issue #1362
+    AC4). Neither write is skipped or reordered on any path; if the round
+    write raises, the flat write is never attempted and the exception
+    propagates to the caller (errors are not swallowed here -- callers that
+    need errors-as-values wrap this call, per the adapters' convention).
+
+    ``head_sha`` stamps ``verdict_payload["reviewed_head_sha"]`` (overwriting
+    any value already present in the payload) before either write, so every
+    writer -- including a caller recording only a head-stamped placeholder,
+    e.g. ``{"decision": "pending"}`` -- goes through the same single point
+    of truth for "what head was this decision recorded against", making a
+    pending-for-a-dead-head verdict detectable downstream. Pass ``None`` to
+    leave the payload's own ``reviewed_head_sha`` (if any) untouched -- for
+    a caller that has already resolved and embedded the correct value and
+    has no independent head argument to assert.
+
+    Every other key in ``verdict_payload`` passes through completely
+    unchanged -- in particular ``verdict_provenance`` (issue #1265: every
+    verdict must record where it came from). This function does not
+    interpret, validate, rename, or drop any field it does not itself
+    write; ``verdict_provenance`` enforcement (e.g. against
+    ``VERDICT_PROVENANCE_VALUES``) remains the caller's responsibility, as
+    it is today at the ``record_review`` call boundary.
+
+    Returns the :class:`ReviewDecision` now readable for ``pr_dir`` --
+    obtained by calling :func:`review_decision` itself, against
+    ``head_sha``, immediately after both writes complete, so the writer and
+    the reader can never disagree about what a freshly-recorded decision
+    looks like.
+    """
+    payload = dict(verdict_payload)
+    if head_sha is not None:
+        payload["reviewed_head_sha"] = head_sha
+
+    if archive_round:
+        rounds_dir = pr_dir / "rounds"
+        round_number = _next_round_number(rounds_dir, payload)
+        round_path = rounds_dir / f"round-{round_number}" / "review-decision.json"
+        _write_json_atomic(round_path, payload)
+
+    flat_path = pr_dir / "review-decision.json"
+    _write_json_atomic(flat_path, payload)
+
+    return review_decision(pr_dir, pr_state=None, current_head_sha=head_sha)
 
 
 def resolve_decision_payload(pr_dir: Path) -> dict[str, Any]:
