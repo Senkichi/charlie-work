@@ -151,6 +151,7 @@ from .worktree import (
     resolve_base_branch_name,
     salvage_branch_empty_diff,
     salvage_push_stranded_commits,
+    SalvagePushResult,
     summarize_branch_work,
     worktree_ahead_of_sha,
     worktree_head_sha,
@@ -3444,6 +3445,7 @@ def _reap_restore_rework_requested(
     worker: WorkerView,
     failure_kind: str | None = None,
     *,
+    repo_root: Path | None = None,
     write_gate: WriteGate,
 ) -> None:
     """Restore a dead/launch-failed rework worker to ``rework_requested``, or
@@ -3486,6 +3488,20 @@ def _reap_restore_rework_requested(
     "check the worktree for stranded work") instead of
     ``redispatch_cap_exceeded`` (triage: "worker is spinning"), and
     includes ``stranded_commits`` in the escalation payload.
+
+    Issue #1239: the rework lane had the stranded-commit detector (#1134)
+    but not the remediation the fresh-dispatch lane has (#1248).  Before
+    counting a death, salvage-push stranded commits via the same
+    sanctioned-git path (``salvage_push_stranded_commits``: ls-remote
+    before pushing, never force-push, fast-forward only).  When the push
+    succeeds the death is NOT recorded and the issue resets to
+    ``rework_requested``; the next ``dispatch_rework`` pass sees the PR
+    head has moved past the ``request_changes`` verdict and routes to
+    review (packet regeneration supersedes the verdict).  Only a death
+    that produced NO pushable commit counts toward ``worker_death_loop``;
+    the genuinely-empty death-loop escalation is unchanged.  ``repo_root``
+    gates the salvage attempt (``None`` for callers without a checkout,
+    e.g. unit tests of the cap logic itself).
     """
     write_gate = require_write_gate(write_gate)
     pr_data = _rework_pr_for_worker(open_prs_by_issue, worker)
@@ -3497,24 +3513,89 @@ def _reap_restore_rework_requested(
     prs_dir = state_file.parent / "prs"
     rework_prompt_path = prs_dir / f"pr-{pr_number}" / "rework-prompt.md"
 
+    # Issue #1362 Stage 1: read through the single review-decision reader
+    # instead of state.json's ``decision``/``reviewed_head_sha``.  Computed
+    # outside the state lock: it reads only the review-decision file and the
+    # PR snapshot's ``headRefOid`` (``live_head_sha``), neither of which
+    # depends on state.json.
+    resolved_decision = review_decision(prs_dir / f"pr-{pr_number}", None, live_head_sha)
+    has_request_changes = (
+        resolved_decision.decision == "request_changes" and not resolved_decision.stale
+    )
+    if not has_request_changes:
+        return
+
+    # Issue #1239: salvage-push stranded commits BEFORE counting a death.
+    # Network I/O (git push) — kept outside the state lock, matching the
+    # fresh-dispatch salvage lane (~line 2168).  ``salvage_push_stranded_commits``
+    # is the sanctioned-git path: ls-remote before pushing (never trust the
+    # sidecar's ``push_succeeded``), never force-push, fast-forward only.
+    salvage_result: SalvagePushResult | None = None
+    if repo_root is not None and live_head_sha and worker.branch and worker.worktree_path:
+        salvage_result = salvage_push_stranded_commits(
+            repo_root,
+            worker.branch,
+            Path(worker.worktree_path),
+            base_ref=config.dispatch.base_ref,
+        )
+
+    # Issue #1239: when stranded commits were published, reset to
+    # rework_requested WITHOUT recording a death and return — the PR head
+    # moved past the request_changes verdict, so the next dispatch_rework
+    # pass routes to review (packet regeneration supersedes the verdict)
+    # instead of re-dispatching into the same tail-death.  A death that
+    # produced a pushable commit is a completion with a failed last step,
+    # not a failed attempt.  The label transition mirrors the non-salvage
+    # restore path below (edge="rework_requested").
+    if salvage_result is not None and salvage_result.pushed:
+        with state_lock(state_file):
+            state = load_state(state_file)
+            entry = state["issues"].get(str(worker.issue_number), {})
+            if not isinstance(entry, dict) or entry.get("status") != "dispatched":
+                return
+            entry["status"] = "rework_requested"
+            entry["dispatched_at"] = None
+            state["issues"][str(worker.issue_number)] = entry
+            state = write_gate.append_event(
+                state,
+                "rework_stranded_commits_salvaged",
+                {
+                    "issue_number": worker.issue_number,
+                    "pr_number": pr_number,
+                    "previous_status": "dispatched",
+                    "new_status": "rework_requested",
+                    "reason": "dead_rework_worker_salvaged",
+                    "failure_kind": failure_kind,
+                    "commit_count": salvage_result.commit_count,
+                    "old_remote_sha": salvage_result.old_remote_sha,
+                    "new_remote_sha": salvage_result.new_remote_sha,
+                },
+            )
+            write_gate.save_state(state)
+        result = write_gate.transition(gh, config.labels, worker.issue_number, "rework_requested")
+        if result.outcome != TransitionOutcome.APPLIED:
+            with state_lock(state_file):
+                state = load_state(state_file)
+                entry = state["issues"].get(str(worker.issue_number), {})
+                entry["label_error"] = {
+                    "edge": "rework_requested",
+                    "outcome": result.outcome.value,
+                    "add_failures": result.add_failures,
+                    "remove_failures": result.remove_failures,
+                }
+                state["issues"][str(worker.issue_number)] = entry
+                write_gate.save_state(state)
+        return
+
     with state_lock(state_file):
         state = load_state(state_file)
         entry = state["issues"].get(str(worker.issue_number), {})
         if not isinstance(entry, dict) or entry.get("status") != "dispatched":
             return
 
-        # Issue #1362 Stage 1: read through the single review-decision
-        # reader instead of state.json's ``decision``/``reviewed_head_sha``.
-        resolved_decision = review_decision(prs_dir / f"pr-{pr_number}", None, live_head_sha)
-        has_request_changes = (
-            resolved_decision.decision == "request_changes" and not resolved_decision.stale
-        )
         # Diagnostic only (issue #315 finding 1) — never gates the restore by
         # itself; see the docstring above.
         has_rework_prompt = rework_prompt_path.exists()
-
-        if not has_request_changes:
-            return
 
         # Issue #315 finding 2: same window-filtered redispatch_at bookkeeping
         # the sibling lanes use (~line 950-961, ~4186-4194), so the cap below
@@ -4611,6 +4692,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                 open_prs_by_issue,
                 w,
                 failure_kind=failure_kind,
+                repo_root=repo_root,
                 write_gate=write_gate,
             )
             continue
@@ -4968,6 +5050,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                                 open_prs_by_issue,
                                 w,
                                 failure_kind=failure_kind,
+                                repo_root=repo_root,
                                 write_gate=write_gate,
                             )
                     else:
@@ -4978,6 +5061,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                             open_prs_by_issue,
                             w,
                             failure_kind=failure_kind,
+                            repo_root=repo_root,
                             write_gate=write_gate,
                         )
 
@@ -20714,6 +20798,9 @@ class OrchestratorApp:
         head_indeterminate: list[int] = []
         no_op_rework_escalated: list[int] = []
         worker_death_escalated: list[int] = []
+        # Issue #1239: issues salvaged out of the death-loop gate (stranded
+        # commits pushed) and routed to review instead of escalated.
+        salvaged_to_review: list[int] = []
         filtered_candidates = []
         for issue in candidates:
             issue_number = int(issue["number"])
@@ -20768,6 +20855,25 @@ class OrchestratorApp:
                         no_op_rework_escalated.append(issue_number)
                         continue
                     if len(prior_deaths) >= self.config.watchdog.max_auto_redispatch:
+                        # Issue #1239: before escalating a death-loop, attempt
+                        # to salvage-push stranded commits from the dead
+                        # worker's worktree — the same sanctioned-git path the
+                        # fresh-dispatch lane uses (#1248).  A successful push
+                        # means the worker completed the rework and died at the
+                        # final push step; the PR head moves past the
+                        # request_changes verdict and the next pass routes to
+                        # review (packet regeneration supersedes the verdict),
+                        # so this death does NOT count toward the death-loop
+                        # cap.  Only a death that produced NO pushable commit
+                        # escalates.  ``salvage_push_stranded_commits`` runs
+                        # ls-remote before pushing, never force-pushes, and is
+                        # fast-forward only — never trust the sidecar's
+                        # ``push_succeeded`` as proof of a push.
+                        if self._salvage_rework_stranded_commits(
+                            issue_number, pr_data, issue_entry
+                        ):
+                            salvaged_to_review.append(issue_number)
+                            continue
                         worker_death_escalated.append(issue_number)
                         continue
                 filtered_candidates.append(issue)
@@ -20839,6 +20945,33 @@ class OrchestratorApp:
             else:
                 review_blocked_retry.append(routed_issue_number)
         routed_to_review = confirmed_routed_to_review
+
+        # Issue #1239: route salvaged death-loop issues to review.  The
+        # salvage push already advanced the PR head past the request_changes
+        # verdict, so review() generates a fresh packet that supersedes the
+        # stale verdict — the same machinery the head-moved branch above uses.
+        # A salvage that review() blocks (deterministic janitor gate) stays
+        # rework_requested for the next pass, same as a blocked head-moved
+        # routing; the death was NOT counted, so the death-loop cap is not
+        # consumed.
+        salvaged_confirmed: list[int] = []
+        salvaged_blocked: list[int] = []
+        for salvaged_issue_number in salvaged_to_review:
+            salvaged_pr_number = int(pr_by_issue[salvaged_issue_number]["number"])
+            reviewed_head_sha_before = (
+                head_check_state.get("prs", {})
+                .get(str(salvaged_pr_number), {})
+                .get("reviewed_head_sha")
+            )
+            routed, _review_result = self._route_rework_candidate_to_review(
+                salvaged_issue_number, salvaged_pr_number, reviewed_head_sha_before
+            )
+            if routed:
+                salvaged_confirmed.append(salvaged_issue_number)
+            else:
+                salvaged_blocked.append(salvaged_issue_number)
+        routed_to_review.extend(salvaged_confirmed)
+        review_blocked_retry.extend(salvaged_blocked)
 
         # Escalate no-op rework issues that have exhausted the redispatch cap
         # without the PR head ever advancing. Each of these would have burned
@@ -20996,6 +21129,7 @@ class OrchestratorApp:
                 "operator_claimed_skipped": sorted(operator_claimed_skipped),
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
+                "salvaged_to_review": sorted(salvaged_to_review),
             }
             if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
@@ -21061,6 +21195,7 @@ class OrchestratorApp:
                 "review_blocked_retry": sorted(review_blocked_retry),
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
+                "salvaged_to_review": sorted(salvaged_to_review),
             }
             if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
@@ -21318,6 +21453,7 @@ class OrchestratorApp:
                 "operator_claimed_skipped": sorted(operator_claimed_skipped),
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
+                "salvaged_to_review": sorted(salvaged_to_review),
             }
             if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
@@ -21651,6 +21787,7 @@ class OrchestratorApp:
             "review_blocked_retry": sorted(review_blocked_retry),
             "operator_claimed_skipped": sorted(operator_claimed_skipped),
             "no_op_rework_escalated": sorted(no_op_rework_escalated),
+            "salvaged_to_review": sorted(salvaged_to_review),
         }
         if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
             data.update(gov.report_fields())
@@ -21683,6 +21820,62 @@ class OrchestratorApp:
             message,
             data,
         )
+
+    def _salvage_rework_stranded_commits(
+        self,
+        issue_number: int,
+        pr_data: dict[str, Any],
+        issue_entry: dict[str, Any],
+    ) -> bool:
+        """Salvage-push stranded commits from a dead rework worker's worktree
+        before the death-loop escalation gate fires (issue #1239).
+
+        Returns ``True`` when the push succeeded (stranded commits were
+        published); ``False`` for any non-push outcome (no stranded commits,
+        divergence, remote-head-not-local, missing worktree/branch, or git
+        error).  The caller treats a ``True`` result as "the death produced
+        completed work — do NOT count it toward ``worker_death_loop``" and
+        routes the issue to review instead of escalating.
+
+        Reuses ``salvage_push_stranded_commits`` — the same sanctioned-git
+        primitive the fresh-dispatch salvage lane uses (#1248): ls-remote
+        before pushing (never trust the sidecar's ``push_succeeded``), never
+        force-push, fast-forward only.  Records a state event so the salvage
+        is observable even when the death-loop gate would have escalated.
+        """
+        live_head = pr_data.get("headRefOid")
+        if not live_head:
+            return False
+        branch = issue_entry.get("branch_name") if isinstance(issue_entry, dict) else None
+        if not branch:
+            return False
+        wt_path = worktree_path_for_branch(self.repo_root, branch, self._layout.worktrees)
+        result = salvage_push_stranded_commits(
+            self.repo_root,
+            branch,
+            wt_path,
+            base_ref=self.config.dispatch.base_ref,
+        )
+        if not result.pushed:
+            return False
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            state = append_event(
+                state,
+                "rework_stranded_commits_salvaged",
+                {
+                    "issue_number": issue_number,
+                    "previous_status": "rework_requested",
+                    "new_status": "rework_requested",
+                    "reason": "death_loop_salvaged",
+                    "commit_count": result.commit_count,
+                    "old_remote_sha": result.old_remote_sha,
+                    "new_remote_sha": result.new_remote_sha,
+                },
+                state_path=self.paths.state_file,
+            )
+            save_state(self.paths.state_file, state)
+        return True
 
     def _route_rework_candidate_to_review(
         self,
