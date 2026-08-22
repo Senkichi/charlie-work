@@ -807,8 +807,8 @@ def _check_no_op_rework(
     # as ``pr_state={}``/``None``, which the ``if not pr_state: return False``
     # guard at the top of this function already rejects before execution
     # ever reaches this fallback) and by each of the four writer-adjacent
-    # mirrors, so it can no longer lag the file the way
-    # it could before Stage 3 introduced that invariant. Reading
+    # mirrors, so it can no longer lag the file the way it could before
+    # Stage 3 introduced that invariant. Reading
     # ``pr_state`` here directly (rather than threading a second
     # ``review_decision``-shaped parameter through every ``_check_no_op_rework``
     # caller) is deliberate, not an oversight left over from Stage 1.
