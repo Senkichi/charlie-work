@@ -349,6 +349,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         # emitted from the same call site with an explicit ``level="warning"``.
         "review_verdict_reconcile_failed": "warning",
         "rework_issue_fetch_skipped": "warning",
+        # Issue #1239: a dead rework worker's stranded commits were
+        # salvage-pushed (the worker completed the rework but died before
+        # ``git push``), so the death is NOT counted toward the death-loop
+        # cap and the issue is routed to review instead of escalated.
+        # Warning, not error: no work was lost -- the push recovered the
+        # completed commit and the issue continues to review. Sibling to
+        # ``dead_dispatched_worker_reaped`` (a reaped death) but with the
+        # recovery made explicit.
+        "rework_stranded_commits_salvaged": "warning",
         "runner_allocation_refused": "warning",
         "runner_allocation_skipped": "warning",
         "runner_capacity_starved": "warning",

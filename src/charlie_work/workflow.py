@@ -21860,7 +21860,7 @@ class OrchestratorApp:
             return False
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            state = append_event(
+            state = self.write_gate.append_event(
                 state,
                 "rework_stranded_commits_salvaged",
                 {
@@ -21872,9 +21872,8 @@ class OrchestratorApp:
                     "old_remote_sha": result.old_remote_sha,
                     "new_remote_sha": result.new_remote_sha,
                 },
-                state_path=self.paths.state_file,
             )
-            save_state(self.paths.state_file, state)
+            self.write_gate.save_state(state)
         return True
 
     def _route_rework_candidate_to_review(
