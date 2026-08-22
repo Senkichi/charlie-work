@@ -59,13 +59,20 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 
 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict"}
+    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict", "cross_repo_hop"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
 # transient contention, not a confirmed-dirty worktree — it must take the
 # ordinary redispatch-cap path instead of escalating on first occurrence
 # (issue #288 follow-up, PR #314).
+#
+# "cross_repo_hop" (issue #1244): a dead worker whose issue scope targets
+# another managed repo.  Redispatching repeats the same hop forever — the
+# worker notices the content targets a sibling repo, hops to its worktree,
+# and exits with zero artifacts in the dispatching repo.  Escalate on the
+# first occurrence so a human can file/transfer a mirror into the target
+# repo's tracker, exactly as was done by hand for #709.
 
 
 class ConfigError(ValueError):
