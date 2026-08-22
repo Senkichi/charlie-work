@@ -772,6 +772,46 @@ _ALLOWED_RAW_PRIMITIVE_SITES: tuple[_RawPrimitiveSite, ...] = (
         ),
         in_predicate=False,
     ),
+    # Issue #1374 AC3: `emit_preflight_refusal` (preflight.py) is the
+    # best-effort refusal emitter for FATAL preflight failures (disk full,
+    # clock skew, venv drift). Its documented contract is "must never
+    # silence the refusal": when the event DB is unreachable or the write
+    # itself raises, it falls back to printing to stderr (which the
+    # `fleet supervise` wrapper captures into the pass log). The
+    # `log_event_fn=log_event` injectable default is for testability --
+    # the function's own docstring states ``log_event_fn`` is "injectable
+    # so this can be unit-tested without a real disk-full condition" --
+    # which is exactly the injectable-default-for-testability pattern
+    # issue #1374 names and this scanner now resolves.
+    #
+    # Routing through WriteGate would be wrong twice over, mirroring the
+    # two R4 dispositions above:
+    #   (1) WriteGate's `dry_run=True` path performs zero event emissions,
+    #       so routing through it would newly suppress a fatal-check-
+    #       failure observability signal under dry-run -- the same reason
+    #       the stalled_review_reap.py entries and the _loop_impl preflight
+    #       warning above stay raw. A preflight REFUSAL (the loop will not
+    #       run at all) is at least as load-bearing as a preflight warning.
+    #   (2) `emit_preflight_refusal` is a standalone module-level function
+    #       with no `self.write_gate` access and no `write_gate` parameter;
+    #       its sole caller (`_loop_impl` at workflow.py) passes no
+    #       `write_gate` either. Threading a WriteGate in would be an
+    #       out-of-scope refactor that breaks the "never silenced, even
+    #       when the DB is down" contract the function exists to enforce.
+    # `in_predicate=False` matches the real scan: the function makes no
+    # `self.write_gate.*`/`write_gate.*` call and has no `write_gate`
+    # parameter, so this is not an R9 exclusivity exemption -- it keeps a
+    # genuinely by-design raw site off the per-module shrink-only ratchet,
+    # the same role the _loop_impl entry above plays.
+    _RawPrimitiveSite(
+        path="preflight.py",
+        scope="emit_preflight_refusal",
+        primitive="log_event",
+        call_source=(
+            "log_event_fn(state_path, 'loop_refused_preflight', payload, repo=repo, level='error')"
+        ),
+        in_predicate=False,
+    ),
 )
 
 
