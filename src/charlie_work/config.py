@@ -775,8 +775,35 @@ class AutoMergeConfig:
 
 
 @dataclass(frozen=True)
+class PreflightConfig:
+    """Thresholds and fatal/non-fatal classification for ``preflight.py``'s
+    four host-precondition checks (issue #1363). Defaults match the issue's
+    explicit design: disk_floor and venv_identity are fatal (refuse the
+    pass); clock_sanity and config_freshness are non-fatal tripwires (emit
+    an event, pass proceeds). Never hardcode these values at a call site --
+    read them from here so an operator can retune per host without a code
+    change.
+    """
+
+    #: Minimum free disk space, in GB, on each volume hosting state_dir/repo
+    #: root. Below this, disk_floor fails. 2026-08-19 outage: C: hit 0 bytes
+    #: free; a refusal here replaces 8 noisy aborted passes with one.
+    disk_floor_gb: int = 10
+    disk_floor_fatal: bool = True
+    #: Bound (hours) on state.json's age before clock_sanity flags it as
+    #: stale/skewed. A negative age (state.json mtime in the future) always
+    #: flags regardless of this bound.
+    clock_max_skew_hours: float = 48.0
+    clock_sanity_fatal: bool = False
+    venv_identity_fatal: bool = True
+    config_freshness_fatal: bool = False
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     state_dir: str = layout.DEFAULT_STATE_DIR
+    # Preflight gate thresholds (issue #1363) -- see PreflightConfig.
+    preflight: PreflightConfig = field(default_factory=PreflightConfig)
     # Repo-local template dir searched before the package defaults. Relative
     # paths resolve against the consumer repo root.
     prompts_dir: str | None = None
@@ -877,6 +904,14 @@ class RuntimeConfig:
     # ``label_error`` is None, which costs a dict lookup and no API call). Set
     # to 0 for unlimited.
     escalated_label_repair_max_per_pass: int = 10
+    # Issue #1372: grace period (in days) after which a stale fleet registry
+    # entry (repo_root no longer exists) is pruned from fleet.json. A stale
+    # entry is skipped every pass and reported separately so one corpse cannot
+    # degrade fleet-wide tooling; after this many days without a successful
+    # touch_repo (last_seen older than the grace period), it is pruned under
+    # state_lock. Set to 0 to disable pruning (stale entries are skipped but
+    # never removed).
+    fleet_registry_stale_grace_days: int = 7
 
 
 @dataclass(frozen=True)
@@ -2346,6 +2381,73 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
                 f"must be >= 0, got {repair_cap}"
             )
+    stale_grace_days = runtime_data.get("fleet_registry_stale_grace_days")
+    if stale_grace_days is not None:
+        if not isinstance(stale_grace_days, int) or isinstance(stale_grace_days, bool):
+            raise ConfigError(
+                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
+                f"must be an int, got {type(stale_grace_days).__name__}"
+            )
+        if stale_grace_days < 0:
+            raise ConfigError(
+                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
+                f"must be >= 0, got {stale_grace_days}"
+            )
+    # Parse preflight sub-section (issue #1363).
+    preflight_data = runtime_data.get("preflight")
+    if preflight_data is not None:
+        if not isinstance(preflight_data, dict):
+            raise ConfigError(
+                "config section 'runtime' key 'preflight' must be a mapping, "
+                f"got {type(preflight_data).__name__}"
+            )
+        preflight_fields = {f.name for f in fields(PreflightConfig)}
+        unknown_preflight_keys = sorted(set(preflight_data) - preflight_fields)
+        if unknown_preflight_keys:
+            raise ConfigError(
+                "config section 'runtime' key 'preflight' has unknown key(s): "
+                f"{', '.join(unknown_preflight_keys)} "
+                f"(valid: {', '.join(sorted(preflight_fields))})"
+            )
+        disk_floor_gb = preflight_data.get("disk_floor_gb")
+        if disk_floor_gb is not None:
+            if not isinstance(disk_floor_gb, int) or isinstance(disk_floor_gb, bool):
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.disk_floor_gb' must be an int, "
+                    f"got {type(disk_floor_gb).__name__}"
+                )
+            if disk_floor_gb < 0:
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.disk_floor_gb' must be >= 0, "
+                    f"got {disk_floor_gb}"
+                )
+        clock_max_skew_hours = preflight_data.get("clock_max_skew_hours")
+        if clock_max_skew_hours is not None:
+            if not isinstance(clock_max_skew_hours, (int, float)) or isinstance(
+                clock_max_skew_hours, bool
+            ):
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be a "
+                    f"number, got {type(clock_max_skew_hours).__name__}"
+                )
+            if clock_max_skew_hours < 0:
+                raise ConfigError(
+                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be >= 0, "
+                    f"got {clock_max_skew_hours}"
+                )
+        for bool_key in (
+            "disk_floor_fatal",
+            "clock_sanity_fatal",
+            "venv_identity_fatal",
+            "config_freshness_fatal",
+        ):
+            bool_value = preflight_data.get(bool_key)
+            if bool_value is not None and not isinstance(bool_value, bool):
+                raise ConfigError(
+                    f"config section 'runtime' key 'preflight.{bool_key}' must be a bool, "
+                    f"got {type(bool_value).__name__}"
+                )
+        runtime_data["preflight"] = PreflightConfig(**preflight_data)
     runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
     devin_data = _section(data, "devin")
     for command_key in ("dispatch_command", "shell_command"):

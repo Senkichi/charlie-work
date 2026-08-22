@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +15,8 @@ from .global_config import load_layered_config
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError, GitHubLike
-from .paths import RuntimePaths
+from .paths import RepoNotFoundError, RuntimePaths, find_repo_root
+from .safe_path import contains
 from .state import save_state, state_lock
 from .worker import iter_workers
 
@@ -22,6 +24,20 @@ if TYPE_CHECKING:
     from .config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _get_temp_dir() -> str:
+    """Return the system temp directory path (issue #1372).
+
+    This is a thin wrapper around ``tempfile.gettempdir()`` that exists so
+    tests can monkeypatch ``fleet_registry._get_temp_dir`` to redirect the
+    temp-dir containment check without patching the global ``tempfile``
+    module — which would break every test that calls
+    ``tempfile.mkdtemp()`` / ``NamedTemporaryFile`` (they resolve the temp
+    dir via ``gettempdir()`` and a redirected target may not exist on disk).
+    """
+    return tempfile.gettempdir()
+
 
 # Intra-process serialization for try_acquire_fleet_lock.
 #
@@ -71,6 +87,21 @@ def _load_registry(fleet_json_path: Path) -> dict[str, Any]:
     data.setdefault("version", FLEET_REGISTRY_VERSION)
     data.setdefault("repos", {})
     return data
+
+
+def _resolved_canonical_root(path: Path) -> Path | None:
+    """Return the shared main worktree root for *path*, or ``None`` if not a git repo.
+
+    Wraps :func:`find_repo_root` so callers can distinguish "this path is a
+    live git worktree (here is its canonical root)" from "this path is no
+    longer a git repo" without handling :class:`RepoNotFoundError` at every
+    call site.  Used by :func:`touch_repo`'s sibling-clone repoint guard
+    (issue #1376).
+    """
+    try:
+        return find_repo_root(path, explicit=True)
+    except RepoNotFoundError:
+        return None
 
 
 def touch_repo(
@@ -130,6 +161,31 @@ def touch_repo(
     if dry_run:
         return _load_registry(fleet_json_path)
 
+    # Issue #1372: refuse to persist an entry whose repo_root resolves under
+    # the system temp directory. A repo that genuinely lives under %TEMP% is
+    # not a fleet lane — test fixtures and ad-hoc CLI invocations from pytest
+    # tmp_path land here, and persisting them pollutes the live registry with
+    # phantom entries whose paths vanish after the test run. This is
+    # defense-in-depth independent of test hygiene: the containment idiom
+    # (resolve both sides, then equality or is_relative_to) mirrors
+    # ci_fleet's safe_path so a junction under temp cannot sneak through.
+    #
+    # The temp root is resolved through the module-level ``_get_temp_dir()``
+    # helper rather than a bare ``tempfile.gettempdir()`` call so tests can
+    # monkeypatch ``fleet_registry._get_temp_dir`` without patching the global
+    # ``tempfile`` module (which would break every test that calls
+    # ``tempfile.mkdtemp()`` / ``NamedTemporaryFile``).
+    temp_root = Path(_get_temp_dir())
+    if contains(temp_root, repo_root):
+        logger.warning(
+            "Skipping fleet registration: repo_root %s resolves under the "
+            "system temp directory %s — a repo under the temp dir is not a "
+            "fleet lane (issue #1372).",
+            repo_root,
+            temp_root,
+        )
+        return _load_registry(fleet_json_path)
+
     # Issue #624: a virtualized fleet dir forks a private copy on this write,
     # so registering a repo would land where the fleet supervisor never reads.
     # Warn before the write; never block it.
@@ -156,6 +212,66 @@ def touch_repo(
             "first_seen": entry.get("first_seen", now) if entry else now,
             "last_seen": now,
         }
+
+        # Issue #1376: do not let a sibling clone repoint the canonical
+        # registry entry.  An unguarded command (merge-check, status,
+        # tripwire ack, ship-it, why-charlie-hate, ...) run from a sibling
+        # clone reaches touch_repo with the clone's own repo_root; blindly
+        # overwriting repo_root would point the fleet registry at the clone,
+        # and a subsequent verdict / merge-authorize / unescalate run from
+        # the TRUE canonical repo would then be *refused* by
+        # ``_assert_not_sibling_clone`` (the guard compares against a
+        # registry that now names the clone as canonical -- the refusal
+        # inverts and blocks the legitimate canonical repo instead of the
+        # sibling clone).  When the existing entry's repo_root is still a
+        # live git worktree whose canonical root differs from the incoming
+        # one, this is a sibling clone, not a moved repo -- the moved-repo
+        # case has the old root gone or no longer a git repo, so
+        # ``_resolved_canonical_root`` returns ``None`` and the repoint is
+        # allowed.  Keep the canonical repo_root / state_dir / config_path
+        # and bump ``last_seen`` only.  Cross-references #1372 (same week's
+        # registry-pollution issue: both are "operator/test context leaks
+        # into the live fleet registry surface" defects).
+        existing_root_str = entry.get("repo_root") if entry else None
+        # Cheap string-equality short-circuit (issue #1376 round-2 review):
+        # the steady-state case -- the canonical repo touching its own
+        # already-registered entry with the same ``repo_root`` string --
+        # is by far the most common path (nearly every CLI invocation).
+        # Skip the git-subprocess resolution in that case so the
+        # fleet-wide ``state_lock`` is not held across 2-3 ``git`` calls
+        # for a repoint that cannot be happening.  Only when the incoming
+        # ``repo_root`` string actually differs from the registered one do
+        # we pay for ``_resolved_canonical_root`` to distinguish a sibling
+        # clone (old root still live) from a moved repo (old root gone).
+        # The short-circuit is safe as a *filter*: a false "differ"
+        # (strings differ but paths are canonically the same) falls
+        # through to the expensive but correct resolution, which is the
+        # original behavior -- never a regression.  A false "equal" is
+        # impossible because the stored value is itself ``str(repo_root)``
+        # from a prior write (line above), so equal strings mean the same
+        # path was registered.
+        if existing_root_str and existing_root_str != str(repo_root):
+            normalized_existing = _resolved_canonical_root(Path(existing_root_str))
+            if normalized_existing is not None and normalized_existing != repo_root:
+                logger.warning(
+                    "touch_repo: refusing to repoint %s registry entry from "
+                    "%s to %s -- the existing root is still a live git repo, "
+                    "so this looks like a sibling clone, not a move "
+                    "(issue #1376). Keeping the canonical root; only bumping "
+                    "last_seen.",
+                    name_with_owner,
+                    existing_root_str,
+                    repo_root,
+                )
+                updated_entry = {
+                    "repo_root": existing_root_str,
+                    "name_with_owner": name_with_owner,
+                    "config_path": entry.get("config_path")
+                    or str(Path(existing_root_str) / DEFAULT_CONFIG_FILENAME),
+                    "state_dir": entry.get("state_dir") or str(paths.root),
+                    "first_seen": entry.get("first_seen", now),
+                    "last_seen": now,
+                }
 
         repos[name_with_owner] = updated_entry
         data["repos"] = repos

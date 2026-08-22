@@ -233,6 +233,15 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
             "reviewed_head_sha": "abc123",
         }
         save_state(paths.state_file, state)
+        # Issue #1362 Stage 1: control-flow reads of the review decision go
+        # through the file-first reader now, not state.json's decision
+        # field -- the flat file must exist and agree with the fixture above.
+        pr_dir = paths.prs / "pr-100"
+        pr_dir.mkdir(parents=True, exist_ok=True)
+        (pr_dir / "review-decision.json").write_text(
+            json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+            encoding="utf-8",
+        )
         return paths.state_file
 
     class FakeGitHubForOrphan(FakeGitHub):

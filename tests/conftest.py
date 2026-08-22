@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tempfile as _tempfile_module
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,14 @@ from unittest.mock import create_autospec
 
 import pytest
 
+from charlie_work.preflight import PreflightResult
 
 _UNSET = object()
+
+# Issue #1372: save the real tempfile.gettempdir before any autouse fixture
+# patches it. Tests that specifically exercise touch_repo's temp-dir backstop
+# restore this via ``monkeypatch.setattr(tempfile, "gettempdir", _real_gettempdir)``.
+_real_gettempdir = _tempfile_module.gettempdir
 
 
 def autospec_patch(
@@ -103,6 +110,40 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.fixture(autouse=True)
+def _redirect_temp_dir_for_touch_repo_backstop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Redirect ``fleet_registry._get_temp_dir`` so ``touch_repo``'s temp-dir
+    backstop (issue #1372) does not reject ``tmp_path``-based repo_roots in
+    tests that exercise ``touch_repo``'s core functionality (first_seen/
+    last_seen, moved repo, gh error, etc.).
+
+    pytest's ``tmp_path`` is under the real ``%TEMP%``, so without this
+    redirect every existing ``touch_repo`` test would hit the backstop and
+    silently skip the write — the test would pass vacuously instead of
+    exercising the registration logic. The backstop itself is tested directly
+    in ``test_issue_1372_fleet_registry_stale.py`` with the real
+    ``tempfile.gettempdir`` (restored by monkeypatching
+    ``fleet_registry._get_temp_dir`` back to ``_real_gettempdir``).
+
+    The redirect is scoped to ``fleet_registry._get_temp_dir`` only — the
+    helper exists specifically so tests can redirect the backstop's view of
+    the temp dir without patching the global ``tempfile.gettempdir``, which
+    would break every test that calls ``tempfile.mkdtemp()`` /
+    ``NamedTemporaryFile`` (they resolve the temp dir via ``gettempdir()``
+    and the redirect target does not exist on disk).
+
+    The redirect points to ``tmp_path / "__system_temp__"`` — a sibling of
+    typical ``tmp_path / "repo"`` repo_roots, not a parent — so
+    ``contains(temp_root, repo_root)`` correctly returns False and the
+    backstop does not fire.
+    """
+    from charlie_work import fleet_registry
+
+    monkeypatch.setattr(fleet_registry, "_get_temp_dir", lambda: str(tmp_path / "__system_temp__"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ambient_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """Strip ambient credential env vars so no test's premise depends on what
     happens to be set on the host.
@@ -164,3 +205,43 @@ def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     import charlie_work.pr_create_retry as pr_create_retry_module
 
     monkeypatch.setattr(pr_create_retry_module, "_default_sleep", lambda seconds: None)
+
+
+def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:
+    return PreflightResult(checks=())
+
+
+@pytest.fixture(autouse=True)
+def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #1363: default every test to a healthy ``run_preflight`` result.
+
+    The preflight gate wired into ``OrchestratorApp._loop_impl`` and
+    ``fleet_dispatch.run_fleet_supervise`` (``charlie_work.workflow.run_preflight``
+    and ``charlie_work.fleet_dispatch.run_preflight`` respectively -- each module
+    imported its own reference, so both must be patched independently) inspects
+    the REAL host: free disk space, ``sys.executable``'s location relative to a
+    conventional ``.venv``, ``charlie_work.__file__``'s location, and
+    ``state.json``'s mtime versus wall clock. That is exactly the point of the
+    check in production, but it means every pre-existing test that drives
+    ``OrchestratorApp(...).loop()`` or ``run_fleet_supervise(...)`` -- none of
+    which exist to test host preconditions -- would otherwise pass or fail
+    depending on incidental facts about whichever machine/venv/checkout layout
+    pytest happens to run under. Worktree-based local test runs in particular
+    put ``sys.executable`` under a DIFFERENT checkout's venv than
+    ``charlie_work.__file__`` resolves to, by deliberate project convention
+    (see CLAUDE.md's Worktree Discipline section) -- which is indistinguishable,
+    to this check, from the real wrong-venv bug class it exists to catch.
+    Confirmed by measurement: leaving ``fleet_dispatch``'s reference unpatched
+    made every ``test_run_fleet_supervise_*``/``test_supervisor_lifecycle_*``
+    test fail, and that failure's early return without the normal lock
+    teardown cascaded into unrelated ``test_cli.py`` fleet-registry pollution.
+
+    Tests that target the preflight gate's OWN wiring re-monkeypatch
+    ``run_preflight`` inside their own test body via the same ``monkeypatch``
+    fixture instance, which cleanly overrides this default for the duration of
+    that one test (`test_charlie_work.py`'s two dedicated wiring tests;
+    `test_supervise_loop.py`'s tests script the subprocess boundary directly
+    and never import either module).
+    """
+    monkeypatch.setattr("charlie_work.workflow.run_preflight", _healthy_preflight)
+    monkeypatch.setattr("charlie_work.fleet_dispatch.run_preflight", _healthy_preflight)

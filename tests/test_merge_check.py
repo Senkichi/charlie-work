@@ -94,7 +94,14 @@ def test_merge_check_rejects_approval_at_stale_head(tmp_path: Path) -> None:
 
 
 def test_merge_check_rejects_malformed_decision(tmp_path: Path) -> None:
-    """Unparseable state fails closed rather than laundering uncertainty."""
+    """Unparseable state fails closed rather than laundering uncertainty.
+
+    Issue #1362 Stage 1: a corrupt flat file with no round-archive fallback
+    now resolves to the same "missing" sentinel as no file at all
+    (review_decision.resolve_decision_payload), so this reports "no_decision"
+    rather than the old distinct "invalid_decision" reason -- the
+    authorization outcome (fails closed) is unchanged.
+    """
     app, _, _ = _merge_check_app(tmp_path)
     decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
     decision_dir.mkdir(parents=True)
@@ -103,7 +110,7 @@ def test_merge_check_rejects_malformed_decision(tmp_path: Path) -> None:
     result = app.merge_check(456)
 
     assert result.ok is False
-    assert result.data["reason"] == "invalid_decision"
+    assert result.data["reason"] == "no_decision"
 
 
 def test_merge_check_authorizes_approved_at_current_head(tmp_path: Path) -> None:
