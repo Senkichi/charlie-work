@@ -38934,14 +38934,18 @@ def test_fleet_status_isolates_broken_repo(
     args = cli.build_parser().parse_args(["fleet", "status"])
     result = cli.run_fleet_status(args)
 
-    # Verify error isolation
-    assert result.ok is False  # Errors present
-    assert "1 repo(s), 1 error(s)" in result.message
+    # Issue #1372: a repo whose repo_root does not exist is STALE, not a live
+    # failing lane. It is reported in a separate "stale" list that does NOT
+    # flip ok/exit-code, so one corpse cannot degrade fleet-wide tooling.
+    assert result.ok is True  # Stale entries do not flip the exit code
+    assert "1 repo(s)" in result.message
+    assert "1 stale(s)" in result.message
     assert len(result.data["repos"]) == 1
     assert "owner/repo_valid" in result.data["repos"]
-    assert len(result.data["errors"]) == 1
-    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
-    assert "does not exist" in result.data["errors"][0]["error"]
+    # The broken repo is in stale, not errors.
+    assert len(result.data["errors"]) == 0
+    assert len(result.data["stale"]) == 1
+    assert result.data["stale"][0]["repo_key"] == "owner/repo_broken"
 
 
 def test_fleet_status_never_mutates(

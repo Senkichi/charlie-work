@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError, GitHubLike
 from .paths import RuntimePaths
+from .safe_path import contains
 from .state import save_state, state_lock
 from .worker import iter_workers
 
@@ -22,6 +24,20 @@ if TYPE_CHECKING:
     from .config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _get_temp_dir() -> str:
+    """Return the system temp directory path (issue #1372).
+
+    This is a thin wrapper around ``tempfile.gettempdir()`` that exists so
+    tests can monkeypatch ``fleet_registry._get_temp_dir`` to redirect the
+    temp-dir containment check without patching the global ``tempfile``
+    module — which would break every test that calls
+    ``tempfile.mkdtemp()`` / ``NamedTemporaryFile`` (they resolve the temp
+    dir via ``gettempdir()`` and a redirected target may not exist on disk).
+    """
+    return tempfile.gettempdir()
+
 
 # Intra-process serialization for try_acquire_fleet_lock.
 #
@@ -128,6 +144,31 @@ def touch_repo(
     # registry entry for this repo at the worktree path, and bump last_seen
     # so the real repo root looks stale. Return the current registry unchanged.
     if dry_run:
+        return _load_registry(fleet_json_path)
+
+    # Issue #1372: refuse to persist an entry whose repo_root resolves under
+    # the system temp directory. A repo that genuinely lives under %TEMP% is
+    # not a fleet lane — test fixtures and ad-hoc CLI invocations from pytest
+    # tmp_path land here, and persisting them pollutes the live registry with
+    # phantom entries whose paths vanish after the test run. This is
+    # defense-in-depth independent of test hygiene: the containment idiom
+    # (resolve both sides, then equality or is_relative_to) mirrors
+    # ci_fleet's safe_path so a junction under temp cannot sneak through.
+    #
+    # The temp root is resolved through the module-level ``_get_temp_dir()``
+    # helper rather than a bare ``tempfile.gettempdir()`` call so tests can
+    # monkeypatch ``fleet_registry._get_temp_dir`` without patching the global
+    # ``tempfile`` module (which would break every test that calls
+    # ``tempfile.mkdtemp()`` / ``NamedTemporaryFile``).
+    temp_root = Path(_get_temp_dir())
+    if contains(temp_root, repo_root):
+        logger.warning(
+            "Skipping fleet registration: repo_root %s resolves under the "
+            "system temp directory %s — a repo under the temp dir is not a "
+            "fleet lane (issue #1372).",
+            repo_root,
+            temp_root,
+        )
         return _load_registry(fleet_json_path)
 
     # Issue #624: a virtualized fleet dir forks a private copy on this write,
