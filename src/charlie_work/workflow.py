@@ -6933,6 +6933,7 @@ class OrchestratorApp:
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
+            branch_issue_validator=self._make_branch_issue_validator(),
         )
 
         # Issue #617: dry-run must short-circuit before the escalation check,
@@ -11384,6 +11385,7 @@ class OrchestratorApp:
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=self._make_branch_issue_validator(),
             )
             if pr
             else None
@@ -12941,6 +12943,7 @@ class OrchestratorApp:
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
+            branch_issue_validator=self._make_branch_issue_validator(),
         )
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
@@ -14148,6 +14151,7 @@ class OrchestratorApp:
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=self.config.dispatch.branch_prefix,
+            branch_issue_validator=self._make_branch_issue_validator(),
         )
         decision = self._review_decision(pr_number)
         approved = decision.get("decision") == "approved"
@@ -19246,11 +19250,18 @@ class OrchestratorApp:
             if self.config.auto_merge.update_branch_strategy == "front_of_train"
             else None
         )
+        # Issue #1229: validate branch-name-derived issue numbers against the
+        # actual open-issue set so a stale branch name (e.g. agent/issue-709-…
+        # left over from a merged PR #709, reused by an unrelated issue-less
+        # PR) cannot bind the PR to a non-existent or closed issue and corrupt
+        # state["issues"][<n>] with an unrelated rework episode.
+        branch_validator = self._make_branch_issue_validator()
         for pr in prs:
             issue_number = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             if issue_number is None:
                 continue
@@ -19766,11 +19777,13 @@ class OrchestratorApp:
         # here vs. later is the same GitHub call.
         prs = self.gh.pr_list()
         pr_by_issue: dict[int, dict[str, Any]] = {}
+        branch_validator = self._make_branch_issue_validator()
         for pr in prs:
             issue_number = linked_issue_number(
                 pr,
                 is_cross_repository=pr.get("isCrossRepository"),
                 branch_prefix=self.config.dispatch.branch_prefix,
+                branch_issue_validator=branch_validator,
             )
             if issue_number is not None:
                 # If multiple PRs link to the same issue, keep the lowest PR number
@@ -22154,6 +22167,40 @@ class OrchestratorApp:
 
     def _branch_name(self, issue: dict[str, Any]) -> str:
         return f"{self.config.dispatch.branch_prefix}-{int(issue['number'])}-{slugify(str(issue.get('title') or 'work'))}"
+
+    def _make_branch_issue_validator(self) -> Callable[[int], bool] | None:
+        """Build a validator for branch-name-derived issue numbers (issue #1229).
+
+        Returns a callable that returns True iff the given number corresponds
+        to a real *open* issue in this repo, or None when the open-issue list
+        cannot be fetched (API outage). Callers that receive None should pass
+        None to ``linked_issue_number``'s ``branch_issue_validator`` — the
+        function then trusts the branch-name binding unconditionally,
+        preserving the pre-#1229 behavior rather than blocking all rework
+        routing during a transient GitHub failure.
+
+        ``issue_list(state="open")`` is cached within a pass, so repeated
+        calls to this helper (e.g. from both ``merge_ready`` and
+        ``dispatch_rework`` in the same loop pass) share a single GitHub API
+        call. The list is capped at ``_LIST_LIMIT`` (500); a repo with more
+        open issues than the cap could see a false negative (a genuinely open
+        issue treated as absent), which is the safe direction — refusing a
+        branch-name binding never corrupts state, it only defers a rework
+        dispatch until the issue is confirmed by a closing keyword.
+        """
+        try:
+            open_issues = self.gh.issue_list(state="open")
+        except Exception:
+            # GitHubError (API outage), AttributeError (test fakes without
+            # issue_list), or any other transient failure — the safe
+            # direction is to skip validation (return None) so callers
+            # preserve the pre-#1229 branch-name trust behavior rather
+            # than crashing or blocking all rework routing.
+            return None
+        open_numbers = frozenset(
+            int(i["number"]) for i in open_issues if i.get("number") is not None
+        )
+        return lambda n: n in open_numbers
 
     def _render_issue_comments(self, issue: dict[str, Any]) -> str:
         """Render the ``$issue_comments`` slot for a worker prompt (issue #872).

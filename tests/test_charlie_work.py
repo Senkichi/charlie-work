@@ -47705,6 +47705,23 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     class FakeGitHubForOrphan(FakeGitHub):
+        def __init__(self):
+            super().__init__()
+            # Issue #457 must appear in issue_list() (the open-issue snapshot)
+            # as well as issue_view(), so the branch-issue validator added in
+            # issue #1229 accepts agent/issue-457 as a real open issue.
+            self.issues = [
+                *self.issues,
+                {
+                    "number": 457,
+                    "title": "Orphan drift test",
+                    "url": "https://example.test/issues/457",
+                    "body": "",
+                    "labels": [{"name": config.labels.needs_rework}],
+                    "state": "OPEN",
+                },
+            ]
+
         def pr_list(self):
             return [
                 {
@@ -47743,6 +47760,18 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
+
+    # Issue #1229: review_decision() reads from the file, not state.json.
+    # Without a review-decision.json file, last_decision is None, which
+    # routes through the #1128 pr-open transition instead of the
+    # dead_worker_unsafe_to_auto_reset drift path this test exercises.
+    # Write the file so last_decision is "approved" as the state entry implies.
+    pr_dir = paths.prs / "pr-100"
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "abc123"}),
+        encoding="utf-8",
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)

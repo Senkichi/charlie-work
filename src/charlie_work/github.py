@@ -6,7 +6,7 @@ import random
 import re
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -2245,6 +2245,7 @@ def linked_issue_number(
     *,
     is_cross_repository: bool | None,
     branch_prefix: str,
+    branch_issue_validator: Callable[[int], bool] | None = None,
 ) -> int | None:
     """Resolve the issue a PR is bound to, safe against hijack.
 
@@ -2266,6 +2267,18 @@ def linked_issue_number(
     false LABEL TRANSITION in charlie-work's own state machine; it has no
     effect on GitHub's own issue auto-close, which is a separate mechanism
     charlie-work does not control.
+
+    Issue #1229: ``branch_issue_validator``, when provided, is called with
+    the candidate issue number parsed from the branch name. If it returns
+    False (the number does not correspond to a real open issue), the
+    branch-name binding is rejected and the function falls through to the
+    closing-keyword path instead. This prevents a stale branch-name number
+    (e.g. a branch ``agent/issue-709-…`` left over from a merged issue/PR
+    #709, reused by an unrelated issue-less PR) from silently keying a
+    rework episode under ``state["issues"]["709"]`` and colliding with the
+    unrelated issue's lifecycle. When the validator is None (the default),
+    the branch-name binding is trusted unconditionally — preserving the
+    behavior of callers that do not need the validation.
     """
     # Cross-repo PRs or unknown provenance never bind for lifecycle purposes
     if is_cross_repository is True or is_cross_repository is None:
@@ -2277,9 +2290,17 @@ def linked_issue_number(
         # Only trust the branch ref when:
         # 1. PR is same-repo (is_cross_repository is not True)
         # 2. Branch starts with the configured prefix
+        # 3. (Issue #1229) The parsed number is a real open issue, when a
+        #    validator is supplied. Without a validator, trust unconditionally
+        #    to preserve existing caller behavior.
         has_correct_prefix = head.startswith(branch_prefix)
         if has_correct_prefix:
-            return int(match.group(1))
+            candidate = int(match.group(1))
+            if branch_issue_validator is None or branch_issue_validator(candidate):
+                return candidate
+            # Branch-name number is stale/unmatched — fall through to the
+            # closing-keyword path rather than binding to a non-existent or
+            # closed issue.
     # For same-repo PRs, trust closing keywords in title/body — but a
     # negated keyword ("does not fix #649") must not bind; see
     # `_first_unnegated_closing_keyword_match`.
