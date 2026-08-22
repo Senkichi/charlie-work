@@ -2541,6 +2541,50 @@ def test_read_only_command_skips_guard(monkeypatch: pytest.MonkeyPatch, tmp_path
     cli.build_app(args)
 
 
+def test_build_app_guard_no_attribute_error_when_command_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression test for build_app's guard-condition ordering (issue #1376).
+
+    ``build_app`` is called directly — outside the full argparse pipeline — by
+    tests and other callers that hand-build a ``Namespace`` without a
+    ``command`` attribute (e.g. ``test_cli_build_app_registers_repo`` in
+    ``test_charlie_work.py``).  The guard condition must not crash with
+    ``AttributeError`` on ``args.command`` for those callers.
+
+    The fix has two parts, both exercised here:
+    - ``args.repo is None`` is checked FIRST (cheap, always present), so when
+      ``--repo`` is explicit the ``and`` short-circuits before ``command`` is
+      touched.
+    - ``command`` is read via ``getattr(args, "command", None)`` so even when
+      ``repo`` is None the absent attribute yields ``None`` (not in
+      ``_STATE_AFFECTING_COMMANDS``) instead of raising.
+    """
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_ctx = cli.CommandContext(repo_root=tmp_path, config=config, paths=paths, gh=_FakeGitHub())
+    monkeypatch.setattr(cli, "bootstrap_command", lambda args: fake_ctx)
+    monkeypatch.setattr(cli, "touch_repo", lambda *a, **k: {})
+    monkeypatch.setattr(cli, "OrchestratorApp", lambda *a, **k: object())
+
+    def _guard_must_not_fire(ctx, args):  # noqa: ANN001
+        raise AssertionError("guard must not fire when command attribute is absent")
+
+    monkeypatch.setattr(cli, "_assert_not_sibling_clone", _guard_must_not_fire)
+
+    # Case 1: explicit --repo (repo is not None), no command attribute.
+    # The `args.repo is None` check short-circuits before `command` is read.
+    args_explicit = argparse.Namespace(repo=tmp_path, config=None, dry_run=False, fleet_dir=None)
+    # Must not raise AttributeError.
+    cli.build_app(args_explicit)
+
+    # Case 2: no --repo (repo is None), no command attribute.
+    # getattr(args, "command", None) returns None, not in _STATE_AFFECTING_COMMANDS.
+    args_no_repo = argparse.Namespace(repo=None, config=None, dry_run=False, fleet_dir=None)
+    # Must not raise AttributeError.
+    cli.build_app(args_no_repo)
+
+
 def test_verdict_round_trip_linked_worktree_to_canonical_merge_check(
     tmp_path: Path,
 ) -> None:
