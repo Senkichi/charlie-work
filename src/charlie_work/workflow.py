@@ -129,6 +129,7 @@ from .reconcile import (
     detect_aviator_stale_blocked,
     detect_drift,
     detect_mergequeue_not_approved,
+    detect_mergequeue_wedged,
 )
 from .review_decision import (
     ReviewDecision,
@@ -15528,6 +15529,26 @@ class OrchestratorApp:
             if merge_output:
                 prs_entry["status"] = "merged"
                 prs_entry["merged"] = True
+            # Issue #1401: track time-in-mergequeue for the wedge watchdog.
+            # ``mergequeue_since`` is the moment the PR entered Aviator's queue
+            # at its current head; ``mergequeue_head_sha`` is that head. A head
+            # advance (Aviator rebase) resets both, so the watchdog's
+            # time-in-queue trigger measures true no-progress dwell, not wall
+            # time since the first handoff. Cleared whenever the PR is not
+            # currently in mergequeue so a later re-entry starts a fresh window.
+            _current_head = pr.get("headRefOid")
+            if prs_entry.get("status") == "mergequeue" and _current_head:
+                if existing.get("mergequeue_head_sha") == _current_head and existing.get(
+                    "mergequeue_since"
+                ):
+                    prs_entry["mergequeue_since"] = existing["mergequeue_since"]
+                    prs_entry["mergequeue_head_sha"] = existing["mergequeue_head_sha"]
+                else:
+                    prs_entry["mergequeue_since"] = utc_now()
+                    prs_entry["mergequeue_head_sha"] = _current_head
+            else:
+                prs_entry.pop("mergequeue_since", None)
+                prs_entry.pop("mergequeue_head_sha", None)
             state["prs"][str(pr_number)] = prs_entry
             state = self._record_event(
                 state,
@@ -16418,6 +16439,9 @@ class OrchestratorApp:
                         + detect_mergequeue_not_approved(
                             self.gh, self.config, repo_root=self.repo_root
                         )
+                        + detect_mergequeue_wedged(
+                            self.gh, self.config, state, repo_root=self.repo_root
+                        )
                     )
                     fixed = False
                     post_fix_drift: list[DriftItem] = []
@@ -16449,6 +16473,9 @@ class OrchestratorApp:
                             )
                             + detect_mergequeue_not_approved(
                                 self.gh, self.config, repo_root=self.repo_root
+                            )
+                            + detect_mergequeue_wedged(
+                                self.gh, self.config, new_state, repo_root=self.repo_root
                             )
                         )
                         fixed = len(post_fix_drift) == 0

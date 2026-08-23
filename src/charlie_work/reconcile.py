@@ -30,7 +30,12 @@ from typing import Any
 
 from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
 from .config import DETERMINISTIC_ESCALATION_FAILURE_KINDS, OrchestratorConfig
-from .escalation import _escalation_edge, _escalation_label, _repair_reason_class
+from .escalation import (
+    _escalate_issue,
+    _escalation_edge,
+    _escalation_label,
+    _repair_reason_class,
+)
 from .github import (
     GitHubError,
     GitHubLike,
@@ -41,7 +46,7 @@ from .github import (
     linked_issue_number,
 )
 from .instrumentation import log_event, query_events
-from .labels import TransitionOutcome, transition
+from .labels import TransitionOutcome, _edges, transition
 from .paths import resolved_layout, runtime_paths
 from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
@@ -508,15 +513,10 @@ def detect_aviator_stale_blocked(
 
         # Multiple check-run entries can exist per name after a rerun; the
         # highest numeric "id" is the most recent (GitHub assigns check-run
-        # ids monotonically per repo) -- never trust list order.
-        latest_by_name: dict[str, dict[str, Any]] = {}
-        for run in check_runs:
-            name = run.get("name")
-            if not name:
-                continue
-            current = latest_by_name.get(name)
-            if current is None or int(run.get("id") or 0) > int(current.get("id") or 0):
-                latest_by_name[name] = run
+        # ids monotonically per repo) -- never trust list order. Shared with
+        # detect_mergequeue_wedged so the two detectors cannot disagree about
+        # which run is current for a given name.
+        latest_by_name = _latest_check_runs_by_name(check_runs)
 
         aviator_run = latest_by_name.get(AVIATOR_CHECK_NAME)
         if aviator_run is None or aviator_run.get("conclusion") != "failure":
@@ -740,6 +740,182 @@ def detect_mergequeue_not_approved(
                 ),
                 fix_actions=(f"remove label {mergequeue_label!r} from PR #{pr_number}",),
                 remove_labels=(mergequeue_label,),
+            )
+        )
+    return drift
+
+
+def _latest_check_runs_by_name(
+    check_runs: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Reduce a ``commit_check_runs`` list to the most recent run per name.
+
+    Multiple check-run entries can exist per name after a rerun; the highest
+    numeric ``id`` is the most recent (GitHub assigns check-run ids
+    monotonically per repo) -- never trust list order. Mirrors the inline
+    reduction in ``detect_aviator_stale_blocked``; extracted here so the wedge
+    watchdog and the stale-blocked detector cannot disagree about which run is
+    current for a given name.
+    """
+    latest_by_name: dict[str, dict[str, Any]] = {}
+    for run in check_runs:
+        name = run.get("name")
+        if not name:
+            continue
+        current = latest_by_name.get(name)
+        if current is None or int(run.get("id") or 0) > int(current.get("id") or 0):
+            latest_by_name[name] = run
+    return latest_by_name
+
+
+def detect_mergequeue_wedged(
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    state: dict[str, Any],
+    *,
+    repo_root: Path | None = None,  # noqa: ARG001 -- signature parity with siblings
+) -> list[DriftItem]:
+    """Detect PRs wedged in Aviator's merge queue and route them to escalation.
+
+    Issue #1401: a PR handed to Aviator (carrying the ``mergequeue`` label) can
+    sit in the queue indefinitely with no progress, yet stay invisible after
+    its first ``merge_failed_attempt_alarm``. That alarm is one-shot at
+    ``consecutive_failed_merge_attempts == threshold`` and the counter resets
+    to 0 on any ``can_merge`` pass, so a PR alternating can_merge true/false --
+    or one Aviator itself keeps failing -- never re-crosses the threshold.
+    Live case: job-cannon PR #1751 carried ``mergequeue`` for 28+ hours with
+    Aviator's own ``blocked`` label and a completed ``aviator/checks`` FAILURE,
+    ``merge_ready`` firing ~280 times without merging, exactly one alarm ever.
+
+    Two independent triggers, OR'd:
+
+    1. **Aviator definitive failure** (the #1751 shape): the PR carries
+       ``mergequeue`` AND Aviator's own ``blocked`` label while
+       ``aviator/checks`` is a completed ``FAILURE``. This is a terminal
+       "Aviator will not merge this" signal, not a heuristic, so it has no
+       time floor. Deliberately gated on NOT all-other-checks-green: when every
+       non-aviator check is green the ``blocked`` label is STALE (Aviator just
+       has not re-evaluated), which is ``detect_aviator_stale_blocked``'s
+       recovery case (remove ``blocked``, re-queue) -- escalating there too
+       would re-queue AND escalate the same PR in one pass. The genuine-failure
+       case (a real non-aviator check is red) is the one with no recovery path,
+       which is exactly what this trigger is for. ``detect_aviator_stale_blocked``
+       correctly does not fire on #1751 because its ``other_checks_green``
+       gate fails; this function is the missing escalation route for that gap.
+
+    2. **Time-in-queue with no head movement**: the PR has carried
+       ``mergequeue`` for more than ``auto_merge.mergequeue_wedge_hours`` hours
+       with no head movement (Aviator never rebased it) and no merge. Dwell is
+       measured from the ``mergequeue_since``/``mergequeue_head_sha`` fields
+       ``merge_ready`` stamps in ``state["prs"][n]`` when a PR enters the queue
+       at a given head; a head advance (Aviator rebase) resets both, so the
+       timer measures true no-progress dwell, not wall time since the first
+       handoff. ``mergequeue_wedge_hours == 0`` disables this trigger only;
+       trigger 1 stays armed.
+
+    Both triggers route to the same escalation: strip ``mergequeue`` from the
+    PR and, when a linked issue is resolvable, transition the issue to
+    ``human_needed`` (the canonical "escalated" edge). ``apply_fixes`` clears
+    the dwell-tracking fields so the post-fix re-detect does not re-fire
+    trigger 2 for the same window.
+
+    Like ``detect_aviator_stale_blocked``/``detect_mergequeue_not_approved``,
+    deliberately NOT folded into ``detect_drift``: that function's contract
+    pins it to exactly two ``gh.run`` list calls, and the Aviator-failure
+    trigger needs a per-PR ``commit_check_runs`` walk gated on the (rare)
+    ``blocked`` label. The cost scales with how many PRs are actually stuck,
+    not the full open-PR count.
+    """
+    mergequeue_label = config.auto_merge.mergequeue_label
+    if not mergequeue_label:
+        return []
+    wedge_hours = config.auto_merge.mergequeue_wedge_hours
+    drift: list[DriftItem] = []
+    prs_state = state.get("prs", {})
+    now = datetime.now(UTC)
+    for pr in _fetch_prs(gh):
+        if str(pr.get("state") or "").upper() != "OPEN":
+            continue
+        names = label_names(pr)
+        if mergequeue_label not in names:
+            continue
+        pr_number = pr.get("number")
+        head_sha = pr.get("headRefOid")
+        if pr_number is None or not head_sha:
+            continue
+        pr_number = int(pr_number)
+        head_sha = str(head_sha)
+
+        wedge_reason: str | None = None
+        # Trigger 1: Aviator definitive failure. Only walk check runs when the
+        # PR also carries Aviator's ``blocked`` label (rare in steady state),
+        # matching detect_aviator_stale_blocked's cost discipline.
+        if "blocked" in names:
+            check_runs = gh.commit_check_runs(head_sha)
+            if check_runs:
+                latest_by_name = _latest_check_runs_by_name(check_runs)
+                aviator_run = latest_by_name.get(AVIATOR_CHECK_NAME)
+                if aviator_run is not None and aviator_run.get("conclusion") == "failure":
+                    other_checks_green = all(
+                        run.get("conclusion") == "success"
+                        for name, run in latest_by_name.items()
+                        if name != AVIATOR_CHECK_NAME
+                    )
+                    if not other_checks_green:
+                        wedge_reason = "aviator_failure"
+
+        # Trigger 2: time-in-queue with no head movement.
+        if wedge_reason is None and wedge_hours > 0:
+            pr_entry = prs_state.get(str(pr_number), {})
+            mq_since = pr_entry.get("mergequeue_since")
+            mq_head = pr_entry.get("mergequeue_head_sha")
+            if mq_since and mq_head == head_sha:
+                try:
+                    since_dt = datetime.fromisoformat(str(mq_since))
+                except (ValueError, TypeError):
+                    since_dt = None
+                if since_dt is not None:
+                    if since_dt.tzinfo is None:
+                        since_dt = since_dt.replace(tzinfo=UTC)
+                    dwell_hours = (now - since_dt).total_seconds() / 3600.0
+                    if dwell_hours > wedge_hours:
+                        wedge_reason = "time_in_queue"
+
+        if wedge_reason is None:
+            continue
+
+        issue_number = linked_issue_number(
+            pr,
+            is_cross_repository=pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        fix_actions: list[str] = [f"remove label {mergequeue_label!r} from PR #{pr_number}"]
+        add_labels: tuple[str, ...] = ()
+        if issue_number is not None:
+            fix_actions.append(f"escalate issue #{issue_number} to {config.labels.human_needed!r}")
+            add_labels = (config.labels.human_needed,)
+        if wedge_reason == "aviator_failure":
+            detail = (
+                f"PR #{pr_number} is wedged in Aviator's merge queue: it carries both "
+                f"{mergequeue_label!r} and Aviator's 'blocked' label with "
+                f"{AVIATOR_CHECK_NAME} completed FAILURE and a genuinely failing "
+                "non-aviator check; escalating to a human (issue #1401)"
+            )
+        else:
+            detail = (
+                f"PR #{pr_number} has carried {mergequeue_label!r} for more than "
+                f"{wedge_hours}h with no head movement and no merge; escalating to a "
+                "human (issue #1401)"
+            )
+        drift.append(
+            DriftItem(
+                kind="mergequeue_wedged",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                detail=detail,
+                fix_actions=tuple(fix_actions),
+                remove_labels=(mergequeue_label,),
+                add_labels=add_labels,
             )
         )
     return drift
@@ -2402,6 +2578,75 @@ def apply_fixes(
                         remove_labels=item.remove_labels,
                         add_labels=item.add_labels,
                     )
+
+        elif item.kind == "mergequeue_wedged":
+            # Issue #1401: a PR wedged in Aviator's merge queue is pulled out
+            # of the queue (strip the PR-level mergequeue label) and, when a
+            # linked issue is resolvable, escalated to a human. The issue
+            # state write goes through ``_escalate_issue`` (the single helper
+            # that owns the ``status="escalated"`` literal + the paired
+            # ``escalation_reason``/``reason_class``/``terminal_since``
+            # fields), and the issue label changes go through
+            # ``gh.add_issue_label``/``gh.remove_issue_label`` directly rather
+            # than ``transition()`` -- ``transition`` is a WriteGate-gated
+            # primitive (issue #1264 R9 ratchet) and ``apply_fixes`` is not a
+            # WriteGate consumer. The add/remove sets are still derived from
+            # the same ``_edges(config.labels)`` table ``transition`` uses, so
+            # the label disposition is identical; only the call path differs.
+            # The dwell-tracking fields (mergequeue_since/mergequeue_head_sha)
+            # are cleared so the post-fix re-detect does not re-fire the
+            # time-in-queue trigger for the same window.
+            fix_actions = list(item.fix_actions)
+            if item.pr_number is not None:
+                label_ok = True
+                for label in item.remove_labels:
+                    if not gh.remove_pr_label(item.pr_number, label):
+                        label_ok = False
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+                pr_key = str(item.pr_number)
+                existing_pr = new_prs.get(pr_key, {})
+                if existing_pr:
+                    new_prs[pr_key] = {
+                        k: v
+                        for k, v in existing_pr.items()
+                        if k not in ("mergequeue_since", "mergequeue_head_sha")
+                    }
+            if item.issue_number is not None:
+                # Escalate the issue state through the canonical helper.
+                # ``pr_number=None`` so the helper does not overwrite the PR
+                # state -- the PR keeps its current status with only the
+                # dwell-tracking fields cleared above; the issue is what gets
+                # escalated.
+                _escalate_issue(
+                    new_state,
+                    item.issue_number,
+                    reason="mergequeue_wedged",
+                    reason_class="judgment",
+                )
+                # Apply the "escalated" edge's label changes directly (add
+                # human_needed, remove all other workflow labels) without
+                # calling the gated ``transition`` primitive.
+                edge = _escalation_edge("escalated", "judgment")
+                add_set, remove_set = _edges(config.labels)[edge]
+                label_ok = True
+                for label in add_set:
+                    if not gh.add_issue_label(item.issue_number, label):
+                        label_ok = False
+                for label in remove_set:
+                    if not gh.remove_issue_label(item.issue_number, label):
+                        label_ok = False
+                if not label_ok:
+                    fix_actions.append("label_write_failed: true")
+            item = DriftItem(
+                kind=item.kind,
+                issue_number=item.issue_number,
+                pr_number=item.pr_number,
+                detail=item.detail,
+                fix_actions=tuple(fix_actions),
+                remove_labels=item.remove_labels,
+                add_labels=item.add_labels,
+            )
 
         elif item.kind == "stale_dispatch_pending_claim":
             if item.issue_number is not None:
