@@ -131,7 +131,7 @@ def test_dispatch_sessions_claude_code_propagates_worktree_unsafe(
     the fix/verification must not be conflict-specific."""
 
     def _unsafe_error() -> WorktreeUnsafeError:
-        return WorktreeUnsafeError("worktree contains local work")
+        return WorktreeUnsafeError("worktree has uncommitted modifications")
 
     monkeypatch.setattr(
         claude_code, "create_worktree", _fake_create_worktree_raising(_unsafe_error)
@@ -152,10 +152,12 @@ def test_dispatch_sessions_claude_code_propagates_worktree_unsafe(
 
     assert results[0].ok is False
     # Issue #807: ``WorktreeUnsafeError`` now carries a discriminator (shim
-    # dirt vs local commits) derived from the reason string. "worktree
-    # contains local work" does not mention "local commit", so it classifies
-    # as shim dirt — the mechanical kind that stays in
-    # DETERMINISTIC_ESCALATION_FAILURE_KINDS.
+    # dirt vs local commits) derived from the reason string. "worktree has
+    # uncommitted modifications" is the actual raise-site string for shim
+    # dirt, so it classifies as the mechanical kind that stays in
+    # DETERMINISTIC_ESCALATION_FAILURE_KINDS. (An unrecognized reason string
+    # now fails closed to ``worktree_unsafe_local_commits`` instead — see
+    # test_worktree_unsafe_kind_fallback_is_local_commits_not_shim_dirt.)
     assert results[0].failure_kind == "worktree_unsafe_shim_dirt"
 
 

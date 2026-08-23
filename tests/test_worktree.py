@@ -25,6 +25,8 @@ from charlie_work.worktree import (
     RESCUE_REF_PREFIX,
     RescueCapture,
     WORKTREE_UNSAFE_KINDS,
+    WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
+    WORKTREE_UNSAFE_KIND_SHIM_DIRT,
     WorktreeCleanResult,
     WorktreeCleanGH,
     WorktreeInfo,
@@ -48,6 +50,7 @@ from charlie_work.worktree import (
     _restore_declared_scaffolding_modifications,
     _worker_authored_dirty,
     _worktree_refuse_to_reset_reason,
+    _worktree_unsafe_kind_from_reason,
     clean_worktrees,
     create_review_checkout,
     create_worktree,
@@ -7649,6 +7652,42 @@ def test_worktree_unsafe_error_derived_kind_is_always_a_known_kind() -> None:
     fail-closed fallback), never an unrecognized or empty kind."""
     exc = WorktreeUnsafeError("worktree is in an unexpected state")
     assert exc.kind in WORKTREE_UNSAFE_KINDS
+
+
+def test_worktree_unsafe_kind_fallback_is_local_commits_not_shim_dirt() -> None:
+    """Issue #807 rework: a reason string that matches neither known pattern
+    must fail closed toward ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` (judgment /
+    human-needed), NOT ``WORKTREE_UNSAFE_KIND_SHIM_DIRT`` (mechanical /
+    auto-clearable). Defaulting an unrecognized reason to the mechanical kind
+    inverts this codebase's fail-closed convention and could silently reproduce
+    the #807 bug for any future reason string that doesn't match the
+    'local commit' or 'uncommitted modifications' substring checks — the
+    de-escalation sweep would auto-clear it and return the issue to dispatch
+    instead of escalating to a human.
+    """
+    # Direct function-level assertion on the fallback path.
+    assert (
+        _worktree_unsafe_kind_from_reason("worktree is in an unexpected state")
+        == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    )
+    # End-to-end through WorktreeUnsafeError construction.
+    exc = WorktreeUnsafeError("worktree is in an unexpected state")
+    assert exc.kind == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+
+
+def test_worktree_unsafe_kind_shim_dirt_reason_classifies_as_shim_dirt() -> None:
+    """Issue #807 rework: the 'uncommitted modifications' reason string (shim /
+    adapter dirt) must still classify as ``WORKTREE_UNSAFE_KIND_SHIM_DIRT``
+    after the fallback was flipped to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS``.
+    This guards against the fallback-flip silently misclassifying shim dirt as
+    a judgment call, which would make every shim-dirt escalation
+    non-auto-clearable."""
+    assert (
+        _worktree_unsafe_kind_from_reason("worktree has uncommitted modifications")
+        == WORKTREE_UNSAFE_KIND_SHIM_DIRT
+    )
+    exc = WorktreeUnsafeError("worktree has uncommitted modifications")
+    assert exc.kind == WORKTREE_UNSAFE_KIND_SHIM_DIRT
 
 
 # --- Issue #849: rescue capture makes worktree_unsafe refusal recoverable ---

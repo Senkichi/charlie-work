@@ -87,13 +87,22 @@ def _worktree_unsafe_kind_from_reason(reason: str) -> str:
     The reason strings are produced by ``_worktree_refuse_to_reset_reason``
     and ``_worktree_dirty_reason``. "uncommitted modifications" denotes
     shim/adapter dirt (mechanical); "local commit(s)" denotes genuine
-    divergence (judgment). A reason that matches neither defaults to
-    ``WORKTREE_UNSAFE_KIND_SHIM_DIRT`` — the historically safe classification
-    — rather than silently dropping the escalation.
+    divergence (judgment). A reason that matches neither known pattern
+    defaults to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` — the fail-closed
+    classification toward judgment/human-needed — so a future reason
+    string that doesn't match either pattern escalates as a judgment
+    call rather than being silently treated as mechanical and
+    auto-cleared (which would reproduce the #807 bug the split exists to
+    prevent). This mirrors the fail-closed convention already enforced
+    for an unrecognized explicit ``kind`` in ``WorktreeUnsafeError.__init__``
+    and for an unrecognized ``reason_class`` in
+    ``state.escalation_reason_class``.
     """
     if "local commit" in reason:
         return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
-    return WORKTREE_UNSAFE_KIND_SHIM_DIRT
+    if "uncommitted modifications" in reason:
+        return WORKTREE_UNSAFE_KIND_SHIM_DIRT
+    return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
 
 
 class WorktreeUnsafeError(RuntimeError):
