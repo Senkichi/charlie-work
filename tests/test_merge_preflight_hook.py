@@ -650,10 +650,15 @@ def test_claude_settings_wires_merge_preflight_hook() -> None:
 
     module_ref = f"-m {hook.__name__}"
     for matcher, entry in matchers.items():
+        # The Bash matcher may carry additional PreToolUse hooks (e.g. the
+        # git-push lint hook, #1309); find the merge_preflight_hook among
+        # them rather than assuming it is the only one.
         command_hooks = entry["hooks"]
-        assert len(command_hooks) == 1
-        command_hook = command_hooks[0]
+        merge_hooks = [h for h in command_hooks if module_ref in h.get("command", "")]
+        assert len(merge_hooks) == 1, (
+            f"{matcher} matcher must wire exactly one {module_ref} hook, got {len(merge_hooks)}"
+        )
+        command_hook = merge_hooks[0]
         assert command_hook["type"] == "command"
         command = command_hook["command"]
-        assert module_ref in command, f"{matcher} hook does not invoke {module_ref!r}"
         assert command.strip().endswith("|| true"), f"{matcher} hook must fail open on crash"
