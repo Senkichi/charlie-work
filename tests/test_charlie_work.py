@@ -7030,19 +7030,21 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
 def test_check_carry_forward_tier1_whitespace_collision_bypasses_tier2(
     tmp_path: Path,
 ) -> None:
-    """Issue #634 audit rework: ``git patch-id --stable`` strips leading
-    whitespace from ``+``/``-`` content lines, so two diffs that differ ONLY
-    in indentation depth produce the identical patch-id.  The tier-1 fast
-    path in ``_check_carry_forward`` (workflow.py:17333-17334) matches on
-    that hash and returns ``"patch-id"`` immediately — it never falls through
-    to the tier-2 line-content signature, which DOES preserve whitespace and
-    WOULD distinguish the two diffs.
+    """Issue #1187 (audit #634 rework): ``git patch-id --stable`` strips
+    leading whitespace from ``+``/``-`` content lines, so two diffs that
+    differ ONLY in indentation depth produce the identical patch-id.  The
+    tier-1 fast path in ``_check_carry_forward`` previously matched on that
+    hash and returned ``"patch-id"`` immediately — it never consulted the
+    tier-2 line-content signature, which DOES preserve whitespace and WOULD
+    distinguish the two diffs.
 
     In Python, an indentation-only change can alter control flow (e.g. moving
     a ``return`` into or out of an ``if`` block).  Carrying forward an
     approved verdict across such a change without review is a review-gate
-    bypass.  This test documents the vulnerability; the fix is tracked as a
-    follow-up (see audit doc and PR body).
+    bypass.  After the fix, the tier-1 patch-id match is no longer
+    sufficient: the tier-2 line-content signature is also validated, and
+    when it differs (a whitespace-only change that patch-id collapsed) the
+    carry-forward is REFUSED — the verdict is reported stale.
     """
     from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
 
@@ -7130,22 +7132,23 @@ def test_check_carry_forward_tier1_whitespace_collision_bypasses_tier2(
     result = app.review_queue()
 
     assert result.ok is True
-    assert result.data["queue"] == [], (
-        "the verdict was carried forward (not reported stale) — this is "
-        "the vulnerability: tier-1 patch-id match short-circuits before "
-        "tier-2 can reject the whitespace-only change"
+    assert result.data["queue"] != [], (
+        "the verdict must NOT be carried forward across an "
+        "indentation-only change — tier-2 signature differs, so the "
+        "verdict is reported stale for re-review"
     )
 
     decision = json.loads(
         (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
     )
-    assert decision["reviewed_head_sha"] == new_head, (
-        "the approved verdict was carried forward to the reindented head "
-        "without review — the review-gate bypass"
+    assert decision["reviewed_head_sha"] == old_head, (
+        "the approved verdict must NOT be carried forward to the "
+        "reindented head — the review-gate bypass is closed"
     )
-    assert decision["carry_forward_tier"] == "patch-id", (
-        "carry-forward was via tier-1 (patch-id), NOT tier-2 (line-content) "
-        "— tier-2 was never consulted because tier-1 short-circuited"
+    assert decision.get("carry_forward_tier") != "patch-id", (
+        "carry-forward must not be via tier-1 (patch-id) when the tier-2 "
+        "line-content signature differs — the whitespace collision is "
+        "detected and the verdict is refused"
     )
 
 
