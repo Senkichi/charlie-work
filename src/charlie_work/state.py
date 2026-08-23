@@ -237,6 +237,13 @@ DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS: frozenset[str] = frozenset(
         # which never sets status "escalated". The kind alone never
         # identifies an escalation transition.
         "ci_run_never_created",
+        # Issue #1131: a rework-label skip diagnostic, not an escalation
+        # transition. Emitted inside ``record_review`` (which does perform
+        # escalation elsewhere), so the AST-based discovery in
+        # ``test_deescalation.py`` picks it up -- but the kind alone never
+        # identifies an escalation: it fires when rework routing is
+        # suppressed for a CLOSED issue, the opposite of an escalation.
+        "rework_label_skipped_issue_closed",
     }
 )
 
