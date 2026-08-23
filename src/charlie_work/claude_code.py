@@ -103,6 +103,32 @@ _PROVIDER_AUTH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern for provider account suspension / insufficient-balance responses
+# (issue #1342). Matched against the log tail of api-kind sessions only — a
+# suspended provider account (e.g. Moonshot "suspended due to insufficient
+# balance, please recharge your account") is a TERMINAL billing failure that
+# will not self-heal in minutes, so it must NOT enter the rate-limit backoff
+# loop. It is classified as ``provider_suspended`` with NO cooldown (terminal),
+# and ``provider_suspended`` sits in
+# ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS`` so the issue escalates to
+# an operator on the first occurrence instead of burning the redispatch cap.
+#
+# Matched by response semantics (HTTP status + error code/message the provider
+# documents), not a brittle full-string comparison: the canonical billing-
+# suspension signals across Anthropic-compatible providers are
+# "insufficient balance/funds/credit", "account (is) suspended" (with billing
+# context), and "recharge your account". These are distinct from the
+# provider-auth pattern (401/403/invalid-key — a credential problem) and the
+# quota-exhaustion pattern ("usage limit" — a usage-ceiling problem).
+_PROVIDER_SUSPENDED_PATTERN = re.compile(
+    r"insufficient\s+(?:balance|funds|credit)"
+    r"|account\s+(?:is\s+)?suspended"
+    r"|suspended\s+due\s+to\s+(?:insufficient\s+balance|billing|payment|unpaid)"
+    r"|recharge\s+your\s+account"
+    r"|please\s+recharge",
+    re.IGNORECASE,
+)
+
 # Default cooldown durations when we can't parse a specific reset time
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
@@ -528,8 +554,10 @@ def _classify_session_failure(
     """Classify a session failure by matching the log tail against provider throttle signatures.
 
     Returns a tuple of (failure_kind, throttled_until_iso):
-    - failure_kind: "rate_limited" | "quota_exhausted" | "provider_auth" | None
-    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not applicable
+    - failure_kind: "provider_suspended" | "rate_limited" | "quota_exhausted" |
+      "provider_auth" | None
+    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not
+      applicable (None for ``provider_suspended`` — terminal, no cooldown)
 
     This is called after a session exits to detect provider throttling and set a cool-down window.
 
@@ -562,6 +590,15 @@ def _classify_session_failure(
 
     # Check the last 2KB of the log (where error messages appear)
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    # Provider account-suspension classification (api only, issue #1342).
+    # Checked BEFORE auth/quota/throttle so a suspended account is never
+    # retried as a transient rate-limit. A suspended account is a terminal
+    # billing failure: it returns ``provider_suspended`` with NO cooldown
+    # (the account will not self-heal) and escalates to an operator on the
+    # first occurrence via ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``.
+    if adapter_kind == "api" and _PROVIDER_SUSPENDED_PATTERN.search(tail):
+        return "provider_suspended", None
 
     # Provider-auth classification (api only, issue #484). Checked before
     # quota/throttle so an auth failure is never relabeled as a generic
