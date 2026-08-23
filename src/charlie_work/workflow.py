@@ -14527,6 +14527,22 @@ class OrchestratorApp:
             and existing_pr_state.get("status") == "mergequeue"
             and self.config.auto_merge.mergequeue_label not in label_names(pr)
         )
+        # Issue #1402: distinguish reconcile's own cooperative self-revocation
+        # (stale-head approval, pending carry-forward re-validation -- the #819
+        # gap fix) from Aviator's #823 silent rejection. reconcile records
+        # ``mergequeue_revoked_reason`` in ``state["prs"][n]`` when IT removes
+        # the label; its absence means the label disappeared for some other
+        # reason (Aviator stripped it, or a pre-#1402 reconcile pass that did
+        # not record the reason). Only ``"stale_head_pending_carry_forward"``
+        # is a self-revocation -- ``"not_approved"`` is a genuine revocation
+        # whose counter-increment path is already suppressed by ``can_merge``
+        # being False (the decision is not ``"approved"``), so it does not
+        # need the same exclusion.
+        mergequeue_self_revoked_stale_head = bool(
+            mergequeue_label_reverted
+            and existing_pr_state.get("mergequeue_revoked_reason")
+            == "stale_head_pending_carry_forward"
+        )
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -15104,6 +15120,14 @@ class OrchestratorApp:
                             "number": pr_number,
                             "issue_number": issue_number,
                             "status": "mergequeue",
+                            # Issue #1402: clear the self-revocation reason now
+                            # that the label has been re-applied (carry-forward
+                            # re-validated the approval), so a subsequent
+                            # Aviator #823 silent rejection is not misread as a
+                            # stale self-revocation. Setting to None (rather
+                            # than deleting the key) keeps the entry shape
+                            # stable for callers that .get() it defensively.
+                            "mergequeue_revoked_reason": None,
                         }
                         # Issue #823 ordering hazard: do NOT zero the counter
                         # when this re-add is recovering from a cross-pass
@@ -15231,7 +15255,7 @@ class OrchestratorApp:
         # (non-)dispatch of check-failure-rework are.
         mergequeue_handoff_failed = bool(
             self.config.auto_merge.mergequeue_label and mergequeue_label_applied is False
-        ) or (mergequeue_label_reverted and can_merge)
+        ) or (mergequeue_label_reverted and can_merge and not mergequeue_self_revoked_stale_head)
         # Conflict-rework dispatch is debounced to the failed-attempt alarm
         # threshold so a single transient/stale CONFLICTING reading does not
         # clobber an approved verdict. Re-read the issue status and the PR

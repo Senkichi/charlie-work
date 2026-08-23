@@ -101,6 +101,16 @@ class DriftItem:
     # Unused by every other kind.
     reason: str | None = None
     failure_kind: str | None = None
+    # Issue #1402: structured "why" for ``mergequeue_revoked`` drift items, so
+    # ``merge_ready`` can distinguish reconcile's own cooperative self-revocation
+    # (stale-head approval, pending carry-forward re-validation -- the #819 gap
+    # fix) from Aviator's silent #823 rejection. ``"stale_head_pending_carry_forward"``
+    # means the recorded decision IS ``"approved"`` but at an older head a rebase
+    # has since moved past; ``"not_approved"`` covers every other cause (missing
+    # decision file, ``request_changes``/never-reviewed verdict). Written to
+    # ``state["prs"][n]["mergequeue_revoked_reason"]`` by ``apply_fixes`` so
+    # ``merge_ready`` can read it cross-pass. Unused by every other kind.
+    mergequeue_revoked_reason: str | None = None
 
 
 # State-machine statuses that mean "this issue is in the orchestrator's pipeline".
@@ -576,8 +586,8 @@ def _mergequeue_revocation_detail(
     pr_number: int,
     head_sha: str,
     mergequeue_label: str,
-) -> str:
-    """Human-readable explanation for why ``mergequeue`` is being revoked.
+) -> tuple[str, str]:
+    """Human-readable explanation and structured reason for a ``mergequeue`` revocation.
 
     Distinguishes "genuinely not approved" (missing/unreadable decision
     file, or a recorded ``request_changes``/never-reviewed verdict -- the
@@ -589,20 +599,34 @@ def _mergequeue_revocation_detail(
     stale-head case alone is not safe either), but the emitted detail/event
     payload makes the distinction explicit rather than collapsing both into
     one indistinguishable string.
+
+    Returns ``(detail, reason)`` where ``detail`` is the human-readable
+    explanation and ``reason`` is the structured path identifier
+    (``"stale_head_pending_carry_forward"`` or ``"not_approved"``) that
+    ``apply_fixes`` writes to ``state["prs"][n]["mergequeue_revoked_reason"]``
+    so ``merge_ready`` can distinguish reconcile's own cooperative
+    self-revocation from Aviator's #823 silent rejection (issue #1402).
     """
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     resolved = _resolve_review_decision(paths.prs / f"pr-{pr_number}", None, head_sha)
     if resolved.missing:
-        return f"no readable review-decision.json for PR #{pr_number}"
+        return (
+            f"no readable review-decision.json for PR #{pr_number}",
+            "not_approved",
+        )
     verdict = resolved.decision
     if verdict != "approved":
-        return f"recorded decision is {verdict!r}, not 'approved'"
+        return (
+            f"recorded decision is {verdict!r}, not 'approved'",
+            "not_approved",
+        )
     reviewed_head = resolved.reviewed_head_sha
     reviewed_head_display = str(reviewed_head)[:12] if reviewed_head else repr(reviewed_head)
     return (
         f"approved at stale head {reviewed_head_display} but current head is "
         f"{head_sha[:12]} -- deferring re-validation to merge_ready's carry-forward "
-        f"check rather than {mergequeue_label!r} staying authorized on an unvalidated head"
+        f"check rather than {mergequeue_label!r} staying authorized on an unvalidated head",
+        "stale_head_pending_carry_forward",
     )
 
 
@@ -725,7 +749,7 @@ def detect_mergequeue_not_approved(
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
         )
-        reason = _mergequeue_revocation_detail(
+        reason_detail, revoked_reason = _mergequeue_revocation_detail(
             config, repo_root, pr_number, head_sha, mergequeue_label
         )
         drift.append(
@@ -735,11 +759,12 @@ def detect_mergequeue_not_approved(
                 pr_number=pr_number,
                 detail=(
                     f"PR #{pr_number} carries {mergequeue_label!r} but is not approved "
-                    f"at its current head {head_sha[:12]} ({reason}); revoking to close "
+                    f"at its current head {head_sha[:12]} ({reason_detail}); revoking to close "
                     "the irrevocable-mergequeue gap (issue #819)"
                 ),
                 fix_actions=(f"remove label {mergequeue_label!r} from PR #{pr_number}",),
                 remove_labels=(mergequeue_label,),
+                mergequeue_revoked_reason=revoked_reason,
             )
         )
     return drift
@@ -2401,7 +2426,25 @@ def apply_fixes(
                         fix_actions=tuple(fix_actions),
                         remove_labels=item.remove_labels,
                         add_labels=item.add_labels,
+                        mergequeue_revoked_reason=item.mergequeue_revoked_reason,
                     )
+                # Issue #1402: record *why* reconcile revoked ``mergequeue``
+                # so ``merge_ready`` can distinguish its own cooperative
+                # self-revocation (stale-head, pending carry-forward
+                # re-validation) from Aviator's #823 silent rejection. Only
+                # written for ``mergequeue_revoked`` items that carry a
+                # structured reason; ``aviator_stale_blocked`` leaves the
+                # field untouched.
+                if (
+                    item.kind == "mergequeue_revoked"
+                    and item.mergequeue_revoked_reason is not None
+                ):
+                    pr_key = str(item.pr_number)
+                    existing_pr = new_prs.get(pr_key, {})
+                    new_prs[pr_key] = {
+                        **existing_pr,
+                        "mergequeue_revoked_reason": item.mergequeue_revoked_reason,
+                    }
 
         elif item.kind == "stale_dispatch_pending_claim":
             if item.issue_number is not None:
@@ -2734,6 +2777,8 @@ def apply_fixes(
             reconcile_payload["reason"] = item.reason
         if item.failure_kind is not None:
             reconcile_payload["failure_kind"] = item.failure_kind
+        if item.mergequeue_revoked_reason is not None:
+            reconcile_payload["mergequeue_revoked_reason"] = item.mergequeue_revoked_reason
         new_state = append_event(
             new_state,
             "reconcile",
