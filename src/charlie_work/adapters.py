@@ -563,3 +563,30 @@ def _write_json(path: Path, value: Any) -> None:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")
     tmp_path.replace(path)
+
+
+def cleanup_stale_session_tmp_files(sessions_dir: Path) -> int:
+    """Remove stranded ``.json.tmp`` files from the sessions directory.
+
+    Issue #1393: the atomic session-record write (``_write_json`` /
+    ``_write_json_atomic``) uses a tmp-file + ``replace()`` pattern.  If the
+    process is interrupted between ``json.dump`` and ``tmp_path.replace()``
+    (e.g. a watchdog kill during a launch-refusal write), the ``.json.tmp``
+    file is left stranded — a torn record that defeats the atomic-write
+    convention.  This sweep removes those stale tmp files at the start of
+    each dispatch pass so they don't accumulate.
+
+    Returns the number of files removed.
+    """
+    if not sessions_dir.is_dir():
+        return 0
+    removed = 0
+    for tmp_path in sessions_dir.glob("*.json.tmp"):
+        try:
+            tmp_path.unlink()
+            removed += 1
+        except OSError:
+            # Best-effort: a concurrent writer may hold the file, or the
+            # file may have already been renamed.  Either way, skip it.
+            continue
+    return removed

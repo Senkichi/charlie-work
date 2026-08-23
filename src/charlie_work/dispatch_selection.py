@@ -448,6 +448,41 @@ def _windowed_orphan_redispatch_at(
     return result
 
 
+def _windowed_blocked_environment_at(
+    entry: dict[str, Any],
+    *,
+    window_minutes: int,
+) -> list[str]:
+    """Return pre-launch environment-block timestamps within the window.
+
+    Parallel to ``_windowed_redispatch_at`` but reads
+    ``entry["blocked_environment_at"]`` -- the list of timestamps recorded
+    each time a rework/fresh dispatch fails at launch with a
+    ``PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS`` failure_kind (issue
+    #1393).  These are pre-launch environment conflicts (e.g. a stale
+    foreign worktree) that never started a worker session, so they must
+    NOT count against the redispatch cap (which measures worker output,
+    not environment hygiene).  A separate counter lets the dispatch layer
+    escalate with the correct reason (``dispatch_blocked_environment``)
+    and the blocking path after the same ``max_auto_redispatch`` budget.
+    """
+    raw = entry.get("blocked_environment_at")
+    if not isinstance(raw, list):
+        return []
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=window_minutes)
+    result: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        try:
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start:
+                result.append(t)
+        except (ValueError, AttributeError):
+            continue
+    return result
+
+
 def _is_review_dispatchable(
     state: dict[str, Any],
     pr_number: int,
