@@ -23570,6 +23570,11 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
     assert state["issues"]["123"]["status"] == "dispatched"
 
     # Step 2: record_review(request_changes) updates issue status to rework_requested
+    # Issue #1131: record_review now refuses on a terminal-state (CLOSED) PR,
+    # so restore the PR to OPEN before recording the verdict -- the CLOSED
+    # state above was a fixture trick to make dispatch select the issue, not
+    # a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     review_result = app.record_review(
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
     )
@@ -23631,6 +23636,9 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     assert dispatch_result.data["selected_count"] == 1
 
     # Step 2: Record first request_changes (count = 1, not escalated, head = "sha-1")
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
     review_result_1 = app.record_review(
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
@@ -23730,6 +23738,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
     assert dispatch_result.ok is True
 
     # Step 2: Record first request_changes (count = 1, head = "sha-1")
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
     review_result_1 = app.record_review(
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
@@ -23807,6 +23818,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     assert dispatch_result.ok is True
 
     # Step 2: Drive request_changes_count up to the cap (2) over two advancing heads.
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
     review_result_1 = app.record_review(
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
@@ -48360,6 +48374,115 @@ def test_render_required_changes_section_vacuous_guard_does_not_drop_populated_e
     )
 
 
+# --------------------------------------------------------------------------
+# Issue #1310: the tier-2 (summary-verbatim) render path -- both the
+# marker-less `summary_text` fallback and the `"derived"` marker branch --
+# must crash-filter `summary` exactly as W12 (#1269) filtered
+# `external_findings`/`required_changes`. A crash-signature body or the
+# LEGACY_VACUOUS_SUMMARY placeholder arriving as a verdict `summary` with
+# an empty findings list must degrade to tier 3, not render verbatim.
+# Production-unreachable today (crash bodies are posted as PR comments,
+# never written into a verdict `summary`), but the suppression contract is
+# "crash noise cannot reach prompt content through any render path."
+# --------------------------------------------------------------------------
+
+
+def test_render_required_changes_section_tier2_crash_summary_degrades_to_tier3() -> None:
+    """Marker-less tier-2 path: a request_changes round whose `summary` is a
+    crash body and whose findings list is empty must NOT render the crash
+    text verbatim -- it degrades to tier 3 (the "findings unavailable"
+    escape hatch), exactly as the other tiers do."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": crash_body,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert crash_body not in section, (
+        "tier-2 verbatim emit must not render a crash-signature summary"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the summary is a crash body"
+    )
+    assert "did not record a structured findings list" not in section, (
+        "must not fall through to the tier-2 verbatim-summary rendering"
+    )
+
+
+def test_render_required_changes_section_tier2_vacuous_summary_degrades_to_tier3() -> None:
+    """Marker-less tier-2 path: a request_changes round whose `summary` is
+    the LEGACY_VACUOUS_SUMMARY placeholder and whose findings list is empty
+    must degrade to tier 3, not present the content-free placeholder as if
+    it were real findings."""
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert LEGACY_VACUOUS_SUMMARY not in section, (
+        "tier-2 verbatim emit must not render the vacuous placeholder"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the summary is the vacuous placeholder"
+    )
+    assert "did not record a structured findings list" not in section
+
+
+def test_render_required_changes_section_tier2_derived_crash_summary_degrades() -> None:
+    """`"derived"` marker branch: a request_changes round stamped
+    `findings_channel == "derived"` whose `summary` is a crash body and
+    whose findings list is empty must degrade to tier 3, not render the
+    crash text verbatim. Without the `and summary_text` guard on the
+    derived branch, the crash guard would neutralize `summary_text` to ""
+    but the branch would still fire and render an empty verbatim summary."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": crash_body,
+        "required_changes": [],
+        "findings_channel": "derived",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert crash_body not in section, (
+        "derived tier-2 verbatim emit must not render a crash-signature summary"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the derived summary is a crash body"
+    )
+    assert "did not record a structured findings list" not in section
+
+
+def test_render_required_changes_section_tier2_genuine_summary_still_renders() -> None:
+    """Guard against over-aggression: a genuine, non-crash, non-vacuous
+    summary with an empty findings list must still render verbatim at
+    tier 2. The crash/vacuous guard must only fire on crash-signature
+    bodies or the LEGACY_VACUOUS_SUMMARY placeholder, never on real
+    reviewer prose."""
+    genuine_summary = (
+        "The retry wrapper swallows the exception type; callers cannot distinguish causes."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": genuine_summary,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert genuine_summary in section, "a genuine summary must still render verbatim at tier 2"
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section, (
+        "a genuine summary must not be discarded down to tier 3"
+    )
+
+
 def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) -> None:
     """F3: _request_no_op_rework_repair's hardcoded no-op note must not
     displace the reviewer's findings. It routes through _route_to_rework,
@@ -49143,6 +49266,771 @@ def test_dispatch_rework_worker_death_loop_includes_stranded_commits(
     assert state["issues"]["123"]["escalation_reason"] == "worker_death_loop"
     # stranded_commits must be present and reflect the 1 unpushed commit.
     assert state["issues"]["123"]["stranded_commits"] == 1
+
+
+def _init_repo_with_remote_inline(tmp_path: Path) -> tuple[Path, Path]:
+    """Create a bare origin remote + local clone with one commit on main.
+
+    Inlined here (instead of importing from test_worktree.py) so this test
+    module stays self-contained for the salvage-push regression tests.
+    Returns ``(remote, repo_root)``.
+
+    Mirrors ``test_worktree._init_repo(bare=True)``: a bare repo cannot
+    receive commits directly, so a temporary non-bare repo is initialized
+    with ``--initial-branch=main``, seeded with one commit, then cloned
+    with ``--bare`` to produce the remote.
+    """
+    import shutil
+
+    # Build a temp non-bare repo with one commit on main, then clone --bare.
+    temp_repo = tmp_path / "remote-temp"
+    temp_repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (temp_repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial commit"],
+        cwd=temp_repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    remote = tmp_path / "remote"
+    subprocess.run(
+        ["git", "clone", "--bare", str(temp_repo), str(remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    shutil.rmtree(temp_repo, ignore_errors=True)
+
+    repo_root = tmp_path / "repo"
+    subprocess.run(
+        ["git", "clone", str(remote), str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.test"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test User"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return remote, repo_root
+
+
+def test_dispatch_rework_death_loop_salvages_stranded_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239: when a rework worker death-loop reaches the cap, the
+    death-loop gate must attempt to salvage-push stranded commits from the
+    dead worker's worktree BEFORE escalating.  A successful push means the
+    worker completed the rework and died at the final push step — the PR
+    head moves past the request_changes verdict, so the issue is routed to
+    review instead of escalated.
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    # Create a branch from main and a worktree at the expected orchestrator path.
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree (worker completed work but died
+    # before pushing).
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    local_tip = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repo_root = repo_root
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+            self.prs[0]["headRefOid"] = pr_head_sha
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert 123 in result.data.get("salvaged_to_review", [])
+    assert 123 not in result.data.get("worker_death_escalated", [])
+
+    # The remote branch head must have advanced to the worktree's local tip.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == local_tip
+
+    state = load_state(paths.state_file)
+    # The issue must NOT be escalated (routed to review or stays rework_requested).
+    assert state["issues"]["123"]["status"] != "escalated"
+    # worker_death_at must NOT have been extended (still 2 entries, not 3).
+    assert len(state["issues"]["123"].get("worker_death_at", [])) == 2
+
+    # An event with kind "rework_stranded_commits_salvaged" must exist.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) >= 1
+
+
+def test_dispatch_rework_death_loop_empty_death_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239: a death-loop where the worktree has NO stranded commits
+    (the worker died without completing any work) must still escalate with
+    ``worker_death_loop`` — the salvage push is only a reprieve when there
+    is actual completed work to publish.
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch — but do NOT add any commit (worktree is at the same
+    # sha as the remote branch, so there are no stranded commits to salvage).
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repo_root = repo_root
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+            self.prs[0]["headRefOid"] = pr_head_sha
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, fake_gh)
+
+    result = app.dispatch_rework()
+    assert result.ok is True
+    assert 123 in result.data.get("worker_death_escalated", [])
+    assert 123 not in result.data.get("salvaged_to_review", [])
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "worker_death_loop"
+
+
+def test_reap_restore_rework_requested_salvages_stranded_commits(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239 Path 1: ``_reap_restore_rework_requested`` must
+    salvage-push stranded commits from a dead rework worker's worktree
+    BEFORE counting a death.  When the push succeeds, the issue resets to
+    ``rework_requested`` WITHOUT recording a death — the PR head moved
+    past the request_changes verdict, so the next ``dispatch_rework`` pass
+    routes to review instead of re-dispatching into the same tail-death.
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.paths import resolved_layout
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _reap_restore_rework_requested
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree.
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    local_tip = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    fake_gh.prs[0]["headRefOid"] = pr_head_sha
+
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "dispatched",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    # Issue #1362 Stage 1: the reader is file-first, so the live
+    # request_changes decision must exist on disk.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": pr_head_sha}),
+        encoding="utf-8",
+    )
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worker died\n", encoding="utf-8")
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,  # non-existent PID — is_alive() returns False
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        process_start_time=1234567890.0,
+        log_path=str(log_path),
+        worktree_path=str(wt_path),
+        error=None,
+        failure_kind="worker_died",
+        reclaimed=None,
+        branch=branch,
+    )
+
+    open_prs_by_issue = {123: [fake_gh.prs[0]]}
+
+    _reap_restore_rework_requested(
+        paths.state_file,
+        fake_gh,
+        config,
+        open_prs_by_issue,
+        worker,
+        failure_kind="worker_died",
+        repo_root=repo_root,
+        write_gate=_wg(paths.state_file),
+    )
+
+    # The remote branch head must have advanced to the worktree's local tip.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == local_tip
+
+    state = load_state(paths.state_file)
+    # The issue must be reset to rework_requested (NOT escalated).
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    # worker_death_at must NOT have been extended (no new death recorded).
+    worker_death_at = state["issues"]["123"].get("worker_death_at", [])
+    assert len(worker_death_at) == 0
+
+    # An event with kind "rework_stranded_commits_salvaged" must exist.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) >= 1
+
+
+def test_reap_restore_rework_requested_skips_salvage_when_status_not_dispatched(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239 round-2: workers are discovered from sidecar files,
+    decoupled from state.json, so by the time ``_reap_restore_rework_requested``
+    runs the issue's status may have already moved off ``dispatched`` (e.g. a
+    concurrent loop pass re-dispatched or escalated).  In that case the
+    salvage push to the shared origin remote MUST NOT be attempted — an
+    unaudited push for a stale/no-longer-dispatched issue leaves no event trail
+    if it succeeds.  A fresh ``status == "dispatched"`` precondition check
+    (short state_lock scope, before computing the review decision and before
+    any network push) gates the whole salvage path.
+    """
+    import json
+    from datetime import UTC, datetime
+
+    from charlie_work.config import DevinConfig
+    from charlie_work.paths import resolved_layout
+    from charlie_work.state import load_state, save_state, state_lock
+    from charlie_work.worker import WorkerView
+    from charlie_work.workflow import _reap_restore_rework_requested
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-124-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(
+                sys.executable,
+                "-c",
+                "import sys; print(sys.argv[1])",
+                "{issue_number}",
+            ),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree — the salvage WOULD push this if
+    # the precondition check were absent.
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    fake_gh = FakeGitHub()
+    fake_gh.issues[0]["labels"] = [{"name": config.labels.in_progress}]
+    fake_gh.prs[0]["headRefOid"] = pr_head_sha
+
+    # The issue's status has ALREADY moved off "dispatched" — a concurrent
+    # loop pass re-dispatched it to rework_requested.  This is the
+    # sidecar/state.json decoupling the round-2 review flagged.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "rework_requested",
+            "worker_pid": 99999,
+            "worker_process_start_time": 1234567890.0,
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    # A LIVE request_changes verdict on disk — without the precondition check
+    # the function would proceed past has_request_changes and attempt the push.
+    pr_decision_dir = paths.prs / "pr-456"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": pr_head_sha}),
+        encoding="utf-8",
+    )
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-123.log"
+    log_path.write_text("worker died\n", encoding="utf-8")
+
+    worker = WorkerView(
+        adapter_kind="devin",
+        issue_number=123,
+        repo_key="",
+        pid=99999,  # non-existent PID — is_alive() returns False
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        process_start_time=1234567890.0,
+        log_path=str(log_path),
+        worktree_path=str(wt_path),
+        error=None,
+        failure_kind="worker_died",
+        reclaimed=None,
+        branch=branch,
+    )
+
+    open_prs_by_issue = {123: [fake_gh.prs[0]]}
+
+    _reap_restore_rework_requested(
+        paths.state_file,
+        fake_gh,
+        config,
+        open_prs_by_issue,
+        worker,
+        failure_kind="worker_died",
+        repo_root=repo_root,
+        write_gate=_wg(paths.state_file),
+    )
+
+    # The remote branch head MUST NOT have advanced — no salvage push.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == pr_head_sha, (
+        f"salvage push attempted for a non-dispatched issue: "
+        f"remote {remote_sha} != pr head {pr_head_sha}"
+    )
+
+    # The issue status must be unchanged (still rework_requested, not reset).
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+
+    # No salvage event must have been recorded.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) == 0
+
+
+def test_salvage_rework_stranded_commits_skips_when_status_not_rework_requested(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239 round-3: the death-loop escalation gate's salvage call site
+    (``_salvage_rework_stranded_commits``) receives ``issue_entry`` from the
+    ``head_check_state`` snapshot loaded at the top of ``dispatch_rework``'s
+    candidate loop.  Between that snapshot and this call the issue's status may
+    have already moved off ``rework_requested`` (e.g. a concurrent loop pass
+    dispatched it, escalated it, or the issue was closed).  In that case the
+    salvage push to the shared origin remote MUST NOT be attempted — an
+    unaudited push for a stale/no-longer-rework_requested issue leaves no event
+    trail if it succeeds.  A fresh ``status == "rework_requested"`` precondition
+    check (short state_lock scope, before any network push) gates the salvage,
+    mirroring the ``_reap_restore_rework_requested`` precondition (which checks
+    ``status == "dispatched"`` because that lane handles already-dispatched
+    workers).
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    # Create a branch from main and a worktree at the expected orchestrator path.
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree — the salvage WOULD push this if
+    # the precondition check were absent.
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repo_root = repo_root
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+            self.prs[0]["headRefOid"] = pr_head_sha
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    # The issue's status has ALREADY moved off "rework_requested" — a
+    # concurrent loop pass dispatched it (status is now "dispatched").  This
+    # is the head_check_state/state.json decoupling the round-3 review flagged:
+    # the snapshot still says rework_requested, but state.json has advanced.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatched",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, fake_gh)
+
+    # The snapshot issue_entry still says rework_requested (stale) — this is
+    # what dispatch_rework's candidate loop would pass.  The fresh check inside
+    # _salvage_rework_stranded_commits must catch that state.json has moved.
+    stale_issue_entry = {
+        "number": 123,
+        "status": "rework_requested",
+        "branch_name": branch,
+    }
+    pr_data = fake_gh.prs[0]
+
+    result = app._salvage_rework_stranded_commits(123, pr_data, stale_issue_entry)
+
+    # The salvage must report no push.
+    assert result is False
+
+    # The remote branch head MUST NOT have advanced — no salvage push.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == pr_head_sha, (
+        f"salvage push attempted for a non-rework_requested issue: "
+        f"remote {remote_sha} != pr head {pr_head_sha}"
+    )
+
+    # The issue status must be unchanged (still dispatched, not reset).
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+
+    # No salvage event must have been recorded.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) == 0
 
 
 def test_windowed_redispatch_at_handles_corrupted_state(tmp_path: Path) -> None:
