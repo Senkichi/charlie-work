@@ -56,17 +56,40 @@ jobs:
   Tests:
     name: Tests
     runs-on: self-hosted
-    # 30 min: derived from 28 successful runs (2026-07-28/29). Per-job
-    # execution time (startedAt->completedAt, excluding runner-queue wait):
-    # median 11.5 min, range 3.85-23.72 min. The prior 60 min budget was
-    # generous enough that the 2026-08-08 cross-repo contention incident let
-    # wedged legs hold both runners for ~10h before anything timed out --
-    # the same shared-box pressure documented in job-cannon's own ci.yml
-    # (5 registered runners on one 8-core box; #1451). 30 clears the 23.72
-    # max by ~26% while applying the same fail-loud bar now used on
-    # job-cannon: a required check should time out fast enough to free the
-    # runner, not sit wedged for hours. Sibling: job-cannon PR #1443.
-    timeout-minutes: 30
+    # NO job-level concurrency group here -- deliberately. PR #1388 (#1254)
+    # added `concurrency: {group: cw-tests-self-hosted, cancel-in-progress:
+    # false}` to serialize Tests across branches, on the premise that excess
+    # jobs would queue. They do not: GitHub keeps at most ONE pending job per
+    # concurrency group and CANCELS the older pending job whenever a newer one
+    # enters the same group, regardless of cancel-in-progress (that flag only
+    # protects the RUNNING job). With a constant group key, every Tests job
+    # that was still queued when any other branch's run was created got
+    # cancelled with runner_name="" / steps=[] -- 2026-08-22 21:19Z-23:37Z,
+    # ~10 PR runs killed, #1389/#1397/#1377 stranded approved-but-unmergeable
+    # (issue #1399). job-cannon's ci.yml header documents the same trap and
+    # the correct primitive: a runner LABEL as the capacity semaphore
+    # (`runs-on: [self-hosted, ..., suite]` on only N provisioned runners),
+    # which the GitHub scheduler enforces by queueing, never cancelling. That
+    # is the follow-up for #1254's contention goal; until it lands, Tests
+    # jobs may run concurrently and the 45m timeout below is the only bound.
+    # 45 min: raised from 30 (#1254). 30 was derived from 28 successful
+    # runs (2026-07-28/29) with per-job execution time median 11.5 min,
+    # range 3.85-23.72 min, and cleared the 23.72 max by ~26%. But on
+    # 2026-08-15 four PRs' Tests jobs ran concurrently on the shared
+    # self-hosted box alongside other repos' CI and the dispatch tree's
+    # pytest sessions; CPU contention stretched a suite that normally
+    # finishes in ~8m (-n 2) to 29:43, and the 30m job timeout killed each
+    # at the finish line -- the suites PASSED ("4140 passed, 4 skipped in
+    # 1783.10s") but the job was cancelled during cleanup, producing false
+    # reds. Until a runner-label semaphore bounds concurrent Tests jobs (see
+    # above), contention from concurrent Tests jobs, sibling repos' CI and
+    # the dispatch tree persists, so the timeout must survive it. 45 min is
+    # ~1.9x the uncontended max (23.72m)
+    # and ~1.5x the observed contended runtime (30m) -- enough headroom for
+    # residual contention without returning to the 60m budget that let the
+    # 2026-08-08 cross-repo incident wedge runners for ~10h. Sibling:
+    # job-cannon PR #1443.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       # setup-uv@v7 replaced with a PATH-append (#1115): the action's runner
