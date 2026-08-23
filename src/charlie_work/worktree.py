@@ -833,6 +833,7 @@ def salvage_push_stranded_commits(
     worktree_path: Path,
     *,
     base_ref: str = "",
+    dry_run: bool = False,
 ) -> SalvagePushResult:
     """Fast-forward-push committed-but-unpushed work from a dead worker's worktree.
 
@@ -857,6 +858,12 @@ def salvage_push_stranded_commits(
       has never seen means someone else pushed -- diverged, skip.
 
     Never raises; every failure comes back as a value.
+
+    When ``dry_run`` is set the real ``git push`` is skipped and a
+    ``SalvagePushResult(pushed=False, skip_reason="dry_run")`` is returned
+    instead -- the pre-push probes still run (they are local read-only git), so
+    the result carries the same ``old_remote_sha``/``commit_count`` a real
+    attempt would, but no network push is issued (issue #1326).
     """
     try:
         branch = require_valid_ref_name(branch, context="salvage_push branch")
@@ -960,7 +967,14 @@ def salvage_push_stranded_commits(
         if commit_count == 0:
             return SalvagePushResult(pushed=False, skip_reason="no_commits_beyond_base")
 
-    ok, push_error = push_branch(repo_root, branch, worktree_path)
+    if dry_run:
+        return SalvagePushResult(
+            pushed=False,
+            skip_reason="dry_run",
+            old_remote_sha=old_remote_sha,
+            commit_count=commit_count,
+        )
+    ok, push_error = push_branch(repo_root, branch, worktree_path, dry_run=dry_run)
     if not ok:
         return SalvagePushResult(
             pushed=False,
@@ -3842,17 +3856,30 @@ def inspect_worktree_state(
 
 
 def push_branch(
-    repo_root: Path, branch: str, worktree_path: Path | None = None
+    repo_root: Path,
+    branch: str,
+    worktree_path: Path | None = None,
+    *,
+    dry_run: bool = False,
 ) -> tuple[bool, str | None]:
     """Push ``branch`` to origin and verify via ``git ls-remote``.
 
     Returns ``(ok, error)``. Pushes can fail silently on some transports, so the
     remote branch tip is explicitly checked and compared to the local branch tip.
+
+    When ``dry_run`` is set the real ``git push`` is skipped and ``(False,
+    "dry_run")`` is returned -- the push did not happen, so ``ok`` is False, but
+    the error string lets a caller distinguish a preview skip from a real
+    failure. Ref-name validation still runs first so an invalid branch fails
+    fast even under a preview (issue #1326).
     """
     try:
         branch = require_valid_ref_name(branch, context="push_branch branch")
     except ValueError as exc:
         return False, str(exc)
+
+    if dry_run:
+        return False, "dry_run"
 
     cwd = worktree_path if worktree_path else repo_root
     push_result = run_captured(
