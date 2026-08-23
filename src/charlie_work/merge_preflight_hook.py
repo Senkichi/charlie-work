@@ -28,6 +28,7 @@ of ``deny`` with a reason, or nothing (undecided) for out-of-scope calls.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import sys
@@ -40,6 +41,130 @@ from typing import Any
 # tokens are matched too — but never across a shell separator, so a mention
 # followed by an unrelated ``merge`` in a later command does not trip it.
 _GH_PR_MERGE = re.compile(r"\bgh(?:\s+[^\s;|&]+)*?\s+pr(?:\s+[^\s;|&]+)*?\s+merge\b")
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Remove heredoc bodies from a shell command string before tokenization.
+
+    shlex (used by ``_parse_gh_merge_targets``) does not understand heredoc
+    syntax (``<<DELIM\\n...\\nDELIM``), so a heredoc body containing ``gh pr
+    merge 123`` as prose would be tokenized as real command tokens and trigger
+    the merge gate on documentation ABOUT merging (#1252 defect 2 — observed
+    live when ``gh issue create`` was denied because the issue body, written
+    via heredoc, described a merge command).
+
+    The scanner tracks single/double-quote state so a ``<<`` inside a quoted
+    string (e.g. ``echo "a << b"``) is not mistaken for a heredoc start. Only
+    well-formed heredocs (with a closing delimiter on its own line) are
+    stripped; a ``<<`` whose delimiter is never closed is left intact so the
+    token stream still reaches the fail-closed path rather than silently
+    dropping a potentially real merge invocation.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(command)
+    in_single = False
+    in_double = False
+    while i < n:
+        ch = command[i]
+        if in_single:
+            out.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(command[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(command[i + 1])
+            i += 2
+            continue
+        # Not inside quotes: check for heredoc start (<< or <<-).
+        if ch == "<" and i + 1 < n and command[i + 1] == "<":
+            heredoc_end = _try_strip_one_heredoc(command, i, out)
+            if heredoc_end is not None:
+                i = heredoc_end
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _try_strip_one_heredoc(command: str, lt_lt_start: int, out: list[str]) -> int | None:
+    """If ``command[lt_lt_start:]`` begins a closed heredoc, strip its body.
+
+    Appends the rest of the command line (after ``<<DELIM``) to ``out`` and
+    returns the index past the closing delimiter line. Returns ``None`` (and
+    appends nothing) if this is not a well-formed, closed heredoc — the caller
+    then emits the ``<<`` literally and continues, preserving fail-closed
+    behavior.
+    """
+    n = len(command)
+    j = lt_lt_start + 2  # past "<<"
+    strip_tabs = False
+    if j < n and command[j] == "-":
+        strip_tabs = True
+        j += 1
+    # Skip whitespace between << and delimiter.
+    while j < n and command[j] in " \t":
+        j += 1
+    # Read delimiter (optionally quoted).
+    delim_quote: str | None = None
+    if j < n and command[j] in "'\"":
+        delim_quote = command[j]
+        j += 1
+    delim_start = j
+    while j < n and (command[j].isalnum() or command[j] == "_"):
+        j += 1
+    delim = command[delim_start:j]
+    if delim_quote and j < n and command[j] == delim_quote:
+        j += 1
+    if not delim:
+        return None  # not a heredoc (e.g. <<<, << followed by non-identifier)
+    # Keep the rest of the line after <<DELIM (the command may continue).
+    rest_start = j
+    while j < n and command[j] != "\n":
+        j += 1
+    line_end = j  # index of newline or n
+    body_start = j + 1 if j < n else n
+    # Scan body lines for the closing delimiter on its own line.
+    k = body_start
+    while k < n:
+        line_start = k
+        while k < n and command[k] != "\n":
+            k += 1
+        line = command[line_start:k]
+        candidate = line.lstrip("\t") if strip_tabs else line
+        if candidate.rstrip() == delim:
+            # Closing delimiter found.
+            after_close = k + 1 if k < n else n
+            out.append(command[rest_start:line_end])
+            if line_end < n:
+                out.append("\n")
+            return after_close
+        if k < n:
+            k += 1
+    # No closing delimiter — not a well-formed heredoc; leave intact.
+    return None
 
 
 def _load_fleet_roots() -> dict[str, Path] | None:
@@ -120,8 +245,9 @@ _MERGE_BOOLEAN_FLAGS = frozenset(
 )
 
 
-def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
-    """Extract every ``gh pr merge`` invocation's PR number and ``--repo``.
+def _parse_gh_merge_targets(command: str, cwd: Path | None = None) -> list[dict[str, Any]]:
+    """Extract every ``gh pr merge`` invocation's PR number, ``--repo``, and
+    effective cwd.
 
     Detection is token-based, not substring-based: the command is shlex-split
     and an invocation is the words ``gh``, ``pr``, ``merge`` in order with only
@@ -130,6 +256,11 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
     quoted string (a commit message, an echo) is a single token after splitting
     and therefore does not match — the first version of this hook denied its
     own feature commit because the message *described* the command it guards.
+
+    Heredoc bodies (``<<DELIM ... DELIM``) are stripped before tokenization
+    (#1252 defect 2): shlex does not understand heredoc syntax, so a body
+    containing ``gh pr merge 123`` as prose would be tokenized as real command
+    tokens and trigger the gate on documentation ABOUT merging.
 
     Splitting uses ``punctuation_chars`` so shell separators (``;``, ``&&``,
     ``|``) become their own tokens instead of gluing onto neighbors (``5;``),
@@ -140,6 +271,16 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
     tracked and applied to invocations that lack an explicit ``-R``/``--repo``,
     mirroring gh's own precedence (flag > GH_REPO > cwd).
 
+    A leading ``cd <path>`` (or any ``cd <path>`` in the same command chain,
+    not inside a subshell) is tracked and the resolved path is returned as
+    ``cd_cwd`` per invocation (#1252 defect 1): the merge runs in the cd'd
+    directory, not the hook process's cwd, so repo resolution must use the
+    command's effective cwd. Subshell boundaries (``(`` / ``)``) push/pop a
+    cwd context so a ``cd`` inside ``(...)`` does not leak to commands after
+    the subshell. ``cd_cwd`` is ``None`` when no ``cd`` precedes the invocation
+    (or when a relative path cannot be resolved because ``cwd`` was not
+    provided) — the caller then falls back to the hook cwd with a warning.
+
     If the command cannot be tokenized (unbalanced quotes), fall back to the
     raw-text regex: a match there yields ``pr=None``, which the caller must
     treat as fail-closed.
@@ -147,18 +288,61 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
     A ``pr`` of ``None`` means the invocation merges "the current branch's PR"
     or the number could not be parsed — the caller must fail closed on that.
     """
+    stripped = _strip_heredoc_bodies(command)
     try:
-        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex = shlex.shlex(stripped, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
         tokens = list(lex)
     except ValueError:
-        return [{"pr": None, "repo": None}] if _GH_PR_MERGE.search(command) else []
+        return [{"pr": None, "repo": None, "cd_cwd": None}] if _GH_PR_MERGE.search(command) else []
 
     targets: list[dict[str, Any]] = []
     gh_repo_env: str | None = None
+    effective_cwd: Path | None = None  # set by cd; None = "use hook cwd"
+    cwd_stack: list[Path | None] = []
+    command_position = True  # first token is in command position
     idx = 0
     while idx < len(tokens):
         tok = tokens[idx]
+        # Subshell boundaries push/pop the cwd context so a cd inside (...)
+        # does not leak to commands after the subshell (#1252 defect 1).
+        # shlex with punctuation_chars splits ``(`` as its own token, but
+        # ``)`` may glue to a following separator (``);``, ``)&&``), so we
+        # match ``)`` as a prefix and treat the remainder as a separator.
+        if tok == "(":
+            cwd_stack.append(effective_cwd)
+            command_position = True
+            idx += 1
+            continue
+        if tok == ")" or tok.startswith(")"):
+            if cwd_stack:
+                effective_cwd = cwd_stack.pop()
+            # The remainder after ) (e.g. ``;``, ``&&``) is a separator that
+            # starts a new command; a bare ``)`` is followed by whitespace,
+            # which also starts a new command.
+            command_position = True
+            idx += 1
+            continue
+        # cd <path> in command position updates the effective cwd for
+        # subsequent merge invocations in the same chain (#1252 defect 1).
+        if command_position and tok == "cd":
+            if idx + 1 < len(tokens):
+                next_tok = tokens[idx + 1]
+                if (
+                    next_tok not in _SHELL_SEPARATORS
+                    and next_tok != "("
+                    and not next_tok.startswith("-")
+                ):
+                    resolved = _resolve_cd_path(next_tok, cwd)
+                    if resolved is not None:
+                        effective_cwd = resolved
+                    idx += 2
+                    command_position = False
+                    continue
+            # bare cd, cd -, or cd with flags — skip the cd token only
+            idx += 1
+            command_position = False
+            continue
         # gh's documented GH_REPO override applies to any later gh call in the
         # same shell command (prefix assignment, ``env``, or ``export``).
         # Tracking every assignment seen so far and applying the latest is
@@ -168,10 +352,16 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
         if env_match:
             gh_repo_env = env_match.group(1)
             idx += 1
+            command_position = False
+            continue
+        if tok in _SHELL_SEPARATORS:
+            command_position = True
+            idx += 1
             continue
         matched_end, flag_repo = _match_gh_pr_merge(tokens, idx)
         if matched_end is None:
             idx += 1
+            command_position = False
             continue
         pr: int | None = None
         pr_ambiguous = False
@@ -216,9 +406,27 @@ def _parse_gh_merge_targets(command: str) -> list[dict[str, Any]]:
         # ``gh`` accepts OWNER/REPO or a full URL for --repo; normalize URLs.
         if repo and repo.startswith("https://github.com/"):
             repo = "/".join(repo.rstrip("/").split("/")[-2:])
-        targets.append({"pr": pr, "repo": repo})
+        targets.append({"pr": pr, "repo": repo, "cd_cwd": effective_cwd})
         idx = i
+        command_position = False
     return targets
+
+
+def _resolve_cd_path(raw: str, cwd: Path | None) -> Path | None:
+    """Resolve a ``cd`` target to an absolute path, or ``None`` if impossible.
+
+    ``~`` and ``$VAR`` are expanded via the standard library. Relative paths
+    are resolved against ``cwd``; if ``cwd`` is ``None`` (the parser was called
+    without a hook cwd), a relative path cannot be resolved and ``None`` is
+    returned — the caller then falls back to the hook cwd with a warning.
+    """
+    expanded = os.path.expanduser(os.path.expandvars(raw))
+    path = Path(expanded)
+    if path.is_absolute():
+        return path
+    if cwd is not None:
+        return (cwd / path).resolve()
+    return None
 
 
 def _match_gh_pr_merge(tokens: list[str], start: int) -> tuple[int | None, str | None]:
@@ -329,7 +537,7 @@ def _decide(tool_name: str, tool_input: dict[str, Any], cwd: Path) -> str | None
     if tool_name != "Bash":
         return None
     command = tool_input.get("command") or ""
-    targets = _parse_gh_merge_targets(command)
+    targets = _parse_gh_merge_targets(command, cwd)
     if not targets:
         return None
 
@@ -342,9 +550,27 @@ def _decide(tool_name: str, tool_input: dict[str, Any], cwd: Path) -> str | None
             "cannot verify merge authorization (#894). Fix fleet.json or "
             "merge via charlie ship-it."
         )
-    cwd_repo = _repo_for_cwd(roots, cwd)
     for target in targets:
-        name = (target["repo"] or cwd_repo or "").lower() or None
+        # Precedence (#1252 defect 1): explicit --repo/-R flag > repo resolved
+        # from the command's effective cwd (a leading ``cd <path>``) > hook cwd
+        # (inferred, with a warning). Never assume session cwd == command cwd.
+        name: str | None = None
+        if target["repo"]:
+            name = target["repo"].lower()
+        elif target["cd_cwd"] is not None:
+            name = _repo_for_cwd(roots, target["cd_cwd"])
+        else:
+            # No explicit repo and no cd: fall back to the hook process's cwd.
+            # This inference can be wrong (the merge may target a different
+            # repo than the session's primary working directory), so warn.
+            name = _repo_for_cwd(roots, cwd)
+            if name is not None:
+                print(
+                    f"merge-check hook: no --repo flag and no cd in command; "
+                    f"inferring repo from hook cwd {cwd}. If the merge targets "
+                    f"a different repo, use --repo or cd.",
+                    file=sys.stderr,
+                )
         if name is None or name not in roots:
             continue  # merging outside the fleet — out of scope
         pr = target["pr"]

@@ -27,46 +27,46 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 def test_parse_plain_merge() -> None:
     targets = hook._parse_gh_merge_targets("gh pr merge 123 --squash")
-    assert targets == [{"pr": 123, "repo": None}]
+    assert targets == [{"pr": 123, "repo": None, "cd_cwd": None}]
 
 
 def test_parse_dash_r_repo() -> None:
     targets = hook._parse_gh_merge_targets("gh pr merge -R owner/repo 123")
-    assert targets == [{"pr": 123, "repo": "owner/repo"}]
+    assert targets == [{"pr": 123, "repo": "owner/repo", "cd_cwd": None}]
 
 
 def test_parse_repo_equals() -> None:
     targets = hook._parse_gh_merge_targets("gh pr merge --repo=owner/repo 123")
-    assert targets == [{"pr": 123, "repo": "owner/repo"}]
+    assert targets == [{"pr": 123, "repo": "owner/repo", "cd_cwd": None}]
 
 
 def test_parse_repo_url_flag() -> None:
     targets = hook._parse_gh_merge_targets("gh pr merge --repo https://github.com/o/r 55")
-    assert targets == [{"pr": 55, "repo": "o/r"}]
+    assert targets == [{"pr": 55, "repo": "o/r", "cd_cwd": None}]
 
 
 def test_parse_pr_url_form() -> None:
     targets = hook._parse_gh_merge_targets("gh pr merge https://github.com/o/r/pull/55")
-    assert targets == [{"pr": 55, "repo": "o/r"}]
+    assert targets == [{"pr": 55, "repo": "o/r", "cd_cwd": None}]
 
 
 def test_parse_no_number_current_branch() -> None:
     targets = hook._parse_gh_merge_targets("gh pr merge --squash")
-    assert targets == [{"pr": None, "repo": None}]
+    assert targets == [{"pr": None, "repo": None, "cd_cwd": None}]
 
 
 def test_parse_multiple_chained_invocations() -> None:
     command = "gh pr merge 1 --squash && gh pr merge -R o/r 2"
     targets = hook._parse_gh_merge_targets(command)
     assert targets == [
-        {"pr": 1, "repo": None},
-        {"pr": 2, "repo": "o/r"},
+        {"pr": 1, "repo": None, "cd_cwd": None},
+        {"pr": 2, "repo": "o/r", "cd_cwd": None},
     ]
 
 
 def test_parse_unbalanced_quote_yields_pr_none() -> None:
     targets = hook._parse_gh_merge_targets('gh pr merge 123 "unterminated')
-    assert targets == [{"pr": None, "repo": None}]
+    assert targets == [{"pr": None, "repo": None, "cd_cwd": None}]
 
 
 def test_parse_no_merge_command_yields_empty_list() -> None:
@@ -481,12 +481,12 @@ def test_parse_quoted_tokens_still_detected() -> None:
     # Shell-quoting individual words must not evade detection: shlex strips
     # the quotes, so the consecutive-token match still fires.
     targets = hook._parse_gh_merge_targets('"gh" pr merge 55')
-    assert targets == [{"pr": 55, "repo": None}]
+    assert targets == [{"pr": 55, "repo": None, "cd_cwd": None}]
 
 
 def test_parse_env_prefixed_invocation_detected() -> None:
     targets = hook._parse_gh_merge_targets("GH_TOKEN=x gh pr merge 7")
-    assert targets == [{"pr": 7, "repo": None}]
+    assert targets == [{"pr": 7, "repo": None, "cd_cwd": None}]
 
 
 def test_decide_mcp_bool_pull_number_in_fleet_repo_denies(
@@ -544,26 +544,26 @@ def test_decide_bash_gh_repo_env_override_denied_on_failed_merge_check(
 )
 def test_parse_interspersed_global_flags(command: str) -> None:
     targets = hook._parse_gh_merge_targets(command)
-    assert targets == [{"pr": 5, "repo": "o/r"}]
+    assert targets == [{"pr": 5, "repo": "o/r", "cd_cwd": None}]
 
 
 def test_parse_gh_repo_env_overridden_by_explicit_flag() -> None:
     # Same precedence as gh itself: explicit -R/--repo beats GH_REPO.
     targets = hook._parse_gh_merge_targets("GH_REPO=a/b gh pr merge 5 -R x/y")
-    assert targets == [{"pr": 5, "repo": "x/y"}]
+    assert targets == [{"pr": 5, "repo": "x/y", "cd_cwd": None}]
 
 
 def test_parse_gh_repo_env_via_env_prefix() -> None:
     targets = hook._parse_gh_merge_targets("env GH_REPO=a/b gh pr merge 7")
-    assert targets == [{"pr": 7, "repo": "a/b"}]
+    assert targets == [{"pr": 7, "repo": "a/b", "cd_cwd": None}]
 
 
 def test_parse_multi_invocation_with_gh_repo_env() -> None:
     command = "gh pr merge 5; GH_REPO=o/r gh pr merge 6"
     targets = hook._parse_gh_merge_targets(command)
     assert targets == [
-        {"pr": 5, "repo": None},
-        {"pr": 6, "repo": "o/r"},
+        {"pr": 5, "repo": None, "cd_cwd": None},
+        {"pr": 6, "repo": "o/r", "cd_cwd": None},
     ]
 
 
@@ -607,7 +607,7 @@ def test_parse_quoted_mention_of_gh_pr_merge_is_not_an_invocation() -> None:
 )
 def test_parse_known_flags_do_not_shift_the_pr_number(command: str, expected_pr: int) -> None:
     targets = hook._parse_gh_merge_targets(command)
-    assert targets == [{"pr": expected_pr, "repo": None}]
+    assert targets == [{"pr": expected_pr, "repo": None, "cd_cwd": None}]
 
 
 def test_parse_unknown_flag_before_pr_number_is_ambiguous() -> None:
@@ -616,13 +616,13 @@ def test_parse_unknown_flag_before_pr_number_is_ambiguous() -> None:
     # would validate the wrong pull request (round-3 review finding) -- the
     # invocation must fail closed instead.
     targets = hook._parse_gh_merge_targets("gh pr merge -x 42 1195")
-    assert targets == [{"pr": None, "repo": None}]
+    assert targets == [{"pr": None, "repo": None, "cd_cwd": None}]
 
 
 def test_parse_unknown_flag_suppresses_pr_url_form_too() -> None:
     command = "gh pr merge --frobnicate 9 https://github.com/o/r/pull/3"
     targets = hook._parse_gh_merge_targets(command)
-    assert targets == [{"pr": None, "repo": None}]
+    assert targets == [{"pr": None, "repo": None, "cd_cwd": None}]
 
 
 def test_decide_bash_ambiguous_pr_denies_without_running_merge_check(
@@ -662,3 +662,297 @@ def test_claude_settings_wires_merge_preflight_hook() -> None:
         assert command_hook["type"] == "command"
         command = command_hook["command"]
         assert command.strip().endswith("|| true"), f"{matcher} hook must fail open on crash"
+
+
+# ---------------------------------------------------------------------------
+# #1252 defect 2: heredoc bodies must not trigger the merge gate
+# ---------------------------------------------------------------------------
+
+
+def test_parse_heredoc_body_with_merge_prose_is_not_an_invocation() -> None:
+    # The observed incident: ``gh issue create`` was denied because the issue
+    # body, written via heredoc, contained "gh pr merge 123" as prose.
+    command = "gh issue create --body-file - <<'EOF'\nThis report describes\ngh pr merge 123\nbehavior.\nEOF"
+    assert hook._parse_gh_merge_targets(command) == []
+
+
+def test_parse_heredoc_body_unquoted_delimiter_is_not_an_invocation() -> None:
+    command = "gh issue create --body-file - <<EOF\ngh pr merge 123\nEOF"
+    assert hook._parse_gh_merge_targets(command) == []
+
+
+def test_parse_heredoc_strip_dash_preserves_real_merge_after_body() -> None:
+    # A real merge after a heredoc body must still be detected.
+    command = (
+        "gh issue create --body-file - <<'EOF'\ngh pr merge 999\nEOF\ngh pr merge 42 --squash"
+    )
+    targets = hook._parse_gh_merge_targets(command)
+    assert len(targets) == 1
+    assert targets[0]["pr"] == 42
+
+
+def test_parse_heredoc_with_command_continuation_on_same_line() -> None:
+    # ``cat <<EOF && gh pr merge 42``: the merge is on the same line as the
+    # heredoc start, so it runs AFTER the heredoc closes and must be detected.
+    command = "cat <<'EOF'\nbody\ngh pr merge 999\nEOF\ngh pr merge 42 --squash"
+    targets = hook._parse_gh_merge_targets(command)
+    assert len(targets) == 1
+    assert targets[0]["pr"] == 42
+
+
+def test_parse_heredoc_inside_double_quotes_not_stripped() -> None:
+    # A << inside a double-quoted string is not a heredoc; the quoted body
+    # is a single shlex token and must not match.
+    command = 'echo "a << b gh pr merge 123"'
+    assert hook._parse_gh_merge_targets(command) == []
+
+
+def test_parse_unclosed_heredoc_left_intact_fail_closed() -> None:
+    # A << with no closing delimiter is not stripped — the raw tokens flow
+    # through and the merge gate fires (fail-closed), rather than silently
+    # dropping a potentially real merge.
+    command = "cat <<EOF\ngh pr merge 123"
+    targets = hook._parse_gh_merge_targets(command)
+    # The body is NOT stripped, so the merge invocation is detected.
+    assert len(targets) == 1
+    assert targets[0]["pr"] == 123
+
+
+def test_parse_heredoc_strip_dash_delimiter() -> None:
+    # <<- strips leading tabs from the delimiter line.
+    command = "cat <<-EOF\n\tbody\ngh pr merge 999\n\tEOF\ngh pr merge 7"
+    targets = hook._parse_gh_merge_targets(command)
+    assert len(targets) == 1
+    assert targets[0]["pr"] == 7
+
+
+def test_decide_bash_heredoc_body_does_not_deny_issue_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The live incident: a ``gh issue create`` with a heredoc body containing
+    # merge prose was denied. After the fix, it must pass through undecided.
+    # The cwd is INSIDE a fleet repo so the old code (without heredoc
+    # stripping) would resolve the "merge" from the heredoc body to this
+    # repo and run merge-check on PR #123 — the test must fail against the
+    # unfixed code to exercise the fix.
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {"o/repo": root})
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        hook,
+        "_run_merge_check",
+        lambda repo_root, pr: calls.append((repo_root, pr)) or (True, "ok"),
+    )
+    command = (
+        "gh issue create --body-file - <<'EOF'\n"
+        "This report describes gh pr merge 123 behavior.\n"
+        "EOF"
+    )
+    reason = hook._decide("Bash", {"command": command}, root)
+    assert reason is None
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# #1252 defect 1: repo resolved from command's effective cwd, not hook cwd
+# ---------------------------------------------------------------------------
+
+
+def test_parse_cd_absolute_path_sets_cd_cwd(tmp_path: Path) -> None:
+    target_dir = tmp_path / "job-cannon"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"cd {target_dir.as_posix()} && gh pr merge 1679", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["pr"] == 1679
+    assert targets[0]["cd_cwd"] == target_dir.resolve()
+
+
+def test_parse_cd_relative_path_resolved_against_cwd(tmp_path: Path) -> None:
+    (tmp_path / "sub" / "repo").mkdir(parents=True)
+    targets = hook._parse_gh_merge_targets("cd sub/repo && gh pr merge 5", tmp_path)
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] == (tmp_path / "sub" / "repo").resolve()
+
+
+def test_parse_no_cd_yields_cd_cwd_none(tmp_path: Path) -> None:
+    targets = hook._parse_gh_merge_targets("gh pr merge 5", tmp_path)
+    assert targets == [{"pr": 5, "repo": None, "cd_cwd": None}]
+
+
+def test_parse_cd_in_subshell_does_not_leak(tmp_path: Path) -> None:
+    # A cd inside (...) must not affect commands after the subshell.
+    target_dir = tmp_path / "inner"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"(cd {target_dir.as_posix()} && ls); gh pr merge 5", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] is None
+
+
+def test_parse_cd_in_subshell_applies_inside(tmp_path: Path) -> None:
+    # A cd inside (...) applies to merge invocations inside the subshell.
+    target_dir = tmp_path / "inner"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"(cd {target_dir.as_posix()} && gh pr merge 5)", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] == target_dir.resolve()
+
+
+def test_parse_cd_not_in_command_position_ignored(tmp_path: Path) -> None:
+    # ``echo cd /path`` must not update effective cwd — cd is an argument.
+    targets = hook._parse_gh_merge_targets(
+        f"echo cd {tmp_path.as_posix()} && gh pr merge 5", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] is None
+
+
+def test_parse_multiple_cds_track_effective_cwd(tmp_path: Path) -> None:
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"cd {dir_a.as_posix()} && gh pr merge 1; cd {dir_b.as_posix()} && gh pr merge 2",
+        tmp_path,
+    )
+    assert len(targets) == 2
+    assert targets[0]["cd_cwd"] == dir_a.resolve()
+    assert targets[1]["cd_cwd"] == dir_b.resolve()
+
+
+def test_decide_bash_cd_resolves_correct_fleet_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The core defect: a session anchored in charlie-work merging a job-cannon
+    # PR by number was checked against charlie-work's PR. After the fix, the
+    # cd'd directory determines the repo.
+    charlie_root = tmp_path / "charlie-work"
+    job_cannon_root = tmp_path / "job-cannon"
+    charlie_root.mkdir()
+    job_cannon_root.mkdir()
+    monkeypatch.setattr(
+        hook,
+        "_load_fleet_roots",
+        lambda: {
+            "senkichi/charlie-work": charlie_root,
+            "senkichi/job-cannon": job_cannon_root,
+        },
+    )
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        hook,
+        "_run_merge_check",
+        lambda repo_root, pr: calls.append((repo_root, pr)) or (True, "ok"),
+    )
+    # Session cwd is charlie-work, but the merge runs in job-cannon.
+    reason = hook._decide(
+        "Bash",
+        {"command": f"cd {job_cannon_root.as_posix()} && gh pr merge 1679 --squash"},
+        charlie_root,
+    )
+    assert reason is None
+    assert calls == [(job_cannon_root, 1679)]
+
+
+def test_decide_bash_cd_to_non_fleet_dir_skips_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If the cd'd directory is not a fleet repo, the merge is out of scope —
+    # do NOT fall back to the hook cwd (the cd is authoritative).
+    charlie_root = tmp_path / "charlie-work"
+    outside = tmp_path / "outside"
+    charlie_root.mkdir()
+    outside.mkdir()
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {"senkichi/charlie-work": charlie_root})
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        hook,
+        "_run_merge_check",
+        lambda repo_root, pr: calls.append((repo_root, pr)) or (True, "ok"),
+    )
+    reason = hook._decide(
+        "Bash",
+        {"command": f"cd {outside.as_posix()} && gh pr merge 5 --squash"},
+        charlie_root,
+    )
+    assert reason is None
+    assert calls == []
+
+
+def test_decide_bash_no_cd_warns_on_hook_cwd_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # No --repo and no cd: the hook infers from its own cwd and warns.
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {"o/repo": root})
+    monkeypatch.setattr(hook, "_run_merge_check", lambda repo_root, pr: (True, "ok"))
+    reason = hook._decide("Bash", {"command": "gh pr merge 5 --squash"}, root)
+    assert reason is None
+    stderr = capsys.readouterr().err
+    assert "inferring repo from hook cwd" in stderr
+
+
+def test_decide_bash_cd_does_not_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # With a cd, the repo is resolved confidently — no warning.
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {"o/repo": root})
+    monkeypatch.setattr(hook, "_run_merge_check", lambda repo_root, pr: (True, "ok"))
+    reason = hook._decide(
+        "Bash", {"command": f"cd {root.as_posix()} && gh pr merge 5 --squash"}, tmp_path
+    )
+    assert reason is None
+    stderr = capsys.readouterr().err
+    assert "inferring repo from hook cwd" not in stderr
+
+
+def test_decide_bash_explicit_repo_does_not_warn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # With an explicit --repo, no warning.
+    root = tmp_path / "repo"
+    root.mkdir()
+    monkeypatch.setattr(hook, "_load_fleet_roots", lambda: {"o/repo": root})
+    monkeypatch.setattr(hook, "_run_merge_check", lambda repo_root, pr: (True, "ok"))
+    reason = hook._decide("Bash", {"command": "gh pr merge -R o/repo 5 --squash"}, tmp_path)
+    assert reason is None
+    stderr = capsys.readouterr().err
+    assert "inferring repo from hook cwd" not in stderr
+
+
+def test_decide_bash_cd_denied_on_failed_merge_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The cd-resolved repo must still be checked: a failing merge-check denies.
+    job_cannon_root = tmp_path / "job-cannon"
+    charlie_root = tmp_path / "charlie-work"
+    job_cannon_root.mkdir()
+    charlie_root.mkdir()
+    monkeypatch.setattr(
+        hook,
+        "_load_fleet_roots",
+        lambda: {
+            "senkichi/charlie-work": charlie_root,
+            "senkichi/job-cannon": job_cannon_root,
+        },
+    )
+    monkeypatch.setattr(hook, "_run_merge_check", lambda repo_root, pr: (False, "not_approved"))
+    reason = hook._decide(
+        "Bash",
+        {"command": f"cd {job_cannon_root.as_posix()} && gh pr merge 1679 --squash"},
+        charlie_root,
+    )
+    assert reason is not None
+    assert "not_approved" in reason
+    assert "#1679" in reason
+    assert "senkichi/job-cannon" in reason
