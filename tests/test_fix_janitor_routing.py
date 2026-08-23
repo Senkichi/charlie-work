@@ -620,7 +620,16 @@ class _RaceClosedGitHub(FakeGitHub):
     earlier in the pass) still sees the PR as OPEN, but ``pr_view`` (called
     inside ``review()``) observes it as CLOSED. This is exactly the window
     the rework finding describes.
+
+    Issue #1131: ``record_review`` now refuses on a terminal-state PR, so
+    ``pr_view`` returns OPEN until ``close_pr_view`` is set -- the test
+    flips it after ``record_review`` (setup) and before ``dispatch_rework``
+    (where the race actually occurs).
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.close_pr_view = False
 
     def pr_list(self):
         out = []
@@ -638,7 +647,7 @@ class _RaceClosedGitHub(FakeGitHub):
         for pr in self.prs:
             if pr["number"] == number:
                 pr_copy = dict(pr)
-                pr_copy["state"] = "CLOSED"
+                pr_copy["state"] = "CLOSED" if self.close_pr_view else "OPEN"
                 if number in self.pr_head_shas:
                     pr_copy["headRefOid"] = self.pr_head_shas[number]
                 return pr_copy
@@ -693,6 +702,10 @@ def test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass(
 
     fake_gh.labels_added.clear()
     fake_gh.labels_removed.clear()
+
+    # Issue #1131: flip pr_view to CLOSED -- the race occurs during
+    # dispatch_rework/review(), not during record_review above.
+    fake_gh.close_pr_view = True
 
     result = app.dispatch_rework()
 
@@ -756,6 +769,10 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     # Head advances (pr_list snapshot sees OPEN + new head); pr_view will
     # report CLOSED when review() runs.
     fake_gh.pr_head_shas[456] = "sha-new-head"
+
+    # Issue #1131: flip pr_view to CLOSED -- the race occurs during the
+    # orphan sweep's review() callback, not during record_review above.
+    fake_gh.close_pr_view = True
 
     with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
