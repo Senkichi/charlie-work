@@ -37,3 +37,19 @@ def _app(tmp_path: Path) -> OrchestratorApp:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     return OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+
+def _dry_run_app(tmp_path: Path) -> OrchestratorApp:
+    """Same fixture as ``_app`` but constructed with ``dry_run=True``.
+
+    Used by issue #1327's regression test: the de-escalation sweep must not
+    clear ``status`` in ``state.json`` under dry-run, since the paired GitHub
+    label transition is already gated at the sink and the two systems of
+    record must stay synchronized.
+    """
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
