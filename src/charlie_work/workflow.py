@@ -18157,8 +18157,24 @@ class OrchestratorApp:
         PR's live head, and via which tier (issues #411/#412, #414).
 
         Tier 1 (fast path): the live diff's stable patch-id equals the
-        recorded ``reviewed_patch_id`` — the effective content is provably
-        identical modulo hunk-context.
+        recorded ``reviewed_patch_id``. Issue #1187: ``git patch-id --stable``
+        strips leading whitespace from ``+``/``-`` content lines, so two
+        diffs that differ ONLY in indentation depth produce the identical
+        patch-id — and in an indentation-sensitive language (Python) an
+        indentation-only change can alter control flow (e.g. moving a
+        ``return`` into or out of an ``if`` block). A tier-1 patch-id match
+        alone is therefore NOT sufficient to carry forward a verdict: when
+        a tier-2 line-content signature (which preserves whitespace verbatim)
+        was recorded at review time, it is also validated and must match.
+        If the tier-2 signatures differ — a whitespace-only change that
+        patch-id collapsed — the check fails closed to stale rather than
+        carrying forward an approved verdict across a semantically
+        different, unreviewed head. Decisions that predate tier-2 (no
+        signature stored) have no tier-2 baseline to consult and preserve
+        #412's original patch-id-only carry-forward behavior. The tier-2
+        binary eligibility gate does NOT apply here: patch-id already
+        proved binary content identity, and tier-2 is consulted only for
+        its text-line view, which is unaffected by binary payloads.
 
         Tier 2 (line-content, issue #414): patch-ids differ — which happens
         on every ordinary main advance, since ``git patch-id --stable``
@@ -18211,7 +18227,32 @@ class OrchestratorApp:
             return CarryForwardCheck(None, live_patch_id, live_signature)
 
         if live_patch_id and live_patch_id == reviewed_patch_id:
-            return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            # Issue #1187: ``git patch-id --stable`` strips leading
+            # whitespace from ``+``/``-`` content lines, so two diffs that
+            # differ only in indentation depth produce the identical
+            # patch-id. In an indentation-sensitive language (Python), an
+            # indentation-only change can alter control flow. A patch-id
+            # match alone must not carry forward a verdict: validate the
+            # tier-2 line-content signature (which preserves whitespace
+            # verbatim) when one was recorded. The tier-2 binary gate does
+            # NOT apply here — patch-id already proved binary content
+            # identity, and tier-2 is consulted only for its text-line view.
+            reviewed_changed_lines = decision.get("reviewed_changed_lines")
+            reviewed_changed_files = decision.get("reviewed_changed_files")
+            if reviewed_changed_lines is None or reviewed_changed_files is None:
+                # Decision predates tier-2 (no signature recorded) —
+                # patch-id is the only available signal; preserve #412's
+                # original carry-forward behavior for legacy decisions.
+                return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
+            files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
+            if lines_match and files_match:
+                return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            # Patch-id matched but tier-2 signatures differ — a
+            # whitespace-only change that patch-id collapsed (issue #1187).
+            # Fail closed to stale rather than carrying forward an approved
+            # verdict across a semantically different, unreviewed head.
+            return CarryForwardCheck(None, live_patch_id, live_signature)
 
         reviewed_changed_lines = decision.get("reviewed_changed_lines")
         reviewed_changed_files = decision.get("reviewed_changed_files")
