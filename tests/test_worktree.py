@@ -4401,16 +4401,21 @@ def test_worker_authored_dirty_detects_sibling_in_collapsed_untracked_dir(
     dir/`` line in the first place — every file, including a worker-authored
     sibling living next to a nested injected path, gets its own record. There
     is no collapsed line left to special-case or re-probe.
+
+    Uses a non-launcher-owned directory (``.custom/``) because ``.devin/`` is
+    now entirely launcher-owned (issue #1391) — a sibling under ``.devin/``
+    is correctly ignored, so it cannot serve as the "should be detected"
+    case here.
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-    injected = repo_root / ".devin" / "prompts" / "worker.md"
+    injected = repo_root / ".custom" / "prompts" / "worker.md"
     injected.parent.mkdir(parents=True)
     injected.write_text("injected prompt", encoding="utf-8")
-    sibling = repo_root / ".devin" / "worker-output.txt"
+    sibling = repo_root / ".custom" / "worker-output.txt"
     sibling.write_text("real worker output", encoding="utf-8")
 
-    assert _worker_authored_dirty(repo_root, (".devin/prompts/worker.md",)) is True
+    assert _worker_authored_dirty(repo_root, (".custom/prompts/worker.md",)) is True
 
 
 def test_worker_authored_dirty_untracked_dir_with_only_injected_stays_clean(
@@ -4579,6 +4584,137 @@ def test_worker_authored_dirty_detects_changes_outside_materialize_and_injected(
     (repo_root / "worker-output.txt").write_text("worker result\n", encoding="utf-8")
 
     assert _worker_authored_dirty(repo_root, (), (".devin",)) is True
+
+
+# --- issue #1391: launcher-owned shim dirt is not worker output ---------------
+
+
+def test_worker_authored_dirty_ignores_devin_shim_residue(tmp_path: Path) -> None:
+    """Issue #1391: untracked ``.devin/`` launcher residue (AGENTS.md,
+    hooks.v1.json, hooks/*.py, skills/, worker.md, orchestrator.md) is shim
+    dirt, not worker output. The dirty check must ignore it so a worktree
+    whose only dirt is launcher residue is not refused re-arm."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Simulate the full set of shim residue observed in the field.
+    devin = repo_root / ".devin"
+    devin.mkdir(parents=True)
+    (devin / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+    (devin / "worker.md").write_text("worker\n", encoding="utf-8")
+    (devin / "orchestrator.md").write_text("orch\n", encoding="utf-8")
+    (devin / "hooks.v1.json").write_text("{}", encoding="utf-8")
+    hooks_dir = devin / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "pre_tool.py").write_text("# hook\n", encoding="utf-8")
+    skills_dir = devin / "skills"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "foo.py").write_text("# skill\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_devin_prompts_modifications(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391: modified ``.devin/prompts/rework.md`` / ``worker.md`` are
+    shim rewrites, not worker output. Even when tracked, modifications under
+    ``.devin/`` must be ignored by the launcher-owned matcher (independent of
+    ``injected_paths`` / ``materialize_dirs`` config)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    prompts_dir = repo_root / ".devin" / "prompts"
+    prompts_dir.mkdir(parents=True)
+    for name in ("worker.md", "rework.md"):
+        p = prompts_dir / name
+        p.write_text("original\n", encoding="utf-8")
+        _git(repo_root, "add", str(p))
+    _git(repo_root, "commit", "-m", "track devin prompts")
+    # Simulate the shim rewriting them.
+    (prompts_dir / "worker.md").write_text("rewritten\n", encoding="utf-8")
+    (prompts_dir / "rework.md").write_text("rewritten\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_pr_body_scratch_files(tmp_path: Path) -> None:
+    """Issue #1391: PR body scratch files (``PR_BODY.md``, ``PR_BODY_42.md``,
+    ``.worker-pr-body.md``, ``_pr_body.md``) are launcher/protocol residue,
+    not worker output. The dirty check must ignore all variants."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    for name in ("PR_BODY.md", "PR_BODY_42.md", ".worker-pr-body.md", "_pr_body.md"):
+        (repo_root / name).write_text("# PR body draft\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_git_worktree_dir(tmp_path: Path) -> None:
+    """Issue #1391: untracked ``.git_worktree_dir/`` is launcher residue."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    wt_dir = repo_root / ".git_worktree_dir"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "cache.json").write_text("{}", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is False
+
+
+def test_worker_authored_dirty_ignores_charlie_writer_deletion(tmp_path: Path) -> None:
+    """Issue #1391: a deleted ``.charlie-writer.json`` marker is protocol
+    residue, not worker output. The writer marker is already in the default
+    ``injected_paths``, so a deletion is excluded by the declared-scaffolding
+    matcher — this test pins that the default config covers the deletion
+    case (not just creation/modification)."""
+    from charlie_work.config import DispatchConfig
+
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    marker = repo_root / ".charlie-writer.json"
+    marker.write_text('{"pid": 1}\n', encoding="utf-8")
+    _git(repo_root, "add", str(marker))
+    _git(repo_root, "commit", "-m", "track writer marker")
+    # Delete it (simulating a worker or shim removing the marker).
+    marker.unlink()
+
+    assert _worker_authored_dirty(repo_root, DispatchConfig().injected_paths) is False
+
+
+def test_worker_authored_dirty_still_flags_real_work_alongside_shim_dirt(
+    tmp_path: Path,
+) -> None:
+    """Issue #1391 negative control: ignoring launcher residue must NOT excuse
+    genuine worker-authored modifications mixed in with the junk. This is the
+    jc #1514 scenario — two real modified source files alongside shim dirt
+    that were lost when the worktree was force-removed."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    # Shim residue.
+    devin = repo_root / ".devin"
+    devin.mkdir(parents=True)
+    (devin / "AGENTS.md").write_text("agents\n", encoding="utf-8")
+    (repo_root / "PR_BODY.md").write_text("# draft\n", encoding="utf-8")
+    # Real worker output — a tracked source file modification.
+    src = repo_root / "src" / "app.py"
+    src.parent.mkdir(parents=True)
+    src.write_text("original\n", encoding="utf-8")
+    _git(repo_root, "add", str(src))
+    _git(repo_root, "commit", "-m", "add app")
+    src.write_text("modified by worker\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
+
+
+def test_worker_authored_dirty_devin_prefix_does_not_collide(tmp_path: Path) -> None:
+    """Issue #1391: a directory that merely shares a string prefix with a
+    launcher-owned dir (``.devin-cache`` vs ``.devin``) must not match —
+    path-segment comparison, not substring matching."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    cache_dir = repo_root / ".devin-cache"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "marker.txt").write_text("not launcher\n", encoding="utf-8")
+
+    assert _worker_authored_dirty(repo_root, ()) is True
 
 
 def test_inspect_worktree_state_no_commits(tmp_path: Path) -> None:
