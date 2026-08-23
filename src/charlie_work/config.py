@@ -663,6 +663,55 @@ class ReviewDispatchConfig:
 
 
 @dataclass(frozen=True)
+class InfraBlockedConfig:
+    """Classification + escalation knobs for required checks that fail
+    because of a fleet-wide infrastructure condition (Actions budget
+    exhaustion, runner outage, quota) rather than the PR's code -- issue
+    #1383.
+
+    A check matching the structural or annotation signal is classified
+    ``infra_blocked`` (see ``checks.is_infra_blocked_check``), excluded from
+    the "required checks failed -> dispatch rework" path, and held without
+    burning rework attempts. Persistence across ``persistence_passes`` loop
+    passes emits exactly ONE operator-facing ``infra_blocked_escalated``
+    event per ``escalation_window_minutes`` window -- not one per PR per
+    pass -- so a billing outage escalates the infra, not every healthy PR
+    on it.
+
+    The annotation substring list lives in config, not code: an operator
+    can retune it for a new infra-outage annotation without a deploy. The
+    structural signal (zero non-setup steps / instant-fail) is code-based
+    and preferred where the Actions API exposes step/timing data.
+    """
+
+    #: Master switch. When False, no infra_blocked classification happens
+    #: and budget-failed checks fall back to ordinary ``failed`` routing
+    #: (the pre-#1383 behavior).
+    enabled: bool = True
+    #: Structural signal: a FAILURE conclusion whose job ran for at most
+    #: this many seconds with zero non-setup steps executed is classified
+    #: infra_blocked (runner never started the work -- billing/runner
+    #: outage). 0 disables the timing signal; zero-step-alone still
+    #: classifies.
+    instant_fail_seconds: int = 10
+    #: Case-insensitive annotation substrings (matched against each
+    #: annotation's ``message``) that indicate an infrastructure/billing
+    #: block rather than a code failure. Kept in config per issue #1383.
+    annotation_patterns: tuple[str, ...] = (
+        "the job was not started",
+        "actions budget is preventing further use",
+        "no runner matching",
+        "usage limit",
+    )
+    #: Number of loop passes the infra_blocked condition must persist
+    #: across before a single operator-facing escalation is emitted (AC3).
+    persistence_passes: int = 3
+    #: Window (minutes) during which only one ``infra_blocked_escalated``
+    #: event is emitted, regardless of how many PRs are affected (AC3).
+    escalation_window_minutes: int = 60
+
+
+@dataclass(frozen=True)
 class AutoMergeConfig:
     enabled: bool = True
     strategy: str = "squash"
@@ -689,6 +738,10 @@ class AutoMergeConfig:
     # run id for a check has been retried this many times on the current
     # head, the PR escalates to a human instead of retrying forever.
     infra_rerun_attempt_cap: int = 2
+    # Issue #1383: classification + escalation knobs for required checks
+    # that fail because of a fleet-wide infra condition (Actions budget /
+    # runner outage) rather than the PR's code. See InfraBlockedConfig.
+    infra_blocked: InfraBlockedConfig = field(default_factory=InfraBlockedConfig)
     # Maximum minutes after the PR's last update (updatedAt) to wait for any
     # required check run to appear before routing an approved PR to readiness
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
@@ -2279,6 +2332,64 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         # Store the stripped value: it is compared against the GitHub commit
         # author login, where surrounding whitespace can never match.
         auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
+    # Issue #1383: nested infra_blocked section under auto_merge.
+    infra_blocked_data = auto_merge_data.get("infra_blocked")
+    if infra_blocked_data is not None:
+        if not isinstance(infra_blocked_data, dict):
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked' must be a mapping, "
+                f"got {type(infra_blocked_data).__name__}"
+            )
+        infra_blocked_fields = {f.name for f in fields(InfraBlockedConfig)}
+        unknown_ib_keys = sorted(set(infra_blocked_data) - infra_blocked_fields)
+        if unknown_ib_keys:
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked' has unknown key(s): "
+                f"{', '.join(unknown_ib_keys)} "
+                f"(valid: {', '.join(sorted(infra_blocked_fields))})"
+            )
+        annotation_patterns = infra_blocked_data.get("annotation_patterns")
+        if annotation_patterns is not None:
+            if not isinstance(annotation_patterns, list):
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.annotation_patterns' "
+                    f"must be a list of strings, got {type(annotation_patterns).__name__}"
+                )
+            infra_blocked_data["annotation_patterns"] = tuple(
+                str(item) for item in annotation_patterns
+            )
+        for int_key in ("instant_fail_seconds", "persistence_passes"):
+            int_value = infra_blocked_data.get(int_key)
+            if int_value is not None:
+                if isinstance(int_value, bool) or not isinstance(int_value, int):
+                    raise ConfigError(
+                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be an "
+                        f"int, got {type(int_value).__name__}"
+                    )
+                if int_value < 0:
+                    raise ConfigError(
+                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be >= 0, "
+                        f"got {int_value}"
+                    )
+        esc_minutes = infra_blocked_data.get("escalation_window_minutes")
+        if esc_minutes is not None:
+            if isinstance(esc_minutes, bool) or not isinstance(esc_minutes, int):
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
+                    f"must be an int, got {type(esc_minutes).__name__}"
+                )
+            if esc_minutes < 0:
+                raise ConfigError(
+                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
+                    f"must be >= 0, got {esc_minutes}"
+                )
+        enabled_value = infra_blocked_data.get("enabled")
+        if enabled_value is not None and not isinstance(enabled_value, bool):
+            raise ConfigError(
+                "config section 'auto_merge' key 'infra_blocked.enabled' must be a bool, "
+                f"got {type(enabled_value).__name__}"
+            )
+        auto_merge_data["infra_blocked"] = InfraBlockedConfig(**infra_blocked_data)
     auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
     runtime_data = _section(data, "runtime")
     throttle_error_markers = runtime_data.get("throttle_error_markers")

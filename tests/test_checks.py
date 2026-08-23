@@ -12,8 +12,10 @@ from charlie_work.checks import (
     _run_id_from_link,
     classify_check_failures,
     classify_infra_failures,
+    is_infra_blocked_check,
     summarize_checks,
 )
+from charlie_work.config import InfraBlockedConfig
 from charlie_work.workflow import _non_required_check_findings
 
 
@@ -772,4 +774,122 @@ def test_summarize_checks_none_returns_unavailable_required_checks() -> None:
     assert summary.passed == ()
     assert summary.pending == ()
     assert summary.failed == ()
+
+
+# ---------------------------------------------------------------------------
+# Issue #1383: infra_blocked classification
+# ---------------------------------------------------------------------------
+
+
+def test_infra_blocked_zero_step_job_classified() -> None:
+    """AC1: a FAILURE job with zero steps is infra_blocked."""
+    job = {"conclusion": "FAILURE", "steps": []}
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is True
+
+
+def test_infra_blocked_setup_only_steps_classified() -> None:
+    """AC1: a FAILURE job with only setup steps is infra_blocked."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [
+            {"name": "Set up job", "conclusion": "SUCCESS"},
+            {"name": "Checkout", "conclusion": "SUCCESS"},
+        ],
+    }
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is True
+
+
+def test_infra_blocked_budget_annotation_classified() -> None:
+    """AC1: a FAILURE job with a budget annotation is infra_blocked."""
+    job = {"conclusion": "FAILURE", "steps": [{"name": "Run tests", "conclusion": "FAILURE"}]}
+    annotations = [
+        {"message": "The job was not started because your spending limit needs to be increased."}
+    ]
+    assert is_infra_blocked_check(job, annotations, InfraBlockedConfig()) is True
+
+
+def test_infra_blocked_instant_fail_no_steps_classified() -> None:
+    """AC1: a FAILURE job with no steps array that failed within the threshold is infra_blocked."""
+    job = {
+        "conclusion": "FAILURE",
+        "started_at": "2026-08-21T10:00:00Z",
+        "completed_at": "2026-08-21T10:00:05Z",
+    }
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is True
+
+
+def test_infra_blocked_real_test_failure_not_classified() -> None:
+    """A FAILURE job with real test steps is NOT infra_blocked."""
+    job = {
+        "conclusion": "FAILURE",
+        "steps": [
+            {"name": "Set up job", "conclusion": "SUCCESS"},
+            {"name": "Run tests", "conclusion": "FAILURE"},
+        ],
+    }
+    assert is_infra_blocked_check(job, [], InfraBlockedConfig()) is False
+
+
+def test_infra_blocked_non_failure_conclusion_not_classified() -> None:
+    """A SUCCESS/CANCELLED job is never infra_blocked."""
+    assert is_infra_blocked_check({"conclusion": "SUCCESS"}, [], InfraBlockedConfig()) is False
+    assert is_infra_blocked_check({"conclusion": "CANCELLED"}, [], InfraBlockedConfig()) is False
+
+
+def test_infra_blocked_disabled_config_not_classified() -> None:
+    """When config.enabled is False, no classification happens."""
+    cfg = InfraBlockedConfig(enabled=False)
+    job = {"conclusion": "FAILURE", "steps": []}
+    assert is_infra_blocked_check(job, [], cfg) is False
+
+
+def test_infra_blocked_custom_annotation_pattern() -> None:
+    """Config-listed annotation patterns are matched (not hardcoded in code)."""
+    cfg = InfraBlockedConfig(annotation_patterns=("billing exhausted",))
+    job = {"conclusion": "FAILURE", "steps": [{"name": "Run tests", "conclusion": "FAILURE"}]}
+    annotations = [{"message": "Error: billing exhausted for this account"}]
+    assert is_infra_blocked_check(job, annotations, cfg) is True
+
+
+def test_infra_blocked_instant_fail_disabled_by_zero_threshold() -> None:
+    """instant_fail_seconds=0 disables the timing signal."""
+    cfg = InfraBlockedConfig(instant_fail_seconds=0)
+    job = {
+        "conclusion": "FAILURE",
+        "started_at": "2026-08-21T10:00:00Z",
+        "completed_at": "2026-08-21T10:00:03Z",
+    }
+    assert is_infra_blocked_check(job, [], cfg) is False
+
+
+def test_summarize_checks_infra_blocked_marker_routed_to_infra_blocked_bucket() -> None:
+    """A check with state=INFRA_BLOCKED is routed to the infra_blocked bucket, not failed."""
+    checks = [{"name": "Tests passed", "state": "INFRA_BLOCKED"}]
+    summary = summarize_checks(checks, ("Tests passed",))
+
+    assert summary.infra_blocked == ("Tests passed",)
+    assert summary.failed == ()
+    assert summary.infra_failed == ()
+    assert summary.ready is False
+
+
+def test_summarize_checks_infra_blocked_does_not_affect_ready_when_empty() -> None:
+    """An empty infra_blocked bucket does not block readiness."""
+    checks = [{"name": "Tests passed", "state": "SUCCESS"}]
+    summary = summarize_checks(checks, ("Tests passed",))
+
+    assert summary.infra_blocked == ()
+    assert summary.ready is True
+
+
+def test_summarize_checks_failed_takes_precedence_over_infra_blocked() -> None:
+    """When a check name has both a FAILURE and an INFRA_BLOCKED run, failed wins (worst-of)."""
+    checks = [
+        {"name": "Tests passed", "state": "INFRA_BLOCKED"},
+        {"name": "Tests passed", "state": "FAILURE"},
+    ]
+    summary = summarize_checks(checks, ("Tests passed",))
+
+    assert summary.failed == ("Tests passed",)
+    assert summary.infra_blocked == ()
     assert summary.missing == ()

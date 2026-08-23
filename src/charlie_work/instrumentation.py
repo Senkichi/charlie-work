@@ -170,6 +170,12 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "fleet_pass_config_error": "error",
         "github_error": "error",
         "github_not_found_error": "error",
+        # Issue #1383: fleet-wide infra block (Actions budget/runner outage)
+        # has persisted across the configured pass threshold -- one
+        # operator-facing escalation per window, not per PR. Terminal for
+        # the affected PRs' lane this pass -> error, parallel to
+        # infra_rerun_escalated.
+        "infra_blocked_escalated": "error",
         "infra_rerun_escalated": "error",
         "intake_failed": "error",
         "janitor_rework_cycle_failed": "error",
@@ -260,6 +266,15 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "cross_family_regen_not_reached": "warning",
         "dead_dispatched_worker_reaped": "warning",
         "deescalation_cap_exhausted": "warning",
+        # Issue #1383: a required check failed due to a fleet-wide infra
+        # condition (Actions budget/runner outage) rather than the PR's
+        # code. Warning, not error: the PR is held without rework (not
+        # escalated), and the operator-facing escalation is the separate
+        # ``infra_blocked_escalated`` error kind, emitted once per window
+        # only when the condition persists. Consumed by heartbeat_check.py's
+        # ``check_infra_blocked_events`` (AC4) and by the cross-pass
+        # escalation tracker in ``_loop_impl``.
+        "check_infra_blocked": "warning",
         # Issue #1000: a path:line citation in a dispatch-ready issue no longer
         # matches the working tree (file renamed/deleted, line out of range, or
         # blank). Warning, not error: dispatch is not gated on drift -- the flag
