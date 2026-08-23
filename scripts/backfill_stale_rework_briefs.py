@@ -52,9 +52,17 @@ regenerates the brief through the OLD code. The freshly-written brief is then
 newer than the verdict again, so the PR falls straight back into
 "will-not-regenerate" - silently burning the one lever this script has, with
 no signal that anything went wrong. --apply therefore refuses to run unless
---require-commit proves the renderer fix is an ancestor of the target repo's
-live HEAD. This check is not bypassable by a flag; if you need to skip it,
-you are doing something this script was deliberately built to prevent.
+--require-commit proves the renderer fix is an ancestor of the RENDERER
+checkout's live HEAD -- the checkout whose code actually performs
+dispatch_rework's render. In the live fleet topology that is the daemon
+deployment (C:\\Users\\senki\\srv\\charlie-work-daemon), NOT the state root
+selected by --repo: the fleet daemon runs all lane code (including the brief
+renderer) from there for every fleet, so the gate must anchor there
+regardless of which state root is being backfilled. Point --renderer-repo at
+that checkout; when omitted it defaults to --repo (correct only for a
+single-checkout layout where the state repo IS the renderer). This check is
+not bypassable by a flag; if you need to skip it, you are doing something
+this script was deliberately built to prevent.
 
 --dry-run is the default and is always safe to run (it opens files read-only
 and never calls os.utime): it still evaluates and reports the gate, since an
@@ -92,6 +100,15 @@ Usage:
     # running from a worktree against the main checkout's live state):
     python scripts/backfill_stale_rework_briefs.py --repo C:/path/to/main-checkout \\
         --require-commit <sha>
+
+    # Fleet topology: the state root (--repo) and the renderer checkout
+    # (the daemon deployment) are different checkouts, and for the
+    # job-cannon lane they are different repos entirely. The gate must
+    # anchor to the renderer checkout, where the renderer-fix SHA lives:
+    python scripts/backfill_stale_rework_briefs.py \\
+        --repo C:/Users/senki/repos/job-cannon \\
+        --renderer-repo C:/Users/senki/srv/charlie-work-daemon \\
+        --require-commit <charlie-work-fix-sha> --apply
 """
 
 from __future__ import annotations
@@ -420,8 +437,20 @@ def _current_head(repo_root: Path) -> str:
     return result.stdout.strip()
 
 
-def check_deployment_gate(repo_root: Path, require_commits: list[str]) -> tuple[bool, list[str]]:
-    """Verify every ref in *require_commits* is an ancestor of *repo_root*'s HEAD.
+def check_deployment_gate(
+    renderer_repo: Path, require_commits: list[str]
+) -> tuple[bool, list[str]]:
+    """Verify every ref in *require_commits* is an ancestor of *renderer_repo*'s HEAD.
+
+    *renderer_repo* is the checkout whose code actually performs
+    ``dispatch_rework``'s render -- in the live fleet topology that is the
+    daemon deployment (``C:\\Users\\senki\\srv\\charlie-work-daemon``), NOT
+    the state root selected by ``--repo``. The gate exists to prove the
+    renderer fix is deployed in the checkout that will regenerate the brief,
+    so the anchor must be that checkout's HEAD, independent of which state
+    root the operator targets (issue #1332). When the state root and the
+    renderer are the same checkout (single-repo dev layout) the caller passes
+    the same path for both.
 
     Returns (all_pass, failure_messages). Never raises for an ordinary
     "not an ancestor" result - only genuine command failure (git missing,
@@ -429,18 +458,25 @@ def check_deployment_gate(repo_root: Path, require_commits: list[str]) -> tuple[
     see, not a routine gate failure.
 
     CAUTION for callers constructing *require_commits*: a ref that resolves
-    relative to *repo_root* itself (e.g. the bare string "HEAD") is a
-    tautology here -- "is repo_root's HEAD an ancestor of repo_root's HEAD"
-    is always true. --require-commit must always be a fixed, specific commit
-    SHA (or a ref from a *different* repository/branch than the one being
-    gated), never a ref that floats with the target checkout.
+    relative to *renderer_repo* itself (e.g. the bare string "HEAD") is a
+    tautology here -- "is renderer_repo's HEAD an ancestor of
+    renderer_repo's HEAD" is always true. --require-commit must always be a
+    fixed, specific commit SHA that exists in *renderer_repo*'s object
+    store. A SHA from a *different* repository (e.g. a charlie-work fix SHA
+    evaluated against a job-cannon checkout) is NOT supported: the renderer
+    checkout cannot resolve it and git exits 128 ("Not a valid commit
+    name"). This is exactly why the gate anchors to the renderer checkout
+    rather than to ``--repo`` -- the renderer fix SHA lives in
+    charlie-work's history, so the gate must run in a charlie-work checkout
+    (the daemon deployment), never in the state root's checkout when that
+    is a different repo.
     """
-    head = _current_head(repo_root)
+    head = _current_head(renderer_repo)
     failures: list[str] = []
     for ref in require_commits:
         result = subprocess.run(
             ["git", "merge-base", "--is-ancestor", ref, "HEAD"],
-            cwd=repo_root,
+            cwd=renderer_repo,
             text=True,
             capture_output=True,
             **no_console_window_kwargs(),
@@ -449,7 +485,7 @@ def check_deployment_gate(repo_root: Path, require_commits: list[str]) -> tuple[
             continue
         if result.returncode == 1:
             failures.append(
-                f"{ref} is NOT an ancestor of {repo_root}'s HEAD ({head}) - "
+                f"{ref} is NOT an ancestor of {renderer_repo}'s HEAD ({head}) - "
                 "the renderer fix is not deployed here yet"
             )
         else:
@@ -626,11 +662,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="SHA_OR_REF",
         help=(
             "A fixed commit SHA (not a floating ref like plain 'HEAD') that "
-            "must be an ancestor of --repo's HEAD for --apply to proceed - "
-            "this is the renderer-fix deployment gate. May be given more "
-            "than once (e.g. F1 and F5) to require all of them. Required "
-            "for every invocation except --check-regenerated, so the report "
-            "always shows whether --apply is currently allowed."
+            "must be an ancestor of the renderer checkout's HEAD for --apply "
+            "to proceed - this is the renderer-fix deployment gate. The "
+            "renderer checkout is --renderer-repo if given, else --repo. "
+            "The SHA must exist in that checkout's object store (a SHA from "
+            "a different repository exits 128). May be given more than once "
+            "(e.g. F1 and F5) to require all of them. Required for every "
+            "invocation except --check-regenerated, so the report always "
+            "shows whether --apply is currently allowed."
+        ),
+    )
+    parser.add_argument(
+        "--renderer-repo",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the git checkout whose code actually performs the "
+            "rework-brief render -- the checkout the deployment gate "
+            "evaluates --require-commit against. In the live fleet topology "
+            "this is the daemon deployment "
+            "(C:/Users/senki/srv/charlie-work-daemon), NOT the state root "
+            "selected by --repo: the gate must prove the renderer fix is "
+            "deployed in the checkout that will regenerate the brief, and "
+            "for the job-cannon lane that checkout is a different repo than "
+            "the state root (issue #1332). Default: same as --repo (correct "
+            "for a single-checkout layout where the state repo IS the "
+            "renderer)."
         ),
     )
     parser.add_argument(
@@ -691,7 +748,21 @@ def main(argv: list[str] | None = None) -> int:
     paths = runtime_paths(repo_root, config.runtime.state_dir)
     prs_root = paths.prs
 
+    # The deployment gate anchors to the RENDERER checkout -- the checkout
+    # whose code performs dispatch_rework's render -- not the state root
+    # selected by --repo. In the live fleet topology these are different
+    # checkouts (the renderer is the daemon deployment; --repo may be a
+    # different repo's state root, e.g. job-cannon). Default to repo_root
+    # for the single-checkout layout where the state repo IS the renderer
+    # (issue #1332).
+    if args.renderer_repo is not None:
+        renderer_repo = find_repo_root(cwd=args.renderer_repo, explicit=True)
+    else:
+        renderer_repo = repo_root
+
     print(f"Repo root: {repo_root}")
+    if renderer_repo != repo_root:
+        print(f"Renderer repo (deployment gate anchor): {renderer_repo}")
 
     if args.check_regenerated:
         manifest_path = args.manifest_path or _default_manifest_path(prs_root)
@@ -704,9 +775,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    gate_ok, gate_failures = check_deployment_gate(repo_root, args.require_commit)
+    gate_ok, gate_failures = check_deployment_gate(renderer_repo, args.require_commit)
     if gate_ok:
-        print(f"Deployment gate: PASS - all of {args.require_commit} are ancestors of HEAD.")
+        print(
+            f"Deployment gate: PASS - all of {args.require_commit} are ancestors of "
+            f"{renderer_repo}'s HEAD."
+        )
     else:
         print("Deployment gate: FAIL")
         for msg in gate_failures:
