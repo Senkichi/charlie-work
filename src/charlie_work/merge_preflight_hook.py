@@ -277,7 +277,13 @@ def _parse_gh_merge_targets(command: str, cwd: Path | None = None) -> list[dict[
     directory, not the hook process's cwd, so repo resolution must use the
     command's effective cwd. Subshell boundaries (``(`` / ``)``) push/pop a
     cwd context so a ``cd`` inside ``(...)`` does not leak to commands after
-    the subshell. ``cd_cwd`` is ``None`` when no ``cd`` precedes the invocation
+    the subshell. A ``cd`` that is part of a pipeline (either side of ``|``)
+    or that is backgrounded (followed by ``&``) also runs in a subshell whose
+    cwd change does not persist — it is reverted at the next command boundary
+    so it cannot set ``effective_cwd`` for later ``&&``/``;``-joined commands
+    in the same chain (#1252 review finding: the pipe/background case reopens
+    the exact wrong-repo merge-check bypass this hook closes).
+    ``cd_cwd`` is ``None`` when no ``cd`` precedes the invocation
     (or when a relative path cannot be resolved because ``cwd`` was not
     provided) — the caller then falls back to the hook cwd with a warning.
 
@@ -299,7 +305,17 @@ def _parse_gh_merge_targets(command: str, cwd: Path | None = None) -> list[dict[
     targets: list[dict[str, Any]] = []
     gh_repo_env: str | None = None
     effective_cwd: Path | None = None  # set by cd; None = "use hook cwd"
-    cwd_stack: list[Path | None] = []
+    # Snapshot of ``effective_cwd`` at the start of the current command. A
+    # ``cd`` in a pipeline or backgrounded command runs in a subshell and
+    # must not persist; when the subshell context ends (at ``|``, ``&``, or a
+    # major separator after a pipeline) we revert ``effective_cwd`` to this
+    # snapshot (#1252 review finding).
+    command_start_cwd: Path | None = None
+    pipeline_depth = 0
+    # Stack of (effective_cwd, pipeline_depth, command_start_cwd) for ``(...)``
+    # subshells — a subshell starts a fresh pipeline context and restores the
+    # outer one on ``)``.
+    cwd_stack: list[tuple[Path | None, int, Path | None]] = []
     command_position = True  # first token is in command position
     idx = 0
     while idx < len(tokens):
@@ -310,13 +326,17 @@ def _parse_gh_merge_targets(command: str, cwd: Path | None = None) -> list[dict[
         # ``)`` may glue to a following separator (``);``, ``)&&``), so we
         # match ``)`` as a prefix and treat the remainder as a separator.
         if tok == "(":
-            cwd_stack.append(effective_cwd)
+            cwd_stack.append((effective_cwd, pipeline_depth, command_start_cwd))
+            # Subshell starts in a fresh pipeline context — a ``&&`` inside
+            # ``(...)`` must not be mistaken for the end of an outer pipeline.
+            pipeline_depth = 0
+            command_start_cwd = effective_cwd
             command_position = True
             idx += 1
             continue
         if tok == ")" or tok.startswith(")"):
             if cwd_stack:
-                effective_cwd = cwd_stack.pop()
+                effective_cwd, pipeline_depth, command_start_cwd = cwd_stack.pop()
             # The remainder after ) (e.g. ``;``, ``&&``) is a separator that
             # starts a new command; a bare ``)`` is followed by whitespace,
             # which also starts a new command.
@@ -355,6 +375,25 @@ def _parse_gh_merge_targets(command: str, cwd: Path | None = None) -> list[dict[
             command_position = False
             continue
         if tok in _SHELL_SEPARATORS:
+            # A ``|`` enters or continues a pipeline: both sides of a pipe
+            # run in subshells, so a ``cd`` in the segment just ended does
+            # not persist. Revert to the cwd captured before that segment
+            # started (#1252 review finding).
+            if tok == "|":
+                effective_cwd = command_start_cwd
+                pipeline_depth += 1
+            elif tok == "&":
+                # A backgrounded command runs in a subshell; its cd does not
+                # persist. ``&`` also ends any in-progress pipeline (the
+                # whole pipeline is backgrounded as a unit).
+                effective_cwd = command_start_cwd
+                pipeline_depth = 0
+            elif pipeline_depth > 0:
+                # Major separator (``&&``, ``||``, ``;``, ``\n``) ends the
+                # pipeline: revert any cd from the last pipe segment.
+                effective_cwd = command_start_cwd
+                pipeline_depth = 0
+            command_start_cwd = effective_cwd
             command_position = True
             idx += 1
             continue

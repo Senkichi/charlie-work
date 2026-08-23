@@ -956,3 +956,175 @@ def test_decide_bash_cd_denied_on_failed_merge_check(
     assert "not_approved" in reason
     assert "#1679" in reason
     assert "senkichi/job-cannon" in reason
+
+
+# ---------------------------------------------------------------------------
+# #1252 review finding: cd in a pipeline or backgrounded command runs in a
+# subshell — its cwd change must not persist to later && / ; -joined commands
+# in the same chain. Without this, ``echo x | cd <repo> && gh pr merge N``
+# and ``cd <repo> & gh pr merge N`` reopen the exact wrong-repo merge-check
+# bypass this hook closes.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_cd_piped_does_not_persist_cd_cwd(tmp_path: Path) -> None:
+    # ``echo x | cd <repo> && gh pr merge N``: the cd is the right side of a
+    # pipe, so it runs in a subshell. The ``&&`` joins the *pipeline* (not
+    # the cd) to the merge, so the merge runs in the original cwd, not the
+    # cd'd directory. cd_cwd must be None.
+    target_dir = tmp_path / "job-cannon"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"echo x | cd {target_dir.as_posix()} && gh pr merge 5", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] is None
+
+
+def test_parse_cd_backgrounded_does_not_persist_cd_cwd(tmp_path: Path) -> None:
+    # ``cd <repo> & gh pr merge N``: the ``&`` backgrounds the cd (subshell),
+    # so the merge runs in the original cwd. cd_cwd must be None.
+    target_dir = tmp_path / "job-cannon"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(f"cd {target_dir.as_posix()} & gh pr merge 5", tmp_path)
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] is None
+
+
+def test_parse_cd_left_side_of_pipe_does_not_persist(tmp_path: Path) -> None:
+    # ``cd <repo> | cat; gh pr merge N``: the left side of a pipe also runs
+    # in a subshell, so the cd does not persist past the pipeline.
+    target_dir = tmp_path / "job-cannon"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"cd {target_dir.as_posix()} | cat; gh pr merge 5", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] is None
+
+
+def test_parse_cd_in_multi_pipe_does_not_persist(tmp_path: Path) -> None:
+    # A cd in any segment of a multi-stage pipeline is subshell-scoped.
+    target_dir = tmp_path / "job-cannon"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"echo a | echo b | cd {target_dir.as_posix()} && gh pr merge 5", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] is None
+
+
+def test_parse_cd_before_pipeline_persists_after_pipeline(tmp_path: Path) -> None:
+    # ``cd <repo> && echo x | cat && gh pr merge N``: the cd is before the
+    # pipeline (joined by ``&&``), so it persists. The pipeline (echo | cat)
+    # runs in subshells but does not undo the prior cd. The merge after the
+    # pipeline runs in the cd'd directory.
+    target_dir = tmp_path / "job-cannon"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"cd {target_dir.as_posix()} && echo x | cat && gh pr merge 5", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] == target_dir.resolve()
+
+
+def test_parse_cd_piped_with_semicolon_does_not_persist(tmp_path: Path) -> None:
+    # ``echo x | cd <repo>; gh pr merge N``: the semicolon ends the pipeline,
+    # reverting the subshell-scoped cd. The merge runs in the original cwd.
+    target_dir = tmp_path / "job-cannon"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"echo x | cd {target_dir.as_posix()}; gh pr merge 5", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] is None
+
+
+def test_parse_cd_in_subshell_with_pipe_does_not_leak(tmp_path: Path) -> None:
+    # ``(echo x | cd <repo>) && gh pr merge N``: the pipe is inside a
+    # subshell, so the cd is doubly contained. The merge after ``)`` runs in
+    # the original cwd.
+    target_dir = tmp_path / "job-cannon"
+    target_dir.mkdir()
+    targets = hook._parse_gh_merge_targets(
+        f"(echo x | cd {target_dir.as_posix()}) && gh pr merge 5", tmp_path
+    )
+    assert len(targets) == 1
+    assert targets[0]["cd_cwd"] is None
+
+
+def test_decide_bash_cd_piped_does_not_check_wrong_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The wrong-repo bypass this hook closes: a session anchored in
+    # charlie-work runs ``echo x | cd job-cannon && gh pr merge 1679``. The
+    # cd is piped (subshell), so the merge actually runs in charlie-work.
+    # The hook must check charlie-work's PR #1679, NOT job-cannon's. If the
+    # cd were wrongly attributed, merge-check would run against job-cannon
+    # (the wrong repo), silently bypassing the gate for charlie-work.
+    charlie_root = tmp_path / "charlie-work"
+    job_cannon_root = tmp_path / "job-cannon"
+    charlie_root.mkdir()
+    job_cannon_root.mkdir()
+    monkeypatch.setattr(
+        hook,
+        "_load_fleet_roots",
+        lambda: {
+            "senkichi/charlie-work": charlie_root,
+            "senkichi/job-cannon": job_cannon_root,
+        },
+    )
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        hook,
+        "_run_merge_check",
+        lambda repo_root, pr: calls.append((repo_root, pr)) or (True, "ok"),
+    )
+    reason = hook._decide(
+        "Bash",
+        {"command": f"echo x | cd {job_cannon_root.as_posix()} && gh pr merge 1679 --squash"},
+        charlie_root,
+    )
+    assert reason is None
+    # The merge runs in charlie-work (the hook cwd, since the piped cd does
+    # not persist), so merge-check is called on charlie_root, not
+    # job_cannon_root.
+    assert calls == [(charlie_root, 1679)], (
+        f"merge-check must run against charlie-work (hook cwd), not job-cannon "
+        f"(piped cd); got {calls}"
+    )
+
+
+def test_decide_bash_cd_backgrounded_does_not_check_wrong_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same bypass via backgrounding: ``cd job-cannon & gh pr merge 1679``.
+    # The cd is backgrounded (subshell), so the merge runs in charlie-work.
+    charlie_root = tmp_path / "charlie-work"
+    job_cannon_root = tmp_path / "job-cannon"
+    charlie_root.mkdir()
+    job_cannon_root.mkdir()
+    monkeypatch.setattr(
+        hook,
+        "_load_fleet_roots",
+        lambda: {
+            "senkichi/charlie-work": charlie_root,
+            "senkichi/job-cannon": job_cannon_root,
+        },
+    )
+    calls: list[Any] = []
+    monkeypatch.setattr(
+        hook,
+        "_run_merge_check",
+        lambda repo_root, pr: calls.append((repo_root, pr)) or (True, "ok"),
+    )
+    reason = hook._decide(
+        "Bash",
+        {"command": f"cd {job_cannon_root.as_posix()} & gh pr merge 1679 --squash"},
+        charlie_root,
+    )
+    assert reason is None
+    assert calls == [(charlie_root, 1679)], (
+        f"merge-check must run against charlie-work (hook cwd), not job-cannon "
+        f"(backgrounded cd); got {calls}"
+    )
