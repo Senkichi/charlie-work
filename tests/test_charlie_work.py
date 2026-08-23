@@ -23551,6 +23551,11 @@ def test_standard_lifecycle_rework_dispatch_selects_issue(tmp_path: Path) -> Non
     assert state["issues"]["123"]["status"] == "dispatched"
 
     # Step 2: record_review(request_changes) updates issue status to rework_requested
+    # Issue #1131: record_review now refuses on a terminal-state (CLOSED) PR,
+    # so restore the PR to OPEN before recording the verdict -- the CLOSED
+    # state above was a fixture trick to make dispatch select the issue, not
+    # a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     review_result = app.record_review(
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
     )
@@ -23612,6 +23617,9 @@ def test_escalated_request_changes_does_not_make_issue_selectable(tmp_path: Path
     assert dispatch_result.data["selected_count"] == 1
 
     # Step 2: Record first request_changes (count = 1, not escalated, head = "sha-1")
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
     review_result_1 = app.record_review(
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
@@ -23711,6 +23719,9 @@ def test_request_changes_count_does_not_increment_on_unchanged_head(tmp_path: Pa
     assert dispatch_result.ok is True
 
     # Step 2: Record first request_changes (count = 1, head = "sha-1")
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
     review_result_1 = app.record_review(
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
@@ -23788,6 +23799,9 @@ def test_at_cap_request_changes_on_unchanged_head_does_not_escalate(
     assert dispatch_result.ok is True
 
     # Step 2: Drive request_changes_count up to the cap (2) over two advancing heads.
+    # Issue #1131: restore PR to OPEN before record_review -- the CLOSED state
+    # was a fixture trick for dispatch, not a real terminal state.
+    app.gh.prs[0]["state"] = "OPEN"
     fake_gh.pr_head_shas[456] = "sha-1"
     review_result_1 = app.record_review(
         456, "request_changes", summary="fix A", verdict_provenance="fresh_llm_review"
