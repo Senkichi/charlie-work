@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -119,6 +120,159 @@ def test_check_worktree_marker_foreign_live_raises(
     assert exc_info.value.worktree_path == worktree_path
     assert exc_info.value.pid == 1234
     assert exc_info.value.session_id == "foreign-session"
+
+
+def _write_marker_with_started_at(
+    worktree_path: Path, pid: int, session_id: str, started_at: str
+) -> None:
+    """Write a marker with a custom ``started_at`` (for staleness tests).
+
+    Also sets the marker file's mtime to the ``started_at`` time so the
+    worktree-mtime activity probe sees a realistic old marker (in production
+    the marker is written once at worker start and never touched again).
+    """
+    from charlie_work.config import WRITER_MARKER_FILENAME
+
+    marker = {
+        "pid": pid,
+        "session_id": session_id,
+        "started_at": started_at,
+        "kind": "worker",
+    }
+    marker_path = worktree_path / WRITER_MARKER_FILENAME
+    tmp = marker_path.with_suffix(marker_path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(marker, handle)
+        handle.write("\n")
+    tmp.replace(marker_path)
+    # Set the marker file's mtime to the started_at time so the worktree
+    # mtime probe does not see a freshly-written marker as "activity".
+    try:
+        old_ts = datetime.fromisoformat(started_at.replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        old_ts = None
+    if old_ts is not None:
+        os.utime(marker_path, (old_ts, old_ts))
+
+
+def test_foreign_writer_live_pid_stale_mtime_reaped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: a foreign writer with a live pid but stale worktree mtime
+    is reaped (killed + marker removed) instead of blocking dispatch."""
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    # Marker with an old started_at (2 hours ago) — the writer has been
+    # alive but idle for a long time.
+    old_started = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    _write_marker_with_started_at(worktree_path, 1234, "foreign-session", old_started)
+
+    # Monkeypatch process kills so the test doesn't actually kill anything.
+    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr("charlie_work.worktree.kill_process_tree", lambda pid, st: [pid])
+    monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
+    monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
+
+    config = OrchestratorConfig()
+    state_file = tmp_path / "state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Should NOT raise — the idle foreign writer is reaped and the marker
+    # is cleaned, so dispatch proceeds.
+    _check_worktree_writer_marker(
+        worktree_path,
+        sessions_dir,
+        config=config,
+        state_file=state_file,
+    )
+
+    # Marker must be removed after reaping.
+    assert read_worktree_marker(worktree_path) is None
+
+
+def test_foreign_writer_live_pid_fresh_mtime_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: a foreign writer with a live pid AND fresh worktree mtime
+    is still blocked (not reaped) — it is genuinely active."""
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    # Marker with an old started_at (2 hours ago).
+    old_started = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    _write_marker_with_started_at(worktree_path, 1234, "foreign-session", old_started)
+
+    # Write a file with a recent mtime (1 minute ago) — the writer is active.
+    fresh_file = worktree_path / "worker_output.txt"
+    fresh_file.write_text("recent work\n", encoding="utf-8")
+    recent_mtime = (datetime.now(UTC) - timedelta(minutes=1)).timestamp()
+    os.utime(fresh_file, (recent_mtime, recent_mtime))
+
+    # Monkeypatch process kills so the test doesn't actually kill anything.
+    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr("charlie_work.worktree.kill_process_tree", lambda pid, st: [pid])
+    monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
+    monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
+
+    config = OrchestratorConfig()
+    state_file = tmp_path / "state.json"
+
+    # Should raise — the writer is active, so dispatch is blocked.
+    with pytest.raises(WorktreeForeignWriterError) as exc_info:
+        _check_worktree_writer_marker(
+            worktree_path,
+            sessions_dir,
+            config=config,
+            state_file=state_file,
+        )
+
+    assert exc_info.value.pid == 1234
+    # Marker must still be present (not reaped).
+    assert read_worktree_marker(worktree_path) is not None
+
+
+def test_foreign_writer_reaped_event_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1423: reaping a foreign writer logs a ``foreign_writer_reaped``
+    event retrievable via ``query_events``."""
+    from charlie_work.instrumentation import query_events
+    from charlie_work.state import empty_state, save_state
+
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+
+    old_started = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    _write_marker_with_started_at(worktree_path, 1234, "foreign-session", old_started)
+
+    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    monkeypatch.setattr("charlie_work.worktree.kill_process_tree", lambda pid, st: [pid])
+    monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
+    monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
+
+    config = OrchestratorConfig()
+    state_file = tmp_path / "state.json"
+    save_state(state_file, empty_state())
+
+    _check_worktree_writer_marker(
+        worktree_path,
+        sessions_dir,
+        config=config,
+        state_file=state_file,
+        issue_number=42,
+    )
+
+    events = query_events(state_file, kind="foreign_writer_reaped")
+    assert len(events) == 1
+    assert events[0]["payload"]["pid"] == 1234
+    assert events[0]["issue_number"] == 42
 
 
 def test_check_worktree_marker_owned_session_allowed(

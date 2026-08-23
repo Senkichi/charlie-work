@@ -142,9 +142,11 @@ from .worktree import (
     OPERATOR_MARKER_SESSION_ID,
     WorktreeProbeFailedError,
     _worktree_refuse_to_reset_reason,
+    _reap_idle_foreign_writer,
     clean_worktrees,
     inspect_worktree_state,
     push_branch,
+    read_worktree_marker,
     read_worker_outcome,
     remote_branch_ahead_count,
     remote_branch_head_sha,
@@ -5774,6 +5776,55 @@ def _is_rerun_already_running_error(error: str) -> bool:
     return "already running" in error.lower()
 
 
+def _try_reap_blocked_foreign_writer(
+    failed_result: Any,
+    config: OrchestratorConfig,
+    state_file: Path,
+    issue_number: int,
+) -> bool:
+    """Attempt to reap an idle foreign writer at the blocked-environment cap.
+
+    Issue #1423: when the ``blocked_environment_at`` counter exhausts the
+    ``max_auto_redispatch`` cap for a ``worktree_foreign_writer`` failure,
+    the default action is to escalate the issue to a human. But a writer that
+    was active on earlier passes and has since gone idle is a zombie the fleet
+    itself launched and forgot — escalating it wastes a human's attention on
+    a process the stall detector would have reaped if it could see it.
+
+    This helper reads the marker from the failed dispatch's worktree path and
+    delegates to ``_reap_idle_foreign_writer`` (the same activity probe + kill
+    path the marker check uses). When the writer is idle past the threshold,
+    it is reaped and the caller resets the counter instead of escalating.
+    When the writer is still active, the caller escalates as before —
+    escalation is reserved for a writer that is alive *and* active.
+
+    Returns ``True`` when the writer was reaped, ``False`` otherwise (including
+    when the failed result is not a foreign-writer block or the marker is gone).
+    """
+    if failed_result is None:
+        return False
+    failure_kind = getattr(failed_result, "failure_kind", None)
+    if failure_kind != "worktree_foreign_writer":
+        return False
+    pid = getattr(failed_result, "pid", None)
+    worktree_path_str = getattr(failed_result, "worktree_path", None)
+    if not pid or not worktree_path_str:
+        return False
+    worktree_path = Path(worktree_path_str)
+    marker = read_worktree_marker(worktree_path)
+    if marker is None:
+        return False
+    return _reap_idle_foreign_writer(
+        worktree_path,
+        pid,
+        marker.get("session_id"),
+        marker,
+        config,
+        state_file=state_file,
+        issue_number=issue_number,
+    )
+
+
 class OrchestratorApp:
     def __init__(
         self,
@@ -8223,28 +8274,56 @@ class OrchestratorApp:
                         blocking_error = failed_result.error if failed_result else None
                         entry["blocked_environment_at"] = blocked_environment_at
                         if len(blocked_environment_at) > self.config.watchdog.max_auto_redispatch:
-                            status = "escalated"
-                            dispatched_at = None
-                            state = _escalate_issue(
-                                state,
+                            # Issue #1423: before escalating a blocked-environment
+                            # cap exhaustion for a foreign writer, attempt to reap
+                            # it one more time. A writer that was active on earlier
+                            # passes but has since gone idle is reaped here instead
+                            # of escalating a zombie to a human. Escalation is
+                            # reserved for a writer that is alive *and* active.
+                            if _try_reap_blocked_foreign_writer(
+                                failed_result,
+                                self.config,
+                                self.paths.state_file,
                                 request.issue_number,
-                                reason="dispatch_blocked_environment",
-                                reason_class="mechanical",
-                                issue_extra=entry,
-                            )
-                            entry = dict(state["issues"][str(request.issue_number)])
-                            state = self._record_event(
-                                state,
-                                "session_failed_escalated",
-                                {
-                                    "issue_number": request.issue_number,
-                                    "previous_status": "dispatch_pending",
-                                    "reason": "dispatch_blocked_environment",
-                                    "failure_kind": failure_kind,
-                                    "blocking_error": blocking_error,
-                                    "blocked_environment_count": len(blocked_environment_at),
-                                },
-                            )
+                            ):
+                                entry["blocked_environment_at"] = []
+                                status = "dispatch_failed"
+                                dispatched_at = None
+                                clear_escalation(entry)
+                                clear_escalation_on_issue_prs(state, request.issue_number)
+                                state = self._record_event(
+                                    state,
+                                    "dispatch_blocked_environment_reaped",
+                                    {
+                                        "issue_number": request.issue_number,
+                                        "failure_kind": failure_kind,
+                                        "pid": failed_result.pid if failed_result else None,
+                                        "blocked_environment_count": len(blocked_environment_at),
+                                    },
+                                )
+                            else:
+                                status = "escalated"
+                                dispatched_at = None
+                                state = _escalate_issue(
+                                    state,
+                                    request.issue_number,
+                                    reason="dispatch_blocked_environment",
+                                    reason_class="mechanical",
+                                    issue_extra=entry,
+                                )
+                                entry = dict(state["issues"][str(request.issue_number)])
+                                state = self._record_event(
+                                    state,
+                                    "session_failed_escalated",
+                                    {
+                                        "issue_number": request.issue_number,
+                                        "previous_status": "dispatch_pending",
+                                        "reason": "dispatch_blocked_environment",
+                                        "failure_kind": failure_kind,
+                                        "blocking_error": blocking_error,
+                                        "blocked_environment_count": len(blocked_environment_at),
+                                    },
+                                )
                         else:
                             status = "dispatch_failed"
                             dispatched_at = None
@@ -21276,6 +21355,55 @@ class OrchestratorApp:
                     window_minutes=self.config.watchdog.redispatch_window_minutes,
                 )
                 if len(prior_blocked) >= self.config.watchdog.max_auto_redispatch:
+                    # Issue #1423: before escalating a stuck blocked-environment
+                    # cap, attempt to reap an idle foreign writer from the
+                    # worktree. If the writer has gone idle since the last
+                    # blocked pass, reaping it clears the path for dispatch
+                    # instead of escalating a zombie. The marker is read from
+                    # the worktree path derived from the PR's head ref.
+                    branch_pre = str(pr_data.get("headRefName") or "")
+                    if branch_pre:
+                        wt_path_pre = worktree_path_for_branch(
+                            self.repo_root, branch_pre, self._layout.worktrees
+                        )
+                        marker_pre = read_worktree_marker(wt_path_pre)
+                        if marker_pre is not None:
+                            pid_pre = marker_pre.get("pid")
+                            if (
+                                isinstance(pid_pre, int)
+                                and pid_pre > 0
+                                and is_pid_alive(pid_pre, None)
+                                and _reap_idle_foreign_writer(
+                                    wt_path_pre,
+                                    pid_pre,
+                                    marker_pre.get("session_id"),
+                                    marker_pre,
+                                    self.config,
+                                    state_file=self.paths.state_file,
+                                    issue_number=issue_number,
+                                )
+                            ):
+                                # Writer reaped: clear the counter so the issue
+                                # proceeds as a legitimate candidate.
+                                with state_lock(self.paths.state_file):
+                                    state = load_state(self.paths.state_file)
+                                    issue_entry = state["issues"].get(str(issue_number), {})
+                                    if isinstance(issue_entry, dict):
+                                        issue_entry["blocked_environment_at"] = []
+                                        state["issues"][str(issue_number)] = issue_entry
+                                        state = append_event(
+                                            state,
+                                            "dispatch_blocked_environment_reaped",
+                                            {
+                                                "issue_number": issue_number,
+                                                "pid": pid_pre,
+                                                "blocked_environment_count": len(prior_blocked),
+                                            },
+                                            state_path=self.paths.state_file,
+                                        )
+                                        save_state(self.paths.state_file, state)
+                                filtered_candidates.append(issue)
+                                continue
                     blocked_environment_escalated.append(issue_number)
                     continue
 
@@ -22211,6 +22339,35 @@ class OrchestratorApp:
                         ) + [now.isoformat().replace("+00:00", "Z")]
                         blocking_error = failed_result.error if failed_result else None
                         if len(blocked_environment_at) > self.config.watchdog.max_auto_redispatch:
+                            # Issue #1423: before escalating a blocked-environment
+                            # cap exhaustion for a foreign writer, attempt to reap
+                            # it one more time. A writer that was active on earlier
+                            # passes but has since gone idle is reaped here instead
+                            # of escalating a zombie to a human. Escalation is
+                            # reserved for a writer that is alive *and* active.
+                            if _try_reap_blocked_foreign_writer(
+                                failed_result,
+                                self.config,
+                                self.paths.state_file,
+                                request.issue_number,
+                            ):
+                                entry["status"] = "rework_requested"
+                                entry["dispatched_at"] = None
+                                entry["blocked_environment_at"] = []
+                                state["issues"][str(request.issue_number)] = entry
+                                state = append_event(
+                                    state,
+                                    "rework_dispatch_blocked_environment_reaped",
+                                    {
+                                        "issue_number": request.issue_number,
+                                        "failure_kind": failure_kind,
+                                        "pid": failed_result.pid if failed_result else None,
+                                        "blocked_environment_count": len(blocked_environment_at),
+                                    },
+                                    state_path=self.paths.state_file,
+                                )
+                                save_state(self.paths.state_file, state)
+                                continue
                             # Escalate with the environment reason and the
                             # blocking path so the operator sees "remove
                             # C:\...\wt", not "worker quality cap exceeded."
