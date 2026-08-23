@@ -397,23 +397,71 @@ def test_deescalation_config_defaults() -> None:
 
 
 def test_deescalation_config_parsed_from_yaml(tmp_path: Path) -> None:
-    """The deescalation section is now parsed from YAML (previously always
-    defaulted). The new fields are configurable."""
+    """Only the two new operator-queue follow-up knobs are parsed from the
+    ``deescalation`` YAML section. The rest of the section was previously
+    100% inert (always defaulted) and stays inert in this PR — full-section
+    activation is a separate, explicitly-reviewed change. So ``enabled`` and
+    ``interval_minutes`` overrides in the YAML are silently ignored (they
+    keep their dataclass defaults), while the two new fields are honored."""
     from charlie_work.config import build_config_from_data
 
     data = {
         "deescalation": {
-            "enabled": True,
+            "enabled": False,
             "interval_minutes": 15,
             "operator_queue_review_interval_minutes": 10,
             "operator_queue_depth_threshold": 3,
         }
     }
     config = build_config_from_data(data)
-    assert config.deescalation.enabled is True
-    assert config.deescalation.interval_minutes == 15
+    # The two new fields are parsed and honored.
     assert config.deescalation.operator_queue_review_interval_minutes == 10
     assert config.deescalation.operator_queue_depth_threshold == 3
+    # Pre-existing fields keep their defaults — overrides are ignored, same
+    # as before this PR (the section was inert).
+    assert config.deescalation.enabled is True
+    assert config.deescalation.interval_minutes == 30
+
+
+def test_deescalation_config_tolerates_unknown_keys(tmp_path: Path) -> None:
+    """Unknown keys in the ``deescalation`` section must NOT brick startup.
+    Before this PR the section was never parsed (always defaulted), so a live
+    config may already carry a ``deescalation:`` block with typo'd or
+    extra keys. Full-section parsing via ``_build_section`` would
+    hard-reject those; this PR scopes to the two new fields only, so unknown
+    keys are silently ignored."""
+    from charlie_work.config import build_config_from_data
+
+    data = {
+        "deescalation": {
+            "typo_key": "whatever",
+            "future_field": 99,
+            "operator_queue_depth_threshold": 7,
+        }
+    }
+    config = build_config_from_data(data)
+    assert config.deescalation.operator_queue_depth_threshold == 7
+
+
+def test_deescalation_config_ignores_enabled_override(tmp_path: Path) -> None:
+    """A pre-existing ``enabled: false`` override must NOT flip the sweep's
+    default-on behavior. Before this PR the section was inert, so operators
+    who set ``enabled: false`` expecting it to be a no-op (it was) must not
+    have their sweep silently disabled by this PR's scoped parsing."""
+    from charlie_work.config import build_config_from_data
+
+    config = build_config_from_data({"deescalation": {"enabled": False}})
+    assert config.deescalation.enabled is True
+
+
+def test_deescalation_config_ignores_interval_minutes_override(tmp_path: Path) -> None:
+    """A pre-existing ``interval_minutes`` override must NOT change the
+    sweep cadence. Before this PR the section was inert, so the override was
+    silently ignored; this PR preserves that."""
+    from charlie_work.config import build_config_from_data
+
+    config = build_config_from_data({"deescalation": {"interval_minutes": 5}})
+    assert config.deescalation.interval_minutes == 30
 
 
 def test_deescalation_config_rejects_negative_review_interval(tmp_path: Path) -> None:
@@ -421,6 +469,13 @@ def test_deescalation_config_rejects_negative_review_interval(tmp_path: Path) ->
 
     with pytest.raises(ConfigError, match="operator_queue_review_interval_minutes"):
         build_config_from_data({"deescalation": {"operator_queue_review_interval_minutes": -1}})
+
+
+def test_deescalation_config_rejects_non_int_review_interval(tmp_path: Path) -> None:
+    from charlie_work.config import ConfigError, build_config_from_data
+
+    with pytest.raises(ConfigError, match="operator_queue_review_interval_minutes"):
+        build_config_from_data({"deescalation": {"operator_queue_review_interval_minutes": "ten"}})
 
 
 def test_deescalation_config_rejects_negative_depth_threshold(tmp_path: Path) -> None:

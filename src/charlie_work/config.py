@@ -2200,23 +2200,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"got {rp_alert_days}"
         )
     reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
-    # Issue #1314: the deescalation section was previously not parsed from
-    # YAML (always defaulted). Now that it carries operator-queue follow-up
-    # knobs (review cadence, depth threshold), parse it like every other
-    # section so operators can override the defaults without a code change.
+    # Issue #1314: extract ONLY the two new operator-queue follow-up knobs
+    # from the ``deescalation`` section. The section as a whole was
+    # previously 100% inert (never passed into OrchestratorConfig — always
+    # defaulted), and activating full-section parsing here would silently
+    # (a) hard-reject unknown keys via ``_build_section`` for any live config
+    # that already has a ``deescalation:`` block with extra/typo'd keys
+    # (self-deploy-brick risk) and (b) flip ``enabled`` / ``interval_minutes``
+    # defaults for configs that set those keys expecting them to be ignored.
+    # Full-section activation is a separate, explicitly-reviewed change with
+    # operator notification; this PR scopes to the two fields the issue
+    # actually asks for. Unknown keys and pre-existing
+    # ``enabled``/``interval_minutes`` overrides are silently ignored, same
+    # as before this PR.
     deescalation_data = _section(data, "deescalation")
-    deescalation_interval = deescalation_data.get("interval_minutes")
-    if deescalation_interval is not None and (
-        isinstance(deescalation_interval, bool) or not isinstance(deescalation_interval, int)
-    ):
-        raise ConfigError(
-            "config section 'deescalation' key 'interval_minutes' must be an int, "
-            f"got {type(deescalation_interval).__name__}"
-        )
-    if deescalation_interval is not None and deescalation_interval < 1:
-        raise ConfigError(
-            f"config section 'deescalation' key 'interval_minutes' must be >= 1, got {deescalation_interval}"
-        )
     oqr_interval = deescalation_data.get("operator_queue_review_interval_minutes")
     if oqr_interval is not None and (
         isinstance(oqr_interval, bool) or not isinstance(oqr_interval, int)
@@ -2243,7 +2240,12 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'deescalation' key 'operator_queue_depth_threshold' "
             f"must be >= 0, got {oq_threshold}"
         )
-    deescalation = _build_section(DeescalationConfig, "deescalation", deescalation_data)
+    deescalation_overrides: dict[str, Any] = {}
+    if oqr_interval is not None:
+        deescalation_overrides["operator_queue_review_interval_minutes"] = oqr_interval
+    if oq_threshold is not None:
+        deescalation_overrides["operator_queue_depth_threshold"] = oq_threshold
+    deescalation = DeescalationConfig(**deescalation_overrides)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
