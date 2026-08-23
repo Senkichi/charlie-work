@@ -3513,6 +3513,24 @@ def _reap_restore_rework_requested(
     prs_dir = state_file.parent / "prs"
     rework_prompt_path = prs_dir / f"pr-{pr_number}" / "rework-prompt.md"
 
+    # Issue #1239 round-2: workers are discovered from sidecar files,
+    # decoupled from state.json, so by the time we reach here the issue's
+    # status may have already moved off ``dispatched`` (e.g. a concurrent
+    # loop pass re-dispatched, escalated, or the issue was closed).  Re-check
+    # under the state lock BEFORE any network push — a salvage push to the
+    # shared origin remote for an issue that is no longer dispatched would be
+    # an unaudited side effect with no event trail if it succeeded.  This is
+    # a short, separate state_lock scope so the network git push below stays
+    # outside any lock; the same precondition is re-checked inside the
+    # success branch's state_lock (line ~3554) and the death-recording
+    # block's state_lock (line ~3593) — both still load-bearing because the
+    # status can move again between this check and those scopes.
+    with state_lock(state_file):
+        state = load_state(state_file)
+        entry = state["issues"].get(str(worker.issue_number), {})
+        if not isinstance(entry, dict) or entry.get("status") != "dispatched":
+            return
+
     # Issue #1362 Stage 1: read through the single review-decision reader
     # instead of state.json's ``decision``/``reviewed_head_sha``.  Computed
     # outside the state lock: it reads only the review-decision file and the
