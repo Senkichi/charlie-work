@@ -55,7 +55,20 @@ env:
 jobs:
   Tests:
     name: Tests
-    runs-on: self-hosted
+    # `suite` is the capacity semaphore for this job (the #1254 follow-up the
+    # comment below promised). Only cw-9800x3d-1/-2 carry the custom `suite`
+    # label (added 2026-08-22; job-cannon's pool uses the identical split), so
+    # at most TWO Tests jobs run at once and the rest QUEUE -- GitHub enforces
+    # this by label matching and never cancels a queued job for it. Measured
+    # the same day, right after the group below was removed: four Tests jobs
+    # landed at once (one per listener) on top of job-cannon's two suite legs
+    # and the dispatch tree, and a suite that runs 7:38 solo at -n 2 took 43.7
+    # min, with three siblings at the 45m timeout. Light jobs (Lint) stay on
+    # `light`, which every cw listener carries, so they are never queued
+    # behind a suite. Labels are registration-side metadata: the allocator
+    # starts/parks listeners and never re-registers, so the split survives
+    # parking; re-provisioning a runner must re-apply them (ci_fleet #96).
+    runs-on: [self-hosted, Windows, X64, suite]
     # NO job-level concurrency group here -- deliberately. PR #1388 (#1254)
     # added `concurrency: {group: cw-tests-self-hosted, cancel-in-progress:
     # false}` to serialize Tests across branches, on the premise that excess
@@ -70,8 +83,8 @@ jobs:
     # the correct primitive: a runner LABEL as the capacity semaphore
     # (`runs-on: [self-hosted, ..., suite]` on only N provisioned runners),
     # which the GitHub scheduler enforces by queueing, never cancelling. That
-    # is the follow-up for #1254's contention goal; until it lands, Tests
-    # jobs may run concurrently and the 45m timeout below is the only bound.
+    # is what the `suite` runs-on above now does; the 45m timeout below is the
+    # backstop for residual contention, not the bound.
     # 45 min: raised from 30 (#1254). 30 was derived from 28 successful
     # runs (2026-07-28/29) with per-job execution time median 11.5 min,
     # range 3.85-23.72 min, and cleared the 23.72 max by ~26%. But on
@@ -236,7 +249,9 @@ jobs:
 
   Lint:
     name: Lint
-    runs-on: self-hosted
+    # `light`: every cw listener carries it, so Lint never waits behind the
+    # two-slot `suite` semaphore that bounds Tests (see that job's header).
+    runs-on: [self-hosted, Windows, X64, light]
     # 15 min: derived from 28 successful runs (2026-07-28/29). Per-job
     # execution: median 0.37 min (22s), max 0.55 min (33s) -- checkout,
     # setup-uv, uv sync, and both ruff steps combined. Lint is a required
