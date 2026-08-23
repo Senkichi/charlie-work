@@ -2225,6 +2225,10 @@ def test_detect_drift_session_failed_worker_blocked_escalates_instead_of_relabel
     assert len(escalated_drift) == 1
     assert escalated_drift[0].issue_number == 42
     assert "worker_blocked" in escalated_drift[0].detail
+    # Issue #807: detect_drift must carry failure_kind on the drift item so
+    # apply_fixes can derive reason_class (judgment vs mechanical) instead of
+    # hardcoding "mechanical".
+    assert escalated_drift[0].failure_kind == "worker_blocked"
 
     # detect_drift is read-only regardless of the worker_blocked branch.
     assert gh.labels_added == []
@@ -2272,6 +2276,59 @@ def test_apply_fixes_session_failed_escalated_transitions_labels(tmp_path: Path)
     assert len(reconcile_events) == 1
     assert reconcile_events[0]["payload"]["kind"] == "session_failed_escalated"
     assert reconcile_events[0]["payload"]["issue_number"] == 42
+
+
+def test_apply_fixes_session_failed_escalated_judgment_lands_human_needed(
+    tmp_path: Path,
+) -> None:
+    """Issue #807: a dead worker whose failure_kind is
+    ``worktree_unsafe_local_commits`` (a deterministic *judgment* failure, not
+    mechanical) must escalate via the ``redispatch_escalated`` edge
+    (reason_class="judgment"), landing ``agent:human-needed`` -- NOT the
+    mechanical ``redispatch_operator_queued`` edge that lands
+    ``agent:operator-queue``.
+
+    This is the reconcile.py apply-path regression for the #807 bug: before
+    the fix, apply_fixes hardcoded reason_class="mechanical" for every
+    session_failed_escalated drift item, so a genuine-local-commits death
+    detected by reconcile's drift pass (before any workflow.py sweep) landed
+    on operator_queue and became auto-clearable, reproducing the exact
+    blanket-mechanical misclassification #807 split the failure kind to
+    prevent."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(43, [config.labels.in_progress])],
+    )
+    state = empty_state()
+
+    drift = [
+        DriftItem(
+            kind="session_failed_escalated",
+            issue_number=43,
+            pr_number=None,
+            detail=(
+                "issue #43 session died with deterministic failure "
+                "(worktree_unsafe_local_commits), no open PR; "
+                "suppressing relabel-to-ready, escalating instead"
+            ),
+            fix_actions=("transition issue #43 labels via 'redispatch_escalated' event",),
+            failure_kind="worktree_unsafe_local_commits",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    # Judgment escalation lands human_needed, not operator_queue.
+    assert (43, config.labels.human_needed) in gh.labels_added
+    assert (43, config.labels.operator_queue) not in gh.labels_added
+    assert (43, config.labels.ready) not in gh.labels_added
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert len(reconcile_events) == 1
+    assert reconcile_events[0]["payload"]["kind"] == "session_failed_escalated"
+    assert reconcile_events[0]["payload"]["issue_number"] == 43
+    assert reconcile_events[0]["payload"]["failure_kind"] == "worktree_unsafe_local_commits"
 
 
 def test_detect_drift_session_failed_already_has_ready_label(tmp_path: Path) -> None:

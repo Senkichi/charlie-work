@@ -161,6 +161,47 @@ def test_dispatch_sessions_claude_code_propagates_worktree_unsafe(
     assert results[0].failure_kind == "worktree_unsafe_shim_dirt"
 
 
+def test_dispatch_sessions_devin_shell_propagates_worktree_unsafe_kind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #807: devin_shell must propagate ``exc.kind`` (the discriminator
+    computed at detection time) as ``failure_kind``, mirroring the claude-code
+    adapter's ``test_dispatch_sessions_claude_code_propagates_worktree_unsafe``.
+
+    Uses the actual raise-site reason string for genuine local commits
+    (``_worktree_refuse_to_reset_reason`` -> "worktree has local commits not
+    on remote branch") so the test exercises the judgment kind
+    (``worktree_unsafe_local_commits``), not the mechanical shim-dirt kind."""
+    from charlie_work.config import DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+
+    def _unsafe_error() -> WorktreeUnsafeError:
+        return WorktreeUnsafeError("worktree has local commits not on remote branch")
+
+    monkeypatch.setattr(
+        devin_shell, "create_worktree", _fake_create_worktree_raising(_unsafe_error)
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    request = _make_request(tmp_path, 602, rework=False)
+    settings = AdapterSettings(adapter="devin-shell", sessions_dir=tmp_path / "sessions")
+
+    results = dispatch_sessions(
+        repo_root,
+        tmp_path / "manifest.json",
+        tmp_path / "results.json",
+        settings,
+        [request],
+    )
+
+    assert results[0].ok is False
+    assert results[0].failure_kind == "worktree_unsafe_local_commits"
+    assert results[0].failure_kind in DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS
+
+    on_disk = json.loads((tmp_path / "results.json").read_text(encoding="utf-8"))
+    assert on_disk["results"][0]["failure_kind"] == "worktree_unsafe_local_commits"
+
+
 def test_dispatch_sessions_devin_shell_propagates_rework_branch_conflict(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
