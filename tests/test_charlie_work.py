@@ -49768,6 +49768,148 @@ def test_reap_restore_rework_requested_skips_salvage_when_status_not_dispatched(
     assert len(salvage_events) == 0
 
 
+def test_salvage_rework_stranded_commits_skips_when_status_not_rework_requested(
+    tmp_path: Path,
+) -> None:
+    """Issue #1239 round-3: the death-loop escalation gate's salvage call site
+    (``_salvage_rework_stranded_commits``) receives ``issue_entry`` from the
+    ``head_check_state`` snapshot loaded at the top of ``dispatch_rework``'s
+    candidate loop.  Between that snapshot and this call the issue's status may
+    have already moved off ``rework_requested`` (e.g. a concurrent loop pass
+    dispatched it, escalated it, or the issue was closed).  In that case the
+    salvage push to the shared origin remote MUST NOT be attempted — an
+    unaudited push for a stale/no-longer-rework_requested issue leaves no event
+    trail if it succeeds.  A fresh ``status == "rework_requested"`` precondition
+    check (short state_lock scope, before any network push) gates the salvage,
+    mirroring the ``_reap_restore_rework_requested`` precondition (which checks
+    ``status == "dispatched"`` because that lane handles already-dispatched
+    workers).
+    """
+    from datetime import UTC, datetime
+
+    from charlie_work.paths import resolved_layout
+    from charlie_work.worktree import push_branch, worktree_path_for_branch
+
+    remote, repo_root = _init_repo_with_remote_inline(tmp_path)
+    branch = "agent/issue-123-fix-search"
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
+    # Create a branch from main and a worktree at the expected orchestrator path.
+    run(["git", "branch", branch])
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "print('ok')"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    layout = resolved_layout(config, repo_root)
+    wt_path = worktree_path_for_branch(repo_root, branch, layout.worktrees)
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "worktree", "add", str(wt_path), branch])
+
+    # Push the branch so the remote branch exists at the PR head sha.
+    ok, error = push_branch(repo_root, branch, worktree_path=wt_path)
+    assert ok, error
+    pr_head_sha = run(["git", "rev-parse", branch]).stdout.strip()
+
+    # Add a stranded commit to the worktree — the salvage WOULD push this if
+    # the precondition check were absent.
+    (wt_path / "fix.txt").write_text("fixed\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "completed rework (died before push)"],
+        cwd=wt_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.repo_root = repo_root
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+            self.prs[0]["headRefOid"] = pr_head_sha
+
+    fake_gh = ReworkGitHub()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    # The issue's status has ALREADY moved off "rework_requested" — a
+    # concurrent loop pass dispatched it (status is now "dispatched").  This
+    # is the head_check_state/state.json decoupling the round-3 review flagged:
+    # the snapshot still says rework_requested, but state.json has advanced.
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "dispatched",
+            "redispatch_at": [now_iso, now_iso],
+            "worker_death_at": [now_iso, now_iso],
+            "branch_name": branch,
+        }
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "decision": "request_changes",
+            "reviewed_head_sha": pr_head_sha,
+        }
+        save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, fake_gh)
+
+    # The snapshot issue_entry still says rework_requested (stale) — this is
+    # what dispatch_rework's candidate loop would pass.  The fresh check inside
+    # _salvage_rework_stranded_commits must catch that state.json has moved.
+    stale_issue_entry = {
+        "number": 123,
+        "status": "rework_requested",
+        "branch_name": branch,
+    }
+    pr_data = fake_gh.prs[0]
+
+    result = app._salvage_rework_stranded_commits(123, pr_data, stale_issue_entry)
+
+    # The salvage must report no push.
+    assert result is False
+
+    # The remote branch head MUST NOT have advanced — no salvage push.
+    remote_sha = subprocess.run(
+        ["git", "rev-parse", branch],
+        cwd=remote,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_sha == pr_head_sha, (
+        f"salvage push attempted for a non-rework_requested issue: "
+        f"remote {remote_sha} != pr head {pr_head_sha}"
+    )
+
+    # The issue status must be unchanged (still dispatched, not reset).
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatched"
+
+    # No salvage event must have been recorded.
+    events = state.get("events", [])
+    salvage_events = [e for e in events if e.get("kind") == "rework_stranded_commits_salvaged"]
+    assert len(salvage_events) == 0
+
+
 def test_windowed_redispatch_at_handles_corrupted_state(tmp_path: Path) -> None:
     """_windowed_redispatch_at must not crash when redispatch_at is corrupted
     (e.g., a string instead of a list). A string value would cause

@@ -22313,6 +22313,31 @@ class OrchestratorApp:
         branch = issue_entry.get("branch_name") if isinstance(issue_entry, dict) else None
         if not branch:
             return False
+        # Issue #1239 round-3: ``issue_entry`` comes from the
+        # ``head_check_state`` snapshot loaded at the top of
+        # ``dispatch_rework``'s candidate loop.  Between that snapshot and
+        # this call the issue's status may have already moved off
+        # ``rework_requested`` (e.g. a concurrent loop pass dispatched it,
+        # escalated it, or the issue was closed).  Re-check under the state
+        # lock BEFORE any network push — a salvage push to the shared origin
+        # remote for an issue that is no longer rework_requested would be an
+        # unaudited side effect with no event trail if it succeeded.  Mirrors
+        # the precondition added to ``_reap_restore_rework_requested`` (which
+        # checks ``status == "dispatched"`` because that lane handles
+        # already-dispatched workers); this lane's eligible state is
+        # ``rework_requested`` because ``dispatch_rework`` only selects
+        # candidates with that status.  The network git push below stays
+        # outside any lock; the event-recording state_lock scope further down
+        # is still load-bearing (status can move again between this check and
+        # that scope).
+        with state_lock(self.paths.state_file):
+            state = load_state(self.paths.state_file)
+            fresh_entry = state["issues"].get(str(issue_number), {})
+            if (
+                not isinstance(fresh_entry, dict)
+                or fresh_entry.get("status") != "rework_requested"
+            ):
+                return False
         wt_path = worktree_path_for_branch(self.repo_root, branch, self._layout.worktrees)
         result = salvage_push_stranded_commits(
             self.repo_root,
