@@ -2215,7 +2215,11 @@ def _detect_and_handle_orphaned_workers(
                 continue
             worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
             result = salvage_push_stranded_commits(
-                repo_root, branch, worktree_path, base_ref=config.dispatch.base_ref
+                repo_root,
+                branch,
+                worktree_path,
+                base_ref=config.dispatch.base_ref,
+                dry_run=write_gate.dry_run,
             )
             if result.pushed:
                 salvage_pushes[issue_number] = {
@@ -5345,15 +5349,15 @@ def _attempt_salvage(
     skip emits ``salvage_skipped_already_landed`` instead of opening a vestigial
     duplicate PR, and the caller treats it as "handled" (no redispatch).
 
-    NOTE (issue #1264, W6 PR3 disclosure): the ``push_branch`` call below is
-    an unconditional, unguarded real ``git push`` -- outside WriteGate's
-    declared 6-primitive surface (state.json/events.db/label-transition/
-    process-kill) and therefore NOT gated by ``write_gate`` here. This is a
-    real dry-run leak (filed separately; see the PR3 handoff) that this PR
-    does not fix -- gating an external git push was never in R6's scope
-    (kill_process was the one sanctioned new primitive) and freelancing a
-    7th WriteGate primitive without design review would repeat exactly the
-    mistake R6b's STOP-and-report exists to prevent.
+    NOTE (issue #1326): the ``push_branch`` call below threads
+    ``dry_run=write_gate.dry_run`` so a dry-run invocation does not issue a
+    real ``git push``. This is explicit-threading (mirroring
+    ``_reconcile_locked``'s convention) rather than a 7th WriteGate primitive
+    -- gating an external git push through WriteGate was an open design
+    question (see issue #1326's remedy section) and the simplest correct
+    fix is to thread the flag directly. Downstream state writes and label
+    transitions remain gated by ``write_gate``; the ``gh pr create`` in
+    ``_open_salvage_pr`` is gated at the ``GitHub`` client sink level.
     """
     write_gate = require_write_gate(write_gate)
     already_landed, skip_reason = _salvage_already_landed(
@@ -5387,7 +5391,9 @@ def _attempt_salvage(
             write_gate.save_state(state)
         return True, None
 
-    push_ok, push_error = push_branch(repo_root, branch, worktree_path=worktree_path)
+    push_ok, push_error = push_branch(
+        repo_root, branch, worktree_path=worktree_path, dry_run=write_gate.dry_run
+    )
     if not push_ok:
         return False, push_error
 

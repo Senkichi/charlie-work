@@ -44323,7 +44323,7 @@ def test_classify_dead_sessions_salvage_push_failure_fallback(tmp_path: Path) ->
     gh.pr_create_return = 101
 
     original_push_branch = workflow_module.push_branch
-    workflow_module.push_branch = lambda repo, br, worktree_path=None: (
+    workflow_module.push_branch = lambda repo, br, worktree_path=None, **kw: (
         False,
         "simulated push failure",
     )
@@ -50560,7 +50560,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
 
     salvage_calls: list[tuple[Any, ...]] = []
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         salvage_calls.append((repo_root, branch, worktree_path, base_ref))
         return SalvagePushResult(
             pushed=True,
@@ -50667,7 +50667,7 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(
             pushed=False,
             error="push_failed: network timeout",
@@ -50752,7 +50752,7 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
 
     fake_gh = FakeGitHubForSalvage(repo_root=tmp_path)
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         return SalvagePushResult(pushed=False, skip_reason="up_to_date", old_remote_sha="abc123")
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -50823,7 +50823,7 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
 
     salvage_calls: list[tuple[Any, ...]] = []
 
-    def fake_salvage(repo_root, branch, worktree_path, *, base_ref=""):
+    def fake_salvage(repo_root, branch, worktree_path, *, base_ref="", dry_run=False):
         salvage_calls.append((repo_root, branch, worktree_path, base_ref))
         return SalvagePushResult(pushed=False, skip_reason="should_never_be_called")
 

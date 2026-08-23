@@ -8097,3 +8097,80 @@ def test_salvage_push_operator_claimed_marker_skips(tmp_path: Path) -> None:
     assert result.skip_reason == "operator_claimed"
     show_ref_after = _git(remote, "show-ref")
     assert branch not in show_ref_after.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #1326: dry_run gate for push_branch / salvage_push_stranded_commits
+# ---------------------------------------------------------------------------
+#
+# Under dry_run=True, push_branch must short-circuit before the ``git push``
+# subprocess call -- no real push reaches origin. salvage_push_stranded_commits
+# threads dry_run through to push_branch. Both tests use real local git repos
+# (bare "origin" remote + clone with linked worktrees) and verify the remote
+# branch tip is unchanged after the call.
+
+
+def test_push_branch_dry_run_does_not_push(tmp_path: Path) -> None:
+    """dry_run=True short-circuits before ``git push``; origin is untouched."""
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1326-push-dry"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "feature commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # The branch must NOT exist on origin before the call.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    ok, error = push_branch(repo, branch, worktree_path=info.path, dry_run=True)
+
+    # Dry-run returns the natural "nothing happened" success shape.
+    assert ok is True
+    assert error is None
+
+    # The branch must STILL NOT exist on origin -- no real push happened.
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
+    # And the local tip is unchanged (the commit is still only local).
+    assert _git(info.path, "rev-parse", "HEAD").stdout.strip() == local_tip
+
+
+def test_salvage_push_stranded_commits_dry_run_does_not_push(tmp_path: Path) -> None:
+    """dry_run=True threads through to push_branch; origin is untouched.
+
+    The read-only probing (rev-parse, ls-remote, merge-base, rev-list) still
+    runs, but the mutating ``git push`` is suppressed. The salvage returns
+    pushed=True (the "nothing happened" success shape that lets downstream
+    classification proceed under dry-run), but the remote branch tip is
+    unchanged.
+    """
+    remote, repo = _init_repo_with_remote(tmp_path)
+    branch = "agent/issue-1326-salvage-dry"
+    info = create_worktree(repo, branch, base_ref="origin/main")
+
+    # Make a commit that would be stranded (never pushed).
+    (info.path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(info.path, "add", "feature.txt")
+    _git(info.path, "commit", "-m", "stranded commit, never pushed")
+    local_tip = _git(info.path, "rev-parse", "HEAD").stdout.strip()
+
+    # The branch must NOT exist on origin before the call.
+    show_ref_before = _git(remote, "show-ref")
+    assert branch not in show_ref_before.stdout
+
+    result = salvage_push_stranded_commits(repo, branch, info.path, dry_run=True)
+
+    assert isinstance(result, SalvagePushResult)
+    # Dry-run: push_branch returned (True, None), so salvage reports pushed=True
+    # with the local tip as the would-be new remote SHA -- but no real push
+    # reached origin.
+    assert result.pushed is True
+    assert result.error is None
+    assert result.new_remote_sha == local_tip
+
+    # The branch must STILL NOT exist on origin -- no real push happened.
+    show_ref_after = _git(remote, "show-ref")
+    assert branch not in show_ref_after.stdout
