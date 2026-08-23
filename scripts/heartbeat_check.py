@@ -78,6 +78,19 @@ ISSUE_LIST_LIMIT = 200
 MERGED_PR_LOOKBACK_LIMIT = 5
 
 QUEUED_STALE_MINUTES = 20
+
+# armable-backlog (2026-08-23): "plenty to work on" = one full wave of armed,
+# unclaimed issues (dispatch.max_concurrent_sessions); fallback when the cap
+# is unreadable. Gating labels mark an open issue as *triaged but deliberately
+# not armed*, so it leaves the un-triaged "armable" pool; keep this set in step
+# with the label taxonomy both repos share (`needs-design`, `human-action`,
+# `blocked`) plus GitHub's default terminal labels.
+ARMABLE_RUNWAY_FLOOR_DEFAULT = 3
+ARMED_LABEL = "automated-ready"
+ARMABLE_GATING_LABELS: frozenset[str] = frozenset(
+    {"blocked", "needs-design", "human-action", "question", "wontfix", "duplicate", "invalid"}
+)
+ARMABLE_PREVIEW_LIMIT = 8
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
 # Measured production cadence (charlie-work `loop_started` gaps, last 39
@@ -1118,6 +1131,111 @@ def check_dispatch_coverage(
     check_in_progress_staleness(
         report, repo, in_progress, prev_repo_state, new_repo_state, skip_delta, now=now
     )
+
+
+def check_armable_backlog(
+    report: Report,
+    repo: RepoInfo,
+    blocked_numbers: set[int] | None,
+    blocked_err: str,
+) -> None:
+    """Is the armed runway thin while un-triaged, armable issues sit idle?
+
+    ``dispatch-coverage`` asks "did the fleet pick up what is armed?"; this
+    check asks the question upstream of it: "is there enough armed work for
+    the fleet to pick up, and if not, is that because the backlog is
+    genuinely empty or because nobody has triaged it?" (2026-08-23: both
+    lanes were about to idle with 12 + 39 open issues carrying no label at
+    all -- neither ``automated-ready`` nor any gating label -- so the fleet
+    starved with work available.)
+
+    Three buckets over the open issues:
+
+    * ``runway``  -- ``automated-ready``, no ``agent:*`` label, not blocked:
+      what dispatch can take next. Healthy when ``>= floor``.
+    * ``active``  -- carries an ``agent:*`` label (in flight / terminal).
+    * ``armable`` -- no ``agent:*`` label, not ``automated-ready``, and no
+      *gating* label (``ARMABLE_GATING_LABELS``) or blocked-by-dependency
+      entry. This is the un-triaged pool: every issue here is either a
+      missed arm or a missed gate, and a triage pass drives it to zero.
+
+    Verdict:
+
+    * runway ``>= floor``                      -> OK (plenty to work on)
+    * runway ``< floor`` and armable is empty  -> OK (genuinely empty)
+    * runway ``< floor`` and armable non-empty -> ANOMALY: triage needed
+
+    ``floor`` is the repo's ``dispatch.max_concurrent_sessions`` cap (one
+    full wave of work), falling back to ``ARMABLE_RUNWAY_FLOOR_DEFAULT``.
+
+    Degraded blocked-issue lookup (``blocked_err``) can only *inflate* both
+    ``runway`` and ``armable``: an inflated runway can turn an anomaly into
+    a false OK, an inflated armable can turn an OK into a false anomaly. The
+    caveat is surfaced on whichever verdict is emitted rather than guessed
+    around.
+    """
+    check = f"armable-backlog {repo.slug}"
+    args = [
+        "issue",
+        "list",
+        "-R",
+        repo.slug,
+        "--state",
+        "open",
+        "--json",
+        "number,labels",
+        "--limit",
+        str(ISSUE_LIST_LIMIT),
+    ]
+    ok, data, err = run_gh_json(args, repo.repo_root)
+    if not ok:
+        report.anom(check, err)
+        return
+
+    runway: list[int] = []
+    active = 0
+    gated = 0
+    armable: list[int] = []
+    for issue in data:
+        number = issue["number"]
+        names = {label["name"] for label in issue.get("labels", [])}
+        if any(n.startswith("agent:") for n in names):
+            active += 1
+            continue
+        is_blocked = blocked_numbers is not None and number in blocked_numbers
+        if is_blocked or names & ARMABLE_GATING_LABELS:
+            gated += 1
+            continue
+        if ARMED_LABEL in names:
+            runway.append(number)
+        else:
+            armable.append(number)
+
+    cap = get_dispatch_cap(repo.config_path) if repo.config_path else None
+    floor = cap if cap is not None else ARMABLE_RUNWAY_FLOOR_DEFAULT
+    facts = (
+        f"runway={len(runway)} floor={floor} armable={len(armable)} "
+        f"active={active} gated={gated} open={len(data)}"
+    )
+    caveat = f" (blocked-issue lookup degraded: {blocked_err})" if blocked_err else ""
+
+    if len(runway) >= floor:
+        report.ok(check, f"plenty armed; {facts}{caveat}")
+    elif not armable:
+        report.ok(
+            check, f"runway thin but backlog genuinely empty of armable issues; {facts}{caveat}"
+        )
+    else:
+        preview = sorted(armable)[:ARMABLE_PREVIEW_LIMIT]
+        more = len(armable) - len(preview)
+        suffix = f" (+{more} more)" if more > 0 else ""
+        report.anom(
+            check,
+            f"runway thin ({len(runway)} < floor {floor}) while {len(armable)} "
+            f"un-triaged armable issue(s) sit idle: {preview}{suffix} -- triage: "
+            f"label each `{ARMED_LABEL}` or one of {sorted(ARMABLE_GATING_LABELS)}"
+            f"; {facts}{caveat}",
+        )
 
 
 def check_in_progress_staleness(
@@ -2442,6 +2560,7 @@ def main() -> int:
             blocked_err,
             now=now,
         )
+        check_armable_backlog(report, repo, blocked_by_repo.get(repo.slug), blocked_err)
         check_review_liveness(report, repo, now=now)
         check_dispatch_failures(report, repo, baseline)
         check_error_events(report, repo, baseline)

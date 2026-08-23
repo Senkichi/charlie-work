@@ -405,41 +405,104 @@ def test_cross_family_staleness_still_warns_when_both_heads_are_known(
 # ---------------------------------------------------------------------------
 
 
-def _call_sites(callee: str) -> list[tuple[str, int, bool]]:
-    """Return ``(relpath, lineno, threads_dry_run)`` for every call to ``callee``.
+# Accepted ``dry_run`` keyword value shapes. The guard derives what is covered
+# and fails closed on anything else, matching the posture of
+# ``test_write_gate_enforcement.py`` (W6 PR4, #1330) rather than a forbidden-value
+# blocklist: a bare ``ast.Constant`` literal (``True``/``False``) is rejected
+# because it structurally discards the operator's dry-run intent.
+#
+#   - ``ast.Name`` with id ``dry_run`` -- the canonical threading form
+#     (``dry_run=dry_run``).
+#   - ``ast.Attribute`` whose attr is ``dry_run`` -- a config/self/args/gate flag
+#     read (``self.dry_run``, ``config.dry_run``, ``args.dry_run``,
+#     ``self.gh.dry_run``, ``write_gate.dry_run``). The outermost attribute name
+#     is the load-bearing part: ``self.gh.dry_run`` is an ``Attribute`` whose
+#     ``.attr`` is ``dry_run`` regardless of how deep the receiver chain is.
+#
+# A bare literal fails in BOTH directions: ``dry_run=False`` forces a real
+# mutation under a preview, and ``dry_run=True`` forces a permanent no-op under a
+# real run. Both are exactly the intent-discard defect class this guard exists to
+# catch (issue #1331, guard limit 1 from #619).
 
+
+def _is_accepted_dry_run_value(value: ast.expr) -> bool:
+    """True if ``value`` threads the caller's dry-run intent rather than hardcoding it."""
+    if isinstance(value, ast.Name) and value.id == "dry_run":
+        return True
+    if isinstance(value, ast.Attribute) and value.attr == "dry_run":
+        return True
+    return False
+
+
+def _classify_dry_run_keyword(node: ast.Call) -> str:
+    """Classify the ``dry_run`` keyword on a call node.
+
+    Returns one of ``"missing"`` (no ``dry_run`` keyword), ``"literal"`` (keyword
+    present but its value is a non-threading shape -- a hardcoded literal or any
+    form that does not read the caller's flag), or ``"threads"`` (keyword present
+    and its value is an accepted threading shape per ``_is_accepted_dry_run_value``).
+    """
+    kw = next((k for k in node.keywords if k.arg == "dry_run"), None)
+    if kw is None:
+        return "missing"
+    return "threads" if _is_accepted_dry_run_value(kw.value) else "literal"
+
+
+def _callee_name(node: ast.Call) -> str | None:
+    """Return the bare or attribute name of a call's func, or ``None`` if unnameable."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def _call_sites(callee: str) -> list[tuple[str, int, str]]:
+    """Return ``(relpath, lineno, status)`` for every call to ``callee``.
+
+    ``status`` is the ``_classify_dry_run_keyword`` result for that call site.
     Derived from the source tree rather than a hand-maintained list, so a new caller
     is covered by construction. Matches both bare (``f(...)``) and attribute
     (``mod.f(...)``) call forms.
     """
-    sites: list[tuple[str, int, bool]] = []
+    sites: list[tuple[str, int, str]] = []
     for path in sorted(SRC_ROOT.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            func = node.func
-            if isinstance(func, ast.Attribute):
-                name = func.attr
-            elif isinstance(func, ast.Name):
-                name = func.id
-            else:
+            if _callee_name(node) != callee:
                 continue
-            if name != callee:
-                continue
-            threads = any(keyword.arg == "dry_run" for keyword in node.keywords)
-            sites.append((path.name, node.lineno, threads))
+            sites.append((path.name, node.lineno, _classify_dry_run_keyword(node)))
     return sites
+
+
+def _classify_calls_in_source(source: str, callee: str) -> list[str]:
+    """Classify every call to ``callee`` in ``source`` (used by the self-tests)."""
+    tree = ast.parse(source)
+    return [
+        _classify_dry_run_keyword(node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _callee_name(node) == callee
+    ]
 
 
 @pytest.mark.parametrize("callee", DRY_RUN_REQUIRED_CALLEES)
 def test_every_production_call_site_threads_dry_run(callee: str) -> None:
-    """Every production caller of a state-mutating helper must pass ``dry_run``.
+    """Every production caller of a state-mutating helper must thread ``dry_run``.
 
     ``observe_runner_pool`` is the reason this guard exists in this shape: it took no
     ``dry_run`` parameter at all, so no caller *could* gate its pool-sample writes.
     Adding the parameter fixed the instances; this test is what keeps the next caller
     from reintroducing them.
+
+    The guard checks the keyword's *value*, not just its presence (issue #1331): a
+    site written as ``self_deploy(..., dry_run=False)`` satisfies a presence-only
+    check identically to a correct ``dry_run=dry_run`` threading, failing open on
+    exactly the defect class the guard exists to catch. A hardcoded literal in
+    either direction is an offender -- ``dry_run=False`` forces a real mutation
+    under a preview, and ``dry_run=True`` forces a permanent no-op under a real run.
     """
     sites = _call_sites(callee)
 
@@ -447,9 +510,66 @@ def test_every_production_call_site_threads_dry_run(callee: str) -> None:
     # function is renamed, this test should break loudly, not go quiet.
     assert sites, f"no call sites found for {callee!r}; the guard would pass vacuously"
 
-    offenders = [f"{name}:{lineno}" for name, lineno, threads in sites if not threads]
+    offenders = [
+        f"{name}:{lineno} ({status})" for name, lineno, status in sites if status != "threads"
+    ]
     assert not offenders, (
-        f"{callee} called without dry_run at: {', '.join(offenders)}. "
+        f"{callee} called without a threading dry_run at: {', '.join(offenders)}. "
         "These paths mutate state outside the process, so a preview that reaches them "
-        "is not a preview. Thread the flag through."
+        "is not a preview. Thread the flag through (dry_run=dry_run or a *.dry_run "
+        "attribute read) -- a hardcoded True/False literal discards the operator's "
+        "dry-run intent in both directions."
     )
+
+
+# ---------------------------------------------------------------------------
+# Self-test: the strengthened guard rejects hardcoded literals and accepts
+# threading. Pins the value-shape check itself, not just its presence on the
+# production tree (issue #1331 acceptance).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("literal",),
+    [("False",), ("True",)],
+    ids=["dry_run=False", "dry_run=True"],
+)
+def test_dry_run_literal_fails_the_guard(literal: str) -> None:
+    """A hardcoded ``dry_run=<literal>`` is an offender in both directions.
+
+    ``dry_run=False`` forces a real mutation under a preview; ``dry_run=True``
+    forces a permanent no-op under a real run. Both structurally discard the
+    operator's dry-run intent, which is the defect class the guard exists to catch.
+    """
+    source = f"def f(dry_run):\n    self_deploy(repo, dry_run={literal})\n"
+    statuses = _classify_calls_in_source(source, "self_deploy")
+    assert statuses == ["literal"], (
+        f"expected the hardcoded {literal} to be classified as a non-threading "
+        f"literal offender; got {statuses!r}"
+    )
+
+
+def test_dry_run_name_threading_passes_the_guard() -> None:
+    """A correct ``dry_run=dry_run`` threading passes the guard."""
+    source = "def f(dry_run):\n    self_deploy(repo, dry_run=dry_run)\n"
+    statuses = _classify_calls_in_source(source, "self_deploy")
+    assert statuses == ["threads"], statuses
+
+
+@pytest.mark.parametrize(
+    ("expr",),
+    [("args.dry_run",), ("self.gh.dry_run",), ("config.dry_run",), ("write_gate.dry_run",)],
+    ids=["args.dry_run", "self.gh.dry_run", "config.dry_run", "write_gate.dry_run"],
+)
+def test_dry_run_attribute_threading_passes_the_guard(expr: str) -> None:
+    """A ``*.dry_run`` attribute read (config/self/args/gate flag) passes the guard."""
+    source = f"def f():\n    self_deploy(repo, dry_run={expr})\n"
+    statuses = _classify_calls_in_source(source, "self_deploy")
+    assert statuses == ["threads"], statuses
+
+
+def test_dry_run_missing_is_still_an_offender() -> None:
+    """A call with no ``dry_run`` keyword at all remains an offender (the pre-#1331 check)."""
+    source = "def f():\n    self_deploy(repo)\n"
+    statuses = _classify_calls_in_source(source, "self_deploy")
+    assert statuses == ["missing"], statuses
