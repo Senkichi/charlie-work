@@ -48,7 +48,7 @@ from .config import (
 )
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
-from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
+from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_acquire_fleet_lock
 from . import layout
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -66,7 +66,7 @@ from .cross_family import (
     report_is_reusable,
     run_cross_family_review,
 )
-from .cross_repo_gate import cross_repo_gate
+from .cross_repo_gate import cross_repo_gate, cross_repo_scope_gate
 from .github import (
     GitHub,
     GitHubError,
@@ -1966,6 +1966,7 @@ def _detect_and_handle_orphaned_workers(
     *,
     write_gate: WriteGate,
     review_callback: Callable[[int], Any] | None = None,
+    fleet_dir_override: str | None = None,
 ) -> None:
     """Detect and handle orphaned workers using state.json PID records.
 
@@ -2059,12 +2060,28 @@ def _detect_and_handle_orphaned_workers(
     # number; each value carries the label-write outcome and the attempt
     # count that triggered the escalation.
     zero_artifact_escalations: dict[int, dict[str, Any]] = {}
+    # Issue #1244: issues escalated to ``agent:human-needed`` by the
+    # cross-repo scope tripwire, instead of being relabeled to
+    # ``automated-ready`` for another fruitless redispatch.  A dead worker
+    # whose issue title names another managed repo hopped to that repo's
+    # worktree; redispatching repeats the hop forever.  Keyed by issue
+    # number; each value carries the label-write outcome and the scope
+    # gate's reason.
+    cross_repo_scope_escalations: dict[int, dict[str, Any]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
             number = issue.get("number")
             if number is not None:
                 issues_by_number[int(number)] = issue
+        # Issue #1244: pre-compute the fleet's managed repo names and the
+        # dispatching repo name once for the whole loop — the fleet registry
+        # is read from disk and gh.name_with_owner() is a network call.
+        sweep_repo_root = getattr(gh, "repo_root", None)
+        sweep_fleet_repos = managed_repo_names(fleet_dir_override)
+        sweep_dispatching_repo_name = (
+            _dispatching_repo_name(gh, sweep_repo_root) if sweep_repo_root is not None else ""
+        )
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)
             if issue is None:
@@ -2108,6 +2125,35 @@ def _detect_and_handle_orphaned_workers(
                 zero_artifact_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
+                }
+                continue
+
+            # Issue #1244: cross-repo scope tripwire. Before relabeling to
+            # ``automated-ready`` for another redispatch, check whether the
+            # issue's title names another managed repo in the fleet. A dead
+            # worker whose issue scope targets a sibling repo hopped to that
+            # repo's worktree; redispatching repeats the hop forever. Escalate
+            # to ``agent:human-needed`` instead of burning another dispatch.
+            # This is the transition tripwire (Option 2): catches issues
+            # dispatched before the intake-time scope gate (Option 1) existed.
+            scope_result = cross_repo_scope_gate(
+                str(issue.get("title") or ""),
+                str(issue.get("body") or ""),
+                sweep_dispatching_repo_name,
+                sweep_fleet_repos,
+            )
+            if not scope_result.passed:
+                label_write_ok = True
+                for label in sorted(active_labels):
+                    if not gh.remove_issue_label(issue_number, label):
+                        label_write_ok = False
+                if config.labels.human_needed not in issue_labels:
+                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
+                        label_write_ok = False
+                cross_repo_scope_escalations[issue_number] = {
+                    "removed_labels": sorted(active_labels),
+                    "label_write_ok": label_write_ok,
+                    "reason": scope_result.reason,
                 }
                 continue
 
@@ -2944,6 +2990,38 @@ def _detect_and_handle_orphaned_workers(
                                 removed_labels=escalation["removed_labels"],
                                 added_ready=False,
                                 label_write_ok=escalation["label_write_ok"],
+                            ),
+                        )
+                    )
+                    continue
+
+                # Issue #1244: check whether this issue was escalated to
+                # ``agent:human-needed`` by the cross-repo scope tripwire
+                # (computed above, outside the state lock). If so, record the
+                # escalation in state and emit a visible event — do NOT fall
+                # through to the reclaim path (which would re-add
+                # ``automated-ready`` and trigger another fruitless
+                # redispatch that hops to the sibling repo again).
+                scope_escalation = cross_repo_scope_escalations.get(issue_number)
+                if scope_escalation is not None:
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="cross_repo_hop",
+                        reason_class="mechanical",
+                    )
+                    escalated_entry = state["issues"][str(issue_number)]
+                    escalated_entry["orphan_flagged_at"] = utc_now()
+                    state["issues"][str(issue_number)] = escalated_entry
+                    sweep_events.append(
+                        (
+                            "session_failed_escalated",
+                            _session_failed_relabeled_payload(
+                                issue_number=issue_number,
+                                reason="cross_repo_hop",
+                                removed_labels=scope_escalation["removed_labels"],
+                                added_ready=False,
+                                label_write_ok=scope_escalation["label_write_ok"],
                             ),
                         )
                     )
@@ -4372,6 +4450,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     write_gate: WriteGate,
     persist_inconclusive_probe_counter: bool = True,
     now: datetime | None = None,
+    fleet_dir_override: str | None = None,
 ) -> list[dict[str, Any]]:
     """Check for dead sessions, classify their failures, and update throttle state.
 
@@ -4451,6 +4530,14 @@ def _classify_dead_sessions_and_update_throttle_state(
             open_prs_by_issue.setdefault(issue_number, []).append(pr)
 
     repo_root = getattr(gh, "repo_root", None)
+    # Issue #1244: pre-compute fleet info for the cross-repo scope tripwire.
+    # The managed-repo set is derived from the fleet registry, never a
+    # hardcoded list.  Computed once before the worker loop because the fleet
+    # registry is read from disk and gh.name_with_owner() is a network call.
+    sweep_fleet_repos = managed_repo_names(fleet_dir_override)
+    sweep_dispatching_repo_name = (
+        _dispatching_repo_name(gh, repo_root) if repo_root is not None else ""
+    )
 
     reaped: list[dict[str, Any]] = []
 
@@ -4826,6 +4913,23 @@ def _classify_dead_sessions_and_update_throttle_state(
                         continue
                     # Salvage failed: fall through to the normal relabel path below.
 
+                # Issue #1244: cross-repo scope tripwire. Before relabeling
+                # to ``automated-ready`` for another redispatch, check whether
+                # the issue's title names another managed repo in the fleet.
+                # A dead worker whose issue scope targets a sibling repo
+                # hopped to that repo's worktree; redispatching repeats the
+                # hop forever.  Override the failure_kind so the
+                # DETERMINISTIC_ESCALATION_FAILURE_KINDS check below
+                # escalates on the first occurrence instead of looping.
+                scope_result = cross_repo_scope_gate(
+                    str(issue.get("title") or ""),
+                    str(issue.get("body") or ""),
+                    sweep_dispatching_repo_name,
+                    sweep_fleet_repos,
+                )
+                if not scope_result.passed:
+                    failure_kind = "cross_repo_hop"
+
                 # Track redispatch count for escalation cap (issue #165)
                 # This relabel-to-ready path is a redispatch event
                 with state_lock(state_file):
@@ -4996,6 +5100,24 @@ def _safe_repo_slug(gh: GitHubLike) -> str:
         return gh.name_with_owner()
     except Exception:
         return "?"
+
+
+def _dispatching_repo_name(gh: GitHubLike, repo_root: Path) -> str:
+    """Return the repo-name segment of the dispatching repo (issue #1244).
+
+    Prefers ``gh.name_with_owner()`` (``owner/repo``) so the name matches
+    the fleet registry's keys.  Falls back to ``repo_root.name`` (the
+    directory name) when the GitHub lookup fails (offline, gh missing) —
+    the directory name is usually the same as the GitHub repo name, and a
+    mismatch only means the scope gate cannot attribute the issue, which
+    is the safe direction (pass, not block).
+    """
+    try:
+        nwo = gh.name_with_owner()
+        parts = nwo.rsplit("/", 1)
+        return parts[1] if len(parts) == 2 else nwo
+    except Exception:
+        return repo_root.name
 
 
 def _open_salvage_pr(
@@ -7166,7 +7288,11 @@ class OrchestratorApp:
             routing_inputs = self._routing_inputs() if api_enabled else None
             # Issue #1010: dry-run cross-repo gate — report which issues would
             # be escalated without mutating state or labels.
+            # Issue #1244: dry-run cross-repo *scope* gate — report issues whose
+            # title names another managed repo.
             dry_run_cross_repo_escalated: dict[int, str] = {}
+            fleet_repos = managed_repo_names(self.fleet_dir_override)
+            dispatching_repo_name = _dispatching_repo_name(self.gh, self.repo_root)
             for issue_number in selected_issue_numbers:
                 full_issue = self.gh.issue_view(issue_number)
                 full_issues[issue_number] = full_issue
@@ -7176,6 +7302,17 @@ class OrchestratorApp:
                 gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
                 if not gate_result.passed:
                     dry_run_cross_repo_escalated[issue_number] = gate_result.reason
+                    continue
+
+                # Pre-flight scope gate: report cross-repo scope targets.
+                scope_result = cross_repo_scope_gate(
+                    str(full_issue.get("title") or ""),
+                    str(full_issue.get("body") or ""),
+                    dispatching_repo_name,
+                    fleet_repos,
+                )
+                if not scope_result.passed:
+                    dry_run_cross_repo_escalated[issue_number] = scope_result.reason
                     continue
 
                 template: str | None = None
@@ -7738,7 +7875,14 @@ class OrchestratorApp:
         # file paths are all absent from the target repo are escalated to
         # human-needed instead of dispatching a worker that will wander to a
         # sibling repo's shared checkout.
+        # Issue #1244: pre-flight cross-repo *scope* gate. Issues whose title
+        # names another managed repo in the fleet (e.g. "job-cannon: ...") are
+        # escalated too — their deliverables live in that repo, not this one,
+        # so the dispatching lane can never finalize them.  The managed-repo
+        # set is derived from the fleet registry, never a hardcoded list.
         cross_repo_escalated: dict[int, str] = {}
+        fleet_repos = managed_repo_names(self.fleet_dir_override)
+        dispatching_repo_name = _dispatching_repo_name(self.gh, self.repo_root)
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
@@ -7749,6 +7893,18 @@ class OrchestratorApp:
             gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
             if not gate_result.passed:
                 cross_repo_escalated[issue_number] = gate_result.reason
+                continue
+
+            # Pre-flight scope gate: refuse to dispatch when the issue's title
+            # names another managed repo (issue #1244).
+            scope_result = cross_repo_scope_gate(
+                str(full_issue.get("title") or ""),
+                str(full_issue.get("body") or ""),
+                dispatching_repo_name,
+                fleet_repos,
+            )
+            if not scope_result.passed:
+                cross_repo_escalated[issue_number] = scope_result.reason
                 continue
 
             # Determine the adapter for this issue (single point of enforcement:
@@ -18062,8 +18218,24 @@ class OrchestratorApp:
         PR's live head, and via which tier (issues #411/#412, #414).
 
         Tier 1 (fast path): the live diff's stable patch-id equals the
-        recorded ``reviewed_patch_id`` — the effective content is provably
-        identical modulo hunk-context.
+        recorded ``reviewed_patch_id``. Issue #1187: ``git patch-id --stable``
+        strips leading whitespace from ``+``/``-`` content lines, so two
+        diffs that differ ONLY in indentation depth produce the identical
+        patch-id — and in an indentation-sensitive language (Python) an
+        indentation-only change can alter control flow (e.g. moving a
+        ``return`` into or out of an ``if`` block). A tier-1 patch-id match
+        alone is therefore NOT sufficient to carry forward a verdict: when
+        a tier-2 line-content signature (which preserves whitespace verbatim)
+        was recorded at review time, it is also validated and must match.
+        If the tier-2 signatures differ — a whitespace-only change that
+        patch-id collapsed — the check fails closed to stale rather than
+        carrying forward an approved verdict across a semantically
+        different, unreviewed head. Decisions that predate tier-2 (no
+        signature stored) have no tier-2 baseline to consult and preserve
+        #412's original patch-id-only carry-forward behavior. The tier-2
+        binary eligibility gate does NOT apply here: patch-id already
+        proved binary content identity, and tier-2 is consulted only for
+        its text-line view, which is unaffected by binary payloads.
 
         Tier 2 (line-content, issue #414): patch-ids differ — which happens
         on every ordinary main advance, since ``git patch-id --stable``
@@ -18116,7 +18288,32 @@ class OrchestratorApp:
             return CarryForwardCheck(None, live_patch_id, live_signature)
 
         if live_patch_id and live_patch_id == reviewed_patch_id:
-            return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            # Issue #1187: ``git patch-id --stable`` strips leading
+            # whitespace from ``+``/``-`` content lines, so two diffs that
+            # differ only in indentation depth produce the identical
+            # patch-id. In an indentation-sensitive language (Python), an
+            # indentation-only change can alter control flow. A patch-id
+            # match alone must not carry forward a verdict: validate the
+            # tier-2 line-content signature (which preserves whitespace
+            # verbatim) when one was recorded. The tier-2 binary gate does
+            # NOT apply here — patch-id already proved binary content
+            # identity, and tier-2 is consulted only for its text-line view.
+            reviewed_changed_lines = decision.get("reviewed_changed_lines")
+            reviewed_changed_files = decision.get("reviewed_changed_files")
+            if reviewed_changed_lines is None or reviewed_changed_files is None:
+                # Decision predates tier-2 (no signature recorded) —
+                # patch-id is the only available signal; preserve #412's
+                # original carry-forward behavior for legacy decisions.
+                return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
+            files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
+            if lines_match and files_match:
+                return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            # Patch-id matched but tier-2 signatures differ — a
+            # whitespace-only change that patch-id collapsed (issue #1187).
+            # Fail closed to stale rather than carrying forward an approved
+            # verdict across a semantically different, unreviewed head.
+            return CarryForwardCheck(None, live_patch_id, live_signature)
 
         reviewed_changed_lines = decision.get("reviewed_changed_lines")
         reviewed_changed_files = decision.get("reviewed_changed_files")
@@ -19831,6 +20028,7 @@ class OrchestratorApp:
             write_gate=self.write_gate,
             persist_inconclusive_probe_counter=False,
             now=now,
+            fleet_dir_override=self.fleet_dir_override,
         )
 
         # Flat-interval Haiku probe for early quota/rate-limit recovery (see
@@ -19880,6 +20078,7 @@ class OrchestratorApp:
             self.gh,
             write_gate=self.write_gate,
             review_callback=self.review,
+            fleet_dir_override=self.fleet_dir_override,
         )
 
         # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)

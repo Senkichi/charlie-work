@@ -22,6 +22,15 @@ _LOCK_TIMEOUT_SECONDS = 30
 _LOAD_RETRY_ATTEMPTS = 3
 _LOAD_RETRY_DELAY_SECONDS = 0.1
 
+# Retry for transient write errors on the atomic replace (issue #1062). On
+# Windows, ``os.replace()`` onto a target another process currently holds open
+# (a lock-free ``load_state`` reader, ``charlie doctor``, a dashboard render)
+# raises ``PermissionError`` [WinError 5]. The failure is transient and
+# non-destructive -- the previous valid file is intact -- so retry with backoff
+# before surfacing, mirroring the reader-side knobs above.
+_SAVE_RETRY_ATTEMPTS = 3
+_SAVE_RETRY_DELAY_SECONDS = 0.1
+
 # Stale claim timeout (minutes) — claims older than this are re-dispatchable
 # to prevent crashed phase-2 from wedging issues
 _STALE_CLAIM_TIMEOUT_MINUTES = 30
@@ -753,7 +762,28 @@ def save_state(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(to_save, handle, indent=2, sort_keys=True)
         handle.write("\n")
-    tmp_path.replace(path)
+    # On Windows, ``replace()`` onto a target another process currently holds
+    # open (a lock-free ``load_state`` reader, ``charlie doctor``, a dashboard
+    # render) raises ``PermissionError`` [WinError 5]. The failure is transient
+    # and non-destructive -- the previous valid file is intact -- so retry with
+    # backoff before surfacing, mirroring ``load_state``'s reader-side retry.
+    # ``PermissionError`` is caught specifically so the final message can name
+    # the condition; a bare "Access is denied" sends an operator hunting for an
+    # admin shell (issue #1062).
+    for attempt in range(_SAVE_RETRY_ATTEMPTS):
+        try:
+            tmp_path.replace(path)
+            break
+        except PermissionError as exc:
+            if attempt < _SAVE_RETRY_ATTEMPTS - 1:
+                time.sleep(_SAVE_RETRY_DELAY_SECONDS)
+                continue
+            raise PermissionError(
+                f"atomic replace of {path} failed after {_SAVE_RETRY_ATTEMPTS} "
+                f"attempts: {exc}. This is usually a transient Windows sharing "
+                f"violation (another process holds the file open); the previous "
+                f"state file is intact."
+            ) from exc
     return to_save
 
 
