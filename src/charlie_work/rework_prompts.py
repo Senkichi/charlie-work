@@ -257,6 +257,20 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
     ``dispatch_rework``'s #800 drift reconciler re-renders and diffs against
     it every pass), so a guard here reaches every persisted record without
     needing the one-off backfill script to run against it.
+
+    Issue #1310: the tier-2 (summary-verbatim) emit sites -- the
+    ``"derived"`` marker branch and the marker-less ``summary`` fallback --
+    render the verdict's ``summary`` verbatim. They are now guarded by the
+    same ``body_has_crash_signature`` and ``LEGACY_VACUOUS_SUMMARY`` checks
+    W12 applied to ``external_findings``/``required_changes``, degrading to
+    tier 3 when the summary is a crash body or the vacuous placeholder.
+    Production-unreachable today (crash bodies are posted as PR comments
+    and folded into ``external_findings``/``required_changes``, never
+    written into a verdict ``summary``), but the suppression contract W12
+    established is "crash noise cannot reach prompt content through any
+    render path" -- enforcing it at N-1 of N emit sites is the
+    signal-without-full-coverage shape a future ``summary`` writer or a
+    hand-edit of an archived decision file re-opens with no test failing.
     """
     if not isinstance(decision, dict):
         return ""
@@ -367,6 +381,44 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         # the "both empty" tier below when they are not, in fact, empty.
         summary_text = ""
 
+    # Issue #1310: tier-2 (summary-verbatim) crash/vacuous guard. Both
+    # tier-2 emit sites below -- the `"derived"` marker branch and the
+    # marker-less `summary_text` fallback -- render `summary_text`
+    # verbatim. Neither applied `body_has_crash_signature` nor the
+    # `LEGACY_VACUOUS_SUMMARY` check, so a crash-signature body arriving
+    # as a verdict `summary` would pass straight into the rework brief --
+    # the exact content class W12 (#1269) suppressed at the collection
+    # and render boundaries for `required_changes`/`external_findings`.
+    # The neighboring tiers are already guarded: `_render_round_findings`'s
+    # `summary_is_usable` covers the summary-fallback and tier-1 re-append
+    # paths; only this tier-2 verbatim emit was bare. Degrade exactly as
+    # the other tiers do: treat a crash or vacuous summary as absent,
+    # routing to tier 3 (the "findings unavailable" escape hatch) when
+    # `changes` is also empty. Production-unreachable today (crash bodies
+    # are posted as PR comments and folded into `external_findings`/
+    # `required_changes`, never written into a verdict `summary`), but a
+    # future `summary` writer or a hand-edit of an archived decision file
+    # re-opens the leak with no test failing.
+    #
+    # Gated on `not new_shape` for the same reason the old-shape
+    # vacuous-neutralization guard above carries `and not external_findings`:
+    # when `external_findings` is populated, the tier-2 summary-fallback
+    # branch is what reaches `_render_external_findings_section` to render
+    # them. Neutralizing `summary_text` here would drop those genuine
+    # findings into tier 3, which returns without ever consulting
+    # `external_findings` -- the exact regression
+    # `test_render_required_changes_section_vacuous_guard_does_not_drop_populated_external_findings`
+    # pins down. The `new_shape`-True + crash/vacuous-summary case (crash
+    # text rendered alongside the external findings) is a separate, wider
+    # gap outside this issue's scope; the issue's acceptance test is the
+    # empty-findings-list case (`new_shape` False).
+    if (
+        not new_shape
+        and summary_text
+        and (summary_text == LEGACY_VACUOUS_SUMMARY or body_has_crash_signature(summary_text))
+    ):
+        summary_text = ""
+
     # issue #792: a verdict recorded by the current record_review carries an
     # explicit marker for exactly this distinction -- handle it before the
     # shape-based tiers below, which exist only to infer the same thing for
@@ -385,7 +437,14 @@ def _render_required_changes_section(decision: dict[str, Any] | None) -> str:
         ]
         return "\n".join(lines)
 
-    if verdict == "request_changes" and findings_channel == "derived":
+    # Issue #1310: `and summary_text` -- the crash/vacuous guard above
+    # can neutralize `summary_text` to "" for a `"derived"` record (a
+    # hand-edited archived decision file, or a hypothetical future writer
+    # that stamps `derived` on a crash body). Without this guard the
+    # branch would render `defang_closing_keywords("")` -- an empty
+    # verbatim summary -- instead of degrading to tier 1 (if `changes`
+    # survived) or tier 3 (if not), exactly as the other tiers do.
+    if verdict == "request_changes" and findings_channel == "derived" and summary_text:
         lines = [
             "## Required changes",
             "",
