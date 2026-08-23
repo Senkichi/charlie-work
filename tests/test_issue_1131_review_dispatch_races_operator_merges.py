@@ -321,6 +321,74 @@ def test_dispatch_reviews_dispatches_pending_pr_without_approved_decision(
     assert any(456 in c["payload"]["pr_numbers"] for c in claim_events)
 
 
+def test_dispatch_reviews_dry_run_skips_already_approved_pr(
+    tmp_path: Path,
+) -> None:
+    """Issue #1131 fix #2 (dry-run mirror): the already-approved pre-claim
+    gate added to ``dispatch_reviews`` must be reflected in the dry-run
+    preview so the two paths cannot diverge. A dry-run pass against a PR
+    whose decision file already records an approval for the head this pass
+    would review must report that PR under ``skipped_already_approved`` and
+    exclude it from the dry-run selected/dispatch count -- and, because the
+    dry-run branch is read-only, must not emit the
+    ``review_dispatch_skipped_already_approved`` event the real path emits."""
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(enabled=True),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    pr_number = 456
+    issue_number = 123
+    head_sha = "sha-abc123"
+    _write_review_packet(paths, pr_number, head_sha)
+    _seed_reviewing_pr(paths, pr_number, issue_number)
+    # The operator recorded an approved verdict AFTER review_queue's snapshot
+    # was built -- the file on disk now says approved at the live head.
+    _write_decision(
+        paths,
+        pr_number,
+        {
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "decision": "approved",
+            "summary": "lgtm",
+            "required_changes": [],
+            "reviewed_head_sha": head_sha,
+        },
+    )
+
+    # Simulate the stale review_queue snapshot (still sees ``pending``).
+    app.review_queue = _stale_queue_review_queue(pr_number, issue_number, head_sha).__get__(  # type: ignore[method-assign]
+        app
+    )
+
+    result = app.dispatch_reviews()
+
+    assert result.ok is True
+    # The PR must be reported under the dry-run skip field.
+    assert result.data["skipped_already_approved"] == [pr_number]
+    # The PR must be excluded from the dry-run selected/dispatch count.
+    assert result.data["selected_count"] == 0
+    assert result.data["attempted_count"] == 0
+    # The dry-run branch is read-only: no state mutation, no event emitted
+    # (the real path emits ``review_dispatch_skipped_already_approved``;
+    # the dry-run mirror must not, per the gate's "no events emitted, no
+    # state mutation" contract).
+    state = load_state(paths.state_file)
+    pr_state = state["prs"].get(str(pr_number), {})
+    assert pr_state.get("review_dispatch_status") != "review_dispatch_pending"
+    assert pr_state.get("review_dispatch_status") != "review_dispatch_dispatched"
+    assert pr_state.get("review_dispatch_attempt_count", 0) == 0
+    skip_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "review_dispatch_skipped_already_approved"
+    ]
+    assert skip_events == []
+
+
 # --- Fix #3: record_review never labels a CLOSED issue agent:needs-rework ---
 
 
