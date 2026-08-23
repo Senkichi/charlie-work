@@ -41792,6 +41792,16 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    # Issue #1229: the branch-issue validator threaded through
+    # _detect_and_handle_orphaned_workers calls issue_list(state="open") and
+    # rejects branch-name issue numbers absent from the open-issue set. The
+    # default FakeGitHub.issues only carries #123, so #207 must be planted
+    # here or the validator rejects the agent/issue-207 binding and the orphan
+    # sweep cannot match the PR to the issue (pr_number resolves to None,
+    # orphan_drift_at gets overwritten instead of preserved).
+    fake_gh.issues.append(
+        {"number": 207, "title": "test issue 207", "state": "OPEN", "labels": [], "body": ""}
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -42150,6 +42160,17 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
             ]
 
     fake_gh = FakeGitHubForOrphan()
+    # Issue #1229: the branch-issue validator threaded through
+    # _detect_and_handle_orphaned_workers calls issue_list(state="open") and
+    # rejects branch-name issue numbers absent from the open-issue set. The
+    # default FakeGitHub.issues only carries #123, so #207 must be planted
+    # here or the validator rejects the agent/issue-207 binding, the orphan
+    # sweep cannot match the PR to the issue, and the fingerprint short-circuit
+    # (which requires the PR to be found) never fires — orphan_drift_at gets
+    # overwritten with a fresh timestamp instead of being preserved.
+    fake_gh.issues.append(
+        {"number": 207, "title": "test issue 207", "state": "OPEN", "labels": [], "body": ""}
+    )
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
