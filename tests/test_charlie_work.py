@@ -16170,6 +16170,123 @@ def test_infra_blocked_persistence_one_escalation_per_window(tmp_path: Path) -> 
     assert len(escalated_3) == 1  # still exactly one
 
 
+def test_infra_blocked_multiple_prs_one_pass_no_premature_escalation(
+    tmp_path: Path,
+) -> None:
+    """AC3 (rework finding): multiple infra-blocked PRs encountered within a
+    single loop pass must increment ``consecutive_passes`` at most ONCE for
+    that pass, not once per PR. Without the correlation_id gate on the
+    increment, N concurrent infra-blocked PRs in one pass reach
+    ``persistence_passes=N`` and fire ``infra_blocked_escalated`` within
+    that single pass -- contradicting the documented "persistence across N
+    passes, not per PR per pass" design.
+
+    This test simulates a single pass (one ``correlation_context``) that
+    encounters three infra-blocked PRs by calling ``review()`` three times
+    within that context. With ``persistence_passes=3``, the bug would fire
+    escalation on the third call within the same pass; the fix holds the
+    counter at 1 for the whole pass, so no escalation fires until two more
+    passes observe infra-blocked PRs.
+    """
+    from charlie_work.config import InfraBlockedConfig
+    from charlie_work.instrumentation import correlation_context
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+
+    config = _required_checks_config(
+        infra_blocked=InfraBlockedConfig(persistence_passes=3, escalation_window_minutes=60),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    def make_infra_blocked_fake() -> _FakeGitHubWithInfraBlockedJob:
+        return _FakeGitHubWithInfraBlockedJob(
+            checks=[
+                {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+                {"name": "Lint & Format", "bucket": "pass"},
+                {"name": "Pre-commit", "state": "SUCCESS"},
+            ],
+            jobs_by_check_run_id={
+                9001: {"conclusion": "FAILURE", "steps": []},
+            },
+        )
+
+    # A single pass: one correlation_context, three infra-blocked review()
+    # calls (simulating three PRs encountered in the same pass). The
+    # infra_blocked branch is idempotent (no state/label mutation, early
+    # return), so repeated calls for the same PR exercise the same counter
+    # path as distinct PRs would.
+    app = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context() as cid:
+        app.review(456)
+        app.review(456)
+        app.review(456)
+
+    # The counter incremented exactly once for this pass, not three times.
+    repo_key = str(tmp_path)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 1, (
+        f"expected one increment for pass {cid!r}, got "
+        f"{_infra_blocked_window[repo_key]['consecutive_passes']!r}"
+    )
+    # persistence_passes=3 not reached within a single pass -> no escalation.
+    escalated = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated) == 0, escalated
+
+    # A second pass (new correlation_context) increments again -> counter=2,
+    # still below threshold -> no escalation.
+    app2 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context():
+        app2.review(456)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 2
+    escalated_2 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_2) == 0
+
+    # A third pass reaches persistence_passes=3 -> exactly one escalation.
+    app3 = OrchestratorApp(tmp_path, paths, config, make_infra_blocked_fake())
+    with correlation_context():
+        app3.review(456)
+    assert _infra_blocked_window[repo_key]["consecutive_passes"] == 3
+    escalated_3 = query_events(paths.state_file, kind="infra_blocked_escalated")
+    assert len(escalated_3) == 1
+
+
+def test_infra_blocked_window_resets_when_pass_observes_zero(tmp_path: Path) -> None:
+    """Rework finding: the ``_loop_impl`` branch that resets
+    ``_infra_blocked_window`` when a pass observes zero infra_blocked PRs
+    (the fleet-wide infra condition has cleared). A pass that processes no
+    infra-blocked PRs must zero the consecutive-pass counter so the next
+    outage starts fresh, rather than carrying stale persistence forward.
+
+    ``loop(limit=0)`` runs a full pass (intake, dispatch, reviews, the
+    post-pass reset sweep) but processes zero PRs, so no
+    ``check_infra_blocked`` events are emitted for this pass's
+    correlation_id -- exactly the ``infra_blocked_this_pass == 0`` condition
+    that triggers the reset.
+    """
+    from charlie_work.workflow import _infra_blocked_window
+
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Pre-populate the window as if prior passes observed infra-blocked PRs.
+    repo_key = str(tmp_path)
+    _infra_blocked_window[repo_key] = {
+        "consecutive_passes": 2,
+        "last_escalation": datetime.now(UTC),
+        "last_pass_cid": "stale-cid-from-prior-pass",
+    }
+
+    app.loop(limit=0)
+
+    # The pass observed zero infra_blocked PRs -> the window was reset.
+    window = _infra_blocked_window[repo_key]
+    assert window["consecutive_passes"] == 0
+    assert window["last_escalation"] is None
+    assert window["last_pass_cid"] is None
+
+
 def test_infra_blocked_check_infra_blocked_event_emitted(tmp_path: Path) -> None:
     """AC4: the ``check_infra_blocked`` event is emitted and has a consumer
     (heartbeat_check.py's ``check_infra_blocked_events``)."""

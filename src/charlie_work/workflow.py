@@ -203,6 +203,7 @@ from .state import (
 )
 from .instrumentation import (
     correlation_context,
+    current_correlation_id,
     log_event,
     query_events,
     record_loop_pass,
@@ -1902,10 +1903,13 @@ _SINK_STATUSES: frozenset[str] = frozenset({"escalated", "blocked"})
 # module-level dict, keyed by repo_root string, survives across passes
 # within the same supervisor process -- exactly the scope AC3 needs:
 # "one operator escalation per window, not one per PR per pass." Each
-# entry records the consecutive-pass count of infra_blocked observations
-# and the datetime of the last ``infra_blocked_escalated`` emission (or
-# None if none has been emitted yet). Reset to zero/None when a pass
-# observes no infra_blocked PRs (the infra condition cleared).
+# entry records the consecutive-pass count of infra_blocked observations,
+# the datetime of the last ``infra_blocked_escalated`` emission (or None
+# if none has been emitted yet), and the correlation_id of the pass that
+# last incremented the counter (so multiple infra-blocked PRs encountered
+# within the same ``review()`` pass increment the counter at most once).
+# Reset to zero/None/None when a pass observes no infra_blocked PRs (the
+# infra condition cleared).
 _infra_blocked_window: dict[str, dict[str, Any]] = {}
 
 
@@ -9643,9 +9647,29 @@ class OrchestratorApp:
                 cfg = self.config.auto_merge.infra_blocked
                 repo_key = str(self.repo_root)
                 window = _infra_blocked_window.setdefault(
-                    repo_key, {"consecutive_passes": 0, "last_escalation": None}
+                    repo_key,
+                    {
+                        "consecutive_passes": 0,
+                        "last_escalation": None,
+                        "last_pass_cid": None,
+                    },
                 )
-                window["consecutive_passes"] = window.get("consecutive_passes", 0) + 1
+                # Issue #1383: increment at most once per loop pass (per
+                # correlation_id), not once per infra-blocked PR encountered
+                # within review(). Without this gate, N concurrent
+                # infra-blocked PRs in one pass would reach
+                # persistence_passes=N in a single pass and fire
+                # ``infra_blocked_escalated`` immediately, contradicting AC3
+                # ("persistence across N passes, not per PR per pass"). The
+                # same correlation_id-dedup pattern is used by the
+                # reset-on-clear logic in ``_loop_impl``. When no correlation
+                # context is active (direct ``review()`` calls outside
+                # ``loop()``, e.g. in tests), ``cid`` is None and each call
+                # increments -- matching the pre-fix direct-call behavior.
+                cid = current_correlation_id()
+                if cid is None or window.get("last_pass_cid") != cid:
+                    window["consecutive_passes"] = window.get("consecutive_passes", 0) + 1
+                    window["last_pass_cid"] = cid
                 last_esc = window.get("last_escalation")
                 now_dt = datetime.now(UTC)
                 should_escalate = window["consecutive_passes"] >= cfg.persistence_passes
@@ -19227,6 +19251,7 @@ class OrchestratorApp:
                     _infra_blocked_window[repo_key] = {
                         "consecutive_passes": 0,
                         "last_escalation": None,
+                        "last_pass_cid": None,
                     }
             log_event(
                 self.paths.state_file,
