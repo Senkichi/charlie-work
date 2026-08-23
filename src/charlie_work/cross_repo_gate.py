@@ -371,8 +371,102 @@ def cross_repo_gate(issue_body: str, repo_root: Path) -> CrossRepoGateResult:
     )
 
 
+def cross_repo_scope_gate(
+    issue_title: str,
+    issue_body: str,
+    dispatching_repo_name: str,
+    managed_repo_names: frozenset[str],
+) -> CrossRepoGateResult:
+    """Decide whether an issue's *scope* targets another managed repo.
+
+    This is the intake-time repo attribution from issue #1244 (Option 1):
+    when an issue's deliverables live in a different managed repo, the lane
+    that dispatches it can never finalize it — the worker either hops to
+    the sibling repo's worktree (contaminating it) or exits with zero
+    artifacts in the dispatching repo, and the single-remote orphan sweep
+    declares it dead and redispatches, looping forever.
+
+    The gate checks the issue **title** for a ``<repo-name>:`` prefix that
+    names a managed repo other than the dispatching one.  This is the
+    clearest signal that the issue's scope is that repo — the #709 case
+    study had the title ``job-cannon: docs/devin-orchestration/ ... stale``
+    in the charlie-work tracker, but every deliverable was a job-cannon
+    file.
+
+    The managed-repo set **must** derive from the fleet registry (see
+    :func:`charlie_work.fleet_registry.managed_repo_names`), never a
+    hardcoded list — a literal list would require manual updates for every
+    fleet change and break silently when a repo is added or removed.
+
+    Conservative by design (mirrors the file-path gate's philosophy):
+
+    - An empty managed-repo set (no fleet registry, single-repo) passes —
+      no other repos to attribute the issue to.
+    - An issue whose title does not start with ``<other-repo>:`` passes —
+      the scope is not unambiguously another repo.
+    - The dispatching repo's own name is excluded — an issue in
+      charlie-work that says ``charlie-work: fix X`` is in-repo by
+      definition.
+    - Only a title that starts with ``<repo-name>:`` for a managed repo
+      *other than* the dispatching one is blocked.  The body is not
+      scanned for repo-name mentions because a passing reference
+      (``coordinate with job-cannon on this``) is not evidence of a
+      cross-repo scope.
+
+    Args:
+        issue_title: The issue's title string.
+        issue_body: The issue's body string (unused by the current
+            title-prefix check, but accepted so callers can extend the
+            detection without changing the call site).
+        dispatching_repo_name: The repo-name segment of the dispatching
+            repo (e.g. ``charlie-work``), extracted from the GitHub
+            ``nameWithOwner`` or the repo root's directory name.
+        managed_repo_names: The set of repo-name segments managed by the
+            fleet, from :func:`fleet_registry.managed_repo_names`.
+
+    Returns:
+        A :class:`CrossRepoGateResult` with ``passed=False`` when the
+        issue title names another managed repo, ``passed=True`` otherwise.
+    """
+    other_repos = managed_repo_names - {dispatching_repo_name}
+    if not other_repos:
+        return CrossRepoGateResult(
+            passed=True,
+            referenced_paths=(),
+            missing_paths=(),
+            reason="no other managed repos in the fleet registry",
+        )
+    title_lower = issue_title.lower().lstrip()
+    for repo_name in sorted(other_repos):
+        # Match "repo-name:" at the start of the title (case-insensitive).
+        # This is the "job-cannon: docs/..." pattern from #709 — the
+        # clearest signal that the issue's scope is that repo, not this
+        # one.  A colon immediately after the repo name is the convention
+        # for scope-prefixed issue titles in this fleet.
+        prefix = f"{repo_name.lower()}:"
+        if title_lower.startswith(prefix):
+            return CrossRepoGateResult(
+                passed=False,
+                referenced_paths=(),
+                missing_paths=(),
+                reason=(
+                    f"cross_repo_scope: issue title starts with "
+                    f"{repo_name!r}: — the issue's deliverables target "
+                    f"{repo_name}, not the dispatching repo "
+                    f"({dispatching_repo_name})"
+                ),
+            )
+    return CrossRepoGateResult(
+        passed=True,
+        referenced_paths=(),
+        missing_paths=(),
+        reason="issue title does not name another managed repo",
+    )
+
+
 __all__ = [
     "CrossRepoGateResult",
     "cross_repo_gate",
+    "cross_repo_scope_gate",
     "extract_referenced_paths",
 ]
