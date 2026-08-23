@@ -842,12 +842,21 @@ _RATCHET_BASELINE: dict[str, int] = {
     "state_migration.py": 1,
     "supervise.py": 11,
     "supervisor_lifecycle.py": 3,
+    # Issue #1131: +2 raw primitives in record_review's rework-label-skip
+    # guard (_record_event + save_state for rework_label_skipped_issue_closed).
+    # These match the existing raw pattern in record_review (which has not
+    # yet been converted to WriteGate -- see #1264/#1324), so routing them
+    # through self.write_gate would trigger R9's exclusive-use predicate on
+    # the whole function and flag every pre-existing raw call. The ratchet
+    # holds at the new count until record_review's full conversion.
     # Issue #1393: +11 raw calls for the blocked-environment dispatch path
     # (separate blocked_environment_at counter, distinct escalation reason,
     # candidate-filtering safety net, and stranded .json.tmp cleanup). These
     # are out-of-wave raw sites in unconverted territory, same class as the
     # pre-existing 270 — the ratchet holds at the new count.
-    "workflow.py": 281,
+    # Combined baseline after merging #1131 (+2) and #1393 (+11) onto the
+    # pre-existing 270: 283.
+    "workflow.py": 283,
     "worktree.py": 1,
 }
 
