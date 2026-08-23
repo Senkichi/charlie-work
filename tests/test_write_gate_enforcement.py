@@ -847,7 +847,11 @@ _RATCHET_BASELINE: dict[str, int] = {
     # candidate-filtering safety net, and stranded .json.tmp cleanup). These
     # are out-of-wave raw sites in unconverted territory, same class as the
     # pre-existing 270 — the ratchet holds at the new count.
-    "workflow.py": 281,
+    # Issue #1314: +2 raw calls for the operator-queue depth gauge
+    # (_maybe_emit_operator_queue_depth: one save_state + one _record_event
+    # -> append_event). Same out-of-wave raw-site class as the pre-existing
+    # 281 — the ratchet holds at the new count.
+    "workflow.py": 283,
     "worktree.py": 1,
 }
 

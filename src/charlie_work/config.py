@@ -555,6 +555,23 @@ class DeescalationConfig:
     # a distinct one-time event (deescalation_cap_exhausted) makes the
     # terminal state diagnosable rather than a silently renamed one-way door.
     max_auto_deescalations: int = 2
+    # Issue #1314 item 2: dedicated cadence knob for the operator-queue
+    # depth gauge (item 3). The gauge currently rides the loop pass cadence
+    # (every pass); this knob lets operators slow it to a dedicated interval
+    # if the per-pass emission volume is too high for their fleet. 0 means
+    # "check every pass" (preserves the pre-knob behavior); > 0 means
+    # "check every N minutes", gated by a ``next_operator_queue_review_at``
+    # timestamp in ``state.json``'s ``deescalation_pass`` section.
+    operator_queue_review_interval_minutes: int = 0
+    # Issue #1314 item 3: alert threshold for the ``operator_queue_depth``
+    # gauge event. When the number of issues parked on
+    # ``agent:operator-queue`` (state entries with ``status == "escalated"``
+    # and ``reason_class == "mechanical"``) exceeds this threshold, a
+    # warning-level ``operator_queue_depth`` event is emitted to
+    # ``events.db`` so a silently growing queue is visible to
+    # ``heartbeat_check.py`` rather than only via label queries. 0 disables
+    # the alert (no event emitted regardless of depth).
+    operator_queue_depth_threshold: int = 5
 
 
 @dataclass(frozen=True)
@@ -2183,6 +2200,50 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"got {rp_alert_days}"
         )
     reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
+    # Issue #1314: the deescalation section was previously not parsed from
+    # YAML (always defaulted). Now that it carries operator-queue follow-up
+    # knobs (review cadence, depth threshold), parse it like every other
+    # section so operators can override the defaults without a code change.
+    deescalation_data = _section(data, "deescalation")
+    deescalation_interval = deescalation_data.get("interval_minutes")
+    if deescalation_interval is not None and (
+        isinstance(deescalation_interval, bool) or not isinstance(deescalation_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'interval_minutes' must be an int, "
+            f"got {type(deescalation_interval).__name__}"
+        )
+    if deescalation_interval is not None and deescalation_interval < 1:
+        raise ConfigError(
+            f"config section 'deescalation' key 'interval_minutes' must be >= 1, got {deescalation_interval}"
+        )
+    oqr_interval = deescalation_data.get("operator_queue_review_interval_minutes")
+    if oqr_interval is not None and (
+        isinstance(oqr_interval, bool) or not isinstance(oqr_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
+            f"must be an int, got {type(oqr_interval).__name__}"
+        )
+    if oqr_interval is not None and oqr_interval < 0:
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
+            f"must be >= 0, got {oqr_interval}"
+        )
+    oq_threshold = deescalation_data.get("operator_queue_depth_threshold")
+    if oq_threshold is not None and (
+        isinstance(oq_threshold, bool) or not isinstance(oq_threshold, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            f"must be an int, got {type(oq_threshold).__name__}"
+        )
+    if oq_threshold is not None and oq_threshold < 0:
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            f"must be >= 0, got {oq_threshold}"
+        )
+    deescalation = _build_section(DeescalationConfig, "deescalation", deescalation_data)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -3194,6 +3255,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         review_dispatch=review_dispatch,
         quota_probe=quota_probe,
         reconcile_pass=reconcile_pass,
+        deescalation=deescalation,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,
