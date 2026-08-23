@@ -59,13 +59,45 @@ def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, 
 
 
 DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict"}
+    {"worker_blocked", "worktree_unsafe", "rework_branch_conflict", "cross_repo_hop"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
 # transient contention, not a confirmed-dirty worktree — it must take the
 # ordinary redispatch-cap path instead of escalating on first occurrence
 # (issue #288 follow-up, PR #314).
+#
+# "cross_repo_hop" (issue #1244): a dead worker whose issue scope targets
+# another managed repo.  Redispatching repeats the same hop forever — the
+# worker notices the content targets a sibling repo, hops to its worktree,
+# and exits with zero artifacts in the dispatching repo.  Escalate on the
+# first occurrence so a human can file/transfer a mirror into the target
+# repo's tracker, exactly as was done by hand for #709.
+
+# Issue #1393: pre-launch environment blocks — failure kinds that happen
+# BEFORE a worker session PID exists (the worker process never started).
+# These are deterministic, zero-cost, and guaranteed to repeat until the
+# environment conflict is resolved (e.g. a stale foreign worktree is
+# removed).  Counting them against the redispatch cap converts an operator
+# hygiene problem into a fake "worker quality" escalation
+# (redispatch_cap_exceeded / no_op_rework_cap_exceeded) whose text gives
+# the operator no hint that the fix is "remove the stale worktree."
+#
+# Instead of incrementing redispatch_at, the dispatch layer records these
+# in a separate blocked_environment_at list and escalates with reason
+# "dispatch_blocked_environment" (including the blocking path) after the
+# same max_auto_redispatch cap — so the operator sees "remove C:\...\wt",
+# not "worker quality cap exceeded."
+#
+# Deliberately disjoint from DETERMINISTIC_ESCALATION_FAILURE_KINDS: those
+# escalate on the *first* occurrence (the environment is unrecoverable
+# without a human).  A blocked-environment refusal is recoverable by
+# operator hygiene (remove the stale checkout), so it gets the same retry
+# budget as an ordinary redispatch before escalating — just with the
+# correct reason and the blocking path in the message.
+PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
+    {"worktree_foreign_writer"}
+)
 
 
 class ConfigError(ValueError):

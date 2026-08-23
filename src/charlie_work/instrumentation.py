@@ -380,6 +380,14 @@ _LEVEL_BY_KIND: Mapping[str, str] = MappingProxyType(
         "venv_pth_mismatch": "warning",
         "venv_pth_repaired": "warning",
         "worktree_foreign_writer": "warning",
+        # Issue #1393: a pre-launch environment block (e.g.
+        # worktree_foreign_writer) prevented a dispatch from starting. Warning,
+        # not error: the issue is not terminal — the cap may not yet be
+        # exhausted, and the operator can resolve the conflict (e.g. remove a
+        # stale checkout) to unblock the next pass. The escalation when the
+        # cap IS exhausted goes through session_failed_escalated (error).
+        "dispatch_blocked_environment": "warning",
+        "rework_dispatch_blocked_environment": "warning",
         # Issue #849: rescue capture preserves work before a reset. Warning
         # level because it means a worktree had uncommitted work that was
         # about to be lost — the capture succeeded, but the condition that

@@ -489,3 +489,32 @@ def count_fleet_runners(
             continue
 
     return total_runners, total_busy_runners, skipped_repos
+
+
+def managed_repo_names(fleet_dir_override: str | None) -> frozenset[str]:
+    """Return the set of repo names managed by the fleet.
+
+    Each entry in the fleet registry is keyed by ``owner/repo`` (the
+    ``nameWithOwner`` from ``gh repo view``).  This function extracts the
+    repo-name segment (the part after the last ``/``) from every registered
+    entry, returning a frozen set suitable for membership checks.
+
+    Derived from the fleet registry on disk — never a hardcoded list — so
+    the cross-repo scope gate (issue #1244) tracks the fleet's actual
+    managed repos rather than a brittle hand-maintained set.  An empty
+    fleet registry (single-repo deployment, fresh install, corrupt file)
+    returns an empty set; callers must treat that as "no other managed
+    repos to check" and pass the gate, not as "block everything."
+    """
+    fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
+    data = _load_registry(fleet_json_path)
+    repos = data.get("repos", {})
+    names: set[str] = set()
+    for name_with_owner in repos:
+        # name_with_owner is "owner/repo" — extract the repo name segment.
+        parts = str(name_with_owner).rsplit("/", 1)
+        if len(parts) == 2:
+            names.add(parts[1])
+        else:
+            names.add(str(name_with_owner))
+    return frozenset(names)

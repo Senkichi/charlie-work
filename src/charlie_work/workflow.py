@@ -16,6 +16,7 @@ from .adapters import (
     AdapterSettings,
     SessionDispatchResult,
     SessionRequest,
+    cleanup_stale_session_tmp_files,
     dispatch_sessions,
     manifest_adapter_label,
     write_session_manifest,
@@ -45,10 +46,11 @@ from .config import (
     CrossFamilyConfig,
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     OrchestratorConfig,
+    PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
 )
 from .env_sanitize import worker_github_token_findings
 from .file_lock import try_acquire_byte_range_lock
-from .fleet_registry import count_fleet_live_sessions, try_acquire_fleet_lock
+from .fleet_registry import count_fleet_live_sessions, managed_repo_names, try_acquire_fleet_lock
 from . import layout
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -66,7 +68,7 @@ from .cross_family import (
     report_is_reusable,
     run_cross_family_review,
 )
-from .cross_repo_gate import cross_repo_gate
+from .cross_repo_gate import cross_repo_gate, cross_repo_scope_gate
 from .github import (
     GitHub,
     GitHubError,
@@ -243,6 +245,7 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _windowed_redispatch_at,
     _windowed_worker_death_at,
     _windowed_orphan_redispatch_at,
+    _windowed_blocked_environment_at,
     _is_review_dispatchable,
     _select_review_dispatch_candidates,
 )
@@ -1967,6 +1970,7 @@ def _detect_and_handle_orphaned_workers(
     *,
     write_gate: WriteGate,
     review_callback: Callable[[int], Any] | None = None,
+    fleet_dir_override: str | None = None,
 ) -> None:
     """Detect and handle orphaned workers using state.json PID records.
 
@@ -2060,12 +2064,28 @@ def _detect_and_handle_orphaned_workers(
     # number; each value carries the label-write outcome and the attempt
     # count that triggered the escalation.
     zero_artifact_escalations: dict[int, dict[str, Any]] = {}
+    # Issue #1244: issues escalated to ``agent:human-needed`` by the
+    # cross-repo scope tripwire, instead of being relabeled to
+    # ``automated-ready`` for another fruitless redispatch.  A dead worker
+    # whose issue title names another managed repo hopped to that repo's
+    # worktree; redispatching repeats the hop forever.  Keyed by issue
+    # number; each value carries the label-write outcome and the scope
+    # gate's reason.
+    cross_repo_scope_escalations: dict[int, dict[str, Any]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
             number = issue.get("number")
             if number is not None:
                 issues_by_number[int(number)] = issue
+        # Issue #1244: pre-compute the fleet's managed repo names and the
+        # dispatching repo name once for the whole loop — the fleet registry
+        # is read from disk and gh.name_with_owner() is a network call.
+        sweep_repo_root = getattr(gh, "repo_root", None)
+        sweep_fleet_repos = managed_repo_names(fleet_dir_override)
+        sweep_dispatching_repo_name = (
+            _dispatching_repo_name(gh, sweep_repo_root) if sweep_repo_root is not None else ""
+        )
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)
             if issue is None:
@@ -2109,6 +2129,35 @@ def _detect_and_handle_orphaned_workers(
                 zero_artifact_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
+                }
+                continue
+
+            # Issue #1244: cross-repo scope tripwire. Before relabeling to
+            # ``automated-ready`` for another redispatch, check whether the
+            # issue's title names another managed repo in the fleet. A dead
+            # worker whose issue scope targets a sibling repo hopped to that
+            # repo's worktree; redispatching repeats the hop forever. Escalate
+            # to ``agent:human-needed`` instead of burning another dispatch.
+            # This is the transition tripwire (Option 2): catches issues
+            # dispatched before the intake-time scope gate (Option 1) existed.
+            scope_result = cross_repo_scope_gate(
+                str(issue.get("title") or ""),
+                str(issue.get("body") or ""),
+                sweep_dispatching_repo_name,
+                sweep_fleet_repos,
+            )
+            if not scope_result.passed:
+                label_write_ok = True
+                for label in sorted(active_labels):
+                    if not gh.remove_issue_label(issue_number, label):
+                        label_write_ok = False
+                if config.labels.human_needed not in issue_labels:
+                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
+                        label_write_ok = False
+                cross_repo_scope_escalations[issue_number] = {
+                    "removed_labels": sorted(active_labels),
+                    "label_write_ok": label_write_ok,
+                    "reason": scope_result.reason,
                 }
                 continue
 
@@ -2945,6 +2994,38 @@ def _detect_and_handle_orphaned_workers(
                                 removed_labels=escalation["removed_labels"],
                                 added_ready=False,
                                 label_write_ok=escalation["label_write_ok"],
+                            ),
+                        )
+                    )
+                    continue
+
+                # Issue #1244: check whether this issue was escalated to
+                # ``agent:human-needed`` by the cross-repo scope tripwire
+                # (computed above, outside the state lock). If so, record the
+                # escalation in state and emit a visible event — do NOT fall
+                # through to the reclaim path (which would re-add
+                # ``automated-ready`` and trigger another fruitless
+                # redispatch that hops to the sibling repo again).
+                scope_escalation = cross_repo_scope_escalations.get(issue_number)
+                if scope_escalation is not None:
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="cross_repo_hop",
+                        reason_class="mechanical",
+                    )
+                    escalated_entry = state["issues"][str(issue_number)]
+                    escalated_entry["orphan_flagged_at"] = utc_now()
+                    state["issues"][str(issue_number)] = escalated_entry
+                    sweep_events.append(
+                        (
+                            "session_failed_escalated",
+                            _session_failed_relabeled_payload(
+                                issue_number=issue_number,
+                                reason="cross_repo_hop",
+                                removed_labels=scope_escalation["removed_labels"],
+                                added_ready=False,
+                                label_write_ok=scope_escalation["label_write_ok"],
                             ),
                         )
                     )
@@ -4471,6 +4552,7 @@ def _classify_dead_sessions_and_update_throttle_state(
     write_gate: WriteGate,
     persist_inconclusive_probe_counter: bool = True,
     now: datetime | None = None,
+    fleet_dir_override: str | None = None,
 ) -> list[dict[str, Any]]:
     """Check for dead sessions, classify their failures, and update throttle state.
 
@@ -4550,6 +4632,14 @@ def _classify_dead_sessions_and_update_throttle_state(
             open_prs_by_issue.setdefault(issue_number, []).append(pr)
 
     repo_root = getattr(gh, "repo_root", None)
+    # Issue #1244: pre-compute fleet info for the cross-repo scope tripwire.
+    # The managed-repo set is derived from the fleet registry, never a
+    # hardcoded list.  Computed once before the worker loop because the fleet
+    # registry is read from disk and gh.name_with_owner() is a network call.
+    sweep_fleet_repos = managed_repo_names(fleet_dir_override)
+    sweep_dispatching_repo_name = (
+        _dispatching_repo_name(gh, repo_root) if repo_root is not None else ""
+    )
 
     reaped: list[dict[str, Any]] = []
 
@@ -4926,6 +5016,23 @@ def _classify_dead_sessions_and_update_throttle_state(
                         continue
                     # Salvage failed: fall through to the normal relabel path below.
 
+                # Issue #1244: cross-repo scope tripwire. Before relabeling
+                # to ``automated-ready`` for another redispatch, check whether
+                # the issue's title names another managed repo in the fleet.
+                # A dead worker whose issue scope targets a sibling repo
+                # hopped to that repo's worktree; redispatching repeats the
+                # hop forever.  Override the failure_kind so the
+                # DETERMINISTIC_ESCALATION_FAILURE_KINDS check below
+                # escalates on the first occurrence instead of looping.
+                scope_result = cross_repo_scope_gate(
+                    str(issue.get("title") or ""),
+                    str(issue.get("body") or ""),
+                    sweep_dispatching_repo_name,
+                    sweep_fleet_repos,
+                )
+                if not scope_result.passed:
+                    failure_kind = "cross_repo_hop"
+
                 # Track redispatch count for escalation cap (issue #165)
                 # This relabel-to-ready path is a redispatch event
                 with state_lock(state_file):
@@ -5098,6 +5205,24 @@ def _safe_repo_slug(gh: GitHubLike) -> str:
         return gh.name_with_owner()
     except Exception:
         return "?"
+
+
+def _dispatching_repo_name(gh: GitHubLike, repo_root: Path) -> str:
+    """Return the repo-name segment of the dispatching repo (issue #1244).
+
+    Prefers ``gh.name_with_owner()`` (``owner/repo``) so the name matches
+    the fleet registry's keys.  Falls back to ``repo_root.name`` (the
+    directory name) when the GitHub lookup fails (offline, gh missing) —
+    the directory name is usually the same as the GitHub repo name, and a
+    mismatch only means the scope gate cannot attribute the issue, which
+    is the safe direction (pass, not block).
+    """
+    try:
+        nwo = gh.name_with_owner()
+        parts = nwo.rsplit("/", 1)
+        return parts[1] if len(parts) == 2 else nwo
+    except Exception:
+        return repo_root.name
 
 
 def _open_salvage_pr(
@@ -7048,6 +7173,9 @@ class OrchestratorApp:
 
         # Gather sessions_dir for stall detection and live worker counting
         sessions_dir = self._layout.sessions_dir
+        # Issue #1393: clean up stranded .json.tmp session sidecar files from
+        # interrupted atomic writes before this pass writes new ones.
+        cleanup_stale_session_tmp_files(sessions_dir)
 
         # Detect and handle stalled sessions before applying concurrency governor.
         # This must run exactly once per pass, not twice (was duplicated in the
@@ -7268,7 +7396,11 @@ class OrchestratorApp:
             routing_inputs = self._routing_inputs() if api_enabled else None
             # Issue #1010: dry-run cross-repo gate — report which issues would
             # be escalated without mutating state or labels.
+            # Issue #1244: dry-run cross-repo *scope* gate — report issues whose
+            # title names another managed repo.
             dry_run_cross_repo_escalated: dict[int, str] = {}
+            fleet_repos = managed_repo_names(self.fleet_dir_override)
+            dispatching_repo_name = _dispatching_repo_name(self.gh, self.repo_root)
             for issue_number in selected_issue_numbers:
                 full_issue = self.gh.issue_view(issue_number)
                 full_issues[issue_number] = full_issue
@@ -7278,6 +7410,17 @@ class OrchestratorApp:
                 gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
                 if not gate_result.passed:
                     dry_run_cross_repo_escalated[issue_number] = gate_result.reason
+                    continue
+
+                # Pre-flight scope gate: report cross-repo scope targets.
+                scope_result = cross_repo_scope_gate(
+                    str(full_issue.get("title") or ""),
+                    str(full_issue.get("body") or ""),
+                    dispatching_repo_name,
+                    fleet_repos,
+                )
+                if not scope_result.passed:
+                    dry_run_cross_repo_escalated[issue_number] = scope_result.reason
                     continue
 
                 template: str | None = None
@@ -7840,7 +7983,14 @@ class OrchestratorApp:
         # file paths are all absent from the target repo are escalated to
         # human-needed instead of dispatching a worker that will wander to a
         # sibling repo's shared checkout.
+        # Issue #1244: pre-flight cross-repo *scope* gate. Issues whose title
+        # names another managed repo in the fleet (e.g. "job-cannon: ...") are
+        # escalated too — their deliverables live in that repo, not this one,
+        # so the dispatching lane can never finalize them.  The managed-repo
+        # set is derived from the fleet registry, never a hardcoded list.
         cross_repo_escalated: dict[int, str] = {}
+        fleet_repos = managed_repo_names(self.fleet_dir_override)
+        dispatching_repo_name = _dispatching_repo_name(self.gh, self.repo_root)
         for issue_number in selected_issue_numbers:
             full_issue = self.gh.issue_view(issue_number)
             full_issues[issue_number] = full_issue
@@ -7851,6 +8001,18 @@ class OrchestratorApp:
             gate_result = cross_repo_gate(str(full_issue.get("body") or ""), self.repo_root)
             if not gate_result.passed:
                 cross_repo_escalated[issue_number] = gate_result.reason
+                continue
+
+            # Pre-flight scope gate: refuse to dispatch when the issue's title
+            # names another managed repo (issue #1244).
+            scope_result = cross_repo_scope_gate(
+                str(full_issue.get("title") or ""),
+                str(full_issue.get("body") or ""),
+                dispatching_repo_name,
+                fleet_repos,
+            )
+            if not scope_result.passed:
+                cross_repo_escalated[issue_number] = scope_result.reason
                 continue
 
             # Determine the adapter for this issue (single point of enforcement:
@@ -8036,57 +8198,120 @@ class OrchestratorApp:
                     # Issue #461: bound dispatch_failed retries with the same
                     # redispatch-window cap used for rework.
                     now = datetime.now(UTC)
-                    all_attempts = list(prev_entry.get("dispatch_failed_at") or [])
-                    if not isinstance(all_attempts, list):
-                        all_attempts = []
-                    all_attempts.append(now.isoformat())
-                    recent = _recent_dispatch_failed_attempts(
-                        {"dispatch_failed_at": all_attempts},
-                        now,
-                        self.config.watchdog.redispatch_window_minutes,
-                    )
-                    # Deterministic launch failures escalate immediately,
-                    # mirroring dispatch_rework's post-#550 behavior — fresh
-                    # dispatch previously only consulted the redispatch-window
-                    # cap, so e.g. a worktree_unsafe failure burned every
-                    # capped retry before a human ever heard about it.
                     failed_result = next(
                         (r for r in dispatch_results if r.issue_number == request.issue_number),
                         None,
                     )
-                    terminal_failure = (
-                        failed_result is not None
-                        and failed_result.failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                    failure_kind = (
+                        failed_result.failure_kind if failed_result is not None else None
                     )
-                    entry["dispatch_failed_at"] = all_attempts
-                    if terminal_failure or len(recent) > self.config.watchdog.max_auto_redispatch:
-                        status = "escalated"
-                        dispatched_at = None
-                        state = _escalate_issue(
-                            state,
-                            request.issue_number,
-                            reason=(
-                                failed_result.failure_kind
-                                if (
-                                    terminal_failure
-                                    and failed_result is not None
-                                    and failed_result.failure_kind is not None
-                                )
-                                else "dispatch_failed_cap_exceeded"
-                            ),
-                            reason_class="mechanical",
-                            issue_extra=entry,
-                        )
-                        # Re-read the escalation fields _escalate_issue merged in,
-                        # but keep ``entry`` a decoupled copy: the mutations below
-                        # must not reach state until the single atomic write at the
-                        # end of this block.
-                        entry = dict(state["issues"][str(request.issue_number)])
+                    # Issue #1393: a pre-launch environment block (e.g.
+                    # worktree_foreign_writer) never started a worker session,
+                    # so it must NOT count against the dispatch_failed cap
+                    # (which measures worker output, not environment hygiene).
+                    # Use a separate blocked_environment_at counter and
+                    # escalate with the correct reason + blocking path after
+                    # the same cap.
+                    blocked_environment = (
+                        failure_kind in PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS
+                    )
+                    if blocked_environment:
+                        blocked_environment_at = _windowed_blocked_environment_at(
+                            entry,
+                            window_minutes=self.config.watchdog.redispatch_window_minutes,
+                        ) + [now.isoformat().replace("+00:00", "Z")]
+                        blocking_error = failed_result.error if failed_result else None
+                        entry["blocked_environment_at"] = blocked_environment_at
+                        if len(blocked_environment_at) > self.config.watchdog.max_auto_redispatch:
+                            status = "escalated"
+                            dispatched_at = None
+                            state = _escalate_issue(
+                                state,
+                                request.issue_number,
+                                reason="dispatch_blocked_environment",
+                                reason_class="mechanical",
+                                issue_extra=entry,
+                            )
+                            entry = dict(state["issues"][str(request.issue_number)])
+                            state = self._record_event(
+                                state,
+                                "session_failed_escalated",
+                                {
+                                    "issue_number": request.issue_number,
+                                    "previous_status": "dispatch_pending",
+                                    "reason": "dispatch_blocked_environment",
+                                    "failure_kind": failure_kind,
+                                    "blocking_error": blocking_error,
+                                    "blocked_environment_count": len(blocked_environment_at),
+                                },
+                            )
+                        else:
+                            status = "dispatch_failed"
+                            dispatched_at = None
+                            clear_escalation(entry)
+                            clear_escalation_on_issue_prs(state, request.issue_number)
+                            state = self._record_event(  # event-consumer: audit-only -- records a pre-launch environment block (issue #1393) already enforced by the blocked_environment_at counter and the dispatch_blocked_environment escalation; consumed by tests/test_charlie_work.py regression tests.
+                                state,
+                                "dispatch_blocked_environment",
+                                {
+                                    "issue_number": request.issue_number,
+                                    "failure_kind": failure_kind,
+                                    "blocking_error": blocking_error,
+                                    "blocked_environment_count": len(blocked_environment_at),
+                                },
+                            )
                     else:
-                        status = "dispatch_failed"
-                        dispatched_at = None
-                        clear_escalation(entry)
-                        clear_escalation_on_issue_prs(state, request.issue_number)
+                        all_attempts = list(prev_entry.get("dispatch_failed_at") or [])
+                        if not isinstance(all_attempts, list):
+                            all_attempts = []
+                        all_attempts.append(now.isoformat())
+                        recent = _recent_dispatch_failed_attempts(
+                            {"dispatch_failed_at": all_attempts},
+                            now,
+                            self.config.watchdog.redispatch_window_minutes,
+                        )
+                        # Deterministic launch failures escalate immediately,
+                        # mirroring dispatch_rework's post-#550 behavior — fresh
+                        # dispatch previously only consulted the redispatch-window
+                        # cap, so e.g. a worktree_unsafe failure burned every
+                        # capped retry before a human ever heard about it.
+                        terminal_failure = (
+                            failed_result is not None
+                            and failed_result.failure_kind
+                            in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+                        )
+                        entry["dispatch_failed_at"] = all_attempts
+                        if (
+                            terminal_failure
+                            or len(recent) > self.config.watchdog.max_auto_redispatch
+                        ):
+                            status = "escalated"
+                            dispatched_at = None
+                            state = _escalate_issue(
+                                state,
+                                request.issue_number,
+                                reason=(
+                                    failed_result.failure_kind
+                                    if (
+                                        terminal_failure
+                                        and failed_result is not None
+                                        and failed_result.failure_kind is not None
+                                    )
+                                    else "dispatch_failed_cap_exceeded"
+                                ),
+                                reason_class="mechanical",
+                                issue_extra=entry,
+                            )
+                            # Re-read the escalation fields _escalate_issue merged in,
+                            # but keep ``entry`` a decoupled copy: the mutations below
+                            # must not reach state until the single atomic write at the
+                            # end of this block.
+                            entry = dict(state["issues"][str(request.issue_number)])
+                        else:
+                            status = "dispatch_failed"
+                            dispatched_at = None
+                            clear_escalation(entry)
+                            clear_escalation_on_issue_prs(state, request.issue_number)
                 entry["status"] = status
                 entry["dispatched_at"] = dispatched_at
                 # Store worker PID and process start time for state-based liveness detection
@@ -18034,8 +18259,24 @@ class OrchestratorApp:
         PR's live head, and via which tier (issues #411/#412, #414).
 
         Tier 1 (fast path): the live diff's stable patch-id equals the
-        recorded ``reviewed_patch_id`` — the effective content is provably
-        identical modulo hunk-context.
+        recorded ``reviewed_patch_id``. Issue #1187: ``git patch-id --stable``
+        strips leading whitespace from ``+``/``-`` content lines, so two
+        diffs that differ ONLY in indentation depth produce the identical
+        patch-id — and in an indentation-sensitive language (Python) an
+        indentation-only change can alter control flow (e.g. moving a
+        ``return`` into or out of an ``if`` block). A tier-1 patch-id match
+        alone is therefore NOT sufficient to carry forward a verdict: when
+        a tier-2 line-content signature (which preserves whitespace verbatim)
+        was recorded at review time, it is also validated and must match.
+        If the tier-2 signatures differ — a whitespace-only change that
+        patch-id collapsed — the check fails closed to stale rather than
+        carrying forward an approved verdict across a semantically
+        different, unreviewed head. Decisions that predate tier-2 (no
+        signature stored) have no tier-2 baseline to consult and preserve
+        #412's original patch-id-only carry-forward behavior. The tier-2
+        binary eligibility gate does NOT apply here: patch-id already
+        proved binary content identity, and tier-2 is consulted only for
+        its text-line view, which is unaffected by binary payloads.
 
         Tier 2 (line-content, issue #414): patch-ids differ — which happens
         on every ordinary main advance, since ``git patch-id --stable``
@@ -18088,7 +18329,32 @@ class OrchestratorApp:
             return CarryForwardCheck(None, live_patch_id, live_signature)
 
         if live_patch_id and live_patch_id == reviewed_patch_id:
-            return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            # Issue #1187: ``git patch-id --stable`` strips leading
+            # whitespace from ``+``/``-`` content lines, so two diffs that
+            # differ only in indentation depth produce the identical
+            # patch-id. In an indentation-sensitive language (Python), an
+            # indentation-only change can alter control flow. A patch-id
+            # match alone must not carry forward a verdict: validate the
+            # tier-2 line-content signature (which preserves whitespace
+            # verbatim) when one was recorded. The tier-2 binary gate does
+            # NOT apply here — patch-id already proved binary content
+            # identity, and tier-2 is consulted only for its text-line view.
+            reviewed_changed_lines = decision.get("reviewed_changed_lines")
+            reviewed_changed_files = decision.get("reviewed_changed_files")
+            if reviewed_changed_lines is None or reviewed_changed_files is None:
+                # Decision predates tier-2 (no signature recorded) —
+                # patch-id is the only available signal; preserve #412's
+                # original carry-forward behavior for legacy decisions.
+                return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
+            files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
+            if lines_match and files_match:
+                return CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            # Patch-id matched but tier-2 signatures differ — a
+            # whitespace-only change that patch-id collapsed (issue #1187).
+            # Fail closed to stale rather than carrying forward an approved
+            # verdict across a semantically different, unreviewed head.
+            return CarryForwardCheck(None, live_patch_id, live_signature)
 
         reviewed_changed_lines = decision.get("reviewed_changed_lines")
         reviewed_changed_files = decision.get("reviewed_changed_files")
@@ -19803,6 +20069,7 @@ class OrchestratorApp:
             write_gate=self.write_gate,
             persist_inconclusive_probe_counter=False,
             now=now,
+            fleet_dir_override=self.fleet_dir_override,
         )
 
         # Flat-interval Haiku probe for early quota/rate-limit recovery (see
@@ -19852,6 +20119,7 @@ class OrchestratorApp:
             self.gh,
             write_gate=self.write_gate,
             review_callback=self.review,
+            fleet_dir_override=self.fleet_dir_override,
         )
 
         # Detect stalled sessions for notification (read-only, stateful via _build_attention_digest)
@@ -20477,6 +20745,10 @@ class OrchestratorApp:
             )
 
         sessions_dir = self._layout.sessions_dir
+        # Issue #1393: clean up stranded .json.tmp session sidecar files from
+        # interrupted atomic writes (e.g. a watchdog kill during a launch-
+        # refusal write) before this pass writes new ones.
+        cleanup_stale_session_tmp_files(sessions_dir)
         # Unconditional stall reaper call, matching dispatch()'s — previously this
         # only ran when max_concurrent_sessions > 0 via the governor. Skipped
         # only when the caller (loop()) already ran the sweep this pass and
@@ -20637,6 +20909,7 @@ class OrchestratorApp:
             dry_head_indeterminate: list[int] = []
             dry_no_op_rework_escalated: list[int] = []
             dry_worker_death_escalated: list[int] = []
+            dry_blocked_environment_escalated: list[int] = []
             dry_filtered_candidates: list[dict[str, Any]] = []
             for issue in dry_candidates:
                 issue_number = int(issue["number"])
@@ -20645,6 +20918,20 @@ class OrchestratorApp:
                 live_head_sha = pr_data.get("headRefOid")
                 pr_state = dry_head_check_state.get("prs", {}).get(str(pr_number), {})
                 reviewed_head_sha = pr_state.get("reviewed_head_sha")
+
+                # Issue #1393: mirror the live path's blocked-environment cap
+                # check (read-only here).
+                dry_issue_entry_pre = dry_head_check_state.get("issues", {}).get(
+                    str(issue_number), {}
+                )
+                if isinstance(dry_issue_entry_pre, dict):
+                    dry_prior_blocked = _windowed_blocked_environment_at(
+                        dry_issue_entry_pre,
+                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                    )
+                    if len(dry_prior_blocked) >= self.config.watchdog.max_auto_redispatch:
+                        dry_blocked_environment_escalated.append(issue_number)
+                        continue
 
                 if not reviewed_head_sha:
                     dry_filtered_candidates.append(issue)
@@ -20786,6 +21073,7 @@ class OrchestratorApp:
                 "operator_claimed_skipped": sorted(operator_claimed_skipped),
                 "no_op_rework_escalated": sorted(dry_no_op_rework_escalated),
                 "worker_death_escalated": sorted(dry_worker_death_escalated),
+                "blocked_environment_escalated": sorted(dry_blocked_environment_escalated),
                 "rescue_issue_numbers": sorted(dry_rescue_issue_numbers),
             }
             if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
@@ -20819,6 +21107,7 @@ class OrchestratorApp:
         # Issue #1239: issues salvaged out of the death-loop gate (stranded
         # commits pushed) and routed to review instead of escalated.
         salvaged_to_review: list[int] = []
+        blocked_environment_escalated: list[int] = []
         filtered_candidates = []
         for issue in candidates:
             issue_number = int(issue["number"])
@@ -20827,6 +21116,24 @@ class OrchestratorApp:
             live_head_sha = pr_data.get("headRefOid")
             pr_state = head_check_state.get("prs", {}).get(str(pr_number), {})
             reviewed_head_sha = pr_state.get("reviewed_head_sha")
+
+            # Issue #1393: if the previous dispatch was blocked by a
+            # pre-launch environment conflict (e.g. worktree_foreign_writer)
+            # and the cap is already exhausted, escalate here instead of
+            # attempting another launch that will fail identically.  This
+            # is a safety net for when the dispatch failure path's
+            # escalation didn't stick (race/crash between the escalation
+            # and the state write), parallel to the no_op/death checks
+            # below.
+            issue_entry_pre = head_check_state.get("issues", {}).get(str(issue_number), {})
+            if isinstance(issue_entry_pre, dict):
+                prior_blocked = _windowed_blocked_environment_at(
+                    issue_entry_pre,
+                    window_minutes=self.config.watchdog.redispatch_window_minutes,
+                )
+                if len(prior_blocked) >= self.config.watchdog.max_auto_redispatch:
+                    blocked_environment_escalated.append(issue_number)
+                    continue
 
             if not reviewed_head_sha:
                 # No recorded request_changes head to compare against —
@@ -21118,6 +21425,55 @@ class OrchestratorApp:
                     _escalation_edge("redispatch_escalated", "mechanical"),
                 )
 
+        # Issue #1393: escalate issues whose pre-launch environment has
+        # blocked every dispatch attempt (e.g. a stale foreign worktree).
+        # The operator triage for ``dispatch_blocked_environment`` is
+        # "remove the stale checkout at <path>," not "worker quality cap
+        # exceeded."  Parallel to the no_op/death escalation blocks above.
+        if blocked_environment_escalated:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for issue_number in blocked_environment_escalated:
+                    entry = state.get("issues", {}).get(str(issue_number), {})
+                    if not isinstance(entry, dict):
+                        entry = {}
+                    current_status = entry.get("status")
+                    if current_status == "escalated":
+                        continue
+                    prior_blocked = _windowed_blocked_environment_at(
+                        entry,
+                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                    )
+                    state = _escalate_issue(
+                        state,
+                        issue_number,
+                        reason="dispatch_blocked_environment",
+                        reason_class="mechanical",
+                        issue_extra={
+                            "blocked_environment_at": prior_blocked,
+                            "dispatched_at": None,
+                        },
+                    )
+                    state = append_event(
+                        state,
+                        "session_failed_escalated",
+                        {
+                            "issue_number": issue_number,
+                            "previous_status": "rework_requested",
+                            "reason": "dispatch_blocked_environment",
+                            "blocked_environment_count": len(prior_blocked),
+                        },
+                        state_path=self.paths.state_file,
+                    )
+                save_state(self.paths.state_file, state)
+            for issue_number in blocked_environment_escalated:
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    _escalation_edge("redispatch_escalated", "mechanical"),
+                )
+
         # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
         # deferred_by_concurrency uniformly across both the only_issues and
         # automatic branches -- the automatic branch used to unconditionally
@@ -21148,6 +21504,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
                 "salvaged_to_review": sorted(salvaged_to_review),
+                "blocked_environment_escalated": sorted(blocked_environment_escalated),
             }
             if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
@@ -21214,6 +21571,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
                 "salvaged_to_review": sorted(salvaged_to_review),
+                "blocked_environment_escalated": sorted(blocked_environment_escalated),
             }
             if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
@@ -21472,6 +21830,7 @@ class OrchestratorApp:
                 "no_op_rework_escalated": sorted(no_op_rework_escalated),
                 "worker_death_escalated": sorted(worker_death_escalated),
                 "salvaged_to_review": sorted(salvaged_to_review),
+                "blocked_environment_escalated": sorted(blocked_environment_escalated),
             }
             if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
                 data.update(gov.report_fields())
@@ -21692,6 +22051,92 @@ class OrchestratorApp:
                     )
                     failure_kind = failed_result.failure_kind if failed_result else None
                     now = datetime.now(UTC)
+                    # Issue #1393: a pre-launch environment block (e.g.
+                    # worktree_foreign_writer) never started a worker session,
+                    # so it must NOT count against the redispatch cap (which
+                    # measures worker output, not environment hygiene).  Use a
+                    # separate blocked_environment_at counter and escalate with
+                    # the correct reason + blocking path after the same cap.
+                    blocked_environment = (
+                        failure_kind in PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS
+                    )
+                    if blocked_environment:
+                        blocked_environment_at = _windowed_blocked_environment_at(
+                            entry,
+                            window_minutes=self.config.watchdog.redispatch_window_minutes,
+                        ) + [now.isoformat().replace("+00:00", "Z")]
+                        blocking_error = failed_result.error if failed_result else None
+                        if len(blocked_environment_at) > self.config.watchdog.max_auto_redispatch:
+                            # Escalate with the environment reason and the
+                            # blocking path so the operator sees "remove
+                            # C:\...\wt", not "worker quality cap exceeded."
+                            state = _escalate_issue(
+                                state,
+                                request.issue_number,
+                                reason="dispatch_blocked_environment",
+                                reason_class="mechanical",
+                                issue_extra={
+                                    "blocked_environment_at": blocked_environment_at,
+                                    "dispatched_at": None,
+                                },
+                            )
+                            entry = state["issues"][str(request.issue_number)]
+                            state = append_event(
+                                state,
+                                "session_failed_escalated",
+                                {
+                                    "issue_number": request.issue_number,
+                                    "previous_status": "rework_requested",
+                                    "reason": "dispatch_blocked_environment",
+                                    "failure_kind": failure_kind,
+                                    "blocking_error": blocking_error,
+                                    "blocked_environment_count": len(blocked_environment_at),
+                                },
+                                state_path=self.paths.state_file,
+                            )
+                            save_state(self.paths.state_file, state)
+                            edge = _escalation_edge("redispatch_escalated", "mechanical")
+                            result = transition(
+                                self.gh,
+                                self.config.labels,
+                                request.issue_number,
+                                edge,
+                            )
+                            if result.outcome != TransitionOutcome.APPLIED:
+                                label_error = {
+                                    "edge": edge,
+                                    "outcome": result.outcome.value,
+                                    "add_failures": result.add_failures,
+                                    "remove_failures": result.remove_failures,
+                                }
+                                entry["label_error"] = label_error
+                                label_errors.append(request.issue_number)
+                                label_error_failures[request.issue_number] = _label_error_reason(
+                                    label_error
+                                )
+                                save_state(self.paths.state_file, state)
+                            continue
+                        # Cap not exceeded: restore to rework_requested without
+                        # incrementing redispatch_at, and emit a distinct event
+                        # so the operator can see the environment conflict
+                        # before it escalates.
+                        entry["status"] = "rework_requested"
+                        entry["dispatched_at"] = None
+                        entry["blocked_environment_at"] = blocked_environment_at
+                        state["issues"][str(request.issue_number)] = entry
+                        state = append_event(  # event-consumer: audit-only -- records a pre-launch environment block (issue #1393) already enforced by the blocked_environment_at counter and the dispatch_blocked_environment escalation; consumed by tests/test_charlie_work.py regression tests.
+                            state,
+                            "rework_dispatch_blocked_environment",
+                            {
+                                "issue_number": request.issue_number,
+                                "failure_kind": failure_kind,
+                                "blocking_error": blocking_error,
+                                "blocked_environment_count": len(blocked_environment_at),
+                            },
+                            state_path=self.paths.state_file,
+                        )
+                        save_state(self.paths.state_file, state)
+                        continue
                     redispatch_at = _windowed_redispatch_at(
                         entry, window_minutes=self.config.watchdog.redispatch_window_minutes
                     ) + [now.isoformat().replace("+00:00", "Z")]
@@ -21806,6 +22251,7 @@ class OrchestratorApp:
             "operator_claimed_skipped": sorted(operator_claimed_skipped),
             "no_op_rework_escalated": sorted(no_op_rework_escalated),
             "salvaged_to_review": sorted(salvaged_to_review),
+            "blocked_environment_escalated": sorted(blocked_environment_escalated),
         }
         if gov.enabled or gov.fleet_enabled or gov.open_pr_enabled:
             data.update(gov.report_fields())

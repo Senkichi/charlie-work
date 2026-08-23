@@ -2954,6 +2954,16 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
     In a criss-cross graph, the two best common ancestors are both minimal.
     A correct BFS distance and a deterministic tie-break must produce the same
     merge base regardless of hash randomization.
+
+    Issue #1292: the harness was previously flaky because (a) it imported
+    ``FakeGitHub`` via ``test_charlie_work`` -- dragging the entire 50k-line
+    test module (pytest, yaml, every helper fixture) into a subprocess whose
+    import can fail transiently under full-suite parallel-run contention --
+    and (b) it collected results into a ``set``, discarding the seed-to-result
+    mapping so a failure was unactionable. The harness now imports
+    ``FakeGitHub`` directly from ``_fakes_github`` (the lightweight module that
+    defines it) and records the seed that produced each result so any future
+    non-determinism is immediately attributable.
     """
     tests_dir = Path(__file__).parent
     repo_root = tests_dir.parent
@@ -2961,7 +2971,7 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
         [
             "import os, sys",
             "sys.path.insert(0, sys.argv[1])",
-            "from test_charlie_work import FakeGitHub",
+            "from _fakes_github import FakeGitHub",
             "gh = FakeGitHub()",
             "gh.commits = {",
             '    "R": {"parents": []},',
@@ -2974,7 +2984,8 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
             'print(gh._merge_base("A2", "B2"))',
         ]
     )
-    results: set[str] = set()
+    # Record the seed that produced each result so a failure is actionable.
+    results: dict[str, str] = {}
     for seed in range(5):
         env = os.environ.copy()
         env["PYTHONHASHSEED"] = str(seed)
@@ -2984,10 +2995,15 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
             cwd=str(repo_root),
             capture_output=True,
             text=True,
-            check=True,
         )
-        results.add(proc.stdout.strip())
-    assert len(results) == 1, f"merge_base varied across hash seeds: {results}"
+        if proc.returncode != 0:
+            raise AssertionError(
+                f"subprocess for PYTHONHASHSEED={seed} exited {proc.returncode}.\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+        results[str(seed)] = proc.stdout.strip()
+    distinct = set(results.values())
+    assert len(distinct) == 1, f"merge_base varied across hash seeds (seed -> result): {results}"
 
 
 def test_base_fake_github_merged_prs_for_issue_returns_typed_result() -> None:
@@ -7014,19 +7030,21 @@ def test_review_queue_stays_stale_with_empty_patch_id_from_rename(
 def test_check_carry_forward_tier1_whitespace_collision_bypasses_tier2(
     tmp_path: Path,
 ) -> None:
-    """Issue #634 audit rework: ``git patch-id --stable`` strips leading
-    whitespace from ``+``/``-`` content lines, so two diffs that differ ONLY
-    in indentation depth produce the identical patch-id.  The tier-1 fast
-    path in ``_check_carry_forward`` (workflow.py:17333-17334) matches on
-    that hash and returns ``"patch-id"`` immediately — it never falls through
-    to the tier-2 line-content signature, which DOES preserve whitespace and
-    WOULD distinguish the two diffs.
+    """Issue #1187 (audit #634 rework): ``git patch-id --stable`` strips
+    leading whitespace from ``+``/``-`` content lines, so two diffs that
+    differ ONLY in indentation depth produce the identical patch-id.  The
+    tier-1 fast path in ``_check_carry_forward`` previously matched on that
+    hash and returned ``"patch-id"`` immediately — it never consulted the
+    tier-2 line-content signature, which DOES preserve whitespace and WOULD
+    distinguish the two diffs.
 
     In Python, an indentation-only change can alter control flow (e.g. moving
     a ``return`` into or out of an ``if`` block).  Carrying forward an
     approved verdict across such a change without review is a review-gate
-    bypass.  This test documents the vulnerability; the fix is tracked as a
-    follow-up (see audit doc and PR body).
+    bypass.  After the fix, the tier-1 patch-id match is no longer
+    sufficient: the tier-2 line-content signature is also validated, and
+    when it differs (a whitespace-only change that patch-id collapsed) the
+    carry-forward is REFUSED — the verdict is reported stale.
     """
     from charlie_work.janitor import _calculate_patch_id, _diff_content_signature
 
@@ -7114,22 +7132,23 @@ def test_check_carry_forward_tier1_whitespace_collision_bypasses_tier2(
     result = app.review_queue()
 
     assert result.ok is True
-    assert result.data["queue"] == [], (
-        "the verdict was carried forward (not reported stale) — this is "
-        "the vulnerability: tier-1 patch-id match short-circuits before "
-        "tier-2 can reject the whitespace-only change"
+    assert result.data["queue"] != [], (
+        "the verdict must NOT be carried forward across an "
+        "indentation-only change — tier-2 signature differs, so the "
+        "verdict is reported stale for re-review"
     )
 
     decision = json.loads(
         (app.paths.prs / f"pr-{pr_number}" / "review-decision.json").read_text(encoding="utf-8")
     )
-    assert decision["reviewed_head_sha"] == new_head, (
-        "the approved verdict was carried forward to the reindented head "
-        "without review — the review-gate bypass"
+    assert decision["reviewed_head_sha"] == old_head, (
+        "the approved verdict must NOT be carried forward to the "
+        "reindented head — the review-gate bypass is closed"
     )
-    assert decision["carry_forward_tier"] == "patch-id", (
-        "carry-forward was via tier-1 (patch-id), NOT tier-2 (line-content) "
-        "— tier-2 was never consulted because tier-1 short-circuited"
+    assert decision.get("carry_forward_tier") != "patch-id", (
+        "carry-forward must not be via tier-1 (patch-id) when the tier-2 "
+        "line-content signature differs — the whitespace collision is "
+        "detected and the verdict is refused"
     )
 
 
@@ -51445,3 +51464,331 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
         )
 
     assert salvage_calls == []
+
+
+def test_dispatch_rework_worktree_foreign_writer_does_not_increment_redispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1393: a rework dispatch that fails at launch with
+    worktree_foreign_writer must NOT increment the redispatch counter.
+
+    A pre-launch environment block (the worktree is a foreign checkout the
+    orchestrator did not create) never started a worker session, so it is
+    not a "worker produced nothing" signal.  Counting it against the
+    redispatch cap converts an operator hygiene problem into a fake
+    "worker quality" escalation (redispatch_cap_exceeded).  Instead, the
+    failure is recorded in a separate blocked_environment_at list and a
+    distinct rework_dispatch_blocked_environment event is emitted.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    blocking_error = (
+        "worktree C:\\repos\\jc-wt-886 is a foreign checkout the "
+        "orchestrator did not create; refusing to adopt it"
+    )
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error=blocking_error,
+                failure_kind="worktree_foreign_writer",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    # First blocked launch: blocked_environment_at grows, redispatch_at stays empty.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["issues"]["123"].get("redispatch_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 1
+
+    # Second blocked launch: still under the cap, still rework_requested.
+    result = app.dispatch_rework()
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert state["issues"]["123"].get("redispatch_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 2
+
+    # Third pass: the candidate-filtering safety net sees
+    # blocked_environment_at == 2 >= max_auto_redispatch (2) and escalates
+    # with dispatch_blocked_environment BEFORE attempting another launch.
+    # This is the correct behavior: the environment conflict is
+    # deterministic, so there is no point dispatching again.
+    result = app.dispatch_rework()
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_blocked_environment"
+    assert state["issues"]["123"].get("redispatch_at") is None
+    assert len(state["issues"]["123"]["blocked_environment_at"]) == 2
+    # Mechanical -> operator-queue, not human-needed.
+    assert (123, config.labels.operator_queue) in fake_gh.labels_added
+
+
+def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1393: after blocked-environment failures are resolved, a
+    subsequent genuine redispatch failure still counts against the
+    redispatch cap correctly — the blocked_environment_at list did not
+    silently inflate it.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class ReworkGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues[0]["labels"] = [{"name": config.labels.needs_rework}]
+
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"]["123"] = {
+            "number": 123,
+            "title": "Fix search",
+            "url": "https://example.test/issues/123",
+            "status": "rework_requested",
+        }
+        save_state(paths.state_file, state)
+
+    fake_gh = ReworkGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    pr_dir.mkdir(parents=True)
+    rework_prompt = pr_dir / "rework-prompt.md"
+    rework_prompt.write_text("Fix the issues", encoding="utf-8")
+
+    # First: one blocked-environment failure (does NOT touch redispatch_at).
+    def fake_blocked(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="foreign checkout",
+                failure_kind="worktree_foreign_writer",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_blocked)
+    app.dispatch_rework()
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"].get("redispatch_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 1
+
+    # Now: a generic (non-blocked) failure.  redispatch_at should start
+    # from 0 (the blocked failure did not inflate it), so the cap is
+    # NOT exceeded on the first generic failure.
+    def fake_generic(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="git worktree add failed",
+                failure_kind=None,
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_generic)
+    result = app.dispatch_rework()
+    assert result.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "rework_requested"
+    assert len(state["issues"]["123"]["redispatch_at"]) == 1
+
+
+def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1393: a fresh dispatch that fails at launch with
+    worktree_foreign_writer must NOT increment the dispatch_failed counter.
+    Instead it uses blocked_environment_at and escalates with
+    dispatch_blocked_environment after the cap.
+    """
+    from charlie_work.adapters import SessionDispatchResult
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(
+            adapter="command",
+            dispatch_command=(sys.executable, "-c", "import sys; sys.exit(1)"),
+        ),
+        watchdog=WatchdogConfig(max_auto_redispatch=2, redispatch_window_minutes=240),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    # Avoid the open-PR exclusion by closing the default fixture PR.
+    fake_gh.prs[0]["state"] = "CLOSED"
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=False,
+                error="worktree C:\\wt is a foreign checkout",
+                failure_kind="worktree_foreign_writer",
+            )
+            for request in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+
+    # First blocked launch: blocked_environment_at grows, dispatch_failed_at stays empty.
+    result1 = app.dispatch(limit=1)
+    assert result1.ok is False
+    assert result1.data["failed_count"] == 1
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "dispatch_failed"
+    assert state["issues"]["123"].get("dispatch_failed_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 1
+
+    # Second blocked launch: still under the cap.
+    result2 = app.dispatch(limit=1)
+    assert result2.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"].get("dispatch_failed_at") is None
+    assert len(state["issues"]["123"].get("blocked_environment_at", [])) == 2
+
+    # Third blocked launch: exceeds the cap (max_auto_redispatch=2).
+    result3 = app.dispatch(limit=1)
+    assert result3.ok is False
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["issues"]["123"]["escalation_reason"] == "dispatch_blocked_environment"
+    assert state["issues"]["123"].get("dispatch_failed_at") is None
+
+
+def test_cleanup_stale_session_tmp_files_removes_stranded_tmp(
+    tmp_path: Path,
+) -> None:
+    """Issue #1393: cleanup_stale_session_tmp_files removes stranded .json.tmp
+    files from the sessions directory (left behind by an interrupted atomic
+    write) without touching the valid .json sidecar.
+
+    The tmp files are aged past the ``min_age_seconds`` threshold so the sweep
+    treats them as genuinely stranded rather than in-flight.
+    """
+    import os
+
+    from charlie_work.adapters import cleanup_stale_session_tmp_files
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    # A valid sidecar.
+    (sessions_dir / "issue-100.json").write_text('{"ok": true}', encoding="utf-8")
+    # A stranded tmp from an interrupted write.
+    (sessions_dir / "issue-100.json.tmp").write_text('{"ok": ', encoding="utf-8")
+    # Another stranded tmp for a different issue.
+    (sessions_dir / "issue-200.json.tmp").write_text('{"partial": ', encoding="utf-8")
+
+    # Age both tmp files beyond the default 60s threshold so the sweep
+    # treats them as stranded, not in-flight.
+    stale_mtime = time.time() - 120
+    os.utime(sessions_dir / "issue-100.json.tmp", (stale_mtime, stale_mtime))
+    os.utime(sessions_dir / "issue-200.json.tmp", (stale_mtime, stale_mtime))
+
+    removed = cleanup_stale_session_tmp_files(sessions_dir)
+
+    assert removed == 2
+    assert (sessions_dir / "issue-100.json").exists()
+    assert not (sessions_dir / "issue-100.json.tmp").exists()
+    assert not (sessions_dir / "issue-200.json.tmp").exists()
+
+
+def test_cleanup_stale_session_tmp_files_skips_fresh_tmp(tmp_path: Path) -> None:
+    """Issue #1393 regression: a freshly-created (not-yet-replaced) .json.tmp
+    file must survive cleanup_stale_session_tmp_files so the sweep cannot race
+    a legitimate in-flight atomic write between its close() and replace()
+    calls — unlinking the tmp there crashes the writer with FileNotFoundError.
+    """
+    from charlie_work.adapters import cleanup_stale_session_tmp_files
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    # A tmp file a legitimate writer just created and closed but has not yet
+    # replaced — its mtime is "now", well within the 60s grace window.
+    fresh = sessions_dir / "issue-300.json.tmp"
+    fresh.write_text('{"in-flight": ', encoding="utf-8")
+
+    removed = cleanup_stale_session_tmp_files(sessions_dir)
+
+    assert removed == 0
+    assert fresh.exists()
+    assert fresh.read_text(encoding="utf-8") == '{"in-flight": '
+
+
+def test_cleanup_stale_session_tmp_files_missing_dir(tmp_path: Path) -> None:
+    """cleanup_stale_session_tmp_files is a no-op when the sessions dir
+    does not exist (e.g. first-ever dispatch pass)."""
+    from charlie_work.adapters import cleanup_stale_session_tmp_files
+
+    removed = cleanup_stale_session_tmp_files(tmp_path / "nonexistent")
+    assert removed == 0

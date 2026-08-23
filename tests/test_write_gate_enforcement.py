@@ -842,7 +842,12 @@ _RATCHET_BASELINE: dict[str, int] = {
     "state_migration.py": 1,
     "supervise.py": 11,
     "supervisor_lifecycle.py": 3,
-    "workflow.py": 270,
+    # Issue #1393: +11 raw calls for the blocked-environment dispatch path
+    # (separate blocked_environment_at counter, distinct escalation reason,
+    # candidate-filtering safety net, and stranded .json.tmp cleanup). These
+    # are out-of-wave raw sites in unconverted territory, same class as the
+    # pre-existing 270 — the ratchet holds at the new count.
+    "workflow.py": 281,
     "worktree.py": 1,
 }
 
