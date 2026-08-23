@@ -48374,6 +48374,115 @@ def test_render_required_changes_section_vacuous_guard_does_not_drop_populated_e
     )
 
 
+# --------------------------------------------------------------------------
+# Issue #1310: the tier-2 (summary-verbatim) render path -- both the
+# marker-less `summary_text` fallback and the `"derived"` marker branch --
+# must crash-filter `summary` exactly as W12 (#1269) filtered
+# `external_findings`/`required_changes`. A crash-signature body or the
+# LEGACY_VACUOUS_SUMMARY placeholder arriving as a verdict `summary` with
+# an empty findings list must degrade to tier 3, not render verbatim.
+# Production-unreachable today (crash bodies are posted as PR comments,
+# never written into a verdict `summary`), but the suppression contract is
+# "crash noise cannot reach prompt content through any render path."
+# --------------------------------------------------------------------------
+
+
+def test_render_required_changes_section_tier2_crash_summary_degrades_to_tier3() -> None:
+    """Marker-less tier-2 path: a request_changes round whose `summary` is a
+    crash body and whose findings list is empty must NOT render the crash
+    text verbatim -- it degrades to tier 3 (the "findings unavailable"
+    escape hatch), exactly as the other tiers do."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": crash_body,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert crash_body not in section, (
+        "tier-2 verbatim emit must not render a crash-signature summary"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the summary is a crash body"
+    )
+    assert "did not record a structured findings list" not in section, (
+        "must not fall through to the tier-2 verbatim-summary rendering"
+    )
+
+
+def test_render_required_changes_section_tier2_vacuous_summary_degrades_to_tier3() -> None:
+    """Marker-less tier-2 path: a request_changes round whose `summary` is
+    the LEGACY_VACUOUS_SUMMARY placeholder and whose findings list is empty
+    must degrade to tier 3, not present the content-free placeholder as if
+    it were real findings."""
+    decision = {
+        "decision": "request_changes",
+        "summary": LEGACY_VACUOUS_SUMMARY,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert LEGACY_VACUOUS_SUMMARY not in section, (
+        "tier-2 verbatim emit must not render the vacuous placeholder"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the summary is the vacuous placeholder"
+    )
+    assert "did not record a structured findings list" not in section
+
+
+def test_render_required_changes_section_tier2_derived_crash_summary_degrades() -> None:
+    """`"derived"` marker branch: a request_changes round stamped
+    `findings_channel == "derived"` whose `summary` is a crash body and
+    whose findings list is empty must degrade to tier 3, not render the
+    crash text verbatim. Without the `and summary_text` guard on the
+    derived branch, the crash guard would neutralize `summary_text` to ""
+    but the branch would still fire and render an empty verbatim summary."""
+    crash_body = f"{REVIEW_SESSION_SUMMARY_HEADING}\n\nNo verdict was produced."
+    decision = {
+        "decision": "request_changes",
+        "summary": crash_body,
+        "required_changes": [],
+        "findings_channel": "derived",
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert crash_body not in section, (
+        "derived tier-2 verbatim emit must not render a crash-signature summary"
+    )
+    assert "REVIEWER FINDINGS UNAVAILABLE" in section, (
+        "must degrade to tier 3 when the derived summary is a crash body"
+    )
+    assert "did not record a structured findings list" not in section
+
+
+def test_render_required_changes_section_tier2_genuine_summary_still_renders() -> None:
+    """Guard against over-aggression: a genuine, non-crash, non-vacuous
+    summary with an empty findings list must still render verbatim at
+    tier 2. The crash/vacuous guard must only fire on crash-signature
+    bodies or the LEGACY_VACUOUS_SUMMARY placeholder, never on real
+    reviewer prose."""
+    genuine_summary = (
+        "The retry wrapper swallows the exception type; callers cannot distinguish causes."
+    )
+    decision = {
+        "decision": "request_changes",
+        "summary": genuine_summary,
+        "required_changes": [],
+    }
+
+    section = _render_required_changes_section(decision)
+
+    assert genuine_summary in section, "a genuine summary must still render verbatim at tier 2"
+    assert "REVIEWER FINDINGS UNAVAILABLE" not in section, (
+        "a genuine summary must not be discarded down to tier 3"
+    )
+
+
 def test_no_op_rework_repair_brief_preserves_reviewer_summary(tmp_path: Path) -> None:
     """F3: _request_no_op_rework_repair's hardcoded no-op note must not
     displace the reviewer's findings. It routes through _route_to_rework,
