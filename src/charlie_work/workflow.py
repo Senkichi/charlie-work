@@ -11819,6 +11819,19 @@ class OrchestratorApp:
                     dry_skipped_empty_diff.append(c["pr"])
                 else:
                     dry_selected.append(c)
+            # Issue #1131: mirror the real path's already-approved pre-claim
+            # gate in the dry-run preview so the two cannot diverge. Read-only:
+            # no events emitted, no state mutation.
+            dry_skipped_already_approved: list[int] = []
+            dry_selected_after_approval: list[dict[str, Any]] = []
+            for c in dry_selected:
+                pr_dir = self.paths.prs / f"pr-{c['pr']}"
+                resolved = review_decision(pr_dir, None, c.get("packet_head_sha"))
+                if resolved.decision == "approved" and not resolved.stale and not resolved.missing:
+                    dry_skipped_already_approved.append(c["pr"])
+                else:
+                    dry_selected_after_approval.append(c)
+            dry_selected = dry_selected_after_approval
             return CommandResult(
                 True,
                 f"dry-run: would dispatch {len(dry_selected)} reviewer(s)",
@@ -11830,6 +11843,7 @@ class OrchestratorApp:
                     "deferred_count": len(all_candidates) - len(dry_selected),
                     "escalated_skipped": selection.escalated_skipped,
                     "skipped_empty_diff": dry_skipped_empty_diff,
+                    "skipped_already_approved": dry_skipped_already_approved,
                     "merge_conflict_routed": [c["pr"] for c in selection.merge_conflict_routed],
                     "rescue_marked_excluded": [c["pr"] for c in rescue_marked_dry],
                     "recorded_verdicts": recorded_verdicts,
@@ -12074,6 +12088,55 @@ class OrchestratorApp:
                         {
                             "pr_number": pr_number,
                             "issue_number": skipped_empty_diff_issues.get(pr_number),
+                        },
+                        level="warning",
+                    )
+                self.write_gate.save_state(state)
+
+        # Issue #1131: re-check the decision file at claim time. review_queue's
+        # snapshot can be stale when a dispatch pass interleaves with an
+        # operator unescalate->approve->merge: the queue was built before the
+        # approved verdict was recorded, so an already-approved PR reaches
+        # claim time looking reviewable (unescalation cleared
+        # ``review_dispatch_status`` and removed ``agent:human-needed``, and
+        # ``_is_review_dispatchable`` keys off those, not the decision file).
+        # Skip any PR whose decision file now records an approval for the head
+        # this pass would review -- launching a fresh paid reviewer is
+        # redundant, and a late request_changes from that reviewer clobbers
+        # the merge-authorizing decision file (issue #1131). Mirrors the
+        # empty-diff gate above: a read-only pre-claim filter that emits an
+        # event and never increments ``review_dispatch_attempt_count`` (an
+        # already-approved PR is not a review attempt). ``packet_head_sha`` is
+        # the head the reviewer would read; for every queued candidate
+        # review_queue already verified it equals the live head, so an
+        # approval pinned to it is an approval for the live head.
+        skipped_already_approved: list[int] = []
+        skipped_already_approved_issues: dict[int, int | None] = {}
+        skipped_already_approved_heads: dict[int, str | None] = {}
+        selected_not_approved: list[dict[str, Any]] = []
+        for c in selected:
+            pr_number = c["pr"]
+            packet_head = c.get("packet_head_sha")
+            pr_dir = self.paths.prs / f"pr-{pr_number}"
+            resolved = review_decision(pr_dir, None, packet_head)
+            if resolved.decision == "approved" and not resolved.stale and not resolved.missing:
+                skipped_already_approved.append(pr_number)
+                skipped_already_approved_issues[pr_number] = c.get("issue")
+                skipped_already_approved_heads[pr_number] = packet_head
+            else:
+                selected_not_approved.append(c)
+        selected = selected_not_approved
+        if skipped_already_approved:
+            with state_lock(self.paths.state_file):
+                state = load_state(self.paths.state_file)
+                for pr_number in skipped_already_approved:
+                    state = self.write_gate.record_event(
+                        state,
+                        "review_dispatch_skipped_already_approved",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": skipped_already_approved_issues.get(pr_number),
+                            "reviewed_head_sha": skipped_already_approved_heads.get(pr_number),
                         },
                         level="warning",
                     )
@@ -12571,6 +12634,7 @@ class OrchestratorApp:
             "deferred_count": len(candidates) - len(dispatchable),
             "escalated_skipped": escalated_skipped,
             "skipped_empty_diff": skipped_empty_diff,
+            "skipped_already_approved": skipped_already_approved,
             "merge_conflict_results": merge_conflict_results,
             "recorded_verdicts": recorded_verdicts,
             "missed_verdicts": missed_verdicts,
@@ -12891,6 +12955,36 @@ class OrchestratorApp:
             if pr
             else None
         )
+
+        # Issue #1131: a terminal-state PR (MERGED or CLOSED) must never have
+        # its decision file overwritten or rework routed. The observed race:
+        # an operator unescalate->approve->merge interleaved with a dispatch
+        # pass, so a reviewer's request_changes landed ~8 minutes after the
+        # merge and clobbered ``review-decision.json`` (approved ->
+        # request_changes), destroying the audit record that authorized the
+        # merge, firing a false unauthorized-merge tripwire, and applying
+        # ``agent:needs-rework`` to an already-CLOSED issue. Refuse here --
+        # the durable verdict that authorized the merge is preserved, and the
+        # late verdict is dropped (the caller logs ``review_verdict_missed``,
+        # same as any refused verdict). This is unconditional (not gated on
+        # ``allow_stale_head``): even the operator CLI must not overwrite a
+        # merge-authorizing decision file. GitHub's PR ``state`` is the
+        # authoritative terminal-state signal; ``pr`` is falsy only when
+        # ``pr_view`` itself failed, in which case the existing head-resolution
+        # logic below fails safe on its own and this guard correctly does not
+        # fire on missing data.
+        pr_github_state = str(pr.get("state") or "").upper() if pr else ""
+        if pr and pr_github_state in ("MERGED", "CLOSED"):
+            return CommandResult(
+                False,
+                f"PR #{pr_number} is {pr_github_state}; verdict not recorded "
+                f"(terminal-state PR decision file is preserved)",
+                {
+                    "pr": pr_number,
+                    "issue": issue_number,
+                    "terminal_state": pr_github_state,
+                },
+            )
 
         # Escalation is terminal for verdict recording too, mirroring review()'s
         # guard: without this, a late-arriving verdict (a reviewer that finished
@@ -13495,26 +13589,62 @@ class OrchestratorApp:
         label_error: dict[str, Any] | None = None
         if issue_number is not None:
             if decision == "request_changes":
-                # Issue #1266: escalated here is always max_rework_cycles_
-                # exceeded (mechanical) -- see the _escalate_issue call above.
-                target = (
-                    _escalation_edge("escalated", "mechanical")
-                    if escalated
-                    else "rework_requested"
-                )
-                result = transition(
-                    self.gh,
-                    self.config.labels,
-                    issue_number,
-                    target,
-                )
-                if result.outcome != TransitionOutcome.APPLIED:
-                    label_error = {
-                        "edge": target,
-                        "outcome": result.outcome.value,
-                        "add_failures": result.add_failures,
-                        "remove_failures": result.remove_failures,
-                    }
+                # Issue #1131: never route rework onto a CLOSED issue. The
+                # observed race applied ``agent:needs-rework`` to an issue
+                # that was already closed by the merge this verdict chased,
+                # polluting roll-call/metrics and requiring a manual label
+                # strip. GitHub's issue ``state`` is the authoritative
+                # closed signal (state.json's workflow ``status`` can lag or
+                # be clobbered). Fetch is best-effort: on lookup failure,
+                # proceed with the transition (label application is already
+                # best-effort and reported, not fatal) -- the same fail-open
+                # posture as the stranded-request_changes restorer's
+                # issue_view call. ``terminal_state`` on the PR (fix #1131
+                # above) already refuses the whole call for a merged/closed
+                # PR; this guard covers the residual case where the PR is
+                # still OPEN but its linked issue is independently CLOSED.
+                issue_is_closed = False
+                try:
+                    linked_issue = self.gh.issue_view(issue_number)
+                    issue_is_closed = str(linked_issue.get("state") or "OPEN").upper() == "CLOSED"
+                except Exception:
+                    pass
+                if issue_is_closed:
+                    with state_lock(self.paths.state_file):
+                        state = load_state(self.paths.state_file)
+                        state = self._record_event(
+                            state,
+                            "rework_label_skipped_issue_closed",
+                            {
+                                "pr_number": pr_number,
+                                "issue_number": issue_number,
+                                "decision": decision,
+                                "escalated": escalated,
+                            },
+                            level="warning",
+                        )
+                        save_state(self.paths.state_file, state)
+                else:
+                    # Issue #1266: escalated here is always max_rework_cycles_
+                    # exceeded (mechanical) -- see the _escalate_issue call above.
+                    target = (
+                        _escalation_edge("escalated", "mechanical")
+                        if escalated
+                        else "rework_requested"
+                    )
+                    result = transition(
+                        self.gh,
+                        self.config.labels,
+                        issue_number,
+                        target,
+                    )
+                    if result.outcome != TransitionOutcome.APPLIED:
+                        label_error = {
+                            "edge": target,
+                            "outcome": result.outcome.value,
+                            "add_failures": result.add_failures,
+                            "remove_failures": result.remove_failures,
+                        }
             elif decision == "blocked":
                 # Issue #1266: "blocked" has no operator-queue counterpart --
                 # a reviewer-blocked verdict is judgment-only by
