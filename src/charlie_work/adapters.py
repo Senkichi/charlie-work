@@ -565,7 +565,7 @@ def _write_json(path: Path, value: Any) -> None:
     tmp_path.replace(path)
 
 
-def cleanup_stale_session_tmp_files(sessions_dir: Path) -> int:
+def cleanup_stale_session_tmp_files(sessions_dir: Path, min_age_seconds: float = 60.0) -> int:
     """Remove stranded ``.json.tmp`` files from the sessions directory.
 
     Issue #1393: the atomic session-record write (``_write_json`` /
@@ -576,12 +576,30 @@ def cleanup_stale_session_tmp_files(sessions_dir: Path) -> int:
     convention.  This sweep removes those stale tmp files at the start of
     each dispatch pass so they don't accumulate.
 
+    Files younger than ``min_age_seconds`` (default 60s) are skipped so the
+    sweep cannot race a legitimate in-flight atomic write — a writer that has
+    closed its tmp file but not yet called ``tmp_path.replace()``.  The
+    close→replace window is sub-second in practice; 60s is a generous margin
+    that still reaps anything genuinely stranded from a prior pass.
+
     Returns the number of files removed.
     """
     if not sessions_dir.is_dir():
         return 0
+    now = time.time()
     removed = 0
     for tmp_path in sessions_dir.glob("*.json.tmp"):
+        try:
+            stat = tmp_path.stat()
+        except OSError:
+            # File vanished between glob and stat — a concurrent writer
+            # completed its replace(), or another sweeper removed it.
+            continue
+        age = now - stat.st_mtime
+        if age < min_age_seconds:
+            # Too young to safely call stranded — a legitimate writer may
+            # be between close() and replace().  Leave it for a later pass.
+            continue
         try:
             tmp_path.unlink()
             removed += 1

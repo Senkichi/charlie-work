@@ -51107,7 +51107,12 @@ def test_cleanup_stale_session_tmp_files_removes_stranded_tmp(
     """Issue #1393: cleanup_stale_session_tmp_files removes stranded .json.tmp
     files from the sessions directory (left behind by an interrupted atomic
     write) without touching the valid .json sidecar.
+
+    The tmp files are aged past the ``min_age_seconds`` threshold so the sweep
+    treats them as genuinely stranded rather than in-flight.
     """
+    import os
+
     from charlie_work.adapters import cleanup_stale_session_tmp_files
 
     sessions_dir = tmp_path / "sessions"
@@ -51120,12 +51125,41 @@ def test_cleanup_stale_session_tmp_files_removes_stranded_tmp(
     # Another stranded tmp for a different issue.
     (sessions_dir / "issue-200.json.tmp").write_text('{"partial": ', encoding="utf-8")
 
+    # Age both tmp files beyond the default 60s threshold so the sweep
+    # treats them as stranded, not in-flight.
+    stale_mtime = time.time() - 120
+    os.utime(sessions_dir / "issue-100.json.tmp", (stale_mtime, stale_mtime))
+    os.utime(sessions_dir / "issue-200.json.tmp", (stale_mtime, stale_mtime))
+
     removed = cleanup_stale_session_tmp_files(sessions_dir)
 
     assert removed == 2
     assert (sessions_dir / "issue-100.json").exists()
     assert not (sessions_dir / "issue-100.json.tmp").exists()
     assert not (sessions_dir / "issue-200.json.tmp").exists()
+
+
+def test_cleanup_stale_session_tmp_files_skips_fresh_tmp(tmp_path: Path) -> None:
+    """Issue #1393 regression: a freshly-created (not-yet-replaced) .json.tmp
+    file must survive cleanup_stale_session_tmp_files so the sweep cannot race
+    a legitimate in-flight atomic write between its close() and replace()
+    calls — unlinking the tmp there crashes the writer with FileNotFoundError.
+    """
+    from charlie_work.adapters import cleanup_stale_session_tmp_files
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    # A tmp file a legitimate writer just created and closed but has not yet
+    # replaced — its mtime is "now", well within the 60s grace window.
+    fresh = sessions_dir / "issue-300.json.tmp"
+    fresh.write_text('{"in-flight": ', encoding="utf-8")
+
+    removed = cleanup_stale_session_tmp_files(sessions_dir)
+
+    assert removed == 0
+    assert fresh.exists()
+    assert fresh.read_text(encoding="utf-8") == '{"in-flight": '
 
 
 def test_cleanup_stale_session_tmp_files_missing_dir(tmp_path: Path) -> None:
