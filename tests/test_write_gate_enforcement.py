@@ -849,7 +849,14 @@ _RATCHET_BASELINE: dict[str, int] = {
     # through self.write_gate would trigger R9's exclusive-use predicate on
     # the whole function and flag every pre-existing raw call. The ratchet
     # holds at the new count until record_review's full conversion.
-    "workflow.py": 272,
+    # Issue #1393: +11 raw calls for the blocked-environment dispatch path
+    # (separate blocked_environment_at counter, distinct escalation reason,
+    # candidate-filtering safety net, and stranded .json.tmp cleanup). These
+    # are out-of-wave raw sites in unconverted territory, same class as the
+    # pre-existing 270 — the ratchet holds at the new count.
+    # Combined baseline after merging #1131 (+2) and #1393 (+11) onto the
+    # pre-existing 270: 283.
+    "workflow.py": 283,
     "worktree.py": 1,
 }
 
