@@ -1701,7 +1701,8 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
 
     killed = []
     monkeypatch.setattr(
-        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
@@ -1719,7 +1720,7 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
     # same failure class as PRs #700/#690) can blow through.
     frozen_now = datetime.now(UTC)
     result = workflow._detect_and_handle_stalled_sessions(
-        sessions_dir, state_file, config, now=frozen_now
+        sessions_dir, state_file, config, write_gate=_wg(state_file), now=frozen_now
     )
 
     assert result == []
@@ -1766,7 +1767,8 @@ def test_deferred_worker_log_resumes_exits_deferred_state(
 
     killed = []
     monkeypatch.setattr(
-        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
@@ -1778,7 +1780,9 @@ def test_deferred_worker_log_resumes_exits_deferred_state(
         )
     )
 
-    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, write_gate=_wg(state_file)
+    )
 
     assert result == []
     assert killed == []
@@ -1812,7 +1816,8 @@ def test_deferred_worker_past_deadline_is_killed(
 
     killed = []
     monkeypatch.setattr(
-        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
@@ -1826,7 +1831,7 @@ def test_deferred_worker_past_deadline_is_killed(
     )
 
     result = workflow._detect_and_handle_stalled_sessions(
-        sessions_dir, state_file, config, now=frozen_now
+        sessions_dir, state_file, config, write_gate=_wg(state_file), now=frozen_now
     )
 
     assert result == [{"issue": issue_number, "pid": 99999}]
@@ -1861,7 +1866,8 @@ def test_stalled_worker_without_rate_limit_signature_is_killed(
 
     killed = []
     monkeypatch.setattr(
-        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
@@ -1874,7 +1880,9 @@ def test_stalled_worker_without_rate_limit_signature_is_killed(
         )
     )
 
-    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, write_gate=_wg(state_file)
+    )
 
     assert result == [{"issue": issue_number, "pid": 99999}]
     assert killed == [99999]
@@ -2011,7 +2019,8 @@ def test_detect_and_handle_stalled_sessions_not_killed_when_real_activity_probe_
 
     killed: list[int] = []
     monkeypatch.setattr(
-        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
@@ -2021,7 +2030,9 @@ def test_detect_and_handle_stalled_sessions_not_killed_when_real_activity_probe_
     )
     state_file = tmp_path / "state.json"
 
-    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, write_gate=_wg(state_file)
+    )
 
     assert result == []
     assert killed == []
@@ -2067,7 +2078,8 @@ def test_detect_and_handle_stalled_sessions_tolerates_none_probe(
 
     killed: list[int] = []
     monkeypatch.setattr(
-        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
@@ -2076,7 +2088,9 @@ def test_detect_and_handle_stalled_sessions_tolerates_none_probe(
     state_file = tmp_path / "state.json"
     config = OrchestratorConfig()
 
-    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, write_gate=_wg(state_file)
+    )
 
     assert result == [{"issue": issue_number, "pid": 99999}]
     assert killed == [99999]
@@ -2128,7 +2142,8 @@ def test_detect_and_handle_stalled_sessions_inconclusive_probe_deferred_then_esc
 
     killed: list[int] = []
     monkeypatch.setattr(
-        workflow, "kill_process_tree", lambda pid, start_time: killed.append(pid) or [pid]
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: False)
@@ -2141,7 +2156,9 @@ def test_detect_and_handle_stalled_sessions_inconclusive_probe_deferred_then_esc
     )
 
     # First pass: dead PID + inconclusive probe → defer, counter advances.
-    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, write_gate=_wg(state_file)
+    )
     assert result == []
     assert killed == []
 
@@ -2151,10 +2168,68 @@ def test_detect_and_handle_stalled_sessions_inconclusive_probe_deferred_then_esc
     assert sidecar.get("failure_kind") is None
 
     # Second pass: counter is now at the cap → reap.
-    result = workflow._detect_and_handle_stalled_sessions(sessions_dir, state_file, config)
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, write_gate=_wg(state_file)
+    )
     assert result == [{"issue": issue_number, "pid": 99999}]
     assert killed == [99999]
 
     sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert sidecar["failure_kind"] == "stalled"
     assert sidecar.get("inconclusive_probe_deferred_count") == 0
+
+
+def test_detect_and_handle_stalled_sessions_dry_run_suppresses_kills_and_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #1325: under ``dry_run=True`` the stall reaper must not kill
+    processes and must not write to ``state.json``/``events.db``.
+
+    Before the fix, ``_detect_and_handle_stalled_sessions`` had no
+    ``write_gate`` parameter: ``kill_process_tree``, ``kill_orphan_pid``,
+    ``append_event``, ``save_state``, and the budget-exceeded sidecar write
+    were all unconditional. A ``--dry-run`` pass could terminate live worker
+    processes and permanently mutate shared state -- exactly the side
+    effects ``--dry-run`` exists to suppress.
+
+    This test drives a STALLED worker through the reaper with a
+    ``dry_run=True`` gate and asserts:
+      1. ``kill_process_tree`` is never called (no process kills).
+      2. ``state.json`` is never written (no ``session_stalled`` event).
+      3. The function still returns the stalled entry (detection is
+         read-only and must keep working under dry-run so the caller can
+         reason about what *would* happen).
+    """
+    from charlie_work import workflow
+
+    issue_number = 1325
+    log_text = "Working on task...\nLast line\n"
+    sessions_dir, state_file, _ = _make_stalled_devin_session(tmp_path, issue_number, log_text)
+
+    killed: list[int] = []
+    monkeypatch.setattr(
+        "charlie_work.write_gate.kill_process_tree",
+        lambda pid, start_time=None: killed.append(pid) or [pid],
+    )
+    monkeypatch.setattr(workflow, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
+
+    config = OrchestratorConfig()
+
+    result = workflow._detect_and_handle_stalled_sessions(
+        sessions_dir, state_file, config, write_gate=_wg(state_file, dry_run=True)
+    )
+
+    # Detection still works -- the stalled entry is returned so the caller
+    # can reason about what *would* have been reaped.
+    assert result == [{"issue": issue_number, "pid": 99999}]
+
+    # No process kills under dry_run.
+    assert killed == []
+
+    # No state.json was written -- the file does not exist because
+    # ``write_gate.save_state`` is a no-op under dry_run and never touched
+    # disk. ``load_state`` on a non-existent path returns a default empty
+    # state, so the in-memory pipeline ran, but nothing persisted.
+    assert not state_file.exists()

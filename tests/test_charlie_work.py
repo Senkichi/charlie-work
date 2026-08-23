@@ -26850,7 +26850,9 @@ def test_stall_and_dead_lane_increment_deferral_counter_at_most_once_per_pass(
     ):
         # loop() order and arguments: stall lane runs before the dead lane,
         # which is told not to persist the counter itself this pass.
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
         _classify_dead_sessions_and_update_throttle_state(
             sessions_dir,
             paths.state_file,
@@ -26972,7 +26974,9 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
                 return_value=inconclusive_probe,
             ),
         ):
-            _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+            _detect_and_handle_stalled_sessions(
+                sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+            )
 
     def _run_dead_lane() -> None:
         with (
@@ -35068,6 +35072,7 @@ def test_loop_forwards_shared_now_to_cadence_gated_lanes(
         state_file: Path,
         config: OrchestratorConfig,
         *,
+        write_gate: object,
         now: datetime | None = None,
     ) -> list[dict[str, int]]:
         received["stalled_sessions"] = now
@@ -37396,7 +37401,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
     with (
         patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch(
             "charlie_work.workflow.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
@@ -37409,7 +37414,9 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         # Run the stall detection and handling
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # Check that the stalled issue was detected
     assert any(entry["issue"] == 109 for entry in result)
@@ -37511,12 +37518,14 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
     after = datetime.now(UTC)
 
     assert any(entry["issue"] == 1034 for entry in result)
@@ -37585,12 +37594,14 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "quota_exhausted"
@@ -37637,12 +37648,14 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
 
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "stalled"
@@ -37691,12 +37704,14 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
 
     with (
         patch("charlie_work.worker.is_session_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99999]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
         # dispatch() re-runs the stall reaper unconditionally at its top (workflow.py
         # dispatch():~1180) before checking is_throttled — keep the same mocks active
@@ -37959,7 +37974,9 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
         # Run the stall detection and handling
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # Check that is_session_alive was NOT called (detection skipped)
     mock_alive.assert_not_called()
@@ -38539,7 +38556,7 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
     # Mock _detect_and_handle_stalled_sessions to track call count
     stall_detection_calls = []
 
-    def mock_stall_detection(sessions_dir, state_file, config):
+    def mock_stall_detection(sessions_dir, state_file, config, *, write_gate):
         stall_detection_calls.append(1)
         return []  # No stalled sessions
 
@@ -44524,14 +44541,16 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
         patch(
-            "charlie_work.workflow.kill_process_tree",
+            "charlie_work.write_gate.kill_process_tree",
             side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
         ),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        result = _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        result = _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     # The budget-killed session is reported in the stalled entries.
     assert any(entry["issue"] == 4801 for entry in result)
@@ -44594,12 +44613,14 @@ def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
     before = datetime.now(UTC)
     with (
         patch("charlie_work.worker.is_worker_alive", return_value=True),
-        patch("charlie_work.workflow.kill_process_tree", return_value=[99998]),
+        patch("charlie_work.write_gate.kill_process_tree", return_value=[99998]),
         patch("charlie_work.workflow.sweep_orphan_processes", return_value=[]),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
-        _detect_and_handle_stalled_sessions(sessions_dir, paths.state_file, config)
+        _detect_and_handle_stalled_sessions(
+            sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
+        )
 
     from charlie_work.claude_code import _sidecar_path as _api_sidecar_path
 

@@ -211,8 +211,6 @@ from .throttle_signatures import match_throttle_tail, parse_reset_clock_time
 from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,
-    kill_orphan_pid,
-    kill_process_tree,
     sweep_orphan_processes,
 )
 from .worker import WorkerHealth, WorkerView, iter_workers
@@ -1247,11 +1245,11 @@ def _detect_stalled_sessions(
 # hoisted to `process_utils.kill_orphan_pid` verbatim (issue #1264, W6 PR3,
 # R6a) so that `write_gate.py` can wrap it as `WriteGate.kill_process`
 # without importing this module. The two call sites below
-# (`_detect_and_handle_stalled_sessions`) are unconditional and out of this
-# PR's scope -- see issue #1311's sibling filing for that function's own
-# dry-run leak -- so they call the hoisted primitive raw, unchanged in
-# behavior. The one in-scope call site (`_sweep_orphan_processes_for_dead_sessions`)
-# now goes through `write_gate.kill_process` instead.
+# (`_detect_and_handle_stalled_sessions`) now route through
+# `write_gate.kill_process` / `write_gate.kill_process_tree` (issue #1325),
+# so the hoisted primitives are no longer called raw from this function.
+# The one in-scope call site (`_sweep_orphan_processes_for_dead_sessions`)
+# also goes through `write_gate.kill_process`.
 
 
 def _detect_and_handle_stalled_sessions(
@@ -1259,6 +1257,7 @@ def _detect_and_handle_stalled_sessions(
     state_file: Path,
     config: OrchestratorConfig,
     *,
+    write_gate: WriteGate,
     now: datetime | None = None,
 ) -> list[dict[str, int]]:
     """Detect stalled sessions (live PID but dead agent) and handle them.
@@ -1300,7 +1299,17 @@ def _detect_and_handle_stalled_sessions(
 
     Returns a list of {issue, pid} dicts for stalled sessions (for exclusion from
     dispatch in the same pass).
+
+    Issue #1325: all process kills (``kill_process_tree``,
+    ``kill_orphan_pid``) and state/event writes (``append_event``,
+    ``save_state``, the budget-exceeded sidecar write) now route through
+    ``write_gate`` so a ``dry_run=True`` gate suppresses them exactly as
+    ``--dry-run`` promises. The ``write_gate`` parameter follows the
+    Convention B explicit-threading pattern (``require_write_gate()``)
+    already used by ``_sweep_orphan_processes_for_dead_sessions`` and the
+    dead-session lane.
     """
+    write_gate = require_write_gate(write_gate)
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import (
         get_rate_limit_defer_until,
@@ -1382,14 +1391,16 @@ def _detect_and_handle_stalled_sessions(
         # 0/unset the check is entirely dormant. Non-api workers are never
         # budget-evaluated. The kill uses the shared ``kill_process_tree``
         # helper (no-console-window discipline on Windows, full process tree
-        # reaped) — not reimplemented here.
+        # reaped) — not reimplemented here. Issue #1325: both the tree kill
+        # and the orphan kill now route through ``write_gate`` so
+        # ``dry_run=True`` suppresses them.
         if w.adapter_kind == "api" and _api_session_over_budget(w, config):
-            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            killed_pids = write_gate.kill_process_tree(w.pid, w.process_start_time)
             orphan_pids_budget: list[int] = []
             orphan_processes = sweep_orphan_processes(w.worktree_path)
             if orphan_processes:
                 for orphan in orphan_processes:
-                    kill_orphan_pid(orphan["pid"])
+                    write_gate.kill_process(orphan["pid"])
                     killed_pids.append(orphan["pid"])
                 orphan_pids_budget = [o["pid"] for o in orphan_processes]
 
@@ -1399,23 +1410,25 @@ def _detect_and_handle_stalled_sessions(
             # budget-exceeded verdict is not overridden by a coincidental
             # throttle/auth log-tail match. The dead-session lane's
             # classification call then short-circuits on the already-set
-            # failure_kind.
+            # failure_kind. Issue #1325: gated on ``write_gate.dry_run`` so
+            # the sidecar is not mutated under ``--dry-run``.
             from .claude_code import _sidecar_path as _api_sidecar_path
             from .claude_code import _write_json_atomic as _api_write_json_atomic
 
             api_sidecar = _api_sidecar_path(sessions_dir, w.issue_number, "api")
-            try:
-                with api_sidecar.open("r", encoding="utf-8") as handle:
-                    api_payload = json.load(handle)
-                if isinstance(api_payload, dict):
-                    api_payload["failure_kind"] = "budget_exceeded"
-                    _api_write_json_atomic(api_sidecar, api_payload)
-            except (OSError, json.JSONDecodeError):
-                pass
+            if not write_gate.dry_run:
+                try:
+                    with api_sidecar.open("r", encoding="utf-8") as handle:
+                        api_payload = json.load(handle)
+                    if isinstance(api_payload, dict):
+                        api_payload["failure_kind"] = "budget_exceeded"
+                        _api_write_json_atomic(api_sidecar, api_payload)
+                except (OSError, json.JSONDecodeError):
+                    pass
 
             with state_lock(state_file):
                 state = load_state(state_file)
-                state = append_event(
+                state = write_gate.append_event(
                     state,
                     "session_budget_exceeded",
                     {
@@ -1426,9 +1439,8 @@ def _detect_and_handle_stalled_sessions(
                         "orphan_pids": orphan_pids_budget if orphan_pids_budget else None,
                         "provider": w.provider,
                     },
-                    state_path=state_file,
                 )
-                save_state(state_file, state)
+                write_gate.save_state(state)
 
             stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
             continue
@@ -1462,7 +1474,7 @@ def _detect_and_handle_stalled_sessions(
                                 reason="rate_limited",
                                 adapter_kind=w.adapter_kind,
                             )
-                            state = append_event(
+                            state = write_gate.append_event(
                                 state,
                                 "session_rate_limit_deferred",
                                 {
@@ -1470,22 +1482,25 @@ def _detect_and_handle_stalled_sessions(
                                     "pid": w.pid,
                                     "defer_until": defer_until,
                                 },
-                                state_path=state_file,
                             )
-                            save_state(state_file, state)
+                            write_gate.save_state(state)
                         continue
 
-            # Kill the process tree (with start-time verification to prevent PID recycling)
-            killed_pids = kill_process_tree(w.pid, w.process_start_time)
+            # Kill the process tree (with start-time verification to prevent PID recycling).
+            # Issue #1325: routed through ``write_gate.kill_process_tree`` so
+            # ``dry_run=True`` suppresses the kill (returns ``[]``).
+            killed_pids = write_gate.kill_process_tree(w.pid, w.process_start_time)
 
             # Sweep for orphan processes that survived the tree kill (Windows-only)
             # This catches detached/daemonized processes (e.g., nohup-style background processes)
             orphan_pids: list[int] = []
             orphan_processes = sweep_orphan_processes(w.worktree_path)
             if orphan_processes:
-                # Kill detected orphans to prevent them from running rejected code
+                # Kill detected orphans to prevent them from running rejected code.
+                # Issue #1325: routed through ``write_gate.kill_process`` so
+                # ``dry_run=True`` suppresses the kill.
                 for orphan in orphan_processes:
-                    kill_orphan_pid(orphan["pid"])
+                    write_gate.kill_process(orphan["pid"])
                     killed_pids.append(orphan["pid"])
                 orphan_pids = [o["pid"] for o in orphan_processes]
 
@@ -1551,7 +1566,7 @@ def _detect_and_handle_stalled_sessions(
                         reason=resolved_failure_kind,
                         adapter_kind=w.adapter_kind,
                     )
-                    save_state(state_file, state)
+                    write_gate.save_state(state)
 
             # Log the event
             log_path = Path(w.log_path)
@@ -1601,7 +1616,7 @@ def _detect_and_handle_stalled_sessions(
 
             with state_lock(state_file):
                 state = load_state(state_file)
-                state = append_event(
+                state = write_gate.append_event(
                     state,
                     event_kind,
                     {
@@ -1618,9 +1633,8 @@ def _detect_and_handle_stalled_sessions(
                         "latest_real_activity_at": probe_payload.get("latest_timestamp"),
                         "latest_real_activity_source": probe_payload.get("latest_source"),
                     },
-                    state_path=state_file,
                 )
-                save_state(state_file, state)
+                write_gate.save_state(state)
 
             stalled_entries.append({"issue": w.issue_number, "pid": w.pid})
 
@@ -7084,7 +7098,10 @@ class OrchestratorApp:
         # deferral counter.
         if stalled_entries is None:
             stalled_entries = _detect_and_handle_stalled_sessions(
-                sessions_dir, self.paths.state_file, self.config
+                sessions_dir,
+                self.paths.state_file,
+                self.config,
+                write_gate=self.write_gate,
             )
 
         # Count live workers after stall handling (stalled workers are killed).
@@ -19939,7 +19956,11 @@ class OrchestratorApp:
         # rate-limit-defer classification shares one sample with the other
         # cadence-gated lanes below instead of re-sampling independently.
         loop_stalled_entries = _detect_and_handle_stalled_sessions(
-            sessions_dir, self.paths.state_file, self.config, now=now
+            sessions_dir,
+            self.paths.state_file,
+            self.config,
+            write_gate=self.write_gate,
+            now=now,
         )
         intake = self.intake()
         # Share a single wave budget between fresh and rework dispatch
@@ -20652,7 +20673,12 @@ class OrchestratorApp:
         # only when the caller (loop()) already ran the sweep this pass and
         # handed its result down — see dispatch_rework()'s docstring.
         if stalled_entries is None:
-            _detect_and_handle_stalled_sessions(sessions_dir, self.paths.state_file, self.config)
+            _detect_and_handle_stalled_sessions(
+                sessions_dir,
+                self.paths.state_file,
+                self.config,
+                write_gate=self.write_gate,
+            )
 
         # Note: orphaned-worker detection is intentionally NOT re-run here.
         # loop() already runs _detect_and_handle_orphaned_workers once per pass
