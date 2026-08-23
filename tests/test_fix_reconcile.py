@@ -1195,3 +1195,179 @@ def test_closed_unmerged_untracked_pr_is_not_invented() -> None:
         if item.kind == "closed_unmerged_pr_state_converged"
     ]
     assert drift == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #1398: a CLOSED-unmerged PR left linked to an issue after an
+# un-escalate + re-dispatch must NOT cause the closed-unmerged convergence
+# rules to strip the NEW session's labels / status. The rules used to key
+# only on "issue OPEN + active status/label" and "PR CLOSED unmerged" and
+# never asked whether the issue's *current* active session postdates the PR
+# close -- so every reconcile pass detached a still-live worker from the
+# orchestrator's tracking and re-selected the issue as a fresh dispatch
+# candidate, burning a concurrency-governor slot each pass.
+#
+# Regression contract from the issue: "close PR A at t0, dispatch issue at
+# t1>t0, reconcile must produce zero drift for the issue."
+# ---------------------------------------------------------------------------
+
+
+def test_closed_unmerged_pr_rules_skip_issue_when_dispatch_postdates_close() -> None:
+    """The exact regression from issue #1398: PR A closed at t0, issue
+    re-dispatched at t1>t0 (status 'dispatched', dispatched_at=t1, live
+    agent:in-progress label). Both issue-side closed-unmerged rules must
+    produce ZERO drift for the issue -- the closed PR is stale, the active
+    session is the redispatch the un-gate sweep intended.
+    """
+    config = OrchestratorConfig()
+    now = datetime.now(UTC)
+    closed_at = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    dispatched_at = (now - timedelta(minutes=22)).isoformat().replace("+00:00", "Z")
+    assert dispatched_at > closed_at  # sanity: session postdates PR close
+
+    gh = FakeGitHub(
+        prs=[_pr(1214, "CLOSED", head_ref="agent/issue-1068-x", closed_at=closed_at)],
+        issues=[_issue(1068, [config.labels.in_progress])],
+    )
+    state = empty_state()
+    state["issues"]["1068"] = {
+        "number": 1068,
+        "status": "dispatched",
+        "dispatched_at": dispatched_at,
+        "worker_pid": 29512,
+    }
+
+    drift = detect_drift(gh, state, config)
+    assert [item for item in drift if item.kind == "closed_unmerged_pr_active_labels"] == []
+    assert [
+        item for item in drift if item.kind == "closed_unmerged_pr_issue_state_converged"
+    ] == []
+
+    # apply_fixes on the (empty) issue-side drift must leave the live
+    # session's state entirely untouched.
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["issues"]["1068"]["status"] == "dispatched"
+    assert new_state["issues"]["1068"]["dispatched_at"] == dispatched_at
+    assert (1068, config.labels.in_progress) not in gh.labels_removed
+
+
+def test_closed_unmerged_pr_state_converged_still_fires_for_stale_pr_entry() -> None:
+    """The PR-side ``closed_unmerged_pr_state_converged`` rule is NOT gated
+    by the #1398 guard -- the PR genuinely IS closed, so its own state
+    entry must still converge to 'closed' regardless of whether the linked
+    issue has a newer session. The guard is scoped to the two issue-side
+    rules only.
+    """
+    config = OrchestratorConfig()
+    now = datetime.now(UTC)
+    closed_at = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    dispatched_at = (now - timedelta(minutes=22)).isoformat().replace("+00:00", "Z")
+
+    gh = FakeGitHub(
+        prs=[_pr(1214, "CLOSED", head_ref="agent/issue-1068-x", closed_at=closed_at)],
+        issues=[_issue(1068, [config.labels.in_progress])],
+    )
+    state = empty_state()
+    state["prs"]["1214"] = {"number": 1214, "issue_number": 1068, "status": "reviewing"}
+    state["issues"]["1068"] = {
+        "number": 1068,
+        "status": "dispatched",
+        "dispatched_at": dispatched_at,
+    }
+
+    drift = [
+        item
+        for item in detect_drift(gh, state, config)
+        if item.kind == "closed_unmerged_pr_state_converged"
+    ]
+    assert len(drift) == 1
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["prs"]["1214"]["status"] == "closed"
+
+
+def test_closed_unmerged_pr_rules_skip_issue_when_pr_number_points_elsewhere() -> None:
+    """The second #1398 signal: the issue's recorded ``pr_number`` points to
+    a *different* (newer) PR than the closed one. The issue has moved on;
+    the stale closed PR must not strip the new session's labels/status even
+    when dispatched_at is absent (e.g. the worker already opened the new PR
+    and dispatched_at was cleared).
+    """
+    config = OrchestratorConfig()
+    now = datetime.now(UTC)
+    closed_at = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+
+    gh = FakeGitHub(
+        prs=[_pr(1348, "CLOSED", head_ref="agent/issue-1342-x", closed_at=closed_at)],
+        issues=[_issue(1342, [config.labels.in_progress])],
+    )
+    state = empty_state()
+    # The issue's current PR is a newer one (#1399), not the stale #1348.
+    state["issues"]["1342"] = {
+        "number": 1342,
+        "status": "reviewing",
+        "pr_number": 1399,
+    }
+
+    drift = detect_drift(gh, state, config)
+    assert [item for item in drift if item.kind == "closed_unmerged_pr_active_labels"] == []
+    assert [
+        item for item in drift if item.kind == "closed_unmerged_pr_issue_state_converged"
+    ] == []
+
+
+def test_closed_unmerged_pr_rules_fire_when_session_predates_close() -> None:
+    """Baseline guard for #1398: when the issue's active session does NOT
+    postdate the PR close (dispatched_at is older than closedAt, the closed
+    PR genuinely is the issue's current dead PR), both issue-side rules
+    must fire exactly as before. The guard never weakens the existing
+    convergence for the case #558/#1066 exist to handle.
+    """
+    config = OrchestratorConfig()
+    now = datetime.now(UTC)
+    dispatched_at = (now - timedelta(hours=3)).isoformat().replace("+00:00", "Z")
+    closed_at = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    assert dispatched_at < closed_at  # sanity: session predates PR close
+
+    gh = FakeGitHub(
+        prs=[_pr(500, "CLOSED", head_ref="agent/issue-495-x", closed_at=closed_at)],
+        issues=[_issue(495, [config.labels.in_progress])],
+    )
+    state = empty_state()
+    state["issues"]["495"] = {
+        "number": 495,
+        "status": "dispatched",
+        "dispatched_at": dispatched_at,
+    }
+
+    drift = detect_drift(gh, state, config)
+    assert len([item for item in drift if item.kind == "closed_unmerged_pr_active_labels"]) == 1
+    assert (
+        len([item for item in drift if item.kind == "closed_unmerged_pr_issue_state_converged"])
+        == 1
+    )
+
+
+def test_closed_unmerged_pr_rules_fire_when_no_session_timestamp() -> None:
+    """Baseline guard for #1398: when the issue has an active status but no
+    dispatched_at and no pr_number (the pre-#558 shape, e.g.
+    'rework_requested' with dispatched_at cleared), there is no positive
+    evidence of a newer session, so both issue-side rules must fire as
+    before. The guard only skips on positive evidence; it never over-skips.
+    """
+    config = OrchestratorConfig()
+    now = datetime.now(UTC)
+    closed_at = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+
+    gh = FakeGitHub(
+        prs=[_pr(500, "CLOSED", head_ref="agent/issue-495-x", closed_at=closed_at)],
+        issues=[_issue(495, [config.labels.needs_rework])],
+    )
+    state = empty_state()
+    state["issues"]["495"] = {"number": 495, "status": "rework_requested"}
+
+    drift = detect_drift(gh, state, config)
+    assert len([item for item in drift if item.kind == "closed_unmerged_pr_active_labels"]) == 1
+    assert (
+        len([item for item in drift if item.kind == "closed_unmerged_pr_issue_state_converged"])
+        == 1
+    )

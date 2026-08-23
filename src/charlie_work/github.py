@@ -180,9 +180,7 @@ LABEL_LIST_FIELDS = "name"
 # like statusCheckRollup (see the PR_CHECKS_FIELDS note above and issue #361);
 # safe to include unconditionally. Needed by detect_aviator_stale_blocked's
 # commit_check_runs(sha) lookup.
-RECONCILE_PR_FIELDS = (
-    "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid"
-)
+RECONCILE_PR_FIELDS = "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid,closedAt"
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
 
