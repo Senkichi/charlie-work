@@ -2147,6 +2147,89 @@ def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> 
         report.ok(check, facts)
 
 
+def check_infra_blocked_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface ``check_infra_blocked`` events and their persisted escalation
+    (issue #1383, AC4).
+
+    ``check_infra_blocked`` is a warning-level event emitted per affected PR
+    when a required check fails due to a fleet-wide infrastructure condition
+    (Actions budget/runner outage) rather than the PR's code. The
+    operator-facing ``infra_blocked_escalated`` error event is emitted at
+    most once per configured window when the condition persists across N
+    passes. Both kinds already appear in the generic
+    ``check_warning_events`` / ``check_error_events`` listings, but those
+    are flat ``kind@ts`` lines with no correlation to the affected PRs or
+    the persistence state. This dedicated check gives the operator a
+    structured view: how many PRs are currently infra-blocked, which
+    checks, and whether the persistence escalation has fired.
+
+    Same db-availability posture as ``check_error_events``: a missing or
+    unreadable events.db is an anomaly (this check cannot vouch for a repo
+    it cannot read), not a silent OK. Timestamps are compared in Python
+    against ``baseline`` for the same ISO-vs-SQLite reason documented on
+    ``check_loop_pass_freshness``.
+    """
+    check = f"infra-blocked-events {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check: events.db has no events table")
+                return
+            blocked_rows = conn.execute(
+                "SELECT ts, kind FROM events WHERE kind = ?",
+                ("check_infra_blocked",),
+            ).fetchall()
+            escalated_rows = conn.execute(
+                "SELECT ts FROM events WHERE kind = ?",
+                ("infra_blocked_escalated",),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_blocked: list[str] = []
+    for ts, _kind in blocked_rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is None or ts_dt > baseline:
+            new_blocked.append(ts)
+
+    new_escalated: list[str] = []
+    for (ts,) in escalated_rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is None or ts_dt > baseline:
+            new_escalated.append(ts)
+
+    facts = f"blocked_rows={len(blocked_rows)} escalated_rows={len(escalated_rows)}"
+    if new_escalated:
+        report.anom(
+            check,
+            f"infra_blocked_escalated since last beat: {new_escalated} ({facts})",
+        )
+    elif new_blocked:
+        report.warn(
+            check,
+            f"check_infra_blocked since last beat: {len(new_blocked)} event(s) ({facts})",
+        )
+    else:
+        report.ok(check, facts)
+
+
 def check_merge_flow(
     report: Report,
     repo: RepoInfo,
@@ -2704,6 +2787,7 @@ def main() -> int:
         check_dispatch_failures(report, repo, baseline)
         check_error_events(report, repo, baseline)
         check_warning_events(report, repo, baseline)
+        check_infra_blocked_events(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)
