@@ -547,19 +547,82 @@ def test_review_claim_timestamp_completed_rebuilt_uses_prompt_mtime(
     assert parsed == rebuild_time
 
 
-def test_review_claim_timestamp_completed_same_head_falls_back_to_state(
+def test_review_claim_timestamp_completed_same_head_rebuilt_uses_prompt_mtime(
     hb: ModuleType, tmp_path: Path
 ) -> None:
-    """Issue #1403 guard: the rebuilt-packet anchor only fires when the head
-    actually advanced past the prior cycle's reviewed head.
+    """Regression for issue #1436.
 
-    When the on-disk pending decision's ``reviewed_head_sha`` matches state's
-    ``reviewed_head_sha`` (no new head -- not a rebuilt-for-new-head packet),
-    the state.json dispatch timestamp path is unchanged.
+    A completed prior cycle whose packet was rebuilt for the SAME head (no SHA
+    advance): the on-disk decision is back to ``pending`` with
+    ``reviewed_head_sha`` EQUAL to state.json's.  The #1403 guard keyed on SHA
+    inequality and fell through, so the newest-timestamp fallback dated the
+    claim by the prior cycle's ``review_dispatched_at`` (false 467m ANOMALY on
+    pr-1432).  The pending decision while status is completed is itself the
+    rebuild evidence; ``_review_claim_timestamp`` must anchor on the
+    ``review-prompt.md`` mtime regardless of SHA equality.
     """
-    pr_dir = tmp_path / "prs" / "pr-42"
+    pr_dir = tmp_path / "prs" / "pr-1432"
     pr_dir.mkdir(parents=True)
+    rebuild_time = datetime(2026, 8, 24, 9, 17, 38, tzinfo=timezone.utc)
     (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (rebuild_time.timestamp(),) * 2)
+
+    pr_state = {
+        "review_dispatch_status": "review_dispatch_completed",
+        # Prior cycle's dispatch time -- 467m before the 09:55Z beat, the
+        # false ANOMALY source from the 2026-08-24T09:55Z incident.
+        "review_dispatched_at": "2026-08-24T02:07:25Z",
+        # Same head as the on-disk decision -- the case #1403 missed.
+        "reviewed_head_sha": "93bf8ed",
+    }
+    decision = {"decision": "pending", "reviewed_head_sha": "93bf8ed"}
+
+    timestamp = hb._review_claim_timestamp(pr_state, pr_dir=pr_dir, decision=decision)
+    assert timestamp is not None
+    parsed = hb.parse_iso(timestamp)
+    assert parsed == rebuild_time
+
+
+def test_review_claim_timestamp_completed_prompt_older_than_dispatch_uses_dispatch(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Issue #1436 guard: the prompt mtime must not be older than the prior
+    cycle's ``review_dispatched_at``.
+
+    If the prompt file's mtime predates the completed cycle's dispatch (clock
+    skew / a packet that was not actually rebuilt), the newer of the two is
+    used so the change can only shrink a false age and never hide a genuinely
+    stale claim from before the completed cycle.
+    """
+    pr_dir = tmp_path / "prs" / "pr-43"
+    pr_dir.mkdir(parents=True)
+    # Prompt mtime OLDER than the prior cycle's dispatch.
+    stale_prompt_time = datetime(2026, 8, 22, 20, 0, 0, tzinfo=timezone.utc)
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (stale_prompt_time.timestamp(),) * 2)
+
+    pr_state = {
+        "review_dispatch_status": "review_dispatch_completed",
+        "review_dispatched_at": "2026-08-22T22:49:27Z",
+        "reviewed_head_sha": "same-head-sha",
+    }
+    decision = {"decision": "pending", "reviewed_head_sha": "same-head-sha"}
+
+    assert (
+        hb._review_claim_timestamp(pr_state, pr_dir=pr_dir, decision=decision)
+        == "2026-08-22T22:49:27Z"
+    )
+
+
+def test_review_claim_timestamp_completed_missing_prompt_falls_back_to_state(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Issue #1436: when the prompt file is missing, the SHA comparison
+    survives only as a tiebreak and we fall back to current behavior (the
+    newest-timestamp fallback) regardless of SHA equality.
+    """
+    pr_dir = tmp_path / "prs" / "pr-44"
+    pr_dir.mkdir(parents=True)
 
     pr_state = {
         "review_dispatch_status": "review_dispatch_completed",
@@ -623,6 +686,59 @@ def test_check_review_liveness_completed_rebuilt_no_false_anomaly(
     # ~15m from the rebuild, not ~138m from the stale prior dispatch.
     assert "oldest_min=15" in report.lines[0]
     assert "138" not in report.lines[0]
+
+
+def test_check_review_liveness_completed_same_head_rebuilt_no_false_anomaly(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Regression for issue #1436: end-to-end check.
+
+    Production shape from the 2026-08-24T09:55Z beat on pr-1432: a prior review
+    cycle completed at 02:07:25Z (``review_dispatch_status ==
+    review_dispatch_completed``, ``reviewed_head_sha`` = 93bf8ed), then the
+    rework cycle rebuilt the packet for the SAME head at 09:17:38Z (on-disk
+    ``review-decision.json`` back to ``pending`` head-stamped with the same
+    93bf8ed, ``review-prompt.md`` rewritten).  ``dispatch_reviews()`` had not
+    yet launched the next reviewer, so ``review_dispatched_at`` still carried
+    the prior cycle's 02:07:25Z.  The #1403 guard keyed on SHA inequality and
+    fell through, so the beat would date the claim by the stale prior dispatch
+    (~467m) and ANOMALY.  The beat at 09:55Z must measure the claim age from
+    the rebuild (~38m, under the 45m threshold), not the stale prior dispatch,
+    and must NOT ANOMALY.
+    """
+    frozen_now = datetime(2026, 8, 24, 9, 55, 0, tzinfo=timezone.utc)
+    rebuild_time = datetime(2026, 8, 24, 9, 17, 38, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    _patch_gh(monkeypatch, hb, [1432])
+    pr_dir = repo.state_dir / "prs" / "pr-1432"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "pr.json").write_text("{}", encoding="utf-8")
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "pending", "reviewed_head_sha": "93bf8ed"}),
+        encoding="utf-8",
+    )
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (rebuild_time.timestamp(),) * 2)
+    _write_state(
+        repo.state_dir,
+        1432,
+        {
+            "review_dispatch_status": "review_dispatch_completed",
+            "review_dispatched_at": "2026-08-24T02:07:25Z",
+            "reviewed_head_sha": "93bf8ed",
+            "reviewer_pid": None,
+        },
+    )
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert not report.anomaly
+    assert report.lines and "review-liveness" in report.lines[0]
+    assert "open_claims=1" in report.lines[0]
+    # ~37m from the rebuild, not ~467m from the stale prior dispatch.
+    assert "oldest_min=37" in report.lines[0]
+    assert "467" not in report.lines[0]
 
 
 # ---------------------------------------------------------------------------
