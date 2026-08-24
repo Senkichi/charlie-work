@@ -785,6 +785,107 @@ def get_dispatch_cap(config_path: Path) -> int | None:
     return cap if isinstance(cap, int) else None
 
 
+def _last_dispatch_drain_signal(state_dir: Path) -> dict[str, Any] | None:
+    """Read the last ``dispatch`` event's concurrency governor from events.db.
+
+    Returns the parsed payload dict of the most recent ``dispatch`` event in
+    ``state_dir/events.db`` (which carries ``concurrency_governor`` and
+    ``deferred_by_concurrency_count``), or ``None`` when no events.db exists,
+    the events table is absent, no ``dispatch`` row is recorded, or the
+    payload is unparseable. Mirrors the stdlib-only events.db access pattern
+    in ``check_loop_pass_freshness`` / ``check_error_events`` rather than
+    importing ``charlie_work.instrumentation`` -- this script stays importable
+    when ``ci_fleet`` is not installed (see the module header).
+
+    The ``concurrency_governor`` sub-payload is written by
+    ``workflow.py``'s dispatch path and carries ``dispatch_limit``,
+    ``fleet_concurrency_limit`` / ``fleet_live_session_count`` (present only
+    when the fleet governor is enabled), and the per-repo
+    ``concurrency_limit`` / ``live_session_count`` / ``available_slots``.
+    ``deferred_by_concurrency_count`` is a sibling top-level field counting
+    every ordered candidate the cap turned away this pass.
+    """
+    db_path = state_dir / "events.db"
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                return None
+            # ORDER BY id DESC: id is AUTOINCREMENT, so the highest id is the
+            # most recent insert. This avoids the ISO-T/Z-vs-SQLite-space
+            # timestamp-format trap documented on check_loop_pass_freshness
+            # (lexicographic ts ordering happens to work for ISO-8601, but id
+            # is the insertion order and is unambiguously monotonic).
+            row = conn.execute(
+                "SELECT payload FROM events WHERE kind = 'dispatch' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _governor_drain_note(
+    persisting_count: int,
+    governor: dict[str, Any],
+    deferred_by_concurrency_count: int | None,
+) -> str | None:
+    """Build the ``draining at cap`` note from a dispatch event's governor.
+
+    Returns a human-readable drain note when the governor shows the backlog
+    is draining at the allowed rate (fleet-wide cap saturated, or the
+    effective dispatch limit was at or below the deferred backlog), or
+    ``None`` when the governor shows free slots -- the caller keeps the
+    anomaly in that case (issue #1424: the #1398 head-of-line case is real).
+
+    The condition mirrors the one stated in issue #1424:
+    ``fleet_live_session_count >= fleet_concurrency_limit`` (when the fleet
+    governor is enabled) OR ``dispatch_limit <= deferred_by_concurrency_count``.
+    """
+    cg = governor.get("concurrency_governor") if isinstance(governor, dict) else None
+    if not isinstance(cg, dict):
+        return None
+    fleet_cap = cg.get("fleet_concurrency_limit")
+    fleet_live = cg.get("fleet_live_session_count")
+    dispatch_limit = cg.get("dispatch_limit")
+
+    fleet_at_cap = (
+        isinstance(fleet_cap, int) and isinstance(fleet_live, int) and fleet_live >= fleet_cap
+    )
+    deferred_at_cap = (
+        isinstance(dispatch_limit, int)
+        and isinstance(deferred_by_concurrency_count, int)
+        and dispatch_limit <= deferred_by_concurrency_count
+    )
+
+    if not (fleet_at_cap or deferred_at_cap):
+        return None
+
+    parts = [f"backlog={persisting_count} draining at cap"]
+    if fleet_at_cap:
+        parts.append(f"fleet_live={fleet_live}/fleet_cap={fleet_cap}")
+    if deferred_at_cap and isinstance(dispatch_limit, int):
+        parts.append(f"dispatch_limit={dispatch_limit}")
+    return " ".join(parts)
+
+
 def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
     """Surface a present-but-broken orchestrator.config.yaml as a loud anomaly.
 
@@ -1073,9 +1174,30 @@ def check_dispatch_coverage(
         cur_dispatchable = set(dispatchable)
         persisting = sorted(prev_dispatchable & cur_dispatchable)
         if persisting:
-            if cap is not None and len(in_progress) >= cap:
-                # Backlog exceeding the drain rate while every dispatch slot is
-                # occupied is designed behavior, not a dispatch failure.
+            # Issue #1424: the governor that actually bounds dispatch is
+            # fleet-wide (fleet_live_session_count vs fleet_concurrency_limit
+            # across all repos), not the per-repo cap. A repo at 2/5 with the
+            # sibling repo holding the other slots reads as a dispatch failure
+            # under the per-repo denominator when it is designed behaviour.
+            # Derive the drain condition from the last dispatch event's
+            # concurrency_governor payload in this repo's events.db; fall back
+            # to the per-repo cap check only when no governor data is
+            # available (fresh install with no dispatch events yet).
+            last_dispatch = _last_dispatch_drain_signal(repo.state_dir)
+            if last_dispatch is not None:
+                deferred_count = last_dispatch.get("deferred_by_concurrency_count")
+                drain_note = _governor_drain_note(len(persisting), last_dispatch, deferred_count)
+                if drain_note is None:
+                    # The governor shows free slots and the issues still
+                    # persist -- the #1398 head-of-line case, which is real.
+                    reasons.append(
+                        f"issue(s) {persisting} dispatchable across 2 consecutive beats "
+                        "(threshold: must clear within 1 beat)"
+                    )
+            elif cap is not None and len(in_progress) >= cap:
+                # Fallback: no dispatch event in events.db yet (fresh install).
+                # Backlog exceeding the drain rate while every dispatch slot
+                # is occupied is designed behavior, not a dispatch failure.
                 drain_note = (
                     f"backlog={len(persisting)} draining at cap "
                     f"(in_progress={len(in_progress)}/cap={cap})"
