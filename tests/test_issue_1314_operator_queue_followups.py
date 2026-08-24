@@ -48,6 +48,7 @@ def _app(
     tmp_path: Path,
     *,
     deescalation: DeescalationConfig | None = None,
+    dry_run: bool = False,
 ) -> OrchestratorApp:
     config = OrchestratorConfig(
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
@@ -55,7 +56,7 @@ def _app(
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
-    return OrchestratorApp(tmp_path, paths, config, fake_gh)
+    return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=dry_run)
 
 
 def _seed_operator_queue_issue(
@@ -339,6 +340,54 @@ def test_depth_gauge_emits_when_review_cadence_due(tmp_path: Path) -> None:
     events = query_events(app.paths.state_file, kind="operator_queue_depth")
     assert len(events) == 1
     assert events[0]["payload"]["depth"] == 2
+
+
+def test_depth_gauge_silent_under_dry_run_with_deep_queue(tmp_path: Path) -> None:
+    """``dry_run=True`` must short-circuit the gauge even when depth exceeds
+    the threshold -- the gauge emits a warning event and persists the
+    ``next_operator_queue_review_at`` arm timestamp via a raw ``save_state``
+    (outside WriteGate), so running it under dry-run would leak an
+    ``operator_queue_depth`` row into ``events.db`` and mutate
+    ``state.json``, violating the C1.2 "byte-identical to a pass that never
+    ran" dry-run invariant.
+
+    The keystone dry-run loop test
+    (``test_loop_wrapper_telemetry_is_the_only_delta_under_dry_run_true``)
+    pins that invariant but seeds zero escalated issues, so it only
+    exercises the depth<=threshold early return and would not catch a
+    deep-queue dry-run leak on its own. This test seeds a queue that
+    EXCEEDS the threshold (depth=3 > threshold=2) so the only thing
+    preventing the emission is the ``dry_run`` guard itself -- the
+    mutation check reverts the guard and confirms this test then fails.
+    """
+    app = _app(
+        tmp_path,
+        dry_run=True,
+        deescalation=DeescalationConfig(
+            enabled=False,
+            operator_queue_depth_threshold=2,
+        ),
+    )
+    _seed_operator_queue_issue(app, 651, terminal_since="2026-01-01T00:00:00Z")
+    _seed_operator_queue_issue(app, 652, terminal_since="2026-01-02T00:00:00Z")
+    _seed_operator_queue_issue(app, 653, terminal_since="2026-01-03T00:00:00Z")
+
+    before_bytes = app.paths.state_file.read_bytes()
+
+    app._maybe_emit_operator_queue_depth()
+
+    events = query_events(app.paths.state_file, kind="operator_queue_depth")
+    assert events == [], (
+        "dry_run=True must not emit operator_queue_depth even when depth "
+        "exceeds the threshold -- the gauge bypasses WriteGate via a raw "
+        "save_state, so the dry_run guard is the only thing preserving the "
+        "C1.2 byte-identical dry-run invariant"
+    )
+    assert app.paths.state_file.read_bytes() == before_bytes, (
+        "dry_run=True must not mutate state.json -- the gauge's raw "
+        "save_state (arming next_operator_queue_review_at) is gated on "
+        "not dry_run"
+    )
 
 
 # ---------------------------------------------------------------------------

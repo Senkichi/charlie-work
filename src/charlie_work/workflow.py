@@ -20345,7 +20345,23 @@ class OrchestratorApp:
         Threshold 0 disables the alert entirely (no event emitted regardless
         of depth), preserving the pre-feature silent-queue behavior for
         fleets that have not yet opted in.
+
+        ``dry_run`` short-circuits the entire gauge before any lock or state
+        read: the gauge emits a warning event and persists the
+        ``next_operator_queue_review_at`` arm timestamp via a raw
+        ``save_state`` (outside WriteGate), so running it under
+        ``dry_run=True`` would both leak an ``operator_queue_depth`` row into
+        ``events.db`` and mutate ``state.json`` -- violating the C1.2
+        "byte-identical to a pass that never ran" dry-run invariant
+        (``test_loop_wrapper_telemetry_is_the_only_delta_under_dry_run_true``
+        pins that invariant; its fixture has zero escalated issues, so it
+        only exercises the depth<=threshold early return and would not catch
+        a deep-queue dry-run leak on its own). The guard is at the top rather
+        than after the threshold check so a dry-run pass pays neither the
+        lock acquisition nor the state load.
         """
+        if self.dry_run:
+            return
         threshold = self.config.deescalation.operator_queue_depth_threshold
         if threshold <= 0:
             return
