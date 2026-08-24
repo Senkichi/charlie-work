@@ -4982,6 +4982,32 @@ def _classify_dead_sessions_and_update_throttle_state(
                 }
             )
 
+            # Issue #1342: emit a distinct error-level event on the FIRST
+            # detection of a provider account suspension so the operator learns
+            # about a billing problem in minutes, not after the redispatch cap
+            # drains. ``provider_suspended`` is terminal (no cooldown) and sits
+            # in DETERMINISTIC_ESCALATION_FAILURE_KINDS, so the no-open-PR path
+            # below escalates the issue to operator-queue on this same pass —
+            # there is no redispatch, hence exactly one episode and no spam.
+            # The sidecar was just reaped, so the next pass won't re-see this
+            # worker — the event fires once per episode by construction.
+            if w.adapter_kind == "api" and failure_kind == "provider_suspended":
+                with state_lock(state_file):
+                    state = load_state(state_file)
+                    state = write_gate.append_event(
+                        state,
+                        "api_worker_provider_suspended",
+                        {
+                            "issue_number": w.issue_number,
+                            "pid": w.pid,
+                            "process_start_time": w.process_start_time,
+                            "provider": w.provider,
+                            "failure_kind": failure_kind,
+                        },
+                        level="error",
+                    )
+                    write_gate.save_state(state)
+
             # Issue #118: reconcile labels for dead sessions with no open PR
             if w.issue_number not in open_prs_by_issue:
                 try:

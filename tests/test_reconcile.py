@@ -66,6 +66,7 @@ def _raw_rest_pr(
     *,
     merged: bool = False,
     merged_at: str | None = None,
+    closed_at: str | None = None,
     head_ref: str = "agent/issue-1-x",
     head_repo: str | None = "owner/test-repo",
     base_repo: str | None = "owner/test-repo",
@@ -74,6 +75,9 @@ def _raw_rest_pr(
 
     This is the shape ``_normalize_reconcile_pr`` sees in production, but
     existing test fixtures all set the normalized ``RECONCILE_PR_FIELDS`` keys.
+    ``closed_at`` is the REST ``pulls`` snake_case field that the normalizer
+    maps to the camelCase ``closedAt`` (issue #1398); it defaults to ``None``
+    so pre-existing callers are unaffected.
     """
     return {
         "number": number,
@@ -94,6 +98,7 @@ def _raw_rest_pr(
         "labels": [],
         "merged": merged,
         "merged_at": merged_at,
+        "closed_at": closed_at,
     }
 
 
@@ -233,7 +238,19 @@ def test_fetch_prs_normalizes_raw_rest_pulls() -> None:
     (no ``headRefName``, ``head``/``base`` sub-objects, ``merged_at``) to the
     ``RECONCILE_PR_FIELDS`` shape. Existing test fixtures already carry the
     normalized keys, so the transformation branch was previously unexercised.
+
+    Issue #1398: the REST ``pulls`` endpoint names the close time
+    ``closed_at`` (snake_case); the normalizer must surface it as the
+    camelCase ``closedAt`` so the closed-unmerged convergence rules can
+    compare it against the issue's active-session start. A typo on that one
+    mapping line would silently revert the #1398 fix while passing every
+    guard test in test_fix_reconcile.py (which all use the already-normalized
+    ``_pr`` fixture), so this assertion pins the production code path:
+    ``_fetch_prs`` -> ``_normalize_reconcile_pr`` on a raw REST payload.
     """
+    # Derive the close timestamp from the clock so a date-window filter can
+    # never rot this seed (test-hygiene rule).
+    closed_at = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
     merged = _raw_rest_pr(1, state="closed", merged_at="2026-08-05T00:00:00Z")
     open_same = _raw_rest_pr(2, state="open")
     cross = _raw_rest_pr(
@@ -244,11 +261,12 @@ def test_fetch_prs_normalizes_raw_rest_pulls() -> None:
         base_repo="owner/test-repo",
     )
     deleted_fork = _raw_rest_pr(4, state="open", head_repo=None)
-    gh = FakeGitHub(prs=[merged, open_same, cross, deleted_fork], issues=[])
+    closed_unmerged = _raw_rest_pr(5, state="closed", closed_at=closed_at)
+    gh = FakeGitHub(prs=[merged, open_same, cross, deleted_fork, closed_unmerged], issues=[])
 
     result = _fetch_prs(gh)
 
-    assert len(result) == 4
+    assert len(result) == 5
     assert result[0]["state"] == "MERGED"
     assert result[0]["headRefName"] == "agent/issue-1-x"
     assert result[0]["url"] == "https://example.test/pull/1"
@@ -256,6 +274,14 @@ def test_fetch_prs_normalizes_raw_rest_pulls() -> None:
     assert result[2]["isCrossRepository"] is True
     assert result[3]["isCrossRepository"] is None
     assert all("headRefName" in pr for pr in result)
+    # Issue #1398: the snake_case REST ``closed_at`` must survive the
+    # _fetch_prs/_normalize_reconcile_pr pipeline as the camelCase ``closedAt``
+    # with the identical value, and PRs that omit it must normalize to None.
+    assert result[4]["closedAt"] == closed_at
+    assert result[4]["state"] == "CLOSED"
+    assert result[0]["closedAt"] is None  # merged PR: closed_at not set on the seed
+    assert result[1]["closedAt"] is None  # open PR: closed_at absent
+    assert all("closedAt" in pr for pr in result)
 
 
 def test_normalize_reconcile_pr_is_idempotent_on_gh_shape() -> None:
