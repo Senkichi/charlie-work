@@ -2553,6 +2553,7 @@ def test_validate_field_lists_passes_when_gh_lists_all_fields(monkeypatch, tmp_p
             "isCrossRepository",
             "mergeable",
             "headRefOid",
+            "closedAt",
             "databaseId",
             "status",
             "createdAt",
