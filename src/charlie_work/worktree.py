@@ -394,7 +394,12 @@ def read_worker_outcome(worktree_path: Path) -> dict[str, Any] | None:
 
 
 def write_worktree_marker(
-    worktree_path: Path, pid: int, session_id: str, kind: str = "worker"
+    worktree_path: Path,
+    pid: int,
+    session_id: str,
+    kind: str = "worker",
+    *,
+    process_start_time: float | None = None,
 ) -> None:
     """Write a ``.charlie-writer.json`` marker into the worktree root.
 
@@ -402,14 +407,26 @@ def write_worktree_marker(
     detect a live foreign writer before dispatching a second one into the
     same worktree. ``kind`` distinguishes long-lived operator claim markers
     (``pid`` is a sentinel) from ordinary worker session markers.
+
+    Issue #1423: ``process_start_time`` is the OS process creation timestamp
+    captured immediately after spawn (same fingerprint the session sidecars
+    store). It is read back by ``_reap_idle_foreign_writer`` and passed to
+    ``kill_process_tree`` so the kill path re-verifies process identity
+    immediately before terminating — the same PID-recycling defense every
+    other ``kill_process_tree`` call site in this codebase uses. A marker
+    without it (legacy marker written before this field existed, or an
+    operator sentinel marker with ``pid == 0``) cannot be safely reaped and
+    falls back to the block/escalate path instead.
     """
     marker_path = worktree_path / WRITER_MARKER_FILENAME
-    marker = {
+    marker: dict[str, Any] = {
         "pid": pid,
         "session_id": session_id,
         "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "kind": kind,
     }
+    if process_start_time is not None:
+        marker["process_start_time"] = process_start_time
     _write_json_atomic(marker_path, marker)
 
 
@@ -594,11 +611,31 @@ def _reap_idle_foreign_writer(
     writer is genuinely active and must remain blocked — escalation is reserved
     for a writer that is alive *and* active (genuinely someone else's).
 
+    PID-recycling defense (issue #1423 review): the marker's
+    ``process_start_time`` fingerprint is passed to ``kill_process_tree`` so
+    the kill path re-verifies process identity immediately before terminating
+    — the same defense every other ``kill_process_tree`` call site in this
+    codebase uses. A marker without ``process_start_time`` (legacy marker
+    written before the field existed, or an operator sentinel with ``pid 0``)
+    cannot be safely reaped: an idle window can be hours long, and without the
+    fingerprint ``kill_process_tree`` would terminate whatever process now
+    holds the PID, which may be unrelated. Such a marker returns ``False`` so
+    the caller falls back to the block/escalate path instead.
+
     Returns ``True`` when the writer was reaped (caller should proceed with
-    dispatch), ``False`` when it is still active (caller should block/raise).
+    dispatch), ``False`` when it is still active or cannot be safely reaped
+    (caller should block/raise).
     """
     if now is None:
         now = datetime.now(UTC)
+
+    # PID-recycling defense: refuse to reap a marker that carries no
+    # process-start-time fingerprint. Without it, ``kill_process_tree`` cannot
+    # re-verify identity, and an hours-long idle window is exactly the window
+    # in which the OS recycles PIDs. Fall back to block/escalate instead.
+    process_start_time = marker.get("process_start_time")
+    if not isinstance(process_start_time, (int, float)):
+        return False
 
     started_at = marker.get("started_at")
     if not isinstance(started_at, str):
@@ -619,8 +656,11 @@ def _reap_idle_foreign_writer(
         return False
 
     # Writer is alive but idle past the threshold — reap it (same kill path
-    # as ``session_stalled`` in ``_detect_and_handle_stalled_sessions``).
-    killed_pids = kill_process_tree(pid, None)
+    # as ``session_stalled`` in ``_detect_and_handle_stalled_sessions``). The
+    # marker's ``process_start_time`` is passed so ``kill_process_tree``
+    # re-verifies identity immediately before terminating, closing the
+    # PID-recycling gap every other kill call site in this codebase closes.
+    killed_pids = kill_process_tree(pid, process_start_time)
     orphan_pids: list[int] = []
     orphan_processes = sweep_orphan_processes(str(worktree_path))
     if orphan_processes:

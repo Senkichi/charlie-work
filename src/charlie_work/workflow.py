@@ -248,6 +248,7 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _windowed_worker_death_at,
     _windowed_orphan_redispatch_at,
     _windowed_blocked_environment_at,
+    _windowed_foreign_writer_reaps,
     _is_review_dispatchable,
     _select_review_dispatch_candidates,
 )
@@ -8280,18 +8281,36 @@ class OrchestratorApp:
                             # passes but has since gone idle is reaped here instead
                             # of escalating a zombie to a human. Escalation is
                             # reserved for a writer that is alive *and* active.
-                            if _try_reap_blocked_foreign_writer(
+                            #
+                            # Review finding: bound the number of auto-reaps per
+                            # issue before falling back to escalation. Each
+                            # successful reap resets ``blocked_environment_at`` to
+                            # ``[]``, so without a separate cross-pass cap a
+                            # persistently-blocked worktree loops forever between
+                            # reap and redispatch. ``foreign_writer_reaps`` is a
+                            # windowed counter that survives the reset; once it
+                            # reaches ``max_foreign_writer_reaps`` the issue
+                            # escalates instead of reaping again.
+                            max_reaps = self.config.watchdog.max_foreign_writer_reaps
+                            prior_reaps = _windowed_foreign_writer_reaps(
+                                entry,
+                                window_minutes=self.config.watchdog.redispatch_window_minutes,
+                            )
+                            if len(prior_reaps) < max_reaps and _try_reap_blocked_foreign_writer(
                                 failed_result,
                                 self.config,
                                 self.paths.state_file,
                                 request.issue_number,
                             ):
                                 entry["blocked_environment_at"] = []
+                                entry["foreign_writer_reaps"] = prior_reaps + [
+                                    now.isoformat().replace("+00:00", "Z")
+                                ]
                                 status = "dispatch_failed"
                                 dispatched_at = None
                                 clear_escalation(entry)
                                 clear_escalation_on_issue_prs(state, request.issue_number)
-                                state = self._record_event(
+                                state = self._record_event(  # event-consumer: audit-only -- records a foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
                                     state,
                                     "dispatch_blocked_environment_reaped",
                                     {
@@ -8299,6 +8318,7 @@ class OrchestratorApp:
                                         "failure_kind": failure_kind,
                                         "pid": failed_result.pid if failed_result else None,
                                         "blocked_environment_count": len(blocked_environment_at),
+                                        "foreign_writer_reap_count": len(prior_reaps) + 1,
                                     },
                                 )
                             else:
@@ -21361,8 +21381,20 @@ class OrchestratorApp:
                     # blocked pass, reaping it clears the path for dispatch
                     # instead of escalating a zombie. The marker is read from
                     # the worktree path derived from the PR's head ref.
+                    #
+                    # Review finding: bound the number of auto-reaps per issue
+                    # before falling back to escalation (see the fresh-dispatch
+                    # site for the full rationale). The cap is checked against
+                    # the snapshot entry here; the reap timestamp is appended
+                    # inside the lock below.
+                    max_reaps = self.config.watchdog.max_foreign_writer_reaps
+                    prior_reaps = _windowed_foreign_writer_reaps(
+                        issue_entry_pre,
+                        window_minutes=self.config.watchdog.redispatch_window_minutes,
+                    )
+                    reap_cap_ok = len(prior_reaps) < max_reaps
                     branch_pre = str(pr_data.get("headRefName") or "")
-                    if branch_pre:
+                    if branch_pre and reap_cap_ok:
                         wt_path_pre = worktree_path_for_branch(
                             self.repo_root, branch_pre, self._layout.worktrees
                         )
@@ -21384,20 +21416,31 @@ class OrchestratorApp:
                                 )
                             ):
                                 # Writer reaped: clear the counter so the issue
-                                # proceeds as a legitimate candidate.
+                                # proceeds as a legitimate candidate, and record
+                                # the reap so a persistently-blocked worktree
+                                # eventually escalates instead of looping.
                                 with state_lock(self.paths.state_file):
                                     state = load_state(self.paths.state_file)
                                     issue_entry = state["issues"].get(str(issue_number), {})
                                     if isinstance(issue_entry, dict):
                                         issue_entry["blocked_environment_at"] = []
+                                        existing_reaps = _windowed_foreign_writer_reaps(
+                                            issue_entry,
+                                            window_minutes=self.config.watchdog.redispatch_window_minutes,
+                                        )
+                                        issue_entry["foreign_writer_reaps"] = existing_reaps + [
+                                            datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                                        ]
                                         state["issues"][str(issue_number)] = issue_entry
-                                        state = append_event(
+                                        state = append_event(  # event-consumer: audit-only -- records a pre-escalation foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
                                             state,
                                             "dispatch_blocked_environment_reaped",
                                             {
                                                 "issue_number": issue_number,
                                                 "pid": pid_pre,
                                                 "blocked_environment_count": len(prior_blocked),
+                                                "foreign_writer_reap_count": len(existing_reaps)
+                                                + 1,
                                             },
                                             state_path=self.paths.state_file,
                                         )
@@ -22345,7 +22388,16 @@ class OrchestratorApp:
                             # passes but has since gone idle is reaped here instead
                             # of escalating a zombie to a human. Escalation is
                             # reserved for a writer that is alive *and* active.
-                            if _try_reap_blocked_foreign_writer(
+                            #
+                            # Review finding: bound the number of auto-reaps per
+                            # issue before falling back to escalation (see the
+                            # fresh-dispatch site for the full rationale).
+                            max_reaps = self.config.watchdog.max_foreign_writer_reaps
+                            prior_reaps = _windowed_foreign_writer_reaps(
+                                entry,
+                                window_minutes=self.config.watchdog.redispatch_window_minutes,
+                            )
+                            if len(prior_reaps) < max_reaps and _try_reap_blocked_foreign_writer(
                                 failed_result,
                                 self.config,
                                 self.paths.state_file,
@@ -22354,8 +22406,11 @@ class OrchestratorApp:
                                 entry["status"] = "rework_requested"
                                 entry["dispatched_at"] = None
                                 entry["blocked_environment_at"] = []
+                                entry["foreign_writer_reaps"] = prior_reaps + [
+                                    now.isoformat().replace("+00:00", "Z")
+                                ]
                                 state["issues"][str(request.issue_number)] = entry
-                                state = append_event(
+                                state = append_event(  # event-consumer: audit-only -- records a rework-dispatch foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
                                     state,
                                     "rework_dispatch_blocked_environment_reaped",
                                     {
@@ -22363,6 +22418,7 @@ class OrchestratorApp:
                                         "failure_kind": failure_kind,
                                         "pid": failed_result.pid if failed_result else None,
                                         "blocked_environment_count": len(blocked_environment_at),
+                                        "foreign_writer_reap_count": len(prior_reaps) + 1,
                                     },
                                     state_path=self.paths.state_file,
                                 )

@@ -483,6 +483,40 @@ def _windowed_blocked_environment_at(
     return result
 
 
+def _windowed_foreign_writer_reaps(
+    entry: dict[str, Any],
+    *,
+    window_minutes: int,
+) -> list[str]:
+    """Return foreign-writer reap timestamps within the window.
+
+    Issue #1423: parallel to ``_windowed_blocked_environment_at`` but reads
+    ``entry["foreign_writer_reaps"]`` -- the list of timestamps recorded each
+    time a ``worktree_foreign_writer`` block was auto-reaped at the
+    blocked-environment cap exhaustion point (instead of escalating). Each
+    successful reap resets ``blocked_environment_at`` to ``[]``, so without
+    this separate cross-pass counter a persistently-blocked worktree would
+    loop forever between reap and redispatch. The cap is enforced by the
+    caller against ``watchdog.max_foreign_writer_reaps``; when the windowed
+    count is at/over the cap, the caller escalates instead of reaping.
+    """
+    raw = entry.get("foreign_writer_reaps")
+    if not isinstance(raw, list):
+        return []
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=window_minutes)
+    result: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        try:
+            if datetime.fromisoformat(t.replace("Z", "+00:00")) >= window_start:
+                result.append(t)
+        except (ValueError, AttributeError):
+            continue
+    return result
+
+
 def _is_review_dispatchable(
     state: dict[str, Any],
     pr_number: int,

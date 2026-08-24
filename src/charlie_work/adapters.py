@@ -95,6 +95,11 @@ class SessionDispatchResult:
     pid: int | None = None  # Worker process PID for state-based liveness detection
     process_start_time: float | None = None  # Process creation time for PID recycling protection
     failure_kind: str | None = None  # stable machine-readable classification of a failure
+    # Issue #1423: the worktree path the launch resolved to. Carried so the
+    # blocked-environment reap path (``_try_reap_blocked_foreign_writer``) can
+    # read the writer marker without re-deriving the path from the branch name.
+    # Empty for adapters that never create a worktree (command/manual/dry-run).
+    worktree_path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -113,6 +118,7 @@ class SessionDispatchResult:
             "pid": self.pid,
             "process_start_time": self.process_start_time,
             "failure_kind": self.failure_kind,
+            "worktree_path": self.worktree_path,
         }
 
 
@@ -335,6 +341,7 @@ def _run_devin_shell_adapter(
             pid=record.pid,
             process_start_time=record.process_start_time,
             failure_kind=record.failure_kind,
+            worktree_path=record.worktree_path,
         )
     except Exception as exc:
         # Catch any unexpected exception and return as a failure result
@@ -391,6 +398,7 @@ def _run_claude_code_adapter(
         pid=record.pid,
         process_start_time=record.process_start_time,
         failure_kind=record.failure_kind,
+        worktree_path=record.worktree_path,
     )
 
 
@@ -457,6 +465,7 @@ def _run_api_adapter(
         pid=record.pid,
         process_start_time=record.process_start_time,
         failure_kind=record.failure_kind,
+        worktree_path=record.worktree_path,
     )
 
 
@@ -536,6 +545,7 @@ def _result(
     pid: int | None = None,
     process_start_time: float | None = None,
     failure_kind: str | None = None,
+    worktree_path: str = "",
 ) -> SessionDispatchResult:
     return SessionDispatchResult(
         issue_number=request.issue_number,
@@ -553,6 +563,7 @@ def _result(
         pid=pid,
         process_start_time=process_start_time,
         failure_kind=failure_kind,
+        worktree_path=worktree_path,
     )
 
 
