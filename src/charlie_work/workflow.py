@@ -19733,6 +19733,18 @@ class OrchestratorApp:
         untouched here (skip reason ``no_open_pr``) rather than guessed at; a
         human still recovers it via ``charlie unescalate --issue``.
         """
+        # Issue #1327: under dry-run the paired GitHub label transition is
+        # already gated at the sink, so the state.json write that records the
+        # clear must be suppressed in lockstep -- otherwise a single dry-run
+        # pass leaves state.json reporting the issue de-escalated while GitHub
+        # still shows the ``escalated`` label. Returning a skip (rather than
+        # proceeding and letting ``self.write_gate`` suppress each write)
+        # also avoids pointless GitHub reads and a misleading ``cleared``
+        # return value that would diverge from the (unwritten) state. The
+        # write-gate routing below is the structural backstop for any future
+        # caller that bypasses this guard.
+        if self.dry_run:
+            return _deescalation_skip("dry_run", issue_number)
         state = load_state_locked(self.paths.state_file)
         issue_key = str(issue_number)
         issue_entry = state.get("issues", {}).get(issue_key, {})
@@ -19763,7 +19775,7 @@ class OrchestratorApp:
                     "number": issue_number,
                     "deescalation_cap_notified_at": utc_now(),
                 }
-                fresh_state = self._record_event(
+                fresh_state = self.write_gate.record_event(
                     fresh_state,
                     "deescalation_cap_exhausted",
                     {
@@ -19772,7 +19784,7 @@ class OrchestratorApp:
                         "max_auto_deescalations": max_auto,
                     },
                 )
-                save_state(self.paths.state_file, fresh_state)
+                self.write_gate.save_state(fresh_state)
             # Issue #1266: the auto-clearing sweep has given up on this
             # mechanical escalation -- move it off operator_queue onto
             # human_needed so a human actually sees it (operator_queue is
@@ -19786,7 +19798,7 @@ class OrchestratorApp:
             # correctly re-targets human_needed once reason_class stays
             # "mechanical" but this cap-exhaustion path has already run
             # (repair reads state fresh, not this function's return value).
-            transition(self.gh, self.config.labels, issue_number, "escalated")
+            self.write_gate.transition(self.gh, self.config.labels, issue_number, "escalated")
             return {"cap_exhausted": True, "issue_number": issue_number}
 
         pr_number: int | None = None
@@ -19868,7 +19880,7 @@ class OrchestratorApp:
                 # Changed concurrently since the snapshot (human unescalate,
                 # re-escalation with a different reason_class, etc.) -- do
                 # not act on stale intent.
-                save_state(self.paths.state_file, fresh_state)
+                self.write_gate.save_state(fresh_state)
                 return _deescalation_skip("changed_concurrently", issue_number)
 
             # Split from a single composite condition purely so each blocking
@@ -19879,13 +19891,13 @@ class OrchestratorApp:
             # ``pr_conflicting`` mean the escalation should never have been a
             # sweep candidate at all.
             if pr_state_str != "OPEN":
-                save_state(self.paths.state_file, fresh_state)
+                self.write_gate.save_state(fresh_state)
                 return _deescalation_skip("pr_not_open", issue_number)
             if mergeable == "CONFLICTING":
-                save_state(self.paths.state_file, fresh_state)
+                self.write_gate.save_state(fresh_state)
                 return _deescalation_skip("pr_conflicting", issue_number)
             if not janitor_verdict.ok:
-                save_state(self.paths.state_file, fresh_state)
+                self.write_gate.save_state(fresh_state)
                 return _deescalation_skip("janitor_blocked", issue_number)
 
             cleared_condition = fresh_issue_entry.get("escalation_reason")
@@ -19938,7 +19950,7 @@ class OrchestratorApp:
                         fresh_pr[counter_field] = 0
                         for _field in companion_fields:
                             fresh_pr.pop(_field, None)
-            fresh_state = self._record_event(
+            fresh_state = self.write_gate.record_event(
                 fresh_state,
                 "deescalation_cleared",
                 {
@@ -19952,9 +19964,11 @@ class OrchestratorApp:
                     "rework_budget_reset": budget_reset_needed,
                 },
             )
-            save_state(self.paths.state_file, fresh_state)
+            self.write_gate.save_state(fresh_state)
 
-        result = transition(self.gh, self.config.labels, issue_number, "unescalated_pr_open")
+        result = self.write_gate.transition(
+            self.gh, self.config.labels, issue_number, "unescalated_pr_open"
+        )
         if result.outcome != TransitionOutcome.APPLIED:
             with state_lock(self.paths.state_file):
                 fresh_state = load_state(self.paths.state_file)
@@ -19969,7 +19983,7 @@ class OrchestratorApp:
                         "remove_failures": result.remove_failures,
                     },
                 }
-                save_state(self.paths.state_file, fresh_state)
+                self.write_gate.save_state(fresh_state)
 
         return {
             "cleared": True,
@@ -20038,7 +20052,7 @@ class OrchestratorApp:
                 **state,
                 "issues": {**state.get("issues", {}), issue_key: issue},
             }
-            state = self._record_event(
+            state = self.write_gate.record_event(
                 state,
                 "deescalation_reason_class_backfilled",
                 {
@@ -20114,7 +20128,7 @@ class OrchestratorApp:
             if not is_deescalation_due(state):
                 return
             state = self._backfill_missing_reason_classes(state)
-            save_state(state_file, state)
+            self.write_gate.save_state(state)
             candidates = sorted(
                 int(num)
                 for num, entry in state.get("issues", {}).items()
@@ -20157,7 +20171,7 @@ class OrchestratorApp:
         with state_lock(state_file):
             state = load_state(state_file)
             state = arm_deescalation_pass(state, next_deescalation_at)
-            state = self._record_event(
+            state = self.write_gate.record_event(
                 state,
                 "deescalation_pass_completed",
                 {
@@ -20176,7 +20190,7 @@ class OrchestratorApp:
                     "errors": errors,
                 },
             )
-            save_state(state_file, state)
+            self.write_gate.save_state(state)
 
     def _loop_body(
         self, limit: int | None, *, merge: bool | None, now: datetime | None = None
