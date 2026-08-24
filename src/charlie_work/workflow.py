@@ -168,6 +168,7 @@ from .state import (
     StateLockBusy,
     append_event,
     arm_deescalation_pass,
+    arm_operator_queue_review,
     arm_quota_probe,
     arm_reconcile_pass,
     clear_quota_throttles,
@@ -181,6 +182,7 @@ from .state import (
     escalation_reason_class,
     is_claim_stale,
     is_deescalation_due,
+    is_operator_queue_review_due,
     is_quota_probe_actionable,
     is_quota_probe_armed,
     is_quota_probe_due,
@@ -1923,6 +1925,38 @@ def sink_census(state: dict[str, Any]) -> set[int]:
         if entry.get("status") in _SINK_STATUSES and str(num).isdigit():
             parked.add(int(num))
     return parked
+
+
+def operator_queue_depth(state: dict[str, Any]) -> set[int]:
+    """Return the set of issue numbers currently parked on the operator queue.
+
+    Issue #1314 item 3. The operator queue is the subset of the sink
+    (``sink_census``) whose entries carry ``reason_class == "mechanical"`` --
+    the in-state mirror of the ``agent:operator-queue`` GitHub label (issue
+    #1266). ``status == "blocked"`` is never mechanical (``blocked`` is a
+    reviewer verdict, always ``reason_class == "judgment"``), so only
+    ``status == "escalated"`` entries with the mechanical class are counted.
+
+    This is a point-in-time census read directly from ``state.json``'s
+    ``issues`` map, deliberately not a GitHub-label query: it is cheap,
+    deterministic, and matches the same source of truth the de-escalation
+    sweep selects candidates from, so the gauge and the sweep agree on the
+    population.
+    """
+    issues = state.get("issues", {})
+    if not isinstance(issues, dict):
+        return set()
+    queued: set[int] = set()
+    for num, entry in issues.items():
+        if not isinstance(entry, dict):
+            continue
+        if (
+            entry.get("status") == "escalated"
+            and entry.get("reason_class") == "mechanical"
+            and str(num).isdigit()
+        ):
+            queued.add(int(num))
+    return queued
 
 
 # Issue #1153: minimum number of zero-artifact attempts (all ``ahead_of_main
@@ -5824,6 +5858,32 @@ def _try_reap_blocked_foreign_writer(
         state_file=state_file,
         issue_number=issue_number,
     )
+
+
+def _has_other_open_pr(
+    state: dict[str, Any], issue_number: int | None, exclude_pr_number: int | None
+) -> bool:
+    """Return True if any PR for ``issue_number`` is open besides ``exclude_pr_number``.
+
+    Used by ``unescalate`` to decide whether a terminal PR on GitHub is the
+    *only* PR for the issue (issue #1391): when it is, the issue can be
+    dropped to baseline in the same call instead of requiring a second
+    ``unescalate --issue N`` to take the no-live-PR path. "Open" here means
+    the state.json status is not ``merged`` or ``closed`` — the same
+    predicate the PR resolution at the top of ``unescalate`` uses.
+    """
+    if issue_number is None:
+        return False
+    for k, v in state.get("prs", {}).items():
+        if not isinstance(v, dict) or not k.isdigit():
+            continue
+        if v.get("issue_number") != issue_number:
+            continue
+        if exclude_pr_number is not None and int(k) == exclude_pr_number:
+            continue
+        if v.get("status") not in ("merged", "closed"):
+            return True
+    return False
 
 
 class OrchestratorApp:
@@ -10864,6 +10924,130 @@ class OrchestratorApp:
             {"queue": queue},
         )
 
+    def operator_queue(self) -> CommandResult:
+        """List issues currently parked on ``agent:operator-queue`` (issue #1314 item 1).
+
+        An operator-facing inspection command that joins three data sources
+        so the queue is workable without hand-rolling ``gh`` queries:
+
+        - GitHub issues carrying the ``operator_queue`` label (via
+          ``gh.issue_list``), for title/URL/label context.
+        - ``state.json``'s ``issues`` map, for ``reason_class`` provenance,
+          ``escalation_reason``, ``terminal_since`` (age), and the
+          de-escalation cap marker (``deescalation_cap_notified_at``).
+        - ``events.db``, for the last escalation-transition event per issue
+          (the ``kind`` and ``ts`` of the most recent event whose kind is in
+          ``ESCALATION_REASON_CLASS_BY_EVENT_KIND`` or
+          ``DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS``), so an
+          operator can see *when* and *why* the issue was parked.
+
+        Issues on the label but missing from state (a manual label add with
+        no escalation event) are included with ``reason_class: null`` and
+        ``age_days: null`` so they are visible rather than silently dropped.
+        Issues in state but missing from the GitHub label query (a label
+        transition that has not yet propagated) are included from state
+        alone.
+
+        Returns a ``CommandResult`` with a ``queue`` list sorted by
+        ``terminal_since`` ascending (oldest first), each entry carrying
+        ``number``, ``title``, ``url``, ``labels``, ``reason_class``,
+        ``escalation_reason``, ``terminal_since``, ``age_days``,
+        ``deescalation_cap_notified_at``, and ``last_escalation_event``.
+        """
+        operator_queue_label = self.config.labels.operator_queue
+        issues = self.gh.issue_list(operator_queue_label)
+        state = load_state_locked(self.paths.state_file)
+        state_issues = state.get("issues", {})
+        if not isinstance(state_issues, dict):
+            state_issues = {}
+
+        now = datetime.now(UTC)
+        escalation_kinds = (
+            frozenset(ESCALATION_REASON_CLASS_BY_EVENT_KIND)
+            | DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS
+        )
+
+        # Build a set of issue numbers from the GitHub label query.
+        gh_numbers: set[int] = set()
+        issues_by_number: dict[int, dict[str, Any]] = {}
+        for issue in issues:
+            num = issue.get("number")
+            if num is not None:
+                gh_numbers.add(int(num))
+                issues_by_number[int(num)] = issue
+
+        # Build a set of issue numbers from state that match the operator-queue
+        # criteria (status == "escalated", reason_class == "mechanical").
+        state_numbers: set[int] = set()
+        for num_str, entry in state_issues.items():
+            if not isinstance(entry, dict):
+                continue
+            if (
+                entry.get("status") == "escalated"
+                and entry.get("reason_class") == "mechanical"
+                and str(num_str).isdigit()
+            ):
+                state_numbers.add(int(num_str))
+
+        all_numbers = sorted(gh_numbers | state_numbers)
+
+        queue: list[dict[str, Any]] = []
+        for issue_number in all_numbers:
+            tracked_entry = state_issues.get(str(issue_number))
+            if not isinstance(tracked_entry, dict):
+                tracked_entry = {}
+
+            gh_issue = issues_by_number.get(issue_number, {})
+
+            terminal_since = tracked_entry.get("terminal_since")
+            age_days: float | None = None
+            if terminal_since:
+                try:
+                    since_dt = datetime.fromisoformat(str(terminal_since).replace("Z", "+00:00"))
+                    age_days = round((now - since_dt).total_seconds() / 86400.0, 2)
+                except (ValueError, TypeError):
+                    age_days = None
+
+            # Query events.db for the last escalation-transition event.
+            last_escalation_event: dict[str, Any] | None = None
+            events = query_events(
+                self.paths.state_file,
+                issue_number=issue_number,
+            )
+            escalation_events = [e for e in events if e.get("kind") in escalation_kinds]
+            if escalation_events:
+                last_escalation_event = {
+                    "kind": escalation_events[-1].get("kind"),
+                    "ts": escalation_events[-1].get("ts"),
+                }
+
+            queue.append(
+                {
+                    "number": issue_number,
+                    "title": gh_issue.get("title"),
+                    "url": gh_issue.get("url"),
+                    "labels": sorted(label_names(gh_issue)) if gh_issue else [],
+                    "reason_class": tracked_entry.get("reason_class"),
+                    "escalation_reason": tracked_entry.get("escalation_reason"),
+                    "terminal_since": terminal_since,
+                    "age_days": age_days,
+                    "deescalation_cap_notified_at": tracked_entry.get(
+                        "deescalation_cap_notified_at"
+                    ),
+                    "last_escalation_event": last_escalation_event,
+                }
+            )
+
+        # Sort by terminal_since ascending (oldest first); issues with no
+        # terminal_since sort last.
+        queue.sort(key=lambda e: (e["terminal_since"] is None, e["terminal_since"] or ""))
+
+        return CommandResult(
+            True,
+            f"operator queue: {len(queue)} issue(s) parked on {operator_queue_label}",
+            {"queue": queue, "depth": len(queue)},
+        )
+
     def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
         """Record verdicts for dead reviewers whose sidecar log contains a valid
         fenced JSON verdict block.
@@ -14177,9 +14361,19 @@ class OrchestratorApp:
                 issue_status_action = "passive"
                 label_edge = "unescalated_pr_open"
             elif live_pr_state in ("MERGED", "CLOSED"):
-                # Terminal PR: leave issue status to finalization/reconcile,
-                # which own the closed-issue bookkeeping.
-                label_edge = None
+                # Terminal PR on GitHub. If the issue is still escalated and
+                # no other open PR references it, drop the issue to baseline
+                # in the same call — reconcile deliberately never rewrites an
+                # open escalated issue's status (D-2), so leaving it would
+                # require a second identical ``unescalate --issue N`` call to
+                # take the no-live-PR path (issue #1391). When another open PR
+                # exists, or the issue is not stuck, leave the issue to
+                # finalization/reconcile as before.
+                if issue_stuck and not _has_other_open_pr(state, issue_number, pr_number):
+                    issue_status_action = "drop"
+                    label_edge = "unescalated_requeued"
+                else:
+                    label_edge = None
             elif issue_stuck:
                 # No live PR at all — back to the never-dispatched baseline
                 # (a status literal no dispatch selector reads would just
@@ -19173,6 +19367,14 @@ class OrchestratorApp:
                     correlation_id=cid,
                 )
             )
+            # Issue #1314 item 3: operator-queue depth gauge. Emitted after
+            # ``_loop_body`` so the gauge reflects post-pass state (the
+            # de-escalation sweep inside ``_loop_body`` may have cleared some
+            # issues), and before ``loop_completed`` so the gauge event is
+            # not self-counted by any post-pass event query. Shares this
+            # pass's correlation ID so the depth reading is attributable to
+            # the same pass as the sink census above.
+            self._maybe_emit_operator_queue_depth()
             log_event(
                 self.paths.state_file,
                 "loop_completed",
@@ -20254,6 +20456,78 @@ class OrchestratorApp:
                 },
             )
             self.write_gate.save_state(state)
+
+    def _maybe_emit_operator_queue_depth(self) -> None:
+        """Emit the ``operator_queue_depth`` gauge event when depth exceeds threshold.
+
+        Issue #1314 item 3. The operator-queue depth gauge makes a silently
+        growing queue of mechanical escalations visible in ``events.db``
+        rather than only via GitHub label queries. The gauge is checked
+        every loop pass (or on the dedicated
+        ``operator_queue_review_interval_minutes`` cadence if configured),
+        and the ``operator_queue_depth`` warning event is emitted only when
+        the depth exceeds the configured ``operator_queue_depth_threshold``
+        -- the same "checked every pass, emitted only when the condition
+        holds" pattern ``dispatch_stale`` uses.
+
+        The consumer is ``heartbeat_check.py``'s ``check_warning_events``,
+        which buckets the kind (registered in
+        ``EXPECTED_OPERATIONAL_KINDS``) into a summarized count so a
+        chronically deep queue does not drown out genuinely rare warnings.
+        That bucketing wiring lands in the same PR as the signal, per the
+        signal-without-a-consumer rule.
+
+        Threshold 0 disables the alert entirely (no event emitted regardless
+        of depth), preserving the pre-feature silent-queue behavior for
+        fleets that have not yet opted in.
+
+        ``dry_run`` short-circuits the entire gauge before any lock or state
+        read: the gauge emits a warning event and persists the
+        ``next_operator_queue_review_at`` arm timestamp via a raw
+        ``save_state`` (outside WriteGate), so running it under
+        ``dry_run=True`` would both leak an ``operator_queue_depth`` row into
+        ``events.db`` and mutate ``state.json`` -- violating the C1.2
+        "byte-identical to a pass that never ran" dry-run invariant
+        (``test_loop_wrapper_telemetry_is_the_only_delta_under_dry_run_true``
+        pins that invariant; its fixture has zero escalated issues, so it
+        only exercises the depth<=threshold early return and would not catch
+        a deep-queue dry-run leak on its own). The guard is at the top rather
+        than after the threshold check so a dry-run pass pays neither the
+        lock acquisition nor the state load.
+        """
+        if self.dry_run:
+            return
+        threshold = self.config.deescalation.operator_queue_depth_threshold
+        if threshold <= 0:
+            return
+
+        state_file = self.paths.state_file
+        review_interval = self.config.deescalation.operator_queue_review_interval_minutes
+        with state_lock(state_file):
+            state = load_state(state_file)
+            if review_interval > 0 and not is_operator_queue_review_due(state):
+                return
+            depth_set = operator_queue_depth(state)
+            depth = len(depth_set)
+            if depth <= threshold:
+                return
+            next_review_at = (
+                (datetime.now(UTC) + timedelta(minutes=review_interval))
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+            state = arm_operator_queue_review(state, next_review_at)
+            state = self._record_event(
+                state,
+                "operator_queue_depth",
+                {
+                    "depth": depth,
+                    "threshold": threshold,
+                    "issue_numbers": sorted(depth_set),
+                },
+            )
+            save_state(state_file, state)
 
     def _loop_body(
         self, limit: int | None, *, merge: bool | None, now: datetime | None = None

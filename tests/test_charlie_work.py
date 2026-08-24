@@ -39391,6 +39391,15 @@ def test_build_parser_fleet_subcommand() -> None:
     args_single = parser.parse_args(["review-queue"])
     assert args_single.command == "review-queue"
 
+    # Test fleet operator-queue parsing (issue #1314 item 1)
+    args_fleet_operator_queue = parser.parse_args(["fleet", "operator-queue"])
+    assert args_fleet_operator_queue.command == "fleet"
+    assert args_fleet_operator_queue.fleet_command == "operator-queue"
+
+    # Test single-repo operator-queue parsing (issue #1314 item 1)
+    args_operator_queue = parser.parse_args(["operator-queue"])
+    assert args_operator_queue.command == "operator-queue"
+
 
 def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monkeypatch) -> None:
     """Issue #369: fleet review-queue aggregates per repo and isolates errors."""
@@ -39487,6 +39496,141 @@ def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monke
     assert len(result.data["errors"]) == 1
     assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
     assert "does not exist" in result.data["errors"][0]["error"]
+
+
+def test_run_command_dispatches_operator_queue(tmp_path: Path) -> None:
+    """Issue #1314 item 1: ``run_command`` routes ``operator-queue`` to
+    ``app.operator_queue()`` and returns its result verbatim.
+
+    Mirrors the established convention that the CLI dispatch branch for a
+    queue command is exercised end-to-end through ``run_command`` rather than
+    only through the ``OrchestratorApp`` method in isolation — a broken
+    dispatch branch (wrong ``args.command`` string, missing branch) would
+    otherwise go undetected by the method-level tests.
+    """
+    args = cli.build_parser().parse_args(["operator-queue"])
+    assert args.command == "operator-queue"
+
+    dispatched: list[str] = []
+    expected = cli.CommandResult(
+        True, "operator queue: 0 issue(s) parked", {"queue": [], "depth": 0}
+    )
+
+    class _FakeApp:
+        def operator_queue(self) -> cli.CommandResult:
+            dispatched.append("operator_queue")
+            return expected
+
+    result = cli.run_command(_FakeApp(), args)  # type: ignore[arg-type]
+
+    assert dispatched == ["operator_queue"]
+    assert result is expected
+
+
+def test_fleet_operator_queue_aggregates_and_isolates_errors(tmp_path: Path, monkeypatch) -> None:
+    """Issue #1314 item 1: fleet operator-queue aggregates per repo and
+    isolates errors, mirroring ``test_fleet_review_queue_aggregates_and_isolates_errors``.
+
+    A broken repo (missing root) is isolated into ``errors`` while the good
+    repo's ``operator_queue()`` result still populates ``per_repo``, and
+    ``CommandResult.ok`` is False only because ``errors`` is non-empty.
+    """
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    repo_ok = tmp_path / "repo_ok"
+    repo_ok.mkdir()
+    config_ok = repo_ok / "orchestrator.config.yaml"
+    config_ok.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\n  operator_queue: agent:operator-queue\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo_ok / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Good repo: one issue carrying the operator_queue label, plus a state.json
+    # entry marking it a mechanical escalation with a terminal_since timestamp.
+    now = datetime.now(UTC)
+    terminal_since = (now - timedelta(days=2)).isoformat().replace("+00:00", "Z")
+    (repo_ok / ".var" / "charlie-work" / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {
+                    "42": {
+                        "number": 42,
+                        "status": "escalated",
+                        "reason_class": "mechanical",
+                        "escalation_reason": "test escalation",
+                        "terminal_since": terminal_since,
+                    }
+                },
+                "prs": {},
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo_ok": {
+                "repo_root": str(repo_ok),
+                "name_with_owner": "owner/repo_ok",
+                "config_path": str(config_ok),
+                "state_dir": str(repo_ok / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo_broken": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "name_with_owner": "owner/repo_broken",
+                "config_path": str(tmp_path / "nonexistent" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "nonexistent" / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, labels=None, state=None):
+        return [
+            {
+                "number": 42,
+                "title": "issue 42",
+                "url": "https://example.test/issues/42",
+                "body": "",
+                "labels": [{"name": "agent:operator-queue"}],
+                "state": "OPEN",
+            }
+        ]
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    # run_fleet_operator_queue creates a real GitHub instance; short-circuit the
+    # field-list probe, which would otherwise require an authenticated ``gh`` CLI.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
+
+    args = cli.build_parser().parse_args(["fleet", "operator-queue"])
+    result = cli.run_fleet_operator_queue(args)
+
+    assert result.ok is False
+    assert "1 repo(s), 1 error(s)" in result.message
+    # The good repo's queue still populated despite the broken repo's error.
+    ok_queue = result.data["repos"]["owner/repo_ok"]["queue"]
+    assert len(ok_queue) == 1
+    assert ok_queue[0]["number"] == 42
+    assert ok_queue[0]["reason_class"] == "mechanical"
+    assert ok_queue[0]["terminal_since"] == terminal_since
+    assert result.data["repos"]["owner/repo_ok"]["depth"] == 1
+    # The broken repo is isolated into errors, not mixed into per_repo.
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
+    assert "does not exist" in result.data["errors"][0]["error"]
+    assert "owner/repo_broken" not in result.data["repos"]
 
 
 def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
