@@ -52297,7 +52297,7 @@ def test_dispatch_fresh_blocked_environment_reap_resets_counter(
     monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
     reap_calls: list[int] = []
 
-    def _fake_reap(failed_result, _config, _state_file, issue_number):
+    def _fake_reap(failed_result, _config, _state_file, issue_number, _sessions_dir=None):
         reap_calls.append(issue_number)
         return True
 
@@ -52391,7 +52391,7 @@ def test_dispatch_rework_blocked_environment_reap_resets_counter(
     # marker so Site 3 can read it too.
     monkeypatch.setattr(
         "charlie_work.workflow._reap_idle_foreign_writer",
-        lambda worktree_path, pid, session_id, marker, _config, **_kw: True,
+        lambda worktree_path, marker, _config, _sessions_dir=None, **_kw: True,
     )
 
     def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
@@ -52490,8 +52490,8 @@ def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
     reap_calls: list[int] = []
 
-    def _fake_reap(worktree_path, pid, session_id, marker, _config, **_kw):
-        reap_calls.append(pid)
+    def _fake_reap(worktree_path, marker, _config, _sessions_dir=None, **_kw):
+        reap_calls.append(marker["pid"])
         return True
 
     monkeypatch.setattr("charlie_work.workflow._reap_idle_foreign_writer", _fake_reap)
@@ -52585,7 +52585,9 @@ def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
 
     monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
 
-    def _reap_must_not_run(_failed_result, _config, _state_file, _issue_number):
+    def _reap_must_not_run(
+        _failed_result, _config, _state_file, _issue_number, _sessions_dir=None
+    ):
         raise AssertionError("reap must not be attempted once the reap cap is reached")
 
     monkeypatch.setattr(
