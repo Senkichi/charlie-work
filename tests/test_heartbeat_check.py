@@ -513,6 +513,118 @@ def test_check_review_liveness_non_escalated_pending_status_still_counts(
     assert "escalated=" not in report.lines[0]
 
 
+def test_review_claim_timestamp_completed_rebuilt_uses_prompt_mtime(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Regression for issue #1403.
+
+    A completed prior cycle (``review_dispatch_status ==
+    review_dispatch_completed``) whose packet was rebuilt for a newer head:
+    state.json still carries the PRIOR cycle's ``review_dispatched_at`` (stale),
+    but the on-disk decision is back to ``pending`` head-stamped with the new
+    head.  ``_review_claim_timestamp`` must anchor on the packet-rebuild
+    evidence (``review-prompt.md`` mtime) instead of the stale dispatch time.
+    """
+    pr_dir = tmp_path / "prs" / "pr-1395"
+    pr_dir.mkdir(parents=True)
+    rebuild_time = datetime(2026, 8, 23, 0, 52, 19, tzinfo=timezone.utc)
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (rebuild_time.timestamp(),) * 2)
+
+    pr_state = {
+        "review_dispatch_status": "review_dispatch_completed",
+        # Prior cycle's dispatch time -- 138m before the beat, the false
+        # ANOMALY source from the 2026-08-23T01:07Z incident.
+        "review_dispatched_at": "2026-08-22T22:49:27Z",
+        # Prior cycle's reviewed head.
+        "reviewed_head_sha": "prior-cycle-head-sha",
+    }
+    decision = {"decision": "pending", "reviewed_head_sha": "new-head-sha"}
+
+    timestamp = hb._review_claim_timestamp(pr_state, pr_dir=pr_dir, decision=decision)
+    assert timestamp is not None
+    parsed = hb.parse_iso(timestamp)
+    assert parsed == rebuild_time
+
+
+def test_review_claim_timestamp_completed_same_head_falls_back_to_state(
+    hb: ModuleType, tmp_path: Path
+) -> None:
+    """Issue #1403 guard: the rebuilt-packet anchor only fires when the head
+    actually advanced past the prior cycle's reviewed head.
+
+    When the on-disk pending decision's ``reviewed_head_sha`` matches state's
+    ``reviewed_head_sha`` (no new head -- not a rebuilt-for-new-head packet),
+    the state.json dispatch timestamp path is unchanged.
+    """
+    pr_dir = tmp_path / "prs" / "pr-42"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+
+    pr_state = {
+        "review_dispatch_status": "review_dispatch_completed",
+        "review_dispatched_at": "2026-08-22T22:49:27Z",
+        "reviewed_head_sha": "same-head-sha",
+    }
+    decision = {"decision": "pending", "reviewed_head_sha": "same-head-sha"}
+
+    assert (
+        hb._review_claim_timestamp(pr_state, pr_dir=pr_dir, decision=decision)
+        == "2026-08-22T22:49:27Z"
+    )
+
+
+def test_check_review_liveness_completed_rebuilt_no_false_anomaly(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Regression for issue #1403: end-to-end check.
+
+    Production shape from the 2026-08-23T01:07Z beat on pr-1395: a prior review
+    cycle completed at 22:49:27Z (``review_dispatch_status ==
+    review_dispatch_completed``, ``reviewed_head_sha`` = prior head), then the
+    rework cycle rebuilt the packet for a new head at 00:52:19Z (on-disk
+    ``review-decision.json`` back to ``pending`` head-stamped with the new
+    head, ``review-prompt.md`` rewritten).  ``dispatch_reviews()`` had not yet
+    launched the next reviewer (waiting on the PR's Tests check), so
+    ``review_dispatched_at`` still carried the prior cycle's 22:49:27Z.  The
+    beat at 01:07Z must measure the claim age from the rebuild (~15m), not the
+    stale prior dispatch (~138m), and must NOT ANOMALY.
+    """
+    frozen_now = datetime(2026, 8, 23, 1, 7, 0, tzinfo=timezone.utc)
+    rebuild_time = datetime(2026, 8, 23, 0, 52, 19, tzinfo=timezone.utc)
+    repo = _make_repo(hb, tmp_path)
+    _patch_gh(monkeypatch, hb, [1395])
+    pr_dir = repo.state_dir / "prs" / "pr-1395"
+    pr_dir.mkdir(parents=True)
+    (pr_dir / "pr.json").write_text("{}", encoding="utf-8")
+    (pr_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "pending", "reviewed_head_sha": "new-head-sha"}),
+        encoding="utf-8",
+    )
+    (pr_dir / "review-prompt.md").write_text("prompt", encoding="utf-8")
+    os.utime(pr_dir / "review-prompt.md", (rebuild_time.timestamp(),) * 2)
+    _write_state(
+        repo.state_dir,
+        1395,
+        {
+            "review_dispatch_status": "review_dispatch_completed",
+            "review_dispatched_at": "2026-08-22T22:49:27Z",
+            "reviewed_head_sha": "prior-cycle-head-sha",
+            "reviewer_pid": None,
+        },
+    )
+
+    report = hb.Report()
+    hb.check_review_liveness(report, repo, now=frozen_now)
+
+    assert not report.anomaly
+    assert report.lines and "review-liveness" in report.lines[0]
+    assert "open_claims=1" in report.lines[0]
+    # ~15m from the rebuild, not ~138m from the stale prior dispatch.
+    assert "oldest_min=15" in report.lines[0]
+    assert "138" not in report.lines[0]
+
+
 # ---------------------------------------------------------------------------
 # Smoke tests for the remaining checks (review-liveness is covered above).
 # Each test exercises one check's OK and/or anomaly path with stubbed I/O.

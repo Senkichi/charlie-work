@@ -23887,6 +23887,101 @@ def test_refresh_pr_decision_cache_skips_pr_not_yet_in_state(tmp_path: Path) -> 
     assert "999" not in state["prs"]
 
 
+def test_loop_pass_refreshes_pr_decision_cache_to_file_value(tmp_path: Path) -> None:
+    """Issue #1386: pin the _refresh_pr_decision_cache CALL SITE in loop()'s
+    per-PR dispatch block.
+
+    The three behavioral tests above cover the method itself (updates a
+    disagreeing tracked PR, no-ops when the cache agrees, skips untracked
+    PRs), but none of them exercise the call site -- deleting the
+    ``self._refresh_pr_decision_cache(...)`` invocation from ``loop()``'s
+    dispatch block would leave the whole suite green. This test closes that
+    gap: it seeds a tracked PR whose state-side decision disagrees with its
+    flat ``review-decision.json`` (the #1340 divergence shape: state lags a
+    concurrent void/record_review), runs one ``loop()`` pass, and asserts
+    ``state["prs"][N]`` was reconciled to the file value.
+
+    The test runs in live (non-dry-run) mode. Dry-run would seem isolating
+    but is not: ``_refresh_pr_decision_cache`` writes through
+    ``self.write_gate.save_state``, which is a no-op under dry-run (the
+    WriteGate's strict "zero writes under dry-run" invariant), so the
+    refresh's disk write is invisible there. In live mode the merge success
+    path (``merge_ready``) DOES write state, but it carries forward the
+    existing decision cache fields via ``**state["prs"].get(...)``
+    (workflow.py merge_success block) -- it does NOT re-derive
+    ``decision``/``reviewed_head_sha``/``decision_path`` from the file. So
+    the final state's cache fields are exactly what the refresh wrote: the
+    file value if the refresh ran, the stale seed value if it did not.
+    Deleting the call site leaves the seeded divergence unreconciled and
+    this test fails.
+    """
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    class FakeGitHubListingPRs(FakeGitHub):
+        """loop()'s reconcile pass (merge-lane-recovery §6-B) queries
+        gh.run(["pr", "list", ...]); the base fake's generic run() fallback
+        returns [] regardless of self.prs, which misreports PR 456 as
+        missing on GitHub. Reflect self.prs so the reconcile pass sees the
+        same PR the rest of this fake knows about. Same override as
+        test_loop_skips_review_for_approved_unmerged_pr."""
+
+        def run(self, args, *, json_output=False, allow_failure=False):
+            if args[:2] == ["pr", "list"]:
+                return list(self.prs) if json_output else ""
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    fake_gh = FakeGitHubListingPRs()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    # Seed a tracked PR whose state-side decision DISAGREES with the file
+    # (the #1340 divergence shape: state says "pending" at a stale head while
+    # the file has already been reset to "approved" at the live head).
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {
+        "number": 456,
+        "issue_number": 123,
+        "status": "reviewing",
+        "decision": "pending",
+        "reviewed_head_sha": "stale-sha",
+        "decision_path": "stale-path",
+    }
+    save_state(paths.state_file, state)
+
+    # The flat file is authoritative: it says "approved" at the live head
+    # (sha-abc123, matching FakeGitHub's default PR head). The file's
+    # reviewed_head_sha matches the live head so the already_approved /
+    # head_matches gates fire and merge_ready's merge-success path runs --
+    # which carries forward the existing cache fields rather than
+    # re-deriving them, isolating the refresh as the sole reconciler.
+    decision_dir = paths.prs / "pr-456"
+    decision_dir.mkdir(parents=True)
+    decision_path = decision_dir / "review-decision.json"
+    decision_path.write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.loop(limit=0)
+
+    # The merge must have run (confirms the per-PR dispatch block reached
+    # merge_ready, which is downstream of the refresh call site).
+    assert len(result.data["merges"]) == 1
+    assert result.data["merges"][0]["merged"] is True
+
+    refreshed = load_state(paths.state_file)["prs"]["456"]
+    # The three cache fields must be reconciled to the file value by the
+    # refresh -- merge_ready's carry-forward preserves whatever the refresh
+    # wrote, so these fail if the refresh call site is deleted.
+    assert refreshed["decision"] == "approved"
+    assert refreshed["reviewed_head_sha"] == "sha-abc123"
+    assert refreshed["decision_path"] == str(decision_path)
+    # Non-decision fields survive: issue_number is carried forward by both
+    # the refresh and merge_ready's spread. (status becomes "merged" after
+    # the merge, which is expected and not a cache field.)
+    assert refreshed["issue_number"] == 123
+
+
 def test_merge_ready_reads_escalated_from_persisted_decision(tmp_path: Path) -> None:
     """Issue #407: merge_ready (via _review_decision and merge-train
     eligibility) must see the escalated flag from the persisted decision file.
@@ -39706,6 +39801,15 @@ def test_build_parser_fleet_subcommand() -> None:
     args_single = parser.parse_args(["review-queue"])
     assert args_single.command == "review-queue"
 
+    # Test fleet operator-queue parsing (issue #1314 item 1)
+    args_fleet_operator_queue = parser.parse_args(["fleet", "operator-queue"])
+    assert args_fleet_operator_queue.command == "fleet"
+    assert args_fleet_operator_queue.fleet_command == "operator-queue"
+
+    # Test single-repo operator-queue parsing (issue #1314 item 1)
+    args_operator_queue = parser.parse_args(["operator-queue"])
+    assert args_operator_queue.command == "operator-queue"
+
 
 def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monkeypatch) -> None:
     """Issue #369: fleet review-queue aggregates per repo and isolates errors."""
@@ -39802,6 +39906,141 @@ def test_fleet_review_queue_aggregates_and_isolates_errors(tmp_path: Path, monke
     assert len(result.data["errors"]) == 1
     assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
     assert "does not exist" in result.data["errors"][0]["error"]
+
+
+def test_run_command_dispatches_operator_queue(tmp_path: Path) -> None:
+    """Issue #1314 item 1: ``run_command`` routes ``operator-queue`` to
+    ``app.operator_queue()`` and returns its result verbatim.
+
+    Mirrors the established convention that the CLI dispatch branch for a
+    queue command is exercised end-to-end through ``run_command`` rather than
+    only through the ``OrchestratorApp`` method in isolation — a broken
+    dispatch branch (wrong ``args.command`` string, missing branch) would
+    otherwise go undetected by the method-level tests.
+    """
+    args = cli.build_parser().parse_args(["operator-queue"])
+    assert args.command == "operator-queue"
+
+    dispatched: list[str] = []
+    expected = cli.CommandResult(
+        True, "operator queue: 0 issue(s) parked", {"queue": [], "depth": 0}
+    )
+
+    class _FakeApp:
+        def operator_queue(self) -> cli.CommandResult:
+            dispatched.append("operator_queue")
+            return expected
+
+    result = cli.run_command(_FakeApp(), args)  # type: ignore[arg-type]
+
+    assert dispatched == ["operator_queue"]
+    assert result is expected
+
+
+def test_fleet_operator_queue_aggregates_and_isolates_errors(tmp_path: Path, monkeypatch) -> None:
+    """Issue #1314 item 1: fleet operator-queue aggregates per repo and
+    isolates errors, mirroring ``test_fleet_review_queue_aggregates_and_isolates_errors``.
+
+    A broken repo (missing root) is isolated into ``errors`` while the good
+    repo's ``operator_queue()`` result still populates ``per_repo``, and
+    ``CommandResult.ok`` is False only because ``errors`` is non-empty.
+    """
+    fleet_override = str(tmp_path / "fleet")
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", fleet_override)
+
+    repo_ok = tmp_path / "repo_ok"
+    repo_ok.mkdir()
+    config_ok = repo_ok / "orchestrator.config.yaml"
+    config_ok.write_text(
+        "labels:\n  ready: automated-ready\n  queued: agent:queued\n  in_progress: agent:in-progress\n  operator_queue: agent:operator-queue\nruntime:\n  state_dir: .var/charlie-work\n"
+    )
+    (repo_ok / ".var" / "charlie-work").mkdir(parents=True)
+
+    # Good repo: one issue carrying the operator_queue label, plus a state.json
+    # entry marking it a mechanical escalation with a terminal_since timestamp.
+    now = datetime.now(UTC)
+    terminal_since = (now - timedelta(days=2)).isoformat().replace("+00:00", "Z")
+    (repo_ok / ".var" / "charlie-work" / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {
+                    "42": {
+                        "number": 42,
+                        "status": "escalated",
+                        "reason_class": "mechanical",
+                        "escalation_reason": "test escalation",
+                        "terminal_since": terminal_since,
+                    }
+                },
+                "prs": {},
+                "events": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fleet_json_path = Path(fleet_override) / "fleet.json"
+    fleet_json_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_data = {
+        "version": 1,
+        "repos": {
+            "owner/repo_ok": {
+                "repo_root": str(repo_ok),
+                "name_with_owner": "owner/repo_ok",
+                "config_path": str(config_ok),
+                "state_dir": str(repo_ok / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+            "owner/repo_broken": {
+                "repo_root": str(tmp_path / "nonexistent"),
+                "name_with_owner": "owner/repo_broken",
+                "config_path": str(tmp_path / "nonexistent" / "orchestrator.config.yaml"),
+                "state_dir": str(tmp_path / "nonexistent" / ".var" / "charlie-work"),
+                "first_seen": "2026-07-06T12:00:00Z",
+                "last_seen": "2026-07-06T12:00:00Z",
+            },
+        },
+    }
+    fleet_json_path.write_text(json.dumps(registry_data, indent=2))
+
+    from charlie_work.github import GitHub
+
+    def mock_issue_list(self, labels=None, state=None):
+        return [
+            {
+                "number": 42,
+                "title": "issue 42",
+                "url": "https://example.test/issues/42",
+                "body": "",
+                "labels": [{"name": "agent:operator-queue"}],
+                "state": "OPEN",
+            }
+        ]
+
+    monkeypatch.setattr(GitHub, "issue_list", mock_issue_list)
+    # run_fleet_operator_queue creates a real GitHub instance; short-circuit the
+    # field-list probe, which would otherwise require an authenticated ``gh`` CLI.
+    monkeypatch.setattr(GitHub, "validate_field_lists", lambda self: None)
+
+    args = cli.build_parser().parse_args(["fleet", "operator-queue"])
+    result = cli.run_fleet_operator_queue(args)
+
+    assert result.ok is False
+    assert "1 repo(s), 1 error(s)" in result.message
+    # The good repo's queue still populated despite the broken repo's error.
+    ok_queue = result.data["repos"]["owner/repo_ok"]["queue"]
+    assert len(ok_queue) == 1
+    assert ok_queue[0]["number"] == 42
+    assert ok_queue[0]["reason_class"] == "mechanical"
+    assert ok_queue[0]["terminal_since"] == terminal_since
+    assert result.data["repos"]["owner/repo_ok"]["depth"] == 1
+    # The broken repo is isolated into errors, not mixed into per_repo.
+    assert len(result.data["errors"]) == 1
+    assert result.data["errors"][0]["repo_key"] == "owner/repo_broken"
+    assert "does not exist" in result.data["errors"][0]["error"]
+    assert "owner/repo_broken" not in result.data["repos"]
 
 
 def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
