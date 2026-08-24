@@ -581,6 +581,23 @@ class DeescalationConfig:
     # a distinct one-time event (deescalation_cap_exhausted) makes the
     # terminal state diagnosable rather than a silently renamed one-way door.
     max_auto_deescalations: int = 2
+    # Issue #1314 item 2: dedicated cadence knob for the operator-queue
+    # depth gauge (item 3). The gauge currently rides the loop pass cadence
+    # (every pass); this knob lets operators slow it to a dedicated interval
+    # if the per-pass emission volume is too high for their fleet. 0 means
+    # "check every pass" (preserves the pre-knob behavior); > 0 means
+    # "check every N minutes", gated by a ``next_operator_queue_review_at``
+    # timestamp in ``state.json``'s ``deescalation_pass`` section.
+    operator_queue_review_interval_minutes: int = 0
+    # Issue #1314 item 3: alert threshold for the ``operator_queue_depth``
+    # gauge event. When the number of issues parked on
+    # ``agent:operator-queue`` (state entries with ``status == "escalated"``
+    # and ``reason_class == "mechanical"``) exceeds this threshold, a
+    # warning-level ``operator_queue_depth`` event is emitted to
+    # ``events.db`` so a silently growing queue is visible to
+    # ``heartbeat_check.py`` rather than only via label queries. 0 disables
+    # the alert (no event emitted regardless of depth).
+    operator_queue_depth_threshold: int = 5
 
 
 @dataclass(frozen=True)
@@ -2209,6 +2226,52 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"got {rp_alert_days}"
         )
     reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
+    # Issue #1314: extract ONLY the two new operator-queue follow-up knobs
+    # from the ``deescalation`` section. The section as a whole was
+    # previously 100% inert (never passed into OrchestratorConfig — always
+    # defaulted), and activating full-section parsing here would silently
+    # (a) hard-reject unknown keys via ``_build_section`` for any live config
+    # that already has a ``deescalation:`` block with extra/typo'd keys
+    # (self-deploy-brick risk) and (b) flip ``enabled`` / ``interval_minutes``
+    # defaults for configs that set those keys expecting them to be ignored.
+    # Full-section activation is a separate, explicitly-reviewed change with
+    # operator notification; this PR scopes to the two fields the issue
+    # actually asks for. Unknown keys and pre-existing
+    # ``enabled``/``interval_minutes`` overrides are silently ignored, same
+    # as before this PR.
+    deescalation_data = _section(data, "deescalation")
+    oqr_interval = deescalation_data.get("operator_queue_review_interval_minutes")
+    if oqr_interval is not None and (
+        isinstance(oqr_interval, bool) or not isinstance(oqr_interval, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
+            f"must be an int, got {type(oqr_interval).__name__}"
+        )
+    if oqr_interval is not None and oqr_interval < 0:
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_review_interval_minutes' "
+            f"must be >= 0, got {oqr_interval}"
+        )
+    oq_threshold = deescalation_data.get("operator_queue_depth_threshold")
+    if oq_threshold is not None and (
+        isinstance(oq_threshold, bool) or not isinstance(oq_threshold, int)
+    ):
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            f"must be an int, got {type(oq_threshold).__name__}"
+        )
+    if oq_threshold is not None and oq_threshold < 0:
+        raise ConfigError(
+            "config section 'deescalation' key 'operator_queue_depth_threshold' "
+            f"must be >= 0, got {oq_threshold}"
+        )
+    deescalation_overrides: dict[str, Any] = {}
+    if oqr_interval is not None:
+        deescalation_overrides["operator_queue_review_interval_minutes"] = oqr_interval
+    if oq_threshold is not None:
+        deescalation_overrides["operator_queue_depth_threshold"] = oq_threshold
+    deescalation = DeescalationConfig(**deescalation_overrides)
     auto_merge_data = _section(data, "auto_merge")
     required_checks = auto_merge_data.get("required_checks")
     if isinstance(required_checks, list):
@@ -3220,6 +3283,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         review_dispatch=review_dispatch,
         quota_probe=quota_probe,
         reconcile_pass=reconcile_pass,
+        deescalation=deescalation,
         auto_merge=auto_merge,
         runtime=runtime,
         devin=devin,

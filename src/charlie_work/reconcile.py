@@ -49,6 +49,7 @@ from .review_decision import review_decision as _resolve_review_decision
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
+    ESCALATION_REASON_CLASSES,
     ORCHESTRATOR_OWNED_ISSUE_STATUSES,
     PASSIVE_OPEN_STATUS,
     append_event,
@@ -805,9 +806,19 @@ def detect_drift(
     # _escalation_label) rather than a second hardcoded label pair, so the
     # label-repair consumers below and the staleness alert further down can
     # never drift out of sync about what "escalated and parked" looks like.
+    # Issue #1314 item 4: iterate ``ESCALATION_REASON_CLASSES`` instead of a
+    # hand-picked ``"mechanical"`` literal so a future third reason_class is
+    # automatically included here -- this is the one site that would silently
+    # under-enumerate instead of failing closed if the enum grew and this set
+    # stayed literal. ``_escalation_edge`` resolves each reason_class to its
+    # edge (mechanical -> operator_queued, judgment -> escalated), and
+    # ``_escalation_label`` resolves that edge to the label it adds; the set
+    # deduplicates, so two reason_classes that park on the same label (e.g.
+    # any future class that passes through unchanged to "escalated") produce
+    # a one-element set, not a duplicate.
     escalation_parked_labels = {
-        _escalation_label(labels_cfg, "escalated"),
-        _escalation_label(labels_cfg, _escalation_edge("escalated", "mechanical")),
+        _escalation_label(labels_cfg, _escalation_edge("escalated", reason_class))
+        for reason_class in ESCALATION_REASON_CLASSES
     }
     prs = _fetch_prs(gh)
     issues = _fetch_issues(gh)
