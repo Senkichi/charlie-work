@@ -3507,3 +3507,171 @@ def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
 
         assert not report.anomaly, f"registry failed to suppress real slug {real_slug}"
         assert report.lines[-1].startswith(f"SUPPRESSED {check}: [#1361 until 2026-09-30]")
+
+
+# ---------------------------------------------------------------------------
+# Blocked-issue lookup economy (issue #1438)
+# ---------------------------------------------------------------------------
+
+
+def _write_fleet_json(
+    hb: ModuleType, fleet_dir: Path, repos: list[tuple[str, Path, Path]]
+) -> None:
+    """Write a fleet.json registering ``repos`` under ``fleet_dir``.
+
+    Each tuple is (slug, repo_root, state_dir). ``config_path`` is left
+    empty so config-reading checks degrade to their no-config path rather
+    than parsing a real file.
+    """
+    fleet_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "repos": {
+            slug: {"repo_root": str(root), "state_dir": str(state)} for slug, root, state in repos
+        }
+    }
+    (fleet_dir / "fleet.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_main_runs_charlie_fleet_status_exactly_once_per_beat(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1438: ``charlie fleet status --json`` must be invoked exactly
+    once per heartbeat run, not once per consumer per repo.
+
+    The fleet status snapshot cannot meaningfully change between checks
+    within one beat, so main() fetches it once before the per-repo loop and
+    threads the result (or the degraded-marker) into every consumer. This
+    test installs a counting fake ``subprocess.run`` over the full ``main()``
+    run with two registered repos -- which exercises both the
+    dispatch-coverage and armable-backlog consumers for each repo (four
+    consumer call-sites total) -- and asserts the charlie fleet status
+    subprocess fires exactly once.
+    """
+    fleet_dir = tmp_path / "fleet"
+    repo_a_root = tmp_path / "repo-a"
+    repo_a_state = tmp_path / "state-a"
+    repo_b_root = tmp_path / "repo-b"
+    repo_b_state = tmp_path / "state-b"
+    for d in (repo_a_root, repo_a_state, repo_b_root, repo_b_state):
+        d.mkdir(parents=True, exist_ok=True)
+    _write_fleet_json(
+        hb,
+        fleet_dir,
+        [("owner/repo-a", repo_a_root, repo_a_state), ("owner/repo-b", repo_b_root, repo_b_state)],
+    )
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setenv("CHARLIE_WORK_HEARTBEAT_STATE", str(tmp_path / "hb-state.json"))
+    monkeypatch.setenv(
+        "CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS", str(tmp_path / "no-suppressions.yaml")
+    )
+
+    fleet_status_payload = json.dumps(
+        {
+            "data": {
+                "repos": {
+                    "owner/repo-a": {"blocked": []},
+                    "owner/repo-b": {"blocked": []},
+                }
+            }
+        }
+    )
+
+    charlie_status_calls: list[int] = []  # records the timeout kwarg per call
+
+    class _FakeProc:
+        def __init__(self, *, returncode: int, stdout: str, stderr: str) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(args, *a, **k):
+        if args[:4] == ["charlie", "fleet", "status", "--json"]:
+            charlie_status_calls.append(k.get("timeout"))
+            return _FakeProc(returncode=0, stdout=fleet_status_payload, stderr="")
+        # Every other subprocess (gh, git log, schtasks, ...) fails benignly;
+        # the checks degrade to ANOMALY/OK lines without crashing.
+        return _FakeProc(returncode=1, stdout="", stderr="fake subprocess disabled in test")
+
+    monkeypatch.setattr(hb.subprocess, "run", fake_run)
+
+    hb.main()
+
+    assert len(charlie_status_calls) == 1, (
+        f"expected exactly one charlie fleet status --json call per beat, "
+        f"got {len(charlie_status_calls)}"
+    )
+    # Issue #1438 AC: timeout >= 120s so the bound is an outlier detector,
+    # not the median runtime.
+    assert charlie_status_calls[0] >= 120, (
+        f"expected timeout >= 120s, got {charlie_status_calls[0]}"
+    )
+
+
+def test_main_annotates_all_consumers_when_fleet_status_degrades(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Issue #1438 AC: the degraded path still annotates all four consumer
+    check lines (dispatch-coverage + armable-backlog, for each of two repos).
+
+    When ``charlie fleet status --json`` fails, the single degraded-marker
+    string is threaded into every consumer. This test captures main()'s
+    stdout and asserts each of the four consumer check lines carries the
+    degraded caveat.
+    """
+    fleet_dir = tmp_path / "fleet"
+    repo_a_root = tmp_path / "repo-a"
+    repo_a_state = tmp_path / "state-a"
+    repo_b_root = tmp_path / "repo-b"
+    repo_b_state = tmp_path / "state-b"
+    for d in (repo_a_root, repo_a_state, repo_b_root, repo_b_state):
+        d.mkdir(parents=True, exist_ok=True)
+    _write_fleet_json(
+        hb,
+        fleet_dir,
+        [("owner/repo-a", repo_a_root, repo_a_state), ("owner/repo-b", repo_b_root, repo_b_state)],
+    )
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setenv("CHARLIE_WORK_HEARTBEAT_STATE", str(tmp_path / "hb-state.json"))
+    monkeypatch.setenv(
+        "CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS", str(tmp_path / "no-suppressions.yaml")
+    )
+
+    degraded_marker = "timed out after 120 seconds"
+
+    class _FakeProc:
+        def __init__(self, *, returncode: int, stdout: str, stderr: str) -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_run(args, *a, **k):
+        if args[:4] == ["charlie", "fleet", "status", "--json"]:
+            # Simulate the timeout path: subprocess.TimeoutExpired is a
+            # SubprocessError subclass, which get_blocked_issue_numbers
+            # catches and converts into the degraded-marker string.
+            raise subprocess.TimeoutExpired(cmd=args, timeout=k.get("timeout", 120))
+        # dispatch-coverage's run_gh_json must succeed with an empty issue
+        # list so the check reaches its OK line (where the degraded caveat
+        # is appended); other subprocesses fail benignly.
+        if args[:2] == ["gh", "issue"] and "list" in args:
+            return _FakeProc(returncode=0, stdout="[]", stderr="")
+        return _FakeProc(returncode=1, stdout="", stderr="fake subprocess disabled in test")
+
+    monkeypatch.setattr(hb.subprocess, "run", fake_run)
+
+    import io
+
+    captured = io.StringIO()
+    monkeypatch.setattr(hb.sys, "stdout", captured)
+    hb.main()
+    output = captured.getvalue()
+
+    for slug in ("owner/repo-a", "owner/repo-b"):
+        assert any(
+            f"dispatch-coverage {slug}:" in line and degraded_marker in line
+            for line in output.splitlines()
+        ), f"dispatch-coverage {slug} missing degraded caveat in:\n{output}"
+        assert any(
+            f"armable-backlog {slug}:" in line and degraded_marker in line
+            for line in output.splitlines()
+        ), f"armable-backlog {slug} missing degraded caveat in:\n{output}"

@@ -122,7 +122,15 @@ MERGEQUEUE_STALL_BEATS = 2
 GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
 MIN_BEAT_INTERVAL_MINUTES = 10
-CHARLIE_STATUS_TIMEOUT_SECONDS = 60
+# Issue #1438: `charlie fleet status --json` wall time is ~60s on this host
+# (dominated by remote API calls). A timeout equal to the typical runtime is a
+# coin flip, not a bound -- the lookup degraded on any beat that landed a hair
+# past the line (reproduced at 59.955s against a 60s timeout). 120s makes the
+# bound a real outlier detector (2x the median) instead of the median itself.
+# The result is fetched ONCE per heartbeat run (in main(), before the per-repo
+# loop) and threaded into every consumer, so this timeout is paid at most once
+# per beat, not once per consumer per repo.
+CHARLIE_STATUS_TIMEOUT_SECONDS = 120
 
 # in-progress-stale worktree mtime threshold (issue #1379). The events-based
 # check flags an issue when its GitHub updatedAt hasn't moved across 2 beats,
