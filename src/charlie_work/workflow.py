@@ -96,6 +96,7 @@ from .closing_reference import (
 from .pr_create_retry import create_pr_with_retry
 from .issue_comments import render_issue_comments
 from .markdown_fence import fenced_block
+from .module_map import build_module_map
 from .janitor import (
     _calculate_patch_id,
     _diff_content_signature,
@@ -4017,6 +4018,12 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         "issue_comments",
         "branch_name",
         "worker_model_tier",
+        # Issue #1444: the module-map section, derived from the live tree at
+        # packet build time by ``build_module_map``. Empty string when the map
+        # could not be derived (fail-soft: omitted section + a
+        # ``worker_module_map_failed`` warning event), never a dispatch
+        # failure.
+        "module_map",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -24141,6 +24148,38 @@ class OrchestratorApp:
             sanitize=defang_closing_keywords,
         )
 
+    def _build_module_map_value(self, issue_number: int) -> str:
+        """Derive the module-map section from the live tree (issue #1444).
+
+        Single point of enforcement for the fail-soft contract: a repo layout
+        ``build_module_map`` cannot parse yields an empty string (an omitted
+        section) plus a ``worker_module_map_failed`` warning event logged to
+        events.db, never a dispatch failure. The worker loses placement
+        steering for this one packet; the next packet rebuilds the map against
+        the then-current tree.
+
+        ``log_event`` (not ``self._record_event``) is used because
+        ``_write_worker_prompt`` runs outside a state-lock context -- the
+        caller (``intake`` / ``_dispatch_impl``) gathers network results and
+        builds prompts before taking the state lock for label/status writes.
+        """
+        package_dir = self.repo_root / "src" / "charlie_work"
+        src_root = self.repo_root / "src"
+        try:
+            return build_module_map(package_dir, src_root)
+        except (OSError, SyntaxError, ValueError) as exc:
+            log_event(
+                self.paths.state_file,
+                "worker_module_map_failed",
+                {
+                    "issue_number": issue_number,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                repo=self.repo_root.name,
+                level="warning",
+            )
+            return ""
+
     def _write_worker_prompt(
         self, issue: dict[str, Any], *, template: str | None = None, dry_run: bool = False
     ) -> Path:
@@ -24165,6 +24204,13 @@ class OrchestratorApp:
                 "issue_comments": self._render_issue_comments(issue),
                 "branch_name": self._branch_name(issue),
                 "worker_model_tier": self.config.dispatch.worker_model_tier,
+                # Issue #1444: the module-map section, derived from the live
+                # tree at packet build time. Fail-soft: a parse failure yields
+                # an empty string (omitted section) plus a
+                # ``worker_module_map_failed`` warning event, never a dispatch
+                # failure. ``_build_module_map_value`` is the single point of
+                # enforcement for that fail-soft contract.
+                "module_map": self._build_module_map_value(issue_number),
             },
         )
         # Issue #714: enforce the no-merge contract on the *rendered output*
