@@ -46,6 +46,17 @@ WRITER_MARKER_FILENAME = ".charlie-writer.json"
 # this module) -- the same arrangement as ``WRITER_MARKER_FILENAME`` above.
 WORKER_OUTCOME_FILENAME = ".worker-outcome.json"
 
+# Launcher-owned directories written into each worktree by the worker launch
+# shim (the Devin CLI's ``.devin`` config directory and the
+# ``.git_worktree_dir`` marker). These are NOT worker output — the shim
+# materializes them and re-materializes them on every dispatch. Shared by
+# ``worktree._worker_authored_dirty`` (excluded from the dirty check) and
+# ``cross_repo_gate.extract_referenced_paths`` (excluded from path candidates)
+# so the two modules share one definition of "launcher-owned, not evidence"
+# (issue #1391). Like ``.venv``, these are structural single-directory
+# constants, not a hand-maintained list of elements.
+LAUNCHER_OWNED_DIRS: tuple[str, ...] = (".devin", ".git_worktree_dir")
+
 
 def _normalize_injected_paths(paths: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     """Return path strings with Windows backslash separators normalized to '/'.
