@@ -1287,17 +1287,27 @@ def test_closed_unmerged_pr_state_converged_still_fires_for_stale_pr_entry() -> 
 
 def test_closed_unmerged_pr_rules_skip_issue_when_pr_number_points_elsewhere() -> None:
     """The second #1398 signal: the issue's recorded ``pr_number`` points to
-    a *different* (newer) PR than the closed one. The issue has moved on;
-    the stale closed PR must not strip the new session's labels/status even
-    when dispatched_at is absent (e.g. the worker already opened the new PR
-    and dispatched_at was cleared).
+    a *different* (newer) PR than the closed one, AND that newer PR actually
+    appears among the issue's linked/fetched PRs. The issue has moved on to a
+    real, newer PR; the stale closed PR must not strip the new session's
+    labels/status even when dispatched_at is absent (e.g. the worker already
+    opened the new PR and dispatched_at was cleared).
+
+    The corroboration requirement (the referenced pr_number must appear in the
+    fetched snapshot) is what separates this from a stale reference -- see
+    ``test_closed_unmerged_pr_rules_fire_when_pr_number_is_stale_dangling``.
     """
     config = OrchestratorConfig()
     now = datetime.now(UTC)
     closed_at = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
 
     gh = FakeGitHub(
-        prs=[_pr(1348, "CLOSED", head_ref="agent/issue-1342-x", closed_at=closed_at)],
+        prs=[
+            _pr(1348, "CLOSED", head_ref="agent/issue-1342-x", closed_at=closed_at),
+            # The newer PR the issue moved on to -- present in the fetched
+            # snapshot, so the pr_number mismatch is corroborated.
+            _pr(1399, "OPEN", head_ref="agent/issue-1342-y"),
+        ],
         issues=[_issue(1342, [config.labels.in_progress])],
     )
     state = empty_state()
@@ -1313,6 +1323,47 @@ def test_closed_unmerged_pr_rules_skip_issue_when_pr_number_points_elsewhere() -
     assert [
         item for item in drift if item.kind == "closed_unmerged_pr_issue_state_converged"
     ] == []
+
+
+def test_closed_unmerged_pr_rules_fire_when_pr_number_is_stale_dangling() -> None:
+    """Issue #1398 rework regression: when ``state.json``'s ``pr_number``
+    names a PR that is ABSENT from the fetched GitHub PR snapshot entirely
+    (a stale/dangling reference from a botched salvage, a hand edit, or a
+    race -- not a legitimate newer PR), and there is no ``dispatched_at``
+    corroboration, the pr_number mismatch must NOT be treated as proof of a
+    newer session. Both issue-side closed-unmerged convergence rules must
+    still fire so the issue reaches a terminal state instead of being
+    permanently skipped -- the #558/#1066 permanent-stuck failure class.
+
+    This is the hardening the round-1 review required: a bare mismatch with
+    no corroborating real PR and no dispatched_at signal lets convergence
+    proceed rather than silently suppressing it forever.
+    """
+    config = OrchestratorConfig()
+    now = datetime.now(UTC)
+    closed_at = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+
+    gh = FakeGitHub(
+        # Only the stale closed PR links the issue; the referenced #1399 does
+        # NOT exist in the fetched snapshot at all.
+        prs=[_pr(1348, "CLOSED", head_ref="agent/issue-1342-x", closed_at=closed_at)],
+        issues=[_issue(1342, [config.labels.in_progress])],
+    )
+    state = empty_state()
+    # Stale dangling reference: pr_number points to a PR that does not exist
+    # on GitHub, and no dispatched_at to corroborate a newer session.
+    state["issues"]["1342"] = {
+        "number": 1342,
+        "status": "reviewing",
+        "pr_number": 1399,
+    }
+
+    drift = detect_drift(gh, state, config)
+    assert len([item for item in drift if item.kind == "closed_unmerged_pr_active_labels"]) == 1
+    assert (
+        len([item for item in drift if item.kind == "closed_unmerged_pr_issue_state_converged"])
+        == 1
+    )
 
 
 def test_closed_unmerged_pr_rules_fire_when_session_predates_close() -> None:

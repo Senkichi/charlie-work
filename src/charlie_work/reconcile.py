@@ -775,6 +775,8 @@ def _closed_pr_superseded_by_newer_session(
     issue_entry: dict[str, Any] | None,
     pr_number: int,
     pr_closed_at: str | None,
+    *,
+    linked_pr_numbers: set[int] | None = None,
 ) -> bool:
     """Return True when a CLOSED-unmerged PR is NOT the issue's current PR
     because the issue's active session postdates the PR close -- the
@@ -794,10 +796,24 @@ def _closed_pr_superseded_by_newer_session(
     Two independent signals, either of which proves the closed PR is stale:
 
     1. The issue's recorded ``pr_number`` points to a *different* PR than the
-       closed one -- the issue has moved on to a newer PR.
+       closed one AND that referenced PR actually appears among the issue's
+       linked/fetched PRs (``linked_pr_numbers``) -- the issue has moved on
+       to a newer, real PR.
     2. The issue's ``dispatched_at`` (the current dispatch session's start)
        postdates the PR's ``closedAt`` -- the active session began after this
        PR died, i.e. a redispatch the un-gate sweep intended.
+
+    Signal 1 requires corroboration: a bare ``pr_number`` mismatch is NOT
+    proof of a newer session, because ``state.json``'s ``pr_number`` can be
+    stale or wrong for reasons unrelated to a legitimate newer PR (a botched
+    salvage, a hand edit, a race that left a dangling reference). Treating a
+    stale reference as proof would permanently skip both issue-side
+    closed-unmerged convergence rules with no other rule able to reconverge
+    the issue -- the same #558/#1066 permanent-stuck failure class this
+    codebase has repeatedly had to fix. Requiring the referenced number to
+    appear among the fetched PRs (or falling through to the dispatched_at
+    signal) keeps the skip gated on positive evidence, so a stale reference
+    lets convergence fire and the issue still reaches a terminal state.
 
     Returns False when there is no positive evidence of a newer session, so
     the rule fires exactly as before for a closed PR that genuinely is the
@@ -809,10 +825,16 @@ def _closed_pr_superseded_by_newer_session(
     current_pr = issue_entry.get("pr_number")
     if current_pr is not None:
         try:
-            if int(current_pr) != pr_number:
-                return True
+            current_pr_int = int(current_pr)
         except (TypeError, ValueError):
-            pass
+            current_pr_int = None
+        if (
+            current_pr_int is not None
+            and current_pr_int != pr_number
+            and linked_pr_numbers is not None
+            and current_pr_int in linked_pr_numbers
+        ):
+            return True
     dispatched_at = issue_entry.get("dispatched_at")
     if dispatched_at and pr_closed_at:
         session_start = _parse_iso_utc(dispatched_at)
@@ -907,6 +929,25 @@ def detect_drift(
     drift: list[DriftItem] = []
     prs_linking_issue: dict[int, list[dict[str, Any]]] = {}
     open_prs_by_issue: dict[int, list[dict[str, Any]]] = {}
+    # Issue #1398 rework: pre-compute the set of PR numbers linking each issue
+    # from the *complete* fetched snapshot. ``prs_linking_issue`` above is
+    # populated incrementally during the PR loop below, so it is only partial
+    # when the CLOSED branch (which runs inside that loop) consults it. This
+    # full map lets ``_closed_pr_superseded_by_newer_session`` corroborate a
+    # ``pr_number`` mismatch against real linked PRs rather than trusting a
+    # stale ``state.json`` reference (see the function's signal-1 docstring).
+    linked_pr_numbers_by_issue: dict[int, set[int]] = {}
+    for _pr in prs:
+        _pr_num = _pr.get("number")
+        if _pr_num is None:
+            continue
+        _issue_num = linked_issue_number(
+            _pr,
+            is_cross_repository=_pr.get("isCrossRepository"),
+            branch_prefix=config.dispatch.branch_prefix,
+        )
+        if _issue_num is not None:
+            linked_pr_numbers_by_issue.setdefault(_issue_num, set()).add(int(_pr_num))
     # Track issues already handled by session relabel to avoid double-emission
     # with issue_active_label_no_open_pr (both fire for dead-session-with-no-PR-ever)
     issues_handled_by_session_relabel: set[int] = set()
@@ -990,6 +1031,7 @@ def detect_drift(
                         issue_entry if isinstance(issue_entry, dict) else None,
                         pr_number,
                         pr_closed_at,
+                        linked_pr_numbers=linked_pr_numbers_by_issue.get(issue_number),
                     )
                 )
             ):
@@ -1092,6 +1134,7 @@ def detect_drift(
                             issue_entry if isinstance(issue_entry, dict) else None,
                             pr_number,
                             pr_closed_at,
+                            linked_pr_numbers=linked_pr_numbers_by_issue.get(issue_number),
                         )
                     )
                 ):
