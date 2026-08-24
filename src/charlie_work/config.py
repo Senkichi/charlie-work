@@ -703,6 +703,39 @@ class ReviewDispatchConfig:
     # after a config change invalidates the current cohort) without needing
     # to rename or remove the fraction field.
     review_effort_experiment_salt: str = ""
+    # Issue #1439: structure-aware reviewer turn cap. The flat
+    # ``review_max_turns`` budget ignores the size of the files a diff touches,
+    # so a PR threading a monolith (e.g. workflow.py at ~25k lines) burns the
+    # whole turn budget on grep -> Read-window navigation without ever reaching
+    # a verdict, then retries the identical flat budget on the next dispatch.
+    # These knobs make the cap structure-aware and self-escalating:
+    #
+    #   effective_multiplier = min(structure_multiplier + turn_limit_miss_streak,
+    #                              turn_cap_max_multiplier)
+    #   final_cap = review_max_turns * effective_multiplier
+    #
+    # where ``structure_multiplier`` is ``turn_cap_large_file_multiplier`` when
+    # any touched file exceeds ``turn_cap_large_file_threshold`` lines, else 1.
+    # The miss streak increments on each ``review_verdict_missed`` with reason
+    # ``turn_limit_summary_posted`` and resets on a recorded verdict or a fresh
+    # packet (new head). After ``max_consecutive_turn_limit_misses`` consecutive
+    # turn-limit misses the PR escalates to ``agent:human-needed`` instead of a
+    # further identical session. 0 disables the backstop (preserves the
+    # pre-fix unbounded retry -- not recommended).
+    # Line count above which a touched file triggers the structure multiplier.
+    # 0 disables the structure bonus (every diff uses the base cap).
+    turn_cap_large_file_threshold: int = 5000
+    # Multiplier applied to ``review_max_turns`` when any touched file exceeds
+    # ``turn_cap_large_file_threshold``. Clamped to ``turn_cap_max_multiplier``.
+    turn_cap_large_file_multiplier: int = 2
+    # Absolute cap on the effective multiplier (structure bonus + miss
+    # escalation combined). Prevents unbounded cap growth on a PR that keeps
+    # hitting the turn limit.
+    turn_cap_max_multiplier: int = 3
+    # After this many CONSECUTIVE turn-limit misses on one PR, escalate to a
+    # human instead of redispatching with a further-raised (but already-maxed)
+    # cap. 0 disables the backstop.
+    max_consecutive_turn_limit_misses: int = 3
 
 
 @dataclass(frozen=True)
@@ -2165,6 +2198,24 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
             f"got {rd_diff_threshold}"
         )
+    # Issue #1439: structure-aware turn-cap knobs.
+    _RD_INT_KEYS = (
+        "turn_cap_large_file_threshold",
+        "turn_cap_large_file_multiplier",
+        "turn_cap_max_multiplier",
+        "max_consecutive_turn_limit_misses",
+    )
+    for _rd_key in _RD_INT_KEYS:
+        _rd_val = review_dispatch_data.get(_rd_key)
+        if _rd_val is not None and (isinstance(_rd_val, bool) or not isinstance(_rd_val, int)):
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{_rd_key}' must be an int, "
+                f"got {type(_rd_val).__name__}"
+            )
+        if _rd_val is not None and _rd_val < 0:
+            raise ConfigError(
+                f"config section 'review_dispatch' key '{_rd_key}' must be >= 0, got {_rd_val}"
+            )
     rd_effort = review_dispatch_data.get("review_effort")
     if rd_effort is not None and not isinstance(rd_effort, str):
         raise ConfigError(

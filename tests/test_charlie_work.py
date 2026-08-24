@@ -8521,8 +8521,15 @@ def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
     claim_events = [e for e in state["events"] if e.get("kind") == "review_dispatch_claim"]
     assert len(claim_events) == 1
     assignments = claim_events[0]["payload"]["review_effort_assignments"]
+    # Issue #1439: the structure-aware turn cap is resolved alongside the
+    # review_effort arm and mirrored into the same assignment record.
     assert assignments == [
-        {"pr_number": 100, "review_effort_arm": "treatment", "review_effort_used": "high"}
+        {
+            "pr_number": 100,
+            "review_effort_arm": "treatment",
+            "review_effort_used": "high",
+            "review_turn_cap": config.review_dispatch.review_max_turns,
+        }
     ]
 
 
