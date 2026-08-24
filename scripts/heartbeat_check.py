@@ -1348,6 +1348,26 @@ def check_in_progress_staleness(
         report.ok(check, facts)
 
 
+def _read_review_decision_payload(decision_path: Path) -> dict[str, Any] | None:
+    """Read and parse a packet's ``review-decision.json``.
+
+    Returns the parsed dict, or ``None`` when the file is missing, unreadable,
+    or not a JSON object. A missing/unreadable file is treated as an open
+    claim by :func:`_claim_is_open` (the placeholder has not been overwritten
+    with a terminal verdict), so ``None`` here means "open, but no payload to
+    inspect" rather than "definitely closed".
+    """
+    if not decision_path.exists():
+        return None
+    try:
+        data = json.loads(decision_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
 def _claim_is_open(decision_path: Path) -> bool:
     """A review claim is OPEN until a non-pending decision is recorded.
 
@@ -1356,13 +1376,8 @@ def _claim_is_open(decision_path: Path) -> bool:
     missing file, a still-"pending" file, or an unparseable file all mean the
     claim has not been resolved yet.
     """
-    if not decision_path.exists():
-        return True
-    try:
-        data = json.loads(decision_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return True
-    if not isinstance(data, dict):
+    data = _read_review_decision_payload(decision_path)
+    if data is None:
         return True
     return data.get("decision") == "pending"
 
@@ -1412,7 +1427,12 @@ def _reviewer_pid_alive(entry: dict[str, Any]) -> bool | None:
     return abs(current_start_time - expected) <= 1.0
 
 
-def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
+def _review_claim_timestamp(
+    pr_state: dict[str, Any],
+    *,
+    pr_dir: Path | None = None,
+    decision: dict[str, Any] | None = None,
+) -> str | None:
     """Return the most relevant claim timestamp for an open review.
 
     The orchestrator's ground truth is ``state.json``:
@@ -1424,6 +1444,27 @@ def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
     For unknown/missing status, fall back to the newest present timestamp.  This
     replaces the packet-directory ``st_mtime`` that never updates across redispatch
     retries (issue #517).
+
+    Issue #1403: ``review_dispatch_completed`` is a special case.  After a review
+    cycle finishes, ``record_review`` stamps ``review_dispatch_status`` to
+    ``review_dispatch_completed`` and never touches ``review_dispatched_at``.
+    When the rework cycle rebuilds the packet for a new head, the on-disk
+    ``review-decision.json`` is back to ``pending`` (so the claim is open again)
+    but state.json still carries the PRIOR cycle's ``review_dispatched_at`` --
+    ``dispatch_reviews()`` only refreshes it when it actually launches the next
+    reviewer, which may be waiting on a CI check.  The newest-timestamp fallback
+    below would date the claim by that stale prior dispatch and overcount the
+    age by the full inter-cycle gap (a false 138m ANOMALY observed on pr-1395).
+
+    Detect this case structurally: the on-disk pending decision is head-stamped
+    (``record_decision`` at packet build writes ``reviewed_head_sha`` = the new
+    PR head), while state.json's ``reviewed_head_sha`` is the prior cycle's
+    reviewed head.  A difference means the packet was rebuilt for a head that
+    has not been reviewed yet.  Anchor on the packet-rebuild evidence -- the
+    ``review-prompt.md`` mtime, rewritten on every ``review()`` packet build --
+    instead of the stale state.json dispatch timestamp.  ``pr_dir`` and
+    ``decision`` are optional so direct unit callers (and the pre-fix tests)
+    keep the original state.json-only behavior.
     """
     status = pr_state.get("review_dispatch_status")
     if status == "review_dispatch_dispatched":
@@ -1432,6 +1473,27 @@ def _review_claim_timestamp(pr_state: dict[str, Any]) -> str | None:
         return pr_state.get("review_dispatch_pending_at")
     if status == "review_dispatch_failed":
         return pr_state.get("review_dispatch_failed_at")
+
+    # Issue #1403: completed prior cycle whose packet was rebuilt for a newer
+    # head.  See the docstring for why state.json's dispatch timestamps are
+    # stale here.  The on-disk pending decision's ``reviewed_head_sha`` is the
+    # new packet head; state.json's is the prior cycle's reviewed head.  They
+    # differ exactly when the packet was rebuilt for a not-yet-reviewed head.
+    if (
+        status == "review_dispatch_completed"
+        and pr_dir is not None
+        and isinstance(decision, dict)
+        and decision.get("decision") == "pending"
+        and decision.get("reviewed_head_sha")
+        and decision.get("reviewed_head_sha") != pr_state.get("reviewed_head_sha")
+    ):
+        prompt_path = pr_dir / "review-prompt.md"
+        if prompt_path.exists():
+            return (
+                datetime.fromtimestamp(prompt_path.stat().st_mtime, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
 
     newest: str | None = None
     newest_dt: datetime | None = None
@@ -1502,7 +1564,16 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
             # PR already resolved (merged/closed); claim dir is stale history
             # from before reap, not evidence of a live stuck review.
             continue
-        if not _claim_is_open(entry / "review-decision.json"):
+        # Read the on-disk decision once (issue #1403): _claim_is_open and the
+        # completed-cycle-rebuilt-packet detection in _review_claim_timestamp
+        # both need it, and re-reading races with a concurrent record_review.
+        decision_payload = _read_review_decision_payload(entry / "review-decision.json")
+        if decision_payload is None:
+            # Missing/unreadable file: open claim, no payload to inspect.
+            is_open = True
+        else:
+            is_open = decision_payload.get("decision") == "pending"
+        if not is_open:
             continue
 
         pr_state = prs_state.get(str(pr_number), {}) if isinstance(prs_state, dict) else {}
@@ -1529,7 +1600,7 @@ def check_review_liveness(report: Report, repo: RepoInfo, *, now: datetime | Non
 
         open_claims += 1
 
-        timestamp = _review_claim_timestamp(pr_state)
+        timestamp = _review_claim_timestamp(pr_state, pr_dir=entry, decision=decision_payload)
         claim_time = parse_iso(timestamp)
         if claim_time is None:
             # Last resort: the packet directory's mtime.  This is a fallback for
