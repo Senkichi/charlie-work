@@ -3157,6 +3157,90 @@ def test_launch_claude_worker_review_pins_configured_model_by_default(
     assert record.command[idx + 1] == ClaudeCodeConfig().model
 
 
+def test_launch_claude_worker_review_pins_max_turns_override(tmp_path: Path) -> None:
+    """Issue #1439 round-2 review: ``launch_claude_worker(review=True,
+    max_turns_override=N)`` must construct a command that hard-pins
+    ``--max-turns`` to N — not the flat ``review_max_turns`` config default.
+
+    The #1439 dispatch-path tests monkeypatch ``launch_claude_worker`` itself
+    and only assert on the ``max_turns_override`` kwarg passed through, so they
+    never exercise the actual command-construction mechanism
+    (``_apply_max_turns_pin``). This test drives the REAL
+    ``launch_claude_worker`` (real ``create_review_checkout``, real
+    ``subprocess.Popen`` of a fake claude script) and asserts on
+    ``record.command`` — the fully-rendered argv handed to ``popen_worker`` —
+    so a regression that drops, ignores, or mis-wires the override is caught.
+
+    Uses 120 (distinct from the default 40) so a mutation that accepts the
+    parameter but silently falls back to the config default also fails this
+    test, not just one that removes the parameter.
+    """
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+
+    record = launch_claude_worker(
+        1439,
+        "agent/issue-1439-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+        max_turns_override=120,
+    )
+
+    assert record.ok, record.error
+    assert record.command.count("--max-turns") == 1
+    idx = record.command.index("--max-turns")
+    assert record.command[idx + 1] == "120"
+    # Distinct from the flat config default — proves the override won, not a
+    # coincidental match.
+    assert record.command[idx + 1] != str(ReviewDispatchConfig().review_max_turns)
+
+
+def test_launch_claude_worker_review_max_turns_override_none_uses_config_default(
+    tmp_path: Path,
+) -> None:
+    """Issue #1439 round-2 review: ``launch_claude_worker(review=True,
+    max_turns_override=None)`` must use
+    ``resolved_config.review_dispatch.review_max_turns`` exactly as before —
+    regression protection for every direct caller and unit test that does not
+    opt into the structure-aware cap.
+
+    Uses a non-default ``review_max_turns`` (25) so the assertion is
+    meaningful: it confirms the value is read from config, not from a
+    hardcoded constant that happens to match the default.
+    """
+    repo_root = tmp_path / "repo"
+    _init_real_repo(repo_root)
+    sessions_dir = tmp_path / "reviews"
+    head_sha = _repo_head_sha(repo_root)
+    config = OrchestratorConfig(
+        review_dispatch=ReviewDispatchConfig(review_max_turns=25),
+    )
+
+    record = launch_claude_worker(
+        1440,
+        "agent/issue-1440-fix",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=_fake_claude_script(tmp_path),
+        review=True,
+        head_sha=head_sha,
+        config=config,
+        max_turns_override=None,
+    )
+
+    assert record.ok, record.error
+    assert record.command.count("--max-turns") == 1
+    idx = record.command.index("--max-turns")
+    assert record.command[idx + 1] == "25"
+
+
 def test_launch_claude_worker_review_uses_review_effort_when_set(tmp_path: Path) -> None:
     """A reviewer session must pin review_dispatch.review_effort over
     claude_code.effort when review_effort is explicitly set."""

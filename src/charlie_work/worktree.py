@@ -39,7 +39,7 @@ from .janitor import _calculate_patch_id
 from . import layout
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
-from .process_utils import is_pid_alive
+from .process_utils import is_pid_alive, kill_orphan_pid, kill_process_tree, sweep_orphan_processes
 from .safe_path import contains
 from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
 from .subprocess_runner import RunResult, run_captured
@@ -408,7 +408,12 @@ def read_worker_outcome(worktree_path: Path) -> dict[str, Any] | None:
 
 
 def write_worktree_marker(
-    worktree_path: Path, pid: int, session_id: str, kind: str = "worker"
+    worktree_path: Path,
+    pid: int,
+    session_id: str,
+    kind: str = "worker",
+    *,
+    process_start_time: float | None = None,
 ) -> None:
     """Write a ``.charlie-writer.json`` marker into the worktree root.
 
@@ -416,14 +421,26 @@ def write_worktree_marker(
     detect a live foreign writer before dispatching a second one into the
     same worktree. ``kind`` distinguishes long-lived operator claim markers
     (``pid`` is a sentinel) from ordinary worker session markers.
+
+    Issue #1423: ``process_start_time`` is the OS process creation timestamp
+    captured immediately after spawn (same fingerprint the session sidecars
+    store). It is read back by ``_reap_idle_foreign_writer`` and passed to
+    ``kill_process_tree`` so the kill path re-verifies process identity
+    immediately before terminating — the same PID-recycling defense every
+    other ``kill_process_tree`` call site in this codebase uses. A marker
+    without it (legacy marker written before this field existed, or an
+    operator sentinel marker with ``pid == 0``) cannot be safely reaped and
+    falls back to the block/escalate path instead.
     """
     marker_path = worktree_path / WRITER_MARKER_FILENAME
-    marker = {
+    marker: dict[str, Any] = {
         "pid": pid,
         "session_id": session_id,
         "started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "kind": kind,
     }
+    if process_start_time is not None:
+        marker["process_start_time"] = process_start_time
     _write_json_atomic(marker_path, marker)
 
 
@@ -509,6 +526,7 @@ def _check_worktree_writer_marker(
     sessions_dir: Path,
     issue_number: int | None = None,
     state_file: Path | None = None,
+    config: OrchestratorConfig | None = None,
 ) -> None:
     """Refuse to enter a worktree that is currently occupied by a foreign writer.
 
@@ -520,6 +538,12 @@ def _check_worktree_writer_marker(
     Operator claim markers (``kind == "operator"`` or legacy ``operator-*``
     session ids) are live while state.json says the issue is operator-claimed,
     independent of PID.
+
+    Issue #1423: when ``config`` is provided, a foreign writer with a live pid
+    is also evaluated against the same inactivity threshold the stall detector
+    uses before blocking dispatch. A writer that is alive but idle past the
+    threshold is reaped and its marker cleaned, so the dispatch proceeds
+    instead of escalating a zombie the fleet itself launched and forgot.
     """
     marker = read_worktree_marker(worktree_path)
     if marker is None:
@@ -550,7 +574,141 @@ def _check_worktree_writer_marker(
     if session_id and own.get(session_id) == pid:
         # Marker belongs to a live session we already know about.
         return
+    # Issue #1423: a foreign writer with a live pid is only ever checked for
+    # "is it alive", never "is it doing anything". A writer the orchestrator
+    # lost the handle to (e.g. via #1398's relabel) is "foreign" in name only
+    # — it is ours, but we forgot. Before blocking dispatch (and eventually
+    # escalating to a human), evaluate it against the same inactivity threshold
+    # the stall detector uses. A foreign writer that is alive but idle past the
+    # threshold is reaped (same kill path as ``session_stalled``) and its marker
+    # cleaned, so the dispatch proceeds instead of escalating a zombie.
+    if config is not None and _reap_idle_foreign_writer(
+        worktree_path,
+        pid,
+        session_id,
+        marker,
+        config,
+        state_file=state_file,
+        issue_number=issue_number,
+    ):
+        return
     raise WorktreeForeignWriterError(worktree_path=worktree_path, pid=pid, session_id=session_id)
+
+
+def _reap_idle_foreign_writer(
+    worktree_path: Path,
+    pid: int,
+    session_id: str | None,
+    marker: dict[str, Any],
+    config: OrchestratorConfig,
+    *,
+    state_file: Path | None = None,
+    issue_number: int | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Reap a foreign writer that is alive but idle past the stall threshold.
+
+    Issue #1423: a writer the orchestrator classifies as *foreign* (live pid,
+    session id not in our sidecars) is exempt from every liveness bound the
+    orchestrator applies to its *own* sessions. Liveness-without-activity is
+    exactly the state the stall detector exists to terminate, and it is
+    reachable from inside the fleet via #1398's relabel, so "foreign" here
+    means "ours, but we lost the handle".
+
+    This helper evaluates the writer against the same real-activity probe the
+    stall detector uses (``real_activity_for_worker``: sessions.db, per-PID
+    Devin log, worktree file mtimes — whichever apply). When the probe is not
+    fresh (every source is quiet past its threshold), the writer is reaped via
+    the same kill path as ``session_stalled`` (``kill_process_tree`` +
+    ``sweep_orphan_processes``), the marker is cleaned, and a
+    ``foreign_writer_reaped`` event is logged. When the probe is fresh, the
+    writer is genuinely active and must remain blocked — escalation is reserved
+    for a writer that is alive *and* active (genuinely someone else's).
+
+    PID-recycling defense (issue #1423 review): the marker's
+    ``process_start_time`` fingerprint is passed to ``kill_process_tree`` so
+    the kill path re-verifies process identity immediately before terminating
+    — the same defense every other ``kill_process_tree`` call site in this
+    codebase uses. A marker without ``process_start_time`` (legacy marker
+    written before the field existed, or an operator sentinel with ``pid 0``)
+    cannot be safely reaped: an idle window can be hours long, and without the
+    fingerprint ``kill_process_tree`` would terminate whatever process now
+    holds the PID, which may be unrelated. Such a marker returns ``False`` so
+    the caller falls back to the block/escalate path instead.
+
+    Returns ``True`` when the writer was reaped (caller should proceed with
+    dispatch), ``False`` when it is still active or cannot be safely reaped
+    (caller should block/raise).
+    """
+    if now is None:
+        now = datetime.now(UTC)
+
+    # PID-recycling defense: refuse to reap a marker that carries no
+    # process-start-time fingerprint. Without it, ``kill_process_tree`` cannot
+    # re-verify identity, and an hours-long idle window is exactly the window
+    # in which the OS recycles PIDs. Fall back to block/escalate instead.
+    process_start_time = marker.get("process_start_time")
+    if not isinstance(process_start_time, (int, float)):
+        return False
+
+    started_at = marker.get("started_at")
+    if not isinstance(started_at, str):
+        started_at = now.isoformat().replace("+00:00", "Z")
+
+    probe = real_activity_for_worker(
+        config.post_mortem,
+        str(worktree_path),
+        started_at,
+        pid,
+        now,
+        log_path=None,
+        watchdog_config=config.watchdog,
+        worker_kind=None,
+    )
+
+    if probe.is_fresh(config.watchdog.stall_minutes):
+        return False
+
+    # Writer is alive but idle past the threshold — reap it (same kill path
+    # as ``session_stalled`` in ``_detect_and_handle_stalled_sessions``). The
+    # marker's ``process_start_time`` is passed so ``kill_process_tree``
+    # re-verifies identity immediately before terminating, closing the
+    # PID-recycling gap every other kill call site in this codebase closes.
+    killed_pids = kill_process_tree(pid, process_start_time)
+    orphan_pids: list[int] = []
+    orphan_processes = sweep_orphan_processes(str(worktree_path))
+    if orphan_processes:
+        for orphan in orphan_processes:
+            kill_orphan_pid(orphan["pid"])
+            killed_pids.append(orphan["pid"])
+        orphan_pids = [o["pid"] for o in orphan_processes]
+
+    remove_worktree_marker(worktree_path)
+
+    if state_file is not None:
+        try:
+            from .instrumentation import log_event
+
+            log_event(
+                state_file,
+                "foreign_writer_reaped",
+                {
+                    "issue_number": issue_number,
+                    "pid": pid,
+                    "session_id": session_id,
+                    "worktree_path": str(worktree_path),
+                    "killed_pids": killed_pids,
+                    "orphan_pids": orphan_pids if orphan_pids else None,
+                    "latest_real_activity_at": probe.latest_timestamp.isoformat()
+                    if probe.latest_timestamp is not None
+                    else None,
+                    "latest_real_activity_source": probe.latest_source,
+                },
+            )
+        except Exception:  # noqa: BLE001 — instrumentation is best-effort
+            pass
+
+    return True
 
 
 def _read_origin_head_symref(repo_root: Path) -> str | None:
@@ -2841,7 +2999,11 @@ def create_worktree(
         state_file = runtime_paths(repo_root, config.runtime.state_dir).state_file
     if sessions_dir is not None:
         _check_worktree_writer_marker(
-            worktree_path, sessions_dir, issue_number=issue_number, state_file=state_file
+            worktree_path,
+            sessions_dir,
+            issue_number=issue_number,
+            state_file=state_file,
+            config=config,
         )
 
     # Recovery mode: dead-worker re-dispatch with leftover worktree/branch
