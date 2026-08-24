@@ -15311,14 +15311,23 @@ class OrchestratorApp:
         else:
             # Issue #1383: use the shared data-boundary enrichment so the
             # merge path classifies infra_blocked checks identically to the
-            # review path. The old inline enrichment only detected
-            # INFRA_FAILURE (CANCELLED/TIMED_OUT-style per-PR infra) and
-            # missed fleet-wide budget/runner-outage FAILURE checks -- the
-            # exact gap issue #1383 closes. The shared helper also preserves
-            # the original INFRA_FAILURE reclassification for non-blocked
-            # infra failures via is_infra_blocked_check's structural
-            # signals (zero steps / setup-only / billing annotations), so
-            # the existing infra_failed routing in merge_ready is unchanged.
+            # review path. The old inline enrichment reclassified a FAILURE
+            # check with an infra signature to ``INFRA_FAILURE`` (routing it
+            # to ``CheckSummary.infra_failed``); the shared helper rewrites
+            # the same population to ``INFRA_BLOCKED`` instead, so those
+            # checks now land in ``CheckSummary.infra_blocked`` rather than
+            # ``infra_failed``. Both buckets block merge (``CheckSummary.ready``
+            # is False for either), so the merge gate is unchanged -- only the
+            # bucket/failure-message differs. ``infra_failed`` is NOT emptied
+            # for its original population: ``_enrich_checks_infra_blocked``
+            # only touches ``FAILURE``-conclusion checks, so genuine
+            # ``CANCELLED``/``INFRA_FAILURE``/``TIMED_OUT`` checks still route
+            # to ``infra_failed`` exactly as before (the #841 auto-rerun path
+            # in ``review()`` is fed by ``run_janitor``, which sees raw checks
+            # -- it never enriched FAILURE to INFRA_FAILURE pre-#1383, so the
+            # #1383 change reroutes zero-step FAILURE from
+            # ``is_check_failure_block`` (rework) to ``is_infra_blocked_block``
+            # (hold), not from ``is_infra_failure_block``).
             enriched_checks = self._enrich_checks_infra_blocked(
                 checks, self.config.auto_merge.required_checks
             )

@@ -16394,6 +16394,117 @@ def test_infra_blocked_config_parses_from_yaml(tmp_path: Path) -> None:
     assert cfg.escalation_window_minutes == 120
 
 
+def test_infra_blocked_does_not_shadow_cancelled_auto_rerun_path(tmp_path: Path) -> None:
+    """Round-3 review finding: the #1383 ``_enrich_checks_infra_blocked``
+    helper gates on ``state == "FAILURE"``, so it must NOT reclassify a
+    ``CANCELLED`` (or ``INFRA_FAILURE``/``TIMED_OUT``) required check. The
+    pre-existing #841 ``is_infra_failure_block`` auto-rerun+escalate path is
+    fed by ``run_janitor`` over those conclusions and must still fire
+    post-#1383. This test confirms a ``CANCELLED`` required check -- carrying
+    a ``databaseId`` and a zero-step job that WOULD match
+    ``is_infra_blocked_check`` if the gate admitted it -- still routes to
+    ``infra_rerun`` (not ``infra_blocked``) with the #1383 classifier enabled
+    (its default). The ``databaseId`` + zero-step job exercise the gate so a
+    mutation that broadens it to ``CANCELLED`` is caught."""
+
+    class _FakeGitHubWithInfraJobAndRerun(_FakeGitHubWithInfraBlockedJob):
+        """Combines actions_job (for the enrichment gate) with rerun capture
+        (for the #841 auto-rerun assertion)."""
+
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.rerun_calls: list[list[str]] = []
+
+        def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):  # noqa: ANN202
+            if len(args) >= 2 and args[0] == "run" and args[1] == "rerun":
+                self.rerun_calls.append(list(args))
+                return "DRY-RUN: gh run rerun " + " ".join(args[2:])
+            return super().run(args, json_output=json_output, allow_failure=allow_failure)
+
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()  # InfraBlockedConfig.enabled defaults to True
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    link = "https://github.com/owner/repo/actions/runs/12345/job/67890"
+    fake_gh = _FakeGitHubWithInfraJobAndRerun(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED", "link": link, "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            # Zero-step FAILURE job that is_infra_blocked_check WOULD classify
+            # -- but the outer gate excludes CANCELLED check-state, so this
+            # job is never consulted and the check stays CANCELLED.
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.review(456)
+
+    # The #841 auto-rerun path fired for the CANCELLED check.
+    assert result.ok is False
+    assert result.data.get("infra_rerun_run_ids") == [12345]
+    assert len(fake_gh.rerun_calls) == 1
+    # The #1383 infra_blocked hold path did NOT fire.
+    assert result.data.get("infra_blocked") is not True
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    # No check_infra_blocked event was emitted -- the CANCELLED check is not
+    # in the infra_blocked population.
+    blocked_events = query_events(paths.state_file, kind="check_infra_blocked")
+    assert len(blocked_events) == 0
+
+
+def test_merge_ready_infra_blocked_failure_blocks_merge_in_blocked_bucket(
+    tmp_path: Path,
+) -> None:
+    """Round-3 review finding: ``merge_ready()`` uses the shared
+    ``_enrich_checks_infra_blocked`` helper, which rewrites a zero-step
+    FAILURE required check to ``INFRA_BLOCKED`` (not ``INFRA_FAILURE`` as the
+    old inline enrichment did). The check must land in
+    ``CheckSummary.infra_blocked`` (not ``infra_failed``) and block the merge
+    (``can_merge=False``, ``merged=False``). Both buckets block merge via
+    ``CheckSummary.ready``, so the merge gate is unchanged -- only the bucket
+    differs. This is the merge_ready()-path coverage the round-1/2 tests
+    lacked (only review()'s new path was covered)."""
+    from charlie_work.workflow import _infra_blocked_window
+
+    _infra_blocked_window.clear()
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeGitHubWithInfraBlockedJob(
+        checks=[
+            {"name": "Tests passed", "state": "FAILURE", "databaseId": 9001},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        jobs_by_check_run_id={
+            9001: {"conclusion": "FAILURE", "steps": []},
+        },
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    # Plant an approved review decision so merge_ready reaches the check gate.
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.merge_ready(456, merge=True)
+
+    # The zero-step FAILURE check blocks merge via the infra_blocked bucket.
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert fake_gh.merged == []
+    checks = result.data["checks"]
+    assert checks["infra_blocked"] == ("Tests passed",)
+    assert checks["infra_failed"] == ()
+    assert checks["failed"] == ()
+
+
 def test_janitor_required_check_repeated_failure_escalates(tmp_path: Path) -> None:
     """Issue #376: repeated check-failure reworks escalate via the
     request_changes cap. Issue #1266: max_rework_cycles_exceeded is
