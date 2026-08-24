@@ -1459,6 +1459,20 @@ class WatchdogConfig:
     # in the issue title, which is trivially distinguishable from a
     # legitimately long worker session.
     dead_dispatched_reap_minutes: int = 60
+    # Issue #1423: upper bound on how many times a ``worktree_foreign_writer``
+    # block can be auto-reaped for the same issue before falling back to
+    # escalation. Each successful reap resets ``blocked_environment_at`` to
+    # ``[]``, so without a separate cross-pass cap a persistently-blocked
+    # worktree (a foreign writer that keeps coming back, or a new one
+    # appearing each pass) would loop forever between reap and redispatch
+    # instead of ever escalating. The counter is a windowed list of reap
+    # timestamps (``foreign_writer_reaps`` on the issue entry, same window as
+    # ``redispatch_window_minutes``) so it eventually clears once the
+    # underlying cause is gone. 0 disables auto-reaping entirely (always
+    # escalate at cap exhaustion), consistent with ``max_auto_redispatch``
+    # where 0 means "never redispatch." The default of 2 provides the bound
+    # the reviewer requested.
+    max_foreign_writer_reaps: int = 2
 
 
 @dataclass(frozen=True)

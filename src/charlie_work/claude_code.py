@@ -1472,7 +1472,9 @@ def launch_claude_worker(
     )
 
     try:
-        write_worktree_marker(worktree.path, process.pid, session_id)
+        write_worktree_marker(
+            worktree.path, process.pid, session_id, process_start_time=process_start_time
+        )
     except OSError:
         # Best-effort marker write must not derail a successful launch.
         pass
